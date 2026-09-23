@@ -1,0 +1,93 @@
+meta:
+  custom:                 # free-form; read by examples/custom_plant.py
+    psc_lag_tau_s: 0.02
+base:
+  s_base: 2000000.0
+  v_ll_rms: 690.0
+  f0: 50.0
+buses:
+  pcc:
+    c_pu: 0.02
+    r_d_pu: 0.5
+sources:
+  grid:
+    bus: pcc
+    x_pu: 0.4
+    r_pu: 0.04
+    events:
+      freq_step_t: 4.0
+      freq_step_hz: -0.2
+units:
+  vsc:
+    bus: pcc
+    ac_filter:
+      l_f_pu: 0.2
+      r_f_pu: 0.01
+    dclink:
+      vdc_ref: 1500.0
+      source:
+        type: voltage
+        v_pu: 1.0
+    measurement:              # ADC
+      average: instantaneous  # instantaneous | window (mean over (t_k - window_s, t_k])
+      window_s: 50.0e-6       # averaging window, used when average = window
+      # u_dc: instantaneous   # same choice for the dc voltage
+    pwm:
+      update_period: 5e-05
+      f_sw: 20000.0
+      modulation_limit: 0.95
+      carrier_phase: 0.0
+    control:
+      type: gfm
+      loops:
+        power:
+          type: power
+          period: 5.0e-05
+          bw_hz: 0.0
+        sync:
+          type: psc
+          period: 5.0e-05
+          k_p_pu: 6.2832
+          k_v: 0.0
+          k_vi: 20.0
+        impedance:
+          type: virtual_impedance
+          r_v_pu: 0.0
+          x_v_pu: 0.0
+        damp:
+          type: active_damping
+          period: 5.0e-05
+          r_a_pu: 0.2
+          alpha_d: 40.0
+      references:
+        p_ref_pu: 0.5
+        q_ref_pu: 0.0
+        v_ref_pu: 1.0
+    delay:
+      steps: 1
+    protection:
+      i_alarm_pu: 1.5
+      hold_s: 0.02
+    events:
+      startup:
+        start: 0.2
+        duration: 1.0
+      setpoint:
+        t: 2.0
+        p_ref_pu: 0.8
+simulation:
+  t_end: 6.0
+  bridge: averaged
+  solver:
+    type: fixed
+    method: rk4
+    dt: 1.25e-05
+  log:
+    plant_period: 0.0005
+    control_every: 10
+  stop_on_trip: true
+initial:
+  t: 0.0           # default: capacitors at 1 pu, every other state 0
+output:
+  states: true
+  signals: false

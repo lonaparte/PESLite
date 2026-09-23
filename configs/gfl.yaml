@@ -1,0 +1,128 @@
+# Grid-following converter on a Thevenin grid. Annotated reference: every key is explained here.
+# Network quantities are pu on the system base; converter quantities are pu on the unit's own base.
+
+base:                      # system base
+  s_base: 2.0e6            # VA
+  v_ll_rms: 690.0          # V
+  f0: 50.0                 # Hz
+
+buses:                     # ac nodes; every bus needs a shunt capacitor
+  pcc:
+    c_pu: 0.02             # shunt capacitor, pu susceptance at f0
+    r_d_pu: 0.5            # damping resistor in series with it
+
+branches: {}               # {name: {from_bus, to_bus, x_pu, r_pu}}
+
+sources:                   # emf behind an impedance, attached to a bus
+  grid:
+    bus: pcc
+    x_pu: 0.4
+    r_pu: 0.04
+    # v_pu: 1.0            # emf magnitude (default 1)
+    # events:              # t < 0 disables an event
+    #   freq_step_t: -1.0    # s; with freq_step_hz
+    #   phase_jump_t: -1.0   # s; with phase_jump_rad
+    #   voltage_step_t: -1.0 # s; with voltage_step (V)
+
+units:                     # converters; one entry per converter
+  vsc:
+    bus: pcc               # terminal bus (fed through the filter branch)
+    # s_base: 2.0e6        # unit rating (default: system base)
+
+    ac_filter:             # bridge --[R, L]-- bus
+      l_f_pu: 0.2
+      r_f_pu: 0.01
+
+    dclink:
+      vdc_ref: 1500.0      # V; dc voltage base and default initial voltage
+      capacitor:           # omit for a voltage-source-only dc side
+        c_pu: 35.0
+        r_esr_pu: 0.001
+      source:
+        type: current      # current | voltage | none
+        i_pu: 0.9          # into the link; scaled by the start-up ramp
+        k_pu: 0.0          # current-source droop: k_pu * (1 - u_C_pu)
+        # voltage source: v_pu (emf, default 1), r_pu (series R, default 0)
+
+    measurement:           # ADC
+      average: instantaneous # instantaneous | window (mean over (t_k - window_s, t_k])
+      # window_s: 50.0e-6  # averaging window; default: the PWM update period
+      # u_dc: instantaneous  # same choice for the dc voltage
+
+    pwm:
+      update_period: 5e-05 # s
+      f_sw: 20000.0        # Hz
+      modulation_limit: 0.95
+      # method: spwm       # spwm | svpwm
+      # sync: asynchronous # asynchronous | synchronous
+      carrier_phase: 0.0   # carrier periods at t = 0
+
+    control:
+      type: gfl            # gfl | gfm | custom
+      loops:
+        pll:
+          type: srf_pll
+          period: 5.0e-05
+          kp_pu: 20.0
+          ki_pu: 1200.0
+          # normalisation: rated  # rated | amplitude
+        cc:
+          type: dq_current_pi
+          period: 5.0e-05
+          bw_hz: 200.0
+          antiwindup: conditional  # conditional | backcalc | none
+        dvc:
+          type: dc_voltage_pi
+          period: 5.0e-05
+          limit_pu: 1.15
+          kp_pu: 0.8
+          ki_pu: 90.0
+          id0_export_pu: 0.9
+          bidirectional: false
+      # sampling_period: 2.5e-5  # ADC oversampling (default: the PWM update period)
+    delay:
+      steps: 0             # computation delay in PWM updates
+    protection:            # trips only this converter
+      i_alarm_pu: 1.15     # instantaneous phase-current trip
+      vac_uv_pu: 0.50
+      vac_ov_pu: 1.20
+      freq_band_hz: -1.0   # < 0: disabled
+      vdc_band_pu: -1.0    # < 0: disabled
+      hold_s: 0.02
+      rocof_alarm_hz_s: 1.0  # alarm only
+      rocof_window_s: 0.1
+
+    events:
+      startup: {start: 0.2, duration: 1.0}
+      # setpoint: {t: -1.0, p_ref_pu: ..., q_ref_pu: ..., v_ref_pu: ...}   # grid-forming setpoints
+      # pll_gain: {t: -1.0, kp_after_pu: ...}
+
+simulation:
+  t_end: 3.0
+  bridge: switching        # switching | averaged | step_averaged
+  solver:
+    type: fixed            # fixed | adaptive
+    method: rk4            # fixed: euler | heun | rk4; adaptive: RK45 | DOP853 | Radau | BDF | LSODA | DP45
+    dt: 12.5e-6            # fixed: maximum step
+    rtol: 1.0e-6           # adaptive tolerances
+    atol: 1.0e-9
+    # subsystems: {vsc.dclink: 10, pcc: 0.1}  # own step relative to dt: 10 = once per 10 steps, 0.1 = 10 per step
+    # sweeps: 2
+    # linearisations: 3
+  log:
+    plant_period: 0.5e-3   # s
+    control_every: 10      # keep every 10th controller sample
+  stop_on_trip: true
+  progress_every: 0.0
+  energy_check: warn       # warn | strict | off
+
+initial:                   # default: capacitors at 1 pu, every other state 0
+  t: 0.0
+  states:                  # names as in states.csv (see --list-states)
+    plant.pcc.u_C: source  # 'source': the emf driving that bus at t
+    plant.vsc.u_dc: rated  # 'rated': the unit's rated dc voltage
+
+output:
+  states: true             # states.csv
+  signals: false           # plant.csv + control.<unit>.csv
+  energy: false            # energy.csv

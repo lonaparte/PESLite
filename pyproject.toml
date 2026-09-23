@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "peslite"
+version = "0.1.0"
+description = "Power-electronics simulation with an internal port-Hamiltonian solver kernel (peslite.phs): connected subsystem models, energy accounting, fixed/adaptive/multirate integration and converter control."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "AGPL-3.0"}
+dependencies = ["numpy>=1.24", "scipy>=1.10", "PyYAML>=6.0"]
+
+[tool.setuptools]
+# The repository folder is the package itself.
+package-dir = {"peslite" = "."}
+packages = ["peslite", "peslite.assembly", "peslite.control", "peslite.firmware", "peslite.modulation",
+            "peslite.params", "peslite.phs", "peslite.phs.solvers", "peslite.power", "peslite.protection",
+            "peslite.results", "peslite.sensing"]

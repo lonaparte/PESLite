@@ -1,0 +1,167 @@
+# Two converters, each on its own bus and connected to the PCC by a line:
+# a grid-forming unit (PSC, 2 MVA, 20 kHz) and a grid-following unit (1 MVA, 10 kHz).
+base:
+  s_base: 2.0e6
+  v_ll_rms: 690.0
+  f0: 50.0
+buses:
+  pcc:
+    c_pu: 0.02
+    r_d_pu: 0.5
+  bus1:
+    c_pu: 0.02
+    r_d_pu: 0.5
+  bus2:
+    c_pu: 0.02
+    r_d_pu: 0.5
+branches:
+  line1:
+    from_bus: bus1
+    to_bus: pcc
+    x_pu: 0.05
+    r_pu: 0.005
+  line2:
+    from_bus: bus2
+    to_bus: pcc
+    x_pu: 0.08
+    r_pu: 0.008
+sources:
+  grid:
+    bus: pcc
+    x_pu: 0.4
+    r_pu: 0.04
+    events:
+      freq_step_t: 0.75
+      freq_step_hz: -0.2
+units:
+  vsc_m:
+    bus: bus1
+    ac_filter:
+      l_f_pu: 0.2
+      r_f_pu: 0.01
+    dclink:
+      vdc_ref: 1500.0
+      source:
+        type: voltage
+        v_pu: 1.0
+    pwm:
+      update_period: 5e-05
+      f_sw: 20000.0
+      modulation_limit: 0.95
+      carrier_phase: 0.0
+    control:
+      type: gfm
+      loops:
+        power:
+          type: power
+          period: 5.0e-05
+          bw_hz: 0.0
+        sync:
+          type: psc
+          period: 5.0e-05
+          k_p_pu: 6.2832
+          k_v: 0.0
+          k_vi: 20.0
+        impedance:
+          type: virtual_impedance
+          r_v_pu: 0.0
+          x_v_pu: 0.0
+        damp:
+          type: active_damping
+          period: 5.0e-05
+          r_a_pu: 0.2
+          alpha_d: 40.0
+      references:
+        p_ref_pu: 0.5
+        q_ref_pu: 0.0
+        v_ref_pu: 1.0
+    delay:
+      steps: 1
+    protection:
+      i_alarm_pu: 1.5
+      hold_s: 0.02
+    events:
+      startup:
+        start: 0.05
+        duration: 0.3
+      setpoint:
+        t: 0.5
+        p_ref_pu: 0.3
+    s_base: 2000000.0
+  vsc_l:
+    bus: bus2
+    ac_filter:
+      l_f_pu: 0.2
+      r_f_pu: 0.01
+    dclink:
+      vdc_ref: 1500.0
+      capacitor:
+        c_pu: 35.0
+        r_esr_pu: 0.001
+      source:
+        type: current
+        i_pu: 0.9
+        k_pu: 0.0
+    pwm:
+      update_period: 0.0001
+      f_sw: 10000.0
+      modulation_limit: 0.95
+      carrier_phase: 0.0
+    control:
+      type: gfl
+      loops:
+        pll:
+          type: srf_pll
+          period: 0.0001
+          kp_pu: 20.0
+          ki_pu: 1200.0
+        cc:
+          type: dq_current_pi
+          period: 0.0001
+          bw_hz: 200.0
+          antiwindup: conditional
+        dvc:
+          type: dc_voltage_pi
+          period: 0.0001
+          limit_pu: 1.15
+          kp_pu: 0.8
+          ki_pu: 90.0
+          id0_export_pu: 0.9
+          bidirectional: false
+    delay:
+      steps: 0
+    protection:
+      i_alarm_pu: 1.15
+      vac_uv_pu: 0.5
+      vac_ov_pu: 1.2
+      freq_band_hz: -1.0
+      vdc_band_pu: -1.0
+      hold_s: 0.02
+      rocof_alarm_hz_s: 1.0
+      rocof_window_s: 0.1
+    events:
+      startup:
+        start: 0.05
+        duration: 0.3
+    s_base: 1000000.0
+simulation:
+  t_end: 1.0
+  bridge: switching
+  solver:
+    type: fixed
+    method: rk4
+    dt: 1.25e-05
+    rtol: 1.0e-06
+    atol: 1.0e-09
+  log:
+    plant_period: 0.0005
+    control_every: 10
+  stop_on_trip: false
+  progress_every: 0.0
+  energy_check: warn
+initial:
+  t: 0.0           # default: capacitors at 1 pu, every other state 0
+output:
+  states: true
+  signals: false
+  energy: false
