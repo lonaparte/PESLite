@@ -1,6 +1,6 @@
-# peslite
+# PESLite
 
-Time-domain simulation of grid-connected voltage-source converters in Python.
+Time-domain simulation of power-electronic converters in Python.
 
 - Networks of buses, lines, grid sources and any number of converters, defined in YAML.
 - Grid-following (PLL, current loop, dc-voltage loop) and grid-forming control
