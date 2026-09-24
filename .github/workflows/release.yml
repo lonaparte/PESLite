@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     name: Build distribution
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout source
@@ -63,7 +63,7 @@ jobs:
         run: ls -lh dist/
 
       - name: Upload distributions
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: python-package-distributions
           path: dist/
@@ -75,7 +75,7 @@ jobs:
     needs:
       - build
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Set up clean Python
@@ -84,7 +84,7 @@ jobs:
           python-version: "3.13"
 
       - name: Download built distributions
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: python-package-distributions
           path: dist/
@@ -134,7 +134,7 @@ jobs:
       - build
       - verify-wheel
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     environment:
       name: pypi
@@ -145,7 +145,7 @@ jobs:
 
     steps:
       - name: Download distributions
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: python-package-distributions
           path: dist/
@@ -160,7 +160,7 @@ jobs:
     needs:
       - publish
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Set up clean Python
