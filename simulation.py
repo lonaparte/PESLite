@@ -686,29 +686,32 @@ class SystemLoop:
 # --------------------------------------------------------- command-line entry
 
 _ROOT = Path(__file__).resolve().parent  # the repository folder
-_CONFIGS = _ROOT / "configs"
-_RESULTS = _ROOT / "output"
+_EXAMPLE_CONFIGS = _ROOT / "configs"
+_RESULTS = Path.cwd() / "output"
 _CONFIG_SUFFIXES = (".yaml", ".yml", ".json")
 
 
 def _config_path(value: str | None) -> Path:
     if value is None:
-        configs = sorted((p for p in _CONFIGS.iterdir()
-                          if p.is_file() and p.suffix.lower() in _CONFIG_SUFFIXES),
-                         key=lambda p: p.name)
+        configs = sorted(
+            p for p in _EXAMPLE_CONFIGS.iterdir()
+            if p.is_file() and p.suffix.lower() in _CONFIG_SUFFIXES
+        )
         if not configs:
-            raise FileNotFoundError(f"no YAML/JSON configurations in {_CONFIGS}; specify a file")
+            raise FileNotFoundError("no bundled example configurations available")
         return configs[0]
-
-    path = Path(value)
-    candidates = [path, _ROOT / path, _CONFIGS / path]
+    path = Path(value).expanduser()
+    candidates = [path]
     if not path.suffix:
-        candidates.extend((_CONFIGS / path).with_suffix(suffix) for suffix in _CONFIG_SUFFIXES)
+        candidates += [path.with_suffix(s) for s in _CONFIG_SUFFIXES]
+    example = _EXAMPLE_CONFIGS / path
+    candidates.append(example)
+    if not path.suffix:
+        candidates += [example.with_suffix(s) for s in _CONFIG_SUFFIXES]
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
     raise FileNotFoundError(f"configuration not found: {value}")
-
 
 def parse_override(text: str):
     key, _, value = text.partition("=")
