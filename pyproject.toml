@@ -9,11 +9,41 @@ description = "Power-electronics simulation with an internal port-Hamiltonian so
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "AGPL-3.0"}
-dependencies = ["numpy>=1.24", "scipy>=1.10", "PyYAML>=6.0"]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+peslite = "peslite.simulation:main"
+
+[project.urls]
+Homepage = "https://github.com/lonaparte/PESLite"
+Repository = "https://github.com/lonaparte/PESLite"
+Issues = "https://github.com/lonaparte/PESLite/issues"
 
 [tool.setuptools]
 # The repository folder is the package itself.
 package-dir = {"peslite" = "."}
-packages = ["peslite", "peslite.assembly", "peslite.control", "peslite.firmware", "peslite.modulation",
-            "peslite.params", "peslite.phs", "peslite.phs.solvers", "peslite.power", "peslite.protection",
-            "peslite.results", "peslite.sensing"]
+packages = [
+    "peslite",
+    "peslite.assembly",
+    "peslite.control",
+    "peslite.firmware",
+    "peslite.modulation",
+    "peslite.params",
+    "peslite.phs",
+    "peslite.phs.solvers",
+    "peslite.power",
+    "peslite.protection",
+    "peslite.results",
+    "peslite.sensing",
+]
+
+[tool.setuptools.package-data]
+peslite = [
+    "configs/*.yaml",
+    "configs/*.yml",
+    "configs/*.json",
+]
