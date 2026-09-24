@@ -745,7 +745,7 @@ def main(argv=None) -> int:
                     help="initial values: a states.csv (last row) or a YAML/JSON file with an 'initial' block")
     ap.add_argument("--initial-time", type=float, default=None, metavar="T",
                     help="with a states.csv: start from the row at time T instead of the last row")
-    ap.add_argument("--out", default=None, help="output directory (default: output/<config name> in the repository folder)")
+    ap.add_argument("--out", default=None, help="output directory (default: output/<config name> in the current working directory)")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
                     help="print a progress line every SECONDS of simulated time (overrides the config)")
     ap.add_argument("--list-states", action="store_true",
