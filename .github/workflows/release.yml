@@ -1,0 +1,206 @@
+name: Build, test and publish PESLite
+
+on:
+  workflow_dispatch:
+
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Check release version
+        if: github.event_name == 'release'
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              version = tomllib.load(f)["project"]["version"]
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          tag_version = tag[1:] if tag.startswith("v") else tag
+
+          if tag_version != version:
+              raise SystemExit(
+                  f"Release tag {tag!r} does not match "
+                  f"pyproject.toml version {version!r}"
+              )
+
+          print(f"Release version OK: {version}")
+          PY
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+
+      - name: Build wheel and source distribution
+        run: python -m build
+
+      - name: Check distribution metadata
+        run: python -m twine check dist/*
+
+      - name: Show distributions
+        run: ls -lh dist/
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v5
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+
+  verify-wheel:
+    name: Test installed wheel
+    needs:
+      - build
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up clean Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Download built distributions
+        uses: actions/download-artifact@v6
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Install wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install dist/*.whl
+
+      - name: Test Python import
+        run: |
+          python - <<'PY'
+          import peslite
+
+          print("peslite module:", peslite.__file__)
+          print("peslite version:", peslite.__version__)
+          print("Simulation:", peslite.Simulation)
+          PY
+
+      - name: Verify packaged example configuration
+        run: |
+          python - <<'PY'
+          from importlib.resources import files
+
+          path = files("peslite").joinpath("configs/gfl.yaml")
+
+          print("gfl.yaml:", path)
+
+          if not path.is_file():
+              raise SystemExit("configs/gfl.yaml is missing from the installed wheel")
+
+          print("Packaged config OK")
+          PY
+
+      - name: Test installed CLI
+        run: |
+          peslite --help
+          peslite gfl --list-states > /tmp/peslite-states.txt
+          test -s /tmp/peslite-states.txt
+          head -n 10 /tmp/peslite-states.txt
+
+
+  publish:
+    name: Publish to PyPI
+    if: github.event_name == 'release'
+    needs:
+      - build
+      - verify-wheel
+
+    runs-on: ubuntu-latest
+
+    environment:
+      name: pypi
+      url: https://pypi.org/p/peslite
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v6
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+
+  verify-pypi:
+    name: Verify installation from PyPI
+    if: github.event_name == 'release'
+    needs:
+      - publish
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up clean Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install released version from PyPI
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            echo "PyPI install attempt ${attempt}"
+
+            if python -m pip install \
+              --no-cache-dir \
+              "peslite==${VERSION}"
+            then
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "Could not install peslite==${VERSION} from PyPI"
+          exit 1
+
+      - name: Verify PyPI package
+        run: |
+          python - <<'PY'
+          import peslite
+
+          print("Installed from:", peslite.__file__)
+          print("Version:", peslite.__version__)
+          print("Simulation:", peslite.Simulation)
+          PY
+
+      - name: Verify PyPI CLI
+        run: |
+          peslite --help
+          peslite gfl --list-states > /tmp/peslite-states.txt
+          test -s /tmp/peslite-states.txt
+          head -n 10 /tmp/peslite-states.txt
