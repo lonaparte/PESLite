@@ -31,6 +31,18 @@ python peslite.py
 python peslite.py gfl
 python peslite.py configs/gfm-psc.yaml --out output/psc
 
+# Run your own configuration
+peslite case.yaml
+peslite ./configs/my-converter.yaml
+
+# A suffix may be omitted
+peslite case
+
+# Bundled examples are also available by name
+peslite gfl
+peslite gfm-psc
+peslite gfm-droop
+
 # override any parameter by its dotted path
 python peslite.py gfl --set simulation.t_end=1 --set units.vsc.delay.steps=1
 python peslite.py gfl --set simulation.solver.type=adaptive --set simulation.solver.method=DP45
