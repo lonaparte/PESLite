@@ -26,7 +26,7 @@ class VoltageAdaptivePLL(Loop):
         d(u_g)/dt = 2*alpha*(real(v * exp(-j*theta)) - u_g)
 
     This differs from PESLite's default rated-voltage SRF-PLL because the measured voltage updates
-    the normalising magnitude.  ``theta`` remains unwrapped to match PESLite's state convention.
+    the normalising magnitude. ``theta`` remains unwrapped to match PESLite's state convention.
     """
 
     @dataclass(frozen=True, kw_only=True)

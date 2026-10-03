@@ -15,7 +15,7 @@ the installed package. Their exact search rules and their relationship to the ou
 defined once in [Project Workspace](Project-Workspace.md).
 
 The bundled `custom-pll-example` demonstrates this layout: its `.pes` file remains in `examples/`,
-while `peslite.addons.controllers.voltage_adaptive_pll` contains the executable custom loop. It
+while `peslite.addons.control.voltage_adaptive_pll` contains the executable custom loop. It
 uses a filtered measured-voltage magnitude and grid-frequency state, then joins the same GFL graph
 as the built-in current and DC-voltage loops.
 
@@ -31,7 +31,7 @@ Register a loop class with `register_loop_type`:
 
 ```python
 from dataclasses import dataclass
-from peslite.addons.controllers import SyncLaw, register_loop_type
+from peslite.addons.control import SyncLaw, register_loop_type
 
 @register_loop_type
 class LaggedSync(SyncLaw):
@@ -64,7 +64,7 @@ class LaggedSync(SyncLaw):
 ```
 
 The nested frozen `Params` dataclass defines the file schema and defaults. A module stored under
-`peslite/addons/controllers/` is discovered automatically; the registered name is then available at
+`peslite/addons/control/` is discovered automatically; the registered name is then available at
 `units.<u>.ctrl.loops.<loop>.type` exactly like a built-in loop.
 
 A specialized loop may expose separate sampled and continuous-flow laws. When its dynamics can be
@@ -75,7 +75,7 @@ implementations during construction. Typed ports still validate all connections 
 The essential pattern is:
 
 ```python
-from peslite.addons.controllers import Filter, Integrator, PI
+from peslite.addons.control import Filter, Integrator, PI
 
 def __init__(self, cfg, unit, startup):
     super().__init__(cfg, unit, startup)
@@ -103,7 +103,7 @@ itself has no mode branch. `Filter` follows the Transfer Fcn coefficient convent
 denominator coefficients are in descending powers of `s`, and the transfer function must be
 proper. Its sampled implementation, and the sampled integral branch of `Integrator` and `PI`, use
 the trapezoidal (Tustin) method. The complete bundled example is
-`peslite.addons.controllers.voltage_adaptive_pll`.
+`peslite.addons.control.voltage_adaptive_pll`.
 
 ## Custom circuit elements
 

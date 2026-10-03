@@ -6,19 +6,19 @@ import numpy as np
 import peslite
 import pytest
 from peslite.addons import components as addon_components
-from peslite.addons import controllers as addon_controllers
+from peslite.addons import control as addon_control
 from peslite.addons.components.cable import CableModel
-from peslite.addons.controllers.voltage_adaptive_pll import VoltageAdaptivePLL
+from peslite.addons.control.voltage_adaptive_pll import VoltageAdaptivePLL
 from peslite.components import ELEMENT_TYPES
 from peslite.control import LOOP_TYPES, Loop
 
 
-def test_controller_addon_path_registers_loops(tmp_path, monkeypatch):
-    path = tmp_path / "controllers"
+def test_control_addon_path_registers_loops(tmp_path, monkeypatch):
+    path = tmp_path / "control"
     path.mkdir()
     (path / "test_controller_addon.py").write_text(
         """from dataclasses import dataclass
-from peslite.addons.controllers import Loop, register_loop_type
+from peslite.addons.control import Loop, register_loop_type
 
 @register_loop_type
 class AddonLoop(Loop):
@@ -31,13 +31,13 @@ class AddonLoop(Loop):
 """,
         encoding="utf-8",
     )
-    monkeypatch.setattr(addon_controllers, "__path__", [str(path)])
+    monkeypatch.setattr(addon_control, "__path__", [str(path)])
     importlib.invalidate_caches()
 
-    imported = addon_controllers.discover()
+    imported = addon_control.discover()
 
     assert [module.__name__ for module in imported] == [
-        "peslite.addons.controllers.test_controller_addon"
+        "peslite.addons.control.test_controller_addon"
     ]
     assert LOOP_TYPES["addon_test_loop"].__module__ == imported[0].__name__
 
@@ -77,9 +77,9 @@ def test_functions_hold_the_plotting_addon():
 
 
 def test_addon_entry_points_match_builtin_public_apis():
-    assert set(peslite.control.__all__) < set(addon_controllers.__all__)
+    assert set(peslite.control.__all__) < set(addon_control.__all__)
     assert set(peslite.components.__all__) < set(addon_components.__all__)
-    assert addon_controllers.LOOP_TYPES is LOOP_TYPES
+    assert addon_control.LOOP_TYPES is LOOP_TYPES
     assert addon_components.ELEMENT_TYPES is ELEMENT_TYPES
 
 
@@ -122,17 +122,17 @@ def test_cable_model_has_two_inward_ports_and_closes_its_power_balance():
 
 def test_pesaddons_beside_simulation_file_merges_project_paths(examples, tmp_path):
     root = tmp_path / "project"
-    controllers = root / "PESaddons/controllers"
+    control = root / "PESaddons/control"
     components = root / "PESaddons/components"
     functions = root / "PESaddons/functions"
-    controllers.mkdir(parents=True)
+    control.mkdir(parents=True)
     components.mkdir()
     functions.mkdir()
-    (controllers / "project_local_pll.py").write_text(
+    (control / "project_local_pll.py").write_text(
         """import cmath
 from dataclasses import dataclass
-from peslite.addons.controllers import (ANGLE, FREQUENCY, V_AB, Integrator, Loop,
-                                         register_loop_type)
+from peslite.addons.control import (ANGLE, FREQUENCY, V_AB, Integrator, Loop,
+                                    register_loop_type)
 
 @register_loop_type
 class ProjectLocalPLL(Loop):
@@ -202,7 +202,7 @@ class ProjectLocalElement(Load):
     assert params.elements["project_load"].type == "project_local_element"
     assert local_function.VALUE == 42
     assert str((root / "PESaddons").resolve()) in peslite.addons.__path__
-    assert str(controllers.resolve()) in addon_controllers.__path__
+    assert str(control.resolve()) in addon_control.__path__
     assert str(components.resolve()) in addon_components.__path__
     assert str(functions.resolve()) in peslite.addons.functions.__path__
 

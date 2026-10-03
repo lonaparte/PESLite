@@ -11,12 +11,12 @@ peslite/
 ├── control/                 built-in controller implementation
 ├── components/              built-in electrical components
 └── addons/
-    ├── controllers/         controller extension entry point
+    ├── control/             control-loop extension entry point
     ├── components/          component extension entry point
     └── functions/           optional user-facing functions
 ```
 
-`peslite.addons.controllers` exposes the same public loop construction API and the same loop-type
+`peslite.addons.control` exposes the same public loop construction API and the same loop-type
 registry as `peslite.control`. A loop registered from either location is consequently validated,
 connected and executed in the same way. Similarly, `peslite.addons.components` exposes the public
 component API and the same element-type registry as `peslite.components`. The add-on directories
@@ -38,7 +38,7 @@ When that directory exists, its paths merge with the installed `peslite.addons` 
 
 | Project path | Equivalent installed extension path | Behaviour |
 |---|---|---|
-| `PESaddons/controllers/` | `peslite/addons/controllers/` | Modules are imported before the `.pes` file is parsed and register loop types. |
+| `PESaddons/control/` | `peslite/addons/control/` | Modules are imported before the `.pes` file is parsed and register loop types. |
 | `PESaddons/components/` | `peslite/addons/components/` | Modules are imported before parsing and register element types. |
 | `PESaddons/functions/` | `peslite/addons/functions/` | Modules become importable as optional functions and remain lazy. |
 
@@ -59,7 +59,7 @@ converter-study/
 ├── case.pes
 ├── another-case.pes
 ├── PESaddons/
-│   ├── controllers/
+│   ├── control/
 │   │   └── project_controller.py
 │   ├── components/
 │   │   └── project_component.py

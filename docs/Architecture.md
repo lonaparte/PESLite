@@ -13,7 +13,7 @@ src/peslite/
 ├── assembly/     parameters, events, protection, units, systems and exporters
 ├── solver/       connected model kernel, energy model, integrators and simulation run
 └── addons/       custom extension entry points and optional functions
-    ├── controllers/  automatically discovered custom control-loop modules
+    ├── control/      automatically discovered custom control-loop modules
     ├── components/   automatically discovered custom circuit-element modules
     └── functions/    optional user-facing functions such as IEEE PDF plotting
 ```

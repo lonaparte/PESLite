@@ -6,7 +6,7 @@
   numbered `busN`, voltage and current ports and construction-time current-direction handling.
 - Added shared sampled/continuous `Integrator`, `PI` and transfer-function `Filter` blocks, typed
   controller connections and controller-owned output limits with sampled tracking anti-windup.
-- Organised add-ons into automatically discovered `controllers` and `components` extension
+- Organised add-ons into automatically discovered `control` and `components` extension
   packages plus an optional `functions` package; a `PESaddons` directory beside a simulation file
   contributes the same project-local extension paths.
 - Added voltage-adaptive PLL and distributed R-L/G-C cable add-ons, together with simulation-file
