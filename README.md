@@ -56,7 +56,21 @@ peslite case.pes --set simulation.t_end=1.0 --out output/test
 ```
 
 Results are written to `output/<name>/`. Bridge/solver presets are available through
-`--switching`, `--pwm-averaging` and `--averaging`; use `peslite --help` for the full interface.
+three run modes:
+
+```bash
+peslite case.pes --switching
+peslite case.pes --pwm-averaging
+peslite case.pes --averaging
+```
+
+- `--switching` uses exact switching bridges with fixed-step RK4 integration.
+- `--pwm-averaging` averages each PWM period while retaining sampled digital-control timing and
+  uses fixed-step RK4 integration.
+- `--averaging` uses ideal averaged controlled-voltage-source bridges, continuous control and
+  adaptive DP45 integration.
+
+Use `peslite --help` for the full interface.
 
 The same workflow is available from Python:
 
@@ -93,6 +107,7 @@ for compilation, runtime configuration and current backend limits.
 - [Multirate Simulation](https://github.com/lonaparte/PESLite/wiki/Multirate-Simulation)
 - [Events and Restart](https://github.com/lonaparte/PESLite/wiki/Events-and-Restart)
 - [Output and Results](https://github.com/lonaparte/PESLite/wiki/Output-and-Results)
+- [Project Workspace](https://github.com/lonaparte/PESLite/wiki/Project-Workspace)
 - [Extending PESLite](https://github.com/lonaparte/PESLite/wiki/Extending-PESLite)
 - [Architecture](https://github.com/lonaparte/PESLite/wiki/Architecture)
 - [CLI Reference](https://github.com/lonaparte/PESLite/wiki/CLI-Reference)
