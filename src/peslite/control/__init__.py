@@ -12,18 +12,22 @@ solver's kernel: the hardware adapts to its interface (:class:`Measurement`, :cl
 from ..solver import ConfigError
 from .blocks import Filter, Integrator, OutputLimit, PI
 from .loops import (ANGLE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES, POWER, PQ, V, V_AB, V_DQ,
-                    DUTY_RATIO, SI_CURRENT, SI_VOLTAGE, InductorCurrentLoop, OutputVoltageLoop,
+                    DUTY_RATIO, SI_CURRENT, SI_VOLTAGE, CapacitorVoltageControl,
+                    InductorCurrentControl,
                     Loop, SignalType, SyncLaw, register_loop_type)
 from .modulation import ModulationLimiter, OutputStage
 from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, ControlMeasurement,
-                         ControlOutput, Controller, Measurement, Startup, UniteType,
-                         default_wiring, make_controller)
+                         ControlOutput, Controller, Measurement, ScalarControlOutput,
+                         ScalarController, Startup, UniteType, default_wiring,
+                         make_controller, make_scalar_controller)
 
 __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter", "SignalType", "ConfigError",
-           "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO", "OutputVoltageLoop", "InductorCurrentLoop",
+           "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO",
+           "CapacitorVoltageControl", "InductorCurrentControl",
            "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER", "PQ",
            "LOOP_TYPES", "register_loop_type", "ControlInterface", "CONTROL_INTERFACE",
            "ControlGraph", "default_wiring",
            "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
-           "Controller", "Startup", "UniteType", "make_controller"]
+           "ScalarControlOutput", "Controller", "Startup", "UniteType", "ScalarController",
+           "make_controller", "make_scalar_controller"]

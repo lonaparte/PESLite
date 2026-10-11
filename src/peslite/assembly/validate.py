@@ -129,7 +129,7 @@ def _control(c, dclink, pwm, where: str, continuous: bool = False) -> None:
                 raise ConfigError(f"{where}.loops.{name}.{key} must be finite")
             if is_dataclass(value) and hasattr(value, "enable"):
                 _switched(value, f"{where}.loops.{name}.{key}")
-        if cfg.type == "matching" and dclink.capacitor is None:
+        if cfg.type == "matching" and (dclink is None or dclink.capacitor is None):
             raise ConfigError(f"{where}: matching control needs dclink.capacitor")
         if cfg.type == "matching" and cfg.k_theta_pu is None and c.references.vdc_ref_pu <= 0:
             raise ConfigError(f"{where}.references.vdc_ref_pu must be positive for automatic matching gain")
@@ -194,12 +194,44 @@ def _unit(u, base, where: str) -> None:
                           f"got {protection.rocof.window}")
 
 
+def _dc_unit(u, base, where: str) -> None:
+    """Check one scalar converter unit."""
+    if u.s_base is not None and (not math.isfinite(u.s_base) or u.s_base <= 0.0):
+        raise ConfigError(f"{where}.s_base must be finite and positive, got {u.s_base}")
+    for name in ("source_voltage", "inductance", "capacitance", "load_resistance"):
+        value = getattr(u, name)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ConfigError(f"{where}.{name} must be finite and positive, got {value}")
+    if not math.isfinite(u.series_resistance) or u.series_resistance < 0.0:
+        raise ConfigError(
+            f"{where}.series_resistance must be finite and nonnegative, got {u.series_resistance}"
+        )
+    if not math.isfinite(u.ctrl.references.voltage) or u.ctrl.references.voltage <= 0.0:
+        raise ConfigError(f"{where}.ctrl.references.voltage must be finite and positive")
+    continuous = u.bridge.model == "averaging"
+    _pwm(u.pwm, base, f"{where}.pwm", continuous)
+    if u.pwm.sync != "asynchronous":
+        raise ConfigError(f"{where}.pwm.sync: scalar converters require asynchronous PWM")
+    _timing(u.ctrl, u.pwm, f"{where}.ctrl", continuous)
+    _control(u.ctrl, None, u.pwm, f"{where}.ctrl", continuous)
+    for name, loop in u.ctrl.loops.items():
+        if hasattr(loop, "minimum") and loop.minimum > loop.maximum:
+            raise ConfigError(
+                f"{where}.ctrl.loops.{name}.minimum must not exceed maximum"
+            )
+        if loop.type == "inductor_current_control" and loop.topology != u.topology:
+            raise ConfigError(
+                f"{where}.ctrl.loops.{name}.topology must match unit topology {u.topology!r}"
+            )
+
+
 def _network(p: Params) -> None:
     """Check element identities, network values and bus references."""
-    if not p.buses:
-        raise ConfigError("buses: a system needs at least one bus")
     if not p.units:
         raise ConfigError("units: a system needs at least one converter")
+    ac_units = {name: unit for name, unit in p.units.items() if not hasattr(unit, "topology")}
+    if (ac_units or p.branches or p.sources or p.elements) and not p.buses:
+        raise ConfigError("buses: an AC network needs at least one bus")
     seen: dict[str, str] = {}
     for kind in NAMED:
         for name in getattr(p, kind):
@@ -229,7 +261,7 @@ def _network(p: Params) -> None:
             raise ConfigError(f"sources.{name}.angle must be finite")
         if src.l <= 0.0:
             raise ConfigError(f"sources.{name}.l must be > 0: a source is an emf behind an impedance")
-    for name, u in p.units.items():
+    for name, u in ac_units.items():
         _bus_of(f"units.{name}.bus", u.bus)
     for name, element in p.elements.items():
         for key, bus in element_buses(element).items():
@@ -303,6 +335,8 @@ def _initial(p: Params) -> None:
     if t0 < 0.0:
         raise ConfigError("simulation.initial.t must be >= 0")
     for name, u in p.units.items():
+        if hasattr(u, "topology"):
+            continue
         if u.bridge.model == "averaging":
             continue
         m, T_c = u.meas, _period(u.ctrl, u.pwm)
@@ -341,7 +375,8 @@ def validate(p: Params) -> Params:
     """Check a :class:`Params` tree and return it unchanged; raise ConfigError if invalid."""
     _network(p)
     for name, unit in p.units.items():
-        _unit(unit, p.base, f"units.{name}")
+        check = _dc_unit if hasattr(unit, "topology") else _unit
+        check(unit, p.base, f"units.{name}")
     _solver(p.simulation.solver)
     _events(p)
     _progress(p.simulation.progress)

@@ -9,21 +9,24 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Any, ContextManager, Mapping, Optional, Protocol
+from typing import Any, ClassVar, ContextManager, Mapping, Optional, Protocol
 
 import numpy as np
 
 from ..components.adc import ADC, MeasurementPorts
-from ..components.converter import make_bridge, make_dclink
+from ..components.converter import HalfBridge, make_bridge, make_dclink
 from ..components.network import RLBranch, Terminal
 from ..components.pwm import TIME_EPS, Modulator
 from ..control.blocks import phases
-from ..control.controller import Controller, Measurement, make_controller
+from ..control.controller import (Controller, Measurement, ScalarController,
+                                  make_controller, make_scalar_controller)
+from ..solver.energy import StoragePort
+from ..solver.model import Bag, OutputStage
 from .events import Scenario
-from .params import SimulationParams, UnitParams
+from .params import DCUnitParams, SimulationParams, UnitParams
 from .protection import Protection
 
-__all__ = ["Plant", "Unit"]
+__all__ = ["Plant", "Unit", "DCUnit"]
 
 
 class Plant(Protocol):
@@ -448,3 +451,321 @@ class Unit:
         ports = self.ports
         return {f"{self.name}.i_c": ports.i_c(), f"{self.name}.u_g": ports.u_g(),
                 f"{self.name}.u_dc": ports.u_dc(), f"{self.name}.i_dc": ports.i_dc()}
+
+
+class _DCPlantState(Bag):
+    __slots__ = ("i_L", "u_o")
+
+
+class _DCPlantInp:
+    __slots__ = ("_q",)
+
+    def __init__(self, q: float = 0.0) -> None:
+        self.q = q
+
+    @property
+    def q(self) -> float:
+        return self._q
+
+    @q.setter
+    def q(self, value) -> None:
+        self._q = float(value.real if isinstance(value, complex) else value)
+
+
+class _DCPlantOut(Bag):
+    __slots__ = ("i_L", "u_o", "v_in", "i_in")
+
+
+class _DCPlant:
+    """The energy-storage network around one scalar bridge topology."""
+
+    state_names: ClassVar[tuple[str, ...]] = ("i_L", "u_o")
+    outputs_need_inputs: ClassVar[bool] = True
+    output_stages: ClassVar[tuple[OutputStage, ...]] = (
+        OutputStage("set_measurements", inputs=(), outputs=("i_L", "u_o", "v_in")),
+        OutputStage("set_input_current", inputs=("q",), outputs=("i_in",)),
+    )
+    ports: ClassVar[tuple] = ()
+    has_source: ClassVar[bool] = True
+
+    def __init__(self, cfg: DCUnitParams) -> None:
+        self.topology = cfg.topology
+        self.v_in = cfg.source_voltage
+        self.L = cfg.inductance
+        self.C = cfg.capacitance
+        self.R_load = cfg.load_resistance
+        self.R_series = cfg.series_resistance
+        self.state = _DCPlantState(i_L=0.0, u_o=0.0)
+        self.inp = _DCPlantInp(q=0.0)
+        self.out = _DCPlantOut(v_in=self.v_in)
+        self.storage = (
+            StoragePort("i_L", self.L, kind="inductor"),
+            StoragePort("u_o", self.C, kind="capacitor"),
+        )
+        self.enabled = False
+        self._active_rhs = {
+            "buck": self._buck_rhs,
+            "boost": self._boost_rhs,
+            "buck_boost": self._buck_boost_rhs,
+        }[cfg.topology]
+        self._active_input_current = {
+            "buck": self._switched_input_current,
+            "boost": self._direct_input_current,
+            "buck_boost": self._switched_input_current,
+        }[cfg.topology]
+        self.rhs = self._disabled_rhs
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self.rhs = self._active_rhs if self.enabled else self._disabled_rhs
+
+    def set_measurements(self, t: float) -> None:
+        self.out.i_L = self.state.i_L
+        self.out.u_o = self.state.u_o
+        self.out.v_in = self.v_in
+
+    def set_input_current(self, t: float) -> None:
+        self.out.i_in = self._active_input_current() if self.enabled else 0.0
+
+    def set_outputs(self, t: float) -> None:
+        self.set_measurements(t)
+        self.set_input_current(t)
+
+    def _switched_input_current(self) -> float:
+        return self.inp.q * self.state.i_L
+
+    def _direct_input_current(self) -> float:
+        return self.state.i_L
+
+    def _disabled_rhs(self, t: float):
+        current, voltage = self.state.i_L, self.state.u_o
+        return (-self.R_series * current / self.L,
+                -voltage / (self.R_load * self.C))
+
+    def _buck_rhs(self, t: float):
+        current, voltage, duty = self.state.i_L, self.state.u_o, self.inp.q
+        return ((duty * self.v_in - voltage - self.R_series * current) / self.L,
+                (current - voltage / self.R_load) / self.C)
+
+    def _boost_rhs(self, t: float):
+        current, voltage, duty = self.state.i_L, self.state.u_o, self.inp.q
+        off = 1.0 - duty
+        return ((self.v_in - off * voltage - self.R_series * current) / self.L,
+                (off * current - voltage / self.R_load) / self.C)
+
+    def _buck_boost_rhs(self, t: float):
+        current, voltage, duty = self.state.i_L, self.state.u_o, self.inp.q
+        off = 1.0 - duty
+        return ((duty * self.v_in + off * voltage - self.R_series * current) / self.L,
+                (-off * current - voltage / self.R_load) / self.C)
+
+    def dissipated_power(self) -> float:
+        current, voltage = self.state.i_L, self.state.u_o
+        return self.R_series * current * current + voltage * voltage / self.R_load
+
+    def supplied_power(self) -> float:
+        return self.v_in * self.out.i_in
+
+
+class _DCMeasurement(Bag):
+    __slots__ = ("current", "voltage", "vin")
+
+
+class DCUnit:
+    """Buck, Boost or Buck-Boost unit assembled around a half bridge.
+
+    The bridge owns switching/PWM timing, the plant owns the topology's storage equations, and
+    :class:`ScalarController` adapts the shared control graph to scalar measurements.
+    """
+
+    def __init__(self, name: str, cfg: DCUnitParams, sim: SimulationParams,
+                 ctrl: Optional[ScalarController] = None,
+                 modulator: Optional[Modulator] = None) -> None:
+        self.name = name
+        self.cfg = cfg
+        self.scenario = Scenario(cfg.events)
+        self.plant = _DCPlant(cfg)
+        self.bridge = make_bridge(cfg, sim, modulator, topology=HalfBridge())
+        self.continuous = bool(getattr(self.bridge, "continuous", False))
+        self.ctrl = ctrl if ctrl is not None else make_scalar_controller(cfg)
+        if bool(getattr(self.ctrl, "continuous", False)) != self.continuous:
+            raise TypeError(
+                f"{name}: the controller and bridge must both be sampled or both be continuous"
+            )
+        self.bridge.reset(np.zeros(1), on=False)
+        self.zoh = f"{name}.q"
+        self.adc = None
+        self.windowed = self._oversamples = False
+        self.breaker = True
+        self.gates = False
+        self._tripped = False
+        self._trip_cause: Optional[str] = None
+        self._write_due: Optional[tuple[float, Any]] = None
+        self._initially_connected = False
+        self._max_current = 0.0
+
+    def subsystems(self) -> dict[str, Any]:
+        parts = {f"{self.name}.plant": self.plant}
+        if self.continuous:
+            parts[f"{self.name}.ctrl"] = self.ctrl
+        return parts
+
+    def connections(self) -> dict:
+        if not self.continuous:
+            return {}
+        return {
+            (self.ctrl, "current"): (self.plant, "i_L"),
+            (self.ctrl, "voltage"): (self.plant, "u_o"),
+            (self.ctrl, "vin"): (self.plant, "v_in"),
+            (self.plant, "q"): (self.ctrl, "q"),
+        }
+
+    def zoh_connections(self) -> dict:
+        return {} if self.continuous else {(self.plant, "q"): self.zoh}
+
+    @staticmethod
+    def terminals() -> tuple:
+        return ()
+
+    def aliases(self) -> dict[str, str]:
+        return {
+            f"{self.name}.i_L": f"{self.name}.plant.i_L",
+            f"{self.name}.u_o": f"{self.name}.plant.u_o",
+        }
+
+    def state_parts(self) -> list[tuple[str, Any]]:
+        return [
+            (self.name, self),
+            (f"{self.name}.ctrl", self.ctrl),
+            (f"{self.name}.{self.bridge.state_prefix}", self.bridge.state_owner),
+        ]
+
+    @property
+    def periods(self) -> list[float]:
+        if self.continuous:
+            return []
+        return [*self.bridge.event_periods,
+                *(period for period in self.ctrl.periods.values() if period)]
+
+    @property
+    def tripped(self) -> bool:
+        return self._tripped
+
+    @property
+    def blocked(self) -> bool:
+        return self.breaker and not self.gates and not self.tripped
+
+    def get_state(self) -> dict[str, Any]:
+        return {"tripped": self.tripped}
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        if "tripped" in values:
+            self._tripped = bool(values["tripped"])
+
+    def _set_gates(self, on: bool) -> None:
+        self.gates = bool(on) and self.breaker and not self.tripped
+        self.plant.set_enabled(self.gates)
+
+    def connect(self, on: bool, t: float, ramp: float = 0.0) -> None:
+        effective = bool(on) and not self.tripped
+        self.breaker = effective
+        if self.continuous:
+            self.ctrl.command_at(effective, ramp, t)
+            self.bridge.enabled = effective
+            self._set_gates(effective)
+        else:
+            self.ctrl.command(effective, ramp)
+            self._set_gates(effective and self.bridge.on)
+
+    def retune(self, cfg: DCUnitParams, paths: list[str], t: float) -> None:
+        self.cfg = cfg
+        self.ctrl.retune(cfg, paths, t)
+
+    def trip(self, t: float, cause: str, plant: Optional[Plant] = None,
+             detail: str = "") -> None:
+        if plant is not None:
+            with plant.change():
+                self.trip(t, cause, detail=detail)
+            return
+        self._tripped = True
+        self._trip_cause = cause
+        self.breaker = False
+        self.ctrl.command_at(False, 0.0, t) if self.continuous else self.ctrl.command(False)
+        self._set_gates(False)
+
+    def start(self, t: float) -> None:
+        self._initially_connected, since, ramp = self.scenario.at(t)
+        if self.continuous:
+            start = since if self._initially_connected and math.isfinite(since) else t
+            self.ctrl.command_at(
+                self._initially_connected,
+                ramp if self._initially_connected else 0.0,
+                start,
+                reset=False,
+            )
+        else:
+            self.ctrl.command(
+                self._initially_connected,
+                ramp if self._initially_connected else 0.0,
+            )
+
+    def states_loaded(self) -> None:
+        if self.continuous:
+            self.bridge.enabled = self.ctrl.startup.active and not self.tripped
+        self.breaker = self._initially_connected and not self.tripped
+        self._set_gates(self.bridge.on if not self.continuous else self.bridge.enabled)
+
+    def begin(self, t: float, plant: Plant, continued: bool, window_given: bool) -> None:
+        if self.continuous:
+            self.ctrl.startup.at(t)
+            self.bridge.enabled = self.ctrl.startup.active and self.breaker
+            self._set_gates(self.bridge.enabled)
+            return
+        plant.hold(self.zoh, self.bridge.start(t, (None, None), continued))
+
+    def next_time(self) -> float:
+        return math.inf if self.continuous else self.bridge.next_time()
+
+    def protect(self, t: float, plant: Plant) -> bool:
+        self._max_current = max(self._max_current, abs(self.plant.state.i_L))
+        return False
+
+    def sense(self, t: float, plant: Plant) -> Optional[tuple[int, Any]]:
+        if self.continuous or not self.bridge.control_due(t):
+            return None
+        plant.outputs(t)
+        out = self.plant.out
+        measurement = _DCMeasurement(current=out.i_L, voltage=out.u_o, vin=out.v_in)
+        result = self.ctrl(t, measurement)
+        self._write_due = (t, result)
+        return self.bridge.control_index, result
+
+    def actuate(self, t: float, plant: Plant) -> bool:
+        if self.continuous:
+            return False
+        changes = self.bridge.actuate(t, self._write_due, self.breaker and not self.tripped)
+        enabled = self.bridge.on and self.breaker and not self.tripped
+        if enabled != self.gates:
+            with plant.change():
+                self._set_gates(enabled)
+        for value in changes:
+            plant.hold(self.zoh, value)
+        self._write_due = None
+        return False
+
+    def summary(self) -> dict[str, Any]:
+        seen = dict(self.ctrl.summary())
+        seen.update({
+            "max_current_pu": self._max_current / self.cfg.dc_base.i,
+            "trip_cause": self._trip_cause,
+        })
+        return seen
+
+    def signals(self) -> dict[str, float]:
+        out = self.plant.out
+        return {
+            f"{self.name}.i_L": out.i_L,
+            f"{self.name}.u_o": out.u_o,
+            f"{self.name}.v_in": out.v_in,
+            f"{self.name}.i_in": out.i_in,
+        }

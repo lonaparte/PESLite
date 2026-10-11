@@ -1,6 +1,6 @@
 # Examples
 
-PESLite ships eight simulation files with the Python wheel. They can be run by name from any
+PESLite ships nine simulation files with the Python wheel. They can be run by name from any
 directory, so cloning the repository is not required.
 
 ```bash
@@ -19,6 +19,7 @@ peslite case.pes
 
 | Name | System and control purpose |
 |---|---|
+| `buck-example` | A closed-loop 48 V to 24 V Buck unit assembled from a half bridge, an L-C output network and the shared scalar control graph. |
 | `cable-gfl-example` | A grid-following converter connected to the grid through the distributed R-L/G-C model registered under `addons/components`. |
 | `custom-pll-example` | Grid-following control assembled from built-in current/DC-voltage loops and an automatically discovered voltage-adaptive PLL under `addons/control`. |
 | `gfl-example` | One grid-following converter with PLL, dc-voltage control, current control and unit protection. This is the most extensively annotated configuration. |
@@ -46,6 +47,8 @@ The default output directories receive a mode suffix, so these runs do not overw
 They represent different model fidelity and timing semantics; compare quantities in their common
 bandwidth rather than expecting identical switching-scale waveforms. See
 [Converter and Bridge Models](Converter-and-Bridge-Models.md).
+
+The scalar `buck-example` supports the same three bridge-model flags.
 
 ## Short exploratory runs
 

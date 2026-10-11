@@ -12,11 +12,11 @@ from peslite.control import (
     LOOP_TYPES,
     SI_CURRENT,
     SI_VOLTAGE,
+    CapacitorVoltageControl,
     ControlGraph,
     ControlInterface,
-    InductorCurrentLoop,
+    InductorCurrentControl,
     OutputLimit,
-    OutputVoltageLoop,
     PI,
 )
 
@@ -29,14 +29,14 @@ class _References:
 def _graph(topology="buck", *, continuous=False, blocked_bridge=False):
     period = 0.0001
     loops = {
-        "voltage": OutputVoltageLoop.Params(
+        "voltage": CapacitorVoltageControl.Params(
             kp=0.18,
             ki=35.0,
             minimum=0.0,
             maximum=18.0,
             period=period,
         ),
-        "current": InductorCurrentLoop.Params(
+        "current": InductorCurrentControl.Params(
             kp=0.025,
             ki=5.0,
             minimum=0.0,
@@ -88,9 +88,9 @@ def test_scalar_control_uses_the_shared_control_package():
     control = Path(peslite.control.__file__).parent
 
     assert not (control / "dc.py").exists()
-    assert OutputVoltageLoop.__module__ == "peslite.control.loops"
-    assert InductorCurrentLoop.__module__ == "peslite.control.loops"
-    assert {"output_voltage_pi", "inductor_current_pi"} <= set(LOOP_TYPES)
+    assert CapacitorVoltageControl.__module__ == "peslite.control.loops"
+    assert InductorCurrentControl.__module__ == "peslite.control.loops"
+    assert {"capacitor_voltage_control", "inductor_current_control"} <= set(LOOP_TYPES)
 
 
 def test_scalar_control_graph_has_typed_si_ports_and_bounded_output():
@@ -120,7 +120,7 @@ def test_scalar_control_graph_runs_the_same_loops_continuously():
     ("buck_boost", False, 0.2),
     ("full_bridge", True, 0.625),
 ])
-def test_inductor_loop_feedforward_is_owned_by_the_loop(
+def test_dc_current_loop_feedforward_is_owned_by_the_loop(
         topology, blocked, expected):
     graph = _graph(topology, blocked_bridge=blocked)
 

@@ -37,7 +37,8 @@ __all__ = [
     "ACFilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams",
     "MeasurementParams", "ReferenceParams", "ControlParams", "OvercurrentParams", "VoltageLimitParams",
     "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
-    "BridgeParams", "UnitParams", "RUNTIME", "Change", "runtime_changeable", "set_changes",
+    "BridgeParams", "UnitParams", "DCReferenceParams", "DCControlParams", "DCUnitParams",
+    "RUNTIME", "Change", "runtime_changeable", "set_changes",
     "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "ProgressParams",
     "MetaParams", "Params",
 ]
@@ -516,6 +517,99 @@ class UnitParams:
         return self.base.dc(self.dclink.vdc_ref)
 
 
+@dataclass(frozen=True)
+class DCReferenceParams:
+    """Scalar converter output-voltage reference in volts."""
+
+    voltage: float
+
+
+@dataclass(frozen=True, kw_only=True)
+class DCControlParams:
+    """Cascaded scalar control assembled from registered control loops."""
+
+    loops: dict[str, Any] = field(metadata={"entries": "loop"})
+    references: DCReferenceParams
+    type: str = "dc"
+    period: Optional[float] = None
+    computation: Optional[float] = None
+    connections: dict = field(default_factory=dict)
+    outputs: dict = field(default_factory=dict)
+
+    _choices = {"type": ("dc",)}
+
+
+@dataclass(frozen=True, kw_only=True)
+class DCUnitParams:
+    """One scalar DC converter unit, including its circuit and controller.
+
+    ``topology`` selects the unit-level circuit assembled around a half bridge. Electrical plant
+    values are SI. The unit uses the same bridge simulation forms and solver as an AC unit.
+    """
+
+    topology: str
+    source_voltage: float
+    inductance: float
+    capacitance: float
+    load_resistance: float
+    pwm: PWMParams
+    ctrl: DCControlParams
+    bridge: BridgeParams = field(default_factory=BridgeParams)
+    series_resistance: float = 0.0
+    s_base: Optional[float] = None
+    base: BaseValues = field(init=False, default=None)
+    derived_defaults: frozenset = field(init=False, default=frozenset(), compare=False)
+    events: tuple = field(init=False, default=(), compare=False)
+
+    _choices = {"topology": ("buck", "boost", "buck_boost")}
+
+    @staticmethod
+    def _bases(data: dict, base: BaseValues, where: str) -> tuple[BaseValues, dict[str, float]]:
+        if data.get("s_base") is not None:
+            base = _build(
+                BaseValues,
+                {"s_base": data["s_base"], "v_ll_rms": base.v_ll_rms, "f0": base.f0},
+                where,
+                None,
+                None,
+            )
+        voltage = _numeric_string(data.get("source_voltage"))
+        if (isinstance(voltage, bool) or not isinstance(voltage, (int, float))
+                or not math.isfinite(voltage) or voltage <= 0.0):
+            raise ConfigError(f"{where}.source_voltage must be finite and positive")
+        return base, base.parameter_scales(float(voltage))
+
+    def resolved(self, system_base: BaseValues, events: tuple = ()) -> "DCUnitParams":
+        """Resolve sampled timing and the unit base without changing the selected circuit."""
+        derived = set()
+        ctrl = self.ctrl
+        continuous = self.bridge.model == "averaging"
+        if not continuous and ctrl.period is None:
+            ctrl = replace(ctrl, period=self.pwm.switching_period)
+            derived.add("ctrl.period")
+        if not continuous and ctrl.computation is None:
+            ctrl = replace(ctrl, computation=1.0e-6)
+            derived.add("ctrl.computation")
+        loops = dict(ctrl.loops)
+        for name, loop in loops.items():
+            if not continuous and loop.period is None:
+                loops[name] = replace(loop, period=ctrl.period)
+                derived.add(f"ctrl.loops.{name}.period")
+        unit = replace(self, ctrl=replace(ctrl, loops=loops))
+        base = system_base if self.s_base is None else BaseValues(
+            self.s_base, system_base.v_ll_rms, system_base.f0,
+        )
+        object.__setattr__(unit, "base", base)
+        object.__setattr__(unit, "derived_defaults", frozenset(derived))
+        object.__setattr__(unit, "events", tuple(events))
+        return unit
+
+    @property
+    def dc_base(self) -> DCBase:
+        """Use the input source as the scalar unit's DC voltage base."""
+        return self.base.dc(self.source_voltage)
+
+
 # ------------------------------------------------------------------ the run
 
 @dataclass(frozen=True)
@@ -616,7 +710,7 @@ class Params:
 
     base: BaseValues  # system base, used for network pu inputs
     buses: dict[str, BusParams]
-    units: dict[str, UnitParams]
+    units: dict[str, UnitParams] = field(metadata={"entries": "unit"})
     simulation: SimulationParams
     sources: dict[str, SourceParams] = field(default_factory=dict)
     branches: dict[str, BranchParams] = field(default_factory=dict)
@@ -785,6 +879,19 @@ _TYPED = {
 }
 
 
+def _unit_params_class(data: Any, path: str) -> type:
+    """Select an AC or scalar unit schema from one entry in ``units``."""
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path}: expected a mapping, got {type(data).__name__}")
+    if "topology" not in data:
+        return UnitParams
+    topology = data.get("topology")
+    choices = DCUnitParams._choices["topology"]
+    if topology not in choices:
+        raise ConfigError(f"{path}.topology: {topology!r} not in {choices}")
+    return DCUnitParams
+
+
 def _typed_class(what: str, data: Any, path: str) -> type:
     registry, hint = _TYPED[what]
     kind = data.get("type") if isinstance(data, dict) else None
@@ -799,7 +906,10 @@ def _target_scales(event: Any, parent: dict, base: Any) -> Optional[dict]:
     units = parent.get("units")
     if not isinstance(target, str) or not isinstance(units, dict) or not isinstance(units.get(target), dict):
         return None
-    return UnitParams._bases(units[target], base, f"units.{target}")[1]
+    unit = units[target]
+    return _unit_params_class(unit, f"units.{target}")._bases(
+        unit, base, f"units.{target}",
+    )[1]
 
 
 def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dict], parent: dict) -> dict:
@@ -815,7 +925,9 @@ def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dic
         if not name or "." in name:
             raise ConfigError(f"{path}: {name!r} is not a usable name (non-empty, no '.')")
         where = f"{path}.{name}"
-        if item_cls in _TYPED:
+        if item_cls == "unit":
+            out[name] = _build(_unit_params_class(item, where), item, where, base, scales)
+        elif item_cls in _TYPED:
             if is_dataclass(item):
                 item = to_dict(item)
             here = (_target_scales(item, parent, base) if item_cls == "event" else None) or scales
@@ -1111,11 +1223,12 @@ def _written_out(p: Params) -> dict:
         unit = d["units"][name]
         if unit["s_base"] is None:
             unit["s_base"] = u.base.s_base
-        meas = unit["meas"]
-        if meas["period"] is None:
-            meas["period"] = u.ctrl.period
-        if meas["window"] is None and meas["average"]:
-            meas["window"] = u.ctrl.period
+        if "meas" in unit:
+            meas = unit["meas"]
+            if meas["period"] is None:
+                meas["period"] = u.ctrl.period
+            if meas["window"] is None and meas["average"]:
+                meas["window"] = u.ctrl.period
     for name, source in d["sources"].items():
         if source["f"] is None:
             source["f"] = p.base.f0

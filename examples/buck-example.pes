@@ -1,0 +1,56 @@
+# Closed-loop Buck converter assembled from a half bridge, an L-C output network and shared
+# scalar control loops. Plant and controller electrical values are SI.
+
+base:
+  s_base: 500.0
+  v_ll_rms: 230.0
+  f0: 50.0
+
+# A scalar DC-only system has no AC buses.
+buses: {}
+
+units:
+  converter:
+    topology: buck
+    source_voltage: 48.0
+    inductance: 1.0e-3
+    capacitance: 470.0e-6
+    load_resistance: 6.0
+    series_resistance: 0.05
+
+    pwm:
+      f_sw: 20000.0
+
+    # bridge: {model: pwm_averaging}  # pwm_averaging | averaging | switching
+
+    ctrl:
+      loops:
+        voltage:
+          type: capacitor_voltage_control
+          kp: 0.3
+          ki: 80.0
+          minimum: 0.0
+          maximum: 15.0
+        current:
+          type: inductor_current_control
+          topology: buck
+          kp: 0.03
+          ki: 30.0
+          minimum: 0.02
+          maximum: 0.95
+      references:
+        voltage: 24.0
+
+simulation:
+  t_end: 0.03
+  solver:
+    dt: 2.5e-6
+    linearisations: 0
+  output:
+    period: 100.0e-6
+    record_every: 2
+    signals: 1
+
+meta:
+  title: Buck converter
+  description: A closed-loop 48 V to 24 V Buck converter using a half bridge.

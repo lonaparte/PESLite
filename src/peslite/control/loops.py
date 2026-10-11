@@ -24,7 +24,8 @@ __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "CurrentLimitParams",
            "SRFPLL", "CurrentLoop", "DCVoltageLoop", "PowerLoop", "SyncLaw", "PSC", "Droop", "VSG", "DVOC",
            "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping", "UnitDelay",
-           "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO", "OutputVoltageLoop", "InductorCurrentLoop"]
+           "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO",
+           "CapacitorVoltageControl", "InductorCurrentControl"]
 
 
 # ------------------------------------------------------------------ signals
@@ -1205,14 +1206,14 @@ class _LimitedScalarPI(Loop):
 
 
 @register_loop_type
-class OutputVoltageLoop(_LimitedScalarPI):
+class CapacitorVoltageControl(_LimitedScalarPI):
     """Output-voltage PI in V/A; positive current charges the output capacitor."""
 
     @dataclass(frozen=True, kw_only=True)
     class Params(_ScalarPIParams):
-        type: str = "output_voltage_pi"
+        type: str = "capacitor_voltage_control"
 
-    type = "output_voltage_pi"
+    type = "capacitor_voltage_control"
     inputs = {"reference": SI_VOLTAGE, "voltage": SI_VOLTAGE}
     outputs = {"current_reference": SI_CURRENT, "requested_current": SI_CURRENT}
     flow_inputs = ("reference", "voltage")
@@ -1223,16 +1224,16 @@ class OutputVoltageLoop(_LimitedScalarPI):
 
 
 @register_loop_type
-class InductorCurrentLoop(_LimitedScalarPI):
+class InductorCurrentControl(_LimitedScalarPI):
     """Inductor-current PI with topology-specific steady-state feedforward."""
 
     @dataclass(frozen=True, kw_only=True)
     class Params(_ScalarPIParams):
         topology: str
         blocked_bridge: bool = False
-        type: str = "inductor_current_pi"
+        type: str = "inductor_current_control"
 
-    type = "inductor_current_pi"
+    type = "inductor_current_control"
     inputs = {"reference": SI_CURRENT, "current": SI_CURRENT,
               "voltage": SI_VOLTAGE, "vin": SI_VOLTAGE}
     outputs = {"duty": DUTY_RATIO, "requested_duty": DUTY_RATIO}
