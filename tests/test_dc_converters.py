@@ -99,6 +99,26 @@ def test_scalar_topology_must_match_the_current_controller():
         params.replace(**{"units.converter.ctrl.loops.current.topology": "boost"})
 
 
+def test_buck_boost_control_boundary_owns_voltage_magnitude():
+    unit = peslite.Simulation(_case("buck_boost")).unit()
+    unit.plant.out.i_L = 2.0
+    unit.plant.out.u_o = -24.0
+    unit.plant.out.v_in = 48.0
+
+    assert unit.control_inputs() == unit.ctrl.control_inputs(2.0, -24.0, 48.0)
+    assert unit.control_inputs()["meas.voltage"] == 24.0
+
+
+def test_scalar_log_schema_comes_from_its_public_sources():
+    ctrl = peslite.Simulation(_case("buck")).unit().ctrl
+    ctrl.set_logging(True)
+    ctrl.command(True)
+
+    output = ctrl.sample(0.0, 0.0, 12.0, 48.0)
+
+    assert tuple(output.log) == ctrl.log_names() == tuple(ctrl.log_sources())
+
+
 def test_unit_and_control_type_boundaries_are_explicit():
     params = _case("buck")
     common = {item.name for item in fields(peslite.assembly.UnitParams)}

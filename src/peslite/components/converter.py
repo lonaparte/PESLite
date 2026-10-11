@@ -322,11 +322,11 @@ class HalfBridge:
 
     @staticmethod
     def switching_state(states) -> float:
-        return float(states[0])
+        return states[0]
 
     @staticmethod
     def pwm_state(duties) -> float:
-        return min(1.0, max(0.0, float(duties[0])))
+        return min(1.0, max(0.0, duties[0]))
 
     @staticmethod
     def command_duties(output):
@@ -453,12 +453,12 @@ class FullBridge:
 
     @staticmethod
     def switching_state(states) -> float:
-        return float(states[0]) - float(states[1])
+        return states[0] - states[1]
 
     @staticmethod
     def pwm_state(duties) -> float:
-        left = min(1.0, max(0.0, float(duties[0])))
-        right = min(1.0, max(0.0, float(duties[1])))
+        left = min(1.0, max(0.0, duties[0]))
+        right = min(1.0, max(0.0, duties[1]))
         return left - right
 
     @staticmethod

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -90,6 +91,10 @@ def _compiler() -> str | None:
                  if (path := shutil.which(name)) is not None), None)
 
 
+def _summary(path: Path) -> dict:
+    return json.loads((path / "summary.json").read_text(encoding="utf-8"))
+
+
 def _quick(mode: str):
     solver = ("adaptive", "DP45") if mode == "averaging" else ("fixed", "rk4")
     return peslite.load(EXAMPLES / "gfl-example.pes").replace(**{
@@ -162,9 +167,61 @@ def test_generated_cpp_runs_all_bridge_modes(mode, tmp_path):
 
     expected, actual = final(python_out / "states.csv"), final(cpp_out / "states.csv")
     assert actual.keys() == expected.keys()
+    assert _summary(cpp_out).keys() == _summary(python_out).keys()
     scale = max(1.0, max(abs(value) for value in expected.values()))
     tolerance = 2e-5 if mode == "averaging" else 2e-8
     assert max(abs(actual[key] - expected[key]) for key in expected) <= tolerance * scale
+
+
+@pytest.mark.parametrize("topology,source,reference,load", (
+    ("buck", 48.0, 24.0, 6.0),
+    ("boost", 24.0, 48.0, 12.0),
+    ("buck_boost", 24.0, 24.0, 6.0),
+))
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
+def test_generated_cpp_uses_public_ports_for_scalar_converters(
+        topology, source, reference, load, mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    changes = {
+        "units.converter.topology": topology,
+        "units.converter.source_voltage": source,
+        "units.converter.load_resistance": load,
+        "units.converter.bridge.model": mode,
+        "units.converter.ctrl.loops.current.topology": topology,
+        "units.converter.ctrl.references.voltage": reference,
+        "simulation.t_end": 0.004,
+        "simulation.output.states": True,
+        "simulation.output.signals": True,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    }
+    if mode == "averaging":
+        changes.update({
+            "simulation.solver.type": "adaptive",
+            "simulation.solver.method": "DP45",
+            "simulation.solver.max_step": 1e-4,
+        })
+    params = peslite.load(EXAMPLES / "buck-example.pes").replace(**changes)
+    project = tmp_path / f"{topology}-{mode}"
+    peslite.export(params, "cpp", project, name=project.name)
+    executable = project / "peslite"
+    subprocess.run([compiler, "-O3", "-DNDEBUG", "-std=c++17",
+                    str(project / "peslite.cpp"), "-o", str(executable)], check=True)
+    cpp_out, python_out = project / "cpp-output", project / "python-output"
+    subprocess.run([str(executable), str(cpp_out)], check=True)
+    peslite.Simulation(params).run(out_dir=python_out)
+
+    def final(path: Path) -> dict[str, float]:
+        with path.open(newline="", encoding="utf-8") as stream:
+            return {key: float(value) for key, value in list(csv.DictReader(stream))[-1].items()}
+
+    expected, actual = final(python_out / "states.csv"), final(cpp_out / "states.csv")
+    assert actual.keys() == expected.keys()
+    assert _summary(cpp_out).keys() == _summary(python_out).keys()
+    scale = max(1.0, max(abs(value) for value in expected.values()))
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * scale
 
 
 def test_generated_cpp_runs_custom_cable_equations(tmp_path):

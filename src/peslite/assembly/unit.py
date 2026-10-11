@@ -133,6 +133,22 @@ class Unit(ABC):
     @abstractmethod
     def signals(self) -> dict[str, float | complex]: ...
 
+    @abstractmethod
+    def control_inputs(self) -> dict[str, float | complex]:
+        """Return instantaneous values at the controller graph's public input ports."""
+
+    def enabled_subsystems(self) -> tuple[Any, ...]:
+        """Return subsystems whose equations are enabled and disabled with the unit gates."""
+        return ()
+
+    def control_maxima(self) -> dict[str, tuple[str, float, float]]:
+        """Map maximum-magnitude summary fields to ``(control port, scale, initial)``."""
+        return {}
+
+    @property
+    def trip_cause(self) -> Optional[str]:
+        return None
+
 
 class VSC(Unit):
     """One converter unit built from its parameter section, connected to ``bus``.
@@ -517,24 +533,22 @@ class VSC(Unit):
         return {f"{self.name}.i_c": ports.i_c(), f"{self.name}.u_g": ports.u_g(),
                 f"{self.name}.u_dc": ports.u_dc(), f"{self.name}.i_dc": ports.i_dc()}
 
+    def control_inputs(self) -> dict[str, float | complex]:
+        """Return the instantaneous per-unit inputs exposed by the control interface."""
+        ports = self.ports
+        return {
+            "meas.u_g": ports.u_g() / self.cfg.base.v_phase_peak,
+            "meas.i_c": ports.i_c() / self.cfg.base.i_phase_peak,
+            "meas.u_dc": ports.u_dc() / self.cfg.dc_base.v,
+        }
+
 
 class _DCPlantState(Bag):
     __slots__ = ("i_L", "u_o")
 
 
-class _DCPlantInp:
-    __slots__ = ("_q",)
-
-    def __init__(self, q: float = 0.0) -> None:
-        self.q = q
-
-    @property
-    def q(self) -> float:
-        return self._q
-
-    @q.setter
-    def q(self, value) -> None:
-        self._q = float(value.real if isinstance(value, complex) else value)
+class _DCPlantInp(Bag):
+    __slots__ = ("q",)
 
 
 class _DCPlantOut(Bag):
@@ -630,10 +644,6 @@ class _DCPlant:
 
     def supplied_power(self) -> float:
         return self.v_in * self.out.i_in
-
-
-class _DCMeasurement(Bag):
-    __slots__ = ("current", "voltage", "vin")
 
 
 class DCConverter(Unit):
@@ -779,8 +789,7 @@ class DCConverter(Unit):
             return None
         plant.outputs(t)
         out = self.plant.out
-        measurement = _DCMeasurement(current=out.i_L, voltage=out.u_o, vin=out.v_in)
-        result = self.ctrl(t, measurement)
+        result = self.ctrl.sample(t, out.i_L, out.u_o, out.v_in)
         self._write_due = (t, result)
         return self.bridge.control_index, result
 
@@ -813,3 +822,20 @@ class DCConverter(Unit):
             f"{self.name}.v_in": out.v_in,
             f"{self.name}.i_in": out.i_in,
         }
+
+    def control_inputs(self) -> dict[str, float]:
+        """Return the SI values exposed by the scalar control interface."""
+        out = self.plant.out
+        return self.ctrl.control_inputs(out.i_L, out.u_o, out.v_in)
+
+    def enabled_subsystems(self) -> tuple[Any, ...]:
+        return (self.plant,)
+
+    def control_maxima(self) -> dict[str, tuple[str, float, float]]:
+        return {
+            "max_current_pu": ("meas.current", self.cfg.dc_base.i, self._max_current),
+        }
+
+    @property
+    def trip_cause(self) -> Optional[str]:
+        return self._trip_cause

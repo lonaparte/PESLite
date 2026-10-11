@@ -1247,8 +1247,7 @@ class InductorCurrentControl(_LimitedScalarPI):
         if self.cfg.topology == "boost":
             return 1.0 - vin / max(voltage, vin)
         if self.cfg.topology == "buck_boost":
-            magnitude = abs(voltage)
-            return magnitude / (vin + magnitude)
+            return voltage / (vin + voltage)
         raise ConfigError(f"unknown scalar converter topology {self.cfg.topology!r}")
 
     def equation(self, reference, current, voltage, vin):

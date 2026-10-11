@@ -1414,6 +1414,15 @@ SCALAR_CONTROL_INTERFACE = ControlInterface(
     outputs=MappingProxyType({"duty": DUTY_RATIO}),
 )
 
+_SCALAR_LOG_SOURCES = MappingProxyType({
+    "current": "meas.current",
+    "voltage": "meas.voltage",
+    "voltage_reference": "references.voltage",
+    "input_voltage": "meas.vin",
+    "duty": "duty",
+    "in_service": "startup.active",
+})
+
 
 @dataclass
 class _ScalarMeasurement:
@@ -1477,13 +1486,21 @@ class ScalarController:
         if self.continuous:
             self._build_flow_state()
 
+    def control_inputs(self, current, voltage, vin) -> dict[str, Any]:
+        """Return the canonical values at the scalar control boundary."""
+        return {
+            "meas.current": current,
+            "meas.voltage": abs(voltage) if self.p.topology == "buck_boost" else voltage,
+            "meas.vin": vin,
+        }
+
     def _measurement(self, current: float, voltage: float, vin: float,
                      target: _ScalarMeasurement | None = None) -> _ScalarMeasurement:
-        measured_voltage = abs(voltage) if self.p.topology == "buck_boost" else voltage
+        values = self.control_inputs(current, voltage, vin)
         measurement = target if target is not None else _ScalarMeasurement()
-        measurement.current = float(current)
-        measurement.voltage = float(measured_voltage)
-        measurement.vin = float(vin)
+        measurement.current = float(values["meas.current"])
+        measurement.voltage = float(values["meas.voltage"])
+        measurement.vin = float(values["meas.vin"])
         return measurement
 
     def _build_flow_state(self) -> None:
@@ -1555,10 +1572,11 @@ class ScalarController:
             self._store_continuous_nodes()
         self.startup.command(run, ramp, t)
 
-    def __call__(self, t: float, meas) -> ScalarControlOutput:
+    def sample(self, t: float, current: float, voltage: float, vin: float) -> ScalarControlOutput:
+        """Evaluate one sampled control interrupt from physical plant values."""
         if self.continuous:
             raise RuntimeError("an ideal averaged scalar controller is evaluated by the ODE solver")
-        measurement = self._measurement(meas.current, meas.voltage, meas.vin)
+        measurement = self._measurement(current, voltage, vin)
         if self.startup.in_progress:
             self.startup.advance()
         self.graph.sample(t, measurement)
@@ -1572,6 +1590,9 @@ class ScalarController:
             gates=gates,
             startup_complete=self.startup.complete,
         )
+
+    def __call__(self, t: float, meas) -> ScalarControlOutput:
+        return self.sample(t, meas.current, meas.voltage, meas.vin)
 
     def set_outputs(self, t: float) -> None:
         self._sync_continuous_nodes()
@@ -1589,14 +1610,15 @@ class ScalarController:
 
     def _log(self, duty: float, active: bool) -> dict[str, float]:
         measurement = self._last_measurement
-        self.last_log = {
-            "current": measurement.current,
-            "voltage": measurement.voltage,
-            "voltage_reference": self.graph.references["voltage"],
-            "input_voltage": measurement.vin,
+        values = {
+            "meas.current": measurement.current,
+            "meas.voltage": measurement.voltage,
+            "references.voltage": self.graph.references["voltage"],
+            "meas.vin": measurement.vin,
             "duty": duty,
-            "in_service": 1.0 if active else 0.0,
+            "startup.active": 1.0 if active else 0.0,
         }
+        self.last_log = {name: values[source] for name, source in self.log_sources().items()}
         return self.last_log
 
     def continuous_log(self, t: float) -> dict[str, float] | None:
@@ -1604,7 +1626,12 @@ class ScalarController:
 
     @staticmethod
     def log_names() -> tuple[str, ...]:
-        return ("current", "voltage", "voltage_reference", "input_voltage", "duty", "in_service")
+        return tuple(_SCALAR_LOG_SOURCES)
+
+    @staticmethod
+    def log_sources() -> Mapping[str, str]:
+        """Map log columns to public control ports or controller lifecycle values."""
+        return _SCALAR_LOG_SOURCES
 
     def set_logging(self, enabled: bool) -> None:
         self.logging = bool(enabled)
