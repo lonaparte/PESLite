@@ -54,6 +54,10 @@ def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():
     )
     unit = peslite.Simulation(p).unit()
 
+    assert type(p.unit()) is peslite.assembly.UnitParams
+    assert p.unit().type == "vsc"
+    assert isinstance(unit, peslite.Unit)
+    assert isinstance(unit, peslite.VSC)
     assert isinstance(unit.adc, ADC)
     assert isinstance(unit.bridge, PWM)
     assert not hasattr(unit, "pwm")

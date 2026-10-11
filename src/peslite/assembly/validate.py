@@ -229,7 +229,7 @@ def _network(p: Params) -> None:
     """Check element identities, network values and bus references."""
     if not p.units:
         raise ConfigError("units: a system needs at least one converter")
-    ac_units = {name: unit for name, unit in p.units.items() if not hasattr(unit, "topology")}
+    ac_units = {name: unit for name, unit in p.units.items() if unit.type == "vsc"}
     if (ac_units or p.branches or p.sources or p.elements) and not p.buses:
         raise ConfigError("buses: an AC network needs at least one bus")
     seen: dict[str, str] = {}
@@ -335,7 +335,7 @@ def _initial(p: Params) -> None:
     if t0 < 0.0:
         raise ConfigError("simulation.initial.t must be >= 0")
     for name, u in p.units.items():
-        if hasattr(u, "topology"):
+        if u.type == "dc_converter":
             continue
         if u.bridge.model == "averaging":
             continue
@@ -375,7 +375,7 @@ def validate(p: Params) -> Params:
     """Check a :class:`Params` tree and return it unchanged; raise ConfigError if invalid."""
     _network(p)
     for name, unit in p.units.items():
-        check = _dc_unit if hasattr(unit, "topology") else _unit
+        check = _dc_unit if unit.type == "dc_converter" else _unit
         check(unit, p.base, f"units.{name}")
     _solver(p.simulation.solver)
     _events(p)

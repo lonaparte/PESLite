@@ -1,4 +1,6 @@
-"""Unit-level Buck, Boost and Buck-Boost simulations."""
+"""Buck, Boost and Buck-Boost DC-converter simulations."""
+
+from dataclasses import fields
 
 import numpy as np
 import pytest
@@ -24,6 +26,7 @@ def _case(topology, model="pwm_averaging", t_end=0.03):
         "base": {"s_base": 500.0, "v_ll_rms": 230.0, "f0": 50.0},
         "buses": {},
         "units": {"converter": {
+            "type": "dc_converter",
             "topology": topology,
             "source_voltage": source,
             "inductance": 1e-3,
@@ -33,6 +36,7 @@ def _case(topology, model="pwm_averaging", t_end=0.03):
             "pwm": {"f_sw": 20_000.0},
             "bridge": {"model": model},
             "ctrl": {
+                "type": "dc",
                 "loops": {
                     "voltage": {
                         "type": "capacitor_voltage_control",
@@ -66,7 +70,11 @@ def test_each_scalar_converter_is_a_closed_loop_simulation(topology):
     simulation = peslite.Simulation(_case(topology))
     unit = simulation.unit()
 
-    assert isinstance(unit, peslite.DCUnit)
+    assert type(simulation.p.unit()) is peslite.assembly.UnitParams
+    assert type(simulation.p.unit().ctrl) is peslite.assembly.ControlParams
+    assert simulation.p.unit().type == "dc_converter"
+    assert isinstance(unit, peslite.Unit)
+    assert isinstance(unit, peslite.DCConverter)
     assert isinstance(unit.bridge.topology, peslite.HalfBridge)
     assert isinstance(unit.ctrl.graph.nodes["voltage"], CapacitorVoltageControl)
     assert isinstance(unit.ctrl.graph.nodes["current"], InductorCurrentControl)
@@ -89,3 +97,17 @@ def test_scalar_topology_must_match_the_current_controller():
     params = _case("buck")
     with pytest.raises(ConfigError, match="must match unit topology"):
         params.replace(**{"units.converter.ctrl.loops.current.topology": "boost"})
+
+
+def test_unit_and_control_type_boundaries_are_explicit():
+    params = _case("buck")
+    common = {item.name for item in fields(peslite.assembly.UnitParams)}
+
+    assert {"type", "pwm", "ctrl", "bridge", "s_base"} <= common
+    assert {"topology", "source_voltage", "bus", "dclink"}.isdisjoint(common)
+    with pytest.raises(ConfigError, match="unknown key"):
+        params.replace(**{"units.converter.bus": "pcc"})
+    with pytest.raises(ConfigError, match="cannot use control type"):
+        params.replace(**{"units.converter.ctrl.type": "gfl"})
+    with pytest.raises(ConfigError, match=r"ctrl\.references: unknown key"):
+        params.replace(**{"units.converter.ctrl.references.p_ref_pu": 0.5})

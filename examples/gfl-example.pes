@@ -30,6 +30,7 @@ sources:                   # emf behind an impedance, attached to a bus
 
 units:                     # converters, one entry each
   vsc:
+    type: vsc
     bus: pcc               # terminal bus, fed through the filter branch
     # s_base: 2.0e6        # the converter's rating (default: the system base)
 

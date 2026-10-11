@@ -947,7 +947,7 @@ class UniteType:
         self.p = cfg
         self.continuous = cfg.bridge.model == "averaging"
         # A continuous controller already participates in construction-time energy probes, before
-        # Unit.start() applies its scenario. Keep its ideal source off until that command arrives.
+        # VSC.start() applies its scenario. Keep its ideal source off until that command arrives.
         self.startup = ContinuousStartup(run=False) if self.continuous else Startup(cfg.ctrl.period)
         wires, outputs = default_wiring(cfg, cfg.ctrl.type)
         self.graph = graph = ControlGraph(cfg, self.startup, wires, outputs)

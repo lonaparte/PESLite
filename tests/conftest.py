@@ -20,6 +20,7 @@ CASE = {
     "buses": {"pcc": {"c_pu": 0.02, "r_d_pu": 0.5}},
     "sources": {"grid": {"bus": "pcc", "x_pu": 0.4, "r_pu": 0.04}},
     "units": {"vsc": {
+        "type": "vsc",
         "bus": "pcc",
         "ac_filter": {"l_f_pu": 0.2, "r_f_pu": 0.01},
         "dclink": {"vdc_ref": 1500.0,

@@ -14,7 +14,7 @@ from .components import (ADC, PWM, PWMBridge, ZOH, AveragingBridge, SwitchingBri
                          ThreePhaseBridge, CarrierComparison, FullBridge, HalfBridge,
                          MeasurementPorts, make_bridge,
                          make_modulator, register_element_type)
-from .assembly import (DCUnit, Params, Protection, SourceScenario, System, Unit,
+from .assembly import (DCConverter, Params, Protection, SourceScenario, System, Unit, VSC,
                        dump, dumps, load, register_event_type)
 from .solver.simulation import Simulation, SimulationResult, main
 from .assembly.exporter import ExportResult, export
@@ -27,7 +27,7 @@ __version__ = "0.3.0"
 
 __all__ = [
     "solver", "control", "components", "assembly", "addons",
-    "Params", "load", "dump", "dumps", "System", "Unit", "DCUnit", "Protection", "MeasurementPorts", "Model", "SourceScenario",
+    "Params", "load", "dump", "dumps", "System", "Unit", "VSC", "DCConverter", "Protection", "MeasurementPorts", "Model", "SourceScenario",
     "Simulation", "SimulationResult", "ExportResult", "export", "UniteType", "main", "make_controller", "make_modulator", "make_solver",
     "register_loop_type", "register_element_type", "register_event_type",
     "OutputStage", "ADC", "PWM", "SwitchingBridge", "PWMBridge", "AveragingBridge",

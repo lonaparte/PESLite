@@ -112,7 +112,7 @@ free-running angle.
 
 ## Protection clocks
 
-All protection and the trip latch belong to the converter `Unit`:
+All protection and the trip latch belong to the `VSC`:
 
 - instantaneous overcurrent protection runs at switching or held-bridge edges;
 - voltage, frequency, DC-voltage and ROCOF criteria run from controller-rate measurements;

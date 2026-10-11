@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from abc import ABC, abstractmethod
 from typing import Any, ClassVar, ContextManager, Mapping, Optional, Protocol
 
 import numpy as np
@@ -23,10 +24,10 @@ from ..control.controller import (Controller, Measurement, ScalarController,
 from ..solver.energy import StoragePort
 from ..solver.model import Bag, OutputStage
 from .events import Scenario
-from .params import DCUnitParams, SimulationParams, UnitParams
+from .params import SimulationParams, UnitParams
 from .protection import Protection
 
-__all__ = ["Plant", "Unit", "DCUnit"]
+__all__ = ["Plant", "Unit", "VSC", "DCConverter"]
 
 
 class Plant(Protocol):
@@ -39,7 +40,101 @@ class Plant(Protocol):
     def change(self) -> ContextManager[None]: ...
 
 
-class Unit:
+class Unit(ABC):
+    """Common runtime interface and lifecycle mechanics for one converter unit."""
+
+    @abstractmethod
+    def subsystems(self) -> dict[str, Any]: ...
+
+    @abstractmethod
+    def connections(self) -> dict: ...
+
+    @abstractmethod
+    def zoh_connections(self) -> dict: ...
+
+    @abstractmethod
+    def terminals(self) -> tuple: ...
+
+    @abstractmethod
+    def aliases(self) -> dict[str, str]: ...
+
+    def state_parts(self) -> list[tuple[str, Any]]:
+        """Return this unit's fixed state owners and their public prefixes."""
+        parts = [(self.name, self), (f"{self.name}.ctrl", self.ctrl),
+                 (f"{self.name}.{self.bridge.state_prefix}", self.bridge.state_owner)]
+        adc = getattr(self, "adc", None)
+        if adc is not None and adc.averaging:
+            parts.append((f"{self.name}.meas", adc))
+        return parts
+
+    @property
+    def periods(self) -> list[float]:
+        if self.continuous:
+            return []
+        return [*self.bridge.event_periods,
+                *(period for period in getattr(self.ctrl, "periods", {}).values() if period)]
+
+    @property
+    @abstractmethod
+    def tripped(self) -> bool: ...
+
+    @property
+    def blocked(self) -> bool:
+        return self.breaker and not self.gates and not self.tripped
+
+    def next_time(self) -> float:
+        if self.continuous:
+            return math.inf
+        bridge = self.bridge
+        next_ = bridge.next_time()
+        if self.windowed:
+            next_ = min(next_, self.adc.t_window(bridge.next_control_time))
+        if self._oversamples:
+            next_ = min(next_, self.adc.t_sample(bridge.previous_control_time()))
+        return next_
+
+    @abstractmethod
+    def get_state(self) -> dict[str, Any]: ...
+
+    @abstractmethod
+    def set_state(self, values: Mapping[str, Any]) -> None: ...
+
+    @abstractmethod
+    def connect(self, on: bool, t: float, ramp: float = 0.0) -> None: ...
+
+    @abstractmethod
+    def retune(self, cfg: Any, paths: list[str], t: float) -> None: ...
+
+    @abstractmethod
+    def trip(self, t: float, cause: str, plant: Optional[Plant] = None,
+             detail: str = "") -> None: ...
+
+    @abstractmethod
+    def start(self, t: float) -> None: ...
+
+    @abstractmethod
+    def states_loaded(self) -> None: ...
+
+    @abstractmethod
+    def begin(self, t: float, plant: Plant, continued: bool, window_given: bool) -> None: ...
+
+    @abstractmethod
+    def protect(self, t: float, plant: Plant) -> bool: ...
+
+    @abstractmethod
+    def sense(self, t: float, plant: Plant) -> Optional[tuple[int, Any]]: ...
+
+    @abstractmethod
+    def actuate(self, t: float, plant: Plant) -> bool: ...
+
+    @abstractmethod
+    def summary(self) -> dict[str, Any]: ...
+
+    @abstractmethod
+    def signals(self) -> dict[str, float | complex]: ...
+
+
+class VSC(Unit):
     """One converter unit built from its parameter section, connected to ``bus``.
 
     ``ctrl`` and ``modulator`` replace the parts built from the section. The unit samples with
@@ -150,21 +245,6 @@ class Unit:
             out[f"{self.name}.u_dc"] = f"{self.name}.dclink.u_C"
         return out
 
-    def state_parts(self) -> list[tuple[str, Any]]:
-        """Return this unit's fixed state owners and their public prefixes."""
-        parts = [(self.name, self), (f"{self.name}.ctrl", self.ctrl),
-                 (f"{self.name}.{self.bridge.state_prefix}", self.bridge.state_owner)]
-        if self.adc is not None and self.adc.averaging:
-            parts.append((f"{self.name}.meas", self.adc))
-        return parts
-
-    @property
-    def periods(self) -> list[float]:
-        if self.continuous:
-            return []
-        return [*self.bridge.event_periods,
-                *(period for period in getattr(self.ctrl, "periods", {}).values() if period)]
-
     # ---------------------------------------------------------------- states
     @property
     def tripped(self) -> bool:
@@ -190,10 +270,6 @@ class Unit:
             self.branch_f.close_breaker()
         else:
             self.branch_f.open_breaker()
-
-    @property
-    def blocked(self) -> bool:
-        return self.breaker and not self.gates and not self.tripped
 
     def connect(self, on: bool, t: float, ramp: float = 0.0) -> None:
         """Connect/disconnect the unit and give the controller its run/stop command."""
@@ -317,17 +393,6 @@ class Unit:
         bridge = self.bridge
         self.adc.start(t, bridge.previous_control_time(), bridge.next_control_time,
                        held=not window_given)
-
-    def next_time(self) -> float:
-        if self.continuous:
-            return math.inf
-        bridge = self.bridge
-        next_ = bridge.next_time()
-        if self.windowed:
-            next_ = min(next_, self.adc.t_window(bridge.next_control_time))
-        if self._oversamples:
-            next_ = min(next_, self.adc.t_sample(bridge.previous_control_time()))
-        return next_
 
     def protect(self, t: float, plant: Plant) -> bool:
         """Run fast protection before any controller samples at this instant."""
@@ -488,7 +553,7 @@ class _DCPlant:
     ports: ClassVar[tuple] = ()
     has_source: ClassVar[bool] = True
 
-    def __init__(self, cfg: DCUnitParams) -> None:
+    def __init__(self, cfg: UnitParams) -> None:
         self.topology = cfg.topology
         self.v_in = cfg.source_voltage
         self.L = cfg.inductance
@@ -571,14 +636,14 @@ class _DCMeasurement(Bag):
     __slots__ = ("current", "voltage", "vin")
 
 
-class DCUnit:
+class DCConverter(Unit):
     """Buck, Boost or Buck-Boost unit assembled around a half bridge.
 
     The bridge owns switching/PWM timing, the plant owns the topology's storage equations, and
     :class:`ScalarController` adapts the shared control graph to scalar measurements.
     """
 
-    def __init__(self, name: str, cfg: DCUnitParams, sim: SimulationParams,
+    def __init__(self, name: str, cfg: UnitParams, sim: SimulationParams,
                  ctrl: Optional[ScalarController] = None,
                  modulator: Optional[Modulator] = None) -> None:
         self.name = name
@@ -633,27 +698,9 @@ class DCUnit:
             f"{self.name}.u_o": f"{self.name}.plant.u_o",
         }
 
-    def state_parts(self) -> list[tuple[str, Any]]:
-        return [
-            (self.name, self),
-            (f"{self.name}.ctrl", self.ctrl),
-            (f"{self.name}.{self.bridge.state_prefix}", self.bridge.state_owner),
-        ]
-
-    @property
-    def periods(self) -> list[float]:
-        if self.continuous:
-            return []
-        return [*self.bridge.event_periods,
-                *(period for period in self.ctrl.periods.values() if period)]
-
     @property
     def tripped(self) -> bool:
         return self._tripped
-
-    @property
-    def blocked(self) -> bool:
-        return self.breaker and not self.gates and not self.tripped
 
     def get_state(self) -> dict[str, Any]:
         return {"tripped": self.tripped}
@@ -677,7 +724,7 @@ class DCUnit:
             self.ctrl.command(effective, ramp)
             self._set_gates(effective and self.bridge.on)
 
-    def retune(self, cfg: DCUnitParams, paths: list[str], t: float) -> None:
+    def retune(self, cfg: UnitParams, paths: list[str], t: float) -> None:
         self.cfg = cfg
         self.ctrl.retune(cfg, paths, t)
 
@@ -722,9 +769,6 @@ class DCUnit:
             self._set_gates(self.bridge.enabled)
             return
         plant.hold(self.zoh, self.bridge.start(t, (None, None), continued))
-
-    def next_time(self) -> float:
-        return math.inf if self.continuous else self.bridge.next_time()
 
     def protect(self, t: float, plant: Plant) -> bool:
         self._max_current = max(self._max_current, abs(self.plant.state.i_L))

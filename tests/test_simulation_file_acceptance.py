@@ -54,6 +54,8 @@ def test_bundled_examples_restate_no_defaults(name):
         except ConfigError:
             continue
         if to_dict(reduced) == reference:
+            if len(path) == 3 and path[0] == "units" and path[2] == "type":
+                continue  # keep explicit unit discriminators in published examples
             restated.append(".".join(map(str, path)))
     assert restated == []
 
@@ -62,7 +64,7 @@ def _options(cls, found=None):
     found = set() if found is None else found
     hints = get_type_hints(cls)
     for item in fields(cls):
-        if not item.init:
+        if not item.init or item.name.startswith("_"):
             continue
         found.add((cls, item.name))
         types = (hints[item.name], *get_args(hints[item.name]),
@@ -75,7 +77,8 @@ def _options(cls, found=None):
 
 def test_annotated_gfl_example_lists_every_option():
     text = (EXAMPLES / "gfl-example.pes").read_text(encoding="utf-8")
-    options = _options(Params)
+    vsc_params = type(from_dict(read_tree(EXAMPLES / "gfl-example.pes")).unit()._specific)
+    options = _options(Params) | _options(vsc_params)
     for kind in ("srf_pll", "dq_current_pi", "dc_voltage_pi"):
         options |= _options(LOOP_TYPES[kind].Params)
     for kind in ("connect", "disconnect", "set"):
@@ -92,6 +95,17 @@ def test_annotated_gfl_example_lists_every_option():
                    for spelling in spellings):
             missing.append(f"{cls.__qualname__}.{name}")
     assert sorted(missing) == []
+
+
+def test_legacy_vsc_without_unit_type_keeps_the_vsc_default():
+    tree = read_tree(EXAMPLES / "gfl-example.pes")
+    tree["units"]["vsc"].pop("type")
+
+    unit = from_dict(tree).unit("vsc")
+
+    assert type(unit) is peslite.assembly.UnitParams
+    assert type(unit.ctrl) is peslite.assembly.ControlParams
+    assert unit.type == "vsc"
 
 
 def _bus_start(params, bus, out):

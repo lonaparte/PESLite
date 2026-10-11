@@ -18,6 +18,7 @@ elements:
     sections: 2
 units:
   vsc:
+    type: vsc
     bus: pcc
     ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
     dclink:

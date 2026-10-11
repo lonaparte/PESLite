@@ -783,7 +783,7 @@ class Simulation:
                 y = settle(t_local, y)
                 mdl.set_states(y)
 
-        # The plant operations exposed to a Unit.  The run loop owns the continuous-state vector;
+        # The plant operations exposed to a converter unit. The run loop owns the continuous-state vector;
         # a unit can only request current outputs, change one held input, or make a discontinuous
         # plant change inside the context manager.
         def hold(label: str, value: Any) -> None:

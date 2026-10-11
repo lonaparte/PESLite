@@ -15,6 +15,7 @@ sources:
     r_pu: 0.04
 units:
   vsc_1:
+    type: vsc
     bus: bus1
     ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
     dclink:
@@ -31,6 +32,7 @@ units:
       references: {p_ref_pu: 0.5}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
   vsc_2:
+    type: vsc
     bus: bus2
     s_base: 1.0e6
     ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}

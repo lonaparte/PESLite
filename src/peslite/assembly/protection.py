@@ -79,7 +79,7 @@ class Protection:
         return self.trip is not None
 
     def get_state(self) -> dict[str, Any]:
-        """Return sampled-protection timer states; unit-level latches are exposed by ``Unit``."""
+        """Return sampled-protection timer states; the owning VSC exposes unit-level latches."""
         return gather(self._timers)
 
     def set_state(self, values: Mapping[str, Any]) -> None:

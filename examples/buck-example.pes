@@ -11,6 +11,7 @@ buses: {}
 
 units:
   converter:
+    type: dc_converter
     topology: buck
     source_voltage: 48.0
     inductance: 1.0e-3
@@ -24,6 +25,7 @@ units:
     # bridge: {model: pwm_averaging}  # pwm_averaging | averaging | switching
 
     ctrl:
+      type: dc
       loops:
         voltage:
           type: capacitor_voltage_control

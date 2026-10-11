@@ -1,4 +1,4 @@
-"""Issue #1: the controller is a closed sampled block; all protection belongs to Unit."""
+"""Issue #1: the controller is a closed sampled block; protection belongs to its converter unit."""
 
 import cmath
 from types import SimpleNamespace

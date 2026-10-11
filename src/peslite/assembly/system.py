@@ -12,7 +12,7 @@ from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather
 from .events import SWITCHING, SourceScenario
 from .params import Change, Params
-from .unit import DCUnit, Unit
+from .unit import DCConverter, Unit, VSC
 
 __all__ = ["System"]
 
@@ -93,12 +93,12 @@ class System:
                             if set(change.touches(f"sources.{name}.")) & {"v", "f", "angle"}],
                             p.simulation.initial.t)
                         for name, cfg in p.sources.items()}
-        self.units: dict[str, Any] = {}
+        self.units: dict[str, Unit] = {}
         for name, cfg in p.units.items():
             if name in parts:
                 built = parts[name]
-            elif hasattr(cfg, "topology"):
-                built = DCUnit(
+            elif cfg.type == "dc_converter":
+                built = DCConverter(
                     name,
                     cfg,
                     p.simulation,
@@ -106,7 +106,7 @@ class System:
                     modulator=parts.get(f"{name}.modulator"),
                 )
             else:
-                built = Unit(
+                built = VSC(
                     name,
                     cfg,
                     p.simulation,
@@ -207,10 +207,10 @@ class System:
                     raise ValueError(f"{key}: 'rated' is a converter's rated dc voltage, and "
                                      f"{head!r} is not a unit ({sorted(self.units)})")
                 cfg = self.units[head].cfg
-                return (cfg.ctrl.references.voltage if hasattr(cfg, "topology")
+                return (cfg.ctrl.references.voltage if cfg.type == "dc_converter"
                         else cfg.dclink.vdc_ref)
             if word == "source":
-                if head in self.units and hasattr(self.units[head].cfg, "topology"):
+                if head in self.units and self.units[head].cfg.type == "dc_converter":
                     return self.units[head].cfg.source_voltage
                 bus = self.units[head].cfg.bus if head in self.units else head
                 at_bus = [s.emf.out.e_g for s in self.sources.values() if s.cfg.bus == bus]

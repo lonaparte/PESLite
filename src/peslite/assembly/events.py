@@ -151,8 +151,8 @@ def connected_at(steps: list[tuple[float, bool]], t: float) -> bool:
 class Scenario:
     """Read-only connection commands for one target over absolute simulation time.
 
-    It does not advance ramps or own component state; Unit turns the selected command into physical
-    connection and controller start-up actions.
+    It does not advance ramps or own component state; the converter unit turns the selected
+    command into physical connection and controller start-up actions.
     """
 
     def __init__(self, events: Iterable[Any] = ()) -> None:

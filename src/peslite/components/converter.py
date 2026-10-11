@@ -163,8 +163,9 @@ class _SampledBridge(_BridgeModel, PWM):
                 enabled: bool) -> list[Any]:
         """Accept one sampled command and return bridge inputs which become active at ``t``.
 
-        The bridge owns the computation/load ordering.  Unit deliberately does not know whether
-        the implementation uses compare registers, a delayed averaged command or no carrier.
+        The bridge owns the computation/load ordering. The converter unit deliberately does not
+        know whether the implementation uses compare registers, a delayed averaged command or no
+        carrier.
         """
         changes: list[Any] = []
         if command is not None and self.computation == 0.0:
