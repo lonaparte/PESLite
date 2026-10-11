@@ -570,6 +570,8 @@ def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e
             model.set_zoh_input(label, value)
         for k in range(4):
             y = rng.normal(size=model.n_states) * 100.0
+            if getattr(model, "has_state_bounds", False):
+                y = model.project_states(y)
             rep = balance(model, 0.01 * (k + 1), y)
             scale = rep.scale
             for s in rep.subsystems:

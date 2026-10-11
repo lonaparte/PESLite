@@ -189,7 +189,6 @@ def test_generated_cpp_uses_public_ports_for_scalar_converters(
         "units.converter.source_voltage": source,
         "units.converter.load_resistance": load,
         "units.converter.bridge.model": mode,
-        "units.converter.ctrl.loops.current.topology": topology,
         "units.converter.ctrl.references.voltage": reference,
         "simulation.t_end": 0.004,
         "simulation.output.states": True,

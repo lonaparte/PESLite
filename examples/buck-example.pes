@@ -1,5 +1,7 @@
-# Closed-loop Buck converter assembled from a half bridge, an L-C output network and shared
-# scalar control loops. Plant and controller electrical values are SI.
+# Closed-loop Buck converter assembled from a configured half bridge, an L-C output network and
+# shared scalar control loops. The Buck topology places a controlled device in the upper position
+# and a diode in the lower position, so the inductor current naturally enters DCM at zero. Plant
+# and controller electrical values are SI.
 
 base:
   s_base: 500.0
@@ -35,7 +37,6 @@ units:
           maximum: 15.0
         current:
           type: inductor_current_control
-          topology: buck
           kp: 0.03
           ki: 30.0
           minimum: 0.02
@@ -55,4 +56,4 @@ simulation:
 
 meta:
   title: Buck converter
-  description: A closed-loop 48 V to 24 V Buck converter using a half bridge.
+  description: A closed-loop 48 V to 24 V Buck converter using a configured half bridge with DCM support.

@@ -1225,31 +1225,18 @@ class CapacitorVoltageControl(_LimitedScalarPI):
 
 @register_loop_type
 class InductorCurrentControl(_LimitedScalarPI):
-    """Inductor-current PI with topology-specific steady-state feedforward."""
+    """Topology-independent inductor-current PI with an external duty feedforward."""
 
     @dataclass(frozen=True, kw_only=True)
     class Params(_ScalarPIParams):
-        topology: str
-        blocked_bridge: bool = False
         type: str = "inductor_current_control"
 
     type = "inductor_current_control"
     inputs = {"reference": SI_CURRENT, "current": SI_CURRENT,
-              "voltage": SI_VOLTAGE, "vin": SI_VOLTAGE}
+              "feedforward": DUTY_RATIO}
     outputs = {"duty": DUTY_RATIO, "requested_duty": DUTY_RATIO}
-    flow_inputs = ("reference", "current", "voltage", "vin")
+    flow_inputs = ("reference", "current", "feedforward")
 
-    def feedforward(self, voltage, vin):
-        if self.cfg.blocked_bridge:
-            return 0.5 * (1.0 + voltage / vin)
-        if self.cfg.topology in ("buck", "full_bridge"):
-            return voltage / vin
-        if self.cfg.topology == "boost":
-            return 1.0 - vin / max(voltage, vin)
-        if self.cfg.topology == "buck_boost":
-            return voltage / (vin + voltage)
-        raise ConfigError(f"unknown scalar converter topology {self.cfg.topology!r}")
-
-    def equation(self, reference, current, voltage, vin):
-        requested = self.pi(reference, current, self.feedforward(voltage, vin))
+    def equation(self, reference, current, feedforward):
+        requested = self.pi(reference, current, feedforward)
         return self.constrain(requested), requested

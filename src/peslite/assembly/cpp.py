@@ -760,9 +760,9 @@ class _ModelGenerator:
             return generator.derivatives()
         enabled = self.enabled_by.get(id(sub))
         if (enabled is not None and hasattr(sub, "_active_rhs")
-                and hasattr(sub, "_disabled_rhs")):
+                and hasattr(sub, "_inactive_rhs")):
             active = self.trace_rhs(sub, sub._active_rhs)
-            disabled = self.trace_rhs(sub, sub._disabled_rhs)
+            disabled = self.trace_rhs(sub, sub._inactive_rhs)
             return [f"({enabled} ? ({on}) : ({off}))"
                     for on, off in zip(active, disabled)]
         if isinstance(sub, UniteType):
@@ -3122,6 +3122,18 @@ class _CppGenerator:
         public_names, state_values = self._state_layout(model, sampled, continuous)
         labels = ",\n        ".join(_cpp_string(name) for name in public_names)
         values = ", ".join(_number(value) for value in initial)
+        projection_lines = []
+        for index, lower, upper in self.model._state_bounds:
+            if lower is not None:
+                projection_lines.append(f"y[{index}] = std::max(y[{index}], {_number(lower)});")
+            if upper is not None:
+                projection_lines.append(f"y[{index}] = std::min(y[{index}], {_number(upper)});")
+        projection_body = "\n        ".join(projection_lines)
+        projection_method = (
+            f"    inline void project_state() {{\n        {projection_body}\n    }}\n"
+            if projection_lines else ""
+        )
+        projection_call = "project_state();" if projection_lines else ""
         member_lines = model.members()
         for generator in sampled.values():
             member_lines.extend(generator.members())
@@ -3313,6 +3325,7 @@ class _CppGenerator:
         const std::size_t count = std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(span / {fixed_dt} - 1e-9)));
         const double h = span / static_cast<double>(count);
         for (std::size_t k = 0; k < count; ++k) step(t, h);
+        {projection_call}
         t = target;
     }}'''
         else:
@@ -3357,6 +3370,7 @@ class _CppGenerator:
             }}
         }}
         adaptive_h = h;
+        {projection_call}
         t = target;
     }}'''
         adaptive_members = ('''std::size_t n_rejected = 0;
@@ -3557,6 +3571,7 @@ public:
         evaluate(t, y, dy);
     }}
 
+{projection_method}
     inline void sync(double t) {{
         {sync_body}
         {observations}
@@ -3589,6 +3604,7 @@ public:
         {energy_declarations_text}
         {energy_header}
         double t = {_number(self.p.simulation.initial.t)};
+        {projection_call}
         const double end = {run_end};
         const double output_period = {output_period_value};
         long long output_index = std::max<long long>(0, static_cast<long long>(std::ceil(t / output_period - 1e-9)));

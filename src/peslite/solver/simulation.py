@@ -631,6 +631,7 @@ class Simulation:
         p, system = self.p, self.system
         mdl, solver = system.model, self.solver
         settle = getattr(solver, "settle", None)
+        project = mdl.project_states if mdl.has_state_bounds else None
         parameters_changed = getattr(solver, "parameters_changed", None)
         t_end = p.simulation.t_end if t_end is None else t_end
         output = p.simulation.output
@@ -651,6 +652,8 @@ class Simulation:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         t_final = t_end
         y = self._apply_initial(t_start)
+        if project is not None:
+            y = project(y)
         if parameters_changed is not None:
             parameters_changed()
         windowed = [unit for unit in units if unit.windowed]
@@ -737,10 +740,18 @@ class Simulation:
                                   f"known: {sorted(values)}")
             return "".join(f"   {name} = {values[name]:.6g}" for name in watch)
 
-        @np.errstate(over="raise")  # overflow counts as divergence
-        def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
-            y = solver(mdl.rhs, t_a, t_b, y).y
-            return settle(t_b, y) if event and settle is not None else y
+        if project is None:
+            @np.errstate(over="raise")  # overflow counts as divergence
+            def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
+                y = solver(mdl.rhs, t_a, t_b, y).y
+                return settle(t_b, y) if event and settle is not None else y
+        else:
+            @np.errstate(over="raise")  # overflow counts as divergence
+            def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
+                y = solver(mdl.rhs, t_a, t_b, y).y
+                if event and settle is not None:
+                    y = settle(t_b, y)
+                return project(y)
 
         def advance(t_a: float, t_b: float, event: bool = False) -> bool:
             """Integrate over ``[t_a, t_b]``; ``event`` means the model changes at ``t_b``."""
@@ -781,6 +792,8 @@ class Simulation:
             nonlocal y
             if settle is not None:
                 y = settle(t_local, y)
+                if project is not None:
+                    y = project(y)
                 mdl.set_states(y)
 
         # The plant operations exposed to a converter unit. The run loop owns the continuous-state vector;
@@ -797,6 +810,8 @@ class Simulation:
             settle_now()
             yield
             y = mdl.get_initial_values()
+            if project is not None:
+                y = project(y)
             adc_inputs_changed = True
             synced_at = None
 
@@ -815,6 +830,8 @@ class Simulation:
                        unit.name in self._windows_given)
         # Continuous controllers may pre-synchronise their ODE states in begin().
         y = mdl.get_initial_values()
+        if project is not None:
+            y = project(y)
         synced_at = None
         while True:
             adc_inputs_changed = False
@@ -843,6 +860,8 @@ class Simulation:
                 if parameters_changed is not None:
                     parameters_changed()
                 y = mdl.get_initial_values()
+                if project is not None:
+                    y = project(y)
                 adc_inputs_changed = True
                 synced_at = None
             # Every unit protects first, then every unit samples, then every unit actuates.  This

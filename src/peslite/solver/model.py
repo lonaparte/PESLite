@@ -72,7 +72,9 @@ class Subsystem(Protocol):
 
     ``state_names``: packing order (a complex state takes two real entries);
     ``outputs_need_inputs``: whether ``set_outputs`` reads ``inp``; optional ``output_stages``
-    (tuple of :class:`OutputStage`) replaces ``set_outputs``.
+    (tuple of :class:`OutputStage`) replaces ``set_outputs``. A subsystem may declare real-state
+    unilateral constraints as ``state_bounds = {name: (lower, upper)}``, using ``None`` for an
+    open side.
     ``out`` and connected ``inp`` fields are current when ``rhs`` runs.
     """
 
@@ -703,6 +705,40 @@ class Model:
                         break
             rhs_layout.append((sub, tuple(entries)))
         self._rhs_layout = tuple(rhs_layout)
+        bounds = []
+        for sub, entries in rhs_layout:
+            declared = getattr(sub, "state_bounds", {})
+            if not isinstance(declared, Mapping):
+                raise TypeError(f"{type(sub).__name__}.state_bounds must be a mapping")
+            unknown = set(declared) - set(sub.state_names)
+            if unknown:
+                raise ValueError(
+                    f"{type(sub).__name__}.state_bounds contains unknown states {sorted(unknown)}"
+                )
+            for name, limits in declared.items():
+                if not isinstance(limits, (tuple, list)) or len(limits) != 2:
+                    raise TypeError(
+                        f"{type(sub).__name__}.state_bounds[{name!r}] must be (lower, upper)"
+                    )
+                lower, upper = limits
+                lower = None if lower is None else float(lower)
+                upper = None if upper is None else float(upper)
+                if ((lower is not None and not math.isfinite(lower))
+                        or (upper is not None and not math.isfinite(upper))):
+                    raise ValueError(
+                        f"{type(sub).__name__}.state_bounds[{name!r}] must be finite"
+                    )
+                if lower is not None and upper is not None and lower > upper:
+                    raise ValueError(
+                        f"{type(sub).__name__}.state_bounds[{name!r}] has lower > upper"
+                    )
+                entry = entries[sub.state_names.index(name)]
+                if entry[1]:
+                    raise TypeError(
+                        f"{type(sub).__name__}.state_bounds cannot constrain complex state {name!r}"
+                    )
+                bounds.append((entry[0], lower, upper))
+        self._state_bounds = tuple(bounds)
         # stateful subsystems with complex flags, in vector order
         self._rhs_flags = tuple((sub, tuple(is_c for _idx, is_c in entries))
                                 for sub, entries in rhs_layout if entries)
@@ -1109,6 +1145,20 @@ class Model:
 
     def set_states(self, y: NDArray[np.float64]) -> None:
         self._load(y.tolist())
+
+    @property
+    def has_state_bounds(self) -> bool:
+        """Whether any subsystem declares a real-state constraint."""
+        return bool(self._state_bounds)
+
+    def project_states(self, y: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Project declared real-state bounds in place and return ``y``."""
+        for index, lower, upper in self._state_bounds:
+            if lower is not None and y[index] < lower:
+                y[index] = lower
+            elif upper is not None and y[index] > upper:
+                y[index] = upper
+        return y
 
     def state_labels(self) -> list[str]:
         """One label per entry of the flat vector (``<subsystem>.<state>[.re|.im]``)."""

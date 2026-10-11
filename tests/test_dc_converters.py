@@ -47,7 +47,6 @@ def _case(topology, model="pwm_averaging", t_end=0.03):
                     },
                     "current": {
                         "type": "inductor_current_control",
-                        "topology": topology,
                         "kp": 0.03,
                         "ki": 30.0,
                         "minimum": 0.02,
@@ -93,10 +92,57 @@ def test_buck_uses_each_shared_bridge_simulation_form(model):
     assert np.isfinite(result.final_states()["converter.plant.u_o"])
 
 
-def test_scalar_topology_must_match_the_current_controller():
-    params = _case("buck")
-    with pytest.raises(ConfigError, match="must match unit topology"):
-        params.replace(**{"units.converter.ctrl.loops.current.topology": "boost"})
+@pytest.mark.parametrize("topology,upper_controlled,lower_controlled", (
+    ("buck", True, False),
+    ("boost", False, True),
+    ("buck_boost", False, True),
+))
+def test_dc_topology_configures_the_half_bridge_devices(
+        topology, upper_controlled, lower_controlled):
+    unit = peslite.Simulation(_case(topology)).unit()
+    bridge = unit.bridge.topology
+
+    assert bridge.upper_controlled is upper_controlled
+    assert bridge.lower_controlled is lower_controlled
+
+
+@pytest.mark.parametrize("topology", CASES)
+def test_diode_path_enforces_the_zero_current_boundary(topology):
+    simulation = peslite.Simulation(_case(topology))
+    plant = simulation.unit().plant
+    plant.set_enabled(True)
+    plant.state.i_L = -1.0
+    plant.state.u_o = CASES[topology][3]
+    plant.inp.q = 0.0
+    plant.set_outputs(0.0)
+
+    assert plant.out.i_L == 0.0
+    assert plant.rhs(0.0)[0] == 0.0
+
+    state = simulation.system.model.get_initial_values()
+    current = simulation.system.model.state_slice(plant, "i_L").start
+    state[current] = -1.0
+    assert simulation.system.model.project_states(state)[current] == 0.0
+
+    plant.state.i_L = 0.0
+    plant.inp.q = 1.0
+    assert plant.rhs(0.0)[0] > 0.0
+
+
+@pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
+def test_light_load_buck_enters_dcm_without_negative_current(model, tmp_path):
+    params = _case("buck", model, t_end=0.005).replace(**{
+        "units.converter.load_resistance": 600.0,
+        "simulation.output.period": 5e-6,
+        "simulation.output.states": True,
+        "simulation.output.energy": False,
+    })
+    result = peslite.Simulation(params).run(out_dir=tmp_path / model)
+    current = result.states["converter.plant.i_L"]
+    tail = current[result.states["t"] >= 0.0025]
+
+    assert np.all(current >= 0.0)
+    assert np.any(tail == 0.0)
 
 
 def test_buck_boost_control_boundary_owns_voltage_magnitude():
@@ -107,6 +153,20 @@ def test_buck_boost_control_boundary_owns_voltage_magnitude():
 
     assert unit.control_inputs() == unit.ctrl.control_inputs(2.0, -24.0, 48.0)
     assert unit.control_inputs()["meas.voltage"] == 24.0
+
+
+@pytest.mark.parametrize("topology,voltage,expected", (
+    ("buck", 12.0, 0.25),
+    ("boost", 12.0, 0.0),
+    ("buck_boost", -12.0, 0.2),
+))
+def test_scalar_control_boundary_owns_topology_feedforward(topology, voltage, expected):
+    unit = peslite.Simulation(_case(topology)).unit()
+    unit.plant.out.i_L = 0.0
+    unit.plant.out.u_o = voltage
+    unit.plant.out.v_in = 48.0
+
+    assert unit.control_inputs()["meas.duty_feedforward"] == pytest.approx(expected)
 
 
 def test_scalar_log_schema_comes_from_its_public_sources():
@@ -125,6 +185,11 @@ def test_unit_and_control_type_boundaries_are_explicit():
 
     assert {"type", "pwm", "ctrl", "bridge", "s_base"} <= common
     assert {"topology", "source_voltage", "bus", "dclink"}.isdisjoint(common)
+    assert not hasattr(params.unit().ctrl.loops["current"], "topology")
+    assert not hasattr(params.unit().ctrl.loops["current"], "blocked_bridge")
+    for field, value in (("topology", "buck"), ("blocked_bridge", False)):
+        with pytest.raises(ConfigError, match="unknown key"):
+            params.replace(**{f"units.converter.ctrl.loops.current.{field}": value})
     with pytest.raises(ConfigError, match="unknown key"):
         params.replace(**{"units.converter.bus": "pcc"})
     with pytest.raises(ConfigError, match="cannot use control type"):

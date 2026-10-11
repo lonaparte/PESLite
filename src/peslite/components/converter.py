@@ -312,7 +312,7 @@ class HalfBridge:
     Device placement is fixed once at construction.  Setting ``upper_controlled``
     or ``lower_controlled`` to false leaves only that device's diode available.
     The simulation hot path therefore uses the same two-bit gate word for
-    asynchronous and synchronous legs.
+    diode-assisted and fully controlled legs.
     """
 
     duty_names = ("d",)
@@ -343,6 +343,16 @@ class HalfBridge:
         if not isinstance(self.devices, DeviceParameters):
             raise TypeError("devices must be DeviceParameters")
         self._gate_mask = int(upper_controlled) | (int(lower_controlled) << 1)
+
+    @property
+    def upper_controlled(self) -> bool:
+        """Whether the upper position contains a controlled device."""
+        return bool(self._gate_mask & 1)
+
+    @property
+    def lower_controlled(self) -> bool:
+        """Whether the lower position contains a controlled device."""
+        return bool(self._gate_mask & 2)
 
     def _gate_word(self, gates) -> int:
         if len(gates) != 2 or any(value not in (0, 1, False, True) for value in gates):

@@ -556,7 +556,7 @@ class _DCPlantOut(Bag):
 
 
 class _DCPlant:
-    """The energy-storage network around one scalar bridge topology."""
+    """The energy-storage network around one configured scalar bridge topology."""
 
     state_names: ClassVar[tuple[str, ...]] = ("i_L", "u_o")
     outputs_need_inputs: ClassVar[bool] = True
@@ -567,8 +567,7 @@ class _DCPlant:
     ports: ClassVar[tuple] = ()
     has_source: ClassVar[bool] = True
 
-    def __init__(self, cfg: UnitParams) -> None:
-        self.topology = cfg.topology
+    def __init__(self, cfg: UnitParams, bridge_topology: HalfBridge) -> None:
         self.v_in = cfg.source_voltage
         self.L = cfg.inductance
         self.C = cfg.capacitance
@@ -582,24 +581,43 @@ class _DCPlant:
             StoragePort("u_o", self.C, kind="capacitor"),
         )
         self.enabled = False
-        self._active_rhs = {
+        self._conducting_rhs = {
             "buck": self._buck_rhs,
             "boost": self._boost_rhs,
             "buck_boost": self._buck_boost_rhs,
+        }[cfg.topology]
+        self._zero_current_rhs = {
+            "buck": self._buck_zero_current_rhs,
+            "boost": self._boost_zero_current_rhs,
+            "buck_boost": self._buck_boost_zero_current_rhs,
         }[cfg.topology]
         self._active_input_current = {
             "buck": self._switched_input_current,
             "boost": self._direct_input_current,
             "buck_boost": self._switched_input_current,
         }[cfg.topology]
-        self.rhs = self._disabled_rhs
+        if bridge_topology.upper_controlled and bridge_topology.lower_controlled:
+            self._active_rhs = self._conducting_rhs
+            self._inactive_rhs = self._disabled_rhs
+        else:
+            self.state_bounds = {"i_L": (0.0, None)}
+            self._active_rhs = self._unilateral_rhs
+            self._inactive_rhs = self._unilateral_disabled_rhs
+            self.set_measurements = self._unilateral_measurements
+        self.rhs = self._inactive_rhs
 
     def set_enabled(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
-        self.rhs = self._active_rhs if self.enabled else self._disabled_rhs
+        self.rhs = self._active_rhs if self.enabled else self._inactive_rhs
 
     def set_measurements(self, t: float) -> None:
         self.out.i_L = self.state.i_L
+        self.out.u_o = self.state.u_o
+        self.out.v_in = self.v_in
+
+    def _unilateral_measurements(self, t: float) -> None:
+        current = self.state.i_L
+        self.out.i_L = current if current > 0.0 else 0.0
         self.out.u_o = self.state.u_o
         self.out.v_in = self.v_in
 
@@ -611,20 +629,36 @@ class _DCPlant:
         self.set_input_current(t)
 
     def _switched_input_current(self) -> float:
-        return self.inp.q * self.state.i_L
+        return self.inp.q * self.out.i_L
 
     def _direct_input_current(self) -> float:
-        return self.state.i_L
+        return self.out.i_L
 
     def _disabled_rhs(self, t: float):
         current, voltage = self.state.i_L, self.state.u_o
         return (-self.R_series * current / self.L,
                 -voltage / (self.R_load * self.C))
 
+    def _unilateral_disabled_rhs(self, t: float):
+        if self.state.i_L > 0.0:
+            return self._disabled_rhs(t)
+        return (0.0, -self.state.u_o / (self.R_load * self.C))
+
+    def _unilateral_rhs(self, t: float):
+        if self.state.i_L > 0.0:
+            return self._conducting_rhs(t)
+        return self._zero_current_rhs(t)
+
     def _buck_rhs(self, t: float):
         current, voltage, duty = self.state.i_L, self.state.u_o, self.inp.q
         return ((duty * self.v_in - voltage - self.R_series * current) / self.L,
                 (current - voltage / self.R_load) / self.C)
+
+    def _buck_zero_current_rhs(self, t: float):
+        voltage, duty = self.state.u_o, self.inp.q
+        derivative = (duty * self.v_in - voltage) / self.L
+        return (derivative if derivative > 0.0 else 0.0,
+                -voltage / (self.R_load * self.C))
 
     def _boost_rhs(self, t: float):
         current, voltage, duty = self.state.i_L, self.state.u_o, self.inp.q
@@ -632,11 +666,23 @@ class _DCPlant:
         return ((self.v_in - off * voltage - self.R_series * current) / self.L,
                 (off * current - voltage / self.R_load) / self.C)
 
+    def _boost_zero_current_rhs(self, t: float):
+        voltage, duty = self.state.u_o, self.inp.q
+        derivative = (self.v_in - (1.0 - duty) * voltage) / self.L
+        return (derivative if derivative > 0.0 else 0.0,
+                -voltage / (self.R_load * self.C))
+
     def _buck_boost_rhs(self, t: float):
         current, voltage, duty = self.state.i_L, self.state.u_o, self.inp.q
         off = 1.0 - duty
         return ((duty * self.v_in + off * voltage - self.R_series * current) / self.L,
                 (-off * current - voltage / self.R_load) / self.C)
+
+    def _buck_boost_zero_current_rhs(self, t: float):
+        voltage, duty = self.state.u_o, self.inp.q
+        derivative = (duty * self.v_in + (1.0 - duty) * voltage) / self.L
+        return (derivative if derivative > 0.0 else 0.0,
+                -voltage / (self.R_load * self.C))
 
     def dissipated_power(self) -> float:
         current, voltage = self.state.i_L, self.state.u_o
@@ -659,8 +705,17 @@ class DCConverter(Unit):
         self.name = name
         self.cfg = cfg
         self.scenario = Scenario(cfg.events)
-        self.plant = _DCPlant(cfg)
-        self.bridge = make_bridge(cfg, sim, modulator, topology=HalfBridge())
+        upper_controlled, lower_controlled = {
+            "buck": (True, False),
+            "boost": (False, True),
+            "buck_boost": (False, True),
+        }[cfg.topology]
+        topology = HalfBridge(
+            upper_controlled=upper_controlled,
+            lower_controlled=lower_controlled,
+        )
+        self.plant = _DCPlant(cfg, topology)
+        self.bridge = make_bridge(cfg, sim, modulator, topology=topology)
         self.continuous = bool(getattr(self.bridge, "continuous", False))
         self.ctrl = ctrl if ctrl is not None else make_scalar_controller(cfg)
         if bool(getattr(self.ctrl, "continuous", False)) != self.continuous:

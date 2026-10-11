@@ -19,7 +19,7 @@ peslite case.pes
 
 | Name | System and control purpose |
 |---|---|
-| `buck-example` | A closed-loop 48 V to 24 V Buck unit assembled from a half bridge, an L-C output network and the shared scalar control graph. |
+| `buck-example` | A closed-loop 48 V to 24 V Buck unit using the half bridge's controlled-device/diode placement, an L-C output network, native DCM and the shared scalar control graph. |
 | `cable-gfl-example` | A grid-following converter connected to the grid through the distributed R-L/G-C model registered under `addons/components`. |
 | `custom-pll-example` | Grid-following control assembled from built-in current/DC-voltage loops and an automatically discovered voltage-adaptive PLL under `addons/control`. |
 | `gfl-example` | One grid-following converter with PLL, dc-voltage control, current control and unit protection. This is the most extensively annotated configuration. |

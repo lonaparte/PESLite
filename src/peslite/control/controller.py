@@ -1409,6 +1409,7 @@ SCALAR_CONTROL_INTERFACE = ControlInterface(
         "meas.current": SI_CURRENT,
         "meas.voltage": SI_VOLTAGE,
         "meas.vin": SI_VOLTAGE,
+        "meas.duty_feedforward": DUTY_RATIO,
         "references.voltage": SI_VOLTAGE,
     }),
     outputs=MappingProxyType({"duty": DUTY_RATIO}),
@@ -1429,6 +1430,7 @@ class _ScalarMeasurement:
     current: float = 0.0
     voltage: float = 0.0
     vin: float = 0.0
+    duty_feedforward: float = 0.0
 
 
 class _ScalarControlState:
@@ -1456,7 +1458,6 @@ class ScalarController:
 
     def __init__(self, cfg) -> None:
         self.p = cfg
-        self.type = cfg.topology
         self.continuous = cfg.bridge.model == "averaging"
         self.startup = (
             ContinuousStartup(run=False) if self.continuous
@@ -1467,8 +1468,7 @@ class ScalarController:
             "voltage.voltage": "meas.voltage",
             "current.reference": "voltage.current_reference",
             "current.current": "meas.current",
-            "current.voltage": "meas.voltage",
-            "current.vin": "meas.vin",
+            "current.feedforward": "meas.duty_feedforward",
         }
         self.graph = ControlGraph(
             cfg,
@@ -1481,26 +1481,47 @@ class ScalarController:
         self.periods = self.graph.periods
         self.logging = True
         self.last_log: dict[str, float] = {}
+        self._input_values = {
+            "buck": self._buck_inputs,
+            "boost": self._boost_inputs,
+            "buck_boost": self._buck_boost_inputs,
+        }[cfg.topology]
         self._last_measurement = _ScalarMeasurement(vin=cfg.source_voltage)
         self._last_duty = 0.0
         if self.continuous:
             self._build_flow_state()
 
+    @staticmethod
+    def _buck_inputs(current, voltage, vin):
+        return current, voltage, vin, voltage / vin
+
+    @staticmethod
+    def _boost_inputs(current, voltage, vin):
+        return current, voltage, vin, 1.0 - vin / max(voltage, vin)
+
+    @staticmethod
+    def _buck_boost_inputs(current, voltage, vin):
+        magnitude = abs(voltage)
+        return current, magnitude, vin, magnitude / (vin + magnitude)
+
     def control_inputs(self, current, voltage, vin) -> dict[str, Any]:
-        """Return the canonical values at the scalar control boundary."""
+        """Return canonical measurements and converter feedforward at the control boundary."""
+        current, voltage, vin, feedforward = self._input_values(current, voltage, vin)
         return {
             "meas.current": current,
-            "meas.voltage": abs(voltage) if self.p.topology == "buck_boost" else voltage,
+            "meas.voltage": voltage,
             "meas.vin": vin,
+            "meas.duty_feedforward": feedforward,
         }
 
     def _measurement(self, current: float, voltage: float, vin: float,
                      target: _ScalarMeasurement | None = None) -> _ScalarMeasurement:
-        values = self.control_inputs(current, voltage, vin)
+        current, voltage, vin, feedforward = self._input_values(current, voltage, vin)
         measurement = target if target is not None else _ScalarMeasurement()
-        measurement.current = float(values["meas.current"])
-        measurement.voltage = float(values["meas.voltage"])
-        measurement.vin = float(values["meas.vin"])
+        measurement.current = float(current)
+        measurement.voltage = float(voltage)
+        measurement.vin = float(vin)
+        measurement.duty_feedforward = float(feedforward)
         return measurement
 
     def _build_flow_state(self) -> None:

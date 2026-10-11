@@ -219,10 +219,6 @@ def _dc_unit(u, base, where: str) -> None:
             raise ConfigError(
                 f"{where}.ctrl.loops.{name}.minimum must not exceed maximum"
             )
-        if loop.type == "inductor_current_control" and loop.topology != u.topology:
-            raise ConfigError(
-                f"{where}.ctrl.loops.{name}.topology must match unit topology {u.topology!r}"
-            )
 
 
 def _network(p: Params) -> None:

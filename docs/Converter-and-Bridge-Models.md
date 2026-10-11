@@ -25,6 +25,27 @@ When `bridge.model` is omitted, the file default is `pwm_averaging`.
 The models answer different questions. Similar low-frequency trajectories do not make them
 numerically identical.
 
+## Scalar DC converter device placement and DCM
+
+The scalar Buck, Boost and Buck-Boost circuits configure the device positions through the existing
+`HalfBridge` topology. Buck uses a controlled upper device and a lower diode; Boost and Buck-Boost
+use a controlled lower device and an upper diode. The assembly does not replace that device
+placement with a default fully controlled leg.
+
+`InductorCurrentControl` is topology-independent. The scalar controller boundary derives the
+steady-state duty feedforward from the configured converter topology and supplies it through a
+typed control port, leaving the current loop responsible only for current regulation and limits.
+
+A diode current is unilateral. The DC plant therefore constrains the inductor current to be
+nonnegative: at zero current, a negative unconstrained derivative is replaced by zero, and any
+numerical crossing is projected back onto the zero-current boundary. This produces the idle
+interval of discontinuous-conduction mode (DCM). A fully controlled `HalfBridge` component remains
+capable of reverse current and does not receive this constraint.
+
+All three simulation forms enforce the same electrical current boundary. `switching` resolves the
+individual charge, discharge and zero-current intervals; the averaged forms preserve the
+low-frequency constrained trajectory but do not reproduce sub-cycle ripple.
+
 ## Switching
 
 `switching` evaluates the carrier comparison and changes the ideal bridge state at the exact edge

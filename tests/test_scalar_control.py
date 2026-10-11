@@ -26,7 +26,7 @@ class _References:
     voltage: float = 24.0
 
 
-def _graph(topology="buck", *, continuous=False, blocked_bridge=False):
+def _graph(*, continuous=False):
     period = 0.0001
     loops = {
         "voltage": CapacitorVoltageControl.Params(
@@ -41,8 +41,6 @@ def _graph(topology="buck", *, continuous=False, blocked_bridge=False):
             ki=5.0,
             minimum=0.0,
             maximum=0.85,
-            topology=topology,
-            blocked_bridge=blocked_bridge,
             period=period,
         ),
     }
@@ -63,6 +61,7 @@ def _graph(topology="buck", *, continuous=False, blocked_bridge=False):
             "meas.current": SI_CURRENT,
             "meas.voltage": SI_VOLTAGE,
             "meas.vin": SI_VOLTAGE,
+            "meas.duty_feedforward": DUTY_RATIO,
             "references.voltage": SI_VOLTAGE,
         }),
         MappingProxyType({"duty": DUTY_RATIO}),
@@ -72,8 +71,7 @@ def _graph(topology="buck", *, continuous=False, blocked_bridge=False):
         "voltage.voltage": "meas.voltage",
         "current.reference": "voltage.current_reference",
         "current.current": "meas.current",
-        "current.voltage": "meas.voltage",
-        "current.vin": "meas.vin",
+        "current.feedforward": "meas.duty_feedforward",
     }
     return ControlGraph(
         unit,
@@ -95,7 +93,9 @@ def test_scalar_control_uses_the_shared_control_package():
 
 def test_scalar_control_graph_has_typed_si_ports_and_bounded_output():
     graph = _graph()
-    measurement = SimpleNamespace(current=0.0, voltage=12.0, vin=48.0)
+    measurement = SimpleNamespace(
+        current=0.0, voltage=12.0, vin=48.0, duty_feedforward=0.25,
+    )
 
     assert graph.interface.inputs["meas.current"] is SI_CURRENT
     assert graph.interface.inputs["meas.voltage"] is SI_VOLTAGE
@@ -106,7 +106,9 @@ def test_scalar_control_graph_has_typed_si_ports_and_bounded_output():
 
 def test_scalar_control_graph_runs_the_same_loops_continuously():
     graph = _graph(continuous=True)
-    measurement = SimpleNamespace(current=0.0, voltage=12.0, vin=48.0)
+    measurement = SimpleNamespace(
+        current=0.0, voltage=12.0, vin=48.0, duty_feedforward=0.25,
+    )
 
     derivatives = graph.flow(0.0, measurement)
 
@@ -114,17 +116,13 @@ def test_scalar_control_graph_runs_the_same_loops_continuously():
     assert 0.0 <= graph.output("duty", measurement) <= 0.85
 
 
-@pytest.mark.parametrize("topology,blocked,expected", [
-    ("buck", False, 0.25),
-    ("boost", False, 0.0),
-    ("buck_boost", False, 0.2),
-    ("full_bridge", True, 0.625),
-])
-def test_dc_current_loop_feedforward_is_owned_by_the_loop(
-        topology, blocked, expected):
-    graph = _graph(topology, blocked_bridge=blocked)
+@pytest.mark.parametrize("feedforward", [0.0, 0.2, 0.25])
+def test_dc_current_loop_accepts_topology_independent_feedforward(feedforward):
+    graph = _graph()
+    current = graph.nodes["current"]
 
-    assert graph.nodes["current"].feedforward(12.0, 48.0) == pytest.approx(expected)
+    assert not hasattr(current.unit, "topology")
+    assert current.equation(0.0, 0.0, feedforward)[0] == pytest.approx(feedforward)
 
 
 def test_output_limit_tracks_sampled_and_continuous_pi_states():

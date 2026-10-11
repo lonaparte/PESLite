@@ -100,18 +100,25 @@ def test_half_bridge_fixes_device_placement_at_construction():
 
     upper_switched_leg = HalfBridge(upper_controlled=True, lower_controlled=False)
     lower_switched_leg = HalfBridge(upper_controlled=False, lower_controlled=True)
-    synchronous_leg = HalfBridge()
+    fully_controlled_leg = HalfBridge()
+
+    assert upper_switched_leg.upper_controlled
+    assert not upper_switched_leg.lower_controlled
+    assert not lower_switched_leg.upper_controlled
+    assert lower_switched_leg.lower_controlled
+    assert fully_controlled_leg.upper_controlled
+    assert fully_controlled_leg.lower_controlled
 
     assert upper_switched_leg.resolve((1, 0), 2.0, 48.0).path == "upper.channel"
     assert upper_switched_leg.resolve((0, 0), 2.0, 48.0).path == "lower.diode"
     assert lower_switched_leg.resolve((0, 1), 2.0, 48.0).path == "lower.channel"
     assert lower_switched_leg.resolve((0, 0), -2.0, 48.0).path == "upper.diode"
-    assert synchronous_leg.resolve((0, 1), 2.0, 48.0).path == "lower.channel"
+    assert fully_controlled_leg.resolve((0, 1), 2.0, 48.0).path == "lower.channel"
 
     with pytest.raises(ConfigError, match="diode-only"):
         upper_switched_leg.resolve((0, 1), 0.0, 48.0)
     with pytest.raises(ConfigError, match="shoot-through"):
-        synchronous_leg.resolve((1, 1), 0.0, 48.0)
+        fully_controlled_leg.resolve((1, 1), 0.0, 48.0)
 
 
 def test_piecewise_linear_current_sharing_needs_no_local_solver():
