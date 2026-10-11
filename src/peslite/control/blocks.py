@@ -14,8 +14,10 @@ from typing import Any, Mapping
 import numpy as np
 from numpy.typing import NDArray
 
+from ..solver.model import ConfigError
+
 __all__ = ["A120", "abc2complex", "complex2abc", "phases", "clamp", "smoothstep", "peak_abs",
-           "Integrator", "PI", "Filter", "HoldTimer", "MovingWindow"]
+           "Integrator", "PI", "OutputLimit", "Filter", "HoldTimer", "MovingWindow"]
 
 
 # ------------------------------------------------------------------ space vectors
@@ -163,6 +165,21 @@ class PI:
         if self.T is not None and self.antiwindup_enabled:
             self.integral += self.T * (output - intended) / self.kp
 
+    def track(self, intended, output) -> None:
+        """Track a constrained output in sampled or continuous execution."""
+        if not self.antiwindup_enabled or output == intended:
+            return
+        if self.kp != 0.0:
+            correction = (output - intended) / self.kp
+        elif (intended - output) * self.derivative > 0.0:
+            correction = -self.derivative
+        else:
+            correction = 0.0
+        if self.T is None:
+            self.derivative += correction
+        else:
+            self.integral += self.T * correction
+
     def reset(self) -> None:
         self.integral = self.initial
         self.derivative = self.initial * 0
@@ -195,6 +212,51 @@ class _ContinuousPI(PI):
         error = r - fb
         self.derivative = error
         return ff + self.kp * error + self.ki * self.integral
+
+
+class OutputLimit:
+    """Scalar or magnitude constraint for sampled and continuous loops."""
+
+    def __init__(self, limit, *, lower=None, pi=None, active=None, observer=None):
+        self.pi = pi
+        self.limit = float(limit)
+        self.lower = lower
+        self.active = active
+        self.observer = observer
+        self.saturated = False
+        if not math.isfinite(self.limit) or self.limit <= 0.0:
+            raise ConfigError("a controller output limit must be finite and positive")
+        if lower is not None and (not math.isfinite(lower) or lower >= self.limit):
+            raise ConfigError("a controller output lower limit must be finite and below its upper limit")
+        if pi is not None and pi.antiwindup_enabled and pi.kp == 0.0:
+            raise ConfigError("tracking anti-windup requires a nonzero proportional gain")
+
+    def _apply(self, intended):
+        if self.lower is not None:
+            return min(self.limit, max(self.lower, intended))
+        magnitude = abs(intended)
+        return intended * (self.limit / magnitude) if magnitude > self.limit else intended
+
+    def exceeded(self, intended):
+        if self.lower is not None:
+            return intended < self.lower or intended > self.limit
+        return abs(intended) > self.limit
+
+    def sample(self, t, intended):
+        output = self._apply(intended)
+        self.saturated = output != intended
+        if self.saturated and self.pi is not None and (self.active is None or self.active()):
+            self.pi.antiwindup(intended, output)
+        if self.observer is not None:
+            self.observer(t, intended, output, count=True)
+        return output
+
+    def flow(self, intended):
+        output = self._apply(intended)
+        self.saturated = output != intended
+        if self.saturated and self.pi is not None and (self.active is None or self.active()):
+            self.pi.track(intended, output)
+        return output
 
 
 def _coefficients(values, name: str) -> tuple[float, ...]:

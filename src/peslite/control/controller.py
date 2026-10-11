@@ -20,7 +20,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..solver.model import Bag, ConfigError, gather, scatter
-from .blocks import abc2complex, peak_abs, phases, smoothstep
+from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
 from .loops import (ANGLE, FREQUENCY, I, I_AB, LOOP_TYPES, POWER, V, V_AB, V_DQ,
                     CurrentLoop, DCVoltageLoop, Loop, SignalType, SyncLaw)
 from .modulation import CONFIGURED, OutputStage
@@ -109,43 +109,7 @@ class ControlInterface:
     outputs: Mapping[str, SignalType]
 
 
-class _OutputLimit:
-    """Controller-owned scalar/magnitude limit; sampled use may track a PI."""
-
-    def __init__(self, limit: float, *, lower=None, pi=None, active=None, observer=None):
-        self.pi = pi
-        self.limit = float(limit)
-        self.lower = lower
-        self.active = active
-        self.observer = observer
-        self.saturated = False
-        if not math.isfinite(self.limit) or self.limit <= 0.0:
-            raise ConfigError("a controller output limit must be finite and positive")
-        if lower is not None and (not math.isfinite(lower) or lower >= self.limit):
-            raise ConfigError("a controller output lower limit must be finite and below its upper limit")
-        if pi is not None and pi.antiwindup_enabled and pi.kp == 0.0:
-            raise ConfigError("tracking anti-windup requires a nonzero proportional gain")
-
-    def _apply(self, intended):
-        if self.lower is not None:
-            return min(self.limit, max(self.lower, intended))
-        magnitude = abs(intended)
-        return intended * (self.limit / magnitude) if magnitude > self.limit else intended
-
-    def exceeded(self, intended) -> bool:
-        if self.lower is not None:
-            return intended < self.lower or intended > self.limit
-        return abs(intended) > self.limit
-
-    def sample(self, t, intended):
-        output = self._apply(intended)
-        self.saturated = output != intended
-        if (self.saturated and self.pi is not None
-                and (self.active is None or self.active())):
-            self.pi.antiwindup(intended, output)
-        if self.observer is not None:
-            self.observer(t, intended, output, count=True)
-        return output
+_OutputLimit = OutputLimit
 
 # ------------------------------------------------------------------ the start-up sequence
 
@@ -300,9 +264,9 @@ class ControlGraph:
     loops are rebuilt from their new parameters and continue from their named states.
     """
 
-    def __init__(self, cfg, startup, connections, outputs):
+    def __init__(self, cfg, startup, connections, outputs, *, interface=CONTROL_INTERFACE):
         self.cfg, self.startup = cfg, startup
-        self.interface = CONTROL_INTERFACE
+        self.interface = interface
         self._pending: list[Any] = []
         self.on_retune = None
         self.connections = {**connections, **cfg.ctrl.connections}

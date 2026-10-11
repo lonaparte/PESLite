@@ -10,8 +10,10 @@ pu bases.
 from . import solver, control, components, assembly
 from .solver import (AdaptiveSolver, DormandPrince45, FixedStepSolver, Model, MultirateSolver, make_solver)
 from .control import OutputStage, UniteType, make_controller, register_loop_type
-from .components import (ADC, PWM, PWMBridge, ZOH, AveragingBridge, CarrierComparison,
-                         MeasurementPorts, make_bridge, make_modulator, register_element_type)
+from .components import (ADC, PWM, PWMBridge, ZOH, AveragingBridge, SwitchingBridge,
+                         ThreePhaseBridge, CarrierComparison, FullBridge, HalfBridge,
+                         MeasurementPorts, make_bridge,
+                         make_modulator, register_element_type)
 from .assembly import (Params, Protection, SourceScenario, System, Unit, dump, dumps, load,
                        register_event_type)
 from .solver.simulation import Simulation, SimulationResult, main
@@ -28,7 +30,9 @@ __all__ = [
     "Params", "load", "dump", "dumps", "System", "Unit", "Protection", "MeasurementPorts", "Model", "SourceScenario",
     "Simulation", "SimulationResult", "ExportResult", "export", "UniteType", "main", "make_controller", "make_modulator", "make_solver",
     "register_loop_type", "register_element_type", "register_event_type",
-    "OutputStage", "ADC", "PWM", "PWMBridge", "AveragingBridge", "make_bridge",
+    "OutputStage", "ADC", "PWM", "SwitchingBridge", "PWMBridge", "AveragingBridge",
+    "ThreePhaseBridge", "make_bridge",
+    "HalfBridge", "FullBridge",
     "CarrierComparison", "ZOH",
     "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "MultirateSolver", "__version__",
 ]

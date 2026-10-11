@@ -4,7 +4,8 @@ A loop type is one class: its parameters (``Params``, the schema of its ``ctrl.l
 its typed input and output ports, its role in the default wiring, and its sampled/continuous law.
 How loops are connected is not theirs to know (:mod:`.controller`).  Built-in loops also expose
 their continuous-time outputs and state derivatives for the ideal averaged converter model.
-Signals are pu; time s, angles rad, frequencies rad/s.
+Grid-control signals use pu. Scalar converter loops declare SI units on their ports.
+Time is in s, angles in rad and frequencies in rad/s.
 """
 
 from __future__ import annotations
@@ -15,14 +16,15 @@ from dataclasses import dataclass, field, is_dataclass
 from typing import Any, ClassVar, Mapping, Optional
 
 from ..solver.model import ConfigError, assign, gather, join, scatter
-from .blocks import Filter, Integrator, PI
+from .blocks import Filter, Integrator, OutputLimit, PI
 
 __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER", "PQ",
            "ROLES", "Loop", "LOOP_TYPES", "register_loop_type", "PowerFilterParams",
            "CurrentLimitParams",
            "SRFPLL", "CurrentLoop", "DCVoltageLoop", "PowerLoop", "SyncLaw", "PSC", "Droop", "VSG", "DVOC",
-           "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping", "UnitDelay"]
+           "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping", "UnitDelay",
+           "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO", "OutputVoltageLoop", "InductorCurrentLoop"]
 
 
 # ------------------------------------------------------------------ signals
@@ -1164,3 +1166,90 @@ class UnitDelay(Loop):
         if set(values) - {self.state_name}:
             raise KeyError(f"unit_delay has the state {self.state_name}")
         self.value = values.get(self.state_name, self.value)
+
+
+# ------------------------------------------------------------------ scalar SI converter loops
+
+SI_CURRENT = SignalType("A", "scalar")
+SI_VOLTAGE = SignalType("V", "scalar")
+DUTY_RATIO = SignalType("1", "duty_ratio")
+
+
+@dataclass(frozen=True, kw_only=True)
+class _ScalarPIParams:
+    kp: float
+    ki: float
+    minimum: float
+    maximum: float
+    period: Optional[float] = None
+
+
+class _LimitedScalarPI(Loop):
+    """One registered PI state shared by sampled and continuous execution."""
+
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
+        self.pi = self.state_block("integral", PI(cfg.kp, cfg.ki, self.block_period))
+        self.limit = OutputLimit(cfg.maximum, lower=cfg.minimum, pi=self.pi)
+
+    def constrain(self, requested):
+        if self.block_period is None:
+            return self.limit.flow(requested)
+        return self.limit.sample(0.0, requested)
+
+    def initial_outputs(self):
+        return {port: self.cfg.minimum for port in self.outputs}
+
+    def reset_integrator(self):
+        self.pi.reset()
+
+
+@register_loop_type
+class OutputVoltageLoop(_LimitedScalarPI):
+    """Output-voltage PI in V/A; positive current charges the output capacitor."""
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params(_ScalarPIParams):
+        type: str = "output_voltage_pi"
+
+    type = "output_voltage_pi"
+    inputs = {"reference": SI_VOLTAGE, "voltage": SI_VOLTAGE}
+    outputs = {"current_reference": SI_CURRENT, "requested_current": SI_CURRENT}
+    flow_inputs = ("reference", "voltage")
+
+    def equation(self, reference, voltage):
+        requested = self.pi(reference, voltage)
+        return self.constrain(requested), requested
+
+
+@register_loop_type
+class InductorCurrentLoop(_LimitedScalarPI):
+    """Inductor-current PI with topology-specific steady-state feedforward."""
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params(_ScalarPIParams):
+        topology: str
+        blocked_bridge: bool = False
+        type: str = "inductor_current_pi"
+
+    type = "inductor_current_pi"
+    inputs = {"reference": SI_CURRENT, "current": SI_CURRENT,
+              "voltage": SI_VOLTAGE, "vin": SI_VOLTAGE}
+    outputs = {"duty": DUTY_RATIO, "requested_duty": DUTY_RATIO}
+    flow_inputs = ("reference", "current", "voltage", "vin")
+
+    def feedforward(self, voltage, vin):
+        if self.cfg.blocked_bridge:
+            return 0.5 * (1.0 + voltage / vin)
+        if self.cfg.topology in ("buck", "full_bridge"):
+            return voltage / vin
+        if self.cfg.topology == "boost":
+            return 1.0 - vin / max(voltage, vin)
+        if self.cfg.topology == "buck_boost":
+            magnitude = abs(voltage)
+            return magnitude / (vin + magnitude)
+        raise ConfigError(f"unknown scalar converter topology {self.cfg.topology!r}")
+
+    def equation(self, reference, current, voltage, vin):
+        requested = self.pi(reference, current, self.feedforward(voltage, vin))
+        return self.constrain(requested), requested

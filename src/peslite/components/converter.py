@@ -5,18 +5,20 @@ bridge also owns the timing which turns sampled controller commands into its mod
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 from typing import Any, Callable, ClassVar, Mapping, Optional
 
 import numpy as np
 from numpy.typing import NDArray
 
-from ..control.blocks import smoothstep
+from ..control.blocks import abc2complex, smoothstep
 from ..solver.energy import PowerPort, StoragePort
-from ..solver.model import Bag, Empty, OutputStage
+from ..solver.model import Bag, ConfigError, Empty, OutputStage
 from .pwm import TIME_EPS, Modulator, PWM, ZOH, make_modulator
 
-__all__ = ["Bridge", "PWMBridge", "AveragingBridge", "DCLink", "DCCapacitor",
+__all__ = ["ThreePhaseBridge", "SwitchingBridge", "PWMBridge", "AveragingBridge",
+           "HalfBridge", "FullBridge", "DeviceParameters", "DCLink", "DCCapacitor",
            "DCCurrentSource", "DCVoltageSource", "make_bridge", "make_dclink"]
 
 
@@ -28,10 +30,34 @@ class _BridgeOut(Bag):
     __slots__ = ("u_c", "i_dc")
 
 
-class Bridge:
-    """Lossless bridge: ``u_c = q u_dc``, ``i_dc = 1.5 Re(q conj(i_c))`` (SI).
+def _set_three_phase_dc_current(bridge, _t: float) -> None:
+    bridge.out.i_dc = 1.5 * (bridge.inp.q * bridge.inp.i_c.conjugate()).real
 
-    ``connections`` and ``zoh_connections`` return the power and switching-state wiring.
+
+def _set_scalar_dc_current(bridge, _t: float) -> None:
+    bridge.out.i_dc = (bridge.inp.q * bridge.inp.i_c).real
+
+
+class ThreePhaseBridge:
+    """Three-leg topology used by the existing AC converter model."""
+
+    __slots__ = ()
+    duty_names = ("d_a", "d_b", "d_c")
+    zero = 0j
+    switching_state = staticmethod(abc2complex)
+    pwm_state = staticmethod(ZOH.value)
+    set_dc_current = staticmethod(_set_three_phase_dc_current)
+
+    @staticmethod
+    def command_duties(output):
+        return output.d_abc
+
+
+class _BridgeModel:
+    """One bridge topology composed with one simulation form.
+
+    Topology selection binds its power equation once during construction.  The
+    output hot path has no topology or simulation-form conditionals.
     """
 
     state_names: ClassVar[tuple[str, ...]] = ()
@@ -43,13 +69,13 @@ class Bridge:
         OutputStage("set_ac_voltage", inputs=("q", "u_dc"), outputs=("u_c",)),
     )
 
-    def __init__(self) -> None:
+    def __init__(self, topology=None) -> None:
+        self.topology = topology if topology is not None else ThreePhaseBridge()
         self.state = Empty()
-        self.inp = _BridgeInp(q=0j, u_dc=0.0, i_c=0j)
-        self.out = _BridgeOut(u_c=0j, i_dc=0.0)
-
-    def set_dc_current(self, t: float) -> None:
-        self.out.i_dc = 1.5 * (self.inp.q * self.inp.i_c.conjugate()).real
+        zero = self.topology.zero
+        self.inp = _BridgeInp(q=zero, u_dc=0.0, i_c=zero)
+        self.out = _BridgeOut(u_c=zero, i_dc=0.0)
+        self.set_dc_current = self.topology.set_dc_current.__get__(self, type(self))
 
     def set_ac_voltage(self, t: float) -> None:
         self.out.u_c = self.inp.q * self.inp.u_dc
@@ -76,20 +102,27 @@ class Bridge:
         return {(self, "q"): label}
 
 
-class PWMBridge(Bridge, PWM):
-    """Physical bridge with its PWM peripheral behind one scheduling interface.
-
-    Exact switching and PWM-period averaging differ only in their modulator. Keeping the PWM
-    inside the bridge gives every bridge model the same external power, held-input and scheduling
-    interface.
-    """
+class _SampledBridge(_BridgeModel, PWM):
+    """Shared sampled timing for exact-switching and PWM-averaged forms."""
 
     state_prefix = "pwm"
 
     def __init__(self, period: float, load_period: float, offset: float, computation: float,
-                 carrier_period: float, modulator: Modulator) -> None:
-        Bridge.__init__(self)
-        PWM.__init__(self, period, load_period, offset, computation, carrier_period, modulator)
+                 carrier_period: float, modulator: Modulator, topology=None) -> None:
+        _BridgeModel.__init__(self, topology)
+        PWM.__init__(
+            self,
+            period,
+            load_period,
+            offset,
+            computation,
+            carrier_period,
+            modulator,
+            duty_names=self.topology.duty_names,
+            switching_state=self.topology.switching_state,
+            pwm_state=self.topology.pwm_state,
+        )
+        self._command_duties = self.topology.command_duties
         self.state_owner = self
         self.has_switching_events = not isinstance(modulator, ZOH)
 
@@ -126,28 +159,37 @@ class PWMBridge(Bridge, PWM):
         """Whether the old bridge output interval ends at ``t``."""
         return self.edge(t)
 
-    def actuate(self, t: float, command: tuple[float, Any] | None, enabled: bool) -> list[complex]:
+    def actuate(self, t: float, command: tuple[float, Any] | None,
+                enabled: bool) -> list[Any]:
         """Accept one sampled command and return bridge inputs which become active at ``t``.
 
         The bridge owns the computation/load ordering.  Unit deliberately does not know whether
         the implementation uses compare registers, a delayed averaged command or no carrier.
         """
-        changes: list[complex] = []
+        changes: list[Any] = []
         if command is not None and self.computation == 0.0:
             at, output = command
-            self.write(at, output.d_abc, bool(output.gates) and enabled,
+            self.write(at, self._command_duties(output), bool(output.gates) and enabled,
                        output.theta, output.omega)
         if abs(self.t_load - t) < TIME_EPS:
             changes.append(self.load(t))
         if command is not None and self.computation > 0.0:
             at, output = command
-            self.write(at, output.d_abc, bool(output.gates) and enabled,
+            self.write(at, self._command_duties(output), bool(output.gates) and enabled,
                        output.theta, output.omega)
         changes.extend(self.switches(t))
         return changes
 
 
-class AveragingBridge(Bridge):
+class SwitchingBridge(_SampledBridge):
+    """A bridge topology evaluated at every exact semiconductor switching edge."""
+
+
+class PWMBridge(_SampledBridge):
+    """A bridge topology driven by duty ratios held for one PWM interval."""
+
+
+class AveragingBridge(_BridgeModel):
     """Ideal averaged bridge driven directly by the continuous controller output.
 
     There is no timer, command history, held modulation input or delay state: the controller and
@@ -156,8 +198,8 @@ class AveragingBridge(Bridge):
 
     state_prefix = "bridge"
 
-    def __init__(self) -> None:
-        Bridge.__init__(self)
+    def __init__(self, topology=None) -> None:
+        _BridgeModel.__init__(self, topology)
         self.modulator = None
         self.state_owner = self
         self.continuous = True
@@ -194,14 +236,14 @@ class AveragingBridge(Bridge):
     def fast_edge(self, t: float) -> bool:
         return False
 
-    def reset(self, d_abc: NDArray[np.float64], on: bool = False) -> None:
+    def reset(self, duties: NDArray[np.float64], on: bool = False) -> None:
         self.enabled = bool(on)
 
-    def start(self, t: float, sync: tuple[float | None, float | None], continued: bool) -> complex:
-        return 0j
+    def start(self, t: float, sync: tuple[float | None, float | None], continued: bool):
+        return self.topology.zero
 
     def actuate(self, t: float, command: tuple[float, Any] | None,
-                enabled: bool) -> list[complex]:
+                enabled: bool) -> list[Any]:
         self.enabled = bool(enabled)
         return []
 
@@ -220,18 +262,290 @@ class AveragingBridge(Bridge):
 
 
 def make_bridge(cfg: Any, sim: Any = None,
-                modulator: Modulator | None = None) -> Bridge:
-    """Build the selected bridge implementation behind the common bridge boundary."""
+                modulator: Modulator | None = None, topology=None) -> _BridgeModel:
+    """Compose a bridge topology with switching, PWM or averaging behavior."""
+    topology = topology if topology is not None else ThreePhaseBridge()
     pwm = cfg.pwm
     if cfg.bridge.model == "averaging":
         if modulator is not None:
             raise ValueError("an averaging bridge does not use a PWM modulator")
-        return AveragingBridge()
-    return PWMBridge(
+        return AveragingBridge(topology)
+    bridge_type = SwitchingBridge if cfg.bridge.model == "switching" else PWMBridge
+    return bridge_type(
         cfg.ctrl.period, pwm.load_period, pwm.grid_offset, cfg.ctrl.computation,
         pwm.switching_period,
         modulator if modulator is not None else make_modulator(pwm, cfg.base.f0, cfg.bridge),
+        topology,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceParameters:
+    """Static on-state parameters shared by scalar bridge devices."""
+
+    on_resistance: float = 0.0
+    diode_drop: float = 0.0
+    diode_resistance: float = 0.0
+
+    def __post_init__(self) -> None:
+        values = (self.on_resistance, self.diode_drop, self.diode_resistance)
+        if any(not math.isfinite(value) or value < 0.0 for value in values):
+            raise ConfigError("device resistance/drop must be finite and nonnegative")
+
+
+@dataclass(frozen=True, slots=True)
+class _LegResult:
+    voltage: float
+    upper_current: float
+    lower_current: float
+    loss: float
+    path: str
+    channel_current: float = 0.0
+    diode_current: float = 0.0
+    blocked: bool = False
+
+
+class HalfBridge:
+    """One scalar switching leg between upper and lower DC rails.
+
+    Device placement is fixed once at construction.  Setting ``upper_controlled``
+    or ``lower_controlled`` to false leaves only that device's diode available.
+    The simulation hot path therefore uses the same two-bit gate word for
+    asynchronous and synchronous legs.
+    """
+
+    duty_names = ("d",)
+    zero = 0.0
+    set_dc_current = staticmethod(_set_scalar_dc_current)
+    __slots__ = ("devices", "_gate_mask")
+
+    @staticmethod
+    def switching_state(states) -> float:
+        return float(states[0])
+
+    @staticmethod
+    def pwm_state(duties) -> float:
+        return min(1.0, max(0.0, float(duties[0])))
+
+    @staticmethod
+    def command_duties(output):
+        return (output.duty,)
+
+    def __init__(self, devices: DeviceParameters | None = None, *,
+                 upper_controlled: bool = True,
+                 lower_controlled: bool = True) -> None:
+        if type(upper_controlled) is not bool or type(lower_controlled) is not bool:
+            raise TypeError("controlled-device flags must be bool")
+        if not upper_controlled and not lower_controlled:
+            raise ConfigError("a half bridge needs at least one controlled device")
+        self.devices = devices or DeviceParameters()
+        if not isinstance(self.devices, DeviceParameters):
+            raise TypeError("devices must be DeviceParameters")
+        self._gate_mask = int(upper_controlled) | (int(lower_controlled) << 1)
+
+    def _gate_word(self, gates) -> int:
+        if len(gates) != 2 or any(value not in (0, 1, False, True) for value in gates):
+            raise ConfigError("a half bridge needs two binary gates")
+        word = int(bool(gates[0])) | (int(bool(gates[1])) << 1)
+        if word == 3:
+            raise ConfigError("shoot-through: both half-bridge devices are on")
+        if word & ~self._gate_mask:
+            raise ConfigError("gate command targets a diode-only half-bridge branch")
+        return word
+
+    def bounds(self, gates, upper: float, lower: float = 0.0) -> tuple[float, float]:
+        word = self._gate_word(gates)
+        if upper < lower:
+            raise ConfigError("upper DC rail must not be below lower rail")
+        if word == 1:
+            return upper, upper
+        if word == 2:
+            return lower, lower
+        return lower - self.devices.diode_drop, upper + self.devices.diode_drop
+
+    def resolve(self, gates, current: float, upper: float, lower: float = 0.0,
+                floating: float = 0.0) -> _LegResult:
+        word = self._gate_word(gates)
+        if upper < lower:
+            raise ConfigError("upper DC rail must not be below lower rail")
+        p = self.devices
+        if word:
+            upper_on = word == 1
+            rail = upper if upper_on else lower
+            reverse = current < 0.0 if upper_on else current > 0.0
+            channel, diode = current, 0.0
+            drop = p.on_resistance * abs(current)
+            if reverse and p.on_resistance > 0.0 and drop > p.diode_drop:
+                diode = math.copysign(
+                    (drop - p.diode_drop)
+                    / (p.on_resistance + p.diode_resistance),
+                    current,
+                )
+                channel = current - diode
+                drop = p.on_resistance * abs(channel)
+            voltage = rail - math.copysign(drop, current) if current else rail
+            upper_current, lower_current = (
+                (current, 0.0) if upper_on else (0.0, current)
+            )
+            side = "upper" if upper_on else "lower"
+            suffix = "+diode" if diode else ""
+            return _LegResult(
+                voltage,
+                upper_current,
+                lower_current,
+                max(0.0, (rail - voltage) * current),
+                f"{side}.channel{suffix}",
+                channel,
+                diode,
+            )
+        if current > 0.0:
+            voltage = lower - p.diode_drop - p.diode_resistance * current
+            return _LegResult(
+                voltage, 0.0, current, (lower - voltage) * current,
+                "lower.diode", diode_current=current,
+            )
+        if current < 0.0:
+            voltage = upper + p.diode_drop - p.diode_resistance * current
+            return _LegResult(
+                voltage, current, 0.0, (upper - voltage) * current,
+                "upper.diode", diode_current=current,
+            )
+        low = lower - p.diode_drop
+        high = upper + p.diode_drop
+        tolerance = 1e-12 * max(1.0, abs(upper), abs(lower), abs(floating))
+        if floating < low - tolerance:
+            return _LegResult(low, 0.0, 0.0, 0.0, "lower.diode")
+        if floating > high + tolerance:
+            return _LegResult(high, 0.0, 0.0, 0.0, "upper.diode")
+        return _LegResult(
+            max(low, min(high, floating)), 0.0, 0.0, 0.0,
+            "blocked", blocked=True,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _FullBridgeResult:
+    voltage: float
+    dc_current: float
+    loss: float
+    paths: tuple[str, str]
+    blocked: bool
+    channels: tuple[float, float, float, float]
+    diodes: tuple[float, float, float, float]
+
+
+class FullBridge:
+    """Two controlled half bridges forming one scalar H-bridge."""
+
+    duty_names = ("d_left", "d_right")
+    zero = 0.0
+    set_dc_current = staticmethod(_set_scalar_dc_current)
+    __slots__ = ("left", "right", "devices")
+
+    gates = {
+        "positive": (1, 0, 0, 1),
+        "negative": (0, 1, 1, 0),
+        "zero_high": (1, 0, 1, 0),
+        "zero_low": (0, 1, 0, 1),
+        "blocked": (0, 0, 0, 0),
+    }
+
+    @staticmethod
+    def switching_state(states) -> float:
+        return float(states[0]) - float(states[1])
+
+    @staticmethod
+    def pwm_state(duties) -> float:
+        left = min(1.0, max(0.0, float(duties[0])))
+        right = min(1.0, max(0.0, float(duties[1])))
+        return left - right
+
+    @staticmethod
+    def command_duties(output):
+        duty = output.duty
+        return duty, 1.0 - duty
+
+    def __init__(self, devices: DeviceParameters | None = None) -> None:
+        self.left = HalfBridge(devices)
+        self.right = HalfBridge(self.left.devices)
+        self.devices = self.left.devices
+
+    def _gates(self, gates) -> tuple[int, int, int, int]:
+        if isinstance(gates, str):
+            try:
+                return self.gates[gates]
+            except KeyError as exc:
+                raise ConfigError("unknown full-bridge gate state") from exc
+        if len(gates) != 4:
+            raise ConfigError("a full bridge needs four binary gates")
+        result = tuple(gates)
+        self.left._gate_word(result[:2])
+        self.right._gate_word(result[2:])
+        return result
+
+    def voltage_bounds(self, gates, vdc: float) -> tuple[float, float]:
+        values = self._gates(gates)
+        left_low, left_high = self.left.bounds(values[:2], vdc, 0.0)
+        right_low, right_high = self.right.bounds(values[2:], vdc, 0.0)
+        return left_low - right_high, left_high - right_low
+
+    def resolve(self, gates, current: float, vdc: float,
+                floating: float = 0.0) -> _FullBridgeResult:
+        if not math.isfinite(vdc) or vdc < 0.0:
+            raise ConfigError("full-bridge DC voltage must be finite and nonnegative")
+        values = self._gates(gates)
+        left_gates, right_gates = values[:2], values[2:]
+        if current == 0.0:
+            left_low, left_high = self.left.bounds(left_gates, vdc, 0.0)
+            right_low, right_high = self.right.bounds(right_gates, vdc, 0.0)
+            target = max(left_low - right_high,
+                         min(left_high - right_low, floating))
+            left_voltage = max(left_low, min(left_high, right_low + target))
+            right_voltage = left_voltage - target
+            left = self.left.resolve(
+                left_gates, 0.0, vdc, floating=left_voltage,
+            )
+            right = self.right.resolve(
+                right_gates, 0.0, vdc, floating=right_voltage,
+            )
+            blocked = (
+                not all((any(left_gates), any(right_gates)))
+                and math.isclose(
+                    target,
+                    floating,
+                    rel_tol=0.0,
+                    abs_tol=1e-12 * max(1.0, vdc, abs(floating)),
+                )
+            )
+        else:
+            left = self.left.resolve(left_gates, current, vdc)
+            right = self.right.resolve(right_gates, -current, vdc)
+            blocked = False
+
+        def currents(leg: _LegResult):
+            upper = leg.path.startswith("upper")
+            channels = (
+                (leg.channel_current, 0.0)
+                if upper else (0.0, -leg.channel_current)
+            )
+            diodes = (
+                (-leg.diode_current, 0.0)
+                if upper else (0.0, leg.diode_current)
+            )
+            return channels, diodes
+
+        left_channels, left_diodes = currents(left)
+        right_channels, right_diodes = currents(right)
+        return _FullBridgeResult(
+            left.voltage - right.voltage,
+            left.upper_current + right.upper_current,
+            left.loss + right.loss,
+            (left.path, right.path),
+            blocked,
+            (*left_channels, *right_channels),
+            (*left_diodes, *right_diodes),
+        )
+
 
 class _DCState(Bag):
     __slots__ = ("u_C",)

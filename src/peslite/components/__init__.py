@@ -9,14 +9,18 @@ models use the ADC (:mod:`.adc`) and own their PWM timing/register implementatio
 from ..solver import Bag, ConfigError, PowerPort, StoragePort
 from .network import (ELEMENT_TYPES, Element, Load, RCNode, RLBranch, Terminal, ThreePhaseSource,
                       register_element_type)
-from .converter import (AveragingBridge, Bridge, PWMBridge, DCCapacitor, DCCurrentSource, DCLink,
-                        DCVoltageSource, make_bridge, make_dclink)
+from .converter import (AveragingBridge, PWMBridge, SwitchingBridge, ThreePhaseBridge,
+                        DCCapacitor, DCCurrentSource, DCLink,
+                        DCVoltageSource, DeviceParameters, FullBridge, HalfBridge,
+                        make_bridge, make_dclink)
 from .adc import ADC, MeasurementPorts
 from .pwm import ZOH, CarrierComparison, PWM, SwitchingSequence, SynchronousCarrier, make_modulator
 
 __all__ = ["Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
            "Bag", "ConfigError", "PowerPort", "StoragePort",
-           "register_element_type", "Load", "Bridge", "PWMBridge", "make_bridge", "DCLink",
+           "register_element_type", "Load", "ThreePhaseBridge", "SwitchingBridge",
+           "PWMBridge", "make_bridge", "DCLink",
            "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink", "ADC",
-           "MeasurementPorts", "AveragingBridge", "PWM", "SwitchingSequence",
+           "MeasurementPorts", "AveragingBridge", "HalfBridge",
+           "FullBridge", "DeviceParameters", "PWM", "SwitchingSequence",
            "CarrierComparison", "SynchronousCarrier", "ZOH", "make_modulator"]

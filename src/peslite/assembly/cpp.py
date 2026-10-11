@@ -19,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from ..components.converter import Bridge, DCLink, DCVoltageSource
+from ..components.converter import _BridgeModel, DCLink, DCVoltageSource
 from ..components.network import RCNode, RLBranch, ThreePhaseSource
 from ..components.pwm import CarrierComparison, SynchronousCarrier, ZOH
 from ..control.controller import UniteType
@@ -635,7 +635,7 @@ class _ModelGenerator:
             return [f"{self.value(out, 'i')} = {self.value(state, 'i')};"]
         if isinstance(owner, RCNode):
             return [f"{self.value(out, 'u')} = {self.value(state, 'u_C')} + {_number(owner.R_d)} * {self.value(inp, 'i')};"]
-        if isinstance(owner, Bridge):
+        if isinstance(owner, _BridgeModel):
             if name == "set_dc_current":
                 return [f"{self.value(out, 'i_dc')} = 1.5 * std::real({self.value(inp, 'q')} * std::conj({self.value(inp, 'i_c')}));"]
             if name == "set_ac_voltage":
@@ -730,7 +730,7 @@ class _ModelGenerator:
             return [derivative]
         if isinstance(sub, RCNode):
             return [f"{self.value(inp, 'i')} / {_number(sub.C)}"]
-        if isinstance(sub, (ThreePhaseSource, Bridge)):
+        if isinstance(sub, (ThreePhaseSource, _BridgeModel)):
             return []
         if isinstance(sub, DCLink):
             if sub.capacitor is None:
