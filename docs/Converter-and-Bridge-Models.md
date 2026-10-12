@@ -36,15 +36,23 @@ placement with a default fully controlled leg.
 steady-state duty feedforward from the configured converter topology and supplies it through a
 typed control port, leaving the current loop responsible only for current regulation and limits.
 
-A diode current is unilateral. The DC plant therefore constrains the inductor current to be
-nonnegative: at zero current, a negative unconstrained derivative is replaced by zero, and any
-numerical crossing is projected back onto the zero-current boundary. This produces the idle
-interval of discontinuous-conduction mode (DCM). A fully controlled `HalfBridge` component remains
-capable of reverse current and does not receive this constraint.
+A diode current is unilateral. In `switching`, integration lands at the natural current zero before
+the bridge is re-evaluated, so the discharge interval ends at the physical boundary rather than at
+the end of a numerical step. Projection remains only a numerical safety net. A fully controlled
+`HalfBridge` remains capable of reverse current and does not receive this boundary handling.
 
-All three simulation forms enforce the same electrical current boundary. `switching` resolves the
-individual charge, discharge and zero-current intervals; the averaged forms preserve the
-low-frequency constrained trajectory but do not reproduce sub-cycle ripple.
+The averaged forms store cycle-mean inductor current, which remains positive in DCM even though the
+instantaneous current has a zero-current interval. They derive the controlled, diode and idle
+fractions from duty, carrier period, mean current and terminal voltages. Consequently their DCM
+conversion ratio is not forced to the CCM duty-ratio relation. The triangular-ripple approximation
+preserves the low-frequency envelope and mean-square winding loss, but does not reproduce sub-cycle
+ripple or exact switching-transient peaks. State derivatives use the actual total conduction
+fraction, so a DCM interval contributes its physical share of the complete carrier period rather
+than introducing a conditional-time fast pole.
+
+The sampled averaged Buck model tightens an explicit fixed step only while its operating point is
+near the DCM boundary. CCM, Boost and Buck-Boost retain the configured solver step; continuous
+averaging relies on the configured adaptive solver in the same way as other continuous models.
 
 ## Switching
 

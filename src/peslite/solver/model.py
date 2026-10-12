@@ -59,11 +59,14 @@ class OutputStage:
 
     ``method``: name of a method taking ``t``; ``inputs``: ``inp`` fields it reads;
     ``outputs``: ``out`` fields it writes. Every output field needs exactly one producer.
+    ``rhs`` may be false when no state derivative of the owning subsystem reads the stage.  The
+    model still includes it when an RHS-required downstream signal depends on its outputs.
     """
 
     method: str
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
+    rhs: bool = True
 
 
 @runtime_checkable
@@ -787,14 +790,15 @@ class Model:
         for sub, field in self.connections:
             connected[id(sub)].append(field)
 
-        operations, owners, dependencies, labels = [], [], [], []
+        operations, owners, dependencies, labels, rhs_required = [], [], [], [], []
 
-        def add(operation, owner, sources, label):
+        def add(operation, owner, sources, label, rhs=True):
             index = len(operations)
             operations.append(operation)
             owners.append((owner, sources))
             dependencies.append(set())
             labels.append(label)
+            rhs_required.append(rhs)
             return index
 
         producers, legacy, stages = {}, {}, []
@@ -808,7 +812,8 @@ class Model:
                 legacy[id(sub)] = node  # state aliases need no output evaluation
             else:
                 for stage in declared:
-                    node = add(("out", getattr(sub, stage.method)), sub, (), f"{name}.{stage.method}")
+                    node = add(("out", getattr(sub, stage.method)), sub, (),
+                               f"{name}.{stage.method}", stage.rhs)
                     stages.append((node, sub, stage.inputs))
                     for field in stage.outputs:
                         producers[id(sub), field] = node
@@ -886,7 +891,7 @@ class Model:
                 visit(node)
 
         component_of = {node: ci for ci, component in enumerate(components) for node in component}
-        compact_ops, compact_owners, compact_labels, compact_deps = [], [], [], []
+        compact_ops, compact_owners, compact_labels, compact_deps, compact_rhs = [], [], [], [], []
         for ci, component in enumerate(components):
             members = set(component)
             cyclic = len(component) > 1 or any(node in dependencies[node] for node in component)
@@ -934,6 +939,7 @@ class Model:
             compact_ops.append(operation)
             compact_owners.append((own_group, srcs))
             compact_labels.append(label)
+            compact_rhs.append(any(rhs_required[node] for node in component))
             compact_deps.append({component_of[dep] for node in component
                                  for dep in dependencies[node] if component_of[dep] != ci})
 
@@ -953,8 +959,17 @@ class Model:
                     ready.append(nxt)
         if len(order) != len(compact_ops):
             raise RuntimeError("internal error while collapsing algebraic output groups")
+        # An observational producer is still part of the derivative plan when a required
+        # downstream copy or output stage consumes it.  Propagate liveness towards producers in
+        # reverse topological order; this retains continuous-control signal paths while pruning
+        # unconnected measurements from sampled plant RHS calls.
+        for node in reversed(order):
+            if compact_rhs[node]:
+                for dependency in compact_deps[node]:
+                    compact_rhs[dependency] = True
         position = {node: i for i, node in enumerate(order)}
         self._plan = tuple(compact_ops[i] for i in order)
+        self._plan_rhs = tuple(compact_rhs[i] for i in order)
         self._plan_owners = tuple(compact_owners[i] for i in order)
         self._plan_dependencies = tuple(
             tuple(position[d] for d in sorted(compact_deps[i])) for i in order
@@ -1007,8 +1022,9 @@ class Model:
         load = [put(st, name, f"complex(v[{idx}], v[{idx + 1}])" if is_c else f"v[{idx}]")
                 for st, name, idx, is_c in self._state_ops]
 
-        plan = []
-        for (kind, item), (op_owners, _srcs) in zip(self._plan, self._plan_owners):
+        plan, derivative_plan = [], []
+        for (kind, item), (op_owners, _srcs), rhs_required in zip(
+                self._plan, self._plan_owners, self._plan_rhs):
             if kind in ("out", "algebraic"):
                 line = f"{ref(item)}(t)"
             else:
@@ -1021,7 +1037,10 @@ class Model:
                         value = f"({value} + {ref(gain)} * {get(out, name)})"
                 line = put(dst, field, value)
             comment = ", ".join(owners[id(owner)] for owner in op_owners)
-            plan.append(f"{line}  # {comment}")
+            line = f"{line}  # {comment}"
+            plan.append(line)
+            if rhs_required:
+                derivative_plan.append(line)
 
         derive, packed = [], []
         for j, (sub, flags, _all_complex) in enumerate(self._rhs_plan):
@@ -1035,7 +1054,8 @@ class Model:
 
         source = "\n".join(function("_load(v)", load) + function("_outputs(t)", plan)
                            + function("_zoh_outputs(t)", [plan[i] for i in self._zoh_plan])
-                           + function("rhs_list(t, v)", load + plan + derive + [f"return [{', '.join(packed)}]"])) + "\n"
+                           + function("rhs_list(t, v)", load + derivative_plan + derive
+                                      + [f"return [{', '.join(packed)}]"])) + "\n"
         filename = f"<peslite model {id(self):#x}>"
         exec(compile(source, filename, "exec"), env)
         linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)

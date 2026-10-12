@@ -1,5 +1,6 @@
 """Buck, Boost and Buck-Boost DC-converter simulations."""
 
+import math
 from dataclasses import fields
 
 import numpy as np
@@ -8,6 +9,9 @@ import pytest
 import peslite
 from peslite.assembly.params import ConfigError, from_dict
 from peslite.control import CapacitorVoltageControl, InductorCurrentControl
+from peslite.solver.integrators import (DormandPrince45, FixedStepSolver,
+                                        integrate_conduction, integrate_limited)
+from peslite.solver.model import Model
 
 
 CASES = {
@@ -129,6 +133,136 @@ def test_diode_path_enforces_the_zero_current_boundary(topology):
     assert plant.rhs(0.0)[0] > 0.0
 
 
+@pytest.mark.parametrize("topology", CASES)
+def test_averaged_dcm_uses_cycle_conduction_fractions(topology):
+    source, inductance, load, duty = 24.0, 200e-6, 400.0, 0.4
+    period = 1.0 / 20_000.0
+    conduction = 2.0 * inductance / (load * period)
+    if topology == "buck":
+        ratio = (-duty**2 + math.sqrt(duty**4 + 4.0 * conduction * duty**2)) / (
+            2.0 * conduction
+        )
+        diode = duty * (1.0 - ratio) / ratio
+        voltage = ratio * source
+        current = voltage / load
+    elif topology == "boost":
+        ratio = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * duty**2 / conduction))
+        diode = duty / (ratio - 1.0)
+        voltage = ratio * source
+        current = voltage * (duty + diode) / (load * diode)
+    else:
+        ratio = duty / math.sqrt(conduction)
+        diode = duty / ratio
+        voltage = -ratio * source
+        current = -voltage * (duty + diode) / (load * diode)
+
+    params = _case(topology, "averaging").replace(**{
+        "units.converter.source_voltage": source,
+        "units.converter.inductance": inductance,
+        "units.converter.capacitance": 100e-6,
+        "units.converter.load_resistance": load,
+        "units.converter.series_resistance": 0.0,
+    })
+    plant = peslite.Simulation(params).unit().plant
+    plant.set_enabled(True)
+    plant.inp.q = duty
+    plant.state.i_L = current
+    plant.state.u_o = voltage
+
+    assert diode < 1.0 - duty
+    assert plant.rhs(0.0) == pytest.approx((0.0, 0.0), abs=1e-8)
+
+
+def test_buck_averaged_dcm_reaches_the_analytic_operating_point():
+    params = _case("buck", "averaging").replace(**{
+        "units.converter.source_voltage": 24.0,
+        "units.converter.inductance": 200e-6,
+        "units.converter.capacitance": 100e-6,
+        "units.converter.load_resistance": 400.0,
+        "units.converter.series_resistance": 0.0,
+    })
+    plant = peslite.Simulation(params).unit().plant
+    plant.set_enabled(True)
+    plant.inp.q = 0.4
+    model = Model({"plant": plant}, {})
+    state = DormandPrince45(1e-8, 1e-10, 2e-6)(
+        model.rhs, 0.0, 0.06, model.get_initial_values()
+    ).y
+
+    assert state[0] == pytest.approx(0.05393877, rel=2e-5)
+    assert state[1] == pytest.approx(21.57550765, rel=2e-5)
+
+
+def test_buck_averaged_dcm_limits_an_explicit_step_near_its_fast_boundary():
+    params = _case("buck", "pwm_averaging").replace(**{
+        "units.converter.source_voltage": 24.0,
+        "units.converter.inductance": 200e-6,
+        "units.converter.capacitance": 470e-6,
+        "units.converter.load_resistance": 400.0,
+        "units.converter.series_resistance": 0.0,
+    })
+    plant = peslite.Simulation(params).unit().plant
+    plant.set_enabled(True)
+    plant.inp.q = 0.6
+    conduction = 2.0 * plant.L / (plant.R_load * plant.period)
+    ratio = (-0.6**2 + math.sqrt(0.6**4 + 4.0 * conduction * 0.6**2)) / (
+        2.0 * conduction
+    )
+    expected_voltage = ratio * plant.v_in
+    expected_current = expected_voltage / plant.R_load
+    plant.state.u_o = expected_voltage
+    plant.state.i_L = expected_current
+    model = Model({"plant": plant}, {})
+    state = integrate_limited(
+        model, FixedStepSolver(5e-6, "rk4"), 0.0, 0.03,
+        model.get_initial_values(), (plant,),
+    )
+
+    assert state[0] == pytest.approx(expected_current, rel=1e-8)
+    assert state[1] == pytest.approx(expected_voltage, rel=1e-8)
+
+
+def test_buck_switching_dcm_lands_on_the_natural_current_zero():
+    params = _case("buck", "switching").replace(**{
+        "units.converter.source_voltage": 24.0,
+        "units.converter.inductance": 200e-6,
+        "units.converter.capacitance": 100e-6,
+        "units.converter.load_resistance": 400.0,
+        "units.converter.series_resistance": 0.0,
+    })
+    plant = peslite.Simulation(params).unit().plant
+    plant.set_enabled(True)
+    model = Model({"plant": plant}, {})
+    solver = FixedStepSolver(2.5e-6, "rk4")
+    state = model.get_initial_values()
+    current_index = model.state_slice(plant, "i_L").start
+    boundaries = ((plant, current_index),)
+    time, period, duty = 0.0, 50e-6, 0.4
+    for _ in range(1200):
+        plant.inp.q = 1.0
+        end = time + duty * period
+        state = integrate_conduction(model, solver, time, end, state, boundaries)
+        time = end
+        plant.inp.q = 0.0
+        end = time + (1.0 - duty) * period
+        state = integrate_conduction(model, solver, time, end, state, boundaries)
+        time = end
+
+    assert state[current_index] == 0.0
+    assert state[current_index + 1] == pytest.approx(21.57550765, rel=1e-4)
+
+
+def test_diode_boundary_does_not_block_current_reversal_through_an_on_channel():
+    plant = peslite.Simulation(_case("buck", "switching")).unit().plant
+    plant.set_enabled(True)
+    plant.inp.q = 1.0
+    plant.state.i_L = 0.0
+    plant.state.u_o = 60.0
+
+    assert not plant.conduction_boundary()
+    assert plant.rhs(0.0)[0] < 0.0
+
+
 @pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
 def test_light_load_buck_enters_dcm_without_negative_current(model, tmp_path):
     params = _case("buck", model, t_end=0.005).replace(**{
@@ -137,12 +271,19 @@ def test_light_load_buck_enters_dcm_without_negative_current(model, tmp_path):
         "simulation.output.states": True,
         "simulation.output.energy": False,
     })
-    result = peslite.Simulation(params).run(out_dir=tmp_path / model)
+    simulation = peslite.Simulation(params)
+    result = simulation.run(out_dir=tmp_path / model)
     current = result.states["converter.plant.i_L"]
     tail = current[result.states["t"] >= 0.0025]
 
     assert np.all(current >= 0.0)
-    assert np.any(tail == 0.0)
+    if model == "switching":
+        assert np.any(tail == 0.0)
+    else:
+        assert np.all(tail > 0.0)
+        plant = simulation.unit().plant
+        alpha, beta, _total, _resistance, _rms = plant._averaged_fractions(plant.inp.q)
+        assert plant.inp.q * beta / alpha < 1.0 - plant.inp.q
 
 
 def test_buck_boost_control_boundary_owns_voltage_magnitude():

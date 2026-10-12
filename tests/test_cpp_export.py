@@ -175,6 +175,7 @@ def test_generated_cpp_runs_all_bridge_modes(mode, tmp_path):
 
 @pytest.mark.parametrize("topology,source,reference,load", (
     ("buck", 48.0, 24.0, 6.0),
+    ("buck", 48.0, 24.0, 600.0),
     ("boost", 24.0, 48.0, 12.0),
     ("buck_boost", 24.0, 24.0, 6.0),
 ))

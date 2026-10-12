@@ -37,7 +37,7 @@ from ..assembly.unit import Unit
 from ..components.pwm import Modulator
 from ..control.blocks import abc2complex, complex2abc
 from ..control.controller import Controller
-from .integrators import Solver
+from .integrators import Solver, integrate_conduction, integrate_limited
 from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
 from .multirate import make_solver
 from .splitbound import split_error_bound
@@ -647,6 +647,15 @@ class Simulation:
         wall0 = time.time()
 
         units = list(system.units.values())
+        conduction_stages = tuple(
+            (subsystem, mdl.state_slice(subsystem, state).start)
+            for subsystem in mdl.subsystems
+            if (state := getattr(subsystem, "conduction_state", None)) is not None
+        )
+        limited_components = tuple(
+            subsystem for subsystem in mdl.subsystems
+            if getattr(subsystem, "integration_step_limit", None) is not None
+        )
         t_start = p.simulation.initial.t
         if t_end <= t_start + _EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
@@ -740,7 +749,21 @@ class Simulation:
                                   f"known: {sorted(values)}")
             return "".join(f"   {name} = {values[name]:.6g}" for name in watch)
 
-        if project is None:
+        if conduction_stages:
+            @np.errstate(over="raise")
+            def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
+                y = integrate_conduction(mdl, solver, t_a, t_b, y, conduction_stages)
+                if event and settle is not None:
+                    y = settle(t_b, y)
+                return project(y) if project is not None else y
+        elif limited_components:
+            @np.errstate(over="raise")
+            def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
+                y = integrate_limited(mdl, solver, t_a, t_b, y, limited_components)
+                if event and settle is not None:
+                    y = settle(t_b, y)
+                return project(y) if project is not None else y
+        elif project is None:
             @np.errstate(over="raise")  # overflow counts as divergence
             def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
                 y = solver(mdl.rhs, t_a, t_b, y).y

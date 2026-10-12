@@ -531,14 +531,28 @@ class _ModelGenerator:
 
         return [value.code for value in self._trace(run)]
 
-    def trace_scalar_method(self, sub: Any, name: str) -> str:
+    def trace_scalar_method(self, sub: Any, name: str,
+                            attributes: dict[str, _Expression] | None = None) -> str:
         method = getattr(sub, name)
 
         def run():
-            clone = self._equation_clone(sub)
+            clone = self._equation_clone(sub, attributes)
             return self._rebind(method, clone)()
 
         return self._trace(run).code
+
+    def trace_solver_method(self, sub: Any, name: str,
+                            attributes: dict[str, _Expression] | None = None) -> str:
+        """Trace a scalar capability for solver scope, where states are read from ``y``."""
+        code = self.trace_scalar_method(sub, name, attributes)
+        for (record_id, field), (index, is_complex) in self.state_index.items():
+            local = self.record_fields[record_id][field]
+            value = (f"Complex{{y[{index}], y[{index + 1}]}}" if is_complex
+                     else f"y[{index}]")
+            code = code.replace(local, value)
+        for (record_id, field), held in self.zoh_fields.items():
+            code = code.replace(self.record_fields[record_id][field], held)
+        return code
 
     def trace_element_signals(self, element: Any) -> dict[str, _Expression]:
         return self.trace_element_values(element, element.signals)
@@ -785,7 +799,9 @@ class _ModelGenerator:
 
     def body(self, derivatives: bool = True) -> list[str]:
         lines = self.declarations()
-        for operation in self.model._plan:
+        for operation, rhs_required in zip(self.model._plan, self.model._plan_rhs):
+            if derivatives and not rhs_required:
+                continue
             lines.extend(self._operation(operation))
         if not derivatives:
             return lines
@@ -3134,6 +3150,33 @@ class _CppGenerator:
             if projection_lines else ""
         )
         projection_call = "project_state();" if projection_lines else ""
+        conduction_stages = tuple(
+            (subsystem, self.model.state_slice(subsystem, state).start)
+            for subsystem in self.model.subsystems
+            if (state := getattr(subsystem, "conduction_state", None)) is not None
+        )
+        conduction_boundaries = []
+        for subsystem, _index in conduction_stages:
+            enabled = model.enabled_by.get(id(subsystem))
+            attributes = ({"enabled": _Expression(enabled, "bool")}
+                          if enabled is not None else None)
+            boundary = model.trace_solver_method(
+                subsystem, "conduction_boundary", attributes
+            )
+            conduction_boundaries.append(boundary)
+        limited_components = tuple(
+            subsystem for subsystem in self.model.subsystems
+            if getattr(subsystem, "integration_step_limit", None) is not None
+        )
+        step_limits = []
+        for subsystem in limited_components:
+            enabled = model.enabled_by.get(id(subsystem))
+            attributes = ({"enabled": _Expression(enabled, "bool")}
+                          if enabled is not None else None)
+            step_limits.append(model.trace_solver_method(
+                subsystem, "integration_step_limit", attributes
+            ))
+        raw_projection_call = "" if conduction_stages or step_limits else projection_call
         member_lines = model.members()
         for generator in sampled.values():
             member_lines.extend(generator.members())
@@ -3325,7 +3368,7 @@ class _CppGenerator:
         const std::size_t count = std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(span / {fixed_dt} - 1e-9)));
         const double h = span / static_cast<double>(count);
         for (std::size_t k = 0; k < count; ++k) step(t, h);
-        {projection_call}
+        {raw_projection_call}
         t = target;
     }}'''
         else:
@@ -3370,6 +3413,86 @@ class _CppGenerator:
             }}
         }}
         adaptive_h = h;
+        {raw_projection_call}
+        t = target;
+    }}'''
+        if step_limits and not conduction_stages:
+            solver_code = solver_code.replace(
+                "void integrate(double& t, double target)",
+                "void integrate_raw(double& t, double target, double maximum_step)",
+            )
+            if fixed:
+                solver_code = solver_code.replace(
+                    f"span / {fixed_dt} - 1e-9",
+                    f"span / std::min({fixed_dt}, maximum_step) - 1e-9",
+                )
+            else:
+                solver_code = solver_code.replace(
+                    f"std::min(span, {adaptive_max_step})",
+                    f"std::min(span, std::min({adaptive_max_step}, maximum_step))",
+                ).replace(
+                    f"std::min(h * factor, {adaptive_max_step})",
+                    f"std::min(h * factor, std::min({adaptive_max_step}, maximum_step))",
+                )
+            solver_code += f'''
+
+    void integrate(double& t, double target) {{
+        double component_step = target - t;
+        {' '.join(f'component_step = std::min(component_step, {limit});' for limit in step_limits)}
+        if (component_step <= 0.0) throw std::runtime_error("component integration step is below time resolution");
+        integrate_raw(t, target, component_step);
+        {projection_call}
+        t = target;
+    }}'''
+        elif conduction_stages:
+            declarations = "\n            ".join(
+                f"double root_{index} = std::numeric_limits<double>::infinity();"
+                for _subsystem, index in conduction_stages
+            )
+            searches = []
+            zeroes = []
+            for (_subsystem, index), boundary in zip(conduction_stages, conduction_boundaries):
+                searches += [
+                    f"if (({boundary}) && initial[{index}] > 0.0 && trial[{index}] < 0.0) {{",
+                    "    double lower = begin, upper = end;",
+                    "    for (int iteration = 0; iteration < 24; ++iteration) {",
+                    "        const double middle = lower + 0.5 * (upper - lower);",
+                    "        y = initial; double probe = begin; integrate_raw(probe, middle);",
+                    f"        if (y[{index}] > 0.0) lower = middle; else upper = middle;",
+                    "    }",
+                    f"    root_{index} = lower + 0.5 * (upper - lower);",
+                    f"    first = std::min(first, root_{index});",
+                    "}",
+                ]
+                zeroes.append(
+                    f"if (std::abs(root_{index} - first) <= 2e-14) y[{index}] = 0.0;"
+                )
+            solver_code = solver_code.replace(
+                "void integrate(double& t, double target)",
+                "void integrate_raw(double& t, double target)",
+            )
+            solver_code += f'''
+
+    void integrate(double& t, double target) {{
+        double component_step = target - t;
+        {' '.join(f'component_step = std::min(component_step, {limit});' for limit in step_limits)}
+        while (t < target - 1e-15) {{
+            const double begin = t;
+            const double end = std::min(target, begin + component_step);
+            if (end <= begin) throw std::runtime_error("component integration step is below time resolution");
+            const State initial = y;
+            integrate_raw(t, end);
+            const State trial = y;
+            double first = std::numeric_limits<double>::infinity();
+            {declarations}
+            {' '.join(searches)}
+            if (std::isfinite(first)) {{
+                y = initial; t = begin; integrate_raw(t, first);
+                {' '.join(zeroes)}
+            }} else {{
+                y = trial; t = end;
+            }}
+        }}
         {projection_call}
         t = target;
     }}'''

@@ -561,8 +561,8 @@ class _DCPlant:
     state_names: ClassVar[tuple[str, ...]] = ("i_L", "u_o")
     outputs_need_inputs: ClassVar[bool] = True
     output_stages: ClassVar[tuple[OutputStage, ...]] = (
-        OutputStage("set_measurements", inputs=(), outputs=("i_L", "u_o", "v_in")),
-        OutputStage("set_input_current", inputs=("q",), outputs=("i_in",)),
+        OutputStage("set_measurements", inputs=(), outputs=("i_L", "u_o", "v_in"), rhs=False),
+        OutputStage("set_input_current", inputs=("q",), outputs=("i_in",), rhs=False),
     )
     ports: ClassVar[tuple] = ()
     has_source: ClassVar[bool] = True
@@ -573,6 +573,8 @@ class _DCPlant:
         self.C = cfg.capacitance
         self.R_load = cfg.load_resistance
         self.R_series = cfg.series_resistance
+        self.period = 1.0 / cfg.pwm.f_sw
+        self.switching = cfg.bridge.model == "switching"
         self.state = _DCPlantState(i_L=0.0, u_o=0.0)
         self.inp = _DCPlantInp(q=0.0)
         self.out = _DCPlantOut(v_in=self.v_in)
@@ -596,13 +598,47 @@ class _DCPlant:
             "boost": self._direct_input_current,
             "buck_boost": self._switched_input_current,
         }[cfg.topology]
+        self._averaged_rhs = {
+            "buck": self._buck_averaged_rhs,
+            "boost": self._boost_averaged_rhs,
+            "buck_boost": self._buck_boost_averaged_rhs,
+        }[cfg.topology]
+        self._averaged_input_current = {
+            "buck": self._averaged_switched_input_current,
+            "boost": self._averaged_direct_input_current,
+            "buck_boost": self._averaged_switched_input_current,
+        }[cfg.topology]
+        self._off_rhs = {
+            "buck": self._buck_off_rhs,
+            "boost": self._boost_off_rhs,
+            "buck_boost": self._buck_boost_off_rhs,
+        }[cfg.topology]
+        self._off_input_current = {
+            "buck": self._zero_input_current,
+            "boost": self._direct_input_current,
+            "buck_boost": self._zero_input_current,
+        }[cfg.topology]
+        self._averaged_bias = {
+            "buck": self._buck_averaged_bias,
+            "boost": self._source_averaged_bias,
+            "buck_boost": self._source_averaged_bias,
+        }[cfg.topology]
         if bridge_topology.upper_controlled and bridge_topology.lower_controlled:
             self._active_rhs = self._conducting_rhs
             self._inactive_rhs = self._disabled_rhs
-        else:
+        elif self.switching:
+            self.conduction_state = "i_L"
             self.state_bounds = {"i_L": (0.0, None)}
             self._active_rhs = self._unilateral_rhs
             self._inactive_rhs = self._unilateral_disabled_rhs
+            self.set_measurements = self._unilateral_measurements
+        else:
+            self.state_bounds = {"i_L": (0.0, None)}
+            self._active_rhs = self._averaged_rhs
+            self._inactive_rhs = self._averaged_off_rhs
+            self._active_input_current = self._averaged_input_current
+            if cfg.bridge.model == "pwm_averaging" and cfg.topology == "buck":
+                self.integration_step_limit = self._averaged_step_limit
             self.set_measurements = self._unilateral_measurements
         self.rhs = self._inactive_rhs
 
@@ -622,7 +658,9 @@ class _DCPlant:
         self.out.v_in = self.v_in
 
     def set_input_current(self, t: float) -> None:
-        self.out.i_in = self._active_input_current() if self.enabled else 0.0
+        self.out.i_in = (
+            self._active_input_current() if self.enabled else self._off_input_current()
+        )
 
     def set_outputs(self, t: float) -> None:
         self.set_measurements(t)
@@ -634,24 +672,122 @@ class _DCPlant:
     def _direct_input_current(self) -> float:
         return self.out.i_L
 
+    @staticmethod
+    def _zero_input_current() -> float:
+        return 0.0
+
+    def _buck_averaged_bias(self) -> float:
+        return self.v_in - self.state.u_o
+
+    def _source_averaged_bias(self) -> float:
+        return self.v_in
+
+    def _averaged_switched_input_current(self) -> float:
+        alpha, _beta, _total, _resistance, _rms = self._averaged_fractions(self.inp.q)
+        return alpha * max(0.0, self.state.i_L)
+
+    def _averaged_direct_input_current(self) -> float:
+        return max(0.0, self.state.i_L)
+
     def _disabled_rhs(self, t: float):
         current, voltage = self.state.i_L, self.state.u_o
         return (-self.R_series * current / self.L,
                 -voltage / (self.R_load * self.C))
 
     def _unilateral_disabled_rhs(self, t: float):
-        if self.state.i_L > 0.0:
-            return self._disabled_rhs(t)
-        return (0.0, -self.state.u_o / (self.R_load * self.C))
+        if self.state.i_L != 0.0:
+            return self._off_rhs(t)
+        derivative, _capacitor = self._off_rhs(t)
+        return (derivative if derivative > 0.0 else 0.0,
+                -self.state.u_o / (self.R_load * self.C))
+
+    def conduction_boundary(self) -> bool:
+        """Return whether the present bridge state has a unilateral diode current."""
+        return not self.enabled or self.inp.q <= 0.5
 
     def _unilateral_rhs(self, t: float):
-        if self.state.i_L > 0.0:
+        if self.state.i_L != 0.0 or not self.conduction_boundary():
             return self._conducting_rhs(t)
         return self._zero_current_rhs(t)
+
+    def _averaged_off_rhs(self, t: float):
+        return self._averaged_rhs(t, 0.0)
+
+    def _averaged_fractions(self, duty: float):
+        current = max(0.0, self.state.i_L)
+        if duty <= 0.0:
+            return 0.0, 1.0, 1.0, self.R_series, 1.0
+        if duty >= 1.0:
+            return 1.0, 0.0, 1.0, self.R_series, 1.0
+        bias = self._averaged_bias()
+        denominator = 2.0 * self.L + self.R_series * duty * self.period
+        critical = duty * self.period * bias / denominator if bias > 0.0 else 0.0
+        if current >= critical:
+            return duty, 1.0 - duty, 1.0, self.R_series, 1.0
+        total = current * denominator / (duty * self.period * bias)
+        delta = max(0.0, total - duty)
+        total = duty + delta
+        rms = 4.0 / (3.0 * total)
+        return duty / total, delta / total, total, self.R_series * rms, rms
+
+    def _averaged_step_limit(self) -> float:
+        duty = self.inp.q
+        if not self.enabled or duty <= 0.0 or duty >= 1.0:
+            return math.inf
+        current = max(0.0, self.state.i_L)
+        bias = self._averaged_bias()
+        denominator = 2.0 * self.L + self.R_series * duty * self.period
+        critical = duty * self.period * bias / denominator if bias > 0.0 else 0.0
+        if current >= 1.5 * critical:
+            return math.inf
+        return min(self.period / 10.0, 2.5 * self.L / (self.R_load + self.R_series))
+
+    def _buck_averaged_rhs(self, t: float, duty: float | None = None):
+        current, voltage = max(0.0, self.state.i_L), self.state.u_o
+        alpha, _beta, total, resistance, _rms = self._averaged_fractions(
+            self.inp.q if duty is None else duty
+        )
+        derivative = total * (
+            alpha * self.v_in - voltage - resistance * current
+        ) / self.L
+        if current == 0.0 and derivative < 0.0:
+            derivative = 0.0
+        return derivative, (current - voltage / self.R_load) / self.C
+
+    def _boost_averaged_rhs(self, t: float, duty: float | None = None):
+        current, voltage = max(0.0, self.state.i_L), self.state.u_o
+        _alpha, beta, total, resistance, _rms = self._averaged_fractions(
+            self.inp.q if duty is None else duty
+        )
+        derivative = total * (
+            self.v_in - beta * voltage - resistance * current
+        ) / self.L
+        capacitor_current = beta * current
+        if current == 0.0 and derivative < 0.0:
+            derivative = capacitor_current = 0.0
+        return derivative, (capacitor_current - voltage / self.R_load) / self.C
+
+    def _buck_boost_averaged_rhs(self, t: float, duty: float | None = None):
+        current, voltage = max(0.0, self.state.i_L), self.state.u_o
+        alpha, beta, total, resistance, _rms = self._averaged_fractions(
+            self.inp.q if duty is None else duty
+        )
+        derivative = total * (
+            alpha * self.v_in + beta * voltage - resistance * current
+        ) / self.L
+        capacitor_current = -beta * current
+        if current == 0.0 and derivative < 0.0:
+            derivative = capacitor_current = 0.0
+        return derivative, (capacitor_current - voltage / self.R_load) / self.C
 
     def _buck_rhs(self, t: float):
         current, voltage, duty = self.state.i_L, self.state.u_o, self.inp.q
         return ((duty * self.v_in - voltage - self.R_series * current) / self.L,
+                (current - voltage / self.R_load) / self.C)
+
+    def _buck_off_rhs(self, t: float):
+        current, voltage = self.state.i_L, self.state.u_o
+        return ((-voltage - self.R_series * current) / self.L,
                 (current - voltage / self.R_load) / self.C)
 
     def _buck_zero_current_rhs(self, t: float):
@@ -666,6 +802,11 @@ class _DCPlant:
         return ((self.v_in - off * voltage - self.R_series * current) / self.L,
                 (off * current - voltage / self.R_load) / self.C)
 
+    def _boost_off_rhs(self, t: float):
+        current, voltage = self.state.i_L, self.state.u_o
+        return ((self.v_in - voltage - self.R_series * current) / self.L,
+                (current - voltage / self.R_load) / self.C)
+
     def _boost_zero_current_rhs(self, t: float):
         voltage, duty = self.state.u_o, self.inp.q
         derivative = (self.v_in - (1.0 - duty) * voltage) / self.L
@@ -678,6 +819,11 @@ class _DCPlant:
         return ((duty * self.v_in + off * voltage - self.R_series * current) / self.L,
                 (-off * current - voltage / self.R_load) / self.C)
 
+    def _buck_boost_off_rhs(self, t: float):
+        current, voltage = self.state.i_L, self.state.u_o
+        return ((voltage - self.R_series * current) / self.L,
+                (-current - voltage / self.R_load) / self.C)
+
     def _buck_boost_zero_current_rhs(self, t: float):
         voltage, duty = self.state.u_o, self.inp.q
         derivative = (duty * self.v_in + (1.0 - duty) * voltage) / self.L
@@ -686,7 +832,18 @@ class _DCPlant:
 
     def dissipated_power(self) -> float:
         current, voltage = self.state.i_L, self.state.u_o
-        return self.R_series * current * current + voltage * voltage / self.R_load
+        if self.switching:
+            winding = self.R_series * current * current
+        else:
+            duty = self.inp.q if self.enabled else 0.0
+            _alpha, _beta, _total, _resistance, rms = self._averaged_fractions(duty)
+            magnitude = max(0.0, current)
+            if rms == 1.0 and 0.0 < duty < 1.0 and magnitude != 0.0:
+                bias = self._averaged_bias()
+                ripple = (bias - self.R_series * magnitude) * duty * self.period / self.L
+                rms += ripple * ripple / (12.0 * magnitude * magnitude)
+            winding = self.R_series * rms * magnitude ** 2
+        return winding + voltage * voltage / self.R_load
 
     def supplied_power(self) -> float:
         return self.v_in * self.out.i_in

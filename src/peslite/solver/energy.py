@@ -286,6 +286,10 @@ class _BalancePlan:
 
     def __call__(self, t: float, y: np.ndarray) -> EnergyReport:
         dy = self.model.rhs(t, y)
+        # The derivative plan may omit observational output stages.  Energy ports and
+        # supplied/dissipated-power methods may still read those outputs, so complete the
+        # public-output synchronization promised by balance() before evaluating power.
+        self.model.evaluate_outputs(t)
         into_default = [0.0] * self.n_defaults
         for term in self.transfers:
             other = getattr(term.other_record, term.other_field)
