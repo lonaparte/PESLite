@@ -22,7 +22,7 @@ __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER", "PQ",
            "ROLES", "Loop", "LOOP_TYPES", "register_loop_type", "PowerFilterParams",
            "CurrentLimitParams",
-           "SRFPLL", "CurrentLoop", "DCVoltageLoop", "PowerLoop", "SyncLaw", "PSC", "Droop", "VSG", "DVOC",
+           "SRFPLL", "CurrentLoop", "DCLinkVoltageLoop", "PowerLoop", "SyncLaw", "PSC", "Droop", "VSG", "DVOC",
            "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping", "UnitDelay",
            "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO",
            "CapacitorVoltageControl", "InductorCurrentControl"]
@@ -455,7 +455,7 @@ class CurrentLoop(Loop):
 
 
 @register_loop_type
-class DCVoltageLoop(Loop):
+class DCLinkVoltageLoop(Loop):
     """PI dc-voltage loop producing ``id_ref = ff + kp*e + ki*int(e)``.
 
     ``e = u_dc - vdc_ref`` in dc pu; ``id_ref`` in ac current pu (positive = export); the

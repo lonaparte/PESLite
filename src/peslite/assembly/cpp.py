@@ -24,9 +24,10 @@ from ..components.network import RCNode, RLBranch, ThreePhaseSource
 from ..components.pwm import CarrierComparison, SynchronousCarrier, ZOH
 from ..control.blocks import OutputLimit
 from ..control.controller import UniteType
-from ..control.loops import (ActiveDamping, CurrentLoop, DCVoltageLoop, Droop, DVOC,
+from ..control.loops import (ActiveDamping, CurrentLoop, DCLinkVoltageLoop, Droop, DVOC,
                              Matching, PowerLoop, PSC, SRFPLL, SyncLaw, UnitDelay,
                              VirtualAdmittance, VirtualImpedance, VSG)
+from .conduction import DiodeConduction
 from .params import _written_out, dumps
 from .exporter import ExportResult, _exporter
 
@@ -1196,7 +1197,7 @@ class _ACControlGenerator(_ProtectionGenerator, _ControlGenerator):
                 f'{stream} << {self.m("mod_first_t")}; else {stream} << "null";',
             ]
         dc_entry = next(((loop_name, node) for loop_name, node in self.graph.nodes.items()
-                         if isinstance(node, DCVoltageLoop)), None)
+                         if isinstance(node, DCLinkVoltageLoop)), None)
         if dc_entry is not None:
             loop_name, _node = dc_entry
             if self.unit.continuous:
@@ -1282,7 +1283,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         for loop_name, node in self.graph.nodes.items():
             if isinstance(node, SyncLaw):
                 lines.append(f"double {self.m(loop_name + '_v_mag')} = {_number(node.v_mag)};")
-            elif isinstance(node, DCVoltageLoop):
+            elif isinstance(node, DCLinkVoltageLoop):
                 lines += [
                     f"std::size_t {self.m(loop_name + '_limit_checks')} = {int(node.n_updates)};",
                     f"std::size_t {self.m(loop_name + '_limit_exceeded')} = {int(node.n_limit_exceeded)};",
@@ -1295,7 +1296,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         """Observe ideal-controller limits once per output snapshot, outside the RHS."""
         lines: list[str] = []
         for loop_name, node in self.graph.nodes.items():
-            if not isinstance(node, DCVoltageLoop):
+            if not isinstance(node, DCLinkVoltageLoop):
                 continue
             # Graph values are local to evaluate(); the snapshot runs after sync(), where the
             # controller's persisted log value is the same current reference.
@@ -1432,7 +1433,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
             body += [f"{g(name + '.extra')} = {inp(name, 'extra')};",
                      f"{g(name + '.u_dq')} = feedforward + {_number(node.kp)} * error + {_number(node.ki)} * {integral};",
                      f"{deriv(name, 'integral_pu')} = error;"]
-        elif isinstance(node, DCVoltageLoop):
+        elif isinstance(node, DCLinkVoltageLoop):
             integral = state(name, "integral_pu")
             error = f"({inp(name, 'u_dc')} - {inp(name, 'vdc_ref')})"
             raw = (f"({self.m('startup_run')} ? ({self.m('startup_value')} * {_number(node.cfg.id0_export_pu)} + "
@@ -1551,7 +1552,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
                     reset.append(("integral_pu", False))
                 elif isinstance(node, CurrentLoop):
                     reset.append(("integral_pu", True))
-                elif isinstance(node, DCVoltageLoop):
+                elif isinstance(node, DCLinkVoltageLoop):
                     reset.append(("integral_pu", False))
                 elif isinstance(node, PSC):
                     reset.append(("v_int_pu", False))
@@ -1723,7 +1724,7 @@ class _UnitGenerator(_ACControlGenerator):
                     lines.append(f"double {self.node(loop_name, 'u_g')} = {_number(node.u_g)};")
             elif isinstance(node, CurrentLoop):
                 lines.append(f"Complex {self.node(loop_name, 'integral')} = {_complex(node.integral)};")
-            elif isinstance(node, DCVoltageLoop):
+            elif isinstance(node, DCLinkVoltageLoop):
                 lines += [f"double {self.node(loop_name, 'integral')} = {_number(node.integral)};",
                           f"bool {self.node(loop_name, 'limit_exceeded')} = {'true' if node.limit_exceeded else 'false'};",
                           f"std::size_t {self.node(loop_name, 'n_updates')} = {int(node.n_updates)};",
@@ -1815,7 +1816,7 @@ class _UnitGenerator(_ACControlGenerator):
                         return self.node(loop_name, aliases[public])
                 if isinstance(node, CurrentLoop) and public == "integral_pu":
                     return self.node(loop_name, "integral")
-                if isinstance(node, DCVoltageLoop):
+                if isinstance(node, DCLinkVoltageLoop):
                     if public == "integral_pu":
                         return self.node(loop_name, "integral")
                 if isinstance(node, PowerLoop) and public in ("p_pu", "q_pu"):
@@ -1898,7 +1899,7 @@ class _UnitGenerator(_ACControlGenerator):
                      f"{g(loop_name + '.extra')} = -{_number(node.r_a)} * (current - low_filtered);"]
         elif isinstance(node, CurrentLoop):
             body += self._current_loop(loop_name, node)
-        elif isinstance(node, DCVoltageLoop):
+        elif isinstance(node, DCLinkVoltageLoop):
             integral = m(loop_name, "integral")
             exceeded = m(loop_name, "limit_exceeded")
             ff = f"{self.m('startup_value')} * {_number(node.cfg.id0_export_pu)}"
@@ -2312,7 +2313,7 @@ class _UnitGenerator(_ACControlGenerator):
                 lines.append(f"{self.node(name, 'integral')} = 0.0;")
             elif isinstance(node, CurrentLoop):
                 lines.append(f"{self.node(name, 'integral')} = Complex{{0.0, 0.0}};")
-            elif isinstance(node, DCVoltageLoop):
+            elif isinstance(node, DCLinkVoltageLoop):
                 lines += [f"{self.node(name, 'integral')} = 0.0;",
                           f"{self.node(name, 'limit_exceeded')} = false;"]
             elif isinstance(node, PSC):
@@ -3150,33 +3151,26 @@ class _CppGenerator:
             if projection_lines else ""
         )
         projection_call = "project_state();" if projection_lines else ""
-        conduction_stages = tuple(
-            (subsystem, self.model.state_slice(subsystem, state).start)
-            for subsystem in self.model.subsystems
-            if (state := getattr(subsystem, "conduction_state", None)) is not None
-        )
-        conduction_boundaries = []
-        for subsystem, _index in conduction_stages:
+        diode_conduction = DiodeConduction(self.model)
+        diode_current_states = diode_conduction.current_states
+        diode_blocking_guards = []
+        for subsystem, _index in diode_current_states:
             enabled = model.enabled_by.get(id(subsystem))
             attributes = ({"enabled": _Expression(enabled, "bool")}
                           if enabled is not None else None)
-            boundary = model.trace_solver_method(
-                subsystem, "conduction_boundary", attributes
+            guard = model.trace_solver_method(
+                subsystem, "diode_blocks_reverse_current", attributes
             )
-            conduction_boundaries.append(boundary)
-        limited_components = tuple(
-            subsystem for subsystem in self.model.subsystems
-            if getattr(subsystem, "integration_step_limit", None) is not None
-        )
-        step_limits = []
-        for subsystem in limited_components:
+            diode_blocking_guards.append(guard)
+        diode_step_limits = []
+        for subsystem in diode_conduction.resolution_subsystems:
             enabled = model.enabled_by.get(id(subsystem))
             attributes = ({"enabled": _Expression(enabled, "bool")}
                           if enabled is not None else None)
-            step_limits.append(model.trace_solver_method(
-                subsystem, "integration_step_limit", attributes
+            diode_step_limits.append(model.trace_solver_method(
+                subsystem, "diode_maximum_step", attributes
             ))
-        raw_projection_call = "" if conduction_stages or step_limits else projection_call
+        raw_projection_call = "" if diode_conduction else projection_call
         member_lines = model.members()
         for generator in sampled.values():
             member_lines.extend(generator.members())
@@ -3416,10 +3410,27 @@ class _CppGenerator:
         {raw_projection_call}
         t = target;
     }}'''
-        if step_limits and not conduction_stages:
+        advance_method = "integrate"
+        diode_declaration = ""
+        diode_guard_methods = "\n".join(
+            f"    inline bool diode_blocks_reverse_current_{index}() {{ return {guard}; }}"
+            for index, guard in enumerate(diode_blocking_guards)
+        )
+        diode_limit_methods = "\n".join(
+            f"    inline double diode_maximum_step_{index}() {{ return {limit}; }}"
+            for index, limit in enumerate(diode_step_limits)
+        )
+        diode_methods = "\n".join(filter(None, (diode_guard_methods, diode_limit_methods)))
+        diode_projection_call = "sim.project_state();" if projection_lines else ""
+        diode_step_update = " ".join(
+            f"diode_step = std::min(diode_step, sim.diode_maximum_step_{index}());"
+            for index in range(len(diode_step_limits))
+        )
+        diode_advance_body = ""
+        if diode_step_limits and not diode_current_states:
             solver_code = solver_code.replace(
                 "void integrate(double& t, double target)",
-                "void integrate_raw(double& t, double target, double maximum_step)",
+                "void integrate_solver(double& t, double target, double maximum_step)",
             )
             if fixed:
                 solver_code = solver_code.replace(
@@ -3434,68 +3445,80 @@ class _CppGenerator:
                     f"std::min(h * factor, {adaptive_max_step})",
                     f"std::min(h * factor, std::min({adaptive_max_step}, maximum_step))",
                 )
-            solver_code += f'''
-
-    void integrate(double& t, double target) {{
-        double component_step = target - t;
-        {' '.join(f'component_step = std::min(component_step, {limit});' for limit in step_limits)}
-        if (component_step <= 0.0) throw std::runtime_error("component integration step is below time resolution");
-        integrate_raw(t, target, component_step);
-        {projection_call}
-        t = target;
-    }}'''
-        elif conduction_stages:
+            diode_advance_body = f'''
+            double diode_step = target - t;
+            {diode_step_update}
+            if (diode_step <= 0.0) throw std::runtime_error("diode conduction step is below time resolution");
+            sim.integrate_solver(t, target, diode_step);
+            {diode_projection_call}
+            t = target;'''
+        elif diode_current_states:
             declarations = "\n            ".join(
                 f"double root_{index} = std::numeric_limits<double>::infinity();"
-                for _subsystem, index in conduction_stages
+                for _subsystem, index in diode_current_states
             )
             searches = []
             zeroes = []
-            for (_subsystem, index), boundary in zip(conduction_stages, conduction_boundaries):
+            for guard_index, ((_subsystem, index), _guard) in enumerate(
+                    zip(diode_current_states, diode_blocking_guards)):
                 searches += [
-                    f"if (({boundary}) && initial[{index}] > 0.0 && trial[{index}] < 0.0) {{",
+                    f"if (sim.diode_blocks_reverse_current_{guard_index}() && initial[{index}] > 0.0 && trial[{index}] < 0.0) {{",
                     "    double lower = begin, upper = end;",
                     "    for (int iteration = 0; iteration < 24; ++iteration) {",
                     "        const double middle = lower + 0.5 * (upper - lower);",
-                    "        y = initial; double probe = begin; integrate_raw(probe, middle);",
-                    f"        if (y[{index}] > 0.0) lower = middle; else upper = middle;",
+                    "        sim.y = initial; double probe = begin; sim.integrate_solver(probe, middle);",
+                    f"        if (sim.y[{index}] > 0.0) lower = middle; else upper = middle;",
                     "    }",
                     f"    root_{index} = lower + 0.5 * (upper - lower);",
                     f"    first = std::min(first, root_{index});",
                     "}",
                 ]
                 zeroes.append(
-                    f"if (std::abs(root_{index} - first) <= 2e-14) y[{index}] = 0.0;"
+                    f"if (std::abs(root_{index} - first) <= 2e-14) sim.y[{index}] = 0.0;"
                 )
             solver_code = solver_code.replace(
                 "void integrate(double& t, double target)",
-                "void integrate_raw(double& t, double target)",
+                "void integrate_solver(double& t, double target)",
             )
+            diode_advance_body = f'''
+            double diode_step = target - t;
+            {diode_step_update}
+            while (t < target - 1e-15) {{
+                const double begin = t;
+                const double end = std::min(target, begin + diode_step);
+                if (end <= begin) throw std::runtime_error("diode conduction step is below time resolution");
+                const State initial = sim.y;
+                sim.integrate_solver(t, end);
+                const State trial = sim.y;
+                double first = std::numeric_limits<double>::infinity();
+                {declarations}
+                {' '.join(searches)}
+                if (std::isfinite(first)) {{
+                    sim.y = initial; t = begin; sim.integrate_solver(t, first);
+                    {' '.join(zeroes)}
+                }} else {{
+                    sim.y = trial; t = end;
+                }}
+            }}
+            {diode_projection_call}
+            t = target;'''
+        if diode_advance_body:
             solver_code += f'''
 
-    void integrate(double& t, double target) {{
-        double component_step = target - t;
-        {' '.join(f'component_step = std::min(component_step, {limit});' for limit in step_limits)}
-        while (t < target - 1e-15) {{
-            const double begin = t;
-            const double end = std::min(target, begin + component_step);
-            if (end <= begin) throw std::runtime_error("component integration step is below time resolution");
-            const State initial = y;
-            integrate_raw(t, end);
-            const State trial = y;
-            double first = std::numeric_limits<double>::infinity();
-            {declarations}
-            {' '.join(searches)}
-            if (std::isfinite(first)) {{
-                y = initial; t = begin; integrate_raw(t, first);
-                {' '.join(zeroes)}
-            }} else {{
-                y = trial; t = end;
-            }}
+{diode_methods}
+
+    class DiodeConduction {{
+        Simulator& sim;
+
+    public:
+        explicit DiodeConduction(Simulator& owner) : sim(owner) {{}}
+
+        void advance(double& t, double target) {{
+{diode_advance_body}
         }}
-        {projection_call}
-        t = target;
-    }}'''
+    }};'''
+            advance_method = "diode_conduction.advance"
+            diode_declaration = "DiodeConduction diode_conduction(*this);"
         adaptive_members = ('''std::size_t n_rejected = 0;
     double adaptive_h = std::numeric_limits<double>::quiet_NaN();
     double adaptive_error = 1.0;''' if adaptive else "")
@@ -3727,6 +3750,7 @@ public:
         {energy_declarations_text}
         {energy_header}
         double t = {_number(self.p.simulation.initial.t)};
+        {diode_declaration}
         {projection_call}
         const double end = {run_end};
         const double output_period = {output_period_value};
@@ -3758,7 +3782,7 @@ public:
             if (action_index < action_times.size()) boundary = std::min(boundary, action_times[action_index]);
             const double interval_start = t;
             if (boundary > t + time_eps) {{
-                integrate(t, boundary);
+                {advance_method}(t, boundary);
             }} else {{
                 t = boundary;
             }}

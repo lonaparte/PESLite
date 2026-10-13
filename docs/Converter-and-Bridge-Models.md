@@ -36,10 +36,12 @@ placement with a default fully controlled leg.
 steady-state duty feedforward from the configured converter topology and supplies it through a
 typed control port, leaving the current loop responsible only for current regulation and limits.
 
-A diode current is unilateral. In `switching`, integration lands at the natural current zero before
-the bridge is re-evaluated, so the discharge interval ends at the physical boundary rather than at
-the end of a numerical step. Projection remains only a numerical safety net. A fully controlled
-`HalfBridge` remains capable of reverse current and does not receive this boundary handling.
+A diode current is unilateral. The dedicated `DiodeConduction` assembly stage owns that device
+behavior; it is not part of RK4, DP45 or another generic integrator. In `switching`, the stage uses
+the selected solver to locate the natural current zero before the bridge is re-evaluated, so the
+discharge interval ends at the physical boundary rather than at the end of a numerical step.
+Projection remains only a numerical safety net. A fully controlled `HalfBridge` remains capable of
+reverse current and does not receive this boundary handling.
 
 The averaged forms store cycle-mean inductor current, which remains positive in DCM even though the
 instantaneous current has a zero-current interval. They derive the controlled, diode and idle
@@ -50,9 +52,10 @@ ripple or exact switching-transient peaks. State derivatives use the actual tota
 fraction, so a DCM interval contributes its physical share of the complete carrier period rather
 than introducing a conditional-time fast pole.
 
-The sampled averaged Buck model tightens an explicit fixed step only while its operating point is
-near the DCM boundary. CCM, Boost and Buck-Boost retain the configured solver step; continuous
-averaging relies on the configured adaptive solver in the same way as other continuous models.
+For the sampled averaged Buck model, the same diode-conduction stage requests finer local
+resolution only while its operating point is near the DCM boundary. CCM, Boost and Buck-Boost
+retain the configured solver step; continuous averaging relies on the configured adaptive solver
+in the same way as other continuous models.
 
 ## Switching
 

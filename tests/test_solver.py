@@ -9,12 +9,18 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.solver import (AdaptiveSolver, Bag, DormandPrince45, Empty, FixedStepSolver,
-                            Model, MultirateSolver, OutputStage, make_solver)
+                            Model, MultirateSolver, OutputMethod, make_solver)
 from peslite.solver.multirate import parse_step
 
 QUIET = {"simulation.progress.enable": 0, "simulation.solver.linearisations": 0}
 FAST = {"events.connect_vsc.t": 0.0, "events.connect_vsc.ramp": 0.01}
 SOLVER = Path(peslite.solver.__file__).parent
+
+
+def test_solver_and_control_output_stage_names_do_not_collide():
+    assert peslite.solver.OutputMethod is OutputMethod
+    assert not hasattr(peslite.solver, "OutputStage")
+    assert peslite.OutputStage is peslite.control.OutputStage
 
 
 @pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda p: p.stem)
@@ -101,7 +107,7 @@ def test_observational_output_stage_is_pruned_or_promoted_by_rhs_dependencies():
     class Producer:
         state_names = ("x",)
         outputs_need_inputs = False
-        output_stages = (OutputStage("observe", (), ("x",), rhs=False),)
+        output_stages = (OutputMethod("observe", (), ("x",), rhs=False),)
 
         def __init__(self):
             self.state, self.inp, self.out = State(x=2.0), Empty(), Output()

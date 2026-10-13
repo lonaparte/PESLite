@@ -26,6 +26,12 @@ from peslite.control import LOOP_TYPES
 BUNDLED = sorted(path.name for path in EXAMPLES.glob("*-example.pes"))
 
 
+@pytest.mark.parametrize("name", BUNDLED)
+def test_bundled_examples_declare_the_current_interface_version(name):
+    first_line = (EXAMPLES / name).read_text(encoding="utf-8").splitlines()[0]
+    assert first_line == f"# PESLite {peslite.__version__}"
+
+
 def _leaves(tree, path=()):
     if isinstance(tree, dict):
         for key, value in tree.items():
@@ -77,7 +83,7 @@ def _options(cls, found=None):
 
 def test_annotated_gfl_example_lists_every_option():
     text = (EXAMPLES / "gfl-example.pes").read_text(encoding="utf-8")
-    vsc_params = type(from_dict(read_tree(EXAMPLES / "gfl-example.pes")).unit()._specific)
+    vsc_params = type(from_dict(read_tree(EXAMPLES / "gfl-example.pes")).unit()._unit_fields)
     options = _options(Params) | _options(vsc_params)
     for kind in ("srf_pll", "dq_current_pi", "dc_voltage_pi"):
         options |= _options(LOOP_TYPES[kind].Params)

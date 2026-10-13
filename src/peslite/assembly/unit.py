@@ -19,10 +19,9 @@ from ..components.converter import HalfBridge, make_bridge, make_dclink
 from ..components.network import RLBranch, Terminal
 from ..components.pwm import TIME_EPS, Modulator
 from ..control.blocks import phases
-from ..control.controller import (Controller, Measurement, ScalarController,
-                                  make_controller, make_scalar_controller)
+from ..control.controller import Controller, Measurement, ScalarController, make_controller
 from ..solver.energy import StoragePort
-from ..solver.model import Bag, OutputStage
+from ..solver.model import Bag, OutputMethod
 from .events import Scenario
 from .params import SimulationParams, UnitParams
 from .protection import Protection
@@ -560,14 +559,14 @@ class _DCPlant:
 
     state_names: ClassVar[tuple[str, ...]] = ("i_L", "u_o")
     outputs_need_inputs: ClassVar[bool] = True
-    output_stages: ClassVar[tuple[OutputStage, ...]] = (
-        OutputStage("set_measurements", inputs=(), outputs=("i_L", "u_o", "v_in"), rhs=False),
-        OutputStage("set_input_current", inputs=("q",), outputs=("i_in",), rhs=False),
+    output_stages: ClassVar[tuple[OutputMethod, ...]] = (
+        OutputMethod("set_measurements", inputs=(), outputs=("i_L", "u_o", "v_in"), rhs=False),
+        OutputMethod("set_input_current", inputs=("q",), outputs=("i_in",), rhs=False),
     )
     ports: ClassVar[tuple] = ()
     has_source: ClassVar[bool] = True
 
-    def __init__(self, cfg: UnitParams, bridge_topology: HalfBridge) -> None:
+    def __init__(self, cfg: UnitParams, leg: HalfBridge) -> None:
         self.v_in = cfg.source_voltage
         self.L = cfg.inductance
         self.C = cfg.capacitance
@@ -623,23 +622,22 @@ class _DCPlant:
             "boost": self._source_averaged_bias,
             "buck_boost": self._source_averaged_bias,
         }[cfg.topology]
-        if bridge_topology.upper_controlled and bridge_topology.lower_controlled:
+        if leg.upper_controlled and leg.lower_controlled:
             self._active_rhs = self._conducting_rhs
             self._inactive_rhs = self._disabled_rhs
-        elif self.switching:
-            self.conduction_state = "i_L"
-            self.state_bounds = {"i_L": (0.0, None)}
-            self._active_rhs = self._unilateral_rhs
-            self._inactive_rhs = self._unilateral_disabled_rhs
-            self.set_measurements = self._unilateral_measurements
         else:
             self.state_bounds = {"i_L": (0.0, None)}
-            self._active_rhs = self._averaged_rhs
-            self._inactive_rhs = self._averaged_off_rhs
-            self._active_input_current = self._averaged_input_current
-            if cfg.bridge.model == "pwm_averaging" and cfg.topology == "buck":
-                self.integration_step_limit = self._averaged_step_limit
             self.set_measurements = self._unilateral_measurements
+            if self.switching:
+                self.diode_blocks_reverse_current = self._diode_blocks_reverse_current
+                self._active_rhs = self._unilateral_rhs
+                self._inactive_rhs = self._unilateral_disabled_rhs
+            else:
+                self._active_rhs = self._averaged_rhs
+                self._inactive_rhs = self._averaged_off_rhs
+                self._active_input_current = self._averaged_input_current
+                if cfg.bridge.model == "pwm_averaging" and cfg.topology == "buck":
+                    self.diode_maximum_step = self._averaged_diode_maximum_step
         self.rhs = self._inactive_rhs
 
     def set_enabled(self, enabled: bool) -> None:
@@ -683,7 +681,7 @@ class _DCPlant:
         return self.v_in
 
     def _averaged_switched_input_current(self) -> float:
-        alpha, _beta, _total, _resistance, _rms = self._averaged_fractions(self.inp.q)
+        alpha, _beta, _total, _resistance, _rms = self._averaged_conduction(self.inp.q)
         return alpha * max(0.0, self.state.i_L)
 
     def _averaged_direct_input_current(self) -> float:
@@ -701,50 +699,53 @@ class _DCPlant:
         return (derivative if derivative > 0.0 else 0.0,
                 -self.state.u_o / (self.R_load * self.C))
 
-    def conduction_boundary(self) -> bool:
-        """Return whether the present bridge state has a unilateral diode current."""
+    def _diode_blocks_reverse_current(self) -> bool:
+        """Return whether the present bridge state prevents negative inductor current."""
         return not self.enabled or self.inp.q <= 0.5
 
     def _unilateral_rhs(self, t: float):
-        if self.state.i_L != 0.0 or not self.conduction_boundary():
+        if self.state.i_L != 0.0 or not self._diode_blocks_reverse_current():
             return self._conducting_rhs(t)
         return self._zero_current_rhs(t)
 
     def _averaged_off_rhs(self, t: float):
         return self._averaged_rhs(t, 0.0)
 
-    def _averaged_fractions(self, duty: float):
+    def _averaged_critical_current(self, duty: float) -> float:
+        """Return the cycle-mean current at the CCM/DCM boundary."""
+        bias = self._averaged_bias()
+        denominator = 2.0 * self.L + self.R_series * duty * self.period
+        return duty * self.period * bias / denominator if bias > 0.0 else 0.0
+
+    def _averaged_conduction(self, duty: float):
+        """Return active/diode shares, total conduction, resistance and RMS-current factor."""
         current = max(0.0, self.state.i_L)
         if duty <= 0.0:
             return 0.0, 1.0, 1.0, self.R_series, 1.0
         if duty >= 1.0:
             return 1.0, 0.0, 1.0, self.R_series, 1.0
-        bias = self._averaged_bias()
-        denominator = 2.0 * self.L + self.R_series * duty * self.period
-        critical = duty * self.period * bias / denominator if bias > 0.0 else 0.0
+        critical = self._averaged_critical_current(duty)
         if current >= critical:
             return duty, 1.0 - duty, 1.0, self.R_series, 1.0
-        total = current * denominator / (duty * self.period * bias)
+        total = current / critical
         delta = max(0.0, total - duty)
         total = duty + delta
         rms = 4.0 / (3.0 * total)
         return duty / total, delta / total, total, self.R_series * rms, rms
 
-    def _averaged_step_limit(self) -> float:
+    def _averaged_diode_maximum_step(self) -> float:
         duty = self.inp.q
         if not self.enabled or duty <= 0.0 or duty >= 1.0:
             return math.inf
         current = max(0.0, self.state.i_L)
-        bias = self._averaged_bias()
-        denominator = 2.0 * self.L + self.R_series * duty * self.period
-        critical = duty * self.period * bias / denominator if bias > 0.0 else 0.0
+        critical = self._averaged_critical_current(duty)
         if current >= 1.5 * critical:
             return math.inf
         return min(self.period / 10.0, 2.5 * self.L / (self.R_load + self.R_series))
 
     def _buck_averaged_rhs(self, t: float, duty: float | None = None):
         current, voltage = max(0.0, self.state.i_L), self.state.u_o
-        alpha, _beta, total, resistance, _rms = self._averaged_fractions(
+        alpha, _beta, total, resistance, _rms = self._averaged_conduction(
             self.inp.q if duty is None else duty
         )
         derivative = total * (
@@ -756,7 +757,7 @@ class _DCPlant:
 
     def _boost_averaged_rhs(self, t: float, duty: float | None = None):
         current, voltage = max(0.0, self.state.i_L), self.state.u_o
-        _alpha, beta, total, resistance, _rms = self._averaged_fractions(
+        _alpha, beta, total, resistance, _rms = self._averaged_conduction(
             self.inp.q if duty is None else duty
         )
         derivative = total * (
@@ -769,7 +770,7 @@ class _DCPlant:
 
     def _buck_boost_averaged_rhs(self, t: float, duty: float | None = None):
         current, voltage = max(0.0, self.state.i_L), self.state.u_o
-        alpha, beta, total, resistance, _rms = self._averaged_fractions(
+        alpha, beta, total, resistance, _rms = self._averaged_conduction(
             self.inp.q if duty is None else duty
         )
         derivative = total * (
@@ -836,7 +837,7 @@ class _DCPlant:
             winding = self.R_series * current * current
         else:
             duty = self.inp.q if self.enabled else 0.0
-            _alpha, _beta, _total, _resistance, rms = self._averaged_fractions(duty)
+            _alpha, _beta, _total, _resistance, rms = self._averaged_conduction(duty)
             magnitude = max(0.0, current)
             if rms == 1.0 and 0.0 < duty < 1.0 and magnitude != 0.0:
                 bias = self._averaged_bias()
@@ -867,14 +868,14 @@ class DCConverter(Unit):
             "boost": (False, True),
             "buck_boost": (False, True),
         }[cfg.topology]
-        topology = HalfBridge(
+        leg = HalfBridge(
             upper_controlled=upper_controlled,
             lower_controlled=lower_controlled,
         )
-        self.plant = _DCPlant(cfg, topology)
-        self.bridge = make_bridge(cfg, sim, modulator, topology=topology)
+        self.plant = _DCPlant(cfg, leg)
+        self.bridge = make_bridge(cfg, sim, modulator, topology=leg)
         self.continuous = bool(getattr(self.bridge, "continuous", False))
-        self.ctrl = ctrl if ctrl is not None else make_scalar_controller(cfg)
+        self.ctrl = ctrl if ctrl is not None else ScalarController(cfg)
         if bool(getattr(self.ctrl, "continuous", False)) != self.continuous:
             raise TypeError(
                 f"{name}: the controller and bridge must both be sampled or both be continuous"

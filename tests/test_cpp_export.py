@@ -95,6 +95,25 @@ def _summary(path: Path) -> dict:
     return json.loads((path / "summary.json").read_text(encoding="utf-8"))
 
 
+def _final_csv(path: Path) -> dict[str, float]:
+    with path.open(newline="", encoding="utf-8") as stream:
+        return {key: float(value) for key, value in list(csv.DictReader(stream))[-1].items()}
+
+
+def _run_generated(params, project: Path, compiler: str):
+    peslite.export(params, "cpp", project, name=project.name)
+    source = project / "peslite.cpp"
+    executable = project / "peslite"
+    subprocess.run(
+        [compiler, "-O3", "-DNDEBUG", "-std=c++17", str(source), "-o", str(executable)],
+        check=True,
+    )
+    cpp_out, python_out = project / "cpp-output", project / "python-output"
+    subprocess.run([str(executable), str(cpp_out)], check=True)
+    peslite.Simulation(params).run(out_dir=python_out)
+    return source, cpp_out, python_out
+
+
 def _quick(mode: str):
     solver = ("adaptive", "DP45") if mode == "averaging" else ("fixed", "rk4")
     return peslite.load(EXAMPLES / "gfl-example.pes").replace(**{
@@ -153,19 +172,10 @@ def test_generated_cpp_runs_all_bridge_modes(mode, tmp_path):
         pytest.skip("no C++17 compiler installed")
     params = _quick(mode)
     project = tmp_path / mode
-    peslite.export(params, "cpp", project, name=mode)
-    executable = project / "peslite"
-    subprocess.run([compiler, "-O3", "-DNDEBUG", "-std=c++17",
-                    str(project / "peslite.cpp"), "-o", str(executable)], check=True)
-    cpp_out, python_out = project / "cpp-output", project / "python-output"
-    subprocess.run([str(executable), str(cpp_out)], check=True)
-    peslite.Simulation(params).run(out_dir=python_out)
+    _source, cpp_out, python_out = _run_generated(params, project, compiler)
 
-    def final(path: Path) -> dict[str, float]:
-        with path.open(newline="", encoding="utf-8") as stream:
-            return {key: float(value) for key, value in list(csv.DictReader(stream))[-1].items()}
-
-    expected, actual = final(python_out / "states.csv"), final(cpp_out / "states.csv")
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
     assert actual.keys() == expected.keys()
     assert _summary(cpp_out).keys() == _summary(python_out).keys()
     scale = max(1.0, max(abs(value) for value in expected.values()))
@@ -205,21 +215,45 @@ def test_generated_cpp_uses_public_ports_for_scalar_converters(
         })
     params = peslite.load(EXAMPLES / "buck-example.pes").replace(**changes)
     project = tmp_path / f"{topology}-{mode}"
-    peslite.export(params, "cpp", project, name=project.name)
-    executable = project / "peslite"
-    subprocess.run([compiler, "-O3", "-DNDEBUG", "-std=c++17",
-                    str(project / "peslite.cpp"), "-o", str(executable)], check=True)
-    cpp_out, python_out = project / "cpp-output", project / "python-output"
-    subprocess.run([str(executable), str(cpp_out)], check=True)
-    peslite.Simulation(params).run(out_dir=python_out)
+    source_path, cpp_out, python_out = _run_generated(params, project, compiler)
+    source = source_path.read_text(encoding="utf-8")
+    has_diode_stage = mode == "switching" or (mode == "pwm_averaging" and topology == "buck")
+    assert ("class DiodeConduction" in source) is has_diode_stage
+    assert ("diode_conduction.advance(t, boundary)" in source) is has_diode_stage
 
-    def final(path: Path) -> dict[str, float]:
-        with path.open(newline="", encoding="utf-8") as stream:
-            return {key: float(value) for key, value in list(csv.DictReader(stream))[-1].items()}
-
-    expected, actual = final(python_out / "states.csv"), final(cpp_out / "states.csv")
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
     assert actual.keys() == expected.keys()
     assert _summary(cpp_out).keys() == _summary(python_out).keys()
+    scale = max(1.0, max(abs(value) for value in expected.values()))
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * scale
+
+
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging"))
+def test_generated_cpp_matches_python_for_adaptive_dcm(mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "buck-example.pes").replace(**{
+        "units.converter.bridge.model": mode,
+        "units.converter.load_resistance": 600.0,
+        "simulation.solver.type": "adaptive",
+        "simulation.solver.method": "DP45",
+        "simulation.solver.max_step": 1e-4,
+        "simulation.t_end": 0.005,
+        "simulation.output.period": 5e-6,
+        "simulation.output.states": True,
+        "simulation.output.signals": False,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    })
+    source, cpp_out, python_out = _run_generated(
+        params, tmp_path / f"adaptive-{mode}", compiler
+    )
+
+    assert source.read_text(encoding="utf-8").count("class DiodeConduction") == 1
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
     scale = max(1.0, max(abs(value) for value in expected.values()))
     assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * scale
 
@@ -235,25 +269,16 @@ def test_generated_cpp_runs_custom_cable_equations(tmp_path):
         "simulation.output.signals": 1,
     })
     project = tmp_path / "cable"
-    peslite.export(params, "cpp", project, name="cable")
-    executable = project / "peslite"
-    subprocess.run([compiler, "-O3", "-DNDEBUG", "-std=c++17",
-                    str(project / "peslite.cpp"), "-o", str(executable)], check=True)
-    cpp_out, python_out = project / "cpp-output", project / "python-output"
-    subprocess.run([str(executable), str(cpp_out)], check=True)
-    peslite.Simulation(params).run(out_dir=python_out)
+    _source, cpp_out, python_out = _run_generated(params, project, compiler)
 
-    def final(path: Path) -> dict[str, float]:
-        with path.open(newline="", encoding="utf-8") as stream:
-            return {key: float(value) for key, value in list(csv.DictReader(stream))[-1].items()}
-
-    expected, actual = final(python_out / "states.csv"), final(cpp_out / "states.csv")
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
     assert actual.keys() == expected.keys()
     assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * max(
         1.0, max(abs(value) for value in expected.values())
     )
-    expected_plant = final(python_out / "plant.csv")
-    actual_plant = final(cpp_out / "plant.csv")
+    expected_plant = _final_csv(python_out / "plant.csv")
+    actual_plant = _final_csv(cpp_out / "plant.csv")
     assert actual_plant.keys() == expected_plant.keys()
     assert {"cable1.i1_a", "cable1.i2_a"} <= actual_plant.keys()
 
@@ -279,29 +304,19 @@ def test_generic_cpp_fallback_lowers_custom_equations_and_state_branches(tmp_pat
     case.write_text(yaml.safe_dump(tree, sort_keys=False), encoding="utf-8")
     params = peslite.load(case)
     project = tmp_path / "conditional"
-    peslite.export(params, "cpp", project, name="conditional")
-    source = (project / "peslite.cpp").read_text(encoding="utf-8")
+    source_path, cpp_out, python_out = _run_generated(params, project, compiler)
+    source = source_path.read_text(encoding="utf-8")
     assert "std::abs" in source and "?" in source
     assert "20.0" in source and "10.0" in source
 
-    executable = project / "peslite"
-    subprocess.run([compiler, "-O3", "-DNDEBUG", "-std=c++17",
-                    str(project / "peslite.cpp"), "-o", str(executable)], check=True)
-    cpp_out, python_out = project / "cpp-output", project / "python-output"
-    subprocess.run([str(executable), str(cpp_out)], check=True)
-    peslite.Simulation(params).run(out_dir=python_out)
-
-    def final(path: Path) -> dict[str, float]:
-        with path.open(newline="", encoding="utf-8") as stream:
-            return {key: float(value) for key, value in list(csv.DictReader(stream))[-1].items()}
-
-    expected, actual = final(python_out / "states.csv"), final(cpp_out / "states.csv")
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
     assert actual.keys() == expected.keys()
     assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * max(
         1.0, max(abs(value) for value in expected.values())
     )
-    expected_plant = final(python_out / "plant.csv")
-    actual_plant = final(cpp_out / "plant.csv")
+    expected_plant = _final_csv(python_out / "plant.csv")
+    actual_plant = _final_csv(cpp_out / "plant.csv")
     assert actual_plant.keys() == expected_plant.keys()
     assert "conditional.i_mag" in actual_plant
 

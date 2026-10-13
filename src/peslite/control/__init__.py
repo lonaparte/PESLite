@@ -19,7 +19,7 @@ from .modulation import ModulationLimiter, OutputStage
 from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, ControlMeasurement,
                          ControlOutput, Controller, Measurement, ScalarControlOutput,
                          ScalarController, Startup, UniteType, default_wiring,
-                         make_controller, make_scalar_controller)
+                         make_controller)
 
 __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter", "SignalType", "ConfigError",
            "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO",
@@ -30,4 +30,4 @@ __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter", "Sign
            "ControlGraph", "default_wiring",
            "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
            "ScalarControlOutput", "Controller", "Startup", "UniteType", "ScalarController",
-           "make_controller", "make_scalar_controller"]
+           "make_controller"]

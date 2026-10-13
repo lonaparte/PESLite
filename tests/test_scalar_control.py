@@ -86,9 +86,11 @@ def test_scalar_control_uses_the_shared_control_package():
     control = Path(peslite.control.__file__).parent
 
     assert not (control / "dc.py").exists()
+    assert not hasattr(peslite.control, "make_scalar_controller")
     assert CapacitorVoltageControl.__module__ == "peslite.control.loops"
     assert InductorCurrentControl.__module__ == "peslite.control.loops"
     assert {"capacitor_voltage_control", "inductor_current_control"} <= set(LOOP_TYPES)
+    assert LOOP_TYPES["dc_voltage_pi"].__name__ == "DCLinkVoltageLoop"
 
 
 def test_scalar_control_graph_has_typed_si_ports_and_bounded_output():
@@ -117,7 +119,7 @@ def test_scalar_control_graph_runs_the_same_loops_continuously():
 
 
 @pytest.mark.parametrize("feedforward", [0.0, 0.2, 0.25])
-def test_dc_current_loop_accepts_topology_independent_feedforward(feedforward):
+def test_inductor_current_control_accepts_topology_independent_feedforward(feedforward):
     graph = _graph()
     current = graph.nodes["current"]
 

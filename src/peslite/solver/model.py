@@ -26,7 +26,7 @@ from numpy.typing import NDArray
 
 from . import energy as _energy
 
-__all__ = ["ConfigError", "Bag", "Empty", "OutputStage", "Subsystem", "Model", "GroupPlan",
+__all__ = ["ConfigError", "Bag", "Empty", "OutputMethod", "Subsystem", "Model", "GroupPlan",
            "Stateful", "StateRegistry", "join", "gather", "scatter", "flatten", "resolve",
            "expand_aliases", "assign"]
 
@@ -54,7 +54,7 @@ class Empty(Bag):
 
 
 @dataclass(frozen=True)
-class OutputStage:
+class OutputMethod:
     """One output method of a subsystem and its direct input dependencies.
 
     ``method``: name of a method taking ``t``; ``inputs``: ``inp`` fields it reads;
@@ -75,7 +75,7 @@ class Subsystem(Protocol):
 
     ``state_names``: packing order (a complex state takes two real entries);
     ``outputs_need_inputs``: whether ``set_outputs`` reads ``inp``; optional ``output_stages``
-    (tuple of :class:`OutputStage`) replaces ``set_outputs``. A subsystem may declare real-state
+    (tuple of :class:`OutputMethod`) replaces ``set_outputs``. A subsystem may declare real-state
     unilateral constraints as ``state_bounds = {name: (lower, upper)}``, using ``None`` for an
     open side.
     ``out`` and connected ``inp`` fields are current when ``rhs`` runs.
@@ -753,11 +753,11 @@ class Model:
         if stages is None:
             return None
         if not isinstance(stages, (tuple, list)) or not stages:
-            raise ValueError(f"{name}.output_stages must be a nonempty sequence of OutputStage declarations")
+            raise ValueError(f"{name}.output_stages must be a nonempty sequence of OutputMethod declarations")
         produced, methods = set(), set()
         for stage in stages:
-            if not isinstance(stage, OutputStage):
-                raise TypeError(f"{name}.output_stages: expected OutputStage, got {type(stage).__name__}")
+            if not isinstance(stage, OutputMethod):
+                raise TypeError(f"{name}.output_stages: expected OutputMethod, got {type(stage).__name__}")
             where = f"{name}.output_stages[{stage.method!r}]"
             if not isinstance(stage.method, str) or not callable(getattr(sub, stage.method, None)):
                 raise ValueError(f"{where}: method must name a callable on the subsystem")

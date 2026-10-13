@@ -4,6 +4,13 @@ PESLite separates physical components, controller logic, system assembly, numeri
 optional add-ons. The five core directories keep ownership explicit while allowing the same
 configuration to run with different bridge and solver implementations.
 
+## Interface versioning
+
+PESLite versions its Python, command-line and simulation-file interfaces with the software release.
+Every bundled simulation example declares its target release in the first comment line. Before
+version 1.0, any `0.x.x` release may change an interface; a project that depends on an exact
+interface must use the matching PESLite version.
+
 ## Package layers
 
 ```text

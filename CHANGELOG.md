@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0
+
+- Added Buck, Boost and Buck-Boost `DCConverter` units using the shared `UnitParams`, control graph,
+  bridge simulation forms and solver infrastructure.
+- Added `HalfBridge` and `FullBridge` topologies and composed them with switching, PWM-period
+  averaging and ideal averaging behavior.
+- Added natural CCM/DCM operation, dedicated diode-conduction handling and matching standalone C++
+  export without adding device behavior to the generic integrators.
+- Renamed internal Python interfaces where their former names conflicted with their actual scope.
+  PESLite versions below 1.0 may make interface changes in any `0.x.x` release.
+
 ## 0.3.0
 
 - Unified one- and multi-terminal electrical elements behind the `Terminal` contract, with

@@ -1,5 +1,6 @@
 """Buck, Boost and Buck-Boost DC-converter simulations."""
 
+import copy
 import math
 from dataclasses import fields
 
@@ -7,10 +8,11 @@ import numpy as np
 import pytest
 
 import peslite
-from peslite.assembly.params import ConfigError, from_dict
+from peslite.assembly.conduction import DiodeConduction
+from peslite.assembly.params import ConfigError, from_dict, to_dict
 from peslite.control import CapacitorVoltageControl, InductorCurrentControl
-from peslite.solver.integrators import (DormandPrince45, FixedStepSolver,
-                                        integrate_conduction, integrate_limited)
+from peslite.solver.integrators import DormandPrince45, FixedStepSolver
+from peslite.solver import integrators
 from peslite.solver.model import Model
 
 
@@ -19,6 +21,10 @@ CASES = {
     "boost": (24.0, 48.0, 12.0, 48.0),
     "buck_boost": (24.0, 24.0, 6.0, -24.0),
 }
+
+
+def test_diode_conduction_is_not_a_generic_integrator_feature():
+    assert "DiodeConduction" not in integrators.__all__
 
 
 def _case(topology, model="pwm_averaging", t_end=0.03):
@@ -213,10 +219,9 @@ def test_buck_averaged_dcm_limits_an_explicit_step_near_its_fast_boundary():
     plant.state.u_o = expected_voltage
     plant.state.i_L = expected_current
     model = Model({"plant": plant}, {})
-    state = integrate_limited(
-        model, FixedStepSolver(5e-6, "rk4"), 0.0, 0.03,
-        model.get_initial_values(), (plant,),
-    )
+    conduction = DiodeConduction(model, FixedStepSolver(5e-6, "rk4"))
+    assert conduction.resolution_subsystems == (plant,)
+    state = conduction.advance(0.0, 0.03, model.get_initial_values())
 
     assert state[0] == pytest.approx(expected_current, rel=1e-8)
     assert state[1] == pytest.approx(expected_voltage, rel=1e-8)
@@ -236,16 +241,17 @@ def test_buck_switching_dcm_lands_on_the_natural_current_zero():
     solver = FixedStepSolver(2.5e-6, "rk4")
     state = model.get_initial_values()
     current_index = model.state_slice(plant, "i_L").start
-    boundaries = ((plant, current_index),)
+    conduction = DiodeConduction(model, solver)
+    assert conduction.current_states == ((plant, current_index),)
     time, period, duty = 0.0, 50e-6, 0.4
     for _ in range(1200):
         plant.inp.q = 1.0
         end = time + duty * period
-        state = integrate_conduction(model, solver, time, end, state, boundaries)
+        state = conduction.advance(time, end, state)
         time = end
         plant.inp.q = 0.0
         end = time + (1.0 - duty) * period
-        state = integrate_conduction(model, solver, time, end, state, boundaries)
+        state = conduction.advance(time, end, state)
         time = end
 
     assert state[current_index] == 0.0
@@ -259,18 +265,22 @@ def test_diode_boundary_does_not_block_current_reversal_through_an_on_channel():
     plant.state.i_L = 0.0
     plant.state.u_o = 60.0
 
-    assert not plant.conduction_boundary()
+    assert not plant.diode_blocks_reverse_current()
     assert plant.rhs(0.0)[0] < 0.0
 
 
-@pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
-def test_light_load_buck_enters_dcm_without_negative_current(model, tmp_path):
-    params = _case("buck", model, t_end=0.005).replace(**{
+def _light_load_buck(model):
+    return _case("buck", model, t_end=0.005).replace(**{
         "units.converter.load_resistance": 600.0,
         "simulation.output.period": 5e-6,
         "simulation.output.states": True,
         "simulation.output.energy": False,
     })
+
+
+@pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
+def test_light_load_buck_enters_dcm_without_negative_current(model, tmp_path):
+    params = _light_load_buck(model)
     simulation = peslite.Simulation(params)
     result = simulation.run(out_dir=tmp_path / model)
     current = result.states["converter.plant.i_L"]
@@ -282,8 +292,40 @@ def test_light_load_buck_enters_dcm_without_negative_current(model, tmp_path):
     else:
         assert np.all(tail > 0.0)
         plant = simulation.unit().plant
-        alpha, beta, _total, _resistance, _rms = plant._averaged_fractions(plant.inp.q)
+        alpha, beta, _total, _resistance, _rms = plant._averaged_conduction(plant.inp.q)
         assert plant.inp.q * beta / alpha < 1.0 - plant.inp.q
+
+
+@pytest.mark.parametrize("model", ["switching", "pwm_averaging"])
+def test_adaptive_dcm_matches_the_fixed_step_reference(model, tmp_path):
+    fixed_params = _light_load_buck(model)
+    adaptive_params = fixed_params.replace(**{
+        "simulation.solver.type": "adaptive",
+        "simulation.solver.method": "DP45",
+        "simulation.solver.max_step": 1e-4,
+    })
+    fixed = peslite.Simulation(fixed_params).run(out_dir=tmp_path / f"{model}-fixed")
+    adaptive = peslite.Simulation(adaptive_params).run(
+        out_dir=tmp_path / f"{model}-adaptive"
+    )
+
+    assert np.all(adaptive.states["converter.plant.i_L"] >= 0.0)
+    for state in ("converter.plant.i_L", "converter.plant.u_o"):
+        assert adaptive.final_states()[state] == pytest.approx(
+            fixed.final_states()[state], rel=1e-7, abs=1e-8
+        )
+
+
+def test_multiple_switching_dc_converters_enforce_their_own_diode_boundaries(tmp_path):
+    tree = to_dict(_light_load_buck("switching"))
+    tree["units"]["converter_b"] = copy.deepcopy(tree["units"]["converter"])
+    result = peslite.Simulation(from_dict(tree)).run(out_dir=tmp_path / "multiple")
+
+    for name in ("converter", "converter_b"):
+        assert np.all(result.states[f"{name}.plant.i_L"] >= 0.0)
+    assert result.final_states()["converter.plant.u_o"] == pytest.approx(
+        result.final_states()["converter_b.plant.u_o"], rel=0.0, abs=1e-12
+    )
 
 
 def test_buck_boost_control_boundary_owns_voltage_magnitude():
@@ -322,12 +364,15 @@ def test_scalar_log_schema_comes_from_its_public_sources():
 
 def test_unit_and_control_type_boundaries_are_explicit():
     params = _case("buck")
+    unit = params.unit()
     common = {item.name for item in fields(peslite.assembly.UnitParams)}
 
     assert {"type", "pwm", "ctrl", "bridge", "s_base"} <= common
     assert {"topology", "source_voltage", "bus", "dclink"}.isdisjoint(common)
-    assert not hasattr(params.unit().ctrl.loops["current"], "topology")
-    assert not hasattr(params.unit().ctrl.loops["current"], "blocked_bridge")
+    assert unit.topology == "buck"
+    assert {"topology", "source_voltage", "inductance", "capacitance"}.isdisjoint(vars(unit))
+    assert not hasattr(unit.ctrl.loops["current"], "topology")
+    assert not hasattr(unit.ctrl.loops["current"], "blocked_bridge")
     for field, value in (("topology", "buck"), ("blocked_bridge", False)):
         with pytest.raises(ConfigError, match="unknown key"):
             params.replace(**{f"units.converter.ctrl.loops.current.{field}": value})

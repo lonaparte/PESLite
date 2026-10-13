@@ -18,8 +18,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 __all__ = ["RHS", "SolverStep", "Solver", "FIXED_METHODS", "ADAPTIVE_METHODS", "TABLEAUS", "combine", "integrator",
-           "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "integrate_conduction",
-           "integrate_limited"]
+           "FixedStepSolver", "AdaptiveSolver", "DormandPrince45"]
 
 RHS = Callable[[float, NDArray[np.float64]], NDArray[np.float64]]
 
@@ -340,69 +339,3 @@ class DormandPrince45:
         return SolverStep(t1, np.asarray(y), self.n_rhs)
 
 
-def integrate_conduction(model, solver, t0: float, t1: float,
-                         y: NDArray[np.float64], stages: tuple[tuple[object, int], ...]
-                         ) -> NDArray[np.float64]:
-    """Integrate up to unilateral-current zeros using an existing solver.
-
-    Components opt in by exposing a ``conduction_state`` and ``conduction_boundary()``. Their
-    equation supplies a smooth signed continuation during a trial step; this adapter locates the
-    first positive-to-negative crossing, lands on it, sets that current to zero and then resumes
-    with the component's blocked equation. No integration algorithm or optional numerical
-    dependency is introduced.
-    """
-    t = t0
-    while t < t1 - 1e-15:
-        initial = y.copy()
-        trial = solver(model.rhs, t, t1, initial).y
-        guards = tuple(index for stage, index in stages if stage.conduction_boundary())
-        crossing = tuple(index for index in guards
-                         if initial[index] > 0.0 and trial[index] < 0.0)
-        if not crossing:
-            return trial
-
-        roots: list[tuple[float, int]] = []
-        for index in crossing:
-            lower, upper = t, t1
-            for _ in range(24):
-                middle = lower + 0.5 * (upper - lower)
-                value = solver(model.rhs, t, middle, initial).y[index]
-                if value > 0.0:
-                    lower = middle
-                else:
-                    upper = middle
-            roots.append((lower + 0.5 * (upper - lower), index))
-
-        root = min(at for at, _index in roots)
-        y = solver(model.rhs, t, root, initial).y
-        for at, index in roots:
-            if abs(at - root) <= 2e-14:
-                y[index] = 0.0
-        t = root
-    return y
-
-
-def integrate_limited(model, solver, t0: float, t1: float,
-                      y: NDArray[np.float64], components: tuple[object, ...]
-                      ) -> NDArray[np.float64]:
-    """Integrate with state-dependent component step limits using an existing solver."""
-    configured_dt = getattr(solver, "dt", None)
-    if configured_dt is not None:
-        model.set_states(y)
-        limit = min(component.integration_step_limit() for component in components)
-        solver.dt = min(configured_dt, limit)
-        try:
-            return solver(model.rhs, t0, t1, y).y
-        finally:
-            solver.dt = configured_dt
-
-    t = t0
-    while t < t1 - 1e-15:
-        model.set_states(y)
-        limit = min(component.integration_step_limit() for component in components)
-        target = min(t1, t + limit)
-        if target <= t:
-            raise FloatingPointError("component integration step is below time resolution")
-        y = solver(model.rhs, t, target, y).y
-        t = target
-    return y

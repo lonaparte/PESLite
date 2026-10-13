@@ -194,8 +194,8 @@ def _unit(u, base, where: str) -> None:
                           f"got {protection.rocof.window}")
 
 
-def _dc_unit(u, base, where: str) -> None:
-    """Check one scalar converter unit."""
+def _dc_converter(u, base, where: str) -> None:
+    """Check one scalar DC converter."""
     if u.s_base is not None and (not math.isfinite(u.s_base) or u.s_base <= 0.0):
         raise ConfigError(f"{where}.s_base must be finite and positive, got {u.s_base}")
     for name in ("source_voltage", "inductance", "capacitance", "load_resistance"):
@@ -371,7 +371,7 @@ def validate(p: Params) -> Params:
     """Check a :class:`Params` tree and return it unchanged; raise ConfigError if invalid."""
     _network(p)
     for name, unit in p.units.items():
-        check = _dc_unit if unit.type == "dc_converter" else _unit
+        check = _dc_converter if unit.type == "dc_converter" else _unit
         check(unit, p.base, f"units.{name}")
     _solver(p.simulation.solver)
     _events(p)

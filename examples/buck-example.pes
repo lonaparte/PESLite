@@ -1,3 +1,4 @@
+# PESLite 0.4.0
 # Closed-loop Buck converter assembled from a configured half bridge, an L-C output network and
 # shared scalar control loops. The Buck topology places a controlled device in the upper position
 # and a diode in the lower position, so the inductor current naturally enters DCM at zero. Plant

@@ -1,3 +1,4 @@
+# PESLite 0.4.0
 # Grid-forming converter: power-synchronization control (PSC) with active damping.
 base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
 buses:

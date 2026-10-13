@@ -456,30 +456,28 @@ class UnitParams:
     ctrl: ControlParams
     bridge: BridgeParams = field(default_factory=BridgeParams)
     s_base: Optional[float] = None
-    _specific: Any = field(repr=False, default=None)
+    _unit_fields: Any = field(repr=False, default=None)
     base: BaseValues = field(init=False, default=None)
     derived_defaults: frozenset = field(init=False, default=frozenset(), compare=False)
     events: tuple = field(init=False, default=(), compare=False)
 
     def __init__(self, *, type: str, pwm: PWMParams, ctrl: ControlParams,
-                 _specific: Any, bridge: Optional[BridgeParams] = None,
+                 _unit_fields: Any, bridge: Optional[BridgeParams] = None,
                  s_base: Optional[float] = None, **changes: Any) -> None:
-        selected = replace(_specific, **changes) if changes else _specific
+        selected = replace(_unit_fields, **changes) if changes else _unit_fields
         object.__setattr__(self, "type", type)
         object.__setattr__(self, "pwm", pwm)
         object.__setattr__(self, "ctrl", ctrl)
         object.__setattr__(self, "bridge", BridgeParams() if bridge is None else bridge)
         object.__setattr__(self, "s_base", s_base)
-        object.__setattr__(self, "_specific", selected)
+        object.__setattr__(self, "_unit_fields", selected)
         object.__setattr__(self, "base", None)
         object.__setattr__(self, "derived_defaults", frozenset())
         object.__setattr__(self, "events", ())
-        for item in fields(selected):
-            object.__setattr__(self, item.name, getattr(selected, item.name))
 
     def __getattr__(self, name: str) -> Any:
-        """Expose the selected unit-specific fields in the flat unit section."""
-        return getattr(object.__getattribute__(self, "_specific"), name)
+        """Expose the selected schema's fields without storing a second copy."""
+        return getattr(object.__getattribute__(self, "_unit_fields"), name)
 
     @staticmethod
     def _bases(data: dict, base: BaseValues, where: str) -> tuple[BaseValues, dict[str, float]]:
@@ -539,7 +537,7 @@ class UnitParams:
 
 
 @dataclass(frozen=True)
-class _VSCFields:
+class _VSCUnitFields:
     """Fields unique to a voltage-source converter.
 
     ``bus``: terminal bus. Plant fields are stored in SI; controller parameters are
@@ -554,14 +552,14 @@ class _VSCFields:
 
 
 @dataclass(frozen=True)
-class _VoltageReferenceParams:
+class _ScalarVoltageReferenceFields:
     """Output-voltage reference in volts for a scalar controller."""
 
     voltage: float
 
 
 @dataclass(frozen=True, kw_only=True)
-class _DCConverterFields:
+class _DCConverterUnitFields:
     """Fields unique to a scalar DC converter circuit.
 
     ``topology`` selects the unit-level circuit assembled around a half bridge. Electrical plant
@@ -768,7 +766,7 @@ def to_dict(p: Any, derived: bool = False) -> dict:
     if isinstance(p, UnitParams):
         d = {
             "type": p.type,
-            **to_dict(p._specific, derived),
+            **to_dict(p._unit_fields, derived),
             "pwm": to_dict(p.pwm, derived),
             "ctrl": to_dict(p.ctrl, derived),
             "bridge": to_dict(p.bridge, derived),
@@ -869,7 +867,7 @@ def _unit_params_class(data: Any, path: str) -> type:
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: expected a mapping, got {type(data).__name__}")
     kind = data.get("type", "vsc")
-    schemas = {"vsc": _VSCFields, "dc_converter": _DCConverterFields}
+    schemas = {"vsc": _VSCUnitFields, "dc_converter": _DCConverterUnitFields}
     if kind not in schemas:
         raise ConfigError(
             f"{path}.type: unknown unit type {kind!r}; known: {sorted(schemas)}"
@@ -879,7 +877,7 @@ def _unit_params_class(data: Any, path: str) -> type:
 
 _CONTROL_REFERENCE_PARAMS = {
     **dict.fromkeys(("gfl", "gfm", "custom"), ReferenceParams),
-    "dc": _VoltageReferenceParams,
+    "dc": _ScalarVoltageReferenceFields,
 }
 
 _UNIT_CONTROL_TYPES = {
@@ -917,11 +915,11 @@ def _build_control_params(data: Any, path: str, base: BaseValues,
 
 def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
     """Build common unit fields and one explicitly scoped set of unique fields."""
-    specific_cls = _unit_params_class(data, path)
+    unit_fields_cls = _unit_params_class(data, path)
     kind = data.get("type", "vsc")
     common_names = {item.name for item in fields(_UnitCommonFields) if item.init}
-    specific_names = {item.name for item in fields(specific_cls) if item.init}
-    known = {"type", "ctrl", *common_names, *specific_names}
+    unit_field_names = {item.name for item in fields(unit_fields_cls) if item.init}
+    known = {"type", "ctrl", *common_names, *unit_field_names}
     unknown = set(data) - known
     if unknown:
         raise ConfigError(f"{path}: unknown key(s) {sorted(unknown)}; known: {sorted(known)}")
@@ -934,9 +932,9 @@ def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
         unit_base,
         unit_scales,
     )
-    specific = _build(
-        specific_cls,
-        {name: data[name] for name in specific_names if name in data},
+    unit_fields = _build(
+        unit_fields_cls,
+        {name: data[name] for name in unit_field_names if name in data},
         path,
         unit_base,
         unit_scales,
@@ -950,7 +948,7 @@ def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
         ctrl=control,
         bridge=common.bridge,
         s_base=common.s_base,
-        _specific=specific,
+        _unit_fields=unit_fields,
     )
 
 

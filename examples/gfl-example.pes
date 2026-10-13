@@ -1,3 +1,4 @@
+# PESLite 0.4.0
 # Grid-following converter on a Thevenin grid: an annotated simulation file.
 # A simulation file is YAML (named .pes): the model (base, buses, branches, sources, units, elements),
 # what happens during the run (events), how it is simulated (simulation), then notes (meta). A key that

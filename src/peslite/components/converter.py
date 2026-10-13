@@ -14,7 +14,7 @@ from numpy.typing import NDArray
 
 from ..control.blocks import abc2complex, smoothstep
 from ..solver.energy import PowerPort, StoragePort
-from ..solver.model import Bag, ConfigError, Empty, OutputStage
+from ..solver.model import Bag, ConfigError, Empty, OutputMethod
 from .pwm import TIME_EPS, Modulator, PWM, ZOH, make_modulator
 
 __all__ = ["ThreePhaseBridge", "SwitchingBridge", "PWMBridge", "AveragingBridge",
@@ -64,9 +64,9 @@ class _BridgeModel:
     has_switching_events: ClassVar[bool] = False
     outputs_need_inputs: ClassVar[bool] = True
     dirac: ClassVar[bool] = True
-    output_stages: ClassVar[tuple[OutputStage, ...]] = (
-        OutputStage("set_dc_current", inputs=("q", "i_c"), outputs=("i_dc",)),
-        OutputStage("set_ac_voltage", inputs=("q", "u_dc"), outputs=("u_c",)),
+    output_stages: ClassVar[tuple[OutputMethod, ...]] = (
+        OutputMethod("set_dc_current", inputs=("q", "i_c"), outputs=("i_dc",)),
+        OutputMethod("set_ac_voltage", inputs=("q", "u_dc"), outputs=("u_c",)),
     )
 
     def __init__(self, topology=None) -> None:
@@ -640,9 +640,9 @@ class DCLink:
 
     ports: ClassVar[tuple[PowerPort, ...]] = (PowerPort("out.u_dc", "inp.i_dc", 1.0, -1.0),)
     outputs_need_inputs: ClassVar[bool] = True  # i_src depends on i_dc
-    output_stages: ClassVar[tuple[OutputStage, ...]] = (
-        OutputStage("set_stored_voltage", inputs=(), outputs=("u_C",)),
-        OutputStage("set_outputs", inputs=("i_dc",), outputs=("u_dc", "i_src")),
+    output_stages: ClassVar[tuple[OutputMethod, ...]] = (
+        OutputMethod("set_stored_voltage", inputs=(), outputs=("u_C",)),
+        OutputMethod("set_outputs", inputs=("i_dc",), outputs=("u_dc", "i_src")),
     )
 
     def __init__(self, capacitor: DCCapacitor | None = None,

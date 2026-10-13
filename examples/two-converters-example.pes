@@ -1,3 +1,4 @@
+# PESLite 0.4.0
 # Two converters, each on its own bus and connected to the PCC by a line:
 # a grid-forming unit (PSC, 2 MVA, 20 kHz) and a grid-following unit (1 MVA, 10 kHz).
 base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}

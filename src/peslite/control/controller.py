@@ -23,13 +23,13 @@ from ..solver.model import Bag, ConfigError, gather, scatter
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, I, I_AB, LOOP_TYPES, POWER,
                     SI_CURRENT, SI_VOLTAGE, V, V_AB, V_DQ, CurrentLoop,
-                    DCVoltageLoop, Loop, SignalType, SyncLaw)
+                    DCLinkVoltageLoop, Loop, SignalType, SyncLaw)
 from .modulation import CONFIGURED, OutputStage
 
 __all__ = ["Measurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
            "ControlInterface", "CONTROL_INTERFACE", "ControlGraph", "default_wiring",
            "UniteType", "ScalarControlOutput", "ScalarController",
-           "make_controller", "make_scalar_controller"]
+           "make_controller"]
 
 
 # ------------------------------------------------------------------ the interface
@@ -1007,7 +1007,7 @@ class UniteType:
             self._terminal_limit_scale = None
             if self.stage is not None:
                 self.stage._command_saturated = False
-        if isinstance(node, DCVoltageLoop):
+        if isinstance(node, DCLinkVoltageLoop):
             limit = _OutputLimit(
                 node.limit, lower=node.floor, pi=None if self.continuous else node.pi,
                 observer=node.observe_limit,
@@ -1675,11 +1675,6 @@ class ScalarController:
 
     def summary(self) -> dict[str, Any]:
         return {"alarms": []}
-
-
-def make_scalar_controller(cfg) -> ScalarController:
-    """Build the scalar controller of a Buck, Boost or Buck-Boost unit."""
-    return ScalarController(cfg)
 
 
 def make_controller(cfg, **kwargs):
