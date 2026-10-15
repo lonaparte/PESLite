@@ -30,20 +30,24 @@ numerically identical.
 `DCConverter` is an open Unit, not a packaged Buck/Boost circuit. It owns a DC link, a selected
 `half_bridge` or `full_bridge`, its controller and an optional series filter. The common terminal
 contract connects that filter to a named bus. A scalar DC network uses
-`buses.<name>.phases: 1`; the same interface also permits a three-phase point-network connection,
-where the scalar bridge acts on the real stationary axis and has no synchronisation law. Such an
-unsynchronised case is intentionally possible, though it is not a normal grid-control strategy.
+`buses.<name>.phases: 1`; a DC converter cannot connect its scalar bridge to a three-phase bus.
 The bus capacitor, load and any further branches remain independent network components. Buck,
 Boost, resonant conversion and similar names describe assembled applications rather than
 additional bridge structures.
 
 A half bridge independently declares whether its upper and lower positions are controlled. For a
 diode-bounded Buck application, the upper position is controlled and the lower position is a
-diode. A fully controlled half bridge and a full bridge remain bidirectional.
+diode; its external point-network port is the output. For a diode-bounded Boost application, the
+lower position is controlled and the upper position is a diode; the same external terminal is the
+input and its branch orientation follows the positive power-flow direction. A fully controlled
+half bridge and a full bridge remain bidirectional. `buck-example.pes`, `boost-example.pes` and the
+two-stage `buck-boost-example.pes` use these structures without adding application-specific plant
+classes.
 
 `InductorCurrentControl` is structure-independent. Its feedforward comes from the selected bridge:
-`u/Vdc` for a half bridge and `(1 + u/Vdc)/2` for a full bridge. The loop itself is responsible only
-for current regulation and limits.
+`u_out/u_in` for an upper-controlled half bridge, `1 - u_in/u_out` for a lower-controlled half
+bridge and `(1 + u/Vdc)/2` for a full bridge. The loop itself is responsible only for current
+regulation and limits.
 
 A diode current is unilateral. The dedicated `DiodeConduction` assembly stage owns that device
 behavior; it is not part of RK4, DP45 or another generic integrator. In `switching`, the stage uses
@@ -59,9 +63,10 @@ belongs to the half bridge while the R-L state remains in the external filter br
 the averaged DCM conversion ratio is not forced to the CCM duty-ratio relation, and no output
 capacitor or load is hidden inside the converter Unit.
 
-For a sampled averaged diode-bounded half bridge, the same diode-conduction stage requests finer
-local resolution only near the DCM boundary. CCM retains the configured solver step; continuous
-averaging relies on the configured adaptive solver in the same way as other continuous models.
+For either averaged form, the diode-conduction stage requests a local step of at most one tenth of
+the physical switching period while the operating point is in DCM. In CCM it imposes no extra
+limit, so the configured solver step remains in force. This resolution limit creates no PWM or
+carrier events and applies equally to fixed and adaptive solvers.
 
 ## Switching
 

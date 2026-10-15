@@ -1,0 +1,85 @@
+# PESLite 0.4.0
+# Cascaded Buck-Boost application assembled from two ordinary open DCConverter units. The first
+# stage regulates the shared scalar bus; the second stage draws from that bus and regulates its
+# standard DC-link output. No Buck-Boost-specific plant or controller is used. Electrical values
+# are SI.
+
+base:
+  s_base: 500.0
+  v_ll_rms: 230.0
+  f0: 50.0
+
+buses:
+  intermediate:
+    phases: 1
+    c: 470.0e-6
+
+units:
+  buck:
+    type: dc_converter
+    bus: intermediate
+    filter: {l_f: 500.0e-6, r_f: 0.05}
+    dclink:
+      vdc_ref: 24.0
+      source: {type: voltage}
+    pwm: {f_sw: 20000.0}
+    bridge: {lower_controlled: false}
+    ctrl:
+      type: dc
+      loops:
+        voltage:
+          type: dc_voltage_control
+          kp: 0.3
+          ki: 80.0
+          minimum: 0.0
+          maximum: 15.0
+        current:
+          type: inductor_current_control
+          kp: 0.03
+          ki: 30.0
+          minimum: 0.02
+          maximum: 0.95
+      references: {voltage: 18.0}
+
+  boost:
+    type: dc_converter
+    bus: intermediate
+    filter: {l_f: 500.0e-6, r_f: 0.05}
+    dclink:
+      vdc_ref: 36.0
+      capacitor: {c: 470.0e-6}
+      source: {type: current, i: -0.5}
+    pwm: {f_sw: 20000.0, carrier_phase: 0.25}
+    bridge: {upper_controlled: false, reverse_port: true}
+    ctrl:
+      type: dc
+      loops:
+        voltage:
+          type: dc_voltage_control
+          kp: 0.2
+          ki: 30.0
+          minimum: 0.0
+          maximum: 10.0
+        current:
+          type: inductor_current_control
+          kp: 0.03
+          ki: 20.0
+          minimum: 0.02
+          maximum: 0.9
+      references: {voltage: 36.0}
+
+simulation:
+  t_end: 0.02
+  initial:
+    states:
+      boost.dclink.u_C: 30.0
+  solver:
+    linearisations: 0
+  output:
+    period: 100.0e-6
+    record_every: 2
+    signals: 1
+
+meta:
+  title: Cascaded Buck-Boost converter
+  description: Buck and Boost DCConverter units sharing an external scalar intermediate bus.

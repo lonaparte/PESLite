@@ -204,7 +204,7 @@ the optional hooks.
 
 ## Custom controllers and modulators
 
-`UniteType` builds a controller from a parameter tree, PWM method and output stage. A replacement
+`VSCController` builds a three-phase controller from a parameter tree, PWM method and output stage. A replacement
 controller satisfies the `Controller` protocol; a replacement modulator satisfies `Modulator` and
 returns a `SwitchingSequence`. The unit checks these protocols at assembly time.
 

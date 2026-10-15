@@ -13,23 +13,47 @@ from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather
 from .events import SWITCHING, SourceScenario
-from .params import Change, Params
+from .params import Change, Params, _unit_at, _unit_leaves
+from .types import unit_type
 from .unit import DCConverter, Unit, VSC
 
-__all__ = ["UnitAssembly", "System"]
+__all__ = ["System"]
 
 
 @dataclass
-class UnitAssembly:
+class _UnitAssembly:
     """One configuration node expanded into runtime leaf units and shared subsystems."""
 
     units: dict[str, Unit] = field(default_factory=dict)
     subsystems: dict[str, Any] = field(default_factory=dict)
+    connections: dict = field(default_factory=dict)
     signal_sources: tuple[Any, ...] = ()
+    power_port: Any = None
+
+    def include(self, other: "_UnitAssembly") -> None:
+        """Merge one child assembly while preserving its single public unit mapping."""
+        unit_overlap = set(self.units) & set(other.units)
+        subsystem_overlap = set(self.subsystems) & set(other.subsystems)
+        connection_overlap = set(self.connections) & set(other.connections)
+        if unit_overlap:
+            raise ConfigError(f"assembled unit name collision: {sorted(unit_overlap)}")
+        if subsystem_overlap:
+            raise ConfigError(
+                f"assembled subsystem name collision: {sorted(subsystem_overlap)}"
+            )
+        if connection_overlap:
+            raise ConfigError(
+                f"assembled connection target collision: "
+                f"{[repr(item) for item in connection_overlap]}"
+            )
+        self.units.update(other.units)
+        self.subsystems.update(other.subsystems)
+        self.connections.update(other.connections)
+        self.signal_sources += other.signal_sources
 
 
 class _WPTSignals:
-    """Expose shared link quantities without making the composite a scheduled runtime unit."""
+    """Expose shared link quantities without making the composite a scheduled unit."""
 
     def __init__(self, name: str, link: Any) -> None:
         self.name = name
@@ -38,10 +62,10 @@ class _WPTSignals:
     def signals(self) -> dict[str, float]:
         out = self.link.out
         return {
-            f"{self.name}.link.i_primary": float(out.i_primary),
-            f"{self.name}.link.i_secondary": float(out.i_secondary),
-            f"{self.name}.link.i_primary_coil": float(out.i_primary_coil),
-            f"{self.name}.link.i_secondary_coil": float(out.i_secondary_coil),
+            f"{self.name}.link.i_primary": out.i_primary,
+            f"{self.name}.link.i_secondary": out.i_secondary,
+            f"{self.name}.link.i_primary_coil": out.i_primary_coil,
+            f"{self.name}.link.i_secondary_coil": out.i_secondary_coil,
         }
 
 
@@ -103,8 +127,17 @@ def _part(parts: Mapping[str, Any], name: str, suffix: str = "") -> Any:
     return parts.get(key)
 
 
+def _owner(names: Mapping[str, Any], value: str, default: Optional[str] = None) -> Optional[str]:
+    """Return the longest runtime name that is equal to or prefixes ``value``."""
+    return next(
+        (name for name in sorted(names, key=len, reverse=True)
+         if value == name or value.startswith(name + ".")),
+        default,
+    )
+
+
 def _assemble_vsc(name: str, cfg: Any, system: "System",
-                  parts: Mapping[str, Any]) -> UnitAssembly:
+                  parts: Mapping[str, Any]) -> _UnitAssembly:
     unit = _part(parts, name) or VSC(
         name,
         cfg,
@@ -113,54 +146,62 @@ def _assemble_vsc(name: str, cfg: Any, system: "System",
         ctrl=_part(parts, name, "ctrl"),
         modulator=_part(parts, name, "modulator"),
     )
-    return UnitAssembly(units={name: unit})
+    return _UnitAssembly(units={name: unit})
 
 
 def _assemble_dc_converter(name: str, cfg: Any, system: "System",
-                           parts: Mapping[str, Any]) -> UnitAssembly:
+                           parts: Mapping[str, Any]) -> _UnitAssembly:
     unit = _part(parts, name) or DCConverter(
         name,
         cfg,
         system.p.simulation,
-        system.buses[cfg.bus],
+        system.buses[cfg.bus] if cfg.bus is not None else None,
         ctrl=_part(parts, name, "ctrl"),
         modulator=_part(parts, name, "modulator"),
     )
-    return UnitAssembly(units={name: unit})
+    return _UnitAssembly(
+        units={name: unit},
+        power_port=unit.connect_power_port if cfg.bus is None else None,
+    )
 
 
 def _assemble_wpt(name: str, cfg: Any, system: "System",
-                  parts: Mapping[str, Any]) -> UnitAssembly:
+                  parts: Mapping[str, Any]) -> _UnitAssembly:
     if _part(parts, name) is not None:
         raise ConfigError(
             f"parts.{name}: a composite WPT unit is assembled from its primary and secondary parts"
         )
     link = make_wpt_link(cfg.link)
-    units: dict[str, Unit] = {}
-    for side in ("primary", "secondary"):
-        child_name = f"{name}.{side}"
-        child_cfg = getattr(cfg, side)
-        units[child_name] = _part(parts, child_name) or DCConverter(
-            child_name,
-            child_cfg,
-            system.p.simulation,
-            link=link,
-            side=side,
-            ctrl=_part(parts, child_name, "ctrl"),
-            modulator=_part(parts, child_name, "modulator"),
-        )
-    return UnitAssembly(
-        units=units,
+    assembly = _UnitAssembly(
         subsystems={f"{name}.link": link},
         signal_sources=(_WPTSignals(name, link),),
     )
+    for side in unit_type(cfg.type).children:
+        child_name = f"{name}.{side}"
+        child_cfg = getattr(cfg, side)
+        child = _assemble_unit(child_name, child_cfg, system, parts)
+        if child.power_port is None:
+            raise ConfigError(
+                f"units.{child_name}: {child_cfg.type!r} does not expose a scalar power port"
+            )
+        port_connections = child.power_port(link, f"u_{side}", f"i_{side}")
+        overlap = set(child.connections) & set(port_connections)
+        if overlap:
+            raise ConfigError(
+                f"units.{child_name}: power-port connection target collision: "
+                f"{[repr(item) for item in overlap]}"
+            )
+        child.connections.update(port_connections)
+        assembly.include(child)
+    return assembly
 
 
-_UNIT_ASSEMBLERS = {
-    "vsc": _assemble_vsc,
-    "dc_converter": _assemble_dc_converter,
-    "wpt": _assemble_wpt,
-}
+def _assemble_unit(name: str, cfg: Any, system: "System",
+                   parts: Mapping[str, Any]) -> _UnitAssembly:
+    assembler = unit_type(cfg.type, f"units.{name}.type").assembler
+    if assembler is None:
+        raise ConfigError(f"units.{name}.type: {cfg.type!r} has no runtime assembler")
+    return assembler(name, cfg, system, parts)
 
 
 class System:
@@ -195,23 +236,15 @@ class System:
                             if set(change.touches(f"sources.{name}.")) & {"v", "f", "angle"}],
                             p.simulation.initial.t)
                         for name, cfg in p.sources.items()}
-        self.units: dict[str, Unit] = {}
-        self.unit_groups = dict(p.unit_groups)
-        shared_subsystems: dict[str, Any] = {}
-        composite_signal_sources: list[Any] = []
+        assembled = _UnitAssembly()
         for name, cfg in p.units.items():
-            assembly = _UNIT_ASSEMBLERS[cfg.type](name, cfg, self, parts)
-            overlap = set(self.units) & set(assembly.units)
-            if overlap:
-                raise ConfigError(f"assembled unit name collision: {sorted(overlap)}")
-            self.units.update(assembly.units)
-            shared_subsystems.update(assembly.subsystems)
-            composite_signal_sources.extend(assembly.signal_sources)
-        self.composite_signal_sources = tuple(composite_signal_sources)
+            assembled.include(_assemble_unit(name, cfg, self, parts))
+        self.units = assembled.units
+        self.composite_signal_sources = assembled.signal_sources
 
         # ---------------------------------------------------------- the wiring
-        subsystems: dict[str, Any] = {**self.buses, **shared_subsystems}
-        connections: dict = {}
+        subsystems: dict[str, Any] = {**self.buses, **assembled.subsystems}
+        connections: dict = dict(assembled.connections)
         bus_currents: dict[str, list] = {name: [] for name in self.buses}
         self.named_elements = {name: ELEMENT_TYPES[cfg.type](name, cfg, self.buses, p)
                                for name, cfg in p.elements.items()}
@@ -275,8 +308,7 @@ class System:
         mine: dict[str, dict] = {name: {} for name in self.units}
         rest: dict[str, Any] = {}
         for key, value in values.items():
-            owner = next((name for name in sorted(self.units, key=len, reverse=True)
-                          if key.startswith(name + ".")), None)
+            owner = _owner(self.units, key)
             tail = key[len(owner) + 1:] if owner is not None else ""
             if owner is not None and tail in self.units[owner].get_state():
                 mine[owner][tail] = value  # unit-owned state
@@ -296,8 +328,7 @@ class System:
             src.emf.set_outputs(t)
 
         def preset(key: str, word: str):
-            head = next((name for name in sorted(self.units, key=len, reverse=True)
-                         if key == name or key.startswith(name + ".")), key.partition(".")[0])
+            head = _owner(self.units, key, key.partition(".")[0])
             if word == "rated":
                 if head not in self.units:
                     raise ValueError(f"{key}: 'rated' is a converter's rated dc voltage, and "
@@ -305,9 +336,9 @@ class System:
                 cfg = self.units[head].cfg
                 return cfg.dclink.vdc_ref
             if word == "source":
-                if head in self.units and self.units[head].cfg.type == "dc_converter":
-                    source = self.units[head].cfg.dclink.source
-                    return source.v if source.type == "voltage" else self.units[head].cfg.dclink.vdc_ref
+                internal = self.units[head].source_preset() if head in self.units else None
+                if internal is not None:
+                    return internal
                 bus = self.units[head].cfg.bus if head in self.units else head
                 at_bus = [s.emf.out.e_g for s in self.sources.values() if s.cfg.bus == bus]
                 if at_bus:
@@ -323,12 +354,10 @@ class System:
     # ---------------------------------------------------------------- events
     def switch(self, name: str, on: bool, t: float, ramp: float = 0.0) -> None:
         """Connect or disconnect a named unit, source, branch or registered element."""
-        if name in self.unit_groups:
-            for child in self.unit_groups[name]:
-                self.units[child].connect(on, t, ramp)
-            return
-        if name in self.units:
-            self.units[name].connect(on, t, ramp)
+        configured = _unit_at(self.p.units, name)
+        if configured is not None:
+            for leaf in _unit_leaves(self.p.units, name):
+                self.units[leaf].connect(on, t, ramp)
             return
         if name in self.sources:
             breakers = [self.sources[name].branch]
@@ -351,8 +380,7 @@ class System:
         for path in change.paths:
             section, _, remainder = path.partition(".")
             if section == "units":
-                name = next((candidate for candidate in sorted(self.units, key=len, reverse=True)
-                             if remainder.startswith(candidate + ".")), remainder.partition(".")[0])
+                name = _owner(self.units, remainder, remainder.partition(".")[0])
             else:
                 name = remainder.partition(".")[0]
             if (section, name) in done:
@@ -367,7 +395,7 @@ class System:
                     p.sources[name], change.touches(f"sources.{name}."), change.t)
             elif section == "units":
                 self.units[name].retune(
-                    p.runtime_units[name], change.touches(f"units.{name}."), change.t)
+                    p.unit(name), change.touches(f"units.{name}."), change.t)
             elif section == "elements":
                 self.named_elements[name].retune(p.elements[name])
         model = self.model
@@ -387,8 +415,7 @@ class System:
             for path in change.paths:
                 section, _, remainder = path.partition(".")
                 if section == "units":
-                    name = next((candidate for candidate in sorted(self.units, key=len, reverse=True)
-                                 if remainder.startswith(candidate + ".")), remainder.partition(".")[0])
+                    name = _owner(self.units, remainder, remainder.partition(".")[0])
                     rest = remainder[len(name) + 1:]
                 else:
                     name, _, rest = remainder.partition(".")

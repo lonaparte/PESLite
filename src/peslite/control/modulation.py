@@ -13,7 +13,7 @@ from typing import Any, Optional, Protocol
 import numpy as np
 from numpy.typing import NDArray
 
-from .blocks import complex2abc, peak_abs, phases
+from .blocks import peak_abs, phases
 
 __all__ = ["PWMMethod", "SignalLimiter", "PWM_METHODS", "spwm", "svpwm", "ModulationLimiter", "OutputStage"]
 
@@ -45,7 +45,9 @@ def spwm(u_ab: complex, u_dc: float) -> NDArray[np.float64]:
 def svpwm(u_ab: complex, u_dc: float) -> NDArray[np.float64]:
     """Continuous space-vector PWM: SPWM signals with min-max zero-sequence injection."""
     m = spwm(u_ab, u_dc)
-    return m - 0.5 * (float(m.max()) + float(m.min()))
+    maximum = np.maximum(m[0], np.maximum(m[1], m[2]))
+    minimum = np.minimum(m[0], np.minimum(m[1], m[2]))
+    return m - 0.5 * (maximum + minimum)
 
 
 PWM_METHODS = {"spwm": spwm, "svpwm": svpwm}
@@ -127,31 +129,39 @@ class OutputStage:
         factor = 1.0 / math.sqrt(3.0) if self.pwm_method is svpwm else 0.5
         return self.limiter.limit * max(0.0, u_dc_pu) * self.v_dc_base / self.v_base * factor
 
+    def equation(self, command: complex, rot: complex, u_dc: float) -> tuple[tuple[Any, ...], bool]:
+        """Pure output-stage equation shared by Python execution and code generation."""
+        u_ab = command * rot * self.v_base
+        if u_dc > 0.0:
+            raw = self.pwm_method(u_ab, u_dc)
+            m = tuple(raw if self._trusted_pwm else _signals(raw, "pwm_method"))
+        else:
+            u = phases(u_ab)
+            peak = np.maximum(abs(u[0]), np.maximum(abs(u[1]), abs(u[2])))
+            m = tuple(value / peak for value in u) if peak > 0.0 else (0.0, 0.0, 0.0)
+        saturated = False
+        if self._standard_limiter:
+            max_abs = np.maximum(abs(m[0]), np.maximum(abs(m[1]), abs(m[2])))
+            if max_abs > self.limiter.limit:
+                scale = self.limiter.limit / max_abs
+                m = tuple(value * scale for value in m)
+                saturated = True
+            elif u_dc <= 0.0 and u_ab != 0j:
+                saturated = True
+        elif self.limiter is not None:
+            original = np.asarray(m, dtype=float)
+            limited = _signals(self.limiter(original.copy()), "limiter")
+            saturated = limited.tolist() != original.tolist() or (u_dc <= 0.0 and u_ab != 0j)
+            m = tuple(limited)
+        return m, saturated
+
     def _evaluate(self, command: complex, rot: complex, u_dc: float) -> tuple[np.ndarray, bool]:
         """Modulating signals and saturation for a dq command (pu), cached for this control instant."""
         memo = self._memo
         if memo is not None and memo[0] == command and memo[1] == (rot, u_dc):
             return memo[2], memo[3]
-        u_ab = command * rot * self.v_base
-        if u_dc > 0.0:
-            raw = self.pwm_method(u_ab, u_dc)
-            m = raw if self._trusted_pwm else _signals(raw, "pwm_method")
-        else:
-            u = complex2abc(u_ab)
-            peak = float(np.max(np.abs(u)))
-            m = u / peak if peak > 0.0 else np.zeros(3)
-        saturated = False
-        if self._standard_limiter:
-            max_abs = max(abs(float(m[0])), abs(float(m[1])), abs(float(m[2])))
-            if max_abs > self.limiter.limit:
-                m *= self.limiter.limit / max_abs
-                saturated = True
-            elif u_dc <= 0.0 and u_ab != 0j:
-                saturated = True
-        elif self.limiter is not None:
-            limited = _signals(self.limiter(m.copy()), "limiter")
-            saturated = limited.tolist() != m.tolist() or (u_dc <= 0.0 and u_ab != 0j)  # both finite, shape (3,)
-            m = limited
+        values, saturated = self.equation(command, rot, u_dc)
+        m = np.asarray(values, dtype=float)
         self._memo = (command, (rot, u_dc), m, saturated)
         return m, saturated
 
@@ -162,7 +172,7 @@ class OutputStage:
         ``u_cmd_dq`` is in pu on the AC base; ``theta`` is in rad and ``u_dc`` is in pu on the
         DC base. ``count=False`` leaves the controller-update and saturation counters unchanged.
         """
-        rot = complex(math.cos(theta), math.sin(theta))
+        rot = np.exp(1j * theta)
         u_dc_pu = u_dc
         u_dc = u_dc * self.v_dc_base  # PWM receives DC volts; loop feedback stays pu
         u_dq = u_cmd_dq

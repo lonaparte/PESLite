@@ -32,8 +32,10 @@ import numpy as np
 
 from ..assembly.events import EVENT_TYPES, SWITCHING, connected_at, switching_schedule
 from ..assembly.conduction import DiodeConduction
-from ..assembly.params import Change, Params, dump, dumps, load
+from ..assembly.params import (Change, Params, _unit_at, _unit_items, _unit_leaves,
+                               dump, dumps, load)
 from ..assembly.system import System
+from ..assembly.types import unit_type
 from ..assembly.unit import Unit
 from ..components.pwm import Modulator
 from ..control.blocks import abc2complex, complex2abc
@@ -60,6 +62,7 @@ def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
                       ctrl_names: Mapping[str, Iterable[str]] | None = None) -> dict[str, float]:
     """Convert one raw plant snapshot into one public, real-valued output row."""
     row: dict[str, float] = {"t": t}
+    unit_names = {name for name, _unit in _unit_items(params.units)}
     for key, value in plant.items():
         head, _, what = key.rpartition(".")
         if np.iscomplexobj(value):
@@ -67,10 +70,10 @@ def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
             prefix = f"{head}." if head else ""
             for phase, phase_value in zip("abc", complex2abc(complex(value))):
                 row[f"{prefix}{stem}_{phase}"] = float(phase_value)
-        elif not ((head in params.runtime_units and what in ("u_dc", "i_dc"))
+        elif not ((head in unit_names and what in ("u_dc", "i_dc"))
                   or (head in params.sources and what == "angle")):
             row[key] = float(value)
-    for name in params.runtime_units:
+    for name in unit_names:
         for what in ("u_dc", "i_dc"):
             key = f"{name}.{what}"
             if key in plant:
@@ -271,7 +274,7 @@ class Recorder:
         if out_dir is not None:
             out_dir.mkdir(parents=True, exist_ok=True)
             names = ["states.csv", "plant.csv", "energy.csv", "summary.json", "simulation.pes",
-                     *(f"ctrl.{unit}.csv" for unit in params.runtime_units)]
+                     *(f"ctrl.{unit}.csv" for unit, _cfg in _unit_items(params.units))]
             for name in names:
                 (out_dir / name).unlink(missing_ok=True)
         self._plant = (_CSVTable(out_dir / "plant.csv", batch_rows)
@@ -391,7 +394,7 @@ class Simulation:
         if solver is not None:
             given["solver"] = solver
         known = {"system", "solver"}
-        for name in {*p.units, *p.runtime_units}:
+        for name, _cfg in _unit_items(p.units):
             known |= {name, f"{name}.ctrl", f"{name}.modulator"}
         for label, what in (("parts", self._factories), ("instances", given)):
             unknown = set(what) - known
@@ -403,7 +406,7 @@ class Simulation:
         self._rebuildable = not given
 
         unit_parts = {}
-        for name, cfg in p.runtime_units.items():
+        for name, cfg in _unit_items(p.units):
             for key in (name, f"{name}.ctrl", f"{name}.modulator"):
                 if key in self._factories:
                     unit_parts[key] = self._factories[key](cfg)
@@ -455,16 +458,17 @@ class Simulation:
         if name is None:
             if len(self.system.units) != 1:
                 raise ConfigError(
-                    f"this system has {len(self.system.units)} runtime units "
+                    f"this system has {len(self.system.units)} assembled units "
                     f"{sorted(self.system.units)}: name the one you mean"
                 )
             name = next(iter(self.system.units))
         if name not in self.system.units:
-            if name in self.p.unit_groups:
+            configured = _unit_at(self.p.units, name)
+            if configured is not None and unit_type(configured.type).composite:
                 raise ConfigError(
-                    f"unit {name!r} is composite; choose one of {list(self.p.unit_groups[name])}"
+                    f"unit {name!r} is composite; choose one of {list(_unit_leaves(self.p.units, name))}"
                 )
-            raise ConfigError(f"unknown runtime unit {name!r}; known: {sorted(self.system.units)}")
+            raise ConfigError(f"unknown assembled unit {name!r}; known: {sorted(self.system.units)}")
         return self.system.units[name]
 
     def export(self, format: str, out_dir: str | Path | None = None, *, name: str = "run",
@@ -492,10 +496,10 @@ class Simulation:
         """Return a function giving the rated (effort, flow) of a storage, or ``None``."""
         base = self.p.base
         system_ac = (base.v_phase_peak, base.i_phase_peak)
-        units = self.p.runtime_units
+        units = tuple(_unit_items(self.p.units))
 
         def rating(name: str, storage: Any) -> Optional[tuple[float, float]]:
-            cfg = next((value for unit_name, value in sorted(units.items(), key=lambda item: len(item[0]), reverse=True)
+            cfg = next((value for unit_name, value in sorted(units, key=lambda item: len(item[0]), reverse=True)
                         if name == unit_name or name.startswith(unit_name + ".")), None)
             if storage.scale == 1.0:  # dc quantities: that unit's dc base
                 if cfg is None:
@@ -1306,7 +1310,7 @@ def main(argv=None) -> int:
               ("averaging", "adaptive", "DP45") if args.averaging else None)
     if preset is not None:
         model, solver_type, method = preset
-        changes = {f"units.{name}.bridge.model": model for name in p.runtime_units
+        changes = {f"units.{name}.bridge.model": model for name, _cfg in _unit_items(p.units)
                    if f"units.{name}.bridge.model" not in set_overrides}
         if not _solver_choice_is_set(set_overrides):
             changes.update({
@@ -1347,7 +1351,7 @@ def main(argv=None) -> int:
         return 0
     units = ", ".join(f"{n} ({u.ctrl.type}, {u.bridge.model.replace('_', ' ')}, "
                       f"{sim.units[n].bridge.describe()})"
-                      for n, u in p.runtime_units.items())
+                      for n, u in _unit_items(p.units))
     print(f"peslite: {config}  units={units}  "
           f"solver={p.simulation.solver.type}/{p.simulation.solver.method}  "
           f"t = {p.simulation.initial.t} .. {p.simulation.t_end} s  "
@@ -1360,7 +1364,7 @@ def main(argv=None) -> int:
     s = r.summary
     print(f"done: wall {r.wall_time:.1f} s, rhs evaluations {r.n_rhs}, stop at {s.get('t_stop', 0):.4f} s, "
           f"tripped={bool(s.get('tripped'))}")
-    for name in p.runtime_units:
+    for name, _cfg in _unit_items(p.units):
         print(f"  {name}: max |i| = {s.get(f'{name}.max_current_pu', 0):.4f} pu, "
               f"trip: {s.get(f'{name}.trip_cause') or 'none'}, "
               f"alarms: {', '.join(s.get(f'{name}.alarms') or []) or 'none'}")

@@ -99,7 +99,9 @@ def test_half_bridge_fixes_device_placement_at_construction():
         DeviceParameters(on_resistance=-1.0)
 
     upper_switched_leg = HalfBridge(upper_controlled=True, lower_controlled=False)
-    lower_switched_leg = HalfBridge(upper_controlled=False, lower_controlled=True)
+    lower_switched_leg = HalfBridge(
+        upper_controlled=False, lower_controlled=True, reverse_port=True,
+    )
     fully_controlled_leg = HalfBridge()
 
     assert upper_switched_leg.upper_controlled
@@ -108,6 +110,11 @@ def test_half_bridge_fixes_device_placement_at_construction():
     assert lower_switched_leg.lower_controlled
     assert fully_controlled_leg.upper_controlled
     assert fully_controlled_leg.lower_controlled
+    assert not fully_controlled_leg.reverse_port
+
+    reverse_fully_controlled_leg = HalfBridge(reverse_port=True)
+    assert reverse_fully_controlled_leg.reverse_port
+    assert reverse_fully_controlled_leg.pwm_state((0.25,)) == pytest.approx(0.75)
 
     assert upper_switched_leg.resolve((1, 0), 2.0, 48.0).path == "upper.channel"
     assert upper_switched_leg.resolve((0, 0), 2.0, 48.0).path == "lower.diode"

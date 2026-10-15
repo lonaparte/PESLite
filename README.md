@@ -16,8 +16,9 @@ API—designed as a deterministic simulation backend for LLM reasoning and verif
   named converter units.
 - Grid-following and grid-forming controllers assembled from typed control loops.
 - Per-converter `switching`, PWM-period-averaged and ideal continuously averaged bridge models.
+- Open single-phase DC converters for Buck, Boost, cascaded Buck-Boost and resonant applications.
 - Composite SS and LCC-LCC wireless-power-transfer units with independently clocked full-bridge
-  primary and secondary converters, flattened before simulation.
+  primary and secondary converters assembled from one nested unit tree.
 - ADC sampling windows, controller interrupts, computation time, PWM shadow/active registers,
   startup sequencing and unit-owned protection.
 - Fixed-step, adaptive and multirate integration with exact event boundaries.

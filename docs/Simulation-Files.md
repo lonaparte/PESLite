@@ -62,14 +62,20 @@ units:
       references: {p_ref_pu: 0.5}
 ```
 
-`ctrl.type` selects built-in GFL/GFM wiring. A custom graph can override loop connections and the
-controller outputs explicitly. See [Control and PWM Timing](Control-and-PWM-Timing.md) and
+`ctrl.type` selects the controller architecture: its reference schema, public ports and default
+wiring. Built-in architectures include `gfl`, `gfm`, scalar `dc` and `resonant`; a custom graph can
+override loop connections and controller outputs explicitly. A key under `ctrl.loops` is only the
+instance name used by those connections. The nested loop `type` selects the registered loop class,
+so an instance such as `voltage` is not implicitly mapped to `DCVoltageControl`. See
+[Control and PWM Timing](Control-and-PWM-Timing.md) and
 [Converter and Bridge Models](Converter-and-Bridge-Models.md).
 
 A WPT unit is a configuration-time composite. It owns no bridge or controller itself; each child
-is an ordinary independently clocked `DCConverter` using full-bridge resonant control. `link.type` selects series-series
-(`ss`) or LCC-LCC (`lcc`) compensation. The complete runnable schema is shown in
-`examples/wpt-example.pes`.
+is an ordinary independently clocked `DCConverter` whose scalar power port is connected to the
+shared link during assembly. The bundled example selects a full bridge and the temporary
+open-loop resonant-modulation loop for each child; neither choice creates a separate converter
+class. `link.type` selects series-series (`ss`) or LCC-LCC (`lcc`) compensation. The complete
+runnable schema is shown in `examples/wpt-example.pes`.
 
 ```yaml
 units:
@@ -82,7 +88,8 @@ units:
       ctrl:
         type: resonant
         computation: 0.0
-        loops: {}
+        loops:
+          modulation: {type: resonant_modulation}
         references: {modulation: 0.8, frequency: 85000.0}
     secondary:
       # The same fields, with its own DC link, PWM clock and phase command.
@@ -92,7 +99,8 @@ units:
       ctrl:
         type: resonant
         computation: 0.0
-        loops: {}
+        loops:
+          modulation: {type: resonant_modulation}
         references: {modulation: 0.7, frequency: 85000.0, phase: -1.5708}
     link:
       type: ss

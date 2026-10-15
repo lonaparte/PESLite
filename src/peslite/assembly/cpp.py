@@ -23,12 +23,12 @@ from ..components.converter import _BridgeModel, DCLink, DCVoltageSource
 from ..components.network import RCNode, RLBranch, ThreePhaseSource
 from ..components.pwm import CarrierComparison, SynchronousCarrier, ZOH
 from ..control.blocks import OutputLimit
-from ..control.controller import UniteType
+from ..control.controller import GraphController, VSCController
 from ..control.loops import (ActiveDamping, CurrentLoop, DCVoltageControl, Droop, DVOC,
                              Matching, PowerLoop, PSC, SRFPLL, SyncLaw, UnitDelay,
                              VirtualAdmittance, VirtualImpedance, VSG)
 from .conduction import DiodeConduction
-from .params import _written_out, dumps
+from .params import _unit_items, _unit_leaves, _written_out, dumps
 from .exporter import ExportResult, _exporter
 
 __all__ = []
@@ -219,6 +219,16 @@ class _Expression:
         if name in functions:
             kind = "complex" if value.kind == "complex" else "real"
             return _Expression(f"{functions[name]}({value.code})", kind)
+        if name == "arctan2":
+            left, right = (self.of(item) for item in inputs)
+            return _Expression(f"std::atan2({left.code}, {right.code})", "real")
+        if name in {"maximum", "minimum"}:
+            left, right = (self.of(item) for item in inputs)
+            function = "std::max" if name == "maximum" else "std::min"
+            return _Expression(
+                f"{function}({left.code}, {right.code})",
+                self._result(left, right),
+            )
         return NotImplemented
 
 
@@ -274,7 +284,7 @@ class _RuntimeParameters:
             add(f"sources.{name}.f", source.f if source.f is not None else p.base.f0,
                 positive=True)
             add(f"sources.{name}.angle", source.angle)
-        for unit_name, unit in p.units.items():
+        for unit_name, unit in _unit_items(p.units):
             references = unit.ctrl.references
             for field in fields(references):
                 add(f"units.{unit_name}.ctrl.references.{field.name}",
@@ -367,6 +377,7 @@ class _ModelGenerator:
         self.record_fields: dict[int, dict[str, str]] = {}
         self.record_types: dict[tuple[int, str], str] = {}
         self._unit_control_inputs: dict[int, dict[str, _Expression]] = {}
+        self._solver_observations: dict[tuple[int, str], tuple[str, Any, str]] = {}
         self.state_index: dict[tuple[int, str], tuple[int, bool]] = {
             (id(state), name): (index, is_complex)
             for state, name, index, is_complex in self.model._state_ops
@@ -523,11 +534,12 @@ class _ModelGenerator:
             raise TypeError("output equation did not assign an output field")
         return lines
 
-    def trace_rhs(self, sub: Any, method: Any = None) -> list[str]:
+    def trace_rhs(self, sub: Any, method: Any = None,
+                  attributes: dict[str, _Expression] | None = None) -> list[str]:
         method = sub.rhs if method is None else method
 
         def run():
-            clone = self._equation_clone(sub)
+            clone = self._equation_clone(sub, attributes)
             return tuple(self._rebind(method, clone)(_Expression("t", "real")))
 
         return [value.code for value in self._trace(run)]
@@ -553,7 +565,73 @@ class _ModelGenerator:
             code = code.replace(local, value)
         for (record_id, field), held in self.zoh_fields.items():
             code = code.replace(self.record_fields[record_id][field], held)
+        for subsystem in self.model.subsystems:
+            subsystem_name = self.subsystem_name[id(subsystem)]
+            for role in ("inp", "out"):
+                record = getattr(subsystem, role)
+                for field in _fields(record):
+                    local = self.record_fields[id(record)][field]
+                    if local not in code:
+                        continue
+                    code = code.replace(
+                        local,
+                        self.solver_observation(record, field, subsystem_name, role),
+                    )
         return code
+
+    def solver_observation(self, record: Any, field: str,
+                           subsystem_name: str | None = None,
+                           role: str | None = None) -> str:
+        """Return a persistent observation usable by solver helpers outside ``evaluate``."""
+        key = (id(record), field)
+        if key not in self._solver_observations:
+            if subsystem_name is None or role is None:
+                owner = next(
+                    (sub for sub in self.model.subsystems
+                     if record is getattr(sub, "inp") or record is getattr(sub, "out")),
+                    None,
+                )
+                if owner is None:
+                    raise RuntimeError("solver observation record has no subsystem owner")
+                subsystem_name = self.subsystem_name[id(owner)]
+                role = "inp" if record is owner.inp else "out"
+            observation_name = f"solver.{subsystem_name}.{role}.{field}"
+            self._solver_observations[key] = (observation_name, record, field)
+        return "obs_" + _identifier(self._solver_observations[key][0])
+
+    def _diode_conduction(self, sub: RLBranch, *, solver_scope: bool = False) -> tuple[str, str]:
+        """Render the shared averaged half-bridge diode law for C++."""
+        conduction = sub.conduction
+        if conduction is None:
+            raise RuntimeError("an averaged diode expression needs a conduction law")
+        if solver_scope:
+            index, is_complex = self.state_index[id(sub.state), "i"]
+            if is_complex:
+                raise TypeError("averaged diode conduction requires a scalar current")
+            current = f"y[{index}]"
+            held = self.zoh_fields.get((id(sub.inp), "q"))
+            q = held if held is not None else self.solver_observation(sub.inp, "q")
+            value = lambda field: self.solver_observation(sub.inp, field)
+        else:
+            current = self.value(sub.state, "i")
+            q = self.value(sub.inp, "q")
+            value = lambda field: self.value(sub.inp, field)
+        result = self._trace(lambda: conduction.equations(
+            _Expression(current, "real"),
+            _Expression(q, "real"),
+            _Expression(value("u1"), "real"),
+            _Expression(value("u2"), "real"),
+            _Expression(value("u_dc"), "real"),
+            sub.L,
+            sub.R,
+        ))
+        return result[4].code, result[5].code
+
+    def _rl_derivative(self, sub: RLBranch, current: str, value: Any) -> str:
+        return (
+            f"({value('u1')} - {value('u2')} - {_number(sub.R)} * {current}) / "
+            f"{_number(sub.L)}"
+        )
 
     def trace_element_signals(self, element: Any) -> dict[str, _Expression]:
         return self.trace_element_values(element, element.signals)
@@ -763,21 +841,9 @@ class _ModelGenerator:
             i = self.value(state, "i")
             zero = ("Complex{0.0, 0.0}"
                     if self.record_types[id(state), "i"] == "Complex" else "0.0")
-            raw = (f"({self.value(inp, 'u1')} - {self.value(inp, 'u2')} - "
-                   f"{_number(sub.R)} * {i}) / {_number(sub.L)}")
-            if sub.conduction is not None:
-                duty = self.value(inp, "q")
-                voltage = self.value(inp, "u2")
-                dc_voltage = self.value(inp, "u_dc")
-                period = _number(sub.conduction.period)
-                critical = (f"({duty} * {period} * ({dc_voltage} - {voltage}) / "
-                            f"(2.0 * {_number(sub.L)} + {_number(sub.R)} * {duty} * {period}))")
-                total = f"std::max({duty}, {i} / ({critical}))"
-                dcm = (f"({duty} * {dc_voltage} - ({total}) * {voltage} - "
-                       f"{_number(4.0 * sub.R / 3.0)} * {i}) / {_number(sub.L)}")
-                in_dcm = (f"({duty} > 0.0 && {duty} < 1.0 && "
-                          f"{dc_voltage} > {voltage} && {i} < ({critical}))")
-                raw = f"({in_dcm} ? ({dcm}) : ({raw}))"
+            value = lambda field: self.value(inp, field)
+            raw = (self._diode_conduction(sub)[0] if sub.conduction is not None
+                   else self._rl_derivative(sub, i, value))
             if sub.unilateral:
                 raw = f"(({i} <= 0.0 && ({raw}) < 0.0) ? 0.0 : ({raw}))"
             derivative = f"(breaker_open_{self.prefix[id(sub)]} ? {zero} : ({raw}))"
@@ -800,7 +866,8 @@ class _ModelGenerator:
             disabled = self.trace_rhs(sub, sub._inactive_rhs)
             return [f"({enabled} ? ({on}) : ({off}))"
                     for on, off in zip(active, disabled)]
-        if isinstance(sub, UniteType):
+        if (getattr(sub, "continuous", False) and hasattr(sub, "graph")
+                and hasattr(sub, "state_names")):
             hook = getattr(sub, "cpp_continuous_rhs", None)
             if hook is not None:
                 return list(hook(self))
@@ -912,7 +979,7 @@ class _ModelGenerator:
                         "bool" if value.kind == "bool" else "double"
                     )
                     add(signal, value.code, kind)
-            if not isinstance(unit.ctrl, UniteType):
+            if hasattr(unit.ctrl, "log_sources"):
                 for port, value in self.unit_control_inputs(unit).items():
                     kind = "Complex" if value.kind == "complex" else (
                         "bool" if value.kind == "bool" else "double"
@@ -939,6 +1006,14 @@ class _ModelGenerator:
                         "bool" if value.kind == "bool" else "double"
                     )
                     add(signal, value.code, kind)
+        for source in self.system.composite_signal_sources:
+            for signal, value in self.trace_element_signals(source).items():
+                kind = "Complex" if value.kind == "complex" else (
+                    "bool" if value.kind == "bool" else "double"
+                )
+                add(signal, value.code, kind)
+        for name, record, field in self._solver_observations.values():
+            add(name, self.value(record, field), self.record_types[id(record), field])
         return members, assigns
 
 
@@ -968,6 +1043,31 @@ class _ControlGenerator:
     def d(self, name: str, field: str) -> str:
         return self.m(f"d_{name}_{field}")
 
+    def _effective_command(self, on: bool) -> str:
+        """C++ expression for a host command after the unit trip latch is applied."""
+        return f"!{self.m('tripped')}" if on else "false"
+
+    def _controller_command_lines(self, on: bool, ramp: float, t: str = "t") -> list[str]:
+        """Lower the controller's shared run/stop and start-up state transition."""
+        effective = self._effective_command(on)
+        lines: list[str] = []
+        if on:
+            lines += [f"if ({effective} && !{self.m('startup_run')}) {{",
+                      *["    " + line for line in self._reset_integrators()], "}"]
+        lines.append(f"{self.m('startup_run')} = {effective};")
+        if self.continuous:
+            lines += [f"{self.m('startup_ramp')} = {_number(ramp)};",
+                      f"{self.m('startup_start')} = {t};"]
+        else:
+            if on:
+                lines.append(
+                    f"if ({effective}) {self.m('startup_ramp')} = {_number(ramp)};"
+                )
+            lines += [f"{self.m('startup_steps')} = 0;",
+                      f"{self.m('startup_value')} = 0.0;",
+                      f"{self.m('startup_complete')} = false;"]
+        return lines
+
     @staticmethod
     def _literal(value: Any) -> str:
         if isinstance(value, complex):
@@ -979,7 +1079,7 @@ class _ControlGenerator:
     def _reference(self, name: str) -> str:
         values = [(self.p.simulation.initial.t, getattr(self.cfg.ctrl.references, name))]
         for change in self.p.changes:
-            current = getattr(change.params.units[self.name].ctrl.references, name)
+            current = getattr(change.params.unit(self.name).ctrl.references, name)
             if current != values[-1][1]:
                 values.append((change.t, current))
         path = f"units.{self.name}.ctrl.references.{name}"
@@ -993,6 +1093,201 @@ class _ControlGenerator:
 
     def derivatives(self) -> list[str]:
         return [self.d(*name.split(".", 1)) for name in self.ctrl.state_names]
+
+    def _state(self, loop: str, local: str) -> str:
+        if self.continuous:
+            return self.model.value(self.ctrl.state, f"{loop}.{local}")
+        return self.state_expression(self.ctrl, f"{loop}.{local}")
+
+    @staticmethod
+    def _local(block_name: str, local: str) -> str:
+        return block_name if not local else f"{block_name}.{local}"
+
+    @staticmethod
+    def _copy_block(block: Any) -> Any:
+        """Copy a dynamic block without invoking factories implemented through ``__new__``."""
+        cloned = object.__new__(type(block))
+        if hasattr(block, "__dict__"):
+            vars(cloned).update(vars(block))
+        for cls in reversed(type(block).__mro__):
+            slots = getattr(cls, "__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for name in slots:
+                if hasattr(block, name):
+                    setattr(cloned, name, getattr(block, name))
+        return cloned
+
+    def _clone_loop(self, loop_name: str, node: Any) -> Any:
+        clone = copy.copy(node)
+        if node.startup is not None:
+            startup = copy.copy(node.startup)
+            startup.run = _Expression(self.m("startup_run"), "bool")
+            startup.value = _Expression(self.m("startup_value"), "real")
+            clone.startup = startup
+
+        bindings = node.flow_state_bindings()
+        if bindings is None:
+            raise TypeError(
+                f"C++ export: {self.name}.{loop_name} does not expose direct state bindings"
+            )
+        owners = {id(owner): owner for owner, _attribute in bindings.values()
+                  if owner is not node}
+        cloned_owners = {key: self._copy_block(owner) for key, owner in owners.items()}
+        for public, (owner, attribute) in bindings.items():
+            target = clone if owner is node else cloned_owners[id(owner)]
+            value = node.get_state()[public]
+            kind = "complex" if isinstance(value, complex) else "real"
+            setattr(target, attribute, _Expression(self._state(loop_name, public), kind))
+
+        clone._state_blocks = {
+            name: cloned_owners.get(id(block), self._copy_block(block))
+            for name, block in node._state_blocks.items()
+        }
+        for attribute, value in vars(node).items():
+            replacement = cloned_owners.get(id(value))
+            if replacement is not None:
+                setattr(clone, attribute, replacement)
+            elif isinstance(value, OutputLimit):
+                limit = copy.copy(value)
+                if limit.pi is not None and id(limit.pi) in cloned_owners:
+                    limit.pi = cloned_owners[id(limit.pi)]
+                setattr(clone, attribute, limit)
+
+        if not self.continuous:
+            for name in node.carried:
+                if name == "first_limit_t":
+                    continue
+                value = getattr(node, name)
+                kind = "bool" if isinstance(value, bool) else "real"
+                setattr(clone, name, _Expression(self.node(loop_name, name), kind))
+        return clone
+
+    def _trace_loop(self, loop_name: str, node: Any) -> tuple[tuple[_Expression, ...],
+                                                               tuple[str, ...], bool, bool]:
+        inputs = tuple(_Expression(self.input(loop_name, port),
+                                   "complex" if spec.complex_value else "real")
+                       for port, spec in node.inputs.items())
+        input_map = dict(zip(node.inputs, inputs))
+        state_names = tuple(node.flow_state() if self.continuous else node.get_state())
+        carried = (() if self.continuous else
+                   tuple(name for name in node.carried if name != "first_limit_t"))
+        internal_limit = isinstance(node, DCVoltageControl)
+        external_limit = not self.continuous and loop_name in self.graph._limits
+
+        def run():
+            clone = self._clone_loop(loop_name, node)
+            external_saturated: Any = False
+            if self.continuous:
+                if node.flow_inputs is None:
+                    outputs, derivatives = clone.flow(_Expression("t", "real"), input_map)
+                    values = tuple(outputs[name] for name in node.outputs) + tuple(
+                        derivatives[name] for name in node.flow_state()
+                    )
+                else:
+                    values = tuple(clone.flow_path(*inputs))
+            else:
+                outputs = clone.sample(_Expression("t", "real"), input_map)
+                if external_limit:
+                    port, original = self.graph._limits[loop_name]
+                    limit = copy.copy(original)
+                    if limit.pi is node.pi:
+                        limit.pi = clone.pi
+                    if original is self.ctrl._terminal_limit:
+                        limit.limit = self.ctrl.stage.command_limit(
+                            _Expression(self.source("meas.u_dc"), "real")
+                        )
+                    limit.active = lambda: clone.startup.active
+                    limit.observer = None
+                    outputs[port] = limit.sample(_Expression("t", "real"), outputs[port])
+                    external_saturated = limit.saturated
+                state = clone.get_state()
+                values = tuple(outputs[name] for name in node.outputs) + tuple(
+                    state[name] for name in state_names
+                )
+            values += tuple(getattr(clone, name) for name in carried)
+            if internal_limit:
+                values += (clone.limit.saturated,)
+            if external_limit:
+                values += (external_saturated,)
+            return values
+
+        return tuple(self.model._trace(run)), carried, internal_limit, external_limit
+
+    def _loop_lines(self, loop_name: str, node: Any) -> list[str]:
+        values, carried, internal_limit, external_limit = self._trace_loop(loop_name, node)
+        temporary = tuple(
+            self.m(f"value_{loop_name}_{index}") for index in range(len(values))
+        )
+        lines = [f"const auto {name} = {value.code};"
+                 for name, value in zip(temporary, values)]
+        n_outputs = len(node.outputs)
+        state_names = tuple(node.flow_state() if self.continuous else node.get_state())
+        n_states = len(state_names)
+        lines += [f"{self.g(loop_name + '.' + port)} = {value};"
+                  for port, value in zip(node.outputs, temporary[:n_outputs])]
+        state_values = temporary[n_outputs:n_outputs + n_states]
+        if self.continuous:
+            lines += [f"{self.d(loop_name, local)} = {value};"
+                      for local, value in zip(state_names, state_values)]
+        else:
+            lines += [f"{self._state(loop_name, local)} = {value};"
+                      for local, value in zip(state_names, state_values)]
+        offset = n_outputs + n_states
+        lines += [f"{self.node(loop_name, name)} = {value};"
+                  for name, value in zip(carried,
+                                         temporary[offset:offset + len(carried)])]
+        offset += len(carried)
+        if internal_limit:
+            target = (self.m(loop_name + "_limit_active") if self.continuous
+                      else self.node(loop_name, "limit_exceeded"))
+            lines.append(f"{target} = {temporary[offset]};")
+            offset += 1
+            if not self.continuous and "first_limit_t" in node.carried:
+                first = self.node(loop_name, "first_limit_t")
+                lines.append(
+                    f"if ({target} && !std::isfinite({first})) {first} = t;"
+                )
+        if external_limit:
+            lines.append(f"{self.m('command_saturated')} = {temporary[offset]};")
+        if self.continuous:
+            return lines
+        period = self.graph.periods[loop_name]
+        every = max(1, int(round(period / self.cfg.ctrl.period)))
+        if every == 1:
+            return lines
+        guard = f"{self.m('pwm_k')} % {every} == 0"
+        return [f"if ({guard}) {{", *["    " + line for line in lines], "}"]
+
+    def _reset_integrators(self) -> list[str]:
+        """Trace each loop's own reset operation and assign only states it changes."""
+        lines: list[str] = []
+        for loop_name, node in self.graph.nodes.items():
+            state_names = tuple(node.get_state())
+
+            def run():
+                clone = self._clone_loop(loop_name, node)
+                clone.reset_integrator()
+                state = clone.get_state()
+                return tuple(state[name] for name in state_names)
+
+            values = tuple(self.model._trace(run))
+            for local, value in zip(state_names, values):
+                current = self._state(loop_name, local)
+                if value.code == current:
+                    continue
+                if self.continuous:
+                    index, is_complex = self.model.state_index[
+                        (id(self.ctrl.state), f"{loop_name}.{local}")
+                    ]
+                    if is_complex:
+                        lines += [f"y[{index}] = std::real({value.code});",
+                                  f"y[{index + 1}] = std::imag({value.code});"]
+                    else:
+                        lines.append(f"y[{index}] = {value.code};")
+                else:
+                    lines.append(f"{current} = {value.code};")
+        return lines
 
     def limit_observation(self) -> list[str]:
         return []
@@ -1014,6 +1309,159 @@ class _ControlGenerator:
 
     def summary_lines(self, stream: str = "summary") -> list[str]:
         return [*self.protection_summary(stream), *self.controller_summary(stream)]
+
+    def _topology_expression(self, method: Any, values: tuple[str, ...]) -> str:
+        result = self.model._trace(
+            lambda: method(tuple(_Expression(value, "real") for value in values))
+        )
+        return result.code
+
+    def _load_modulation(self, hold: str, switching: bool) -> list[str]:
+        """Map active compares to the topology's one held bridge input."""
+        bridge = self.bridge
+        if switching:
+            modulator = bridge.modulator
+            if isinstance(modulator, SynchronousCarrier):
+                frequency = (
+                    f"({_number(modulator.pulse_ratio)} * {self.m('omega')} / (2.0 * pi))"
+                )
+                phase = (
+                    f"({_number(modulator.pulse_ratio)} * {self.m('theta')} / (2.0 * pi) + "
+                    f"{_number(modulator.phase)} - t * {frequency})"
+                )
+            elif isinstance(modulator, CarrierComparison):
+                frequency = _number(modulator.f_sw)
+                phase = _number(modulator.phase)
+            else:
+                raise TypeError(
+                    f"C++ export: unsupported PWM modulator {type(modulator).__name__}"
+                )
+            mapped = (
+                f"make_switches_{self.tag}(t, {_number(bridge.load_period)}, "
+                f"{frequency}, {phase}, {hold});"
+            )
+        else:
+            values = tuple(f"{self.m('active')}[{index}]" for index in range(self.width))
+            mapped = f"{hold} = {self._topology_expression(self.topology.pwm_state, values)};"
+        return [f"        {mapped}",
+                f"        {self.m('load_end')} = t + {_number(bridge.load_period)};"]
+
+    def switching_method(self) -> str:
+        """Generate one topology-driven carrier-comparison implementation."""
+        if isinstance(self.bridge.modulator, ZOH):
+            return ""
+        hold = self._hold()
+        values = tuple(f"q[{index}]" for index in range(self.width))
+        encoded = self._topology_expression(self.topology.switching_state, values)
+        q_kind = "Complex" if isinstance(self.topology.zero, complex) else "double"
+        return f'''void make_switches_{self.tag}(double t, double span, double frequency,
+        double phase, {q_kind}& held) {{
+    if (!(frequency > 0.0)) throw std::runtime_error("PWM frequency is not positive");
+    {self.m('switches')}.clear();
+    {self.m('switch_index')} = 0;
+    std::array<double, {self.width}> modulation{{}};
+    std::array<double, {self.width}> q{{}};
+    for (int k = 0; k < {self.width}; ++k)
+        modulation[k] = std::clamp(2.0 * {self.m('active')}[k] - 1.0, -1.0, 1.0);
+    double position = carrier_position(t, frequency, phase);
+    const double carrier0 = carrier_value(position);
+    for (int k = 0; k < {self.width}; ++k)
+        q[k] = position < 0.5 ? (modulation[k] > carrier0) : (modulation[k] >= carrier0);
+    held = {encoded};
+    std::vector<std::tuple<double, int, double>> edges;
+    double covered = 0.0;
+    for (int piece = 0; piece < 64 && covered < span - 1e-13; ++piece) {{
+        position = carrier_position(t + covered, frequency, phase);
+        const bool rising = position < 0.5;
+        const double length = std::min(((rising ? 0.5 : 1.0) - position) / frequency,
+                                       span - covered);
+        const double c0 = carrier_value(position);
+        const double slope = rising ? 4.0 * frequency : -4.0 * frequency;
+        for (int k = 0; k < {self.width}; ++k) {{
+            const double x = (modulation[k] - c0) / slope;
+            if (x > 0.0 && x < length)
+                edges.emplace_back(covered + x, k, rising ? 0.0 : 1.0);
+        }}
+        covered += length;
+    }}
+    std::sort(edges.begin(), edges.end());
+    double previous = 0.0;
+    for (const auto& edge : edges) {{
+        const double at = std::get<0>(edge);
+        q[std::get<1>(edge)] = std::get<2>(edge);
+        if (at - previous > 1e-12) {{
+            {self.m('switches')}.emplace_back(t + at, {encoded});
+            previous = at;
+        }} else if (!{self.m('switches')}.empty()) {{
+            {self.m('switches')}.back().second = {encoded};
+        }}
+    }}
+    {self.m('next_switch')} = {self.m('switches')}.empty()
+        ? std::numeric_limits<double>::infinity() : {self.m('switches')}[0].first;
+}}
+'''
+
+    def _pwm_members(self) -> list[str]:
+        """Declare the shared sampled bridge timer, register and edge state."""
+        bridge = self.bridge
+        q_kind = "Complex" if isinstance(self.topology.zero, complex) else "double"
+        schedule = ", ".join(
+            "{" + _number(at) + ", " + self._literal(q) + "}" for at, q in bridge.schedule
+        )
+        return [
+            f"long long {self.m('pwm_k')} = {int(bridge.k)};",
+            f"long long {self.m('pwm_j')} = {int(bridge.j)};",
+            f"double {self.m('t_interrupt')} = {_number(bridge.t_interrupt)};",
+            f"double {self.m('t_load')} = {_number(bridge.t_load)};",
+            f"std::array<double, {self.width + 1}> {self.m('active')}"
+            f"{{{', '.join(_number(x) for x in bridge.active)}}};",
+            f"std::array<double, {self.width + 1}> {self.m('shadow')}"
+            f"{{{', '.join(_number(x) for x in bridge.shadow)}}};",
+            f"std::vector<std::pair<double, {q_kind}>> {self.m('switches')}"
+            f"{{{schedule}}};",
+            f"std::size_t {self.m('switch_index')} = 0;",
+            f"double {self.m('next_switch')} = {_number(bridge.next_switch)};",
+            f"double {self.m('load_end')} = {_number(bridge.load_end)};",
+        ]
+
+    def _pwm_write_lines(self, on: str) -> list[str]:
+        bridge = self.bridge
+        return [
+            f"        for (int k = 0; k < {self.width}; ++k) "
+            f"{self.m('shadow')}[k] = {self.m('pending_d')}[k];",
+            f"        {self.m('shadow')}[{self.width}] = {on};",
+            f"        ++{self.m('pwm_k')}; {self.m('t_interrupt')} = "
+            f"{_number(bridge.offset)} + {self.m('pwm_k')} * {_number(bridge.period)};",
+        ]
+
+    def _pwm_load_lines(self, hold: str, switching: bool, gates: str,
+                        tail: tuple[str, ...] = ()) -> list[str]:
+        bridge = self.bridge
+        return [
+            "    if (load_due) {",
+            f"        const double completed = {_number(bridge.offset)} + "
+            f"({self.m('pwm_k')} - 1) * {_number(bridge.period)} + "
+            f"{_number(bridge.computation)};",
+            f"        if (completed <= t + time_eps) {self.m('active')} = {self.m('shadow')};",
+            *self._load_modulation(hold, switching),
+            f"        ++{self.m('pwm_j')}; {self.m('t_load')} = {_number(bridge.offset)} + "
+            f"{self.m('pwm_j')} * {_number(bridge.load_period)};",
+            f"        {self.m('gates')} = {gates};",
+            *tail,
+            "    }",
+        ]
+
+    def _pwm_switch_lines(self, hold: str) -> list[str]:
+        return [
+            f"    while ({self.m('switch_index')} < {self.m('switches')}.size() && "
+            f"std::abs({self.m('switches')}[{self.m('switch_index')}].first - t) < time_eps) {{",
+            f"        {hold} = {self.m('switches')}[{self.m('switch_index')}++].second;",
+            "    }",
+            f"    {self.m('next_switch')} = {self.m('switch_index')} < "
+            f"{self.m('switches')}.size() ? "
+            f"{self.m('switches')}[{self.m('switch_index')}].first : "
+            "std::numeric_limits<double>::infinity();",
+        ]
 
 
 class _ProtectionGenerator:
@@ -1049,10 +1497,11 @@ class _ProtectionGenerator:
     def _trip_body(self) -> list[str]:
         branch = f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]}"
         link = f"dclink_tripped_{self.model.prefix[id(self.unit.dclink)]}"
-        lines = [f"{self.m('startup_run')} = false;", f"{branch} = true;", f"{link} = true;"]
-        if not self.unit.continuous:
-            lines += [f"{self.m('gates')} = false;", f"{self.m('breaker')} = false;"]
-        return lines
+        return [f"{self.m('startup_run')} = false;",
+                f"{self.m('gates')} = false;",
+                f"{self.m('breaker')} = false;",
+                f"{branch} = true;",
+                f"{link} = true;"]
 
     def protection_methods(self) -> str:
         """Fast and sampled protection, plus the one physical trip action."""
@@ -1201,6 +1650,26 @@ class _ACControlGenerator(_ProtectionGenerator, _ControlGenerator):
     def __init__(self, name: str, unit: Any, model: _ModelGenerator, prefix: str) -> None:
         _ControlGenerator.__init__(self, name, unit, model, prefix)
 
+    def _mode_log_lines(self, indent: str, current_name: str | None) -> list[str]:
+        """Generate the control-family-specific suffix of the AC controller log."""
+        if self.unit.ctrl._is_gfl:
+            idref = self.input(current_name, "id_ref") if current_name is not None else "0.0"
+            return [f"{indent}{self.m('log_id_ref_pu')} = {idref};"]
+        power_name = next((name for name, node in self.graph.nodes.items()
+                           if isinstance(node, PowerLoop)), None)
+        sync_name = next((name for name, node in self.graph.nodes.items()
+                          if isinstance(node, SyncLaw)), None)
+        return [
+            f"{indent}{self.m('log_p_pu')} = "
+            f"{self.g(power_name + '.p') if power_name else '0.0'};",
+            f"{indent}{self.m('log_q_pu')} = "
+            f"{self.g(power_name + '.q') if power_name else '0.0'};",
+            f"{indent}{self.m('log_p_ref_pu')} = {self.m('startup_value')} * "
+            f"{self._reference('p_ref_pu')};",
+            f"{indent}{self.m('log_v_ref_pu')} = "
+            f"{self.g(sync_name + '.v_ref') if sync_name else self._reference('v_ref_pu')};",
+        ]
+
     def protection_method(self) -> str:
         return self.protection_methods()
 
@@ -1252,6 +1721,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
 
     def __init__(self, name: str, unit: Any, model: _ModelGenerator) -> None:
         super().__init__(name, unit, model, "c")
+        self.continuous = True
 
     def state(self, loop: str, local: str) -> str:
         return self.model.value(self.ctrl.state, f"{loop}.{local}")
@@ -1294,6 +1764,8 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
             *[f"double {self.m('prot_' + key)} = {_number(value)};"
               for key, value in self.unit.protection.get_state().items()],
             *self.protection_members(),
+            f"bool {self.m('breaker')} = {'true' if self.unit.breaker else 'false'};",
+            f"bool {self.m('gates')} = {'true' if self.unit.gates else 'false'};",
             f"bool {self.m('startup_run')} = {'true' if startup.run else 'false'};",
             f"double {self.m('startup_ramp')} = {_number(startup.ramp)};",
             f"double {self.m('startup_start')} = {_number(startup.start)};",
@@ -1368,7 +1840,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
             if cyclic:
                 lines.append("for (int control_sweep = 0; control_sweep < 16; ++control_sweep) {")
             for loop_name in group:
-                emitted = self._loop(loop_name, self.graph.nodes[loop_name])
+                emitted = self._loop_lines(loop_name, self.graph.nodes[loop_name])
                 lines += (["    " + line for line in emitted] if cyclic else emitted)
             if cyclic:
                 # The outer Model algebraic solver also checks its electrical tear.  Fixed built-in
@@ -1408,203 +1880,30 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
                  f"{self.m('log_in_service')} = {self.m('startup_run')} ? 1.0 : 0.0;",
                  f"{self.m('log_freq_dev')} = ({self.m('omega')} - {_number(self.cfg.base.w0)}) / (2.0 * pi);",
                  f"{self.m('log_angle_rel')} = std::remainder({self.m('theta')} - {_number(self.cfg.base.w0)} * t, 2.0 * pi);"]
-        if self.cfg.ctrl.type == "gfl":
-            idref = self.input(current_name, "id_ref") if current_name is not None else "0.0"
-            lines.append(f"{self.m('log_id_ref_pu')} = {idref};")
-        else:
-            power_name = next((name for name, node in self.graph.nodes.items()
-                               if isinstance(node, PowerLoop)), None)
-            sync_name = next((name for name, node in self.graph.nodes.items()
-                              if isinstance(node, SyncLaw)), None)
-            lines += [f"{self.m('log_p_pu')} = {self.g(power_name + '.p') if power_name else '0.0'};",
-                      f"{self.m('log_q_pu')} = {self.g(power_name + '.q') if power_name else '0.0'};",
-                      f"{self.m('log_p_ref_pu')} = {self.m('startup_value')} * {self._reference('p_ref_pu')};",
-                      f"{self.m('log_v_ref_pu')} = {self.g(sync_name + '.v_ref') if sync_name else self._reference('v_ref_pu')};"]
+        lines += self._mode_log_lines("", current_name)
         return lines
 
-    def _loop(self, name: str, node: Any) -> list[str]:
-        inp, g, state, deriv = self.input, self.g, self.state, self.d
-        body: list[str]
-        if isinstance(node, SRFPLL):
-            theta, integral = state(name, "theta"), state(name, "integral_pu")
-            voltage = self._rotate(inp(name, "v"), theta)
-            if node.u_g is None:
-                epsilon = "std::imag(v)"
-                extra: list[str] = []
-            else:
-                ug = state(name, "u_g_pu")
-                epsilon = f"({ug} > 0.0 ? std::imag(v) / {ug} : 0.0)"
-                extra = [f"{deriv(name, 'u_g_pu')} = {_number(node.kp)} * (std::real(v) - {ug});"]
-            body = [f"const Complex v = {voltage};",
-                    f"const double epsilon = {epsilon};",
-                    f"const double omega = {_number(node.w0)} + {_number(node.kp)} * epsilon + {_number(node.ki)} * {integral};",
-                    f"{g(name + '.theta')} = {theta};", f"{g(name + '.frame')} = {theta};",
-                    f"{g(name + '.omega')} = omega;", f"{deriv(name, 'theta')} = omega;",
-                    f"{deriv(name, 'integral_pu')} = epsilon;", *extra]
-        elif isinstance(node, CurrentLoop):
-            integral = state(name, "integral_pu")
-            frame, omega = inp(name, "frame"), inp(name, "omega")
-            i = self._rotate(inp(name, "i"), frame)
-            uff = self._rotate(inp(name, "v"), frame)
-            body = [f"const Complex i = {i};", f"const Complex u_ff = {uff};",
-                    f"const Complex error = {self.m('startup_run')} ? Complex{{{inp(name, 'id_ref')}, {inp(name, 'iq_ref')}}} - i : Complex{{0.0, 0.0}};",
-                    f"Complex feedforward = {inp(name, 'extra')};"]
-            if node.feedforward:
-                body.append("feedforward += u_ff;")
-            if node.decoupling:
-                body.append(f"feedforward += Complex{{{_number(node.r_pu)}, {omega} / {_number(node.w0)} * {_number(node.x_pu)}}} * i;")
-            body += [f"{g(name + '.extra')} = {inp(name, 'extra')};",
-                     f"{g(name + '.u_dq')} = feedforward + {_number(node.kp)} * error + {_number(node.ki)} * {integral};",
-                     f"{deriv(name, 'integral_pu')} = error;"]
-        elif isinstance(node, DCVoltageControl):
-            integral = state(name, "integral")
-            error = f"({inp(name, 'reference')} - {inp(name, 'voltage')})"
-            raw = (f"({self.m('startup_run')} ? ({self.m('startup_value')} * {_number(node.cfg.feedforward)} + "
-                   f"{_number(node.kp)} * error + {_number(node.ki)} * {integral}) : 0.0)")
-            value = f"std::clamp(raw, {_number(node.minimum)}, {_number(node.maximum)})"
-            derivative = f"({self.m('startup_run')} ? error : 0.0)"
-            body = [f"const double error = {error};", f"const double raw = {raw};",
-                    f"const double value = {value};",
-                    f"{self.m(name + '_limit_active')} = value != raw;",
-                    f"{g(name + '.current_reference')} = value;",
-                    ]
-            if node.antiwindup:
-                derivative = f"({derivative} + (value != raw ? (value - raw) / {_number(node.kp)} : 0.0))"
-            body.append(f"{deriv(name, 'integral')} = {derivative};")
-        elif isinstance(node, PowerLoop):
-            power = f"({inp(name, 'v')} * std::conj({inp(name, 'i')}))"
-            if node.bandwidth > 0.0:
-                p, q = state(name, "p_pu"), state(name, "q_pu")
-                pole = _number(2.0 * math.pi * node.bandwidth)
-                body = [f"const Complex power = {power};", f"{g(name + '.p')} = {p};", f"{g(name + '.q')} = {q};",
-                        f"{deriv(name, 'p_pu')} = {pole} * (std::real(power) - {p});",
-                        f"{deriv(name, 'q_pu')} = {pole} * (std::imag(power) - {q});"]
-            else:
-                body = [f"const Complex power = {power};", f"{g(name + '.p')} = std::real(power);",
-                        f"{g(name + '.q')} = std::imag(power);"]
-        elif isinstance(node, SyncLaw):
-            body = self._sync_loop(name, node)
-        elif isinstance(node, VirtualImpedance):
-            current = self._rotate(inp(name, "i"), inp(name, "frame"))
-            body = [f"const Complex current = {current};",
-                    f"{g(name + '.u_dq')} = Complex{{{inp(name, 'v_ref')}, 0.0}} - Complex{{{_number(node.r_pu)}, {inp(name, 'omega')} / {_number(node.w0)} * {_number(node.x_pu)}}} * current + {inp(name, 'extra')};"]
-        elif isinstance(node, ActiveDamping):
-            low = state(name, "hpf_pu")
-            current = self._rotate(inp(name, "i"), inp(name, "frame"))
-            body = [f"const Complex delta = {current} - {low};",
-                    f"{g(name + '.extra')} = -{_number(node.r_a)} * delta;",
-                    f"{deriv(name, 'hpf_pu')} = {_number(node.alpha_d)} * delta;"]
-        elif isinstance(node, VirtualAdmittance):
-            current = state(name, "i_ref_pu")
-            voltage = self._rotate(inp(name, "v"), inp(name, "frame"))
-            body = [f"const double magnitude = std::abs({current});",
-                    f"const Complex limited = magnitude <= {_number(node.i_limit)} ? {current} : {current} * ({_number(node.i_limit)} / magnitude);",
-                    f"Complex flow = {_number(node.w0 / node.x_pu)} * (Complex{{{inp(name, 'v_ref')}, 0.0}} - {voltage} - Complex{{{_number(node.r_pu)}, {inp(name, 'omega')} / {_number(node.w0)} * {_number(node.x_pu)}}} * limited);",
-                    f"if (magnitude >= {_number(node.i_limit)}) {{ const double radial = std::real(flow * std::conj(limited)); if (radial > 0.0) flow -= radial / {_number(node.i_limit * node.i_limit)} * limited; }}",
-                    f"{g(name + '.id_ref')} = std::real(limited);", f"{g(name + '.iq_ref')} = std::imag(limited);",
-                    f"{deriv(name, 'i_ref_pu')} = flow;"]
-        else:
-            raise TypeError(f"C++ export: continuous loop {self.name}.{name} has unsupported type {type(node).__name__}")
-        return ["{"] + ["    " + line for line in body] + ["}"]
-
-    def _sync_loop(self, name: str, node: SyncLaw) -> list[str]:
-        inp, g, state, deriv = self.input, self.g, self.state, self.d
-        theta = state(name, "theta")
-        vmag_member = self.m(name + "_v_mag")
-        voltage, current = inp(name, "v"), inp(name, "i")
-        frame_voltage = self._rotate(voltage, theta)
-        frame_current = self._rotate(current, theta)
-        p, q = inp(name, "p"), inp(name, "q")
-        pref = f"({self.m('startup_value')} * {inp(name, 'p_ref')})"
-        qref, vref, udc = inp(name, "q_ref"), inp(name, "v_ref"), inp(name, "u_dc")
-        body = [f"const Complex v = {frame_voltage};", f"const Complex i = {frame_current};",
-                f"double omega = {_number(node.w0)};", f"double vmag = {vmag_member};"]
-        zero_flows = []
-        if isinstance(node, PSC):
-            zero_flows = [f"{deriv(name, 'v_int_pu')} = 0.0;"]
-        elif isinstance(node, VSG):
-            zero_flows = [f"{deriv(name, 'dw_pu')} = 0.0;"]
-            if node.t_q > 0.0:
-                zero_flows.append(f"{deriv(name, 'v_mag_pu')} = 0.0;")
-        elif isinstance(node, DVOC):
-            zero_flows = [f"{deriv(name, 'v_mag_pu')} = 0.0;"]
-        body += [f"if (!{self.m('startup_run')}) {{", "    const double measured = std::abs(v);",
-                 "    if (measured > 0.1) vmag = measured;", f"    {deriv(name, 'theta')} = {_number(node.w0)};",
-                 *["    " + line for line in zero_flows], "} else {"]
-        if isinstance(node, PSC):
-            vint = state(name, "v_int_pu")
-            body += [f"    omega = {_number(node.w0)} + {_number(node.k_p)} * ({pref} - {p});",
-                     f"    const double error = {vref} - std::abs(v);",
-                     f"    vmag = {vref} + {_number(node.k_v)} * error + {_number(node.k_vi)} * {vint};",
-                     f"    {deriv(name, 'theta')} = omega;", f"    {deriv(name, 'v_int_pu')} = error;"]
-        elif isinstance(node, Droop):
-            body += [f"    omega = {_number(node.w0)} + {_number(node.m_p)} * ({pref} - {p});",
-                     f"    vmag = {vref} + {_number(node.n_q)} * ({qref} - {q});",
-                     f"    {deriv(name, 'theta')} = omega;"]
-        elif isinstance(node, VSG):
-            dw = state(name, "dw_pu")
-            body += [f"    omega = {_number(node.w0)} * (1.0 + {dw});",
-                     f"    {deriv(name, 'theta')} = omega;",
-                     f"    {deriv(name, 'dw_pu')} = ({pref} - {p} - {_number(node.d_p)} * {dw}) / {_number(2.0 * node.h)};",
-                     f"    const double v_command = {vref} + {_number(node.k_q)} * ({qref} - {q});"]
-            if node.t_q > 0.0:
-                vstate = state(name, "v_mag_pu")
-                body += [f"    vmag = {vstate};", f"    {deriv(name, 'v_mag_pu')} = (v_command - {vstate}) / {_number(node.t_q)};"]
-            else:
-                body.append("    vmag = v_command;")
-        elif isinstance(node, DVOC):
-            vstate = state(name, "v_mag_pu")
-            body += [f"    const double V = std::max({vstate}, 1e-12);",
-                     f"    const Complex i_star = Complex{{{pref}, -({qref})}} * V / (({vref}) * ({vref}));",
-                     f"    const Complex w = {_number(node.eta)} * {_complex(node.rot)} * (i_star - i) + {_number(node.eta * node.alpha)} * (1.0 - V * V / (({vref}) * ({vref}))) * V;",
-                     f"    omega = {_number(node.w0)} + std::imag(w) / V;", "    vmag = V;",
-                     f"    {deriv(name, 'theta')} = omega;", f"    {deriv(name, 'v_mag_pu')} = std::real(w);"]
-        elif isinstance(node, Matching):
-            body += [f"    omega = {_number(node.k_theta)} * {udc};",
-                     f"    vmag = {vref} + {_number(node.k_q)} * ({qref} - {q});",
-                     f"    {deriv(name, 'theta')} = omega;"]
-        else:
-            raise TypeError(f"C++ export: unsupported continuous synchronisation law {type(node).__name__}")
-        body += ["}", f"{vmag_member} = vmag;", f"{g(name + '.theta')} = {theta};",
-                 f"{g(name + '.frame')} = {theta};", f"{g(name + '.omega')} = omega;",
-                 f"{g(name + '.v_ref')} = vmag;"]
-        return body
-
-    def command_lines(self, on: bool, ramp: float, t: str = "t") -> list[str]:
-        branch = f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]}"
-        q = self.model.value(self.ctrl.out, "q")
-        lines: list[str] = []
-        if on:
-            lines.append(f"if (!{self.m('startup_run')}) {{")
-            for loop_name, node in self.graph.nodes.items():
-                reset: list[tuple[str, bool]] = []
-                if isinstance(node, SRFPLL):
-                    reset.append(("integral_pu", False))
-                elif isinstance(node, CurrentLoop):
-                    reset.append(("integral_pu", True))
-                elif isinstance(node, DCVoltageControl):
-                    reset.append(("integral", False))
-                elif isinstance(node, PSC):
-                    reset.append(("v_int_pu", False))
-                for local, complex_value in reset:
-                    index, _is_complex = self.model.state_index[(id(self.ctrl.state), f"{loop_name}.{local}")]
-                    lines.append(f"    y[{index}] = 0.0;")
-                    if complex_value:
-                        lines.append(f"    y[{index + 1}] = 0.0;")
-            lines.append("}")
-        lines += ([f"{self.m('track_due')} = !{self.m('startup_run')};"] if on else
-                  [f"{self.m('track_due')} = false;"])
-        lines += [f"{self.m('startup_run')} = {'true' if on else 'false'};",
-                 f"{self.m('startup_ramp')} = {_number(ramp if on else 0.0)};",
-                 f"{self.m('startup_start')} = {t};", f"{branch} = {'false' if on else 'true'};"]
-        if not on:
-            lines.append(f"{q} = Complex{{0.0, 0.0}};")
+    def command_lines(self, on: bool, ramp: float) -> list[str]:
+        effective = self._effective_command(on)
+        lines = [
+            (f"{self.m('track_due')} = {effective} && "
+             f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});")
+            if on else f"{self.m('track_due')} = false;"
+        ]
+        lines += self._controller_command_lines(on, ramp)
+        lines += [
+            f"{self.m('breaker')} = {effective};",
+            f"{self.m('gates')} = {effective};",
+            f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
+            f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});",
+        ]
         return lines
 
     def sense_method(self) -> str:
         observed = f"obs_{_identifier(self.name + '.u_g')}"
         dc = f"obs_{_identifier(self.name + '.u_dc')}"
-        lines = [f"void sense_{self.tag}(double t) {{", f"    if ({self.m('track_due')}) {{"]
+        lines = [f"void sense_{self.tag}(double t) {{",
+                 f"    if ({self.m('track_due')}) {{"]
         for loop_name, node in self.graph.nodes.items():
             if not isinstance(node, SyncLaw):
                 continue
@@ -1613,11 +1912,16 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
             lines += [f"        if (std::abs({observed}) > 0.1) {{",
                       f"            y[{index}] += std::remainder(std::arg({observed}) - y[{index}], 2.0 * pi);",
                       f"            {self.m(loop_name + '_v_mag')} = {magnitude};"]
-            if isinstance(node, (DVOC, VSG)) and (not isinstance(node, VSG) or node.t_q > 0.0):
-                v_index, _ = self.model.state_index[(id(self.ctrl.state), f"{loop_name}.v_mag_pu")]
+            if isinstance(node, (DVOC, VSG)) and (
+                    not isinstance(node, VSG) or node.t_q > 0.0):
+                v_index, _ = self.model.state_index[
+                    (id(self.ctrl.state), f"{loop_name}.v_mag_pu")
+                ]
                 lines.append(f"            y[{v_index}] = {magnitude};")
             if isinstance(node, VSG):
-                dw_index, _ = self.model.state_index[(id(self.ctrl.state), f"{loop_name}.dw_pu")]
+                dw_index, _ = self.model.state_index[
+                    (id(self.ctrl.state), f"{loop_name}.dw_pu")
+                ]
                 lines.append(f"            y[{dw_index}] = 0.0;")
             lines.append("        }")
         lines += [f"        {self.m('track_due')} = false;", "    }",
@@ -1637,11 +1941,21 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
     return true;
 }}'''
 
+    def protection_method(self) -> str:
+        return self.protection_methods()
+
 class _UnitGenerator(_ACControlGenerator):
     """Lower one sampled controller/PWM unit to allocation-free specialised methods."""
 
     def __init__(self, name: str, unit: Any, model: _ModelGenerator) -> None:
         super().__init__(name, unit, model, "u")
+        self.continuous = False
+        self.bridge = unit.bridge
+        self.topology = self.bridge.topology
+        self.width = len(self.topology.duty_names)
+
+    def _hold(self) -> str:
+        return self.model.zoh_fields[id(self.bridge.inp), "q"]
 
     def source(self, path: str) -> str:
         if path == "meas.u_g":
@@ -1759,6 +2073,7 @@ class _UnitGenerator(_ACControlGenerator):
                           f"bool {self.node(loop_name, 'limit_exceeded')} = {'true' if node.limit_exceeded else 'false'};",
                           f"std::size_t {self.node(loop_name, 'n_updates')} = {int(node.n_updates)};",
                           f"std::size_t {self.node(loop_name, 'n_limit_exceeded')} = {int(node.n_limit_exceeded)};",
+                          f"std::size_t {self.node(loop_name, 'n_reverse')} = {int(node.n_reverse)};",
                           f"double {self.node(loop_name, 'first_limit_t')} = {_number(node.first_limit_t if node.first_limit_t is not None else math.nan)};"]
             elif isinstance(node, PowerLoop):
                 if node.bandwidth > 0.0:
@@ -1787,21 +2102,7 @@ class _UnitGenerator(_ACControlGenerator):
                     f"{type(node).__name__}"
                 )
         if not unit.continuous:
-            lines += [
-                f"long long {self.m('pwm_k')} = {int(bridge.k)};",
-                f"long long {self.m('pwm_j')} = {int(bridge.j)};",
-                f"double {self.m('t_interrupt')} = {_number(bridge.t_interrupt)};",
-                f"double {self.m('t_load')} = {_number(bridge.t_load)};",
-                f"std::array<double, 4> {self.m('active')}{{{', '.join(_number(x) for x in bridge.active)}}};",
-                f"std::array<double, 4> {self.m('shadow')}{{{', '.join(_number(x) for x in bridge.shadow)}}};",
-                f"std::vector<std::pair<double, Complex>> {self.m('switches')}{{{', '.join('{' + _number(at) + ', ' + _complex(q) + '}' for at, q in bridge.schedule)}}};",
-                f"std::size_t {self.m('switch_index')} = 0;",
-                f"double {self.m('next_switch')} = {_number(bridge.next_switch)};",
-                f"double {self.m('load_end')} = {_number(bridge.load_end)};",
-                f"double {self.m('source_ramp_start')} = -std::numeric_limits<double>::infinity();",
-                f"double {self.m('source_ramp_duration')} = 0.0;",
-                f"bool {self.m('source_connected')} = {'false' if getattr(unit.dclink.source, 'ramp', None) is not None else 'true'};",
-            ]
+            lines += self._pwm_members()
         return lines
 
     def state_expression(self, part: Any, local: str) -> str:
@@ -1815,7 +2116,7 @@ class _UnitGenerator(_ACControlGenerator):
         if part is self.unit.bridge:
             bank, _, field = local.rpartition(".")
             word = self.m("shadow" if bank == "shadow" else "active")
-            index = {"d_a": 0, "d_b": 1, "d_c": 2, "on": 3}[field]
+            index = (*self.topology.duty_names, "on").index(field)
             return f"{word}[{index}]"
         if part is self.unit.adc and local.startswith("x_"):
             return self.m("adc_acc_" + local[2:])
@@ -1864,206 +2165,6 @@ class _UnitGenerator(_ACControlGenerator):
                     return self.node(loop_name, "value")
         raise KeyError(local)
 
-    def _complex_rotate(self, value: str, angle: str) -> str:
-        return f"({value} * Complex{{std::cos({angle}), -std::sin({angle})}})"
-
-    def _due_guard(self, loop_name: str) -> str:
-        period = self.graph.periods[loop_name]
-        every = max(1, int(round(period / self.cfg.ctrl.period)))
-        return "true" if every == 1 else f"({self.m('pwm_k')} % {every} == 0)"
-
-    def _loop(self, loop_name: str, node: Any) -> list[str]:
-        m, g, inp = self.node, self.g, self.input
-        guard = self._due_guard(loop_name)
-        body: list[str] = []
-        if isinstance(node, SRFPLL):
-            theta, omega, integral = (m(loop_name, key) for key in ("theta", "omega", "integral"))
-            body += [f"const double frame = {theta};",
-                     f"const Complex v = {self._complex_rotate(inp(loop_name, 'v'), 'frame')};"]
-            if node.u_g is None:
-                body.append("const double epsilon = std::imag(v);")
-            else:
-                ug = m(loop_name, "u_g")
-                body.append(f"const double epsilon = {ug} > 0.0 ? std::imag(v) / {ug} : 0.0;")
-            body += [f"const double integrated = {integral} + {_number(0.5 * node.T)} * epsilon;",
-                     f"{integral} += {_number(node.T)} * epsilon;",
-                     f"{omega} = {_number(node.w0)} + {_number(node.kp)} * epsilon + {_number(node.ki)} * integrated;",
-                     f"{theta} += {_number(node.T)} * {omega};"]
-            if node.u_g is not None:
-                body.append(f"{m(loop_name, 'u_g')} += {_number(node.T * node.kp)} * (std::real(v) - {m(loop_name, 'u_g')});")
-            body += [f"{g(loop_name + '.theta')} = {theta};",
-                     f"{g(loop_name + '.frame')} = frame;",
-                     f"{g(loop_name + '.omega')} = {omega};"]
-        elif isinstance(node, PowerLoop):
-            body.append(f"const Complex power = {inp(loop_name, 'v')} * std::conj({inp(loop_name, 'i')});")
-            if node.bandwidth > 0.0:
-                pstate, qstate = m(loop_name, "p"), m(loop_name, "q")
-                body += [
-                    f"const double p_filtered = {_number(node.lpf_p._cd)} * {pstate} + {_number(node.lpf_p._dd)} * std::real(power);",
-                    f"const double q_filtered = {_number(node.lpf_q._cd)} * {qstate} + {_number(node.lpf_q._dd)} * std::imag(power);",
-                    f"{pstate} = {_number(node.lpf_p._ad)} * {pstate} + {_number(node.lpf_p._bd)} * std::real(power);",
-                    f"{qstate} = {_number(node.lpf_q._ad)} * {qstate} + {_number(node.lpf_q._bd)} * std::imag(power);",
-                    f"{g(loop_name + '.p')} = p_filtered;",
-                    f"{g(loop_name + '.q')} = q_filtered;",
-                ]
-            else:
-                body += [f"{g(loop_name + '.p')} = std::real(power);",
-                         f"{g(loop_name + '.q')} = std::imag(power);"]
-        elif isinstance(node, SyncLaw):
-            body += self._sync_loop(loop_name, node)
-        elif isinstance(node, VirtualImpedance):
-            current = self._complex_rotate(inp(loop_name, "i"), inp(loop_name, "frame"))
-            drop = (f"(Complex{{{_number(node.r_pu)}, {_number(node.x_pu)}}} * "
-                    f"Complex{{1.0, {inp(loop_name, 'omega')} / {_number(node.w0)}}} * ({current}))")
-            # Written without std::polar or allocation; the expanded coefficient is clearer and
-            # lets the optimiser fold a zero R/X branch.
-            drop = (f"(Complex{{{_number(node.r_pu)}, "
-                    f"{inp(loop_name, 'omega')} / {_number(node.w0)} * {_number(node.x_pu)}}} * ({current}))")
-            body.append(f"{g(loop_name + '.u_dq')} = Complex{{{inp(loop_name, 'v_ref')}, 0.0}} - {drop} + {inp(loop_name, 'extra')};")
-        elif isinstance(node, ActiveDamping):
-            low = m(loop_name, "low")
-            current = self._complex_rotate(inp(loop_name, "i"), inp(loop_name, "frame"))
-            body += [f"const Complex current = {current};",
-                     f"const Complex low_filtered = {_number(node.lpf._cd)} * {low} + {_number(node.lpf._dd)} * current;",
-                     f"{low} = {_number(node.lpf._ad)} * {low} + {_number(node.lpf._bd)} * current;",
-                     f"{g(loop_name + '.extra')} = -{_number(node.r_a)} * (current - low_filtered);"]
-        elif isinstance(node, CurrentLoop):
-            body += self._current_loop(loop_name, node)
-        elif isinstance(node, DCVoltageControl):
-            integral = m(loop_name, "integral")
-            exceeded = m(loop_name, "limit_exceeded")
-            ff = f"{self.m('startup_value')} * {_number(node.cfg.feedforward)}"
-            body += [f"const double error = {inp(loop_name, 'reference')} - {inp(loop_name, 'voltage')};",
-                     f"double integrated = {integral};",
-                     f"if ({self.m('startup_run')}) {{",
-                     f"    integrated += {_number(0.5 * node.T)} * error;",
-                     f"    {integral} += {_number(node.T)} * error;",
-                     f"}}",
-                     f"const double raw = {self.m('startup_run')} ? ({ff} + {_number(node.kp)} * error + {_number(node.ki)} * integrated) : 0.0;",
-                     f"const double value = std::clamp(raw, {_number(node.minimum)}, {_number(node.maximum)});",
-                     f"{exceeded} = value != raw;",
-                     *([f"if ({exceeded}) {integral} += {_number(node.T / node.kp)} * (value - raw);"]
-                       if node.antiwindup else []),
-                     f"++{m(loop_name, 'n_updates')};",
-                     f"if ({exceeded}) {{ ++{m(loop_name, 'n_limit_exceeded')}; if (!std::isfinite({m(loop_name, 'first_limit_t')})) {m(loop_name, 'first_limit_t')} = t; }}",
-                     f"{g(loop_name + '.current_reference')} = value;"]
-        elif isinstance(node, VirtualAdmittance):
-            state = m(loop_name, "i_ref")
-            voltage = self._complex_rotate(inp(loop_name, "v"), inp(loop_name, "frame"))
-            body += [f"const Complex v_dq = {voltage};",
-                     f"Complex next = {state} + {_number(node.T * node.w0 / node.x_pu)} * (Complex{{{inp(loop_name, 'v_ref')}, 0.0}} - v_dq - Complex{{{_number(node.r_pu)}, {inp(loop_name, 'omega')} / {_number(node.w0)} * {_number(node.x_pu)}}} * {state});",
-                     f"const double magnitude = std::abs(next);",
-                     f"if (magnitude > {_number(node.i_limit)}) next *= {_number(node.i_limit)} / magnitude;",
-                     f"{state} = next;",
-                     f"{g(loop_name + '.id_ref')} = std::real(next);",
-                     f"{g(loop_name + '.iq_ref')} = std::imag(next);"]
-        elif isinstance(node, UnitDelay):
-            body.append(f"{g(loop_name + '.value')} = {m(loop_name, 'value')};")
-        else:
-            raise TypeError(f"C++ export: unsupported loop {type(node).__name__}")
-        lines = [f"if ({guard}) {{"] + ["    " + line for line in body] + ["}"]
-        return lines
-
-    def _sync_loop(self, loop_name: str, node: SyncLaw) -> list[str]:
-        m, g, inp = self.node, self.g, self.input
-        theta, omega, vmag = (m(loop_name, field) for field in ("theta", "omega", "v_mag"))
-        voltage, current = inp(loop_name, "v"), inp(loop_name, "i")
-        body = [f"double frame = {theta};",
-                f"const Complex v = {self._complex_rotate(voltage, 'frame')};",
-                f"const Complex i = {self._complex_rotate(current, 'frame')};",
-                f"if (!{self.m('startup_run')}) {{",
-                f"    if (std::abs({voltage}) > 0.1) {{",
-                f"        const double delta = std::remainder(std::arg({voltage}) - {theta}, 2.0 * pi);",
-                f"        {theta} += delta;",
-                f"        {omega} = {_number(node.w0)};",
-                f"        {vmag} = std::abs({voltage});"]
-        if isinstance(node, PSC):
-            vint = m(loop_name, "v_int")
-            if node.k_vi > 0.0:
-                body.append(f"        {vint} = ({vmag} - {inp(loop_name, 'v_ref')} - {_number(node.k_v)} * ({inp(loop_name, 'v_ref')} - {vmag})) / {_number(node.k_vi)};")
-            else:
-                body.append(f"        {vint} = 0.0;")
-        elif isinstance(node, VSG):
-            body.append(f"        {m(loop_name, 'dw')} = 0.0;")
-        body += ["    }", f"    frame = {theta};", "} else {",
-                 f"    const double p_ref = {self.m('startup_value')} * {inp(loop_name, 'p_ref')};"]
-        p, q, qref, vref, udc = (inp(loop_name, port) for port in ("p", "q", "q_ref", "v_ref", "u_dc"))
-        T = _number(node.T)
-        if isinstance(node, PSC):
-            vint = m(loop_name, "v_int")
-            body += [f"    {omega} = {_number(node.w0)} + {_number(node.k_p)} * (p_ref - {p});",
-                     f"    {theta} += {T} * {omega};",
-                     f"    const double e_v = {vref} - std::abs(v);",
-                     f"    const double v_integrated = {vint} + {_number(0.5 * node.T)} * e_v;",
-                     f"    {vint} += {T} * e_v;",
-                     f"    {vmag} = {vref} + {_number(node.k_v)} * e_v + {_number(node.k_vi)} * v_integrated;"]
-        elif isinstance(node, Droop):
-            body += [f"    {omega} = {_number(node.w0)} + {_number(node.m_p)} * (p_ref - {p});",
-                     f"    {theta} += {T} * {omega};",
-                     f"    {vmag} = {vref} + {_number(node.n_q)} * ({qref} - {q});"]
-        elif isinstance(node, VSG):
-            dw = m(loop_name, "dw")
-            body += [f"    {dw} += {T} / {_number(2.0 * node.h)} * (p_ref - {p} - {_number(node.d_p)} * {dw});",
-                     f"    {omega} = {_number(node.w0)} * (1.0 + {dw});",
-                     f"    {theta} += {T} * {omega};",
-                     f"    const double v_command = {vref} + {_number(node.k_q)} * ({qref} - {q});"]
-            if node.t_q > 0.0:
-                body.append(f"    {vmag} += {T} / {_number(node.t_q)} * (v_command - {vmag});")
-            else:
-                body.append(f"    {vmag} = v_command;")
-        elif isinstance(node, DVOC):
-            body += [f"    const double V = std::max({vmag}, 1e-12);",
-                     f"    const Complex i_star = Complex{{p_ref, -{qref}}} * V / ({vref} * {vref});",
-                     f"    const Complex w = {_number(node.eta)} * {_complex(node.rot)} * (i_star - i) + {_number(node.eta * node.alpha)} * (1.0 - V * V / ({vref} * {vref})) * V;",
-                     f"    {omega} = {_number(node.w0)} + std::imag(w) / V;",
-                     f"    {vmag} = V + {T} * std::real(w);",
-                     f"    {theta} += {T} * {omega};"]
-        elif isinstance(node, Matching):
-            body += [f"    {omega} = {_number(node.k_theta)} * {udc};",
-                     f"    {theta} += {T} * {omega};",
-                     f"    {vmag} = {vref} + {_number(node.k_q)} * ({qref} - {q});"]
-        else:
-            raise TypeError(f"C++ export: unsupported synchronisation law {type(node).__name__}")
-        body += ["}", f"{g(loop_name + '.theta')} = {theta};",
-                 f"{g(loop_name + '.frame')} = frame;",
-                 f"{g(loop_name + '.omega')} = {omega};",
-                 f"{g(loop_name + '.v_ref')} = {vmag};"]
-        return body
-
-    def _current_loop(self, loop_name: str, node: CurrentLoop) -> list[str]:
-        m, g, inp = self.node, self.g, self.input
-        integral = m(loop_name, "integral")
-        rotate = self._complex_rotate
-        lines = [
-            f"const Complex rotation{{std::cos({inp(loop_name, 'frame')}), -std::sin({inp(loop_name, 'frame')})}};",
-            f"const Complex i = {inp(loop_name, 'i')} * rotation;",
-            f"const Complex u_ff = {inp(loop_name, 'v')} * rotation;",
-            f"const Complex e = {self.m('startup_run')} ? Complex{{{inp(loop_name, 'id_ref')}, {inp(loop_name, 'iq_ref')}}} - i : Complex{{0.0, 0.0}};",
-            f"Complex integrated = {integral};",
-            f"if ({self.m('startup_run')}) {{ integrated += {_number(0.5 * node.T)} * e; {integral} += {_number(node.T)} * e; }}",
-            f"{g(loop_name + '.extra')} = {inp(loop_name, 'extra')};",
-            f"Complex feedforward = {g(loop_name + '.extra')};",
-            *( ["feedforward += u_ff;"] if node.feedforward else [] ),
-            *( [f"feedforward += Complex{{{_number(node.r_pu)}, {inp(loop_name, 'omega')} / {_number(node.w0)} * {_number(node.x_pu)}}} * i;"] if node.decoupling else [] ),
-            f"Complex intended = feedforward + {_number(node.kp)} * e + {_number(node.ki)} * integrated;",
-        ]
-        output_limit = self.graph._limits.get(loop_name)
-        if output_limit is not None and output_limit[0] == "u_dq":
-            limit = self.ctrl.stage.command_limit(1.0)
-            lines += [
-                f"const double command_limit = {_number(limit)} * std::max(0.0, meas_u_dc);",
-                "const double command_magnitude = std::abs(intended);",
-                "const bool command_saturated = command_magnitude > command_limit;",
-                "Complex output = command_saturated ? intended * (command_limit / command_magnitude) : intended;",
-                *([f"if ({self.m('startup_run')} && command_saturated) {integral} += {_number(node.T / node.kp)} * (output - intended);"]
-                  if node.antiwindup else []),
-                f"{self.m('command_saturated')} = command_saturated;",
-                f"{g(loop_name + '.u_dq')} = output;",
-            ]
-        else:
-            lines.append(f"{g(loop_name + '.u_dq')} = intended;")
-        return lines
-
     def controller_method(self) -> str:
         lines = [f"void controller_{self.tag}(double t) {{",
                  f"    const Complex meas_u_g = {self._adc_value('u_g')} / {_number(self.cfg.base.v_phase_peak)};",
@@ -2076,7 +2177,8 @@ class _UnitGenerator(_ACControlGenerator):
                  f"        if (!{self.m('startup_complete')}) ++{self.m('startup_steps')};",
                  "    }"]
         for loop_name in self.graph.order:
-            lines.extend("    " + line for line in self._loop(loop_name, self.graph.nodes[loop_name]))
+            lines.extend("    " + line for line in
+                         self._loop_lines(loop_name, self.graph.nodes[loop_name]))
         theta_source = self.source(self.graph.outputs["theta"])
         omega_source = self.source(self.graph.outputs["omega"])
         command_source = self.source(self.graph.outputs["u_dq"])
@@ -2114,18 +2216,7 @@ class _UnitGenerator(_ACControlGenerator):
                  f"{indent}{self.m('log_in_service')} = {self.m('startup_run')} ? 1.0 : 0.0;",
                  f"{indent}{self.m('log_freq_dev')} = ({self.m('omega')} - {_number(self.cfg.base.w0)}) / (2.0 * pi);",
                  f"{indent}{self.m('log_angle_rel')} = std::remainder({self.m('theta')} - {_number(self.cfg.base.w0)} * t, 2.0 * pi);"]
-        if self.cfg.ctrl.type == "gfl":
-            idref = self.input(current_name, "id_ref") if current_name is not None else "0.0"
-            lines.append(f"{indent}{self.m('log_id_ref_pu')} = {idref};")
-        else:
-            power_name = next((name for name, node in self.graph.nodes.items()
-                               if isinstance(node, PowerLoop)), None)
-            sync_name = next((name for name, node in self.graph.nodes.items()
-                              if isinstance(node, SyncLaw)), None)
-            lines += [f"{indent}{self.m('log_p_pu')} = {self.g(power_name + '.p') if power_name else '0.0'};",
-                      f"{indent}{self.m('log_q_pu')} = {self.g(power_name + '.q') if power_name else '0.0'};",
-                      f"{indent}{self.m('log_p_ref_pu')} = {self.m('startup_value')} * {self._reference('p_ref_pu')};",
-                      f"{indent}{self.m('log_v_ref_pu')} = {self.g(sync_name + '.v_ref') if sync_name else self._reference('v_ref_pu')};"]
+        lines += self._mode_log_lines(indent, current_name)
         return lines
 
     def _modulation_lines(self, indent: str) -> list[str]:
@@ -2133,28 +2224,23 @@ class _UnitGenerator(_ACControlGenerator):
         command = self.m("u_cmd")
         theta = self.m("command_theta")
         udc = f"obs_{_identifier(self.name + '.u_dc')}"
-        lines = [f"{indent}const Complex u_ab = {command} * Complex{{std::cos({theta}), std::sin({theta})}} * {_number(stage.v_base)};",
-                 f"{indent}std::array<double, 3> modulation{{}};",
-                 f"{indent}const auto phase = phases(u_ab);"]
-        if self.cfg.pwm.method == "svpwm":
-            lines += [f"{indent}if ({udc} > 0.0) {{",
-                      f"{indent}    for (int k = 0; k < 3; ++k) modulation[k] = 2.0 * phase[k] / {udc};",
-                      f"{indent}    const auto [lo, hi] = std::minmax_element(modulation.begin(), modulation.end());",
-                      f"{indent}    const double zero = 0.5 * (*lo + *hi);",
-                      f"{indent}    for (double& value : modulation) value -= zero;",
-                      f"{indent}}} else {{"]
-        else:
-            lines += [f"{indent}if ({udc} > 0.0) {{",
-                      f"{indent}    for (int k = 0; k < 3; ++k) modulation[k] = 2.0 * phase[k] / {udc};",
-                      f"{indent}}} else {{"]
-        lines += [f"{indent}    const double peak = std::max({{std::abs(phase[0]), std::abs(phase[1]), std::abs(phase[2])}});",
-                  f"{indent}    if (peak > 0.0) for (int k = 0; k < 3; ++k) modulation[k] = phase[k] / peak;",
-                  f"{indent}}}",
+        if not stage._trusted_pwm or not stage._standard_limiter:
+            raise TypeError(
+                "C++ export: a custom VSC output stage has no equation tracer contract"
+            )
+        traced = self.model._trace(lambda: stage.equation(
+            _Expression(command, "complex"),
+            _Expression(f"Complex{{std::cos({theta}), std::sin({theta})}}", "complex"),
+            _Expression(udc, "real"),
+        ))
+        modulation, output_saturated = traced
+        lines = [
+                  f"{indent}std::array<double, 3> modulation{{"
+                  f"{', '.join(value.code for value in modulation)}}};",
                   f"{indent}const double peak_m = std::max({{std::abs(modulation[0]), std::abs(modulation[1]), std::abs(modulation[2])}});",
-                  f"{indent}const bool output_saturated = peak_m > {_number(self.cfg.pwm.modulation_limit)};",
-                  f"{indent}if (output_saturated) for (double& value : modulation) value *= {_number(self.cfg.pwm.modulation_limit)} / peak_m;",
+                  f"{indent}const bool output_saturated = {output_saturated.code};",
                   f"{indent}const bool saturated = {self.m('command_saturated')} || output_saturated;",
-                  f"{indent}{self.m('last_m_max')} = std::min(peak_m, {_number(self.cfg.pwm.modulation_limit)});",
+                  f"{indent}{self.m('last_m_max')} = peak_m;",
                   f"{indent}++{self.m('mod_updates')};",
                   f"{indent}if (saturated) {{ ++{self.m('mod_saturated')}; if (!std::isfinite({self.m('mod_first_t')})) {self.m('mod_first_t')} = t; }}",
                   f"{indent}for (int k = 0; k < 3; ++k) {self.m('pending_d')}[k] = 0.5 * (1.0 + modulation[k]);"]
@@ -2163,7 +2249,6 @@ class _UnitGenerator(_ACControlGenerator):
     def event_methods(self) -> str:
         bridge = self.unit.bridge
         hold = self.model.zoh_fields[id(bridge.inp), "q"]
-        T, TL, offset = bridge.period, bridge.load_period, bridge.offset
         switching = not isinstance(bridge.modulator, ZOH)
         next_values = [self.m('t_interrupt'), self.m('t_load'), self.m('next_switch')]
         adc = self.unit.adc
@@ -2199,31 +2284,24 @@ class _UnitGenerator(_ACControlGenerator):
             f"    const bool control_due = std::abs(t - {self.m('t_interrupt')}) < time_eps;",
             f"    const bool load_due = std::abs(t - {self.m('t_load')}) < time_eps;",
         ]
+        write = self._pwm_write_lines(
+            f"{self.m('pending_on')} && !{self.m('tripped')}"
+        )
         if bridge.computation == 0.0:
             lines += [f"    if (control_due && {self.m('pending_valid')}) {{",
-                      f"        for (int k = 0; k < 3; ++k) {self.m('shadow')}[k] = {self.m('pending_d')}[k];",
-                      f"        {self.m('shadow')}[3] = {self.m('pending_on')} && !{self.m('tripped')};",
-                      f"        ++{self.m('pwm_k')}; {self.m('t_interrupt')} = {_number(offset)} + {self.m('pwm_k')} * {_number(T)};",
-                      "    }"]
-        lines += [f"    if (load_due) {{",
-                  f"        const double completed = {_number(offset)} + ({self.m('pwm_k')} - 1) * {_number(T)} + {_number(bridge.computation)};",
-                  f"        if (completed <= t + time_eps) {self.m('active')} = {self.m('shadow')};",
-                  *self._load_modulation(hold, switching),
-                  f"        ++{self.m('pwm_j')}; {self.m('t_load')} = {_number(offset)} + {self.m('pwm_j')} * {_number(TL)};",
-                  f"        {self.m('gates')} = {self.m('active')}[3] != 0.0 && !{self.m('tripped')};",
-                  f"        breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = !({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});",
-                  "    }"]
+                      *write, "    }"]
+        lines += self._pwm_load_lines(
+            hold,
+            switching,
+            f"{self.m('active')}[{self.width}] != 0.0 && !{self.m('tripped')}",
+            (f"        breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
+             f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});",),
+        )
         if bridge.computation > 0.0:
             lines += [f"    if (control_due && {self.m('pending_valid')}) {{",
-                      f"        for (int k = 0; k < 3; ++k) {self.m('shadow')}[k] = {self.m('pending_d')}[k];",
-                      f"        {self.m('shadow')}[3] = {self.m('pending_on')} && !{self.m('tripped')};",
-                      f"        ++{self.m('pwm_k')}; {self.m('t_interrupt')} = {_number(offset)} + {self.m('pwm_k')} * {_number(T)};",
-                      "    }"]
+                      *write, "    }"]
         if switching:
-            lines += [f"    while ({self.m('switch_index')} < {self.m('switches')}.size() && std::abs({self.m('switches')}[{self.m('switch_index')}].first - t) < time_eps) {{",
-                      f"        {hold} = {self.m('switches')}[{self.m('switch_index')}++].second;",
-                      "    }",
-                      f"    {self.m('next_switch')} = {self.m('switch_index')} < {self.m('switches')}.size() ? {self.m('switches')}[{self.m('switch_index')}].first : std::numeric_limits<double>::infinity();"]
+            lines += self._pwm_switch_lines(hold)
         if adc is not None:
             if adc.averaging:
                 full = adc._full
@@ -2250,106 +2328,15 @@ class _UnitGenerator(_ACControlGenerator):
                   "    return tripped_now;", "}"]
         return "\n".join(lines)
 
-    def _load_modulation(self, hold: str, switching: bool) -> list[str]:
-        """Code which maps active compares to the bridge input for the next load interval."""
-        if not switching:
-            return [f"        {hold} = abc_to_complex({self.m('active')}[0], {self.m('active')}[1], {self.m('active')}[2]);",
-                    f"        {self.m('load_end')} = t + {_number(self.unit.bridge.load_period)};"]
-        modulator = self.unit.bridge.modulator
-        if isinstance(modulator, SynchronousCarrier):
-            frequency = f"({_number(modulator.pulse_ratio)} * {self.m('omega')} / (2.0 * pi))"
-            phase = f"({_number(modulator.pulse_ratio)} * {self.m('theta')} / (2.0 * pi) + {_number(modulator.phase)} - t * {frequency})"
-        elif isinstance(modulator, CarrierComparison):
-            frequency = _number(modulator.f_sw)
-            phase = _number(modulator.phase)
-        else:
-            raise TypeError(f"C++ export: unsupported PWM modulator {type(modulator).__name__}")
-        return [
-            f"        make_switches_{self.tag}(t, {_number(self.unit.bridge.load_period)}, {frequency}, {phase}, {hold});",
-            f"        {self.m('load_end')} = t + {_number(self.unit.bridge.load_period)};",
-        ]
-
-    def switching_method(self) -> str:
-        """Exact carrier comparison without heap work in the integration hot path."""
-        if isinstance(self.unit.bridge.modulator, ZOH):
-            return ""
-        hold = self.model.zoh_fields[id(self.unit.bridge.inp), "q"]
-        switches, index, next_ = (self.m("switches"), self.m("switch_index"), self.m("next_switch"))
-        return f'''void make_switches_{self.tag}(double t, double span, double frequency, double phase, Complex& held) {{
-    if (!(frequency > 0.0)) throw std::runtime_error("synchronous PWM frequency is not positive");
-    {switches}.clear();
-    {index} = 0;
-    std::array<double, 3> modulation{{}};
-    std::array<double, 3> q{{}};
-    for (int k = 0; k < 3; ++k) modulation[k] = std::clamp(2.0 * {self.m('active')}[k] - 1.0, -1.0, 1.0);
-    double position = carrier_position(t, frequency, phase);
-    const double carrier0 = carrier_value(position);
-    for (int k = 0; k < 3; ++k) q[k] = position < 0.5 ? (modulation[k] > carrier0) : (modulation[k] >= carrier0);
-    held = abc_to_complex(q[0], q[1], q[2]);
-    std::vector<std::tuple<double, int, double>> edges;
-    double covered = 0.0;
-    for (int piece = 0; piece < 64 && covered < span - 1e-13; ++piece) {{
-        position = carrier_position(t + covered, frequency, phase);
-        const bool rising = position < 0.5;
-        const double length = std::min(((rising ? 0.5 : 1.0) - position) / frequency, span - covered);
-        const double c0 = carrier_value(position);
-        const double slope = rising ? 4.0 * frequency : -4.0 * frequency;
-        for (int k = 0; k < 3; ++k) {{
-            const double x = (modulation[k] - c0) / slope;
-            if (x > 0.0 && x < length) edges.emplace_back(covered + x, k, rising ? 0.0 : 1.0);
-        }}
-        covered += length;
-    }}
-    std::sort(edges.begin(), edges.end());
-    double previous = 0.0;
-    for (const auto& edge : edges) {{
-        const double at = std::get<0>(edge);
-        q[std::get<1>(edge)] = std::get<2>(edge);
-        if (at - previous > 1e-12) {{
-            {switches}.emplace_back(t + at, abc_to_complex(q[0], q[1], q[2]));
-            previous = at;
-        }} else if (!{switches}.empty()) {{
-            {switches}.back().second = abc_to_complex(q[0], q[1], q[2]);
-        }}
-    }}
-    {next_} = {switches}.empty() ? std::numeric_limits<double>::infinity() : {switches}[0].first;
-}}
-'''
-
     def command_lines(self, on: bool, ramp: float) -> list[str]:
-        lines = [f"{self.m('breaker')} = {'true' if on else 'false'};",
-                 f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = true;"]
-        if on:
-            lines += [f"if (!{self.m('startup_run')}) {{",
-                      *["    " + line for line in self._reset_integrators()],
-                      "}",
-                      f"{self.m('startup_run')} = true;",
-                      f"{self.m('startup_ramp')} = {_number(ramp)};",
-                      f"{self.m('startup_steps')} = 0;",
-                      f"{self.m('startup_value')} = 0.0;",
-                      f"{self.m('startup_complete')} = false;"]
-        else:
-            lines += [f"{self.m('startup_run')} = false;",
-                      f"{self.m('startup_steps')} = 0;",
-                      f"{self.m('startup_value')} = 0.0;",
-                      f"{self.m('startup_complete')} = false;",
-                      f"{self.m('gates')} = false;"]
+        effective = self._effective_command(on)
+        lines = [f"{self.m('breaker')} = {effective};"]
+        lines += self._controller_command_lines(on, ramp)
+        lines.append(
+            f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
+            f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});"
+        )
         return lines
-
-    def _reset_integrators(self) -> list[str]:
-        lines = []
-        for name, node in self.graph.nodes.items():
-            if isinstance(node, SRFPLL):
-                lines.append(f"{self.node(name, 'integral')} = 0.0;")
-            elif isinstance(node, CurrentLoop):
-                lines.append(f"{self.node(name, 'integral')} = Complex{{0.0, 0.0}};")
-            elif isinstance(node, DCVoltageControl):
-                lines += [f"{self.node(name, 'integral')} = 0.0;",
-                          f"{self.node(name, 'limit_exceeded')} = false;"]
-            elif isinstance(node, PSC):
-                lines.append(f"{self.node(name, 'v_int')} = 0.0;")
-        return lines
-
 
 class _GraphUnitGenerator(_ControlGenerator):
     """Lower a unit through its public control and bridge ports.
@@ -2390,99 +2377,6 @@ class _GraphUnitGenerator(_ControlGenerator):
             return self.m("startup_run")
         return self.g(path)
 
-    def _state(self, loop: str, local: str) -> str:
-        if self.continuous:
-            return self.model.value(self.ctrl.state, f"{loop}.{local}")
-        return self.node(loop, local)
-
-    @staticmethod
-    def _local(block_name: str, local: str) -> str:
-        return block_name if not local else f"{block_name}.{local}"
-
-    @staticmethod
-    def _copy_block(block: Any) -> Any:
-        """Copy a dynamic block without invoking factories implemented through ``__new__``."""
-        cloned = object.__new__(type(block))
-        if hasattr(block, "__dict__"):
-            vars(cloned).update(vars(block))
-        for cls in reversed(type(block).__mro__):
-            slots = getattr(cls, "__slots__", ())
-            if isinstance(slots, str):
-                slots = (slots,)
-            for name in slots:
-                if hasattr(block, name):
-                    setattr(cloned, name, getattr(block, name))
-        return cloned
-
-    def _clone_loop(self, loop_name: str, node: Any) -> Any:
-        clone = copy.copy(node)
-        if node.startup is not None:
-            startup = copy.copy(node.startup)
-            startup.run = _Expression(self.m("startup_run"), "bool")
-            startup.value = _Expression(self.m("startup_value"), "real")
-            clone.startup = startup
-        blocks: dict[int, Any] = {}
-        cloned_blocks: dict[str, Any] = {}
-        for block_name, block in node._state_blocks.items():
-            cloned = self._copy_block(block)
-            for local, (owner, attribute) in block.state_bindings().items():
-                if owner is not block:
-                    raise TypeError(
-                        f"C++ export: indirect state binding in {self.name}.{loop_name}.{block_name}"
-                    )
-                public = self._local(block_name, local)
-                value = block.get_state()[local]
-                kind = "complex" if isinstance(value, complex) else "real"
-                setattr(cloned, attribute, _Expression(self._state(loop_name, public), kind))
-            blocks[id(block)] = cloned
-            cloned_blocks[block_name] = cloned
-        clone._state_blocks = cloned_blocks
-        for attribute, value in vars(node).items():
-            replacement = blocks.get(id(value))
-            if replacement is not None:
-                setattr(clone, attribute, replacement)
-            elif isinstance(value, OutputLimit):
-                limit = copy.copy(value)
-                if limit.pi is not None and id(limit.pi) in blocks:
-                    limit.pi = blocks[id(limit.pi)]
-                setattr(clone, attribute, limit)
-        return clone
-
-    def _trace_loop(self, loop_name: str, node: Any) -> tuple[_Expression, ...]:
-        inputs = tuple(_Expression(self.input(loop_name, port),
-                                   "complex" if spec.complex_value else "real")
-                       for port, spec in node.inputs.items())
-        state_names = tuple(node.get_state())
-
-        def run():
-            clone = self._clone_loop(loop_name, node)
-            if self.continuous:
-                return tuple(clone.flow_path(*inputs))
-            outputs = tuple(clone.equation(*inputs))
-            state = clone.get_state()
-            return outputs + tuple(state[name] for name in state_names)
-
-        result = self.model._trace(run)
-        return tuple(result)
-
-    def _loop_lines(self, loop_name: str, node: Any) -> list[str]:
-        values = self._trace_loop(loop_name, node)
-        n_outputs = len(node.outputs)
-        lines = [f"{self.g(loop_name + '.' + port)} = {value.code};"
-                 for port, value in zip(node.outputs, values[:n_outputs])]
-        if self.continuous:
-            lines += [f"{self.d(loop_name, local)} = {value.code};"
-                      for local, value in zip(node.flow_state(), values[n_outputs:])]
-            return lines
-        lines += [f"{self.node(loop_name, local)} = {value.code};"
-                  for local, value in zip(node.get_state(), values[n_outputs:])]
-        period = self.graph.periods[loop_name]
-        every = max(1, int(round(period / self.cfg.ctrl.period)))
-        if every == 1:
-            return lines
-        guard = f"{self.m('pwm_k')} % {every} == 0"
-        return [f"if ({guard}) {{", *["    " + line for line in lines], "}"]
-
     def declarations(self) -> list[str]:
         if not self.continuous:
             return []
@@ -2519,12 +2413,10 @@ class _GraphUnitGenerator(_ControlGenerator):
                 f"double {self.m('startup_start')} = {_number(startup.start)};",
                 f"double {self.m('startup_value')} = {_number(startup.value)};",
             ]
+            lines += [f"bool {self.m(loop_name + '_limit_active')} = false;"
+                      for loop_name, node in self.graph.nodes.items()
+                      if isinstance(node, DCVoltageControl)]
             return lines
-        bridge = self.bridge
-        q_kind = "Complex" if isinstance(self.topology.zero, complex) else "double"
-        schedule = ", ".join(
-            "{" + _number(at) + ", " + self._literal(q) + "}" for at, q in bridge.schedule
-        )
         lines += [
             f"long long {self.m('startup_steps')} = {int(startup.steps)};",
             f"double {self.m('startup_value')} = {_number(startup.value)};",
@@ -2540,20 +2432,27 @@ class _GraphUnitGenerator(_ControlGenerator):
             for local, value in node.get_state().items():
                 kind = "Complex" if isinstance(value, complex) else "double"
                 lines.append(f"{kind} {self.node(loop_name, local)} = {self._literal(value)};")
+            if isinstance(node, DCVoltageControl):
+                lines.append(
+                    f"bool {self.node(loop_name, 'limit_exceeded')} = "
+                    f"{'true' if node.limit_exceeded else 'false'};"
+                )
+            for carried in node.carried:
+                value = getattr(node, carried)
+                if carried == "first_limit_t":
+                    lines.append(
+                        f"double {self.node(loop_name, carried)} = "
+                        f"{_number(value if value is not None else math.nan)};"
+                    )
+                    continue
+                kind = ("bool" if isinstance(value, bool) else
+                        "std::size_t" if isinstance(value, int) else
+                        "Complex" if isinstance(value, complex) else "double")
+                lines.append(
+                    f"{kind} {self.node(loop_name, carried)} = {self._literal(value)};"
+                )
         lines += [
-            f"long long {self.m('pwm_k')} = {int(bridge.k)};",
-            f"long long {self.m('pwm_j')} = {int(bridge.j)};",
-            f"double {self.m('t_interrupt')} = {_number(bridge.t_interrupt)};",
-            f"double {self.m('t_load')} = {_number(bridge.t_load)};",
-            f"std::array<double, {self.width + 1}> {self.m('active')}"
-            f"{{{', '.join(_number(x) for x in bridge.active)}}};",
-            f"std::array<double, {self.width + 1}> {self.m('shadow')}"
-            f"{{{', '.join(_number(x) for x in bridge.shadow)}}};",
-            f"std::vector<std::pair<double, {q_kind}>> {self.m('switches')}"
-            f"{{{schedule}}};",
-            f"std::size_t {self.m('switch_index')} = 0;",
-            f"double {self.m('next_switch')} = {_number(bridge.next_switch)};",
-            f"double {self.m('load_end')} = {_number(bridge.load_end)};",
+            *self._pwm_members(),
         ]
         return lines
 
@@ -2595,10 +2494,11 @@ class _GraphUnitGenerator(_ControlGenerator):
             raise TypeError(
                 f"C++ export: a port-driven bridge controller needs one output, got {outputs}"
             )
-        command = self.source(outputs[0])
+        command = _Expression(self.source(outputs[0]), "real")
+        state = self.model._trace(lambda: self.topology.state_from_duty(command))
         q = self.model.value(self.ctrl.out, "q")
         lines.append(
-            f"{q} = {self.m('startup_run')} ? {command} : {self._literal(self.topology.zero)};"
+            f"{q} = {self.m('startup_run')} ? {state.code} : {self._literal(self.topology.zero)};"
         )
         lines += self._log_lines()
         return lines
@@ -2653,30 +2553,10 @@ class _GraphUnitGenerator(_ControlGenerator):
         record = subsystem.inp
         return self.model.zoh_fields[id(record), field]
 
-    def _topology_expression(self, method: Any, values: tuple[str, ...]) -> str:
-        result = self.model._trace(
-            lambda: method(tuple(_Expression(value, "real") for value in values))
-        )
-        return result.code
-
-    def _load_modulation(self, hold: str, switching: bool) -> list[str]:
-        if switching:
-            return [
-                f"        make_switches_{self.tag}(t, {_number(self.bridge.load_period)}, "
-                f"{_number(self.bridge.modulator.f_sw)}, {_number(self.bridge.modulator.phase)}, {hold});",
-                f"        {self.m('load_end')} = t + {_number(self.bridge.load_period)};",
-            ]
-        values = tuple(f"{self.m('active')}[{index}]" for index in range(self.width))
-        encoded = self._topology_expression(self.topology.pwm_state, values)
-        return [f"        {hold} = {encoded};",
-                f"        {self.m('load_end')} = t + {_number(self.bridge.load_period)};"]
-
     def event_methods(self) -> str:
         hold = self._hold()
         bridge = self.bridge
-        T, TL, offset = bridge.period, bridge.load_period, bridge.offset
         switching = not isinstance(bridge.modulator, ZOH)
-        on_index = self.width
         lines = [
             f"double next_{self.tag}() const noexcept {{ return std::min({{{self.m('t_interrupt')}, "
             f"{self.m('t_load')}, {self.m('next_switch')}}}); }}",
@@ -2687,105 +2567,40 @@ class _GraphUnitGenerator(_ControlGenerator):
             f"    const bool control_due = std::abs(t - {self.m('t_interrupt')}) < time_eps;",
             f"    const bool load_due = std::abs(t - {self.m('t_load')}) < time_eps;",
         ]
-        write = [
-            f"        for (int k = 0; k < {self.width}; ++k) "
-            f"{self.m('shadow')}[k] = {self.m('pending_d')}[k];",
-            f"        {self.m('shadow')}[{on_index}] = "
-            f"{self.m('pending_on')} && {self.m('breaker')} && !{self.m('tripped')};",
-            f"        ++{self.m('pwm_k')}; {self.m('t_interrupt')} = {_number(offset)} + "
-            f"{self.m('pwm_k')} * {_number(T)};",
-        ]
+        write = self._pwm_write_lines(
+            f"{self.m('pending_on')} && {self.m('breaker')} && !{self.m('tripped')}"
+        )
         if bridge.computation == 0.0:
             lines += [f"    if (control_due && {self.m('pending_valid')}) {{",
                       *write, "    }"]
-        lines += [
-            "    if (load_due) {",
-            f"        const double completed = {_number(offset)} + ({self.m('pwm_k')} - 1) * "
-            f"{_number(T)} + {_number(bridge.computation)};",
-            f"        if (completed <= t + time_eps) {self.m('active')} = {self.m('shadow')};",
-            *self._load_modulation(hold, switching),
-            f"        ++{self.m('pwm_j')}; {self.m('t_load')} = {_number(offset)} + "
-            f"{self.m('pwm_j')} * {_number(TL)};",
-            f"        {self.m('gates')} = {self.m('active')}[{on_index}] != 0.0 && "
-            f"{self.m('breaker')} && !{self.m('tripped')};",
-            f"        breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
-            f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});",
-            "    }",
-        ]
+        if self.unit.branch_f is None:
+            tail = (f"        if (!{self.m('gates')}) "
+                    f"{hold} = {self._literal(self.topology.zero)};",)
+        else:
+            tail = (
+                f"        breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
+                f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});",
+            )
+        lines += self._pwm_load_lines(
+            hold,
+            switching,
+            f"{self.m('active')}[{self.width}] != 0.0 && "
+            f"{self.m('breaker')} && !{self.m('tripped')}",
+            tail,
+        )
         if bridge.computation > 0.0:
             lines += [f"    if (control_due && {self.m('pending_valid')}) {{",
                       *write, "    }"]
         if switching:
-            lines += [
-                f"    while ({self.m('switch_index')} < {self.m('switches')}.size() && "
-                f"std::abs({self.m('switches')}[{self.m('switch_index')}].first - t) < time_eps) {{",
-                f"        {hold} = {self.m('switches')}[{self.m('switch_index')}++].second;",
-                "    }",
-                f"    {self.m('next_switch')} = {self.m('switch_index')} < "
-                f"{self.m('switches')}.size() ? "
-                f"{self.m('switches')}[{self.m('switch_index')}].first : "
-                "std::numeric_limits<double>::infinity();",
-            ]
+            lines += self._pwm_switch_lines(hold)
+            if self.unit.branch_f is None:
+                lines.append(
+                    f"    if (!{self.m('gates')}) "
+                    f"{hold} = {self._literal(self.topology.zero)};"
+                )
         lines += [f"    if (control_due) {self.m('pending_valid')} = false;",
                   "    return false;", "}"]
         return "\n".join(lines)
-
-    def switching_method(self) -> str:
-        if isinstance(self.bridge.modulator, ZOH):
-            return ""
-        if not isinstance(self.bridge.modulator, CarrierComparison):
-            raise TypeError(
-                f"C++ export: port-driven unit {self.name!r} needs an asynchronous carrier"
-            )
-        values = tuple(f"q[{index}]" for index in range(self.width))
-        encoded = self._topology_expression(self.topology.switching_state, values)
-        q_kind = "Complex" if isinstance(self.topology.zero, complex) else "double"
-        return f'''void make_switches_{self.tag}(double t, double span, double frequency,
-        double phase, {q_kind}& held) {{
-    if (!(frequency > 0.0)) throw std::runtime_error("PWM frequency is not positive");
-    {self.m('switches')}.clear();
-    {self.m('switch_index')} = 0;
-    std::array<double, {self.width}> modulation{{}};
-    std::array<double, {self.width}> q{{}};
-    for (int k = 0; k < {self.width}; ++k)
-        modulation[k] = std::clamp(2.0 * {self.m('active')}[k] - 1.0, -1.0, 1.0);
-    double position = carrier_position(t, frequency, phase);
-    const double carrier0 = carrier_value(position);
-    for (int k = 0; k < {self.width}; ++k)
-        q[k] = position < 0.5 ? (modulation[k] > carrier0) : (modulation[k] >= carrier0);
-    held = {encoded};
-    std::vector<std::tuple<double, int, double>> edges;
-    double covered = 0.0;
-    for (int piece = 0; piece < 64 && covered < span - 1e-13; ++piece) {{
-        position = carrier_position(t + covered, frequency, phase);
-        const bool rising = position < 0.5;
-        const double length = std::min(((rising ? 0.5 : 1.0) - position) / frequency,
-                                       span - covered);
-        const double c0 = carrier_value(position);
-        const double slope = rising ? 4.0 * frequency : -4.0 * frequency;
-        for (int k = 0; k < {self.width}; ++k) {{
-            const double x = (modulation[k] - c0) / slope;
-            if (x > 0.0 && x < length)
-                edges.emplace_back(covered + x, k, rising ? 0.0 : 1.0);
-        }}
-        covered += length;
-    }}
-    std::sort(edges.begin(), edges.end());
-    double previous = 0.0;
-    for (const auto& edge : edges) {{
-        const double at = std::get<0>(edge);
-        q[std::get<1>(edge)] = std::get<2>(edge);
-        const {q_kind} state = {encoded};
-        if (at - previous > 1e-12) {{
-            {self.m('switches')}.emplace_back(t + at, state);
-            previous = at;
-        }} else if (!{self.m('switches')}.empty()) {{
-            {self.m('switches')}.back().second = state;
-        }}
-    }}
-    {self.m('next_switch')} = {self.m('switches')}.empty() ?
-        std::numeric_limits<double>::infinity() : {self.m('switches')}[0].first;
-}}'''
 
     def state_expression(self, *args: Any) -> str:
         if self.continuous:
@@ -2806,7 +2621,7 @@ class _GraphUnitGenerator(_ControlGenerator):
         if part is self.bridge:
             bank, _, field = local.rpartition(".")
             word = self.m("shadow" if bank == "shadow" else "active")
-            index = self.bridge._names.index(field)
+            index = (*self.topology.duty_names, "on").index(field)
             return f"{word}[{index}]"
         if part is self.ctrl:
             if local.startswith("held."):
@@ -2826,49 +2641,32 @@ class _GraphUnitGenerator(_ControlGenerator):
                 return self.node(loop_name, public)
         raise KeyError(local)
 
-    def _reset_integrators(self) -> list[str]:
-        lines: list[str] = []
-        for loop_name, node in self.graph.nodes.items():
-            for block_name, block in node._state_blocks.items():
-                initial = getattr(block, "initial", None)
-                if initial is None:
-                    continue
-                for local in block.get_state():
-                    public = self._local(block_name, local)
-                    if self.continuous:
-                        key = (id(self.ctrl.state), f"{loop_name}.{public}")
-                        index, is_complex = self.model.state_index[key]
-                        lines.append(f"y[{index}] = {self._literal(initial)};")
-                        if is_complex:
-                            lines.append(f"y[{index + 1}] = 0.0;")
-                    else:
-                        lines.append(
-                            f"{self.node(loop_name, public)} = {self._literal(initial)};"
-                        )
-        return lines
-
     def command_lines(self, on: bool, ramp: float, t: str = "t") -> list[str]:
-        lines: list[str] = []
-        if on:
-            lines += [f"if (!{self.m('startup_run')}) {{",
-                      *["    " + line for line in self._reset_integrators()], "}"]
-        lines += [
-            f"{self.m('breaker')} = {'true' if on else 'false'};",
-            f"{self.m('startup_run')} = {'true' if on else 'false'};",
-            f"{self.m('startup_ramp')} = {_number(ramp if on else 0.0)};",
-        ]
+        effective = self._effective_command(on)
+        lines = [f"{self.m('breaker')} = {effective};"]
+        lines += self._controller_command_lines(on, ramp, t)
         if self.continuous:
-            lines += [f"{self.m('startup_start')} = {t};",
-                      f"{self.m('gates')} = {'true' if on else 'false'};",
-                      f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
-                      f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});"]
+            lines.append(f"{self.m('gates')} = {effective};")
+            if self.unit.branch_f is not None:
+                lines.append(
+                    f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
+                    f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});"
+                )
         else:
-            lines += [f"{self.m('startup_steps')} = 0;",
-                      f"{self.m('startup_value')} = 0.0;",
-                      f"{self.m('startup_complete')} = false;"]
-            if not on:
-                lines += [f"{self.m('gates')} = false;",
-                          f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = true;"]
+            lines.append(
+                f"{self.m('gates')} = {self.m('active')}[{self.width}] != 0.0 && "
+                f"{self.m('breaker')} && !{self.m('tripped')};"
+            )
+            if self.unit.branch_f is None:
+                lines.append(
+                    f"if (!{self.m('gates')}) "
+                    f"{self._hold()} = {self._literal(self.topology.zero)};"
+                )
+            else:
+                lines.append(
+                    f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
+                    f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});"
+                )
         return lines
 
     def sense_method(self) -> str:
@@ -2900,10 +2698,14 @@ class _GraphUnitGenerator(_ControlGenerator):
 
 def _make_unit_generator(name: str, unit: Any, model: _ModelGenerator) -> Any:
     """Select an optimized controller lowering or the public-port graph lowering."""
-    if isinstance(unit.ctrl, UniteType):
+    if isinstance(unit.ctrl, GraphController):
+        return _GraphUnitGenerator(name, unit, model)
+    if isinstance(unit.ctrl, VSCController):
         return (_ContinuousUnitGenerator(name, unit, model) if unit.continuous
                 else _UnitGenerator(name, unit, model))
-    return _GraphUnitGenerator(name, unit, model)
+    raise TypeError(
+        f"C++ export: controller {type(unit.ctrl).__name__!r} has no generator"
+    )
 
 
 class _CppGenerator:
@@ -2973,6 +2775,15 @@ class _CppGenerator:
                     lines = sampled[target].command_lines(on, getattr(action, "ramp", 0.0))
                 elif target in continuous:
                     lines = continuous[target].command_lines(on, getattr(action, "ramp", 0.0))
+                elif leaves := _unit_leaves(self.p.units, target):
+                    generators = [sampled.get(leaf) or continuous.get(leaf) for leaf in leaves]
+                    if any(generator is None for generator in generators):
+                        raise TypeError(f"C++ export: composite unit {target!r} is incomplete")
+                    lines = [
+                        line
+                        for generator in generators
+                        for line in generator.command_lines(on, getattr(action, "ramp", 0.0))
+                    ]
                 elif target in self.system.sources:
                     branch = self.system.sources[target].branch
                     lines = [f"breaker_open_{model.prefix[id(branch)]} = {'false' if on else 'true'};"]
@@ -3030,11 +2841,11 @@ class _CppGenerator:
                 prefix = f"{head}." if head else ""
                 columns.extend(f"{prefix}{stem}_{phase}" for phase in "abc")
                 expressions.extend(self._phase_expressions(f"obs_{_identifier(key)}"))
-            elif not ((head in self.p.units and what in ("u_dc", "i_dc"))
+            elif not ((head in self.system.units and what in ("u_dc", "i_dc"))
                       or (head in self.p.sources and what == "angle")):
                 columns.append(key)
                 expressions.append(f"obs_{_identifier(key)}")
-        for name in self.p.units:
+        for name in self.system.units:
             for what in ("u_dc", "i_dc"):
                 key = f"{name}.{what}"
                 if key in signal_values:
@@ -3043,7 +2854,7 @@ class _CppGenerator:
         for name in self.p.sources:
             columns.append(f"{name}.angle")
             expressions.append(f"obs_{_identifier(name + '.angle')}")
-        for name in self.p.units:
+        for name in self.system.units:
             generator = sampled.get(name) or continuous[name]
             for key in generator.ctrl.log_names():
                 columns.append(f"{name}.{key}")
@@ -3192,6 +3003,7 @@ class _CppGenerator:
                    for name, unit in self.system.units.items() if not unit.continuous}
         continuous = {name: model.continuous_units[id(unit.ctrl)]
                       for name, unit in self.system.units.items() if unit.continuous}
+        unit_names = tuple(self.system.units)
         state_names = self.model.state_labels()
         initial = self.model.get_initial_values().tolist()
         public_names, state_values = self._state_layout(model, sampled, continuous)
@@ -3223,24 +3035,12 @@ class _CppGenerator:
         diode_step_limits = []
         for subsystem in diode_conduction.resolution_subsystems:
             if isinstance(subsystem, RLBranch) and subsystem.conduction is not None:
-                owner = next(
-                    unit for unit in self.system.units.values()
-                    if getattr(unit, "branch_f", None) is subsystem
-                )
-                prefix = _identifier(owner.name)
-                duty = model.zoh_fields[id(subsystem.inp), "q"]
-                current = f"obs_{prefix}_ctrl_meas_current"
-                voltage = f"obs_{prefix}_ctrl_meas_voltage"
-                dc_voltage = f"obs_{prefix}_ctrl_meas_vin"
-                period = _number(subsystem.conduction.period)
-                critical = (
-                    f"({duty} * {period} * ({dc_voltage} - {voltage}) / "
-                    f"(2.0 * {_number(subsystem.L)} + {_number(subsystem.R)} * {duty} * {period}))"
+                _derivative, in_dcm = model._diode_conduction(
+                    subsystem, solver_scope=True
                 )
                 diode_step_limits.append(
-                    f"({duty} > 0.0 && {duty} < 1.0 && {dc_voltage} > {voltage} "
-                    f"&& {current} < ({critical}) ? {period} / 10.0 : "
-                    "std::numeric_limits<double>::infinity())"
+                    f"({in_dcm} ? {_number(subsystem.conduction.period / 10.0)} "
+                    ": std::numeric_limits<double>::infinity())"
                 )
             else:
                 enabled = model.enabled_by.get(id(subsystem))
@@ -3273,13 +3073,13 @@ class _CppGenerator:
         methods_text = "\n\n    ".join(method.replace("\n", "\n    ") for method in methods if method)
         next_units = ", ".join(f"next_{generator.tag}()" for generator in sampled.values())
         sense = []
-        for name in self.p.units:
+        for name in unit_names:
             generator = sampled.get(name) or continuous.get(name)
             sense += [f"sense_{generator.tag}(t);", "sync(t);"]
         actuate = [f"trip_now = actuate_{(sampled.get(name) or continuous[name]).tag}(t) || trip_now;"
-                   for name in self.p.units]
+                   for name in unit_names]
         protect = [f"trip_now = protect_{(sampled.get(name) or continuous[name]).tag}(t) || trip_now;"
-                   for name in self.p.units]
+                   for name in unit_names]
         adc_accumulate = [generator.adc_accumulate_call("t - interval_start")
                           for generator in sampled.values()]
         adc_accumulate = [line for line in adc_accumulate if line]
@@ -3307,7 +3107,7 @@ class _CppGenerator:
                                     "if (!plant) throw std::runtime_error(\"cannot open plant.csv\");",
                                     "plant << std::setprecision(17); "]
             signal_headers.append(f"plant << {self._csv_header(plant_names)};")
-            for name in self.p.units:
+            for name in unit_names:
                 generator = sampled.get(name) or continuous[name]
                 stream = "ctrl_" + _identifier(name)
                 log_names = list(generator.ctrl.log_names())
@@ -3363,10 +3163,10 @@ class _CppGenerator:
                 "}",
             ])
         global_tripped = " || ".join(
-            (sampled.get(name) or continuous[name]).m("tripped") for name in self.p.units
+            (sampled.get(name) or continuous[name]).m("tripped") for name in unit_names
         ) or "false"
         summary_rows: list[str] = []
-        for name in self.p.units:
+        for name in unit_names:
             generator = sampled.get(name) or continuous[name]
             summary_rows += generator.summary_lines()
         summary_text = "\n        ".join(summary_rows)
@@ -3973,11 +3773,6 @@ int main(int argc, char** argv) {{
 def _export_cpp(simulation: Any, out_dir: Path, name: str,
                 variables: tuple[str, ...], reusable: bool) -> ExportResult:
     """Write one self-contained, parameter-specialised C++17 translation unit."""
-    if any(unit.type == "wpt" for unit in simulation.p.units.values()):
-        raise TypeError(
-            "C++ export does not yet lower composite WPT units; run this configuration with "
-            "the Python backend"
-        )
     # Execute only the ordinary initialisation path.  A caller-owned Simulation is copied to avoid
     # mutation; the Simulation already created internally by export(Params, ...) can be reused.
     # Initialisation replaces diagnostic values temporarily used by the port-Hamiltonian structure

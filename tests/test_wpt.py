@@ -9,6 +9,7 @@ import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, from_dict, read_tree, to_dict
 from peslite.components import LCCLink, SSLink
+from peslite.control import GraphController, ResonantModulation
 
 
 def _tree():
@@ -23,14 +24,13 @@ def _short(tree=None):
     return from_dict(tree)
 
 
-def test_wpt_configuration_stays_composite_and_runtime_units_are_flat():
+def test_wpt_configuration_has_one_authoritative_nested_unit_tree():
     params = from_dict(_tree())
 
+    assert tuple(params.units) == ("charger",)
     assert params.unit("charger").type == "wpt"
-    assert tuple(params.runtime_units) == ("charger.primary", "charger.secondary")
-    assert params.unit_groups == {
-        "charger": ("charger.primary", "charger.secondary"),
-    }
+    assert not hasattr(params, "runtime_units")
+    assert not hasattr(params, "unit_groups")
     assert params.unit("charger.primary").type == "dc_converter"
     assert params.unit("charger.primary").ctrl.period == pytest.approx(1.0e-6)
     assert params.unit("charger.secondary").ctrl.period == pytest.approx(1.25e-6)
@@ -43,8 +43,13 @@ def test_wpt_assembly_flattens_only_once_and_shares_one_link():
     assert tuple(simulation.units) == ("charger.primary", "charger.secondary")
     assert isinstance(subsystems["charger.link"], SSLink)
     assert "charger" not in simulation.units
-    assert simulation.units["charger.primary"].link is simulation.units["charger.secondary"].link
-    assert simulation.system.unit_groups["charger"] == tuple(simulation.units)
+    for unit in simulation.units.values():
+        assert not hasattr(unit, "link")
+        assert not hasattr(unit, "side")
+        assert unit._external_current[0] is subsystems["charger.link"]
+        assert type(unit.ctrl) is GraphController
+        assert isinstance(unit.ctrl.graph.nodes["modulation"], ResonantModulation)
+    assert not hasattr(simulation.system, "unit_groups")
     assert not simulation.energy_problems
 
 
@@ -62,6 +67,27 @@ def test_wpt_runs_with_each_bridge_form(model):
     assert np.isfinite(simulation.system.model.get_initial_values()).all()
 
 
+@pytest.mark.parametrize("model", ["switching", "pwm_averaging"])
+def test_direct_power_port_blocks_held_command_while_disconnected(model):
+    tree = _tree()
+    for side in ("primary", "secondary"):
+        tree["units"]["charger"][side]["bridge"] = {"model": model}
+    tree["events"] = {
+        "stop_primary": {
+            "type": "disconnect",
+            "target": "charger.primary",
+            "t": 8.0e-6,
+        },
+    }
+    simulation = peslite.Simulation(_short(tree))
+    simulation.run(out_dir=None)
+    primary = simulation.units["charger.primary"]
+
+    assert not primary.breaker
+    assert not primary.gates
+    assert primary.bridge.inp.q == primary.bridge.topology.zero
+
+
 def test_composite_switching_event_is_inherited_by_both_children():
     tree = _tree()
     tree["events"] = {
@@ -69,7 +95,7 @@ def test_composite_switching_event_is_inherited_by_both_children():
     }
     params = from_dict(tree)
 
-    for unit in params.runtime_units.values():
+    for unit in (params.unit("charger.primary"), params.unit("charger.secondary")):
         assert [(event.type, event.t) for event in unit.events] == [("connect", 5.0e-6)]
 
     system = peslite.System(params)
@@ -146,10 +172,8 @@ def test_wpt_tree_round_trips_without_losing_child_unit_types():
     rebuilt = from_dict(to_dict(params))
 
     assert rebuilt.unit("charger").type == "wpt"
-    assert {unit.type for unit in rebuilt.runtime_units.values()} == {"dc_converter"}
+    assert {rebuilt.unit(f"charger.{side}").type for side in ("primary", "secondary")} == {
+        "dc_converter"
+    }
 
 
-def test_cpp_export_rejects_wpt_before_writing_backend_files(tmp_path):
-    with pytest.raises(TypeError, match="does not yet lower composite WPT units"):
-        peslite.export(_short(), "cpp", tmp_path)
-    assert not list(tmp_path.iterdir())

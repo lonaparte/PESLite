@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from peslite import Simulation, load  # noqa: E402
+from peslite.assembly.params import _unit_items  # noqa: E402
 from peslite.solver.simulation import read_csv  # noqa: E402
 
 
@@ -82,7 +83,7 @@ def main() -> int:
             for case, settings in CASES.items():
                 changes = {
                     **{f"units.{name}.bridge.model": settings["bridge"]
-                       for name in base.runtime_units},
+                       for name, _unit in _unit_items(base.units)},
                     "simulation.solver.type": settings["type"],
                     "simulation.solver.method": settings["method"],
                 }

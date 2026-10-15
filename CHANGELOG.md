@@ -8,8 +8,9 @@
   averaging and ideal averaging behavior.
 - Added natural CCM/DCM operation, dedicated diode-conduction handling and matching standalone C++
   export without adding device behavior to the generic integrators.
-- Renamed internal Python interfaces where their former names conflicted with their actual scope.
-  PESLite versions below 1.0 may make interface changes in any `0.x.x` release.
+- Renamed the AC converter runtime interface from `UniteType` to `VSCController`, and consolidated
+  DC-link and capacitor voltage regulation as `DCVoltageControl`. PESLite versions below 1.0 may
+  make interface changes in any `0.x.x` release.
 
 ## 0.3.0
 

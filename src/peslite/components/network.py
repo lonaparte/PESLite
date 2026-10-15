@@ -15,7 +15,7 @@ from ..solver.model import Bag, ConfigError, Empty
 
 __all__ = [
     "Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
-    "register_element_type", "element_buses", "Load", "Resistor",
+    "register_element_type", "element_buses", "Load", "Resistor", "VoltageSource",
 ]
 
 
@@ -144,6 +144,10 @@ class RLBranch:
     def diode_blocks_reverse_current(self) -> bool:
         """Return whether this branch represents a diode-bounded current path."""
         return self.unilateral
+
+    def diode_maximum_step(self) -> float:
+        """Return the local step requested by an attached averaged conduction law."""
+        return math.inf if self.conduction is None else self.conduction.maximum_step(self)
 
     def dissipated_power(self) -> float:
         factor = (1.0 if self.conduction is None
@@ -413,3 +417,84 @@ class Resistor(Element):
     def retune(self, cfg: Any) -> None:
         self.cfg = cfg
         self.resistor.resistance = cfg.r
+
+
+class _VoltageSourceInp(Bag):
+    __slots__ = ("u",)
+
+
+class _VoltageSourceOut(Bag):
+    __slots__ = ("i",)
+
+
+class _VoltageSourceModel:
+    """Scalar voltage source behind a series resistance."""
+
+    state_names: ClassVar[tuple[str, ...]] = ()
+    outputs_need_inputs: ClassVar[bool] = True
+    storage: ClassVar[tuple[StoragePort, ...]] = ()
+
+    def __init__(self, voltage: float, resistance: float) -> None:
+        self.voltage, self.resistance = voltage, resistance
+        self.state = Empty()
+        self.inp = _VoltageSourceInp(u=0.0)
+        self.out = _VoltageSourceOut(i=0.0)
+        self.ports = (PowerPort("inp.u", "out.i", 1.0),)
+        self.terminal = Terminal(self, "u", "i", 1)
+
+    def set_outputs(self, t: float) -> None:
+        self.out.i = (self.inp.u - self.voltage) / self.resistance
+
+    def rhs(self, t: float):
+        return ()
+
+    def dissipated_power(self) -> float:
+        return self.resistance * self.out.i ** 2
+
+    def supplied_power(self) -> float:
+        return -self.voltage * self.out.i
+
+
+@register_element_type
+class VoltageSource(Element):
+    """Scalar point-network voltage source behind a positive series resistance."""
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        type: str = "voltage_source"
+        bus: str
+        v: float
+        r: float
+
+        _quantities = {"v": "voltage", "r": "resistance"}
+
+        def __post_init__(self) -> None:
+            if not math.isfinite(self.v):
+                raise ConfigError(f"v must be finite, got {self.v}")
+            if not math.isfinite(self.r) or self.r <= 0.0:
+                raise ConfigError(f"r must be finite and positive, got {self.r}")
+
+    type = "voltage_source"
+
+    def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
+        if buses[cfg.bus].phases != 1:
+            raise ConfigError("a point-network voltage source needs a single-phase bus")
+        self.name, self.cfg = name, cfg
+        self.source = _VoltageSourceModel(cfg.v, cfg.r)
+
+    def subsystems(self) -> dict[str, Any]:
+        return {self.name: self.source}
+
+    @staticmethod
+    def connections() -> dict:
+        return {}
+
+    def terminals(self) -> tuple[tuple[str, Terminal], ...]:
+        return ((self.cfg.bus, self.source.terminal),)
+
+    def signals(self) -> dict[str, float]:
+        return {f"{self.name}.i": self.source.out.i}
+
+    def retune(self, cfg: Any) -> None:
+        self.cfg = cfg
+        self.source.voltage, self.source.resistance = cfg.v, cfg.r

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Sequence
 
 import peslite
+from peslite.assembly.params import _unit_items
 
 
 def _compiler(command: str | Sequence[str] | None = None) -> list[str]:
@@ -45,7 +46,7 @@ def benchmark_cpp_export(config: str | Path, work: str | Path, *,
         solver = ("adaptive", "DP45") if mode == "averaging" else ("fixed", "rk4")
         loaded = peslite.load(config)
         changes = {
-            **{f"units.{name}.bridge.model": mode for name in loaded.runtime_units},
+            **{f"units.{name}.bridge.model": mode for name, _unit in _unit_items(loaded.units)},
             "simulation.solver.type": solver[0], "simulation.solver.method": solver[1],
             "simulation.solver.subsystems": {}, "simulation.progress.enable": 0,
         }

@@ -63,10 +63,11 @@ checks wiring and creates an execution plan. Sampled graphs require an explicit 
 cycle; continuous graphs identify strongly connected loop groups and solve only those cyclic
 groups iteratively.
 
-The graph has one typed, directed boundary. Its input ports are the measured feedback signals
-(`meas.*`) and controller references (`references.*`); its output ports are `u_dq`, `theta` and
-`omega`. A connection always binds a loop input to a boundary or loop output. Default GFL/GFM
-wiring and explicit custom wiring are both lowered to this same graph before the run.
+The graph has one typed, directed boundary. Its input ports are measured feedback signals
+(`meas.*`) and controller references (`references.*`). Its output schema belongs to that boundary:
+AC control exposes `u_dq`, `theta` and `omega`, while scalar bridge control exposes `duty`. A
+connection always binds a loop input to a boundary or loop output. Default wiring and explicit
+custom wiring are both lowered to this same graph before the run.
 
 Control ports use one canonical set of signal representations: complex vectors `I_AB`, `V_AB`,
 `I_DQ`, `V_DQ` and `PQ`; scalar `I`, `V` and `POWER`; and scalar `ANGLE` and `FREQUENCY`.
@@ -88,15 +89,16 @@ The assembly layer:
 `Unit` is the common converter lifecycle and runtime interface. Both `VSC` and `DCConverter` expose
 their electrical side through the same named-bus `Terminal` contract; `VSC` supplies a three-phase
 bridge and `DCConverter` a selectable scalar half or full bridge. The same
-`DCConverter` also serves as each full-bridge port of a resonant link. Each runtime specialization
+`DCConverter` also serves as each full-bridge port of a resonant link. Each assembled specialization
 owns its power stage, controller, sensing, startup interface, breakers and gates.
 
 Every entry in `Params.units` is a `UnitParams`. Its `type` selects `vsc`, `dc_converter` or the
 composite `wpt`; type-specific schema selection and runtime construction happen once while the
 system is assembled. A WPT configuration contains `primary` and `secondary` UnitParams plus one
-shared compensated link. Assembly expands that tree once into two ordinary runtime units and a
-link subsystem. The solver sees only the flat result, so its event loop has no composite recursion
-or WPT-specific scheduling. `Params.runtime_units` exposes the same flat leaf-unit mapping.
+shared compensated link. `Params.units` is the only stored configuration tree. Assembly walks it
+and places its leaf converters in `System.units` beside the shared link subsystem; it does not keep
+a second flattened parameter mapping or a group table. The solver therefore sees ordinary
+converter units without WPT-specific scheduling.
 
 For compatibility with version 0.3.0 files, an omitted type means `vsc`; DC converters always use
 the explicit `dc_converter` type.
@@ -109,7 +111,8 @@ Parameter ownership is explicit:
 | VSC only | `unit.type: vsc` | `bus`, `ac_filter`, `dclink`, `meas`, and `protection` |
 | DC converter only | `unit.type: dc_converter` | `bus`, `filter`, and `dclink`; a composite parent may bind the power port internally instead of naming a bus |
 | WPT composite only | `unit.type: wpt` | `primary`, `secondary`, and `link`; it has no bridge, PWM or controller of its own |
-| Bridge | `bridge.type` | `three_phase_bridge`, `half_bridge`, or `full_bridge`; `model` independently selects switching, PWM averaging, or ideal averaging |
+| Common bridge | none | `type` selects `three_phase_bridge`, `half_bridge`, or `full_bridge`; `model` independently selects switching, PWM averaging, or ideal averaging |
+| Half bridge only | `bridge.type: half_bridge` | `upper_controlled`, `lower_controlled`, and `reverse_port` |
 | Common control | none | `type`, `period`, `computation`, `loops`, `connections`, and `outputs` |
 | Control architecture | `ctrl.type` | reference fields and default wiring unique to the selected architecture |
 | Control loop | `ctrl.loops.<name>.type` | gains, limits, and other fields unique to the selected loop |

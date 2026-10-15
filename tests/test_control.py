@@ -119,7 +119,7 @@ def test_continuous_control_graph_automatically_solves_feedback_between_loops():
         unit, ctrl=replace(unit.ctrl, loops=loops, connections=connections)
     )
     object.__setattr__(configured, "base", unit.base)
-    controller = peslite.UniteType(configured)
+    controller = peslite.VSCController(configured)
 
     controller.set_outputs(0.0)
 

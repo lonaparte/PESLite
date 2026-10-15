@@ -2,7 +2,7 @@
 
 ``loops``: what each loop type computes; ``controller``: the controller as one block (its
 interface, the loop network that connects and runs the loops, the gfl/gfm wiring,
-:class:`UniteType`); ``modulation``: the output stage,
+:class:`VSCController`); ``modulation``: the output stage,
 from the voltage command to duty ratios; ``blocks``: transforms, filters and timers they are built of.
 Grid-control signals use pu and scalar converter signals use SI; shared scalar loops bind to the
 coordinates of their containing graph. Time is in s, angles in rad and frequencies in rad/s. The controller depends on nothing but the
@@ -12,23 +12,22 @@ solver's kernel: the hardware adapts to its interface (:class:`Measurement`, :cl
 from ..solver import ConfigError
 from .blocks import Filter, Integrator, OutputLimit, PI
 from .loops import (ANGLE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES, POWER, PQ, V, V_AB, V_DQ,
-                    DUTY_RATIO, SI_CURRENT, SI_VOLTAGE, DCVoltageControl,
-                    InductorCurrentControl,
+                    DUTY_RATIO, HERTZ, MODULATION, SI_CURRENT, SI_VOLTAGE, DCVoltageControl,
+                    InductorCurrentControl, ResonantModulation,
                     Loop, SignalType, SyncLaw, register_loop_type)
 from .modulation import ModulationLimiter, OutputStage
 from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, ControlMeasurement,
-                         ControlOutput, Controller, Measurement, ScalarControlOutput,
-                         ResonantController, ScalarController, Startup, UniteType, default_wiring,
+                         BridgeControlOutput, ControlOutput, Controller, GraphController, Measurement,
+                         Startup, VSCController, default_wiring,
                          make_controller)
 
 __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter", "SignalType", "ConfigError",
-           "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO",
-           "DCVoltageControl", "InductorCurrentControl",
+           "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO", "MODULATION", "HERTZ",
+           "DCVoltageControl", "InductorCurrentControl", "ResonantModulation",
            "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER", "PQ",
            "LOOP_TYPES", "register_loop_type", "ControlInterface", "CONTROL_INTERFACE",
            "ControlGraph", "default_wiring",
            "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
-           "ScalarControlOutput", "Controller", "Startup", "UniteType", "ScalarController",
-           "ResonantController",
+           "BridgeControlOutput", "Controller", "Startup", "VSCController", "GraphController",
            "make_controller"]

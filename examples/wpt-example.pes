@@ -1,7 +1,7 @@
 # PESLite 0.4.0
 # Series-series compensated wireless power transfer. The WPT entry is a composite Unit; assembly
-# expands its independently clocked primary and secondary DCConverter units into ordinary
-# runtime units connected by one shared magnetic link. Electrical plant values are SI.
+# expands its independently clocked primary and secondary DCConverter children during assembly
+# and connects them through one shared magnetic link. Electrical plant values are SI.
 
 base:
   s_base: 5000.0
@@ -25,7 +25,8 @@ units:
       ctrl:
         type: resonant
         computation: 0.0
-        loops: {}
+        loops:
+          modulation: {type: resonant_modulation}
         references:
           modulation: 0.8
           frequency: 85000.0
@@ -41,7 +42,8 @@ units:
       ctrl:
         type: resonant
         computation: 0.0
-        loops: {}
+        loops:
+          modulation: {type: resonant_modulation}
         references:
           modulation: 0.7
           frequency: 85000.0

@@ -16,6 +16,7 @@ from peslite.control import (
     ControlGraph,
     ControlInterface,
     InductorCurrentControl,
+    ResonantModulation,
     OutputLimit,
     PI,
 )
@@ -87,10 +88,13 @@ def test_scalar_control_uses_the_shared_control_package():
 
     assert not (control / "dc.py").exists()
     assert not hasattr(peslite.control, "make_scalar_controller")
+    assert not hasattr(peslite.control, "ScalarController")
+    assert not hasattr(peslite.control, "ResonantController")
     assert DCVoltageControl.__module__ == "peslite.control.loops"
     assert InductorCurrentControl.__module__ == "peslite.control.loops"
     assert {"dc_voltage_control", "inductor_current_control"} <= set(LOOP_TYPES)
     assert LOOP_TYPES["dc_voltage_control"] is DCVoltageControl
+    assert LOOP_TYPES["resonant_modulation"] is ResonantModulation
 
 
 @pytest.mark.parametrize(

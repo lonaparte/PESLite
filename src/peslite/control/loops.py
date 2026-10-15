@@ -16,6 +16,8 @@ import math
 from dataclasses import dataclass, field, is_dataclass
 from typing import Any, ClassVar, Mapping, Optional
 
+import numpy as np
+
 from ..solver.model import ConfigError, assign, gather, join, scatter
 from .blocks import Filter, Integrator, OutputLimit, PI
 
@@ -25,7 +27,8 @@ __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "CurrentLimitParams",
            "SRFPLL", "CurrentLoop", "DCVoltageControl", "PowerLoop", "SyncLaw", "PSC", "Droop", "VSG", "DVOC",
            "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping", "UnitDelay",
-           "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO", "InductorCurrentControl"]
+           "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO", "MODULATION", "HERTZ",
+           "InductorCurrentControl", "ResonantModulation"]
 
 
 # ------------------------------------------------------------------ signals
@@ -72,7 +75,8 @@ GENERIC_VOLTAGE = SignalType("voltage")
 # ------------------------------------------------------------------ the base class and the registry
 
 # The parts a loop can play in the default GFL/GFM wiring assembled by ControllerGraph.
-ROLES = ("pll", "sync", "current", "dc_voltage", "power", "impedance", "admittance", "damping")
+ROLES = ("pll", "sync", "current", "dc_voltage", "power", "impedance", "admittance",
+         "damping", "modulation")
 
 
 class Loop:
@@ -263,7 +267,7 @@ def register_loop_type(cls: type) -> type:
 
 def _into(frame: float):
     """The rotation from alpha-beta into the dq frame of angle ``frame`` (rad)."""
-    return cmath.exp(-1j * frame)
+    return np.exp(-1j * frame)
 
 
 @dataclass(frozen=True)
@@ -431,7 +435,7 @@ class CurrentLoop(Loop):
         rot = _into(inputs["frame"])
         self.extra = inputs["extra"]
         i, u_ff, omega = inputs["i"] * rot, inputs["v"] * rot, inputs["omega"]
-        reference = i if not self.startup.active else complex(inputs["id_ref"], inputs["iq_ref"])
+        reference = i if not self.startup.active else inputs["id_ref"] + 1j * inputs["iq_ref"]
         ff = self.feedforward_voltage(i, u_ff, omega, self.extra)
         return {"u_dq": self.pi(reference, i, ff), "extra": self.extra}
 
@@ -440,7 +444,7 @@ class CurrentLoop(Loop):
         rot = _into(frame)
         self.extra = extra
         i, u_ff = current * rot, voltage * rot
-        reference = i if not self.startup.active else complex(id_ref, iq_ref)
+        reference = i if not self.startup.active else id_ref + 1j * iq_ref
         ff = self.feedforward_voltage(i, u_ff, omega, self.extra)
         output = self.pi(reference, i, ff)
         return output, self.extra, self.pi.derivative
@@ -656,7 +660,7 @@ class SyncLaw(Loop):
         self.v_mag = unit.ctrl.references.v_ref_pu
 
     def initial_outputs(self):
-        return {"theta": float(self.theta), "frame": float(self.theta), "omega": float(self.omega),
+        return {"theta": self.theta, "frame": self.theta, "omega": self.omega,
                 "v_ref": self.unit.ctrl.references.v_ref_pu}
 
     def sample(self, t, inputs):
@@ -666,7 +670,7 @@ class SyncLaw(Loop):
                 return out
             return {"theta": self.theta, "frame": self.theta, "omega": self.omega,
                     "v_ref": self.v_mag}
-        frame = float(self.theta)
+        frame = self.theta
         rot = _into(frame)
         v, i = inputs["v"] * rot, inputs["i"] * rot
         p_ref = self.startup.value * inputs["p_ref"]
@@ -683,7 +687,7 @@ class SyncLaw(Loop):
 
     def flow_path(self, p, q, voltage, current, u_dc, p_ref, q_ref, v_ref):
         """Shared continuous evaluation for all synchronization laws."""
-        frame = float(self.theta)
+        frame = self.theta
         rot = _into(frame)
         v, i = voltage * rot, current * rot
         if not self.startup.active:
@@ -710,8 +714,9 @@ class SyncLaw(Loop):
         voltage = inputs["v"]
         if abs(voltage) <= 0.1:
             return None
-        theta = float(self.theta)
-        theta += (cmath.phase(voltage) - theta + math.pi) % (2.0 * math.pi) - math.pi
+        theta = self.theta
+        delta = np.angle(voltage * np.exp(-1j * theta))
+        theta += delta
         self.follow(theta, abs(voltage), inputs["v_ref"])
         return {"theta": theta, "frame": theta, "omega": self.omega, "v_ref": self.v_mag}
 
@@ -891,7 +896,7 @@ class DVOC(SyncLaw):
     def _sample(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
                 p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
         V = self.v_mag
-        i_star = complex(p_ref_pu, -q_ref_pu) * V / (v_ref_pu * v_ref_pu)
+        i_star = (p_ref_pu - 1j * q_ref_pu) * V / (v_ref_pu * v_ref_pu)
         w = self.eta * self.rot * (i_star - i_dq) + self.eta * self.alpha * (1.0 - V * V / (v_ref_pu * v_ref_pu)) * V
         self.omega = self.w0 + w.imag / V
         self.v_mag = V + T * w.real
@@ -900,7 +905,7 @@ class DVOC(SyncLaw):
     def _flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
               q_ref_pu, v_ref_pu, i_dq):
         V = max(self.v_mag, 1e-12)
-        i_star = complex(p_ref_pu, -q_ref_pu) * V / (v_ref_pu * v_ref_pu)
+        i_star = (p_ref_pu - 1j * q_ref_pu) * V / (v_ref_pu * v_ref_pu)
         w = (self.eta * self.rot * (i_star - i_dq)
              + self.eta * self.alpha * (1.0 - V * V / (v_ref_pu * v_ref_pu)) * V)
         self.omega = self.w0 + w.imag / V
@@ -979,12 +984,12 @@ class VirtualImpedance(Loop):
     def sample(self, t, inputs):
         i = inputs["i"] * _into(inputs["frame"])
         drop = (self.r_pu + 1j * inputs["omega"] / self.w0 * self.x_pu) * i
-        return {"u_dq": complex(inputs["v_ref"], 0.0) - drop + inputs["extra"]}
+        return {"u_dq": inputs["v_ref"] - drop + inputs["extra"]}
 
     def flow_path(self, v_ref, current, frame, omega, extra):
         i = current * _into(frame)
         drop = (self.r_pu + 1j * omega / self.w0 * self.x_pu) * i
-        return (complex(v_ref, 0.0) - drop + extra,)
+        return (v_ref - drop + extra,)
 
 
 @register_loop_type
@@ -1022,7 +1027,7 @@ class VirtualAdmittance(Loop):
         return {"id_ref": 0.0, "iq_ref": 0.0}
 
     def sample(self, t, inputs):
-        v_ref_dq, v_dq, omega = complex(inputs["v_ref"], 0.0), inputs["v"] * _into(inputs["frame"]), inputs["omega"]
+        v_ref_dq, v_dq, omega = inputs["v_ref"], inputs["v"] * _into(inputs["frame"]), inputs["omega"]
         i_ref = self.i_ref + self.T * self.w0 / self.x_pu * (
             v_ref_dq - v_dq - (self.r_pu + 1j * omega / self.w0 * self.x_pu) * self.i_ref)
         mag = abs(i_ref)
@@ -1033,7 +1038,7 @@ class VirtualAdmittance(Loop):
 
     def flow_path(self, v_ref, voltage, frame, omega):
         """Positional form used by the construction-time compiled continuous graph."""
-        v_ref_dq = complex(v_ref, 0.0)
+        v_ref_dq = v_ref
         v_dq = voltage * _into(frame)
         i_ref = self.i_ref
         mag = abs(i_ref)
@@ -1181,6 +1186,9 @@ class UnitDelay(Loop):
     def get_state(self):
         return {self.state_name: self.value}
 
+    def flow_state_bindings(self):
+        return {self.state_name: (self, "value")}
+
     def set_state(self, values):
         if set(values) - {self.state_name}:
             raise KeyError(f"unit_delay has the state {self.state_name}")
@@ -1192,6 +1200,8 @@ class UnitDelay(Loop):
 SI_CURRENT = SignalType("A", "scalar")
 SI_VOLTAGE = SignalType("V", "scalar")
 DUTY_RATIO = SignalType("1", "duty_ratio")
+MODULATION = SignalType("1", "modulation")
+HERTZ = SignalType("Hz")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1232,6 +1242,7 @@ class InductorCurrentControl(_LimitedScalarPI):
         type: str = "inductor_current_control"
 
     type = "inductor_current_control"
+    role = "current"
     inputs = {"reference": SI_CURRENT, "current": SI_CURRENT,
               "feedforward": DUTY_RATIO}
     outputs = {"duty": DUTY_RATIO, "requested_duty": DUTY_RATIO}
@@ -1240,3 +1251,38 @@ class InductorCurrentControl(_LimitedScalarPI):
     def equation(self, reference, current, feedforward):
         requested = self.pi(reference, current, feedforward)
         return self.constrain(requested), requested
+
+
+@register_loop_type
+class ResonantModulation(Loop):
+    """Temporary open-loop sinusoidal modulation for a resonant converter application.
+
+    It is an ordinary registered loop: the DC converter still uses the same control graph,
+    scheduling and bridge boundary as feedback-controlled applications. A later feedback loop can
+    replace this loop without changing the converter implementation.
+    """
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: Optional[float] = None
+        type: str = "resonant_modulation"
+
+    type = "resonant_modulation"
+    role = "modulation"
+    inputs = {"modulation": MODULATION, "frequency": HERTZ, "phase": ANGLE}
+    outputs = {"duty": DUTY_RATIO}
+
+    def initial_outputs(self):
+        return {"duty": 0.5}
+
+    def _duty(self, t, inputs):
+        q = self.startup.value * inputs["modulation"] * np.sin(
+            2.0 * math.pi * inputs["frequency"] * t + inputs["phase"]
+        )
+        return 0.5 * (1.0 + q)
+
+    def sample(self, t, inputs):
+        return {"duty": self._duty(t, inputs)}
+
+    def flow(self, t, inputs):
+        return {"duty": self._duty(t, inputs)}, {}

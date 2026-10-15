@@ -34,6 +34,10 @@ ctrl:
     dc_voltage: {type: dc_voltage_control, period: 500e-6}
 ```
 
+`current` and `dc_voltage` in this example are graph-local instance names. The respective `type`
+fields select the registered implementations; connections address the instance names. Instances
+are constructed only from entries present in `ctrl.loops`—unused loop classes are not instantiated.
+
 A loop period must be an integer multiple of `ctrl.period`. If omitted, it inherits the controller
 period. Loop state is preserved when run-time parameter changes rebuild a loop.
 

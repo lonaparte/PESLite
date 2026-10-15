@@ -58,7 +58,7 @@ def test_completed_startup_is_not_advanced_again():
 
 def test_controller_needs_only_samples_and_host_commands(gfl):
     cfg = gfl().unit("vsc")
-    controller = peslite.UniteType(cfg)
+    controller = peslite.VSCController(cfg)
     assert not hasattr(controller, "scenario")
     assert not hasattr(controller, "protection")
     voltage, w0 = cfg.base.v_phase_peak, cfg.base.w0
@@ -83,7 +83,7 @@ def test_controller_needs_only_samples_and_host_commands(gfl):
 
 
 def test_pwm_start_clears_error_integrators_once(gfl):
-    controller = peslite.UniteType(gfl().unit("vsc"))
+    controller = peslite.VSCController(gfl().unit("vsc"))
     pll = controller.graph.nodes["pll"]
     dvc = controller.graph.nodes["dvc"]
     cc = controller.graph.nodes["cc"]
@@ -105,7 +105,7 @@ def test_presynchronisation_does_not_seed_a_pwm_start_integrator():
         **{"simulation.solver.linearisations": 0, "simulation.progress.enable": 0},
     )
     cfg = params.unit("vsc")
-    controller = peslite.UniteType(cfg)
+    controller = peslite.VSCController(cfg)
     sync = controller.graph.nodes["sync"]
     sync.v_int = 4.0
     controller.track(Measurement(0.0, cfg.base.v_phase_peak, 0j, cfg.dclink.vdc_ref, np.zeros(3)))

@@ -148,19 +148,22 @@ covered, their generated expressions are deliberately tuned, and unsupported beh
 before a long build. The fallback is intended for pure numerical component equations with a fixed
 state and port layout.
 
+Composite WPT configurations are expanded before export exactly as they are for Python execution.
+Their primary and secondary remain ordinary `DCConverter` units with independent clocks, while the
+shared compensated link is lowered through its fixed scalar state equations.
+
 ## Current limitations
 
 - Supported solvers are fixed `euler`, `heun` and `rk4`, plus adaptive `DP45`.
 - Multirate subsystem schedules are not currently lowered to C++.
-- Composite WPT units and their resonant-link schedule are not currently lowered to C++; the
-  exporter rejects them before writing backend files.
 - Arbitrary Python behavior is not embedded in the standalone executable. File or network I/O,
   reflection, run-time type/layout changes and unsupported library calls in a custom equation are
   rejected during export rather than silently approximated.
 - Symbolic branch exploration is bounded; deeply state-dependent iterative control flow needs
   dedicated backend support instead of an exponentially large generated expression.
-- Custom controller loops, events and modulators still need backend support because they alter the
-  discrete schedule rather than only contributing continuous scalar equations.
+- Custom controller loops with non-traceable Python behavior, events and modulators still need
+  backend support because they alter the discrete schedule rather than only contributing
+  continuous scalar equations.
 - Only parameters reported by `--list-params` can change in the compiled simulator.
 
 The exporter supports the built-in switching, PWM-period-averaged and ideal averaged bridge models.

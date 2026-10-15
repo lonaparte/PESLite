@@ -7,12 +7,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Callable, ClassVar, Mapping, Optional
+from typing import Any, Callable, ClassVar, Mapping, NamedTuple, Optional
 
 import numpy as np
 from numpy.typing import NDArray
 
-from ..control.blocks import abc2complex, smoothstep
+from ..control.blocks import smoothstep
 from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, ConfigError, Empty, OutputMethod
 from .pwm import TIME_EPS, Modulator, PWM, ZOH, make_modulator
@@ -20,7 +20,7 @@ from .pwm import TIME_EPS, Modulator, PWM, ZOH, make_modulator
 __all__ = ["ThreePhaseBridge", "SwitchingBridge", "PWMBridge", "AveragingBridge",
            "HalfBridge", "FullBridge", "DeviceParameters", "DCLink", "DCCapacitor",
            "DCCurrentSource", "DCVoltageSource", "HalfBridgeDiodeConduction",
-           "make_bridge", "make_dclink"]
+           "make_topology", "make_bridge", "make_dclink"]
 
 
 class _BridgeInp(Bag):
@@ -36,22 +36,57 @@ def _set_three_phase_dc_current(bridge, _t: float) -> None:
 
 
 def _set_scalar_dc_current(bridge, _t: float) -> None:
-    bridge.out.i_dc = bridge.topology.power_scale * (bridge.inp.q * bridge.inp.i_c).real
+    bridge.out.i_dc = (bridge.inp.q * bridge.inp.i_c).real
 
 
 class ThreePhaseBridge:
     """Three-leg topology used by the existing AC converter model."""
 
+    type = "three_phase_bridge"
     __slots__ = ()
     duty_names = ("d_a", "d_b", "d_c")
     zero = 0j
-    switching_state = staticmethod(abc2complex)
-    pwm_state = staticmethod(ZOH.value)
+    neutral_duty = 0.5
+    reverse_port = False
+    unilateral = False
+    config_fields = frozenset()
     set_dc_current = staticmethod(_set_three_phase_dc_current)
+
+    @classmethod
+    def from_config(cls, _cfg: Any) -> "ThreePhaseBridge":
+        return cls()
+
+    @staticmethod
+    def switching_state(states):
+        a, b, c = states
+        return (2.0 / 3.0) * (a + complex(-0.5, math.sqrt(3.0) / 2.0) * b
+                              + complex(-0.5, -math.sqrt(3.0) / 2.0) * c)
+
+    @staticmethod
+    def pwm_state(duties):
+        values = tuple(min(1.0, max(0.0, duty)) for duty in duties)
+        return ThreePhaseBridge.switching_state(values)
 
     @staticmethod
     def command_duties(output):
         return output.d_abc
+
+
+TOPOLOGY_TYPES: dict[str, type] = {}
+
+
+def _register_topology(cls: type) -> type:
+    """Register one bridge topology under its configuration name."""
+    name = getattr(cls, "type", None)
+    if not isinstance(name, str) or not name:
+        raise TypeError("a bridge topology needs a non-empty type")
+    if name in TOPOLOGY_TYPES:
+        raise ValueError(f"bridge topology {name!r} is already registered")
+    TOPOLOGY_TYPES[name] = cls
+    return cls
+
+
+_register_topology(ThreePhaseBridge)
 
 
 class _BridgeModel:
@@ -89,14 +124,21 @@ class _BridgeModel:
     def rhs(self, t: float):
         return ()
 
-    def connections(self, dc_link, ac_branch) -> dict:
-        """Return the connections of the bridge to ``dc_link`` and ``ac_branch``."""
-        return {
-            (ac_branch, "u1"): (self, "u_c"),
-            (self, "i_c"): (ac_branch, "i"),
+    def connections(self, dc_link, branch=None) -> dict:
+        """Connect the DC rails and, when given, one external filter branch."""
+        connections = {
             (dc_link, "i_dc"): (self, "i_dc"),
             (self, "u_dc"): (dc_link, "u_dc"),
         }
+        if branch is not None:
+            reverse_port = self.topology.reverse_port
+            branch_voltage = "u2" if reverse_port else "u1"
+            current = (branch, "i", -1.0) if reverse_port else (branch, "i")
+            connections.update({
+                (branch, branch_voltage): (self, "u_c"),
+                (self, "i_c"): current,
+            })
+        return connections
 
     def zoh_connections(self, label: str) -> dict:
         """Return the connection of the held switching state ``label`` to ``q``."""
@@ -195,7 +237,9 @@ class AveragingBridge(_BridgeModel):
     """Ideal averaged bridge driven directly by the continuous controller output.
 
     There is no timer, command history, held modulation input or delay state: the controller and
-    power stage are evaluated in the same Model RHS plan.
+    power stage are evaluated in the same Model RHS plan. A unilateral half bridge may still use
+    the configured physical switching period in its external branch's cycle-averaged DCM law;
+    that parameter describes conduction physics and does not create simulation events.
     """
 
     state_prefix = "bridge"
@@ -263,10 +307,30 @@ class AveragingBridge(_BridgeModel):
             raise KeyError(f"continuous averaging bridge has no states, got {sorted(values)}")
 
 
-def make_bridge(cfg: Any, sim: Any = None,
-                modulator: Modulator | None = None, topology=None) -> _BridgeModel:
+def make_topology(cfg: Any):
+    """Build the bridge topology selected by ``cfg.type``."""
+    try:
+        topology_type = TOPOLOGY_TYPES[cfg.type]
+    except KeyError:
+        raise ConfigError(
+            f"unknown bridge topology {cfg.type!r}; known: {sorted(TOPOLOGY_TYPES)}"
+        ) from None
+    return topology_type.from_config(cfg)
+
+
+def topology_type(name: str, where: str = "bridge.type") -> type:
+    """Return a registered bridge topology class by configuration name."""
+    try:
+        return TOPOLOGY_TYPES[name]
+    except KeyError:
+        raise ConfigError(
+            f"{where}: unknown bridge topology {name!r}; known: {sorted(TOPOLOGY_TYPES)}"
+        ) from None
+
+
+def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None) -> _BridgeModel:
     """Compose a bridge topology with switching, PWM or averaging behavior."""
-    topology = topology if topology is not None else ThreePhaseBridge()
+    topology = topology if topology is not None else make_topology(cfg.bridge)
     pwm = cfg.pwm
     if cfg.bridge.model == "averaging":
         if modulator is not None:
@@ -307,6 +371,7 @@ class _LegResult:
     blocked: bool = False
 
 
+@_register_topology
 class HalfBridge:
     """One scalar switching leg between upper and lower DC rails.
 
@@ -316,18 +381,21 @@ class HalfBridge:
     diode-assisted and fully controlled legs.
     """
 
+    type = "half_bridge"
     duty_names = ("d",)
     zero = 0.0
+    neutral_duty = 0.0
+    config_fields = frozenset(("upper_controlled", "lower_controlled", "reverse_port"))
     set_dc_current = staticmethod(_set_scalar_dc_current)
-    __slots__ = ("devices", "_gate_mask", "power_scale")
+    __slots__ = ("devices", "_gate_mask", "_reverse_port")
 
-    @staticmethod
-    def switching_state(states) -> float:
-        return states[0]
+    def switching_state(self, states) -> float:
+        state = states[0]
+        return 1.0 - state if self._reverse_port else state
 
-    @staticmethod
-    def pwm_state(duties) -> float:
-        return min(1.0, max(0.0, duties[0]))
+    def pwm_state(self, duties) -> float:
+        duty = min(1.0, max(0.0, duties[0]))
+        return 1.0 - duty if self._reverse_port else duty
 
     @staticmethod
     def command_duties(output):
@@ -336,18 +404,52 @@ class HalfBridge:
     def __init__(self, devices: DeviceParameters | None = None, *,
                  upper_controlled: bool = True,
                  lower_controlled: bool = True,
-                 power_scale: float = 1.0) -> None:
-        if type(upper_controlled) is not bool or type(lower_controlled) is not bool:
-            raise TypeError("controlled-device flags must be bool")
+                 reverse_port: bool = False) -> None:
+        if any(type(value) is not bool for value in (
+                upper_controlled, lower_controlled, reverse_port)):
+            raise TypeError("controlled-device and port-orientation flags must be bool")
         if not upper_controlled and not lower_controlled:
             raise ConfigError("a half bridge needs at least one controlled device")
+        if reverse_port and not lower_controlled:
+            raise ConfigError("a reverse half bridge needs a controlled lower device")
+        if not reverse_port and not upper_controlled:
+            raise ConfigError("a forward half bridge needs a controlled upper device")
         self.devices = devices or DeviceParameters()
         if not isinstance(self.devices, DeviceParameters):
             raise TypeError("devices must be DeviceParameters")
-        if power_scale not in (1.0, 1.5):
-            raise ValueError("scalar bridge power scale must be 1.0 or 1.5")
-        self.power_scale = power_scale
         self._gate_mask = int(upper_controlled) | (int(lower_controlled) << 1)
+        self._reverse_port = reverse_port
+
+    @classmethod
+    def from_config(cls, cfg: Any) -> "HalfBridge":
+        return cls(
+            upper_controlled=cfg.upper_controlled,
+            lower_controlled=cfg.lower_controlled,
+            reverse_port=cfg.reverse_port,
+        )
+
+    def state_from_duty(self, duty: float) -> float:
+        """Return the bridge output ratio produced by its controlled device's duty."""
+        return self.pwm_state((duty,))
+
+    @property
+    def reverse_port(self) -> bool:
+        """Whether the external scalar port is on the bridge's input side."""
+        return self._reverse_port
+
+    @property
+    def unilateral(self) -> bool:
+        """Whether one device position is diode-only and therefore blocks reverse current."""
+        return self.upper_controlled != self.lower_controlled
+
+    def control_values(self, current, voltage, supply):
+        """Return canonical control measurements and the topology's feed-forward duty."""
+        current, voltage = np.real(current), np.real(voltage)
+        if self._reverse_port:
+            feedforward = 1.0 - supply / voltage if voltage > 0.0 else 0.0
+        else:
+            feedforward = voltage / supply if supply > 0.0 else 0.0
+        return current, voltage, supply, feedforward
 
     @property
     def upper_controlled(self) -> bool:
@@ -439,6 +541,15 @@ class HalfBridge:
         )
 
 
+class _DiodeConductionResult(NamedTuple):
+    controlled: Any
+    diode: Any
+    total: Any
+    resistance_factor: Any
+    derivative: Any
+    in_dcm: Any
+
+
 class HalfBridgeDiodeConduction:
     """Cycle-averaged diode conduction law for an external scalar filter branch.
 
@@ -447,31 +558,63 @@ class HalfBridgeDiodeConduction:
     bridge enters DCM naturally.
     """
 
-    def __init__(self, switching_period: float) -> None:
+    def __init__(self, switching_period: float, topology: HalfBridge | None = None) -> None:
         self.period = switching_period
+        self.topology = topology if topology is not None else HalfBridge(lower_controlled=False)
+        if not isinstance(self.topology, HalfBridge) or not self.topology.unilateral:
+            raise TypeError("diode conduction requires a unilateral half-bridge topology")
+
+    def equations(self, current: Any, q: Any, u1: Any, u2: Any, u_dc: Any,
+                  inductance: float, resistance: float
+                  ) -> _DiodeConductionResult:
+        """Evaluate the one conduction law used by Python and generated backends."""
+        current = max(0.0, current)
+        duty = 1.0 - q if self.topology.reverse_port else q
+        bias = u1 if self.topology.reverse_port else u_dc - u2
+        denominator = 2.0 * inductance + resistance * duty * self.period
+        critical = duty * self.period * bias / denominator
+        in_dcm = duty > 0.0 and duty < 1.0 and bias > 0.0 and current < critical
+        if in_dcm:
+            total = max(duty, current / critical)
+            controlled = duty / total
+            diode = max(0.0, total - duty) / total
+            resistance_factor = 4.0 / (3.0 * total)
+        else:
+            total = 1.0
+            controlled = duty
+            diode = 1.0 - duty
+            resistance_factor = 1.0
+        if self.topology.reverse_port:
+            dcm_derivative = total * (
+                u1 - diode * u_dc - resistance * resistance_factor * current
+            ) / inductance
+        else:
+            dcm_derivative = total * (
+                controlled * u_dc - u2 - resistance * resistance_factor * current
+            ) / inductance
+        derivative = max(0.0, dcm_derivative) if current == 0.0 else dcm_derivative
+        return _DiodeConductionResult(
+            controlled, diode, total, resistance_factor, derivative, in_dcm,
+        )
+
+    def _branch_equations(self, branch) -> _DiodeConductionResult:
+        return self.equations(
+            branch.state.i,
+            branch.inp.q,
+            branch.inp.u1,
+            branch.inp.u2,
+            branch.inp.u_dc,
+            branch.L,
+            branch.R,
+        )
 
     def fractions(self, branch) -> tuple[float, float, float, float]:
-        duty = branch.inp.q
-        current = max(0.0, branch.state.i)
-        if duty <= 0.0 or duty >= 1.0:
-            return duty, 1.0 - duty, 1.0, 1.0
-        bias = branch.inp.u_dc - branch.inp.u2
-        denominator = 2.0 * branch.L + branch.R * duty * self.period
-        critical = duty * self.period * bias / denominator if bias > 0.0 else 0.0
-        if critical <= 0.0 or current >= critical:
-            return duty, 1.0 - duty, 1.0, 1.0
-        total = max(duty, current / critical)
-        diode = max(0.0, total - duty)
-        rms = 4.0 / (3.0 * total)
-        return duty / total, diode / total, total, rms
+        result = self._branch_equations(branch)
+        return (result.controlled, result.diode, result.total,
+                result.resistance_factor)
 
     def derivative(self, branch) -> float:
-        current = max(0.0, branch.state.i)
-        controlled, _diode, total, rms = self.fractions(branch)
-        derivative = total * (
-            controlled * branch.inp.u_dc - branch.inp.u2 - branch.R * rms * current
-        ) / branch.L
-        return max(0.0, derivative) if current == 0.0 else derivative
+        return self._branch_equations(branch).derivative
 
     def maximum_step(self, branch) -> float:
         _controlled, _diode, total, _rms = self.fractions(branch)
@@ -492,13 +635,17 @@ class _FullBridgeResult:
     diodes: tuple[float, float, float, float]
 
 
+@_register_topology
 class FullBridge:
     """Two controlled half bridges forming one scalar H-bridge."""
 
+    type = "full_bridge"
     duty_names = ("d_left", "d_right")
     zero = 0.0
+    neutral_duty = 0.5
+    config_fields = frozenset()
     set_dc_current = staticmethod(_set_scalar_dc_current)
-    __slots__ = ("left", "right", "devices", "power_scale")
+    __slots__ = ("left", "right", "devices")
 
     gates = {
         "positive": (1, 0, 0, 1),
@@ -523,14 +670,28 @@ class FullBridge:
         duty = output.duty
         return duty, 1.0 - duty
 
-    def __init__(self, devices: DeviceParameters | None = None, *,
-                 power_scale: float = 1.0) -> None:
+    def __init__(self, devices: DeviceParameters | None = None) -> None:
         self.left = HalfBridge(devices)
         self.right = HalfBridge(self.left.devices)
         self.devices = self.left.devices
-        if power_scale not in (1.0, 1.5):
-            raise ValueError("scalar bridge power scale must be 1.0 or 1.5")
-        self.power_scale = power_scale
+
+    @classmethod
+    def from_config(cls, _cfg: Any) -> "FullBridge":
+        return cls()
+
+    def state_from_duty(self, duty: float) -> float:
+        """Return the differential bridge ratio produced by a bipolar duty command."""
+        return 2.0 * min(1.0, max(0.0, duty)) - 1.0
+
+    reverse_port = False
+    unilateral = False
+
+    @staticmethod
+    def control_values(current, voltage, supply):
+        """Return canonical control measurements and the bipolar feed-forward duty."""
+        current, voltage = np.real(current), np.real(voltage)
+        feedforward = 0.5 * (1.0 + voltage / supply) if supply > 0.0 else 0.5
+        return current, voltage, supply, feedforward
 
     def _gates(self, gates) -> tuple[int, int, int, int]:
         if isinstance(gates, str):

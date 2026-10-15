@@ -9,6 +9,8 @@ from peslite.solver.simulation import _config_path
 
 EXPECTED = {
     "buck-example.pes",
+    "boost-example.pes",
+    "buck-boost-example.pes",
     "cable-gfl-example.pes",
     "custom-pll-example.pes",
     "gfl-example.pes",

@@ -1,0 +1,73 @@
+# PESLite 0.4.0
+# Closed-loop Boost application assembled from an open DCConverter. The external scalar bus is
+# the input port, while the converter's standard DC link is the regulated output capacitor.
+# Electrical values are SI.
+
+base:
+  s_base: 500.0
+  v_ll_rms: 230.0
+  f0: 50.0
+
+buses:
+  input:
+    phases: 1
+    c: 100.0e-6
+
+elements:
+  supply:
+    type: voltage_source
+    bus: input
+    v: 24.0
+    r: 0.1
+
+units:
+  converter:
+    type: dc_converter
+    bus: input
+    filter: {l_f: 500.0e-6, r_f: 0.05}
+    dclink:
+      vdc_ref: 48.0
+      capacitor: {c: 470.0e-6}
+      source: {type: current, i: -1.0}
+
+    pwm:
+      f_sw: 20000.0
+
+    bridge:
+      upper_controlled: false
+      reverse_port: true
+      # model: switching  # pwm_averaging (default) | averaging | switching
+
+    ctrl:
+      type: dc
+      loops:
+        voltage:
+          type: dc_voltage_control
+          kp: 0.2
+          ki: 30.0
+          minimum: 0.0
+          maximum: 10.0
+        current:
+          type: inductor_current_control
+          kp: 0.03
+          ki: 20.0
+          minimum: 0.02
+          maximum: 0.9
+      references:
+        voltage: 48.0
+
+simulation:
+  t_end: 0.02
+  initial:
+    states:
+      converter.dclink.u_C: 36.0
+  solver:
+    linearisations: 0
+  output:
+    period: 100.0e-6
+    record_every: 2
+    signals: 1
+
+meta:
+  title: Boost converter
+  description: A lower-controlled half-bridge DCConverter drawing from an external scalar input bus.

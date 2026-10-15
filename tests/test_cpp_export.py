@@ -14,6 +14,7 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES
+from peslite.assembly.params import from_dict
 from peslite.components import Bag, Element, Terminal, register_element_type
 from peslite.solver.simulation import convert_main
 
@@ -258,6 +259,110 @@ def test_generated_cpp_matches_python_for_adaptive_dcm(mode, tmp_path):
     assert source.read_text(encoding="utf-8").count("class DiodeConduction") == 1
     expected = _final_csv(python_out / "states.csv")
     actual = _final_csv(cpp_out / "states.csv")
+    scale = max(1.0, max(abs(value) for value in expected.values()))
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * scale
+
+
+@pytest.mark.parametrize(("example", "mode"), (
+    ("boost-example.pes", "switching"),
+    ("boost-example.pes", "pwm_averaging"),
+    ("boost-example.pes", "averaging"),
+    ("buck-boost-example.pes", "pwm_averaging"),
+))
+def test_generated_cpp_matches_open_dc_converter_compositions(
+        example, mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / example)
+    changes = {
+        f"units.{name}.bridge.model": mode
+        for name in params.units
+    }
+    changes.update({
+        "simulation.solver.type": "adaptive" if mode == "averaging" else "fixed",
+        "simulation.solver.method": "DP45" if mode == "averaging" else "rk4",
+        "simulation.t_end": 0.002,
+        "simulation.output.states": True,
+        "simulation.output.signals": False,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    })
+    if mode == "averaging":
+        changes["simulation.solver.max_step"] = 1.0e-4
+    params = params.replace(**changes)
+    project = tmp_path / f"{Path(example).stem}-{mode}"
+    _source, cpp_out, python_out = _run_generated(params, project, compiler)
+
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
+    assert actual.keys() == expected.keys()
+    scale = max(1.0, max(abs(value) for value in expected.values()))
+    # Independent floating-point step decisions can differ at a DCM boundary while the resulting
+    # open-converter trajectories remain within two tenths of a part per million.
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-7 * scale
+
+
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
+def test_generated_cpp_matches_composite_wpt_with_independent_clocks(mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    changes = {
+        "units.charger.primary.bridge.model": mode,
+        "units.charger.secondary.bridge.model": mode,
+        "simulation.t_end": 20.0e-6,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    }
+    if mode == "averaging":
+        changes.update({
+            "simulation.solver.type": "adaptive",
+            "simulation.solver.method": "DP45",
+            "simulation.solver.max_step": 50.0e-9,
+        })
+    params = peslite.load(EXAMPLES / "wpt-example.pes").replace(**changes)
+    _source, cpp_out, python_out = _run_generated(
+        params, tmp_path / f"wpt-{mode}", compiler
+    )
+
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
+    assert actual.keys() == expected.keys()
+    scale = max(1.0, max(abs(value) for value in expected.values()))
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * scale
+    assert _final_csv(cpp_out / "plant.csv").keys() == _final_csv(
+        python_out / "plant.csv"
+    ).keys()
+
+
+def test_generated_cpp_matches_composite_wpt_switching_events(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    tree = yaml.safe_load((EXAMPLES / "wpt-example.pes").read_text(encoding="utf-8"))
+    for side in ("primary", "secondary"):
+        tree["units"]["charger"][side]["bridge"] = {"model": "pwm_averaging"}
+    tree["events"] = {
+        "stop": {"type": "disconnect", "target": "charger", "t": 8.0e-6},
+        "restart": {
+            "type": "connect",
+            "target": "charger",
+            "t": 12.0e-6,
+            "ramp": 2.0e-6,
+        },
+    }
+    tree["simulation"]["t_end"] = 20.0e-6
+    tree["simulation"]["energy_check"] = "off"
+    tree["simulation"]["output"].update({"states": 1, "energy": 0})
+    params = from_dict(tree)
+    _source, cpp_out, python_out = _run_generated(
+        params, tmp_path / "wpt-events", compiler
+    )
+
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
+    assert actual.keys() == expected.keys()
     scale = max(1.0, max(abs(value) for value in expected.values()))
     assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * scale
 

@@ -31,7 +31,8 @@ class DiodeConduction:
         )
         self.resolution_subsystems = tuple(
             subsystem for subsystem in model.subsystems
-            if callable(getattr(subsystem, "diode_maximum_step", None))
+            if getattr(subsystem, "conduction", None) is not None
+            and callable(getattr(subsystem, "diode_maximum_step", None))
         )
 
     def __bool__(self) -> bool:

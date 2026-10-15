@@ -6,9 +6,10 @@ import numpy as np
 import pytest
 
 import peslite
+from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, from_dict
-from peslite.components import HalfBridgeDiodeConduction, RLBranch
-from peslite.control import DCVoltageControl, InductorCurrentControl
+from peslite.components import HalfBridge, HalfBridgeDiodeConduction, PWMBridge, RLBranch
+from peslite.control import DCVoltageControl, GraphController, InductorCurrentControl
 
 
 def _case(*, model="pwm_averaging", bridge_type="half_bridge",
@@ -79,16 +80,17 @@ def test_dc_converter_is_an_open_unit_connected_through_the_common_terminal_api(
     assert isinstance(unit.ctrl.graph.nodes["current"], InductorCurrentControl)
 
 
-def test_dc_converter_can_use_the_same_three_phase_point_network_interface(tmp_path):
-    params = _case(t_end=0.0002).replace(**{"buses.output.phases": 3})
-    simulation = peslite.Simulation(params)
-    unit = simulation.unit()
+def test_dc_converter_rejects_a_three_phase_point_network():
+    with pytest.raises(ConfigError, match="needs a single-phase bus"):
+        _case(t_end=0.0002).replace(**{"buses.output.phases": 3})
 
-    simulation.run(out_dir=tmp_path)
 
-    assert isinstance(unit.branch_f.state.i, complex)
-    assert unit.bridge.topology.power_scale == 1.5
-    assert unit.terminals() == (("output", unit.branch_f.terminal2),)
+def test_scalar_control_limits_need_a_nonzero_range():
+    with pytest.raises(ConfigError, match="minimum must be below maximum"):
+        _case().replace(**{
+            "units.converter.ctrl.loops.current.minimum": 0.95,
+            "units.converter.ctrl.loops.current.maximum": 0.95,
+        })
 
 
 @pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
@@ -110,6 +112,16 @@ def test_dc_converter_selects_its_bridge_structure(bridge_type, topology):
     unit = peslite.Simulation(params).unit()
 
     assert isinstance(unit.bridge.topology, topology)
+
+
+def test_public_factories_follow_the_registered_unit_configuration():
+    cfg = _case().unit()
+    bridge = peslite.make_bridge(cfg)
+    controller = peslite.make_controller(cfg, topology=bridge.topology)
+
+    assert isinstance(bridge, PWMBridge)
+    assert isinstance(bridge.topology, HalfBridge)
+    assert isinstance(controller, GraphController)
 
 
 def test_half_bridge_device_placement_controls_unilateral_current():
@@ -164,6 +176,41 @@ def test_control_feedforward_depends_on_bridge_structure_not_an_application_name
     assert full.control_inputs(1.0, 12.0, 48.0)["meas.duty_feedforward"] == pytest.approx(0.625)
 
 
+def test_explicit_half_bridge_orientation_sets_the_power_port_and_boost_feedforward():
+    params = peslite.load(EXAMPLES / "boost-example.pes")
+    unit = peslite.Simulation(params).unit()
+
+    assert unit.bridge.topology.reverse_port
+    assert unit.terminals() == (("input", unit.branch_f.terminal1),)
+    assert unit.ctrl.control_inputs(2.0, 48.0, 24.0)["meas.duty_feedforward"] == pytest.approx(0.5)
+
+
+def test_averaged_boost_enters_dcm_from_its_operating_point():
+    branch = RLBranch(1.0e-3, 0.0, phases=1, unilateral=True)
+    branch.conduction = HalfBridgeDiodeConduction(
+        50.0e-6, HalfBridge(upper_controlled=False, reverse_port=True),
+    )
+    branch.inp.q = 0.7
+    branch.inp.u1 = 24.0
+    branch.inp.u_dc = 48.0
+    branch.state.i = 0.108
+
+    _controlled, _diode, total, _rms = branch.conduction.fractions(branch)
+
+    assert total == pytest.approx(0.6)
+    assert branch.conduction.derivative(branch) == pytest.approx(0.0, abs=2e-10)
+
+
+def test_scalar_bridge_feedforward_is_safe_before_the_power_ports_are_energised():
+    forward = HalfBridge()
+    reverse = HalfBridge(reverse_port=True)
+    full = peslite.FullBridge()
+
+    assert forward.control_values(0.0, 0.0, 0.0)[3] == 0.0
+    assert reverse.control_values(0.0, 0.0, 0.0)[3] == 0.0
+    assert full.control_values(0.0, 0.0, 0.0)[3] == 0.5
+
+
 def test_unit_and_control_scopes_have_no_closed_circuit_fields():
     params = _case()
     unit = params.unit()
@@ -181,7 +228,21 @@ def test_unit_and_control_scopes_have_no_closed_circuit_fields():
 
 def test_dc_converter_rejects_wrong_network_and_bridge_scopes():
     params = _case()
-    with pytest.raises(ConfigError, match="requires 'half_bridge' or 'full_bridge'"):
+    with pytest.raises(ConfigError, match="unit type 'dc_converter' requires one of"):
         params.replace(**{"units.converter.bridge.type": "three_phase_bridge"})
     with pytest.raises(ConfigError, match="specified together|unknown bus None"):
         params.replace(**{"units.converter.bus": None})
+
+
+def test_restored_dc_converter_trip_stops_the_common_controller_lifecycle():
+    unit = peslite.Simulation(_case(t_end=0.0002)).unit()
+    unit.start(0.0)
+    assert unit.ctrl.startup.run
+
+    unit.set_state({"tripped": True})
+    unit.states_loaded()
+
+    assert not unit.ctrl.startup.run
+    assert not unit.breaker
+    assert not unit.gates
+    assert unit.trip_cause == "restored"

@@ -68,21 +68,25 @@ class _CoupledLink:
             pivot = int(np.argmax(np.abs(vectors[:, column])))
             if vectors[pivot, column] < 0.0:
                 vectors[:, column] *= -1.0
-        self._inductance = values
-        self._modes = vectors
+        self._inductance = (float(values[0]), float(values[1]))
+        self._mode_primary = (float(vectors[0, 0]), float(vectors[0, 1]))
+        self._mode_secondary = (float(vectors[1, 0]), float(vectors[1, 1]))
         self.inp = _LinkInp()
         self.out = _LinkOut()
 
     def _coil_currents(self) -> tuple[float, float]:
-        modes = np.array((self.state.i_mode_1, self.state.i_mode_2))
-        primary, secondary = self._modes @ modes
-        return primary.item(), secondary.item()
+        i1, i2 = self.state.i_mode_1, self.state.i_mode_2
+        p1, p2 = self._mode_primary
+        s1, s2 = self._mode_secondary
+        return p1 * i1 + p2 * i2, s1 * i1 + s2 * i2
 
     def _modal_derivatives(self, primary_voltage: float,
                            secondary_voltage: float) -> tuple[float, float]:
-        voltages = np.array((primary_voltage, secondary_voltage))
-        derivatives = self._modes.T @ voltages / self._inductance
-        return derivatives[0].item(), derivatives[1].item()
+        p1, p2 = self._mode_primary
+        s1, s2 = self._mode_secondary
+        l1, l2 = self._inductance
+        return ((p1 * primary_voltage + s1 * secondary_voltage) / l1,
+                (p2 * primary_voltage + s2 * secondary_voltage) / l2)
 
     def supplied_power(self) -> float:
         return 0.0

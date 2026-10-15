@@ -49,7 +49,7 @@ def main() -> int:
             order = cases[repeat % len(cases):] + cases[:repeat % len(cases)]
             for case in order:
                 model = "averaging" if case == "averaging_adaptive" else case
-                changes = {f"units.{name}.bridge.model": model for name in base.runtime_units}
+                changes = {f"units.{name}.bridge.model": model for name in base.units}
                 if case == "averaging_adaptive":
                     changes.update({
                         "simulation.solver.type": "adaptive",

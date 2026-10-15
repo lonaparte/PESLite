@@ -1,6 +1,6 @@
 # Examples
 
-PESLite ships ten simulation files with the Python wheel. They can be run by name from any
+PESLite ships twelve simulation files with the Python wheel. They can be run by name from any
 directory, so cloning the repository is not required.
 
 ```bash
@@ -20,6 +20,8 @@ peslite case.pes
 | Name | System and control purpose |
 |---|---|
 | `buck-example` | A closed-loop 48 V to 24 V Buck unit using the half bridge's controlled-device/diode placement, an L-C output network, native DCM and the shared scalar control graph. |
+| `boost-example` | A closed-loop 24 V to 48 V Boost application using the same DCConverter with the lower device controlled, the upper diode active and the external scalar bus as its input port. |
+| `buck-boost-example` | A cascaded Buck-Boost application made from two ordinary DCConverter units sharing one scalar intermediate bus. |
 | `cable-gfl-example` | A grid-following converter connected to the grid through the distributed R-L/G-C model registered under `addons/components`. |
 | `custom-pll-example` | Grid-following control assembled from built-in current/DC-voltage loops and an automatically discovered voltage-adaptive PLL under `addons/control`. |
 | `gfl-example` | One grid-following converter with PLL, dc-voltage control, current control and unit protection. This is the most extensively annotated configuration. |
@@ -28,7 +30,7 @@ peslite case.pes
 | `gfm-dvoc-example` | Grid-forming dispatchable virtual oscillator control. |
 | `gfm-matching-example` | Matching control coupled to a dynamic dc link and current source. |
 | `two-converters-example` | A GFM and a GFL unit on separate buses, with different ratings and switching frequencies. |
-| `wpt-example` | A composite series-series compensated WPT unit whose independently clocked full-bridge primary and secondary are flattened during assembly. |
+| `wpt-example` | A composite series-series compensated WPT unit whose independently clocked full-bridge primary and secondary are assembled from its single nested unit tree. |
 
 The files are also available in the repository's
 [`examples/`](https://github.com/lonaparte/PESLite/tree/main/examples) directory. The root
@@ -49,8 +51,8 @@ They represent different model fidelity and timing semantics; compare quantities
 bandwidth rather than expecting identical switching-scale waveforms. See
 [Converter and Bridge Models](Converter-and-Bridge-Models.md).
 
-The scalar `buck-example` and both child converters of `wpt-example` support the same three
-bridge-model flags.
+The scalar Buck, Boost and cascaded Buck-Boost cases and both child converters of `wpt-example`
+support the same three bridge-model flags.
 
 ## Short exploratory runs
 

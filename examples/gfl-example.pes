@@ -69,6 +69,7 @@ units:                     # converters, one entry each
     #   type: three_phase_bridge   # inferred from the unit/control; scalar: half_bridge | full_bridge
     #   upper_controlled: 1        # half-bridge device placement; ignored by three/full bridges
     #   lower_controlled: 1
+    #   reverse_port: 0            # half-bridge scalar-port orientation
     #                              # CLI: --averaging | --pwm-averaging | --switching
 
     ctrl:

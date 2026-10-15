@@ -10,7 +10,7 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import ConfigError
+from peslite.assembly.params import ConfigError, _unit_items
 
 
 SHORT = ["--set", "simulation.t_end=0.004",
@@ -104,7 +104,7 @@ def test_bridge_flags_are_mutually_exclusive(capsys):
 
 def _with_model(params, model):
     return params.replace(**{
-        f"units.{name}.bridge.model": model for name in params.runtime_units
+        f"units.{name}.bridge.model": model for name, _unit in _unit_items(params.units)
     })
 
 
