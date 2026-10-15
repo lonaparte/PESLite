@@ -66,6 +66,43 @@ units:
 controller outputs explicitly. See [Control and PWM Timing](Control-and-PWM-Timing.md) and
 [Converter and Bridge Models](Converter-and-Bridge-Models.md).
 
+A WPT unit is a configuration-time composite. It owns no bridge or controller itself; each child
+is an ordinary independently clocked `DCConverter` using full-bridge resonant control. `link.type` selects series-series
+(`ss`) or LCC-LCC (`lcc`) compensation. The complete runnable schema is shown in
+`examples/wpt-example.pes`.
+
+```yaml
+units:
+  charger:
+    type: wpt
+    primary:
+      type: dc_converter
+      dclink: {vdc_ref: 400.0, source: {type: voltage}}
+      pwm: {f_sw: 1.0e6}
+      ctrl:
+        type: resonant
+        computation: 0.0
+        loops: {}
+        references: {modulation: 0.8, frequency: 85000.0}
+    secondary:
+      # The same fields, with its own DC link, PWM clock and phase command.
+      type: dc_converter
+      dclink: {vdc_ref: 300.0, source: {type: voltage}}
+      pwm: {f_sw: 800.0e3}
+      ctrl:
+        type: resonant
+        computation: 0.0
+        loops: {}
+        references: {modulation: 0.7, frequency: 85000.0, phase: -1.5708}
+    link:
+      type: ss
+      primary_inductance: 100.0e-6
+      secondary_inductance: 100.0e-6
+      mutual_inductance: 20.0e-6
+      primary_capacitance: 35.07e-9
+      secondary_capacitance: 35.07e-9
+```
+
 ## Simulation settings
 
 ```yaml

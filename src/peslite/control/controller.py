@@ -19,16 +19,16 @@ from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
-from ..solver.model import Bag, ConfigError, gather, scatter
+from ..solver.model import Bag, ConfigError, Empty, gather, scatter
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, I, I_AB, LOOP_TYPES, POWER,
                     SI_CURRENT, SI_VOLTAGE, V, V_AB, V_DQ, CurrentLoop,
-                    DCLinkVoltageLoop, Loop, SignalType, SyncLaw)
+                    DCVoltageControl, Loop, SignalType, SyncLaw)
 from .modulation import CONFIGURED, OutputStage
 
 __all__ = ["Measurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
            "ControlInterface", "CONTROL_INTERFACE", "ControlGraph", "default_wiring",
-           "UniteType", "ScalarControlOutput", "ScalarController",
+           "UniteType", "ScalarControlOutput", "ScalarController", "ResonantController",
            "make_controller"]
 
 
@@ -323,7 +323,7 @@ class ControlGraph:
                 source = self.connections.get(target)
                 if source not in types:
                     raise ConfigError(f"ctrl.connections.{target}: missing or unknown source {source!r}")
-                if types[source] != spec:
+                if not types[source].compatible(spec):
                     raise ConfigError(f"ctrl.connections.{target}: incompatible signal {source!r}: "
                                       f"{types[source]} -> {spec}")
                 owner = source.partition(".")[0]
@@ -339,7 +339,7 @@ class ControlGraph:
                               f"known: {sorted(self.interface.outputs)}")
         for port, spec in self.interface.outputs.items():
             source = self.outputs.get(port)
-            if source not in types or types[source] != spec:
+            if source not in types or not types[source].compatible(spec):
                 raise ConfigError(f"ctrl.outputs.{port}: missing or incompatible source {source!r}")
         self.order = []
         if not self.continuous:
@@ -899,9 +899,11 @@ def default_wiring(cfg, family):
     extra = f"{damping}.extra" if damping else "references.zero_v_pu"
     ports_of = {
         "pll": {"v": "meas.u_g"},
-        "dc_voltage": {"u_dc": "meas.u_dc", "vdc_ref": "references.vdc_ref_pu"},
+        "dc_voltage": {"voltage": "meas.u_dc", "reference": "references.vdc_ref_pu"},
         "current": {"v": "meas.u_g", "i": "meas.i_c", "frame": frame, "omega": omega,
-                    "extra": extra, "id_ref": f"{va or dc}.id_ref" if va or dc else "references.id_ref_pu",
+                    "extra": extra,
+                    "id_ref": (f"{va}.id_ref" if va else f"{dc}.current_reference"
+                               if dc else "references.id_ref_pu"),
                     "iq_ref": f"{va}.iq_ref" if va else "references.iq_ref_pu"},
         "power": {"v": "meas.u_g", "i": "meas.i_c"},
         "sync": {"p": f"{power}.p", "q": f"{power}.q", "v": "meas.u_g", "i": "meas.i_c",
@@ -1007,15 +1009,8 @@ class UniteType:
             self._terminal_limit_scale = None
             if self.stage is not None:
                 self.stage._command_saturated = False
-        if isinstance(node, DCLinkVoltageLoop):
-            limit = _OutputLimit(
-                node.limit, lower=node.floor, pi=None if self.continuous else node.pi,
-                observer=node.observe_limit,
-            )
-            if self.continuous:
-                self._flow_limits[name] = (f"{name}.id_ref", limit, "ID_REF_LIMIT", node)
-            else:
-                graph.limit_output(name, "id_ref", limit)
+        if isinstance(node, DCVoltageControl) and self.continuous:
+            self._flow_limits[name] = (f"{name}.current_reference", "ID_REF_LIMIT", node)
         if (not self.continuous and name == self._terminal
                 and isinstance(node, CurrentLoop) and self.stage is not None):
             limit = self.stage.command_limit(1.0)
@@ -1030,16 +1025,12 @@ class UniteType:
 
     def observe_limits(self, t: float) -> None:
         """Check ideal-model commands at a recorded snapshot without altering their values."""
-        for path, limit, alarm, node in self._flow_limits.values():
-            value = self.graph.values[path]
-            exceeded = limit.exceeded(value)
+        for output_path, alarm, node in self._flow_limits.values():
+            output = self.graph.values[output_path]
             node.n_updates += 1
-            node.limit_exceeded = exceeded
-            if not exceeded:
+            node.observe_limit(t, node.raw, output, count=True)
+            if not node.limit_exceeded:
                 continue
-            node.n_limit_exceeded += 1
-            if node.first_limit_t is None:
-                node.first_limit_t = t
             if alarm not in self.alarms:
                 self.alarms.append(alarm)
 
@@ -1481,28 +1472,25 @@ class ScalarController:
         self.periods = self.graph.periods
         self.logging = True
         self.last_log: dict[str, float] = {}
-        self._input_values = {
-            "buck": self._buck_inputs,
-            "boost": self._boost_inputs,
-            "buck_boost": self._buck_boost_inputs,
-        }[cfg.topology]
-        self._last_measurement = _ScalarMeasurement(vin=cfg.source_voltage)
+        self._input_values = (
+            self._full_bridge_inputs
+            if cfg.bridge.type == "full_bridge"
+            else self._half_bridge_inputs
+        )
+        self._last_measurement = _ScalarMeasurement(vin=cfg.dclink.vdc_ref)
         self._last_duty = 0.0
         if self.continuous:
             self._build_flow_state()
 
     @staticmethod
-    def _buck_inputs(current, voltage, vin):
+    def _half_bridge_inputs(current, voltage, vin):
+        current, voltage = np.real(current), np.real(voltage)
         return current, voltage, vin, voltage / vin
 
     @staticmethod
-    def _boost_inputs(current, voltage, vin):
-        return current, voltage, vin, 1.0 - vin / max(voltage, vin)
-
-    @staticmethod
-    def _buck_boost_inputs(current, voltage, vin):
-        magnitude = abs(voltage)
-        return current, magnitude, vin, magnitude / (vin + magnitude)
+    def _full_bridge_inputs(current, voltage, vin):
+        current, voltage = np.real(current), np.real(voltage)
+        return current, voltage, vin, 0.5 * (1.0 + voltage / vin)
 
     def control_inputs(self, current, voltage, vin) -> dict[str, Any]:
         """Return canonical measurements and converter feedforward at the control boundary."""
@@ -1535,7 +1523,7 @@ class ScalarController:
         self.state, self.state_names = state, tuple(names)
         if self.state_names != self.graph.flow_state_names:
             raise RuntimeError("continuous scalar controller state layouts differ")
-        self.inp = _ScalarControlInp(current=0.0, voltage=0.0, vin=self.p.source_voltage)
+        self.inp = _ScalarControlInp(current=0.0, voltage=0.0, vin=self.p.dclink.vdc_ref)
         self.out = _ScalarControlOut(q=0.0)
         self._derivatives = [0.0] * len(self.state_names)
         self._bind_flow_state()
@@ -1674,6 +1662,140 @@ class ScalarController:
                                   if not name.startswith("startup.")})
 
     def summary(self) -> dict[str, Any]:
+        return {"alarms": []}
+
+
+class _ResonantControlInp(Bag):
+    __slots__ = ("current", "u_dc")
+
+
+class _ResonantControlOut(Bag):
+    __slots__ = ("q",)
+
+
+class ResonantController:
+    """Sinusoidal fundamental command for one resonant full bridge.
+
+    The controller deliberately has no feedback graph.  Switching and PWM-period averaging sample
+    the same absolute-time command on their normal interrupt grids; ideal averaging evaluates it
+    directly in the continuous model.
+    """
+
+    state_names: tuple[str, ...] = ()
+    outputs_need_inputs = False
+    observer = True
+
+    def __init__(self, cfg) -> None:
+        self.p = cfg
+        self.continuous = cfg.bridge.model == "averaging"
+        self.startup = (
+            ContinuousStartup(run=False) if self.continuous
+            else Startup(cfg.ctrl.period, run=False)
+        )
+        self.periods: dict[str, float] = {}
+        self.logging = True
+        self.last_log: dict[str, float] = {}
+        self._last_current = 0.0
+        self._last_u_dc = cfg.dclink.vdc_ref
+        self._last_q = 0.0
+        self.state = Empty()
+        self.inp = _ResonantControlInp(u_dc=cfg.dclink.vdc_ref)
+        self.out = _ResonantControlOut()
+
+    def _command(self, t: float) -> float:
+        ref = self.p.ctrl.references
+        return ref.modulation * math.sin(2.0 * math.pi * ref.frequency * t + ref.phase)
+
+    def command(self, run: bool, ramp: float = 0.0) -> None:
+        if self.continuous:
+            self.command_at(run, ramp, 0.0)
+        else:
+            self.startup.command(run, ramp)
+
+    def command_at(self, run: bool, ramp: float, t: float, *, reset: bool = True) -> None:
+        if self.continuous:
+            self.startup.command(run, ramp, t)
+        else:
+            self.command(run, ramp)
+
+    def sample(self, t: float, current: float, u_dc: float) -> ScalarControlOutput:
+        if self.continuous:
+            raise RuntimeError("an ideal averaged resonant controller is evaluated by the ODE solver")
+        if self.startup.in_progress:
+            self.startup.advance()
+        q = self.startup.value * self._command(t) if self.startup.active else 0.0
+        duty = 0.5 * (1.0 + q)
+        self._last_current, self._last_u_dc, self._last_q = current, u_dc, q
+        log = self._log() if self.logging else None
+        return ScalarControlOutput(
+            duty=duty,
+            log=log,
+            gates=self.startup.active,
+            startup_complete=self.startup.complete,
+        )
+
+    def __call__(self, t: float, meas) -> ScalarControlOutput:
+        return self.sample(t, meas.current, meas.u_dc)
+
+    def set_outputs(self, t: float) -> None:
+        self.startup.at(t)
+        self._last_current = self.inp.current
+        self._last_u_dc = self.inp.u_dc
+        self._last_q = self.startup.value * self._command(t) if self.startup.active else 0.0
+        self.out.q = self._last_q
+
+    def rhs(self, t: float):
+        return ()
+
+    def control_inputs(self, current: float, u_dc: float) -> dict[str, float]:
+        return {"meas.current": current, "meas.u_dc": u_dc}
+
+    def _log(self) -> dict[str, float]:
+        ref = self.p.ctrl.references
+        self.last_log = {
+            "meas.current": self._last_current,
+            "meas.u_dc": self._last_u_dc,
+            "references.modulation": ref.modulation,
+            "references.frequency": ref.frequency,
+            "references.phase": ref.phase,
+            "q": self._last_q,
+            "startup.active": 1.0 if self.startup.active else 0.0,
+        }
+        return self.last_log
+
+    def continuous_log(self, t: float) -> dict[str, float] | None:
+        return self._log() if self.logging else None
+
+    @staticmethod
+    def log_names() -> tuple[str, ...]:
+        return (
+            "meas.current", "meas.u_dc", "references.modulation",
+            "references.frequency", "references.phase", "q", "startup.active",
+        )
+
+    @classmethod
+    def log_sources(cls) -> Mapping[str, str]:
+        return {name: name for name in cls.log_names()}
+
+    def set_logging(self, enabled: bool) -> None:
+        self.logging = bool(enabled)
+
+    def retune(self, cfg, paths, t: float) -> None:
+        self.p = cfg
+
+    def get_state(self) -> dict[str, Any]:
+        return {f"startup.{name}": value for name, value in self.startup.get_state().items()}
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        self.startup.set_state({name[8:]: value for name, value in values.items()
+                                if name.startswith("startup.")})
+
+    @staticmethod
+    def initial_sync() -> tuple[None, None]:
+        return None, None
+
+    @staticmethod
+    def summary() -> dict[str, Any]:
         return {"alarms": []}
 
 

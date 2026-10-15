@@ -5,16 +5,44 @@ It also exposes the component operations used by simulation-file events.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
 from ..components.network import ELEMENT_TYPES, RCNode, RLBranch, Terminal, ThreePhaseSource
+from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather
 from .events import SWITCHING, SourceScenario
 from .params import Change, Params
 from .unit import DCConverter, Unit, VSC
 
-__all__ = ["System"]
+__all__ = ["UnitAssembly", "System"]
+
+
+@dataclass
+class UnitAssembly:
+    """One configuration node expanded into runtime leaf units and shared subsystems."""
+
+    units: dict[str, Unit] = field(default_factory=dict)
+    subsystems: dict[str, Any] = field(default_factory=dict)
+    signal_sources: tuple[Any, ...] = ()
+
+
+class _WPTSignals:
+    """Expose shared link quantities without making the composite a scheduled runtime unit."""
+
+    def __init__(self, name: str, link: Any) -> None:
+        self.name = name
+        self.link = link
+
+    def signals(self) -> dict[str, float]:
+        out = self.link.out
+        return {
+            f"{self.name}.link.i_primary": float(out.i_primary),
+            f"{self.name}.link.i_secondary": float(out.i_secondary),
+            f"{self.name}.link.i_primary_coil": float(out.i_primary_coil),
+            f"{self.name}.link.i_secondary_coil": float(out.i_secondary_coil),
+        }
 
 
 class _Source:
@@ -70,6 +98,71 @@ class _BranchAssembly:
                 (self.cfg.bus2, self.branch.terminal2))
 
 
+def _part(parts: Mapping[str, Any], name: str, suffix: str = "") -> Any:
+    key = f"{name}.{suffix}" if suffix else name
+    return parts.get(key)
+
+
+def _assemble_vsc(name: str, cfg: Any, system: "System",
+                  parts: Mapping[str, Any]) -> UnitAssembly:
+    unit = _part(parts, name) or VSC(
+        name,
+        cfg,
+        system.p.simulation,
+        system.buses[cfg.bus],
+        ctrl=_part(parts, name, "ctrl"),
+        modulator=_part(parts, name, "modulator"),
+    )
+    return UnitAssembly(units={name: unit})
+
+
+def _assemble_dc_converter(name: str, cfg: Any, system: "System",
+                           parts: Mapping[str, Any]) -> UnitAssembly:
+    unit = _part(parts, name) or DCConverter(
+        name,
+        cfg,
+        system.p.simulation,
+        system.buses[cfg.bus],
+        ctrl=_part(parts, name, "ctrl"),
+        modulator=_part(parts, name, "modulator"),
+    )
+    return UnitAssembly(units={name: unit})
+
+
+def _assemble_wpt(name: str, cfg: Any, system: "System",
+                  parts: Mapping[str, Any]) -> UnitAssembly:
+    if _part(parts, name) is not None:
+        raise ConfigError(
+            f"parts.{name}: a composite WPT unit is assembled from its primary and secondary parts"
+        )
+    link = make_wpt_link(cfg.link)
+    units: dict[str, Unit] = {}
+    for side in ("primary", "secondary"):
+        child_name = f"{name}.{side}"
+        child_cfg = getattr(cfg, side)
+        units[child_name] = _part(parts, child_name) or DCConverter(
+            child_name,
+            child_cfg,
+            system.p.simulation,
+            link=link,
+            side=side,
+            ctrl=_part(parts, child_name, "ctrl"),
+            modulator=_part(parts, child_name, "modulator"),
+        )
+    return UnitAssembly(
+        units=units,
+        subsystems={f"{name}.link": link},
+        signal_sources=(_WPTSignals(name, link),),
+    )
+
+
+_UNIT_ASSEMBLERS = {
+    "vsc": _assemble_vsc,
+    "dc_converter": _assemble_dc_converter,
+    "wpt": _assemble_wpt,
+}
+
+
 class System:
     """Buses, branches, sources, units and elements wired into one model."""
 
@@ -83,10 +176,19 @@ class System:
         parts = dict(parts or {})
         base = p.base
         # ---------------------------------------------------------- the elements
-        # buses start at the AC base voltage, angle zero, unless initial states override it
-        self.buses = {name: RCNode(cfg.c, cfg.r_d, u0=base.v_phase_peak)
+        # Three-phase buses start at one pu; scalar buses start de-energized unless overridden.
+        self.buses = {name: RCNode(
+                          cfg.c,
+                          cfg.r_d,
+                          u0=base.v_phase_peak if cfg.phases == 3 else 0.0,
+                          phases=cfg.phases,
+                      )
                       for name, cfg in p.buses.items()}
-        self.branches = {name: RLBranch(cfg.l, cfg.r)
+        self.branches = {name: RLBranch(
+                             cfg.l,
+                             cfg.r,
+                             phases=p.buses[cfg.bus1].phases,
+                         )
                          for name, cfg in p.branches.items()}
         self.sources = {name: _Source(name, cfg, base, [
                             (change.t, change.params.sources[name]) for change in p.changes
@@ -94,30 +196,21 @@ class System:
                             p.simulation.initial.t)
                         for name, cfg in p.sources.items()}
         self.units: dict[str, Unit] = {}
+        self.unit_groups = dict(p.unit_groups)
+        shared_subsystems: dict[str, Any] = {}
+        composite_signal_sources: list[Any] = []
         for name, cfg in p.units.items():
-            if name in parts:
-                built = parts[name]
-            elif cfg.type == "dc_converter":
-                built = DCConverter(
-                    name,
-                    cfg,
-                    p.simulation,
-                    ctrl=parts.get(f"{name}.ctrl"),
-                    modulator=parts.get(f"{name}.modulator"),
-                )
-            else:
-                built = VSC(
-                    name,
-                    cfg,
-                    p.simulation,
-                    self.buses[cfg.bus],
-                    ctrl=parts.get(f"{name}.ctrl"),
-                    modulator=parts.get(f"{name}.modulator"),
-                )
-            self.units[name] = built
+            assembly = _UNIT_ASSEMBLERS[cfg.type](name, cfg, self, parts)
+            overlap = set(self.units) & set(assembly.units)
+            if overlap:
+                raise ConfigError(f"assembled unit name collision: {sorted(overlap)}")
+            self.units.update(assembly.units)
+            shared_subsystems.update(assembly.subsystems)
+            composite_signal_sources.extend(assembly.signal_sources)
+        self.composite_signal_sources = tuple(composite_signal_sources)
 
         # ---------------------------------------------------------- the wiring
-        subsystems: dict[str, Any] = dict(self.buses)
+        subsystems: dict[str, Any] = {**self.buses, **shared_subsystems}
         connections: dict = {}
         bus_currents: dict[str, list] = {name: [] for name in self.buses}
         self.named_elements = {name: ELEMENT_TYPES[cfg.type](name, cfg, self.buses, p)
@@ -182,9 +275,11 @@ class System:
         mine: dict[str, dict] = {name: {} for name in self.units}
         rest: dict[str, Any] = {}
         for key, value in values.items():
-            head, _, tail = key.partition(".")
-            if head in self.units and tail in self.units[head].get_state():
-                mine[head][tail] = value  # unit-owned state
+            owner = next((name for name in sorted(self.units, key=len, reverse=True)
+                          if key.startswith(name + ".")), None)
+            tail = key[len(owner) + 1:] if owner is not None else ""
+            if owner is not None and tail in self.units[owner].get_state():
+                mine[owner][tail] = value  # unit-owned state
             else:
                 rest[key] = value
         for name, own in mine.items():
@@ -201,17 +296,18 @@ class System:
             src.emf.set_outputs(t)
 
         def preset(key: str, word: str):
-            head = key.partition(".")[0]
+            head = next((name for name in sorted(self.units, key=len, reverse=True)
+                         if key == name or key.startswith(name + ".")), key.partition(".")[0])
             if word == "rated":
                 if head not in self.units:
                     raise ValueError(f"{key}: 'rated' is a converter's rated dc voltage, and "
                                      f"{head!r} is not a unit ({sorted(self.units)})")
                 cfg = self.units[head].cfg
-                return (cfg.ctrl.references.voltage if cfg.type == "dc_converter"
-                        else cfg.dclink.vdc_ref)
+                return cfg.dclink.vdc_ref
             if word == "source":
                 if head in self.units and self.units[head].cfg.type == "dc_converter":
-                    return self.units[head].cfg.source_voltage
+                    source = self.units[head].cfg.dclink.source
+                    return source.v if source.type == "voltage" else self.units[head].cfg.dclink.vdc_ref
                 bus = self.units[head].cfg.bus if head in self.units else head
                 at_bus = [s.emf.out.e_g for s in self.sources.values() if s.cfg.bus == bus]
                 if at_bus:
@@ -227,6 +323,10 @@ class System:
     # ---------------------------------------------------------------- events
     def switch(self, name: str, on: bool, t: float, ramp: float = 0.0) -> None:
         """Connect or disconnect a named unit, source, branch or registered element."""
+        if name in self.unit_groups:
+            for child in self.unit_groups[name]:
+                self.units[child].connect(on, t, ramp)
+            return
         if name in self.units:
             self.units[name].connect(on, t, ramp)
             return
@@ -249,7 +349,12 @@ class System:
         """Apply the checked parameter state after one ``set`` event to affected components."""
         p, done = change.params, set()
         for path in change.paths:
-            section, name, _rest = path.split(".", 2)
+            section, _, remainder = path.partition(".")
+            if section == "units":
+                name = next((candidate for candidate in sorted(self.units, key=len, reverse=True)
+                             if remainder.startswith(candidate + ".")), remainder.partition(".")[0])
+            else:
+                name = remainder.partition(".")[0]
             if (section, name) in done:
                 continue
             done.add((section, name))
@@ -262,7 +367,7 @@ class System:
                     p.sources[name], change.touches(f"sources.{name}."), change.t)
             elif section == "units":
                 self.units[name].retune(
-                    p.units[name], change.touches(f"units.{name}."), change.t)
+                    p.runtime_units[name], change.touches(f"units.{name}."), change.t)
             elif section == "elements":
                 self.named_elements[name].retune(p.elements[name])
         model = self.model
@@ -280,7 +385,13 @@ class System:
                         "connect and disconnect events cannot switch it")
         for change in p.changes:
             for path in change.paths:
-                section, name, rest = path.split(".", 2)
+                section, _, remainder = path.partition(".")
+                if section == "units":
+                    name = next((candidate for candidate in sorted(self.units, key=len, reverse=True)
+                                 if remainder.startswith(candidate + ".")), remainder.partition(".")[0])
+                    rest = remainder[len(name) + 1:]
+                else:
+                    name, _, rest = remainder.partition(".")
                 if section == "elements" and not hasattr(self.named_elements[name], "retune"):
                     raise ConfigError(
                         f"events.{change.event}: elements.{name} has no retune(parameters), so a "
@@ -296,7 +407,8 @@ class System:
     def signals(self, t: float) -> dict[str, float | complex]:
         """Return the plant signals (SI) for the recorder; outputs must be synced to ``t``."""
         out: dict[str, float | complex] = {}
-        for element in (*self.sources.values(), *self.units.values(), *self.named_elements.values()):
+        for element in (*self.sources.values(), *self.units.values(),
+                        *self.composite_signal_sources, *self.named_elements.values()):
             out.update(element.signals() if hasattr(element, "signals") else {})
         for name, branch in self.branches.items():
             out[f"{name}.i"] = branch.out.i

@@ -4,7 +4,8 @@ A loop type is one class: its parameters (``Params``, the schema of its ``ctrl.l
 its typed input and output ports, its role in the default wiring, and its sampled/continuous law.
 How loops are connected is not theirs to know (:mod:`.controller`).  Built-in loops also expose
 their continuous-time outputs and state derivatives for the ideal averaged converter model.
-Grid-control signals use pu. Scalar converter loops declare SI units on their ports.
+Grid-control signals use pu and scalar converter signals use SI. Unit-system-independent loops
+declare generic scalar voltage/current ports that bind to either control-graph boundary.
 Time is in s, angles in rad and frequencies in rad/s.
 """
 
@@ -22,10 +23,9 @@ __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER", "PQ",
            "ROLES", "Loop", "LOOP_TYPES", "register_loop_type", "PowerFilterParams",
            "CurrentLimitParams",
-           "SRFPLL", "CurrentLoop", "DCLinkVoltageLoop", "PowerLoop", "SyncLaw", "PSC", "Droop", "VSG", "DVOC",
+           "SRFPLL", "CurrentLoop", "DCVoltageControl", "PowerLoop", "SyncLaw", "PSC", "Droop", "VSG", "DVOC",
            "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping", "UnitDelay",
-           "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO",
-           "CapacitorVoltageControl", "InductorCurrentControl"]
+           "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO", "InductorCurrentControl"]
 
 
 # ------------------------------------------------------------------ signals
@@ -38,6 +38,22 @@ class SignalType:
     frame: str = "scalar"
     complex_value: bool = False
 
+    def compatible(self, other: "SignalType") -> bool:
+        """Return whether two ports carry the same signal in a compatible representation."""
+        if self == other:
+            return True
+        if self.frame != other.frame or self.complex_value != other.complex_value:
+            return False
+        families = {
+            "current": frozenset(("current", "pu_current", "A")),
+            "voltage": frozenset(("voltage", "pu_voltage", "V")),
+        }
+        return any(
+            self.unit in family and other.unit in family
+            and (self.unit == quantity or other.unit == quantity)
+            for quantity, family in families.items()
+        )
+
 
 I_AB = SignalType("pu_current", "alpha_beta", True)
 V_AB = SignalType("pu_voltage", "alpha_beta", True)
@@ -49,6 +65,8 @@ ANGLE = SignalType("rad")
 FREQUENCY = SignalType("rad/s")
 POWER = SignalType("pu_power")
 PQ = SignalType("pu_power", "pq", True)
+GENERIC_CURRENT = SignalType("current")
+GENERIC_VOLTAGE = SignalType("voltage")
 
 
 # ------------------------------------------------------------------ the base class and the registry
@@ -455,49 +473,53 @@ class CurrentLoop(Loop):
 
 
 @register_loop_type
-class DCLinkVoltageLoop(Loop):
-    """PI dc-voltage loop producing ``id_ref = ff + kp*e + ki*int(e)``.
+class DCVoltageControl(Loop):
+    """Unit-system-independent voltage PI producing a bounded current reference.
 
-    ``e = u_dc - vdc_ref`` in dc pu; ``id_ref`` in ac current pu (positive = export); the
-    feed-forward ``id0_export_pu`` follows the connection ramp. Sampled control constrains the
-    result to ``[floor, limit]`` and applies tracking anti-windup; ideal averaging leaves it
-    unconstrained and reports limit crossings. Named state: ``integral`` (pu*s).
+    The error is always ``reference - voltage``. ``output_polarity`` is ``+1`` when positive
+    commanded current raises the controlled voltage and ``-1`` when it lowers the voltage, as for
+    a VSC whose positive d-axis current exports power from its DC side. The feed-forward follows
+    the common converter start-up ramp.
     """
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
-        kp_pu: float
-        ki_pu: float
-        id0_export_pu: float = 0.0  # d-axis current feed-forward, pu
-        bidirectional: bool = False  # False: id_ref limited to >= 0
-        period: Optional[float] = None
-        limit_pu: float = 1.0
+        kp: float
+        ki: float
+        minimum: float
+        maximum: float
+        feedforward: float = 0.0
+        output_polarity: float = 1.0
         antiwindup: bool = True
-        type: str = "dc_voltage_pi"
+        period: Optional[float] = None
+        type: str = "dc_voltage_control"
 
-        _quantities = {"kp_pu": "current/dc_voltage", "ki_pu": "current/dc_voltage",
-                       "id0_export_pu": "current", "limit_pu": "current"}
+        _choices = {"output_polarity": (-1.0, 1.0)}
 
-    type = "dc_voltage_pi"
+    type = "dc_voltage_control"
     role = "dc_voltage"
-    inputs = {"u_dc": V, "vdc_ref": V}
-    outputs = {"id_ref": I}
-    flow_inputs = ("u_dc", "vdc_ref")
+    inputs = {"reference": GENERIC_VOLTAGE, "voltage": GENERIC_VOLTAGE}
+    outputs = {"current_reference": GENERIC_CURRENT}
+    flow_inputs = ("reference", "voltage")
     carried = ("n_updates", "n_limit_exceeded", "n_reverse", "first_limit_t")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
-        self.kp, self.ki, self.T = cfg.kp_pu, cfg.ki_pu, cfg.period
-        self.limit = cfg.limit_pu
-        self.floor = -cfg.limit_pu if cfg.bidirectional else 0.0
+        self.kp = cfg.output_polarity * cfg.kp
+        self.ki = cfg.output_polarity * cfg.ki
+        self.T = cfg.period
+        self.minimum, self.maximum = cfg.minimum, cfg.maximum
         self.antiwindup = cfg.antiwindup
-        self.pi = PI(self.kp, self.ki, self.block_period, antiwindup=cfg.antiwindup)
+        self.pi = self.state_block(
+            "integral", PI(self.kp, self.ki, self.block_period,
+                           antiwindup=cfg.antiwindup)
+        )
+        self.limit = OutputLimit(cfg.maximum, lower=cfg.minimum, pi=self.pi)
         self.error = self.raw = 0.0
         self.limit_exceeded = False
         self.n_updates = self.n_limit_exceeded = 0
-        self.n_reverse = 0  # updates asking for reverse (import) current
+        self.n_reverse = 0
         self.first_limit_t: float | None = None
-        self.state_names = {"integral_pu": "integral"}
 
     @property
     def integral(self):
@@ -508,36 +530,32 @@ class DCLinkVoltageLoop(Loop):
         self.pi.integral = float(value)
 
     def initial_outputs(self):
-        return {"id_ref": 0.0}
+        return {"current_reference": 0.0}
+
+    def _requested(self, reference, voltage):
+        self.error = reference - voltage
+        if self.startup is not None and not self.startup.active:
+            self.pi.derivative = 0.0
+            return 0.0
+        ramp = 1.0 if self.startup is None else self.startup.value
+        return self.pi(reference, voltage, ramp * self.cfg.feedforward)
+
+    def equation(self, reference, voltage):
+        self.raw = self._requested(reference, voltage)
+        current = (self.limit.flow(self.raw) if self.block_period is None
+                   else self.limit.sample(0.0, self.raw))
+        return (current,)
 
     def sample(self, t, inputs):
+        current, = self.equation(inputs["reference"], inputs["voltage"])
         self.n_updates += 1
-        ff = self.startup.value * self.cfg.id0_export_pu
-        self.error = inputs["u_dc"] - inputs["vdc_ref"]
-        if not self.startup.active:
-            self.raw = 0.0
-        else:
-            self.raw = self.pi(inputs["u_dc"], inputs["vdc_ref"], ff)
+        self.observe_limit(t, self.raw, current, count=True)
         if self.raw < 0.0:
             self.n_reverse += 1
-        return {"id_ref": self.raw}
-
-    def flow_path(self, u_dc, vdc_ref):
-        """Positional form used by the construction-time compiled continuous graph."""
-        ff = self.startup.value * self.cfg.id0_export_pu
-        self.error = u_dc - vdc_ref
-        if not self.startup.active:
-            self.raw, derivative = 0.0, 0.0
-        else:
-            self.raw = self.pi(u_dc, vdc_ref, ff)
-            derivative = self.pi.derivative
-        return self.raw, derivative
-
-    def flow_state_bindings(self):
-        return {"integral_pu": (self.pi, "integral")}
+        return {"current_reference": current}
 
     def observe_limit(self, t, intended, output, *, count):
-        """Record whether the controller-owned ``id_ref`` limit was exceeded."""
+        """Record whether the requested current lies outside the configured range."""
         self.limit_exceeded = output != intended
         if count and self.limit_exceeded:
             self.n_limit_exceeded += 1
@@ -1203,24 +1221,6 @@ class _LimitedScalarPI(Loop):
 
     def reset_integrator(self):
         self.pi.reset()
-
-
-@register_loop_type
-class CapacitorVoltageControl(_LimitedScalarPI):
-    """Output-voltage PI in V/A; positive current charges the output capacitor."""
-
-    @dataclass(frozen=True, kw_only=True)
-    class Params(_ScalarPIParams):
-        type: str = "capacitor_voltage_control"
-
-    type = "capacitor_voltage_control"
-    inputs = {"reference": SI_VOLTAGE, "voltage": SI_VOLTAGE}
-    outputs = {"current_reference": SI_CURRENT, "requested_current": SI_CURRENT}
-    flow_inputs = ("reference", "voltage")
-
-    def equation(self, reference, voltage):
-        requested = self.pi(reference, voltage)
-        return self.constrain(requested), requested
 
 
 @register_loop_type

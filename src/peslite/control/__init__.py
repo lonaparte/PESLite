@@ -4,30 +4,31 @@
 interface, the loop network that connects and runs the loops, the gfl/gfm wiring,
 :class:`UniteType`); ``modulation``: the output stage,
 from the voltage command to duty ratios; ``blocks``: transforms, filters and timers they are built of.
-Grid-control signals use pu; scalar converter loops declare SI ports. Time is in s, angles in rad and
-frequencies in rad/s. The controller depends on nothing but the
+Grid-control signals use pu and scalar converter signals use SI; shared scalar loops bind to the
+coordinates of their containing graph. Time is in s, angles in rad and frequencies in rad/s. The controller depends on nothing but the
 solver's kernel: the hardware adapts to its interface (:class:`Measurement`, :class:`ControlOutput`).
 """
 
 from ..solver import ConfigError
 from .blocks import Filter, Integrator, OutputLimit, PI
 from .loops import (ANGLE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES, POWER, PQ, V, V_AB, V_DQ,
-                    DUTY_RATIO, SI_CURRENT, SI_VOLTAGE, CapacitorVoltageControl,
+                    DUTY_RATIO, SI_CURRENT, SI_VOLTAGE, DCVoltageControl,
                     InductorCurrentControl,
                     Loop, SignalType, SyncLaw, register_loop_type)
 from .modulation import ModulationLimiter, OutputStage
 from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, ControlMeasurement,
                          ControlOutput, Controller, Measurement, ScalarControlOutput,
-                         ScalarController, Startup, UniteType, default_wiring,
+                         ResonantController, ScalarController, Startup, UniteType, default_wiring,
                          make_controller)
 
 __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter", "SignalType", "ConfigError",
            "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO",
-           "CapacitorVoltageControl", "InductorCurrentControl",
+           "DCVoltageControl", "InductorCurrentControl",
            "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER", "PQ",
            "LOOP_TYPES", "register_loop_type", "ControlInterface", "CONTROL_INTERFACE",
            "ControlGraph", "default_wiring",
            "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
            "ScalarControlOutput", "Controller", "Startup", "UniteType", "ScalarController",
+           "ResonantController",
            "make_controller"]

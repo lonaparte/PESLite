@@ -34,10 +34,10 @@ __all__ = [
     "ConfigError", "load", "dump", "dumps", "read_tree", "read_initial", "from_dict", "to_dict",
     "BaseValues", "DCBase",
     "BusParams", "BranchParams", "SourceParams",
-    "ACFilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams",
+    "FilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams",
     "MeasurementParams", "ReferenceParams", "ControlParams", "OvercurrentParams", "VoltageLimitParams",
     "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
-    "BridgeParams", "UnitParams",
+    "BridgeParams", "SSLinkParams", "LCCLinkParams", "UnitParams",
     "RUNTIME", "Change", "runtime_changeable", "set_changes",
     "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "ProgressParams",
     "MetaParams", "Params",
@@ -177,14 +177,15 @@ def _scale(expression: str, scales: dict[str, float]) -> float:
 
 @dataclass(frozen=True)
 class BusParams:
-    """AC network node with a shunt capacitor to ground.
+    """Electrical node with a shunt capacitor to ground.
 
-    ``c``: capacitance, F (must be > 0); ``r_d``: series damping resistor, ohm.
-    pu inputs use the system base.
+    ``phases`` is 3 for the peak-scaled AC space-vector domain and 1 for a real scalar domain.
+    ``c`` is capacitance in F and ``r_d`` is series damping resistance in ohm.
     """
 
     c: float
     r_d: float = 0.0
+    phases: int = 3
 
     _quantities = {"c": "capacitance", "r_d": "resistance"}
 
@@ -226,10 +227,10 @@ class SourceParams:
 # ------------------------------------------------------------------ a converter unit
 
 @dataclass(frozen=True)
-class ACFilterParams:
-    """Series R-L branch of the converter's AC filter (``l_f`` H, ``r_f`` ohm).
+class FilterParams:
+    """Series R-L branch at a converter terminal (``l_f`` H, ``r_f`` ohm).
 
-    pu inputs use the unit's AC base. The filter capacitor is set on the bus (:class:`BusParams`).
+    The shunt capacitor is set on the connected bus (:class:`BusParams`).
     """
 
     l_f: float
@@ -434,8 +435,14 @@ class BridgeParams:
     """
 
     model: str = "pwm_averaging"
+    type: Optional[str] = None
+    upper_controlled: bool = True
+    lower_controlled: bool = True
 
-    _choices = {"model": ("switching", "pwm_averaging", "averaging")}
+    _choices = {
+        "model": ("switching", "pwm_averaging", "averaging"),
+        "type": (None, "three_phase_bridge", "half_bridge", "full_bridge"),
+    }
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -452,23 +459,24 @@ class UnitParams:
     """Common converter-unit parameters plus one ``type``-selected field set."""
 
     type: str
-    pwm: PWMParams
-    ctrl: ControlParams
-    bridge: BridgeParams = field(default_factory=BridgeParams)
+    pwm: Optional[PWMParams]
+    ctrl: Optional[ControlParams]
+    bridge: Optional[BridgeParams] = None
     s_base: Optional[float] = None
     _unit_fields: Any = field(repr=False, default=None)
     base: BaseValues = field(init=False, default=None)
     derived_defaults: frozenset = field(init=False, default=frozenset(), compare=False)
     events: tuple = field(init=False, default=(), compare=False)
 
-    def __init__(self, *, type: str, pwm: PWMParams, ctrl: ControlParams,
-                 _unit_fields: Any, bridge: Optional[BridgeParams] = None,
+    def __init__(self, *, type: str, pwm: Optional[PWMParams] = None,
+                 ctrl: Optional[ControlParams] = None, _unit_fields: Any,
+                 bridge: Optional[BridgeParams] = None,
                  s_base: Optional[float] = None, **changes: Any) -> None:
         selected = replace(_unit_fields, **changes) if changes else _unit_fields
         object.__setattr__(self, "type", type)
         object.__setattr__(self, "pwm", pwm)
         object.__setattr__(self, "ctrl", ctrl)
-        object.__setattr__(self, "bridge", BridgeParams() if bridge is None else bridge)
+        object.__setattr__(self, "bridge", bridge if type == "wpt" or bridge is not None else BridgeParams())
         object.__setattr__(self, "s_base", s_base)
         object.__setattr__(self, "_unit_fields", selected)
         object.__setattr__(self, "base", None)
@@ -490,19 +498,27 @@ class UnitParams:
                 None,
                 None,
             )
-        if data.get("type", "vsc") == "dc_converter":
-            voltage = _numeric_string(data.get("source_voltage"))
-            label = "source_voltage"
-        else:
-            dclink = data.get("dclink")
-            voltage = _numeric_string(dclink.get("vdc_ref")) if isinstance(dclink, dict) else None
-            label = "dclink.vdc_ref"
+        kind = data.get("type", "vsc")
+        if kind == "wpt":
+            return base, base.parameter_scales()
+        dclink = data.get("dclink")
+        voltage = _numeric_string(dclink.get("vdc_ref")) if isinstance(dclink, dict) else None
+        label = "dclink.vdc_ref"
         if (isinstance(voltage, bool) or not isinstance(voltage, (int, float))
                 or not math.isfinite(voltage) or voltage <= 0.0):
             raise ConfigError(f"{where}.{label} must be finite and positive")
         return base, base.parameter_scales(float(voltage))
 
     def resolved(self, system_base: BaseValues, events: tuple = ()) -> "UnitParams":
+        if self.type == "wpt":
+            unit = replace(self)
+            base = system_base if self.s_base is None else BaseValues(
+                self.s_base, system_base.v_ll_rms, system_base.f0,
+            )
+            object.__setattr__(unit, "base", base)
+            object.__setattr__(unit, "events", tuple(events))
+            return unit
+        assert self.ctrl is not None and self.pwm is not None and self.bridge is not None
         derived = set()
         ctrl = self.ctrl
         continuous = self.bridge.model == "averaging"
@@ -532,8 +548,9 @@ class UnitParams:
 
     @property
     def dc_base(self) -> DCBase:
-        voltage = self.source_voltage if self.type == "dc_converter" else self.dclink.vdc_ref
-        return self.base.dc(voltage)
+        if self.type == "wpt":
+            raise AttributeError("a composite WPT unit has no single DC base")
+        return self.base.dc(self.dclink.vdc_ref)
 
 
 @dataclass(frozen=True)
@@ -545,7 +562,7 @@ class _VSCUnitFields:
     """
 
     bus: str
-    ac_filter: ACFilterParams
+    ac_filter: FilterParams
     dclink: DCLinkParams
     meas: MeasurementParams = field(default_factory=MeasurementParams)
     protection: ProtectionParams = field(default_factory=ProtectionParams)
@@ -558,22 +575,78 @@ class _ScalarVoltageReferenceFields:
     voltage: float
 
 
+@dataclass(frozen=True)
+class _ResonantReferenceFields:
+    """Open-loop fundamental command for a resonant full bridge."""
+
+    modulation: float
+    frequency: float
+    phase: float = 0.0
+
+
 @dataclass(frozen=True, kw_only=True)
 class _DCConverterUnitFields:
-    """Fields unique to a scalar DC converter circuit.
+    """Fields unique to a scalar converter unit.
 
-    ``topology`` selects the unit-level circuit assembled around a half bridge. Electrical plant
-    values are SI. The unit uses the same bridge simulation forms and solver as an AC unit.
+    A named ``bus`` and series ``filter`` expose the bridge to the point network. Both are
+    omitted only when a composite parent connects the converter port directly to an internal
+    subsystem, as WPT does.
     """
 
-    topology: str
-    source_voltage: float
-    inductance: float
-    capacitance: float
-    load_resistance: float
-    series_resistance: float = 0.0
+    dclink: DCLinkParams
+    bus: Optional[str] = None
+    filter: Optional[FilterParams] = None
 
-    _choices = {"topology": ("buck", "boost", "buck_boost")}
+
+@dataclass(frozen=True, kw_only=True)
+class SSLinkParams:
+    """Series-series compensated two-winding inductive link in SI units."""
+
+    type: str = "ss"
+    primary_inductance: float
+    secondary_inductance: float
+    mutual_inductance: float
+    primary_capacitance: float
+    secondary_capacitance: float
+    primary_resistance: float = 0.0
+    secondary_resistance: float = 0.0
+
+    _choices = {"type": ("ss",)}
+
+
+@dataclass(frozen=True, kw_only=True)
+class LCCLinkParams:
+    """Symmetric-form LCC-LCC compensated two-winding inductive link in SI units.
+
+    Each port has a series compensation inductor, a shunt compensation capacitor and a
+    series coil capacitor.  The two coil inductances are coupled by ``mutual_inductance``.
+    """
+
+    type: str = "lcc"
+    primary_inductance: float
+    secondary_inductance: float
+    mutual_inductance: float
+    primary_series_capacitance: float
+    secondary_series_capacitance: float
+    primary_compensation_inductance: float
+    secondary_compensation_inductance: float
+    primary_parallel_capacitance: float
+    secondary_parallel_capacitance: float
+    primary_resistance: float = 0.0
+    secondary_resistance: float = 0.0
+    primary_compensation_resistance: float = 0.0
+    secondary_compensation_resistance: float = 0.0
+
+    _choices = {"type": ("lcc",)}
+
+
+@dataclass(frozen=True)
+class _WPTUnitFields:
+    """Fields unique to a composite wireless-power-transfer unit."""
+
+    primary: Any
+    secondary: Any
+    link: Any
 
 
 # ------------------------------------------------------------------ the run
@@ -691,12 +764,56 @@ class Params:
                 raise ConfigError(f"this system has {len(self.units)} units {sorted(self.units)}: "
                                   f"name the one you mean")
             name = next(iter(self.units))
-        if name not in self.units:
-            raise ConfigError(f"unknown unit {name!r}; known: {sorted(self.units)}")
-        return self.units[name]
+        if name in self.units:
+            return self.units[name]
+        if name in self.runtime_units:
+            return self.runtime_units[name]
+        known = sorted({*self.units, *self.runtime_units})
+        raise ConfigError(f"unknown unit {name!r}; known: {known}")
+
+    @functools.cached_property
+    def runtime_units(self) -> dict[str, UnitParams]:
+        """Leaf units keyed by their assembled names.
+
+        Composite configuration nodes stay in :attr:`units`; this mapping is the one-time
+        flattened view used by assembly and simulation infrastructure.
+        """
+        out: dict[str, UnitParams] = {}
+
+        def add(path: str, unit: UnitParams) -> None:
+            if unit.type == "wpt":
+                add(f"{path}.primary", unit.primary)
+                add(f"{path}.secondary", unit.secondary)
+            else:
+                out[path] = unit
+
+        for unit_name, unit in self.units.items():
+            add(unit_name, unit)
+        return out
+
+    @functools.cached_property
+    def unit_groups(self) -> dict[str, tuple[str, ...]]:
+        """Composite unit names mapped to their descendant leaf-unit names."""
+        groups: dict[str, tuple[str, ...]] = {}
+
+        def add(path: str, unit: UnitParams) -> tuple[str, ...]:
+            if unit.type != "wpt":
+                return (path,)
+            leaves = (
+                *add(f"{path}.primary", unit.primary),
+                *add(f"{path}.secondary", unit.secondary),
+            )
+            groups[path] = leaves
+            return leaves
+
+        for unit_name, unit in self.units.items():
+            add(unit_name, unit)
+        return groups
 
     def section_of(self, name: str) -> Optional[str]:
         """Return the named section containing ``name``, or ``None``."""
+        if name in self.runtime_units or name in self.unit_groups:
+            return "units"
         return next((section for section in NAMED if name in getattr(self, section)), None)
 
     @functools.cached_property
@@ -751,10 +868,28 @@ def from_dict(data: dict) -> Params:
     """Build, validate and resolve parameters, including every successive ``set`` event."""
     p = _build(Params, _normalize(data), "", None, None)
     validate(p)
-    p = replace(p, units={name: unit.resolved(p.base, events_for(p.events, name))
+    p = replace(p, units={name: _resolve_unit(unit, name, p.base, p.events)
                           for name, unit in p.units.items()})
     p.changes
     return p
+
+
+def _resolve_unit(unit: UnitParams, path: str, system_base: BaseValues,
+                  events: dict[str, Any], inherited: tuple = ()) -> UnitParams:
+    """Resolve one configuration node and pass composite switching commands to its leaves."""
+    own_events = tuple(events_for(events, path))
+    active_events = (*inherited, *own_events)
+    if unit.type != "wpt":
+        return unit.resolved(system_base, active_events)
+    resolved = unit.resolved(system_base, active_events)
+    child_base = resolved.base
+    selected = replace(
+        resolved._unit_fields,
+        primary=_resolve_unit(unit.primary, f"{path}.primary", child_base, events, active_events),
+        secondary=_resolve_unit(unit.secondary, f"{path}.secondary", child_base, events, active_events),
+    )
+    object.__setattr__(resolved, "_unit_fields", selected)
+    return resolved
 
 
 def to_dict(p: Any, derived: bool = False) -> dict:
@@ -764,6 +899,12 @@ def to_dict(p: Any, derived: bool = False) -> dict:
     so rebuilding the mapping derives them from any replacements again.
     """
     if isinstance(p, UnitParams):
+        if p.type == "wpt":
+            return {
+                "type": p.type,
+                **to_dict(p._unit_fields, derived),
+                "s_base": p.s_base,
+            }
         d = {
             "type": p.type,
             **to_dict(p._unit_fields, derived),
@@ -867,7 +1008,11 @@ def _unit_params_class(data: Any, path: str) -> type:
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: expected a mapping, got {type(data).__name__}")
     kind = data.get("type", "vsc")
-    schemas = {"vsc": _VSCUnitFields, "dc_converter": _DCConverterUnitFields}
+    schemas = {
+        "vsc": _VSCUnitFields,
+        "dc_converter": _DCConverterUnitFields,
+        "wpt": _WPTUnitFields,
+    }
     if kind not in schemas:
         raise ConfigError(
             f"{path}.type: unknown unit type {kind!r}; known: {sorted(schemas)}"
@@ -878,11 +1023,12 @@ def _unit_params_class(data: Any, path: str) -> type:
 _CONTROL_REFERENCE_PARAMS = {
     **dict.fromkeys(("gfl", "gfm", "custom"), ReferenceParams),
     "dc": _ScalarVoltageReferenceFields,
+    "resonant": _ResonantReferenceFields,
 }
 
 _UNIT_CONTROL_TYPES = {
     "vsc": frozenset(("gfl", "gfm", "custom")),
-    "dc_converter": frozenset(("dc",)),
+    "dc_converter": frozenset(("dc", "resonant")),
 }
 
 
@@ -917,6 +1063,29 @@ def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
     """Build common unit fields and one explicitly scoped set of unique fields."""
     unit_fields_cls = _unit_params_class(data, path)
     kind = data.get("type", "vsc")
+    if kind == "wpt":
+        known = {"type", "s_base", "primary", "secondary", "link"}
+        unknown = set(data) - known
+        if unknown:
+            raise ConfigError(f"{path}: unknown key(s) {sorted(unknown)}; known: {sorted(known)}")
+        unit_base, _unit_scales = UnitParams._bases(data, base, path)
+        primary = _build_unit_params(data.get("primary"), f"{path}.primary", unit_base)
+        secondary = _build_unit_params(data.get("secondary"), f"{path}.secondary", unit_base)
+        link_data = data.get("link")
+        if not isinstance(link_data, dict):
+            raise ConfigError(f"{path}.link: expected a mapping, got {type(link_data).__name__}")
+        link_type = link_data.get("type")
+        link_schemas = {"ss": SSLinkParams, "lcc": LCCLinkParams}
+        if link_type not in link_schemas:
+            raise ConfigError(
+                f"{path}.link.type: unknown WPT link type {link_type!r}; known: {sorted(link_schemas)}"
+            )
+        link = _build(link_schemas[link_type], link_data, f"{path}.link", unit_base, None)
+        return UnitParams(
+            type=kind,
+            s_base=unit_base.s_base if data.get("s_base") is not None else None,
+            _unit_fields=_WPTUnitFields(primary=primary, secondary=secondary, link=link),
+        )
     common_names = {item.name for item in fields(_UnitCommonFields) if item.init}
     unit_field_names = {item.name for item in fields(unit_fields_cls) if item.init}
     known = {"type", "ctrl", *common_names, *unit_field_names}
@@ -942,11 +1111,16 @@ def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
     control = _build_control_params(
         data.get("ctrl"), f"{path}.ctrl", unit_base, unit_scales, kind
     )
+    bridge_type = common.bridge.type or (
+        "full_bridge"
+        if kind == "dc_converter" and control.type == "resonant"
+        else {"vsc": "three_phase_bridge", "dc_converter": "half_bridge"}[kind]
+    )
     return UnitParams(
         type=kind,
         pwm=common.pwm,
         ctrl=control,
-        bridge=common.bridge,
+        bridge=replace(common.bridge, type=bridge_type),
         s_base=common.s_base,
         _unit_fields=unit_fields,
     )
@@ -1114,7 +1288,12 @@ class Change:
 def runtime_changeable(path: str, p: Params) -> bool:
     """Whether stored parameter ``path`` may be changed by a ``set`` event."""
     section, _, rest = path.partition(".")
-    name, _, rest = rest.partition(".")
+    if section == "units":
+        name = next((candidate for candidate in sorted(p.runtime_units, key=len, reverse=True)
+                     if rest.startswith(candidate + ".")), rest.partition(".")[0])
+        rest = rest[len(name) + 1:]
+    else:
+        name, _, rest = rest.partition(".")
     keys = rest.split(".")
     if section == "buses":
         return keys in (["c"], ["r_d"])
@@ -1279,6 +1458,13 @@ def _written_out(p: Params) -> dict:
     d = to_dict(p, derived=True)
     for name, u in p.units.items():
         unit = d["units"][name]
+        if unit["s_base"] is None:
+            unit["s_base"] = u.base.s_base
+    for name, u in p.runtime_units.items():
+        keys = name.split(".")
+        unit = d["units"][keys[0]]
+        for key in keys[1:]:
+            unit = unit[key]
         if unit["s_base"] is None:
             unit["s_base"] = u.base.s_base
         if "meas" in unit:

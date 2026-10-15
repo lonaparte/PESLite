@@ -25,16 +25,25 @@ When `bridge.model` is omitted, the file default is `pwm_averaging`.
 The models answer different questions. Similar low-frequency trajectories do not make them
 numerically identical.
 
-## Scalar DC converter device placement and DCM
+## Scalar converter ports, device placement and DCM
 
-The scalar Buck, Boost and Buck-Boost circuits configure the device positions through the existing
-`HalfBridge` topology. Buck uses a controlled upper device and a lower diode; Boost and Buck-Boost
-use a controlled lower device and an upper diode. The assembly does not replace that device
-placement with a default fully controlled leg.
+`DCConverter` is an open Unit, not a packaged Buck/Boost circuit. It owns a DC link, a selected
+`half_bridge` or `full_bridge`, its controller and an optional series filter. The common terminal
+contract connects that filter to a named bus. A scalar DC network uses
+`buses.<name>.phases: 1`; the same interface also permits a three-phase point-network connection,
+where the scalar bridge acts on the real stationary axis and has no synchronisation law. Such an
+unsynchronised case is intentionally possible, though it is not a normal grid-control strategy.
+The bus capacitor, load and any further branches remain independent network components. Buck,
+Boost, resonant conversion and similar names describe assembled applications rather than
+additional bridge structures.
 
-`InductorCurrentControl` is topology-independent. The scalar controller boundary derives the
-steady-state duty feedforward from the configured converter topology and supplies it through a
-typed control port, leaving the current loop responsible only for current regulation and limits.
+A half bridge independently declares whether its upper and lower positions are controlled. For a
+diode-bounded Buck application, the upper position is controlled and the lower position is a
+diode. A fully controlled half bridge and a full bridge remain bidirectional.
+
+`InductorCurrentControl` is structure-independent. Its feedforward comes from the selected bridge:
+`u/Vdc` for a half bridge and `(1 + u/Vdc)/2` for a full bridge. The loop itself is responsible only
+for current regulation and limits.
 
 A diode current is unilateral. The dedicated `DiodeConduction` assembly stage owns that device
 behavior; it is not part of RK4, DP45 or another generic integrator. In `switching`, the stage uses
@@ -43,19 +52,16 @@ discharge interval ends at the physical boundary rather than at the end of a num
 Projection remains only a numerical safety net. A fully controlled `HalfBridge` remains capable of
 reverse current and does not receive this boundary handling.
 
-The averaged forms store cycle-mean inductor current, which remains positive in DCM even though the
+The averaged forms store cycle-mean filter current, which remains positive in DCM even though the
 instantaneous current has a zero-current interval. They derive the controlled, diode and idle
-fractions from duty, carrier period, mean current and terminal voltages. Consequently their DCM
-conversion ratio is not forced to the CCM duty-ratio relation. The triangular-ripple approximation
-preserves the low-frequency envelope and mean-square winding loss, but does not reproduce sub-cycle
-ripple or exact switching-transient peaks. State derivatives use the actual total conduction
-fraction, so a DCM interval contributes its physical share of the complete carrier period rather
-than introducing a conditional-time fast pole.
+fractions from duty, carrier period, mean current and the external terminal voltage. The diode law
+belongs to the half bridge while the R-L state remains in the external filter branch. Consequently
+the averaged DCM conversion ratio is not forced to the CCM duty-ratio relation, and no output
+capacitor or load is hidden inside the converter Unit.
 
-For the sampled averaged Buck model, the same diode-conduction stage requests finer local
-resolution only while its operating point is near the DCM boundary. CCM, Boost and Buck-Boost
-retain the configured solver step; continuous averaging relies on the configured adaptive solver
-in the same way as other continuous models.
+For a sampled averaged diode-bounded half bridge, the same diode-conduction stage requests finer
+local resolution only near the DCM boundary. CCM retains the configured solver step; continuous
+averaging relies on the configured adaptive solver in the same way as other continuous models.
 
 ## Switching
 

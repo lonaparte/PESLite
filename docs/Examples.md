@@ -1,6 +1,6 @@
 # Examples
 
-PESLite ships nine simulation files with the Python wheel. They can be run by name from any
+PESLite ships ten simulation files with the Python wheel. They can be run by name from any
 directory, so cloning the repository is not required.
 
 ```bash
@@ -28,6 +28,7 @@ peslite case.pes
 | `gfm-dvoc-example` | Grid-forming dispatchable virtual oscillator control. |
 | `gfm-matching-example` | Matching control coupled to a dynamic dc link and current source. |
 | `two-converters-example` | A GFM and a GFL unit on separate buses, with different ratings and switching frequencies. |
+| `wpt-example` | A composite series-series compensated WPT unit whose independently clocked full-bridge primary and secondary are flattened during assembly. |
 
 The files are also available in the repository's
 [`examples/`](https://github.com/lonaparte/PESLite/tree/main/examples) directory. The root
@@ -48,7 +49,8 @@ They represent different model fidelity and timing semantics; compare quantities
 bandwidth rather than expecting identical switching-scale waveforms. See
 [Converter and Bridge Models](Converter-and-Bridge-Models.md).
 
-The scalar `buck-example` supports the same three bridge-model flags.
+The scalar `buck-example` and both child converters of `wpt-example` support the same three
+bridge-model flags.
 
 ## Short exploratory runs
 

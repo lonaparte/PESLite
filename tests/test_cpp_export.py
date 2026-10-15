@@ -183,22 +183,23 @@ def test_generated_cpp_runs_all_bridge_modes(mode, tmp_path):
     assert max(abs(actual[key] - expected[key]) for key in expected) <= tolerance * scale
 
 
-@pytest.mark.parametrize("topology,source,reference,load", (
-    ("buck", 48.0, 24.0, 6.0),
-    ("buck", 48.0, 24.0, 600.0),
-    ("boost", 24.0, 48.0, 12.0),
-    ("buck_boost", 24.0, 24.0, 6.0),
+@pytest.mark.parametrize("bridge_type,source,reference,load", (
+    ("half_bridge", 48.0, 24.0, 6.0),
+    ("half_bridge", 48.0, 24.0, 600.0),
+    ("full_bridge", 48.0, 12.0, 6.0),
 ))
 @pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
 def test_generated_cpp_uses_public_ports_for_scalar_converters(
-        topology, source, reference, load, mode, tmp_path):
+        bridge_type, source, reference, load, mode, tmp_path):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
     changes = {
-        "units.converter.topology": topology,
-        "units.converter.source_voltage": source,
-        "units.converter.load_resistance": load,
+        "units.converter.bridge.type": bridge_type,
+        "units.converter.bridge.lower_controlled": bridge_type == "full_bridge",
+        "units.converter.dclink.vdc_ref": source,
+        "units.converter.dclink.source.v": source,
+        "elements.load.r": load,
         "units.converter.bridge.model": mode,
         "units.converter.ctrl.references.voltage": reference,
         "simulation.t_end": 0.004,
@@ -214,10 +215,10 @@ def test_generated_cpp_uses_public_ports_for_scalar_converters(
             "simulation.solver.max_step": 1e-4,
         })
     params = peslite.load(EXAMPLES / "buck-example.pes").replace(**changes)
-    project = tmp_path / f"{topology}-{mode}"
+    project = tmp_path / f"{bridge_type}-{mode}"
     source_path, cpp_out, python_out = _run_generated(params, project, compiler)
     source = source_path.read_text(encoding="utf-8")
-    has_diode_stage = mode == "switching" or (mode == "pwm_averaging" and topology == "buck")
+    has_diode_stage = bridge_type == "half_bridge"
     assert ("class DiodeConduction" in source) is has_diode_stage
     assert ("diode_conduction.advance(t, boundary)" in source) is has_diode_stage
 
@@ -226,7 +227,10 @@ def test_generated_cpp_uses_public_ports_for_scalar_converters(
     assert actual.keys() == expected.keys()
     assert _summary(cpp_out).keys() == _summary(python_out).keys()
     scale = max(1.0, max(abs(value) for value in expected.values()))
-    assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * scale
+    # Repeated light-load diode zero crossings are independently root-located by the two
+    # runtimes; their accumulated difference remains below six parts per million.
+    tolerance = 6e-6 if bridge_type == "half_bridge" and load >= 600.0 else 2e-8
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= tolerance * scale
 
 
 @pytest.mark.parametrize("mode", ("switching", "pwm_averaging"))
@@ -236,7 +240,7 @@ def test_generated_cpp_matches_python_for_adaptive_dcm(mode, tmp_path):
         pytest.skip("no C++17 compiler installed")
     params = peslite.load(EXAMPLES / "buck-example.pes").replace(**{
         "units.converter.bridge.model": mode,
-        "units.converter.load_resistance": 600.0,
+        "elements.load.r": 600.0,
         "simulation.solver.type": "adaptive",
         "simulation.solver.method": "DP45",
         "simulation.solver.max_step": 1e-4,

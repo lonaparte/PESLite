@@ -67,10 +67,10 @@ def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
             prefix = f"{head}." if head else ""
             for phase, phase_value in zip("abc", complex2abc(complex(value))):
                 row[f"{prefix}{stem}_{phase}"] = float(phase_value)
-        elif not ((head in params.units and what in ("u_dc", "i_dc"))
+        elif not ((head in params.runtime_units and what in ("u_dc", "i_dc"))
                   or (head in params.sources and what == "angle")):
             row[key] = float(value)
-    for name in params.units:
+    for name in params.runtime_units:
         for what in ("u_dc", "i_dc"):
             key = f"{name}.{what}"
             if key in plant:
@@ -271,7 +271,7 @@ class Recorder:
         if out_dir is not None:
             out_dir.mkdir(parents=True, exist_ok=True)
             names = ["states.csv", "plant.csv", "energy.csv", "summary.json", "simulation.pes",
-                     *(f"ctrl.{unit}.csv" for unit in params.units)]
+                     *(f"ctrl.{unit}.csv" for unit in params.runtime_units)]
             for name in names:
                 (out_dir / name).unlink(missing_ok=True)
         self._plant = (_CSVTable(out_dir / "plant.csv", batch_rows)
@@ -391,7 +391,7 @@ class Simulation:
         if solver is not None:
             given["solver"] = solver
         known = {"system", "solver"}
-        for name in p.units:
+        for name in {*p.units, *p.runtime_units}:
             known |= {name, f"{name}.ctrl", f"{name}.modulator"}
         for label, what in (("parts", self._factories), ("instances", given)):
             unknown = set(what) - known
@@ -403,7 +403,7 @@ class Simulation:
         self._rebuildable = not given
 
         unit_parts = {}
-        for name, cfg in p.units.items():
+        for name, cfg in p.runtime_units.items():
             for key in (name, f"{name}.ctrl", f"{name}.modulator"):
                 if key in self._factories:
                     unit_parts[key] = self._factories[key](cfg)
@@ -452,8 +452,20 @@ class Simulation:
 
     def unit(self, name: Optional[str] = None) -> Unit:
         """Return the named unit, or the only unit when ``name`` is omitted."""
-        self.p.unit(name)  # checks the name
-        return self.system.units[name if name is not None else next(iter(self.p.units))]
+        if name is None:
+            if len(self.system.units) != 1:
+                raise ConfigError(
+                    f"this system has {len(self.system.units)} runtime units "
+                    f"{sorted(self.system.units)}: name the one you mean"
+                )
+            name = next(iter(self.system.units))
+        if name not in self.system.units:
+            if name in self.p.unit_groups:
+                raise ConfigError(
+                    f"unit {name!r} is composite; choose one of {list(self.p.unit_groups[name])}"
+                )
+            raise ConfigError(f"unknown runtime unit {name!r}; known: {sorted(self.system.units)}")
+        return self.system.units[name]
 
     def export(self, format: str, out_dir: str | Path | None = None, *, name: str = "run",
                variables=()):
@@ -480,10 +492,11 @@ class Simulation:
         """Return a function giving the rated (effort, flow) of a storage, or ``None``."""
         base = self.p.base
         system_ac = (base.v_phase_peak, base.i_phase_peak)
-        units = self.p.units
+        units = self.p.runtime_units
 
         def rating(name: str, storage: Any) -> Optional[tuple[float, float]]:
-            cfg = units.get(name.partition(".")[0])
+            cfg = next((value for unit_name, value in sorted(units.items(), key=lambda item: len(item[0]), reverse=True)
+                        if name == unit_name or name.startswith(unit_name + ".")), None)
             if storage.scale == 1.0:  # dc quantities: that unit's dc base
                 if cfg is None:
                     return None
@@ -506,8 +519,11 @@ class Simulation:
         hold = None
         if hasattr(solver, "window") and hasattr(solver, "dt"):
             hold = {"step": solver.dt, "window": solver.window}
-        zoh = {unit.zoh: 0.7 + 0.2j for unit in self.system.units.values()
-               if not getattr(unit, "continuous", False)}
+        zoh = {
+            unit.zoh: (0.7 + 0.2j if isinstance(unit.bridge.topology.zero, complex) else 0.7)
+            for unit in self.system.units.values()
+            if not getattr(unit, "continuous", False)
+        }
         self.ph_report = report = model.ph_report(zoh=zoh, groups=groups, hold=hold)
         problems = list(report.problems)
         if report.defaulted:
@@ -1290,7 +1306,7 @@ def main(argv=None) -> int:
               ("averaging", "adaptive", "DP45") if args.averaging else None)
     if preset is not None:
         model, solver_type, method = preset
-        changes = {f"units.{name}.bridge.model": model for name in p.units
+        changes = {f"units.{name}.bridge.model": model for name in p.runtime_units
                    if f"units.{name}.bridge.model" not in set_overrides}
         if not _solver_choice_is_set(set_overrides):
             changes.update({
@@ -1331,7 +1347,7 @@ def main(argv=None) -> int:
         return 0
     units = ", ".join(f"{n} ({u.ctrl.type}, {u.bridge.model.replace('_', ' ')}, "
                       f"{sim.units[n].bridge.describe()})"
-                      for n, u in p.units.items())
+                      for n, u in p.runtime_units.items())
     print(f"peslite: {config}  units={units}  "
           f"solver={p.simulation.solver.type}/{p.simulation.solver.method}  "
           f"t = {p.simulation.initial.t} .. {p.simulation.t_end} s  "
@@ -1344,7 +1360,7 @@ def main(argv=None) -> int:
     s = r.summary
     print(f"done: wall {r.wall_time:.1f} s, rhs evaluations {r.n_rhs}, stop at {s.get('t_stop', 0):.4f} s, "
           f"tripped={bool(s.get('tripped'))}")
-    for name in p.units:
+    for name in p.runtime_units:
         print(f"  {name}: max |i| = {s.get(f'{name}.max_current_pu', 0):.4f} pu, "
               f"trip: {s.get(f'{name}.trip_cause') or 'none'}, "
               f"alarms: {', '.join(s.get(f'{name}.alarms') or []) or 'none'}")

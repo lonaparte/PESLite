@@ -45,7 +45,7 @@ def benchmark_cpp_export(config: str | Path, work: str | Path, *,
         solver = ("adaptive", "DP45") if mode == "averaging" else ("fixed", "rk4")
         loaded = peslite.load(config)
         changes = {
-            **{f"units.{name}.bridge.model": mode for name in loaded.units},
+            **{f"units.{name}.bridge.model": mode for name in loaded.runtime_units},
             "simulation.solver.type": solver[0], "simulation.solver.method": solver[1],
             "simulation.solver.subsystems": {}, "simulation.progress.enable": 0,
         }

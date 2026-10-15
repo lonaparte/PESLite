@@ -204,7 +204,7 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
         "units.vsc.dclink.source.i_pu": 0.5,
         "units.vsc.ctrl.references.p_ref_pu": 0.4,
         "units.vsc.ctrl.loops.pll.kp_pu": 10.0,
-        "units.vsc.ctrl.loops.dvc.kp_pu": 0.4,
+        "units.vsc.ctrl.loops.dvc.kp": 0.4,
         "units.vsc.protection.hold": 0.01,
         "units.vsc.protection.rocof.window": 0.2,
     }}
@@ -253,8 +253,9 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     assert pll.integral == pytest.approx(0.3)
     assert pll.theta == pytest.approx(1.2 + pll.T * (pll.w0 + pll.ki * 0.3))
     dvc = unit.ctrl.graph.nodes["dvc"]
-    assert dvc is not old_dvc and dvc.kp == 0.4 and dvc.integral == 0.2
-    assert (dvc.n_updates, dvc.n_limit_exceeded, dvc.n_reverse, dvc.first_limit_t) == (6, 3, 1, 4e-4)
+    assert dvc is not old_dvc and dvc.cfg.kp == 0.4 and dvc.kp == -0.4
+    assert dvc.integral == 0.2
+    assert (dvc.n_updates, dvc.n_limit_exceeded, dvc.n_reverse, dvc.first_limit_t) == (6, 3, 2, 4e-4)
     assert unit.ctrl.graph.references["p_ref_pu"] == 0.4
 
     specs = system.model.energy_specs
@@ -269,7 +270,7 @@ def test_continuous_controller_retune_rebinds_its_ode_states(tmp_path):
     tree["events"]["connect_vsc"].update(t=0.0, ramp=0.0)
     tree["events"]["retune"] = {"type": "set", "t": 1e-4, "set": {
         "units.vsc.ctrl.loops.pll.kp_pu": 10.0,
-        "units.vsc.ctrl.loops.dvc.kp_pu": 0.4,
+        "units.vsc.ctrl.loops.dvc.kp": 0.4,
     }}
     tree["simulation"].update(t_end=2e-4, energy_check="off")
     tree["simulation"]["progress"] = {"enable": 0}
@@ -278,5 +279,5 @@ def test_continuous_controller_retune_rebinds_its_ode_states(tmp_path):
     result = simulation.run(out_dir=tmp_path)
 
     assert simulation.unit().ctrl.graph.nodes["pll"].kp == 10.0
-    assert simulation.unit().ctrl.graph.nodes["dvc"].kp == 0.4
+    assert simulation.unit().ctrl.graph.nodes["dvc"].kp == -0.4
     assert all(np.isfinite(values[-1]) for values in result.states.values())

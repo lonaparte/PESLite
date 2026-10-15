@@ -14,6 +14,7 @@ base:                      # system base
 
 buses:                     # ac nodes; every bus needs a shunt capacitor
   pcc:
+    # phases: 3             # 3: AC space vector (default), 1: real scalar bus
     c_pu: 0.02             # shunt capacitor, pu susceptance at f0
     r_d_pu: 0.5            # damping resistor in series with it
 
@@ -63,7 +64,11 @@ units:                     # converters, one entry each
       # sync: asynchronous # asynchronous | synchronous (carrier locked to the controller angle)
       # carrier_phase: 0.0 # carrier position at t = 0, in periods
 
-    # bridge: {model: pwm_averaging}  # pwm_averaging (default) | averaging | switching
+    # bridge:
+    #   model: pwm_averaging       # pwm_averaging (default) | averaging | switching
+    #   type: three_phase_bridge   # inferred from the unit/control; scalar: half_bridge | full_bridge
+    #   upper_controlled: 1        # half-bridge device placement; ignored by three/full bridges
+    #   lower_controlled: 1
     #                              # CLI: --averaging | --pwm-averaging | --switching
 
     ctrl:
@@ -84,14 +89,15 @@ units:                     # converters, one entry each
           # feedforward: 1
           # antiwindup: 1     # tracking anti-windup after controller output limiting
         dvc:
-          type: dc_voltage_pi
-          kp_pu: 0.8
-          ki_pu: 90.0
-          limit_pu: 1.15
-          id0_export_pu: 0.9 # feed-forward, raised with the start-up
-          # bidirectional: 0
+          type: dc_voltage_control
+          kp: 0.8
+          ki: 90.0
+          minimum: 0.0
+          maximum: 1.15
+          feedforward: 0.9 # current feed-forward, raised with the start-up
+          output_polarity: -1.0 # positive d-axis export current lowers the DC-link voltage
           # antiwindup: 1
-      # connections: {cc.id_ref: dvc.id_ref}   # input port -> output port, over the default wiring
+      # connections: {cc.id_ref: dvc.current_reference} # input port -> output port
       # outputs: {u_dq: cc.u_dq, theta: pll.theta, omega: pll.omega}
       # references:        # constant inputs, pu on this unit's base
       #   id_ref_pu: 0.0

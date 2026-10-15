@@ -19,7 +19,8 @@ from .pwm import TIME_EPS, Modulator, PWM, ZOH, make_modulator
 
 __all__ = ["ThreePhaseBridge", "SwitchingBridge", "PWMBridge", "AveragingBridge",
            "HalfBridge", "FullBridge", "DeviceParameters", "DCLink", "DCCapacitor",
-           "DCCurrentSource", "DCVoltageSource", "make_bridge", "make_dclink"]
+           "DCCurrentSource", "DCVoltageSource", "HalfBridgeDiodeConduction",
+           "make_bridge", "make_dclink"]
 
 
 class _BridgeInp(Bag):
@@ -35,7 +36,7 @@ def _set_three_phase_dc_current(bridge, _t: float) -> None:
 
 
 def _set_scalar_dc_current(bridge, _t: float) -> None:
-    bridge.out.i_dc = (bridge.inp.q * bridge.inp.i_c).real
+    bridge.out.i_dc = bridge.topology.power_scale * (bridge.inp.q * bridge.inp.i_c).real
 
 
 class ThreePhaseBridge:
@@ -318,7 +319,7 @@ class HalfBridge:
     duty_names = ("d",)
     zero = 0.0
     set_dc_current = staticmethod(_set_scalar_dc_current)
-    __slots__ = ("devices", "_gate_mask")
+    __slots__ = ("devices", "_gate_mask", "power_scale")
 
     @staticmethod
     def switching_state(states) -> float:
@@ -334,7 +335,8 @@ class HalfBridge:
 
     def __init__(self, devices: DeviceParameters | None = None, *,
                  upper_controlled: bool = True,
-                 lower_controlled: bool = True) -> None:
+                 lower_controlled: bool = True,
+                 power_scale: float = 1.0) -> None:
         if type(upper_controlled) is not bool or type(lower_controlled) is not bool:
             raise TypeError("controlled-device flags must be bool")
         if not upper_controlled and not lower_controlled:
@@ -342,6 +344,9 @@ class HalfBridge:
         self.devices = devices or DeviceParameters()
         if not isinstance(self.devices, DeviceParameters):
             raise TypeError("devices must be DeviceParameters")
+        if power_scale not in (1.0, 1.5):
+            raise ValueError("scalar bridge power scale must be 1.0 or 1.5")
+        self.power_scale = power_scale
         self._gate_mask = int(upper_controlled) | (int(lower_controlled) << 1)
 
     @property
@@ -434,6 +439,48 @@ class HalfBridge:
         )
 
 
+class HalfBridgeDiodeConduction:
+    """Cycle-averaged diode conduction law for an external scalar filter branch.
+
+    The branch continues to own only its R-L state. This object supplies the half-bridge's
+    within-cycle controlled, diode and idle fractions when a sampled or continuous averaged
+    bridge enters DCM naturally.
+    """
+
+    def __init__(self, switching_period: float) -> None:
+        self.period = switching_period
+
+    def fractions(self, branch) -> tuple[float, float, float, float]:
+        duty = branch.inp.q
+        current = max(0.0, branch.state.i)
+        if duty <= 0.0 or duty >= 1.0:
+            return duty, 1.0 - duty, 1.0, 1.0
+        bias = branch.inp.u_dc - branch.inp.u2
+        denominator = 2.0 * branch.L + branch.R * duty * self.period
+        critical = duty * self.period * bias / denominator if bias > 0.0 else 0.0
+        if critical <= 0.0 or current >= critical:
+            return duty, 1.0 - duty, 1.0, 1.0
+        total = max(duty, current / critical)
+        diode = max(0.0, total - duty)
+        rms = 4.0 / (3.0 * total)
+        return duty / total, diode / total, total, rms
+
+    def derivative(self, branch) -> float:
+        current = max(0.0, branch.state.i)
+        controlled, _diode, total, rms = self.fractions(branch)
+        derivative = total * (
+            controlled * branch.inp.u_dc - branch.inp.u2 - branch.R * rms * current
+        ) / branch.L
+        return max(0.0, derivative) if current == 0.0 else derivative
+
+    def maximum_step(self, branch) -> float:
+        _controlled, _diode, total, _rms = self.fractions(branch)
+        return self.period / 10.0 if total < 1.0 else math.inf
+
+    def resistance_factor(self, branch) -> float:
+        return self.fractions(branch)[3]
+
+
 @dataclass(frozen=True, slots=True)
 class _FullBridgeResult:
     voltage: float
@@ -451,7 +498,7 @@ class FullBridge:
     duty_names = ("d_left", "d_right")
     zero = 0.0
     set_dc_current = staticmethod(_set_scalar_dc_current)
-    __slots__ = ("left", "right", "devices")
+    __slots__ = ("left", "right", "devices", "power_scale")
 
     gates = {
         "positive": (1, 0, 0, 1),
@@ -476,10 +523,14 @@ class FullBridge:
         duty = output.duty
         return duty, 1.0 - duty
 
-    def __init__(self, devices: DeviceParameters | None = None) -> None:
+    def __init__(self, devices: DeviceParameters | None = None, *,
+                 power_scale: float = 1.0) -> None:
         self.left = HalfBridge(devices)
         self.right = HalfBridge(self.left.devices)
         self.devices = self.left.devices
+        if power_scale not in (1.0, 1.5):
+            raise ValueError("scalar bridge power scale must be 1.0 or 1.5")
+        self.power_scale = power_scale
 
     def _gates(self, gates) -> tuple[int, int, int, int]:
         if isinstance(gates, str):

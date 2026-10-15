@@ -31,11 +31,20 @@ ctrl:
   period: 50e-6
   loops:
     current: {type: dq_current_pi, period: 50e-6}
-    dc_voltage: {type: dc_voltage_pi, period: 500e-6}
+    dc_voltage: {type: dc_voltage_control, period: 500e-6}
 ```
 
 A loop period must be an integer multiple of `ctrl.period`. If omitted, it inherits the controller
 period. Loop state is preserved when run-time parameter changes rebuild a loop.
+
+`DCVoltageControl` is the common voltage-to-current loop for VSC and DCConverter control graphs.
+Its error is always `reference - voltage`, and its output is `current_reference`. Parameters use
+the coordinates of the containing controller graph: per-unit values in a VSC graph and SI values
+in a scalar DC graph. `output_polarity` describes the plant direction. It is `+1` when positive
+commanded current charges the controlled capacitor and `-1` when positive commanded current draws
+energy from it, as with the VSC convention that positive d-axis current exports power. A DCConverter
+normally sends the result to `InductorCurrentControl`; a VSC sends it to the d-axis input of
+`CurrentLoop`.
 
 ## ADC sampling
 

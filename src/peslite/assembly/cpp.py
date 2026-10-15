@@ -24,7 +24,7 @@ from ..components.network import RCNode, RLBranch, ThreePhaseSource
 from ..components.pwm import CarrierComparison, SynchronousCarrier, ZOH
 from ..control.blocks import OutputLimit
 from ..control.controller import UniteType
-from ..control.loops import (ActiveDamping, CurrentLoop, DCLinkVoltageLoop, Droop, DVOC,
+from ..control.loops import (ActiveDamping, CurrentLoop, DCVoltageControl, Droop, DVOC,
                              Matching, PowerLoop, PSC, SRFPLL, SyncLaw, UnitDelay,
                              VirtualAdmittance, VirtualImpedance, VSG)
 from .conduction import DiodeConduction
@@ -560,7 +560,10 @@ class _ModelGenerator:
 
     def trace_element_values(self, element: Any, read: Any) -> dict[str, _Expression]:
         """Trace values returned by an assembly object from its subsystem records."""
-        subsystems = tuple(element.subsystems().values())
+        # An assembly object's public boundary may read a connected network subsystem which it
+        # does not own (for example a converter reads its terminal bus voltage). Rebind every
+        # assembled record so this generic tracing path follows those references as well.
+        subsystems = tuple(self.model.subsystems)
 
         def run():
             saved: list[tuple[Any, str, Any]] = []
@@ -758,9 +761,26 @@ class _ModelGenerator:
         state, inp, out = sub.state, sub.inp, sub.out
         if isinstance(sub, RLBranch):
             i = self.value(state, "i")
-            derivative = (f"(breaker_open_{self.prefix[id(sub)]} ? Complex{{0.0, 0.0}} : "
-                          f"({self.value(inp, 'u1')} - {self.value(inp, 'u2')} - "
-                          f"{_number(sub.R)} * {i}) / {_number(sub.L)})")
+            zero = ("Complex{0.0, 0.0}"
+                    if self.record_types[id(state), "i"] == "Complex" else "0.0")
+            raw = (f"({self.value(inp, 'u1')} - {self.value(inp, 'u2')} - "
+                   f"{_number(sub.R)} * {i}) / {_number(sub.L)}")
+            if sub.conduction is not None:
+                duty = self.value(inp, "q")
+                voltage = self.value(inp, "u2")
+                dc_voltage = self.value(inp, "u_dc")
+                period = _number(sub.conduction.period)
+                critical = (f"({duty} * {period} * ({dc_voltage} - {voltage}) / "
+                            f"(2.0 * {_number(sub.L)} + {_number(sub.R)} * {duty} * {period}))")
+                total = f"std::max({duty}, {i} / ({critical}))"
+                dcm = (f"({duty} * {dc_voltage} - ({total}) * {voltage} - "
+                       f"{_number(4.0 * sub.R / 3.0)} * {i}) / {_number(sub.L)}")
+                in_dcm = (f"({duty} > 0.0 && {duty} < 1.0 && "
+                          f"{dc_voltage} > {voltage} && {i} < ({critical}))")
+                raw = f"({in_dcm} ? ({dcm}) : ({raw}))"
+            if sub.unilateral:
+                raw = f"(({i} <= 0.0 && ({raw}) < 0.0) ? 0.0 : ({raw}))"
+            derivative = f"(breaker_open_{self.prefix[id(sub)]} ? {zero} : ({raw}))"
             return [derivative]
         if isinstance(sub, RCNode):
             return [f"{self.value(inp, 'i')} / {_number(sub.C)}"]
@@ -870,16 +890,20 @@ class _ModelGenerator:
             assigns.append(f"{member} = {expression};")
 
         for name, node in self.system.buses.items():
-            add(f"{name}.u", self.value(node.out, "u"), "Complex")
+            add(f"{name}.u", self.value(node.out, "u"),
+                self.record_types[id(node.out), "u"])
         for name, branch in self.system.branches.items():
-            add(f"{name}.i", self.value(branch.out, "i"), "Complex")
+            add(f"{name}.i", self.value(branch.out, "i"),
+                self.record_types[id(branch.out), "i"])
         for name, source in self.system.sources.items():
             add(f"{name}.i", self.value(source.branch.out, "i"), "Complex")
             add(f"{name}.angle", self.value(source.emf.out, "phi"), "double")
         for name, unit in self.system.units.items():
-            if hasattr(unit, "branch_f") and hasattr(unit, "dclink"):
-                add(f"{name}.i_c", self.value(unit.branch_f.out, "i"), "Complex")
-                add(f"{name}.u_g", self.value(unit.bus.out, "u"), "Complex")
+            if getattr(unit, "branch_f", None) is not None and hasattr(unit, "dclink"):
+                add(f"{name}.i_c", self.value(unit.branch_f.out, "i"),
+                    self.record_types[id(unit.branch_f.out), "i"])
+                add(f"{name}.u_g", self.value(unit.bus.out, "u"),
+                    self.record_types[id(unit.bus.out), "u"])
                 add(f"{name}.u_dc", self.value(unit.dclink.out, "u_dc"), "double")
                 add(f"{name}.i_dc", self.value(unit.dclink.inp, "i_dc"), "double")
             else:
@@ -1197,7 +1221,7 @@ class _ACControlGenerator(_ProtectionGenerator, _ControlGenerator):
                 f'{stream} << {self.m("mod_first_t")}; else {stream} << "null";',
             ]
         dc_entry = next(((loop_name, node) for loop_name, node in self.graph.nodes.items()
-                         if isinstance(node, DCLinkVoltageLoop)), None)
+                         if isinstance(node, DCVoltageControl)), None)
         if dc_entry is not None:
             loop_name, _node = dc_entry
             if self.unit.continuous:
@@ -1283,12 +1307,13 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         for loop_name, node in self.graph.nodes.items():
             if isinstance(node, SyncLaw):
                 lines.append(f"double {self.m(loop_name + '_v_mag')} = {_number(node.v_mag)};")
-            elif isinstance(node, DCLinkVoltageLoop):
+            elif isinstance(node, DCVoltageControl):
                 lines += [
                     f"std::size_t {self.m(loop_name + '_limit_checks')} = {int(node.n_updates)};",
                     f"std::size_t {self.m(loop_name + '_limit_exceeded')} = {int(node.n_limit_exceeded)};",
                     f"double {self.m(loop_name + '_limit_first_t')} = "
                     f"{_number(node.first_limit_t if node.first_limit_t is not None else math.nan)};",
+                    f"bool {self.m(loop_name + '_limit_active')} = false;",
                 ]
         return lines
 
@@ -1296,17 +1321,15 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         """Observe ideal-controller limits once per output snapshot, outside the RHS."""
         lines: list[str] = []
         for loop_name, node in self.graph.nodes.items():
-            if not isinstance(node, DCLinkVoltageLoop):
+            if not isinstance(node, DCVoltageControl):
                 continue
-            # Graph values are local to evaluate(); the snapshot runs after sync(), where the
-            # controller's persisted log value is the same current reference.
-            value = self.m("log_id_ref_pu")
             checks = self.m(loop_name + "_limit_checks")
             exceeded = self.m(loop_name + "_limit_exceeded")
             first = self.m(loop_name + "_limit_first_t")
+            active = self.m(loop_name + "_limit_active")
             lines += [
                 f"++{checks};",
-                f"if ({value} < {_number(node.floor)} || {value} > {_number(node.limit)}) {{",
+                f"if ({active}) {{",
                 f"    ++{exceeded};",
                 f"    if (!std::isfinite({first})) {first} = t;",
                 f"    alarm_{self.tag}(\"ID_REF_LIMIT\");",
@@ -1433,14 +1456,21 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
             body += [f"{g(name + '.extra')} = {inp(name, 'extra')};",
                      f"{g(name + '.u_dq')} = feedforward + {_number(node.kp)} * error + {_number(node.ki)} * {integral};",
                      f"{deriv(name, 'integral_pu')} = error;"]
-        elif isinstance(node, DCLinkVoltageLoop):
-            integral = state(name, "integral_pu")
-            error = f"({inp(name, 'u_dc')} - {inp(name, 'vdc_ref')})"
-            raw = (f"({self.m('startup_run')} ? ({self.m('startup_value')} * {_number(node.cfg.id0_export_pu)} + "
+        elif isinstance(node, DCVoltageControl):
+            integral = state(name, "integral")
+            error = f"({inp(name, 'reference')} - {inp(name, 'voltage')})"
+            raw = (f"({self.m('startup_run')} ? ({self.m('startup_value')} * {_number(node.cfg.feedforward)} + "
                    f"{_number(node.kp)} * error + {_number(node.ki)} * {integral}) : 0.0)")
+            value = f"std::clamp(raw, {_number(node.minimum)}, {_number(node.maximum)})"
+            derivative = f"({self.m('startup_run')} ? error : 0.0)"
             body = [f"const double error = {error};", f"const double raw = {raw};",
-                    f"{g(name + '.id_ref')} = raw;",
-                    f"{deriv(name, 'integral_pu')} = {self.m('startup_run')} ? error : 0.0;"]
+                    f"const double value = {value};",
+                    f"{self.m(name + '_limit_active')} = value != raw;",
+                    f"{g(name + '.current_reference')} = value;",
+                    ]
+            if node.antiwindup:
+                derivative = f"({derivative} + (value != raw ? (value - raw) / {_number(node.kp)} : 0.0))"
+            body.append(f"{deriv(name, 'integral')} = {derivative};")
         elif isinstance(node, PowerLoop):
             power = f"({inp(name, 'v')} * std::conj({inp(name, 'i')}))"
             if node.bandwidth > 0.0:
@@ -1552,8 +1582,8 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
                     reset.append(("integral_pu", False))
                 elif isinstance(node, CurrentLoop):
                     reset.append(("integral_pu", True))
-                elif isinstance(node, DCLinkVoltageLoop):
-                    reset.append(("integral_pu", False))
+                elif isinstance(node, DCVoltageControl):
+                    reset.append(("integral", False))
                 elif isinstance(node, PSC):
                     reset.append(("v_int_pu", False))
                 for local, complex_value in reset:
@@ -1724,7 +1754,7 @@ class _UnitGenerator(_ACControlGenerator):
                     lines.append(f"double {self.node(loop_name, 'u_g')} = {_number(node.u_g)};")
             elif isinstance(node, CurrentLoop):
                 lines.append(f"Complex {self.node(loop_name, 'integral')} = {_complex(node.integral)};")
-            elif isinstance(node, DCLinkVoltageLoop):
+            elif isinstance(node, DCVoltageControl):
                 lines += [f"double {self.node(loop_name, 'integral')} = {_number(node.integral)};",
                           f"bool {self.node(loop_name, 'limit_exceeded')} = {'true' if node.limit_exceeded else 'false'};",
                           f"std::size_t {self.node(loop_name, 'n_updates')} = {int(node.n_updates)};",
@@ -1816,8 +1846,8 @@ class _UnitGenerator(_ACControlGenerator):
                         return self.node(loop_name, aliases[public])
                 if isinstance(node, CurrentLoop) and public == "integral_pu":
                     return self.node(loop_name, "integral")
-                if isinstance(node, DCLinkVoltageLoop):
-                    if public == "integral_pu":
+                if isinstance(node, DCVoltageControl):
+                    if public == "integral":
                         return self.node(loop_name, "integral")
                 if isinstance(node, PowerLoop) and public in ("p_pu", "q_pu"):
                     return self.node(loop_name, public[0])
@@ -1899,24 +1929,24 @@ class _UnitGenerator(_ACControlGenerator):
                      f"{g(loop_name + '.extra')} = -{_number(node.r_a)} * (current - low_filtered);"]
         elif isinstance(node, CurrentLoop):
             body += self._current_loop(loop_name, node)
-        elif isinstance(node, DCLinkVoltageLoop):
+        elif isinstance(node, DCVoltageControl):
             integral = m(loop_name, "integral")
             exceeded = m(loop_name, "limit_exceeded")
-            ff = f"{self.m('startup_value')} * {_number(node.cfg.id0_export_pu)}"
-            body += [f"const double error = {inp(loop_name, 'u_dc')} - {inp(loop_name, 'vdc_ref')};",
+            ff = f"{self.m('startup_value')} * {_number(node.cfg.feedforward)}"
+            body += [f"const double error = {inp(loop_name, 'reference')} - {inp(loop_name, 'voltage')};",
                      f"double integrated = {integral};",
                      f"if ({self.m('startup_run')}) {{",
                      f"    integrated += {_number(0.5 * node.T)} * error;",
                      f"    {integral} += {_number(node.T)} * error;",
                      f"}}",
                      f"const double raw = {self.m('startup_run')} ? ({ff} + {_number(node.kp)} * error + {_number(node.ki)} * integrated) : 0.0;",
-                     f"const double value = std::clamp(raw, {_number(node.floor)}, {_number(node.limit)});",
+                     f"const double value = std::clamp(raw, {_number(node.minimum)}, {_number(node.maximum)});",
                      f"{exceeded} = value != raw;",
                      *([f"if ({exceeded}) {integral} += {_number(node.T / node.kp)} * (value - raw);"]
                        if node.antiwindup else []),
                      f"++{m(loop_name, 'n_updates')};",
                      f"if ({exceeded}) {{ ++{m(loop_name, 'n_limit_exceeded')}; if (!std::isfinite({m(loop_name, 'first_limit_t')})) {m(loop_name, 'first_limit_t')} = t; }}",
-                     f"{g(loop_name + '.id_ref')} = value;"]
+                     f"{g(loop_name + '.current_reference')} = value;"]
         elif isinstance(node, VirtualAdmittance):
             state = m(loop_name, "i_ref")
             voltage = self._complex_rotate(inp(loop_name, "v"), inp(loop_name, "frame"))
@@ -2313,7 +2343,7 @@ class _UnitGenerator(_ACControlGenerator):
                 lines.append(f"{self.node(name, 'integral')} = 0.0;")
             elif isinstance(node, CurrentLoop):
                 lines.append(f"{self.node(name, 'integral')} = Complex{{0.0, 0.0}};")
-            elif isinstance(node, DCLinkVoltageLoop):
+            elif isinstance(node, DCVoltageControl):
                 lines += [f"{self.node(name, 'integral')} = 0.0;",
                           f"{self.node(name, 'limit_exceeded')} = false;"]
             elif isinstance(node, PSC):
@@ -2386,6 +2416,11 @@ class _GraphUnitGenerator(_ControlGenerator):
 
     def _clone_loop(self, loop_name: str, node: Any) -> Any:
         clone = copy.copy(node)
+        if node.startup is not None:
+            startup = copy.copy(node.startup)
+            startup.run = _Expression(self.m("startup_run"), "bool")
+            startup.value = _Expression(self.m("startup_value"), "real")
+            clone.startup = startup
         blocks: dict[int, Any] = {}
         cloned_blocks: dict[str, Any] = {}
         for block_name, block in node._state_blocks.items():
@@ -2480,7 +2515,10 @@ class _GraphUnitGenerator(_ControlGenerator):
         lines += [f"double {self.m('maximum_' + key)} = {_number(initial)};"
                   for key, (_port, _scale, initial) in self.maxima.items()]
         if self.continuous:
-            lines.append(f"double {self.m('startup_start')} = {_number(startup.start)};")
+            lines += [
+                f"double {self.m('startup_start')} = {_number(startup.start)};",
+                f"double {self.m('startup_value')} = {_number(startup.value)};",
+            ]
             return lines
         bridge = self.bridge
         q_kind = "Complex" if isinstance(self.topology.zero, complex) else "double"
@@ -2538,6 +2576,11 @@ class _GraphUnitGenerator(_ControlGenerator):
 
     def output_lines(self) -> list[str]:
         lines = self._measurement_lines(members=True)
+        lines += [
+            f"{self.m('startup_value')} = !{self.m('startup_run')} ? 0.0 : "
+            f"({self.m('startup_ramp')} <= 0.0 ? 1.0 : smoothstep("
+            f"std::clamp((t - {self.m('startup_start')}) / {self.m('startup_ramp')}, 0.0, 1.0)));"
+        ] if self.continuous else []
         for group in self.graph._continuous_plan:
             cyclic = group in self.graph._continuous_cycles
             if cyclic:
@@ -2596,11 +2639,17 @@ class _GraphUnitGenerator(_ControlGenerator):
 
     def _hold(self) -> str:
         connections = self.unit.zoh_connections()
-        if len(connections) != 1:
+        labels = set(connections.values())
+        target = next(
+            ((subsystem, field) for subsystem, field in connections
+             if subsystem is self.bridge and field == "q"),
+            None,
+        )
+        if target is None or len(labels) != 1:
             raise TypeError(
-                f"C++ export: sampled unit {self.name!r} needs one held bridge connection"
+                f"C++ export: sampled unit {self.name!r} needs one shared held bridge command"
             )
-        (subsystem, field), _label = next(iter(connections.items()))
+        subsystem, field = target
         record = subsystem.inp
         return self.model.zoh_fields[id(record), field]
 
@@ -2659,6 +2708,8 @@ class _GraphUnitGenerator(_ControlGenerator):
             f"{self.m('pwm_j')} * {_number(TL)};",
             f"        {self.m('gates')} = {self.m('active')}[{on_index}] != 0.0 && "
             f"{self.m('breaker')} && !{self.m('tripped')};",
+            f"        breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
+            f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});",
             "    }",
         ]
         if bridge.computation > 0.0:
@@ -2808,13 +2859,16 @@ class _GraphUnitGenerator(_ControlGenerator):
         ]
         if self.continuous:
             lines += [f"{self.m('startup_start')} = {t};",
-                      f"{self.m('gates')} = {'true' if on else 'false'};"]
+                      f"{self.m('gates')} = {'true' if on else 'false'};",
+                      f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
+                      f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});"]
         else:
             lines += [f"{self.m('startup_steps')} = 0;",
                       f"{self.m('startup_value')} = 0.0;",
                       f"{self.m('startup_complete')} = false;"]
             if not on:
-                lines.append(f"{self.m('gates')} = false;")
+                lines += [f"{self.m('gates')} = false;",
+                          f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = true;"]
         return lines
 
     def sense_method(self) -> str:
@@ -3042,10 +3096,14 @@ class _CppGenerator:
             sub = check.subsystem
             if isinstance(sub, RLBranch):
                 current = model.value(sub.state, "i")
-                return "0.0", f"{_number(1.5 * sub.R)} * std::norm({current})"
+                squared = (f"std::norm({current})" if sub.phases == 3
+                           else f"({current}) * ({current})")
+                return "0.0", f"{_number(sub.power_scale * sub.R)} * {squared}"
             if isinstance(sub, RCNode):
                 current = model.value(sub.inp, "i")
-                return "0.0", f"{_number(1.5 * sub.R_d)} * std::norm({current})"
+                squared = (f"std::norm({current})" if sub.phases == 3
+                           else f"({current}) * ({current})")
+                return "0.0", f"{_number(sub.power_scale * sub.R_d)} * {squared}"
             if isinstance(sub, ThreePhaseSource):
                 supplied = product(sub.out, "e_g", sub.inp, "i")
                 return f"1.5 * ({supplied})", "0.0"
@@ -3164,12 +3222,33 @@ class _CppGenerator:
             diode_blocking_guards.append(guard)
         diode_step_limits = []
         for subsystem in diode_conduction.resolution_subsystems:
-            enabled = model.enabled_by.get(id(subsystem))
-            attributes = ({"enabled": _Expression(enabled, "bool")}
-                          if enabled is not None else None)
-            diode_step_limits.append(model.trace_solver_method(
-                subsystem, "diode_maximum_step", attributes
-            ))
+            if isinstance(subsystem, RLBranch) and subsystem.conduction is not None:
+                owner = next(
+                    unit for unit in self.system.units.values()
+                    if getattr(unit, "branch_f", None) is subsystem
+                )
+                prefix = _identifier(owner.name)
+                duty = model.zoh_fields[id(subsystem.inp), "q"]
+                current = f"obs_{prefix}_ctrl_meas_current"
+                voltage = f"obs_{prefix}_ctrl_meas_voltage"
+                dc_voltage = f"obs_{prefix}_ctrl_meas_vin"
+                period = _number(subsystem.conduction.period)
+                critical = (
+                    f"({duty} * {period} * ({dc_voltage} - {voltage}) / "
+                    f"(2.0 * {_number(subsystem.L)} + {_number(subsystem.R)} * {duty} * {period}))"
+                )
+                diode_step_limits.append(
+                    f"({duty} > 0.0 && {duty} < 1.0 && {dc_voltage} > {voltage} "
+                    f"&& {current} < ({critical}) ? {period} / 10.0 : "
+                    "std::numeric_limits<double>::infinity())"
+                )
+            else:
+                enabled = model.enabled_by.get(id(subsystem))
+                attributes = ({"enabled": _Expression(enabled, "bool")}
+                              if enabled is not None else None)
+                diode_step_limits.append(model.trace_solver_method(
+                    subsystem, "diode_maximum_step", attributes
+                ))
         raw_projection_call = "" if diode_conduction else projection_call
         member_lines = model.members()
         for generator in sampled.values():
@@ -3894,6 +3973,11 @@ int main(int argc, char** argv) {{
 def _export_cpp(simulation: Any, out_dir: Path, name: str,
                 variables: tuple[str, ...], reusable: bool) -> ExportResult:
     """Write one self-contained, parameter-specialised C++17 translation unit."""
+    if any(unit.type == "wpt" for unit in simulation.p.units.values()):
+        raise TypeError(
+            "C++ export does not yet lower composite WPT units; run this configuration with "
+            "the Python backend"
+        )
     # Execute only the ordinary initialisation path.  A caller-owned Simulation is copied to avoid
     # mutation; the Simulation already created internally by export(Params, ...) can be reused.
     # Initialisation replaces diagnostic values temporarily used by the port-Hamiltonian structure

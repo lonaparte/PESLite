@@ -20,8 +20,8 @@ units:
       loops:
         pll: {type: voltage_adaptive_pll, bandwidth: 20.0}
         cc: {type: dq_current_pi, bandwidth: 200.0}
-        dvc: {type: dc_voltage_pi, kp_pu: 0.8, ki_pu: 90.0, limit_pu: 1.15,
-              id0_export_pu: 0.9}
+        dvc: {type: dc_voltage_control, kp: 0.8, ki: 90.0, minimum: 0.0,
+              maximum: 1.15, feedforward: 0.9, output_polarity: -1.0}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 events:
   connect_vsc: {type: connect, target: vsc, t: 0.0, ramp: 0.01}

@@ -226,7 +226,7 @@ def test_custom_pll_assembles_with_builtin_loops_and_runs(examples, tmp_path, mo
     assert type(nodes["pll"]).flow_path is Loop.flow_path
     assert set(nodes["pll"]._state_blocks) == {"theta", "omega_g", "u_g_pu"}
     assert nodes["cc"].type == "dq_current_pi"
-    assert nodes["dvc"].type == "dc_voltage_pi"
+    assert nodes["dvc"].type == "dc_voltage_control"
 
     result = simulation.run(out_dir=tmp_path / model)
     theta = result.states["vsc.ctrl.pll.theta"]

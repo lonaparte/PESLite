@@ -152,6 +152,8 @@ state and port layout.
 
 - Supported solvers are fixed `euler`, `heun` and `rk4`, plus adaptive `DP45`.
 - Multirate subsystem schedules are not currently lowered to C++.
+- Composite WPT units and their resonant-link schedule are not currently lowered to C++; the
+  exporter rejects them before writing backend files.
 - Arbitrary Python behavior is not embedded in the standalone executable. File or network I/O,
   reflection, run-time type/layout changes and unsupported library calls in a custom equation are
   rejected during export rather than silently approximated.

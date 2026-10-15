@@ -31,8 +31,9 @@ CASE = {
         "ctrl": {"type": "gfl", "loops": {
             "pll": {"type": "srf_pll", "period": 5e-5, "kp_pu": 20.0, "ki_pu": 1200.0},
             "cc": {"type": "dq_current_pi", "period": 5e-5, "bandwidth": 200.0},
-            "dvc": {"type": "dc_voltage_pi", "period": 5e-5, "kp_pu": 0.8,
-                    "ki_pu": 90.0, "limit_pu": 1.15, "id0_export_pu": 0.9},
+            "dvc": {"type": "dc_voltage_control", "period": 5e-5, "kp": 0.8,
+                    "ki": 90.0, "minimum": 0.0, "maximum": 1.15,
+                    "feedforward": 0.9, "output_polarity": -1.0},
         }},
     }},
     "simulation": {"t_end": 0.004, "solver": {"dt": 12.5e-6, "linearisations": 0}},

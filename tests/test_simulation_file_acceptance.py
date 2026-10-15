@@ -85,7 +85,7 @@ def test_annotated_gfl_example_lists_every_option():
     text = (EXAMPLES / "gfl-example.pes").read_text(encoding="utf-8")
     vsc_params = type(from_dict(read_tree(EXAMPLES / "gfl-example.pes")).unit()._unit_fields)
     options = _options(Params) | _options(vsc_params)
-    for kind in ("srf_pll", "dq_current_pi", "dc_voltage_pi"):
+    for kind in ("srf_pll", "dq_current_pi", "dc_voltage_control"):
         options |= _options(LOOP_TYPES[kind].Params)
     for kind in ("connect", "disconnect", "set"):
         options |= _options(EVENT_TYPES[kind].Params)

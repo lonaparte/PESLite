@@ -12,7 +12,7 @@ from peslite.control import (
     LOOP_TYPES,
     SI_CURRENT,
     SI_VOLTAGE,
-    CapacitorVoltageControl,
+    DCVoltageControl,
     ControlGraph,
     ControlInterface,
     InductorCurrentControl,
@@ -29,7 +29,7 @@ class _References:
 def _graph(*, continuous=False):
     period = 0.0001
     loops = {
-        "voltage": CapacitorVoltageControl.Params(
+        "voltage": DCVoltageControl.Params(
             kp=0.18,
             ki=35.0,
             minimum=0.0,
@@ -87,10 +87,34 @@ def test_scalar_control_uses_the_shared_control_package():
 
     assert not (control / "dc.py").exists()
     assert not hasattr(peslite.control, "make_scalar_controller")
-    assert CapacitorVoltageControl.__module__ == "peslite.control.loops"
+    assert DCVoltageControl.__module__ == "peslite.control.loops"
     assert InductorCurrentControl.__module__ == "peslite.control.loops"
-    assert {"capacitor_voltage_control", "inductor_current_control"} <= set(LOOP_TYPES)
-    assert LOOP_TYPES["dc_voltage_pi"].__name__ == "DCLinkVoltageLoop"
+    assert {"dc_voltage_control", "inductor_current_control"} <= set(LOOP_TYPES)
+    assert LOOP_TYPES["dc_voltage_control"] is DCVoltageControl
+
+
+@pytest.mark.parametrize(
+    "polarity,reference,voltage,error",
+    [(1.0, 2.0, 1.0, 1.0), (-1.0, 1.0, 2.0, -1.0)],
+)
+def test_dc_voltage_control_always_uses_reference_minus_voltage(
+        polarity, reference, voltage, error):
+    unit = SimpleNamespace(bridge=SimpleNamespace(model="pwm_averaging"))
+    startup = SimpleNamespace(active=True, value=1.0)
+    loop = DCVoltageControl(
+        DCVoltageControl.Params(
+            kp=2.0, ki=0.0, minimum=-10.0, maximum=10.0,
+            output_polarity=polarity, period=0.1,
+        ),
+        unit,
+        startup,
+    )
+
+    output = loop.sample(0.0, {"reference": reference, "voltage": voltage})
+
+    assert loop.error == error
+    assert output == {"current_reference": pytest.approx(2.0)}
+    assert tuple(loop.outputs) == ("current_reference",)
 
 
 def test_scalar_control_graph_has_typed_si_ports_and_bounded_output():

@@ -74,7 +74,7 @@ def test_controller_states_in_pu_are_named_as_pu(examples):
     )).state_names()
     assert {
         "vsc.ctrl.pll.integral_pu",
-        "vsc.ctrl.dvc.integral_pu",
+        "vsc.ctrl.dvc.integral",
         "vsc.ctrl.cc.integral_pu.re",
         "vsc.tripped",
     } <= set(gfl_names)

@@ -1,37 +1,45 @@
 # PESLite 0.4.0
-# Closed-loop Buck converter assembled from a configured half bridge, an L-C output network and
-# shared scalar control loops. The Buck topology places a controlled device in the upper position
-# and a diode in the lower position, so the inductor current naturally enters DCM at zero. Plant
-# and controller electrical values are SI.
+# Closed-loop Buck application assembled from an open DCConverter, a scalar output bus and a
+# resistive load. The half bridge owns only its power stage; the filter inductance, bus capacitor
+# and load remain independently connected network components. Electrical values are SI.
 
 base:
   s_base: 500.0
   v_ll_rms: 230.0
   f0: 50.0
 
-# A scalar DC-only system has no AC buses.
-buses: {}
+buses:
+  output:
+    phases: 1
+    c: 470.0e-6
+
+elements:
+  load:
+    type: resistor
+    bus: output
+    r: 6.0
 
 units:
   converter:
     type: dc_converter
-    topology: buck
-    source_voltage: 48.0
-    inductance: 1.0e-3
-    capacitance: 470.0e-6
-    load_resistance: 6.0
-    series_resistance: 0.05
+    bus: output
+    filter: {l_f: 1.0e-3, r_f: 0.05}
+    dclink:
+      vdc_ref: 48.0
+      source: {type: voltage}
 
     pwm:
       f_sw: 20000.0
 
-    # bridge: {model: pwm_averaging}  # pwm_averaging | averaging | switching
+    bridge:
+      lower_controlled: false
+      # model: switching  # pwm_averaging (default) | averaging | switching
 
     ctrl:
       type: dc
       loops:
         voltage:
-          type: capacitor_voltage_control
+          type: dc_voltage_control
           kp: 0.3
           ki: 80.0
           minimum: 0.0
@@ -57,4 +65,4 @@ simulation:
 
 meta:
   title: Buck converter
-  description: A closed-loop 48 V to 24 V Buck converter using a configured half bridge with DCM support.
+  description: An open half-bridge DCConverter feeding an external L-C output network and load.

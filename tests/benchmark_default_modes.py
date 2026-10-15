@@ -82,7 +82,7 @@ def main() -> int:
             for case, settings in CASES.items():
                 changes = {
                     **{f"units.{name}.bridge.model": settings["bridge"]
-                       for name in base.units},
+                       for name in base.runtime_units},
                     "simulation.solver.type": settings["type"],
                     "simulation.solver.method": settings["method"],
                 }

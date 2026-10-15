@@ -222,30 +222,33 @@ def test_filter_uses_descending_s_coefficients_and_tustin_for_sampled_control():
         Filter((1.0, 0.0), (1.0,), 0.1)
 
 
-def test_controller_applies_limits_only_to_sampled_control(gfl):
+def test_dc_voltage_control_owns_its_limit_in_both_execution_modes(gfl):
     sampled = peslite.Simulation(gfl()).unit().ctrl
     continuous = peslite.Simulation(gfl(**{"units.vsc.bridge.model": "averaging"})).unit().ctrl
 
-    assert set(sampled.graph._limits) == {"cc", "dvc"}
+    assert set(sampled.graph._limits) == {"cc"}
     assert continuous.graph._limits == {}
     assert set(continuous._flow_limits) == {"dvc"}
     assert sampled.graph._limits["cc"][1].pi is sampled.graph.nodes["cc"].pi
-    assert sampled.graph._limits["dvc"][1].pi is sampled.graph.nodes["dvc"].pi
+    assert sampled.graph.nodes["dvc"].limit.pi is sampled.graph.nodes["dvc"].pi
+    assert continuous.graph.nodes["dvc"].limit.pi is continuous.graph.nodes["dvc"].pi
 
 
-def test_averaging_observes_pi_limit_without_clipping_or_antiwindup(gfl):
+def test_averaging_clips_dc_current_reference_and_tracks_antiwindup(gfl):
     ctrl = peslite.Simulation(gfl(**{"units.vsc.bridge.model": "averaging"})).unit().ctrl
     dvc = ctrl.graph.nodes["dvc"]
     ctrl.command_at(True, 0.0, 0.0)
-    intended = 2.0 * dvc.limit
-    setattr(ctrl.state, "dvc.integral_pu", intended / dvc.ki)
+    intended = 2.0 * dvc.maximum
+    integral = (intended - dvc.cfg.feedforward) / dvc.ki
+    setattr(ctrl.state, "dvc.integral", integral)
     ctrl.inp.u_dc = ctrl.p.dclink.vdc_ref
 
     ctrl.set_outputs(0.0)
 
-    expected = intended + dvc.cfg.id0_export_pu
-    assert ctrl.graph.values["dvc.id_ref"] == pytest.approx(expected)
-    assert ctrl.rhs(0.0)[ctrl.state_names.index("dvc.integral_pu")] == pytest.approx(0.0)
+    assert dvc.raw == pytest.approx(intended)
+    assert ctrl.graph.values["dvc.current_reference"] == pytest.approx(dvc.maximum)
+    derivative = ctrl.rhs(0.0)[ctrl.state_names.index("dvc.integral")]
+    assert derivative == pytest.approx((dvc.maximum - intended) / dvc.kp)
     assert ctrl.alarms == []
     ctrl.observe_limits(0.0)
     assert ctrl.alarms == ["ID_REF_LIMIT"]

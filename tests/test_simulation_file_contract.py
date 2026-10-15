@@ -17,6 +17,7 @@ EXPECTED = {
     "gfm-psc-example.pes",
     "gfm-vsg-example.pes",
     "two-converters-example.pes",
+    "wpt-example.pes",
 }
 
 

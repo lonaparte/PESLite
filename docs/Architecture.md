@@ -85,13 +85,19 @@ The assembly layer:
 5. compiles model connection and output-evaluation plans;
 6. builds event scenarios and validated parameter changes.
 
-`Unit` is the common converter lifecycle and runtime interface. `VSC` implements it for a grid
-converter; `DCConverter` implements it for a scalar DC converter. Each specialization owns its
-power stage, controller, sensing, startup interface, protection latch, breakers and gates. Both
-startup and protection act through the same unit-level hardware operations.
+`Unit` is the common converter lifecycle and runtime interface. Both `VSC` and `DCConverter` expose
+their electrical side through the same named-bus `Terminal` contract; `VSC` supplies a three-phase
+bridge and `DCConverter` a selectable scalar half or full bridge. The same
+`DCConverter` also serves as each full-bridge port of a resonant link. Each runtime specialization
+owns its power stage, controller, sensing, startup interface, breakers and gates.
 
-Every entry in `Params.units` is a `UnitParams`. Its `type` selects `vsc` or `dc_converter`;
-type-specific schema selection and runtime construction happen once while the system is assembled.
+Every entry in `Params.units` is a `UnitParams`. Its `type` selects `vsc`, `dc_converter` or the
+composite `wpt`; type-specific schema selection and runtime construction happen once while the
+system is assembled. A WPT configuration contains `primary` and `secondary` UnitParams plus one
+shared compensated link. Assembly expands that tree once into two ordinary runtime units and a
+link subsystem. The solver sees only the flat result, so its event loop has no composite recursion
+or WPT-specific scheduling. `Params.runtime_units` exposes the same flat leaf-unit mapping.
+
 For compatibility with version 0.3.0 files, an omitted type means `vsc`; DC converters always use
 the explicit `dc_converter` type.
 
@@ -101,7 +107,9 @@ Parameter ownership is explicit:
 |---|---|---|
 | Common unit | none | `pwm`, `ctrl`, `bridge`, `s_base`, resolved `base`, and unit events |
 | VSC only | `unit.type: vsc` | `bus`, `ac_filter`, `dclink`, `meas`, and `protection` |
-| DC converter only | `unit.type: dc_converter` | `topology`, `source_voltage`, `inductance`, `capacitance`, `load_resistance`, and `series_resistance` |
+| DC converter only | `unit.type: dc_converter` | `bus`, `filter`, and `dclink`; a composite parent may bind the power port internally instead of naming a bus |
+| WPT composite only | `unit.type: wpt` | `primary`, `secondary`, and `link`; it has no bridge, PWM or controller of its own |
+| Bridge | `bridge.type` | `three_phase_bridge`, `half_bridge`, or `full_bridge`; `model` independently selects switching, PWM averaging, or ideal averaging |
 | Common control | none | `type`, `period`, `computation`, `loops`, `connections`, and `outputs` |
 | Control architecture | `ctrl.type` | reference fields and default wiring unique to the selected architecture |
 | Control loop | `ctrl.loops.<name>.type` | gains, limits, and other fields unique to the selected loop |

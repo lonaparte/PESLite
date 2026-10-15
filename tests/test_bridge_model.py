@@ -103,7 +103,9 @@ def test_bridge_flags_are_mutually_exclusive(capsys):
 
 
 def _with_model(params, model):
-    return params.replace(**{f"units.{name}.bridge.model": model for name in params.units})
+    return params.replace(**{
+        f"units.{name}.bridge.model": model for name in params.runtime_units
+    })
 
 
 @pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda path: path.stem)
@@ -111,14 +113,13 @@ def _with_model(params, model):
 def test_every_bundled_file_runs_with_every_completed_model(path, model, tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        params = peslite.load(
-            path,
-            **{"simulation.t_end": 0.004, "simulation.solver.linearisations": 0},
-        )
+        params = peslite.load(path, **{"simulation.solver.linearisations": 0})
+        duration = min(0.004, params.simulation.t_end)
+        params = params.replace(**{"simulation.t_end": duration})
         params = _with_model(params, model)
     result = peslite.Simulation(params).run(out_dir=tmp_path / f"{path.stem}-{model}")
     assert np.isfinite(result.states["t"]).all()
-    assert result.states["t"][-1] == pytest.approx(0.004)
+    assert result.states["t"][-1] == pytest.approx(duration)
 
 
 def test_units_can_have_different_models(tmp_path):

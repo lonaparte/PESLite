@@ -178,6 +178,12 @@ def _unit(u, base, where: str) -> None:
         raise ConfigError(f"{where}.s_base must be finite and positive, got {u.s_base}")
     if u.ac_filter.l_f <= 0.0:
         raise ConfigError(f"{where}.ac_filter.l_f must be > 0")
+    if u.bridge.type != "three_phase_bridge":
+        raise ConfigError(f"{where}.bridge.type: a VSC requires 'three_phase_bridge'")
+    if not u.bridge.upper_controlled or not u.bridge.lower_controlled:
+        raise ConfigError(
+            f"{where}.bridge: controlled-device fields apply only to a half bridge"
+        )
     _dclink(u.dclink, f"{where}.dclink")
     continuous = u.bridge.model == "averaging"
     _pwm(u.pwm, base, f"{where}.pwm", continuous)
@@ -194,40 +200,112 @@ def _unit(u, base, where: str) -> None:
                           f"got {protection.rocof.window}")
 
 
-def _dc_converter(u, base, where: str) -> None:
-    """Check one scalar DC converter."""
+def _dc_converter(u, base, where: str, *, nested: bool = False) -> None:
+    """Check one open scalar converter."""
     if u.s_base is not None and (not math.isfinite(u.s_base) or u.s_base <= 0.0):
         raise ConfigError(f"{where}.s_base must be finite and positive, got {u.s_base}")
-    for name in ("source_voltage", "inductance", "capacitance", "load_resistance"):
-        value = getattr(u, name)
-        if not math.isfinite(value) or value <= 0.0:
-            raise ConfigError(f"{where}.{name} must be finite and positive, got {value}")
-    if not math.isfinite(u.series_resistance) or u.series_resistance < 0.0:
+    _dclink(u.dclink, f"{where}.dclink")
+    if u.bridge.type not in {"half_bridge", "full_bridge"}:
         raise ConfigError(
-            f"{where}.series_resistance must be finite and nonnegative, got {u.series_resistance}"
+            f"{where}.bridge.type: a DC converter requires 'half_bridge' or 'full_bridge'"
         )
-    if not math.isfinite(u.ctrl.references.voltage) or u.ctrl.references.voltage <= 0.0:
-        raise ConfigError(f"{where}.ctrl.references.voltage must be finite and positive")
+    if u.bridge.type != "half_bridge" and (
+            not u.bridge.upper_controlled or not u.bridge.lower_controlled):
+        raise ConfigError(
+            f"{where}.bridge: controlled-device fields apply only to a half bridge"
+        )
+    if (u.bus is None) != (u.filter is None):
+        raise ConfigError(f"{where}: bus and filter must be specified together")
+    if not nested and u.bus is None:
+        raise ConfigError(f"{where}.bus: a standalone DC converter needs a scalar bus")
+    if u.filter is not None and u.filter.l_f <= 0.0:
+        raise ConfigError(f"{where}.filter.l_f must be > 0")
+    if u.ctrl.type == "dc":
+        if nested:
+            raise ConfigError(f"{where}.ctrl.type: a directly connected WPT port requires 'resonant'")
+        if not math.isfinite(u.ctrl.references.voltage) or u.ctrl.references.voltage <= 0.0:
+            raise ConfigError(f"{where}.ctrl.references.voltage must be finite and positive")
     continuous = u.bridge.model == "averaging"
     _pwm(u.pwm, base, f"{where}.pwm", continuous)
     if u.pwm.sync != "asynchronous":
         raise ConfigError(f"{where}.pwm.sync: scalar converters require asynchronous PWM")
     _timing(u.ctrl, u.pwm, f"{where}.ctrl", continuous)
-    _control(u.ctrl, None, u.pwm, f"{where}.ctrl", continuous)
-    for name, loop in u.ctrl.loops.items():
-        if hasattr(loop, "minimum") and loop.minimum > loop.maximum:
+    if u.ctrl.type == "dc":
+        _control(u.ctrl, u.dclink, u.pwm, f"{where}.ctrl", continuous)
+        for name, loop in u.ctrl.loops.items():
+            if hasattr(loop, "minimum") and loop.minimum > loop.maximum:
+                raise ConfigError(
+                    f"{where}.ctrl.loops.{name}.minimum must not exceed maximum"
+                )
+    else:
+        if u.bridge.type != "full_bridge":
+            raise ConfigError(f"{where}.ctrl.type: resonant control requires a full bridge")
+        if u.ctrl.loops:
+            raise ConfigError(f"{where}.ctrl.loops: resonant control has no feedback loops")
+        ref = u.ctrl.references
+        if not math.isfinite(ref.modulation) or not 0.0 <= ref.modulation <= 1.0:
+            raise ConfigError(f"{where}.ctrl.references.modulation must be in [0, 1]")
+        if not math.isfinite(ref.frequency) or ref.frequency <= 0.0:
+            raise ConfigError(f"{where}.ctrl.references.frequency must be finite and positive")
+        if not math.isfinite(ref.phase):
+            raise ConfigError(f"{where}.ctrl.references.phase must be finite")
+
+
+def _wpt(u, base, where: str) -> None:
+    """Check a WPT composite and its shared compensated magnetic link."""
+    if u.s_base is not None and (not math.isfinite(u.s_base) or u.s_base <= 0.0):
+        raise ConfigError(f"{where}.s_base must be finite and positive, got {u.s_base}")
+    for side in ("primary", "secondary"):
+        child = getattr(u, side)
+        child_where = f"{where}.{side}"
+        if child.type != "dc_converter":
             raise ConfigError(
-                f"{where}.ctrl.loops.{name}.minimum must not exceed maximum"
+                f"{child_where}.type: a WPT port must be 'dc_converter', got {child.type!r}"
             )
+        _dc_converter(child, base, child_where, nested=True)
+    link = u.link
+    positive = [
+        "primary_inductance", "secondary_inductance",
+    ]
+    if link.type == "ss":
+        positive += ["primary_capacitance", "secondary_capacitance"]
+    else:
+        positive += [
+            "primary_series_capacitance", "secondary_series_capacitance",
+            "primary_compensation_inductance", "secondary_compensation_inductance",
+            "primary_parallel_capacitance", "secondary_parallel_capacitance",
+        ]
+    for name in positive:
+        value = getattr(link, name)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ConfigError(f"{where}.link.{name} must be finite and positive")
+    for name in ("mutual_inductance", "primary_resistance", "secondary_resistance"):
+        value = getattr(link, name)
+        if not math.isfinite(value) or value < 0.0:
+            raise ConfigError(f"{where}.link.{name} must be finite and nonnegative")
+    if link.type == "lcc":
+        for name in ("primary_compensation_resistance", "secondary_compensation_resistance"):
+            value = getattr(link, name)
+            if not math.isfinite(value) or value < 0.0:
+                raise ConfigError(f"{where}.link.{name} must be finite and nonnegative")
+    determinant = (
+        link.primary_inductance * link.secondary_inductance
+        - link.mutual_inductance * link.mutual_inductance
+    )
+    if determinant <= 0.0:
+        raise ConfigError(
+            f"{where}.link: the coupled-inductor matrix must be positive definite "
+            "(mutual_inductance^2 < primary_inductance * secondary_inductance)"
+        )
 
 
 def _network(p: Params) -> None:
     """Check element identities, network values and bus references."""
     if not p.units:
         raise ConfigError("units: a system needs at least one converter")
-    ac_units = {name: unit for name, unit in p.units.items() if unit.type == "vsc"}
+    ac_units = {name: unit for name, unit in p.runtime_units.items() if unit.type == "vsc"}
     if (ac_units or p.branches or p.sources or p.elements) and not p.buses:
-        raise ConfigError("buses: an AC network needs at least one bus")
+        raise ConfigError("buses: a connected electrical network needs at least one bus")
     seen: dict[str, str] = {}
     for kind in NAMED:
         for name in getattr(p, kind):
@@ -239,6 +317,8 @@ def _network(p: Params) -> None:
         if bus.c <= 0.0:
             raise ConfigError(f"buses.{name}.c must be > 0: the shunt capacitor is what makes the "
                               f"bus voltage a state (a bus without one would need a node-voltage solver)")
+        if bus.phases not in (1, 3):
+            raise ConfigError(f"buses.{name}.phases must be 1 or 3")
     def _bus_of(where: str, bus: str) -> None:
         if bus not in p.buses:
             raise ConfigError(f"{where}: unknown bus {bus!r}; known: {sorted(p.buses)}")
@@ -247,10 +327,14 @@ def _network(p: Params) -> None:
         _bus_of(f"branches.{name}.bus2", br.bus2)
         if br.bus1 == br.bus2:
             raise ConfigError(f"branches.{name}: both ends are {br.bus1!r}")
+        if p.buses[br.bus1].phases != p.buses[br.bus2].phases:
+            raise ConfigError(f"branches.{name}: both buses must have the same phase count")
         if br.l <= 0.0:
             raise ConfigError(f"branches.{name}.l must be > 0")
     for name, src in p.sources.items():
         _bus_of(f"sources.{name}.bus", src.bus)
+        if p.buses[src.bus].phases != 3:
+            raise ConfigError(f"sources.{name}.bus: a three-phase source needs a three-phase bus")
         if src.f is not None and (not math.isfinite(src.f) or src.f <= 0.0):
             raise ConfigError(f"sources.{name}.f must be finite and positive, got {src.f}")
         if not math.isfinite(src.angle):
@@ -258,6 +342,14 @@ def _network(p: Params) -> None:
         if src.l <= 0.0:
             raise ConfigError(f"sources.{name}.l must be > 0: a source is an emf behind an impedance")
     for name, u in ac_units.items():
+        _bus_of(f"units.{name}.bus", u.bus)
+        if p.buses[u.bus].phases != 3:
+            raise ConfigError(f"units.{name}.bus: a VSC needs a three-phase bus")
+    for name, u in p.units.items():
+        if u.type != "dc_converter":
+            continue
+        if u.bus is None:
+            continue
         _bus_of(f"units.{name}.bus", u.bus)
     for name, element in p.elements.items():
         for key, bus in element_buses(element).items():
@@ -315,14 +407,21 @@ def _events(p: Params) -> None:
             raise ConfigError(f"{where}.target: {target!r} is a bus, which has no breaker; {event.type} "
                               f"switches a unit, source, branch or element")
         on = event.type == "connect"
-        previous = switched.get(target)
-        if previous is not None and previous[1] == on:
-            raise ConfigError(f"{where}: {target!r} is already {event.type}ed by events.{previous[0]}")
-        if (target, event.t) in at:
-            raise ConfigError(f"{where}: {target!r} is also switched at t = {event.t} "
-                              f"by events.{at[(target, event.t)]}")
-        at[(target, event.t)] = name
-        switched[target] = (name, on)
+        affected = p.unit_groups.get(target, (target,))
+        for actual in affected:
+            previous = switched.get(actual)
+            if previous is not None and previous[1] == on:
+                detail = (f"{target!r} is already {event.type}ed"
+                          if actual == target else
+                          f"{target!r} also switches {actual!r}, which is already {event.type}ed")
+                raise ConfigError(f"{where}: {detail} by events.{previous[0]}")
+            if (actual, event.t) in at:
+                detail = (f"{target!r} is also switched at t = {event.t}"
+                          if actual == target else
+                          f"{target!r} also switches {actual!r} at t = {event.t}")
+                raise ConfigError(f"{where}: {detail} by events.{at[(actual, event.t)]}")
+            at[(actual, event.t)] = name
+            switched[actual] = (name, on)
 
 
 def _initial(p: Params) -> None:
@@ -330,8 +429,8 @@ def _initial(p: Params) -> None:
     t0 = p.simulation.initial.t
     if t0 < 0.0:
         raise ConfigError("simulation.initial.t must be >= 0")
-    for name, u in p.units.items():
-        if u.type == "dc_converter":
+    for name, u in p.runtime_units.items():
+        if u.type != "vsc":
             continue
         if u.bridge.model == "averaging":
             continue
@@ -370,8 +469,13 @@ def _progress(progress) -> None:
 def validate(p: Params) -> Params:
     """Check a :class:`Params` tree and return it unchanged; raise ConfigError if invalid."""
     _network(p)
+    checks = {
+        "vsc": _unit,
+        "dc_converter": _dc_converter,
+        "wpt": _wpt,
+    }
     for name, unit in p.units.items():
-        check = _dc_converter if unit.type == "dc_converter" else _unit
+        check = checks[unit.type]
         check(unit, p.base, f"units.{name}")
     _solver(p.simulation.solver)
     _events(p)

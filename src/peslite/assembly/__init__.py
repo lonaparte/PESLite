@@ -6,16 +6,18 @@
 one model.
 """
 
-from .params import (BaseValues, ConfigError, ControlParams, Params, UnitParams,
+from .params import (BaseValues, ConfigError, ControlParams, LCCLinkParams, Params,
+                     SSLinkParams, UnitParams,
                      dump, dumps, from_dict, load,
                      read_initial, to_dict)
 from .events import (EVENT_TYPES, Event, Scenario, SourceScenario,
                      register_event_type)
 from .protection import Protection
 from .unit import DCConverter, Unit, VSC
-from .system import System
+from .system import System, UnitAssembly
 
 __all__ = ["Params", "BaseValues", "ConfigError", "load", "dump", "dumps", "from_dict", "to_dict", "read_initial",
            "Event", "EVENT_TYPES", "register_event_type", "Scenario",
            "SourceScenario", "Protection", "Unit", "VSC", "DCConverter",
-           "UnitParams", "ControlParams", "System"]
+           "UnitAssembly", "UnitParams", "ControlParams",
+           "SSLinkParams", "LCCLinkParams", "System"]

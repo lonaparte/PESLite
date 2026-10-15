@@ -10,18 +10,18 @@ from __future__ import annotations
 import math
 import warnings
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, ContextManager, Mapping, Optional, Protocol
+from typing import Any, ContextManager, Mapping, Optional, Protocol
 
 import numpy as np
 
 from ..components.adc import ADC, MeasurementPorts
-from ..components.converter import HalfBridge, make_bridge, make_dclink
+from ..components.converter import (FullBridge, HalfBridge, HalfBridgeDiodeConduction,
+                                    make_bridge, make_dclink)
 from ..components.network import RLBranch, Terminal
 from ..components.pwm import TIME_EPS, Modulator
 from ..control.blocks import phases
-from ..control.controller import Controller, Measurement, ScalarController, make_controller
-from ..solver.energy import StoragePort
-from ..solver.model import Bag, OutputMethod
+from ..control.controller import (Controller, Measurement, ResonantController,
+                                  ScalarController, make_controller)
 from .events import Scenario
 from .params import SimulationParams, UnitParams
 from .protection import Protection
@@ -542,345 +542,64 @@ class VSC(Unit):
         }
 
 
-class _DCPlantState(Bag):
-    __slots__ = ("i_L", "u_o")
-
-
-class _DCPlantInp(Bag):
-    __slots__ = ("q",)
-
-
-class _DCPlantOut(Bag):
-    __slots__ = ("i_L", "u_o", "v_in", "i_in")
-
-
-class _DCPlant:
-    """The energy-storage network around one configured scalar bridge topology."""
-
-    state_names: ClassVar[tuple[str, ...]] = ("i_L", "u_o")
-    outputs_need_inputs: ClassVar[bool] = True
-    output_stages: ClassVar[tuple[OutputMethod, ...]] = (
-        OutputMethod("set_measurements", inputs=(), outputs=("i_L", "u_o", "v_in"), rhs=False),
-        OutputMethod("set_input_current", inputs=("q",), outputs=("i_in",), rhs=False),
-    )
-    ports: ClassVar[tuple] = ()
-    has_source: ClassVar[bool] = True
-
-    def __init__(self, cfg: UnitParams, leg: HalfBridge) -> None:
-        self.v_in = cfg.source_voltage
-        self.L = cfg.inductance
-        self.C = cfg.capacitance
-        self.R_load = cfg.load_resistance
-        self.R_series = cfg.series_resistance
-        self.period = 1.0 / cfg.pwm.f_sw
-        self.switching = cfg.bridge.model == "switching"
-        self.state = _DCPlantState(i_L=0.0, u_o=0.0)
-        self.inp = _DCPlantInp(q=0.0)
-        self.out = _DCPlantOut(v_in=self.v_in)
-        self.storage = (
-            StoragePort("i_L", self.L, kind="inductor"),
-            StoragePort("u_o", self.C, kind="capacitor"),
-        )
-        self.enabled = False
-        self._conducting_rhs = {
-            "buck": self._buck_rhs,
-            "boost": self._boost_rhs,
-            "buck_boost": self._buck_boost_rhs,
-        }[cfg.topology]
-        self._zero_current_rhs = {
-            "buck": self._buck_zero_current_rhs,
-            "boost": self._boost_zero_current_rhs,
-            "buck_boost": self._buck_boost_zero_current_rhs,
-        }[cfg.topology]
-        self._active_input_current = {
-            "buck": self._switched_input_current,
-            "boost": self._direct_input_current,
-            "buck_boost": self._switched_input_current,
-        }[cfg.topology]
-        self._averaged_rhs = {
-            "buck": self._buck_averaged_rhs,
-            "boost": self._boost_averaged_rhs,
-            "buck_boost": self._buck_boost_averaged_rhs,
-        }[cfg.topology]
-        self._averaged_input_current = {
-            "buck": self._averaged_switched_input_current,
-            "boost": self._averaged_direct_input_current,
-            "buck_boost": self._averaged_switched_input_current,
-        }[cfg.topology]
-        self._off_rhs = {
-            "buck": self._buck_off_rhs,
-            "boost": self._boost_off_rhs,
-            "buck_boost": self._buck_boost_off_rhs,
-        }[cfg.topology]
-        self._off_input_current = {
-            "buck": self._zero_input_current,
-            "boost": self._direct_input_current,
-            "buck_boost": self._zero_input_current,
-        }[cfg.topology]
-        self._averaged_bias = {
-            "buck": self._buck_averaged_bias,
-            "boost": self._source_averaged_bias,
-            "buck_boost": self._source_averaged_bias,
-        }[cfg.topology]
-        if leg.upper_controlled and leg.lower_controlled:
-            self._active_rhs = self._conducting_rhs
-            self._inactive_rhs = self._disabled_rhs
-        else:
-            self.state_bounds = {"i_L": (0.0, None)}
-            self.set_measurements = self._unilateral_measurements
-            if self.switching:
-                self.diode_blocks_reverse_current = self._diode_blocks_reverse_current
-                self._active_rhs = self._unilateral_rhs
-                self._inactive_rhs = self._unilateral_disabled_rhs
-            else:
-                self._active_rhs = self._averaged_rhs
-                self._inactive_rhs = self._averaged_off_rhs
-                self._active_input_current = self._averaged_input_current
-                if cfg.bridge.model == "pwm_averaging" and cfg.topology == "buck":
-                    self.diode_maximum_step = self._averaged_diode_maximum_step
-        self.rhs = self._inactive_rhs
-
-    def set_enabled(self, enabled: bool) -> None:
-        self.enabled = bool(enabled)
-        self.rhs = self._active_rhs if self.enabled else self._inactive_rhs
-
-    def set_measurements(self, t: float) -> None:
-        self.out.i_L = self.state.i_L
-        self.out.u_o = self.state.u_o
-        self.out.v_in = self.v_in
-
-    def _unilateral_measurements(self, t: float) -> None:
-        current = self.state.i_L
-        self.out.i_L = current if current > 0.0 else 0.0
-        self.out.u_o = self.state.u_o
-        self.out.v_in = self.v_in
-
-    def set_input_current(self, t: float) -> None:
-        self.out.i_in = (
-            self._active_input_current() if self.enabled else self._off_input_current()
-        )
-
-    def set_outputs(self, t: float) -> None:
-        self.set_measurements(t)
-        self.set_input_current(t)
-
-    def _switched_input_current(self) -> float:
-        return self.inp.q * self.out.i_L
-
-    def _direct_input_current(self) -> float:
-        return self.out.i_L
-
-    @staticmethod
-    def _zero_input_current() -> float:
-        return 0.0
-
-    def _buck_averaged_bias(self) -> float:
-        return self.v_in - self.state.u_o
-
-    def _source_averaged_bias(self) -> float:
-        return self.v_in
-
-    def _averaged_switched_input_current(self) -> float:
-        alpha, _beta, _total, _resistance, _rms = self._averaged_conduction(self.inp.q)
-        return alpha * max(0.0, self.state.i_L)
-
-    def _averaged_direct_input_current(self) -> float:
-        return max(0.0, self.state.i_L)
-
-    def _disabled_rhs(self, t: float):
-        current, voltage = self.state.i_L, self.state.u_o
-        return (-self.R_series * current / self.L,
-                -voltage / (self.R_load * self.C))
-
-    def _unilateral_disabled_rhs(self, t: float):
-        if self.state.i_L != 0.0:
-            return self._off_rhs(t)
-        derivative, _capacitor = self._off_rhs(t)
-        return (derivative if derivative > 0.0 else 0.0,
-                -self.state.u_o / (self.R_load * self.C))
-
-    def _diode_blocks_reverse_current(self) -> bool:
-        """Return whether the present bridge state prevents negative inductor current."""
-        return not self.enabled or self.inp.q <= 0.5
-
-    def _unilateral_rhs(self, t: float):
-        if self.state.i_L != 0.0 or not self._diode_blocks_reverse_current():
-            return self._conducting_rhs(t)
-        return self._zero_current_rhs(t)
-
-    def _averaged_off_rhs(self, t: float):
-        return self._averaged_rhs(t, 0.0)
-
-    def _averaged_critical_current(self, duty: float) -> float:
-        """Return the cycle-mean current at the CCM/DCM boundary."""
-        bias = self._averaged_bias()
-        denominator = 2.0 * self.L + self.R_series * duty * self.period
-        return duty * self.period * bias / denominator if bias > 0.0 else 0.0
-
-    def _averaged_conduction(self, duty: float):
-        """Return active/diode shares, total conduction, resistance and RMS-current factor."""
-        current = max(0.0, self.state.i_L)
-        if duty <= 0.0:
-            return 0.0, 1.0, 1.0, self.R_series, 1.0
-        if duty >= 1.0:
-            return 1.0, 0.0, 1.0, self.R_series, 1.0
-        critical = self._averaged_critical_current(duty)
-        if current >= critical:
-            return duty, 1.0 - duty, 1.0, self.R_series, 1.0
-        total = current / critical
-        delta = max(0.0, total - duty)
-        total = duty + delta
-        rms = 4.0 / (3.0 * total)
-        return duty / total, delta / total, total, self.R_series * rms, rms
-
-    def _averaged_diode_maximum_step(self) -> float:
-        duty = self.inp.q
-        if not self.enabled or duty <= 0.0 or duty >= 1.0:
-            return math.inf
-        current = max(0.0, self.state.i_L)
-        critical = self._averaged_critical_current(duty)
-        if current >= 1.5 * critical:
-            return math.inf
-        return min(self.period / 10.0, 2.5 * self.L / (self.R_load + self.R_series))
-
-    def _buck_averaged_rhs(self, t: float, duty: float | None = None):
-        current, voltage = max(0.0, self.state.i_L), self.state.u_o
-        alpha, _beta, total, resistance, _rms = self._averaged_conduction(
-            self.inp.q if duty is None else duty
-        )
-        derivative = total * (
-            alpha * self.v_in - voltage - resistance * current
-        ) / self.L
-        if current == 0.0 and derivative < 0.0:
-            derivative = 0.0
-        return derivative, (current - voltage / self.R_load) / self.C
-
-    def _boost_averaged_rhs(self, t: float, duty: float | None = None):
-        current, voltage = max(0.0, self.state.i_L), self.state.u_o
-        _alpha, beta, total, resistance, _rms = self._averaged_conduction(
-            self.inp.q if duty is None else duty
-        )
-        derivative = total * (
-            self.v_in - beta * voltage - resistance * current
-        ) / self.L
-        capacitor_current = beta * current
-        if current == 0.0 and derivative < 0.0:
-            derivative = capacitor_current = 0.0
-        return derivative, (capacitor_current - voltage / self.R_load) / self.C
-
-    def _buck_boost_averaged_rhs(self, t: float, duty: float | None = None):
-        current, voltage = max(0.0, self.state.i_L), self.state.u_o
-        alpha, beta, total, resistance, _rms = self._averaged_conduction(
-            self.inp.q if duty is None else duty
-        )
-        derivative = total * (
-            alpha * self.v_in + beta * voltage - resistance * current
-        ) / self.L
-        capacitor_current = -beta * current
-        if current == 0.0 and derivative < 0.0:
-            derivative = capacitor_current = 0.0
-        return derivative, (capacitor_current - voltage / self.R_load) / self.C
-
-    def _buck_rhs(self, t: float):
-        current, voltage, duty = self.state.i_L, self.state.u_o, self.inp.q
-        return ((duty * self.v_in - voltage - self.R_series * current) / self.L,
-                (current - voltage / self.R_load) / self.C)
-
-    def _buck_off_rhs(self, t: float):
-        current, voltage = self.state.i_L, self.state.u_o
-        return ((-voltage - self.R_series * current) / self.L,
-                (current - voltage / self.R_load) / self.C)
-
-    def _buck_zero_current_rhs(self, t: float):
-        voltage, duty = self.state.u_o, self.inp.q
-        derivative = (duty * self.v_in - voltage) / self.L
-        return (derivative if derivative > 0.0 else 0.0,
-                -voltage / (self.R_load * self.C))
-
-    def _boost_rhs(self, t: float):
-        current, voltage, duty = self.state.i_L, self.state.u_o, self.inp.q
-        off = 1.0 - duty
-        return ((self.v_in - off * voltage - self.R_series * current) / self.L,
-                (off * current - voltage / self.R_load) / self.C)
-
-    def _boost_off_rhs(self, t: float):
-        current, voltage = self.state.i_L, self.state.u_o
-        return ((self.v_in - voltage - self.R_series * current) / self.L,
-                (current - voltage / self.R_load) / self.C)
-
-    def _boost_zero_current_rhs(self, t: float):
-        voltage, duty = self.state.u_o, self.inp.q
-        derivative = (self.v_in - (1.0 - duty) * voltage) / self.L
-        return (derivative if derivative > 0.0 else 0.0,
-                -voltage / (self.R_load * self.C))
-
-    def _buck_boost_rhs(self, t: float):
-        current, voltage, duty = self.state.i_L, self.state.u_o, self.inp.q
-        off = 1.0 - duty
-        return ((duty * self.v_in + off * voltage - self.R_series * current) / self.L,
-                (-off * current - voltage / self.R_load) / self.C)
-
-    def _buck_boost_off_rhs(self, t: float):
-        current, voltage = self.state.i_L, self.state.u_o
-        return ((voltage - self.R_series * current) / self.L,
-                (-current - voltage / self.R_load) / self.C)
-
-    def _buck_boost_zero_current_rhs(self, t: float):
-        voltage, duty = self.state.u_o, self.inp.q
-        derivative = (duty * self.v_in + (1.0 - duty) * voltage) / self.L
-        return (derivative if derivative > 0.0 else 0.0,
-                -voltage / (self.R_load * self.C))
-
-    def dissipated_power(self) -> float:
-        current, voltage = self.state.i_L, self.state.u_o
-        if self.switching:
-            winding = self.R_series * current * current
-        else:
-            duty = self.inp.q if self.enabled else 0.0
-            _alpha, _beta, _total, _resistance, rms = self._averaged_conduction(duty)
-            magnitude = max(0.0, current)
-            if rms == 1.0 and 0.0 < duty < 1.0 and magnitude != 0.0:
-                bias = self._averaged_bias()
-                ripple = (bias - self.R_series * magnitude) * duty * self.period / self.L
-                rms += ripple * ripple / (12.0 * magnitude * magnitude)
-            winding = self.R_series * rms * magnitude ** 2
-        return winding + voltage * voltage / self.R_load
-
-    def supplied_power(self) -> float:
-        return self.v_in * self.out.i_in
-
-
 class DCConverter(Unit):
-    """Buck, Boost or Buck-Boost unit assembled around a half bridge.
+    """Open DC converter unit with the same network boundary as :class:`VSC`.
 
-    The bridge owns switching/PWM timing, the plant owns the topology's storage equations, and
-    :class:`ScalarController` adapts the shared control graph to scalar measurements.
+    The unit owns its DC link, selected half/full bridge, controller and optional series filter.
+    Its terminal is connected to a named point-network bus by ``System``. Composite units may instead
+    connect the bridge port directly to an internal subsystem, as WPT does.
     """
 
     def __init__(self, name: str, cfg: UnitParams, sim: SimulationParams,
-                 ctrl: Optional[ScalarController] = None,
-                 modulator: Optional[Modulator] = None) -> None:
+                 bus: Any = None, *, link: Any = None, side: Optional[str] = None,
+                 ctrl: Optional[Any] = None, modulator: Optional[Modulator] = None) -> None:
         self.name = name
         self.cfg = cfg
         self.scenario = Scenario(cfg.events)
-        upper_controlled, lower_controlled = {
-            "buck": (True, False),
-            "boost": (False, True),
-            "buck_boost": (False, True),
-        }[cfg.topology]
-        leg = HalfBridge(
-            upper_controlled=upper_controlled,
-            lower_controlled=lower_controlled,
+        self.bus, self.link, self.side = bus, link, side
+        power_scale = 1.0 if bus is None else bus.power_scale
+        topology = (
+            HalfBridge(
+                upper_controlled=cfg.bridge.upper_controlled,
+                lower_controlled=cfg.bridge.lower_controlled,
+                power_scale=power_scale,
+            )
+            if cfg.bridge.type == "half_bridge"
+            else FullBridge(power_scale=power_scale)
         )
-        self.plant = _DCPlant(cfg, leg)
-        self.bridge = make_bridge(cfg, sim, modulator, topology=leg)
+        self.dclink = make_dclink(cfg.dclink)
+        connected, since, ramp = self.scenario.at(sim.initial.t)
+        self.dclink.connect(
+            connected,
+            since,
+            ramp if sim.initial.t < since + ramp else 0.0,
+        )
+        self.branch_f = None if cfg.filter is None else RLBranch(
+            cfg.filter.l_f,
+            cfg.filter.r_f,
+            phases=bus.phases,
+            unilateral=(
+                bus.phases == 1
+                and isinstance(topology, HalfBridge)
+                and not topology.lower_controlled
+            ),
+        )
+        self.bridge = make_bridge(cfg, sim, modulator, topology=topology)
+        if (self.branch_f is not None and self.branch_f.unilateral
+                and cfg.bridge.model != "switching"):
+            self.branch_f.conduction = HalfBridgeDiodeConduction(cfg.pwm.switching_period)
+            if cfg.bridge.model == "pwm_averaging":
+                self.branch_f.diode_maximum_step = (
+                    lambda: self.branch_f.conduction.maximum_step(self.branch_f)
+                )
         self.continuous = bool(getattr(self.bridge, "continuous", False))
-        self.ctrl = ctrl if ctrl is not None else ScalarController(cfg)
+        controller_type = ResonantController if cfg.ctrl.type == "resonant" else ScalarController
+        self.ctrl = ctrl if ctrl is not None else controller_type(cfg)
         if bool(getattr(self.ctrl, "continuous", False)) != self.continuous:
             raise TypeError(
                 f"{name}: the controller and bridge must both be sampled or both be continuous"
             )
-        self.bridge.reset(np.zeros(1), on=False)
+        self.bridge.reset(np.full(len(topology.duty_names), 0.5), on=False)
         self.zoh = f"{name}.q"
         self.adc = None
         self.windowed = self._oversamples = False
@@ -893,33 +612,64 @@ class DCConverter(Unit):
         self._max_current = 0.0
 
     def subsystems(self) -> dict[str, Any]:
-        parts = {f"{self.name}.plant": self.plant}
+        parts = {
+            f"{self.name}.bridge": self.bridge,
+            f"{self.name}.dclink": self.dclink,
+        }
+        if self.branch_f is not None:
+            parts[f"{self.name}.branch_f"] = self.branch_f
         if self.continuous:
             parts[f"{self.name}.ctrl"] = self.ctrl
         return parts
 
     def connections(self) -> dict:
-        if not self.continuous:
-            return {}
-        return {
-            (self.ctrl, "current"): (self.plant, "i_L"),
-            (self.ctrl, "voltage"): (self.plant, "u_o"),
-            (self.ctrl, "vin"): (self.plant, "v_in"),
-            (self.plant, "q"): (self.ctrl, "q"),
-        }
+        if self.branch_f is not None:
+            connections = self.bridge.connections(self.dclink, self.branch_f)
+            if self.branch_f.conduction is not None:
+                connections[(self.branch_f, "u_dc")] = (self.dclink, "u_dc")
+        else:
+            connections = {
+                (self.link, f"u_{self.side}"): (self.bridge, "u_c"),
+                (self.bridge, "i_c"): (self.link, f"i_{self.side}"),
+                (self.dclink, "i_dc"): (self.bridge, "i_dc"),
+                (self.bridge, "u_dc"): (self.dclink, "u_dc"),
+            }
+        if self.continuous:
+            if self.cfg.ctrl.type == "resonant":
+                connections.update({
+                    (self.ctrl, "current"): self._current_connection(),
+                    (self.ctrl, "u_dc"): (self.dclink, "u_dc"),
+                })
+            else:
+                connections.update({
+                    (self.ctrl, "current"): (self.branch_f, "i"),
+                    (self.ctrl, "voltage"): (self.bus, "u"),
+                    (self.ctrl, "vin"): (self.dclink, "u_dc"),
+                })
+            connections[(self.bridge, "q")] = (self.ctrl, "q")
+            if self.branch_f is not None and self.branch_f.conduction is not None:
+                connections[(self.branch_f, "q")] = (self.ctrl, "q")
+        return connections
 
     def zoh_connections(self) -> dict:
-        return {} if self.continuous else {(self.plant, "q"): self.zoh}
+        if self.continuous:
+            return {}
+        connections = self.bridge.zoh_connections(self.zoh)
+        if self.branch_f is not None and self.branch_f.conduction is not None:
+            connections[(self.branch_f, "q")] = self.zoh
+        return connections
 
-    @staticmethod
-    def terminals() -> tuple:
-        return ()
+    def terminals(self) -> tuple:
+        if self.branch_f is None:
+            return ()
+        return ((self.cfg.bus, self.branch_f.terminal2),)
 
     def aliases(self) -> dict[str, str]:
-        return {
-            f"{self.name}.i_L": f"{self.name}.plant.i_L",
-            f"{self.name}.u_o": f"{self.name}.plant.u_o",
-        }
+        out = ({f"{self.name}.i_c": f"{self.name}.branch_f.i"}
+               if self.branch_f is not None else {})
+        if self.cfg.dclink.capacitor is not None:
+            out[f"{self.name}.u_dc"] = f"{self.name}.dclink.u_C"
+        return out
 
     @property
     def tripped(self) -> bool:
@@ -934,11 +684,13 @@ class DCConverter(Unit):
 
     def _set_gates(self, on: bool) -> None:
         self.gates = bool(on) and self.breaker and not self.tripped
-        self.plant.set_enabled(self.gates)
+        if self.branch_f is not None:
+            (self.branch_f.close_breaker if self.gates else self.branch_f.open_breaker)()
 
     def connect(self, on: bool, t: float, ramp: float = 0.0) -> None:
         effective = bool(on) and not self.tripped
         self.breaker = effective
+        self.dclink.connect(effective, t, ramp)
         if self.continuous:
             self.ctrl.command_at(effective, ramp, t)
             self.bridge.enabled = effective
@@ -949,7 +701,12 @@ class DCConverter(Unit):
 
     def retune(self, cfg: UnitParams, paths: list[str], t: float) -> None:
         self.cfg = cfg
-        self.ctrl.retune(cfg, paths, t)
+        if any(path.startswith("dclink.source.") for path in paths):
+            source = cfg.dclink.source
+            self.dclink.retune_source(source.i, source.k, source.v, source.r)
+        rest = [path for path in paths if not path.startswith("dclink.")]
+        if rest:
+            self.ctrl.retune(cfg, rest, t)
 
     def trip(self, t: float, cause: str, plant: Optional[Plant] = None,
              detail: str = "") -> None:
@@ -960,7 +717,9 @@ class DCConverter(Unit):
         self._tripped = True
         self._trip_cause = cause
         self.breaker = False
+        self.dclink.open_breaker()
         self.ctrl.command_at(False, 0.0, t) if self.continuous else self.ctrl.command(False)
+        self.bridge.enabled = False
         self._set_gates(False)
 
     def start(self, t: float) -> None:
@@ -994,15 +753,22 @@ class DCConverter(Unit):
         plant.hold(self.zoh, self.bridge.start(t, (None, None), continued))
 
     def protect(self, t: float, plant: Plant) -> bool:
-        self._max_current = max(self._max_current, abs(self.plant.state.i_L))
+        self._max_current = max(self._max_current, abs(self._current()))
         return False
 
     def sense(self, t: float, plant: Plant) -> Optional[tuple[int, Any]]:
         if self.continuous or not self.bridge.control_due(t):
             return None
         plant.outputs(t)
-        out = self.plant.out
-        result = self.ctrl.sample(t, out.i_L, out.u_o, out.v_in)
+        if self.cfg.ctrl.type == "resonant":
+            result = self.ctrl.sample(t, self._current(), self.dclink.out.u_dc)
+        else:
+            result = self.ctrl.sample(
+                t,
+                self._current(),
+                self.bus.out.u,
+                self.dclink.out.u_dc,
+            )
         self._write_due = (t, result)
         return self.bridge.control_index, result
 
@@ -1028,21 +794,25 @@ class DCConverter(Unit):
         return seen
 
     def signals(self) -> dict[str, float]:
-        out = self.plant.out
         return {
-            f"{self.name}.i_L": out.i_L,
-            f"{self.name}.u_o": out.u_o,
-            f"{self.name}.v_in": out.v_in,
-            f"{self.name}.i_in": out.i_in,
+            f"{self.name}.i_c": self._current(),
+            f"{self.name}.u_g": (
+                self.bus.out.u if self.bus is not None else self.bridge.out.u_c
+            ),
+            f"{self.name}.u_dc": self.dclink.out.u_dc,
+            f"{self.name}.i_dc": self.bridge.out.i_dc,
         }
 
     def control_inputs(self) -> dict[str, float]:
         """Return the SI values exposed by the scalar control interface."""
-        out = self.plant.out
-        return self.ctrl.control_inputs(out.i_L, out.u_o, out.v_in)
+        if self.cfg.ctrl.type == "resonant":
+            return self.ctrl.control_inputs(self._current(), self.dclink.out.u_dc)
+        return self.ctrl.control_inputs(
+            self._current(), self.bus.out.u, self.dclink.out.u_dc,
+        )
 
     def enabled_subsystems(self) -> tuple[Any, ...]:
-        return (self.plant,)
+        return ()
 
     def control_maxima(self) -> dict[str, tuple[str, float, float]]:
         return {
@@ -1052,3 +822,14 @@ class DCConverter(Unit):
     @property
     def trip_cause(self) -> Optional[str]:
         return self._trip_cause
+
+    def _current(self) -> float:
+        if self.branch_f is not None:
+            return self.branch_f.out.i
+        return getattr(self.link.out, f"i_{self.side}")
+
+    def _current_connection(self) -> tuple[Any, str]:
+        if self.branch_f is not None:
+            return self.branch_f, "i"
+        return self.link, f"i_{self.side}"
+
