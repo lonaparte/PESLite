@@ -267,7 +267,35 @@ def test_generated_cpp_uses_public_ports_for_scalar_converters(
     assert max(abs(actual[key] - expected[key]) for key in expected) <= tolerance * scale
 
 
-@pytest.mark.parametrize("mode", ("switching", "pwm_averaging"))
+def test_generated_cpp_reuses_common_adc_and_protection_for_dc_converter(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "buck-example.pes").replace(**{
+        "units.converter.meas.average": ["current", "voltage", "vin"],
+        "units.converter.meas.window": 50.0e-6,
+        "units.converter.protection.overcurrent.enable": 1,
+        "units.converter.protection.overcurrent.limit_pu": 0.05,
+        "simulation.stop_on_trip": 0,
+        "simulation.t_end": 0.001,
+        "simulation.output.states": True,
+        "simulation.output.signals": False,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    })
+    _source, cpp_out, python_out = _run_generated(
+        params, tmp_path / "dc-common-runtime", compiler
+    )
+
+    actual = _final_csv(cpp_out / "states.csv")
+    expected = _final_csv(python_out / "states.csv")
+    assert actual.keys() == expected.keys()
+    assert max(abs(actual[key] - expected[key]) for key in actual) < 1e-8
+    assert _summary(cpp_out).keys() == _summary(python_out).keys()
+    assert _summary(cpp_out)["converter.trip_cause"] == "overcurrent"
+
+
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
 def test_generated_cpp_matches_python_for_adaptive_dcm(mode, tmp_path):
     compiler = _compiler()
     if compiler is None:

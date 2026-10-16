@@ -1,47 +1,50 @@
-"""The ADC of a converter: instantaneous samples of its measurement ports, or their means over an
-averaging window ``(X(t) - X(t - length)) / length`` of trapezoidal integrals (SI values), taken at
-each control interrupt and, when oversampling, between interrupts."""
+"""The common converter ADC: instantaneous named samples or window means in SI units."""
 
 from __future__ import annotations
 
-import dataclasses
 import math
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
-import numpy as np
-
-from ..control.blocks import complex2abc
-from ..control.controller import Measurement
 from .pwm import TIME_EPS
 
-__all__ = ["MeasurementPorts", "ADC"]
+__all__ = ["ADCSample", "MeasurementPorts", "ADC"]
 
 
-@dataclass(frozen=True)
-class MeasurementPorts:
-    """Zero-argument callables that read one converter's quantities from the model (SI).
+@dataclass(frozen=True, slots=True)
+class ADCSample:
+    """One generic converter sample before its unit-specific control adaptation.
 
-    ``u_g`` terminal voltage, ``i_c`` converter current, ``u_dc`` dc voltage;
-    ``i_c_state`` reads the current from the state vector; ``i_dc`` is recorded only.
+    ``values`` is the published control value. ``samples`` contains the instantaneous
+    conversions in chronological order; its final entry is the conversion at ``t``. An
+    instantaneous entry has an empty ``samples`` tuple.
     """
 
-    u_g: Callable[[], complex]
-    i_c: Callable[[], complex]
-    i_c_state: Callable[[], complex]
-    u_dc: Callable[[], float]
-    i_dc: Optional[Callable[[], float]] = None
+    t: float
+    values: Mapping[str, complex | float]
+    samples: tuple["ADCSample", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementPorts:
+    """Named zero-argument readers at a converter's control boundary."""
+
+    readers: Mapping[str, Callable[[], complex | float]]
 
     def read(self) -> dict[str, complex | float]:
         """The instantaneous values of the ADC channels."""
-        return {"u_g": self.u_g(), "i_c": self.i_c(), "u_dc": self.u_dc()}
+        return {name: read() for name, read in self.readers.items()}
+
+    def value(self, name: str) -> complex | float:
+        """Read one named channel."""
+        return self.readers[name]()
 
 
 class ADC:
     """Sampler triggered every control ``period`` and optionally between interrupts.
 
-    The channels in ``channels`` (``"u_g"``, ``"i_c"``, ``"u_dc"``) are averaged
-    over a window of ``length`` s ending at the interrupt; the others are instantaneous.
+    The named channels in ``channels`` are averaged over a window of ``length`` s ending at the
+    interrupt; all other ports are instantaneous.
     Named state per averaged channel ``c``: ``x_c``, the integral accumulated in the open window.
     """
 
@@ -59,7 +62,7 @@ class ADC:
         self._last = dict(channels)  # previous sample
         self.period, self.sample_period = period, sample_period
         self.samples = max(1, int(round(period / sample_period)))
-        self.peeks: list[Measurement] = []  # samples taken since the last interrupt
+        self.peeks: list[ADCSample] = []  # instantaneous samples since the last interrupt
         self.n_samp = 1  # sample 0 of a period is its control interrupt
         # the next interrupt's window is open (a full-period window opens at the interrupt itself)
         self.window_open = self.length is None or self._full
@@ -88,8 +91,8 @@ class ADC:
             self.held_before(max(0.0, t - (next_ - length)))
         self.peeks = []
         if self.n_samp > 1:  # a new run between interrupts: earlier samples use its start values
-            first = self.measure(t)
-            self.peeks = [dataclasses.replace(first, t=last + i * self.sample_period)
+            values = self.ports.read()
+            self.peeks = [ADCSample(last + i * self.sample_period, values)
                           for i in range(1, self.n_samp)]
 
     # ------------------------------------------------------------ the window
@@ -131,10 +134,10 @@ class ADC:
 
     def peek(self, t: float) -> None:
         """Take an oversample between two control interrupts."""
-        self.peeks.append(self.measure(t))
+        self.peeks.append(ADCSample(t, self.ports.read()))
         self.n_samp += 1
 
-    def sample(self, t: float) -> Measurement:
+    def sample(self, t: float) -> ADCSample:
         """Take the sample at the control interrupt ``t``, with the preceding oversamples,
         and rearm the averaging window."""
         meas = self.measure(t)
@@ -144,33 +147,16 @@ class ADC:
                 self.open()
             else:
                 self.accumulated = dict(self._zero)
-        if self.samples > 1:  # oversampling: this publication's samples, oldest first
-            meas = dataclasses.replace(meas, samples=tuple(self.peeks) + (meas,))
+        meas = ADCSample(meas.t, meas.values, tuple(self.peeks) + meas.samples)
         self.peeks, self.n_samp = [], 1
         return meas
 
-    def measure(self, t: float) -> Measurement:
-        """Return the :class:`Measurement` at ``t``; model outputs must be up to date at ``t``.
-
-        ``u_g``, ``i_c``, ``u_dc`` are window means for averaged channels;
-        ``u_g_raw``, ``i_c_raw``, ``u_dc_raw`` and ``i_abc`` are instantaneous values before
-        averaging.
-        """
-        ports = self.ports
-        u_raw, i_raw, dc_raw = ports.u_g(), ports.i_c(), ports.u_dc()
+    def measure(self, t: float) -> ADCSample:
+        """Read every named channel at ``t`` and apply configured window means."""
+        reading = self.ports.read()
         mean = {channel: self.accumulated[channel] / self.length for channel in self.channels}
-        return Measurement(t=t,
-                           u_g=mean.get("u_g", u_raw), i_c=mean.get("i_c", i_raw),
-                           u_dc=mean.get("u_dc", dc_raw), i_abc=complex2abc(i_raw),
-                           u_g_raw=u_raw, i_c_raw=i_raw, u_dc_raw=dc_raw)
-
-    def phase_currents(self) -> np.ndarray:
-        """Return the instantaneous phase currents read from the state vector."""
-        return complex2abc(self.ports.i_c_state())
-
-    def current_space_vector(self) -> complex:
-        """Return the instantaneous current state without allocating a phase array."""
-        return complex(self.ports.i_c_state())
+        values = {channel: mean.get(channel, value) for channel, value in reading.items()}
+        return ADCSample(t=t, values=values, samples=(ADCSample(t=t, values=reading),))
 
     # ------------------------------------------------------------ its states
     def get_state(self) -> dict[str, Any]:

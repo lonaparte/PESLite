@@ -11,10 +11,10 @@ from .network import (ELEMENT_TYPES, Element, Load, Resistor, RCNode, RLBranch, 
                       ThreePhaseSource, VoltageSource, register_element_type)
 from .converter import (AveragingBridge, PWMBridge, SwitchingBridge, ThreePhaseBridge,
                         DCCapacitor, DCCurrentSource, DCLink,
-                        DCVoltageSource, DeviceParameters, FullBridge, HalfBridge,
+                        DCVoltageSource, FullBridge, HalfBridge,
                         HalfBridgeDiodeConduction,
                         make_bridge, make_dclink)
-from .adc import ADC, MeasurementPorts
+from .adc import ADC, ADCSample, MeasurementPorts
 from .pwm import ZOH, CarrierComparison, PWM, SwitchingSequence, SynchronousCarrier, make_modulator
 from .wpt import LCCLink, SSLink, make_wpt_link
 
@@ -22,8 +22,8 @@ __all__ = ["Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELE
            "Bag", "ConfigError", "PowerPort", "StoragePort",
            "register_element_type", "Load", "Resistor", "VoltageSource", "ThreePhaseBridge", "SwitchingBridge",
            "PWMBridge", "make_bridge", "DCLink",
-           "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink", "ADC",
+           "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink", "ADC", "ADCSample",
            "MeasurementPorts", "AveragingBridge", "HalfBridge",
-           "FullBridge", "HalfBridgeDiodeConduction", "DeviceParameters", "PWM", "SwitchingSequence",
+           "FullBridge", "HalfBridgeDiodeConduction", "PWM", "SwitchingSequence",
            "CarrierComparison", "SynchronousCarrier", "ZOH", "make_modulator",
            "SSLink", "LCCLink", "make_wpt_link"]

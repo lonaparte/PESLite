@@ -151,14 +151,15 @@ def _control(c, dclink, pwm, where: str, continuous: bool = False) -> None:
         reference_validator(c.references, f"{where}.references")
 
 
-def _measurement(m, T_c: Optional[float], where: str) -> None:
+def _measurement(m, T_c: Optional[float], where: str,
+                 channels: frozenset[str]) -> None:
     """Check ADC oversampling and averaging windows within one control period."""
     if not isinstance(m.average, (list, tuple)):
         raise ConfigError(f"{where}.average: expected a list of channels, got {m.average!r}")
-    unknown = set(m.average) - {"u_g", "i_c", "u_dc"}
+    unknown = set(m.average) - channels
     if unknown:
         raise ConfigError(f"{where}.average: unknown channel(s) {sorted(unknown)}; "
-                          "known: ['i_c', 'u_dc', 'u_g']")
+                          f"known: {sorted(channels)}")
     if len(set(m.average)) != len(m.average):
         raise ConfigError(f"{where}.average: channels must not be repeated")
     for key in ("period", "window"):
@@ -209,6 +210,26 @@ def _converter(u, base, where: str):
     _pwm(u.pwm, base, f"{where}.pwm", continuous)
     _timing(u.ctrl, u.pwm, f"{where}.ctrl", continuous)
     _control(u.ctrl, u.dclink, u.pwm, f"{where}.ctrl", continuous)
+    _measurement(
+        u.meas,
+        None if continuous else _period(u.ctrl, u.pwm),
+        f"{where}.meas",
+        spec.measurement_channels,
+    )
+    protection = u.protection
+    for name in ("overcurrent", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof"):
+        criterion = getattr(protection, name)
+        _switched(criterion, f"{where}.protection.{name}")
+        if criterion.enable and name not in spec.protection_criteria:
+            raise ConfigError(
+                f"{where}.protection.{name}: unit type {u.type!r} does not provide "
+                "the required signal"
+            )
+    if not math.isfinite(protection.hold) or protection.hold < 0:
+        raise ConfigError(f"{where}.protection.hold must be finite and >= 0, got {protection.hold}")
+    if not math.isfinite(protection.rocof.window) or protection.rocof.window <= 0:
+        raise ConfigError(f"{where}.protection.rocof.window must be finite and positive, "
+                          f"got {protection.rocof.window}")
     return topology, continuous
 
 
@@ -216,18 +237,11 @@ def _unit(u, base, where: str, *, nested: bool = False) -> None:
     """Check one converter unit."""
     if nested:
         raise ConfigError(f"{where}: a three-phase VSC cannot be used as a scalar composite port")
-    _topology, continuous = _converter(u, base, where)
+    _topology, _continuous = _converter(u, base, where)
+    if u.bus is None:
+        raise ConfigError(f"{where}.bus: a VSC needs a three-phase bus")
     if u.ac_filter.l_f <= 0.0:
         raise ConfigError(f"{where}.ac_filter.l_f must be > 0")
-    _measurement(u.meas, None if continuous else _period(u.ctrl, u.pwm), f"{where}.meas")
-    protection = u.protection
-    for name in ("overcurrent", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof"):
-        _switched(getattr(protection, name), f"{where}.protection.{name}")
-    if not math.isfinite(protection.hold) or protection.hold < 0:
-        raise ConfigError(f"{where}.protection.hold must be finite and >= 0, got {protection.hold}")
-    if not math.isfinite(protection.rocof.window) or protection.rocof.window <= 0:
-        raise ConfigError(f"{where}.protection.rocof.window must be finite and positive, "
-                          f"got {protection.rocof.window}")
 
 
 def _dc_converter(u, base, where: str, *, nested: bool = False) -> None:
@@ -236,7 +250,7 @@ def _dc_converter(u, base, where: str, *, nested: bool = False) -> None:
     if (u.bus is None) != (u.filter is None):
         raise ConfigError(f"{where}: bus and filter must be specified together")
     if nested and u.bus is not None:
-        raise ConfigError(f"{where}: a directly connected composite port cannot also name a bus")
+        raise ConfigError(f"{where}: a composite child uses its parent's scoped power bus")
     if not nested and u.bus is None:
         raise ConfigError(f"{where}.bus: a standalone DC converter needs a scalar bus")
     if u.filter is not None and u.filter.l_f <= 0.0:
@@ -245,7 +259,7 @@ def _dc_converter(u, base, where: str, *, nested: bool = False) -> None:
         raise ConfigError(f"{where}.pwm.sync: scalar converters require asynchronous PWM")
 
 
-def _wpt(u, base, where: str) -> None:
+def _wpt(u, base, where: str, *, nested: bool = False) -> None:
     """Check a WPT composite and its shared compensated magnetic link."""
     if u.s_base is not None and (not math.isfinite(u.s_base) or u.s_base <= 0.0):
         raise ConfigError(f"{where}.s_base must be finite and positive, got {u.s_base}")
@@ -253,9 +267,9 @@ def _wpt(u, base, where: str) -> None:
         child = getattr(u, side)
         child_where = f"{where}.{side}"
         spec = unit_type(child.type, f"{child_where}.type")
-        if not spec.direct_power_port or spec.validator is None:
+        if spec.phases != 1 or spec.validator is None:
             raise ConfigError(
-                f"{child_where}: a WPT child needs a unit type with a direct scalar power port"
+                f"{child_where}: a WPT child needs a scalar unit"
             )
         spec.validator(child, base, child_where, nested=True)
     link = u.link
@@ -306,13 +320,6 @@ def _network(p: Params) -> None:
     }
     if (connected_units or p.branches or p.sources or p.elements) and not p.buses:
         raise ConfigError("buses: a connected electrical network needs at least one bus")
-    seen: dict[str, str] = {}
-    for kind in NAMED:
-        for name in getattr(p, kind):
-            if name in seen:
-                raise ConfigError(f"{kind}.{name}: the name is already used by {seen[name]}; element "
-                                  f"names are unique across buses, branches, sources, units and elements")
-            seen[name] = f"{kind}.{name}"
     for name, bus in p.buses.items():
         if bus.c <= 0.0:
             raise ConfigError(f"buses.{name}.c must be > 0: the shunt capacitor is what makes the "
@@ -397,15 +404,24 @@ def _events(p: Params) -> None:
             if isinstance(value, float) and not math.isfinite(value):
                 raise ConfigError(f"{where}.{key} must be finite")
         target = getattr(event, "target", None)
-        section = p.section_of(target) if isinstance(target, str) else None
-        if target is not None and section is None:
+        sections = p.sections_of(target) if isinstance(target, str) else ()
+        if target is not None and not sections:
             known = sorted(name for named in NAMED for name in getattr(p, named))
             raise ConfigError(f"{where}.target: unknown name {target!r}; known: {known}")
+        candidates = tuple(section for section in sections if section in SWITCHABLE)
         if event.type not in SWITCHING:
+            if len(sections) > 1:
+                raise ConfigError(
+                    f"{where}.target: {target!r} is ambiguous across {list(sections)}"
+                )
             continue
-        if section not in SWITCHABLE:
+        if not candidates:
             raise ConfigError(f"{where}.target: {target!r} is a bus, which has no breaker; {event.type} "
                               f"switches a unit, source, branch or element")
+        if len(candidates) > 1:
+            raise ConfigError(
+                f"{where}.target: {target!r} is ambiguous across {list(candidates)}"
+            )
         on = event.type == "connect"
         leaves = _unit_leaves(p.units, target)
         affected = leaves if leaves else (target,)

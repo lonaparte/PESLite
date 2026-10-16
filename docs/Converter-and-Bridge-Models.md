@@ -37,7 +37,7 @@ additional bridge structures.
 
 A half bridge independently declares whether its upper and lower positions are controlled. For a
 diode-bounded Buck application, the upper position is controlled and the lower position is a
-diode; its external point-network port is the output. For a diode-bounded Boost application, the
+diode; its external named bus is the output. For a diode-bounded Boost application, the
 lower position is controlled and the upper position is a diode; the same external terminal is the
 input and its branch orientation follows the positive power-flow direction. A fully controlled
 half bridge and a full bridge remain bidirectional. `buck-example.pes`, `boost-example.pes` and the
@@ -59,14 +59,23 @@ reverse current and does not receive this boundary handling.
 The averaged forms store cycle-mean filter current, which remains positive in DCM even though the
 instantaneous current has a zero-current interval. They derive the controlled, diode and idle
 fractions from duty, carrier period, mean current and the external terminal voltage. The diode law
-belongs to the half bridge while the R-L state remains in the external filter branch. Consequently
-the averaged DCM conversion ratio is not forced to the CCM duty-ratio relation, and no output
-capacitor or load is hidden inside the converter Unit.
+belongs to the half bridge while the R-L state remains in the external filter branch. One explicit
+algebraic conduction subsystem supplies the branch derivative, the bridge DC-current transfer
+ratio, the copper-loss factor and the local step request. Consequently the averaged DCM conversion
+ratio and DC-terminal current are not forced to their CCM duty-ratio relation, Python and exported
+C++ use the same loss equation, and no output capacitor or load is hidden inside the converter
+Unit.
+
+The cycle-mean DCM state does not have the ordinary instantaneous `L i^2 / 2` storage function.
+Energy reporting therefore keeps the physical port power and copper loss but flags strict energy
+auditing when this averaged conduction relation is present instead of reporting false closure.
 
 For either averaged form, the diode-conduction stage requests a local step of at most one tenth of
 the physical switching period while the operating point is in DCM. In CCM it imposes no extra
 limit, so the configured solver step remains in force. This resolution limit creates no PWM or
-carrier events and applies equally to fixed and adaptive solvers.
+carrier events and applies equally to fixed, adaptive and multirate solvers. A subsystem with a
+state-dependent local limit cannot be placed in a window-averaged group because that group cannot
+resolve its conduction transition.
 
 ## Switching
 

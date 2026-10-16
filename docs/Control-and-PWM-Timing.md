@@ -55,9 +55,10 @@ normally sends the result to `InductorCurrentControl`; a VSC sends it to the d-a
 
 ## ADC sampling
 
-The ADC exposes terminal voltage `u_g`, converter current `i_c` and DC voltage `u_dc`. Channels not
-listed under `meas.average` are instantaneous at the controller interrupt. Listed channels use the
-mean over a window ending at that interrupt:
+Every sampled converter uses the same ADC implementation. A VSC exposes `u_g`, `i_c` and `u_dc`;
+a scalar DC converter exposes `current`, `voltage` and `vin`. Channels not listed under
+`meas.average` are instantaneous at the controller interrupt. Listed channels use the mean over a
+window ending at that interrupt:
 
 ```yaml
 meas:
@@ -82,7 +83,9 @@ corresponding computation has completed; otherwise the previous active word rema
 
 ## Shadow and active registers
 
-Both register banks contain `d_a`, `d_b`, `d_c` and the PWM enable bit:
+Both register banks contain the selected topology's duty fields and the PWM enable bit. A
+three-phase bridge uses `d_a`, `d_b` and `d_c`; scalar half/full bridges expose their registered
+duty names through the same bridge contract:
 
 - `shadow`: most recently computed duty word waiting for an eligible load;
 - `active`: word currently applied to the modulator and bridge.
@@ -111,9 +114,10 @@ pwm:
 - `single` loads the active register at carrier valleys: one load per switching period;
 - `double` loads at valleys and peaks: two loads per switching period.
 
-`pwm.method` selects `spwm` or `svpwm`. `pwm.sync: asynchronous` places the carrier on absolute
-time and allows `carrier_phase`; `synchronous` locks carrier timing to the controller angle and
-requires an integer pulse ratio `f_sw / base.f0`.
+`pwm.method` selects `spwm` or `svpwm` for a three-phase VSC. `pwm.sync: asynchronous` places the
+carrier on absolute time and allows `carrier_phase`; `synchronous` locks three-phase carrier timing
+to the controller angle and requires an integer pulse ratio `f_sw / base.f0`. Scalar converters use
+the same PWM scheduler with asynchronous timing.
 
 ## Startup and synchronization
 
@@ -128,12 +132,17 @@ free-running angle.
 
 ## Protection clocks
 
-All protection and the trip latch belong to the `VSC`:
+All protection and the trip latch belong to the converter `Unit`, independently of its AC or DC
+signal adapter:
 
 - instantaneous overcurrent protection runs at switching or held-bridge edges;
 - voltage, frequency, DC-voltage and ROCOF criteria run from controller-rate measurements;
 - sampled criteria are armed after startup reports completion;
-- a trip blocks the gates, opens the AC terminal and disconnects the DC source.
+- a trip blocks the gates, opens an external terminal when present and disconnects the DC source.
+
+Frequency and ROCOF require the synchronization frequency supplied by a VSC controller. A scalar
+DC converter therefore accepts overcurrent, terminal under/overvoltage and DC-link voltage
+protection, but rejects frequency criteria during validation.
 
 The controller reports measurements and startup status but does not own the physical trip action.
 

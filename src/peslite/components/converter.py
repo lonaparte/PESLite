@@ -5,7 +5,6 @@ bridge also owns the timing which turns sampled controller commands into its mod
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 from typing import Any, Callable, ClassVar, Mapping, NamedTuple, Optional
 
@@ -15,16 +14,17 @@ from numpy.typing import NDArray
 from ..control.blocks import smoothstep
 from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, ConfigError, Empty, OutputMethod
+from .network import Terminal
 from .pwm import TIME_EPS, Modulator, PWM, ZOH, make_modulator
 
 __all__ = ["ThreePhaseBridge", "SwitchingBridge", "PWMBridge", "AveragingBridge",
-           "HalfBridge", "FullBridge", "DeviceParameters", "DCLink", "DCCapacitor",
+           "HalfBridge", "FullBridge", "DCLink", "DCCapacitor",
            "DCCurrentSource", "DCVoltageSource", "HalfBridgeDiodeConduction",
            "make_topology", "make_bridge", "make_dclink"]
 
 
 class _BridgeInp(Bag):
-    __slots__ = ("q", "u_dc", "i_c")
+    __slots__ = ("q", "current_ratio", "u_dc", "i_c")
 
 
 class _BridgeOut(Bag):
@@ -37,6 +37,10 @@ def _set_three_phase_dc_current(bridge, _t: float) -> None:
 
 def _set_scalar_dc_current(bridge, _t: float) -> None:
     bridge.out.i_dc = (bridge.inp.q * bridge.inp.i_c).real
+
+
+def _set_scalar_transferred_current(bridge, _t: float) -> None:
+    bridge.out.i_dc = (bridge.inp.current_ratio * bridge.inp.i_c).real
 
 
 class ThreePhaseBridge:
@@ -104,13 +108,21 @@ class _BridgeModel:
         OutputMethod("set_dc_current", inputs=("q", "i_c"), outputs=("i_dc",)),
         OutputMethod("set_ac_voltage", inputs=("q", "u_dc"), outputs=("u_c",)),
     )
+    _transferred_current_stages: ClassVar[tuple[OutputMethod, ...]] = (
+        OutputMethod(
+            "set_dc_current", inputs=("current_ratio", "i_c"), outputs=("i_dc",)
+        ),
+        OutputMethod("set_ac_voltage", inputs=("q", "u_dc"), outputs=("u_c",)),
+    )
 
     def __init__(self, topology=None) -> None:
         self.topology = topology if topology is not None else ThreePhaseBridge()
         self.state = Empty()
         zero = self.topology.zero
-        self.inp = _BridgeInp(q=zero, u_dc=0.0, i_c=zero)
+        self.inp = _BridgeInp(q=zero, current_ratio=zero, u_dc=0.0, i_c=zero)
         self.out = _BridgeOut(u_c=zero, i_dc=0.0)
+        self.dc_terminal = Terminal(self, "u_dc", "i_dc", 1)
+        self.power_terminal = Terminal(self, "u_c", "i_c", -1, drives_voltage=True)
         self.set_dc_current = self.topology.set_dc_current.__get__(self, type(self))
 
     def set_ac_voltage(self, t: float) -> None:
@@ -121,27 +133,18 @@ class _BridgeModel:
         self.set_dc_current(t)
         self.set_ac_voltage(t)
 
+    def use_current_transfer_ratio(self) -> None:
+        """Drive DC current from an explicit ratio while voltage remains driven by ``q``."""
+        if not isinstance(self.topology, HalfBridge):
+            raise TypeError("an independent current-transfer ratio requires a half bridge")
+        self.set_dc_current = _set_scalar_transferred_current.__get__(self, type(self))
+        self.output_stages = self._transferred_current_stages
+
     def rhs(self, t: float):
         return ()
 
-    def connections(self, dc_link, branch=None) -> dict:
-        """Connect the DC rails and, when given, one external filter branch."""
-        connections = {
-            (dc_link, "i_dc"): (self, "i_dc"),
-            (self, "u_dc"): (dc_link, "u_dc"),
-        }
-        if branch is not None:
-            reverse_port = self.topology.reverse_port
-            branch_voltage = "u2" if reverse_port else "u1"
-            current = (branch, "i", -1.0) if reverse_port else (branch, "i")
-            connections.update({
-                (branch, branch_voltage): (self, "u_c"),
-                (self, "i_c"): current,
-            })
-        return connections
-
     def zoh_connections(self, label: str) -> dict:
-        """Return the connection of the held switching state ``label`` to ``q``."""
+        """Connect the held bridge conversion ratio to ``label``."""
         return {(self, "q"): label}
 
 
@@ -345,32 +348,6 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None) -> 
     )
 
 
-@dataclass(frozen=True, slots=True)
-class DeviceParameters:
-    """Static on-state parameters shared by scalar bridge devices."""
-
-    on_resistance: float = 0.0
-    diode_drop: float = 0.0
-    diode_resistance: float = 0.0
-
-    def __post_init__(self) -> None:
-        values = (self.on_resistance, self.diode_drop, self.diode_resistance)
-        if any(not math.isfinite(value) or value < 0.0 for value in values):
-            raise ConfigError("device resistance/drop must be finite and nonnegative")
-
-
-@dataclass(frozen=True, slots=True)
-class _LegResult:
-    voltage: float
-    upper_current: float
-    lower_current: float
-    loss: float
-    path: str
-    channel_current: float = 0.0
-    diode_current: float = 0.0
-    blocked: bool = False
-
-
 @_register_topology
 class HalfBridge:
     """One scalar switching leg between upper and lower DC rails.
@@ -387,7 +364,7 @@ class HalfBridge:
     neutral_duty = 0.0
     config_fields = frozenset(("upper_controlled", "lower_controlled", "reverse_port"))
     set_dc_current = staticmethod(_set_scalar_dc_current)
-    __slots__ = ("devices", "_gate_mask", "_reverse_port")
+    __slots__ = ("_gate_mask", "_reverse_port")
 
     def switching_state(self, states) -> float:
         state = states[0]
@@ -401,8 +378,7 @@ class HalfBridge:
     def command_duties(output):
         return (output.duty,)
 
-    def __init__(self, devices: DeviceParameters | None = None, *,
-                 upper_controlled: bool = True,
+    def __init__(self, *, upper_controlled: bool = True,
                  lower_controlled: bool = True,
                  reverse_port: bool = False) -> None:
         if any(type(value) is not bool for value in (
@@ -414,9 +390,6 @@ class HalfBridge:
             raise ConfigError("a reverse half bridge needs a controlled lower device")
         if not reverse_port and not upper_controlled:
             raise ConfigError("a forward half bridge needs a controlled upper device")
-        self.devices = devices or DeviceParameters()
-        if not isinstance(self.devices, DeviceParameters):
-            raise TypeError("devices must be DeviceParameters")
         self._gate_mask = int(upper_controlled) | (int(lower_controlled) << 1)
         self._reverse_port = reverse_port
 
@@ -461,86 +434,6 @@ class HalfBridge:
         """Whether the lower position contains a controlled device."""
         return bool(self._gate_mask & 2)
 
-    def _gate_word(self, gates) -> int:
-        if len(gates) != 2 or any(value not in (0, 1, False, True) for value in gates):
-            raise ConfigError("a half bridge needs two binary gates")
-        word = int(bool(gates[0])) | (int(bool(gates[1])) << 1)
-        if word == 3:
-            raise ConfigError("shoot-through: both half-bridge devices are on")
-        if word & ~self._gate_mask:
-            raise ConfigError("gate command targets a diode-only half-bridge branch")
-        return word
-
-    def bounds(self, gates, upper: float, lower: float = 0.0) -> tuple[float, float]:
-        word = self._gate_word(gates)
-        if upper < lower:
-            raise ConfigError("upper DC rail must not be below lower rail")
-        if word == 1:
-            return upper, upper
-        if word == 2:
-            return lower, lower
-        return lower - self.devices.diode_drop, upper + self.devices.diode_drop
-
-    def resolve(self, gates, current: float, upper: float, lower: float = 0.0,
-                floating: float = 0.0) -> _LegResult:
-        word = self._gate_word(gates)
-        if upper < lower:
-            raise ConfigError("upper DC rail must not be below lower rail")
-        p = self.devices
-        if word:
-            upper_on = word == 1
-            rail = upper if upper_on else lower
-            reverse = current < 0.0 if upper_on else current > 0.0
-            channel, diode = current, 0.0
-            drop = p.on_resistance * abs(current)
-            if reverse and p.on_resistance > 0.0 and drop > p.diode_drop:
-                diode = math.copysign(
-                    (drop - p.diode_drop)
-                    / (p.on_resistance + p.diode_resistance),
-                    current,
-                )
-                channel = current - diode
-                drop = p.on_resistance * abs(channel)
-            voltage = rail - math.copysign(drop, current) if current else rail
-            upper_current, lower_current = (
-                (current, 0.0) if upper_on else (0.0, current)
-            )
-            side = "upper" if upper_on else "lower"
-            suffix = "+diode" if diode else ""
-            return _LegResult(
-                voltage,
-                upper_current,
-                lower_current,
-                max(0.0, (rail - voltage) * current),
-                f"{side}.channel{suffix}",
-                channel,
-                diode,
-            )
-        if current > 0.0:
-            voltage = lower - p.diode_drop - p.diode_resistance * current
-            return _LegResult(
-                voltage, 0.0, current, (lower - voltage) * current,
-                "lower.diode", diode_current=current,
-            )
-        if current < 0.0:
-            voltage = upper + p.diode_drop - p.diode_resistance * current
-            return _LegResult(
-                voltage, current, 0.0, (upper - voltage) * current,
-                "upper.diode", diode_current=current,
-            )
-        low = lower - p.diode_drop
-        high = upper + p.diode_drop
-        tolerance = 1e-12 * max(1.0, abs(upper), abs(lower), abs(floating))
-        if floating < low - tolerance:
-            return _LegResult(low, 0.0, 0.0, 0.0, "lower.diode")
-        if floating > high + tolerance:
-            return _LegResult(high, 0.0, 0.0, 0.0, "upper.diode")
-        return _LegResult(
-            max(low, min(high, floating)), 0.0, 0.0, 0.0,
-            "blocked", blocked=True,
-        )
-
-
 class _DiodeConductionResult(NamedTuple):
     controlled: Any
     diode: Any
@@ -548,30 +441,70 @@ class _DiodeConductionResult(NamedTuple):
     resistance_factor: Any
     derivative: Any
     in_dcm: Any
+    current_ratio: Any
+
+
+class _ConductionInp(Bag):
+    __slots__ = ("current", "q", "voltage", "supply")
+
+
+class _ConductionOut(Bag):
+    __slots__ = (
+        "controlled", "diode", "total", "resistance_factor", "derivative",
+        "in_dcm", "current_ratio", "maximum_step",
+    )
 
 
 class HalfBridgeDiodeConduction:
-    """Cycle-averaged diode conduction law for an external scalar filter branch.
+    """Stateless cycle-averaged conduction relation for a unilateral half bridge.
 
-    The branch continues to own only its R-L state. This object supplies the half-bridge's
-    within-cycle controlled, diode and idle fractions when a sampled or continuous averaged
-    bridge enters DCM naturally.
+    One evaluation supplies the branch derivative, bridge current-transfer ratio, copper-loss
+    factor and local resolution request.  It is assembled as an ordinary algebraic subsystem so
+    every consumer has an explicit model dependency and generated backends trace the same law.
     """
 
-    def __init__(self, switching_period: float, topology: HalfBridge | None = None) -> None:
+    state_names: ClassVar[tuple[str, ...]] = ()
+    outputs_need_inputs: ClassVar[bool] = True
+    observer: ClassVar[bool] = True
+    output_stages: ClassVar[tuple[OutputMethod, ...]] = (
+        OutputMethod(
+            "set_outputs",
+            inputs=("current", "q", "voltage", "supply"),
+            outputs=(
+                "controlled", "diode", "total", "resistance_factor", "derivative",
+                "in_dcm", "current_ratio", "maximum_step",
+            ),
+        ),
+    )
+
+    def __init__(self, switching_period: float, inductance: float, resistance: float,
+                 topology: HalfBridge | None = None) -> None:
         self.period = switching_period
+        self.inductance = inductance
+        self.resistance = resistance
         self.topology = topology if topology is not None else HalfBridge(lower_controlled=False)
         if not isinstance(self.topology, HalfBridge) or not self.topology.unilateral:
             raise TypeError("diode conduction requires a unilateral half-bridge topology")
+        self.state = Empty()
+        self.inp = _ConductionInp(current=0.0, q=0.0, voltage=0.0, supply=0.0)
+        self.out = _ConductionOut(
+            controlled=0.0,
+            diode=0.0,
+            total=1.0,
+            resistance_factor=1.0,
+            derivative=0.0,
+            in_dcm=False,
+            current_ratio=0.0,
+            maximum_step=math.inf,
+        )
 
-    def equations(self, current: Any, q: Any, u1: Any, u2: Any, u_dc: Any,
-                  inductance: float, resistance: float
-                  ) -> _DiodeConductionResult:
+    def equations(self, current: Any, q: Any, voltage: Any,
+                  supply: Any) -> _DiodeConductionResult:
         """Evaluate the one conduction law used by Python and generated backends."""
         current = max(0.0, current)
         duty = 1.0 - q if self.topology.reverse_port else q
-        bias = u1 if self.topology.reverse_port else u_dc - u2
-        denominator = 2.0 * inductance + resistance * duty * self.period
+        bias = supply if self.topology.reverse_port else supply - voltage
+        denominator = 2.0 * self.inductance + self.resistance * duty * self.period
         critical = duty * self.period * bias / denominator
         in_dcm = duty > 0.0 and duty < 1.0 and bias > 0.0 and current < critical
         if in_dcm:
@@ -586,53 +519,34 @@ class HalfBridgeDiodeConduction:
             resistance_factor = 1.0
         if self.topology.reverse_port:
             dcm_derivative = total * (
-                u1 - diode * u_dc - resistance * resistance_factor * current
-            ) / inductance
+                supply - diode * voltage - self.resistance * resistance_factor * current
+            ) / self.inductance
+            current_ratio = diode
         else:
             dcm_derivative = total * (
-                controlled * u_dc - u2 - resistance * resistance_factor * current
-            ) / inductance
+                controlled * supply - voltage - self.resistance * resistance_factor * current
+            ) / self.inductance
+            current_ratio = controlled
         derivative = max(0.0, dcm_derivative) if current == 0.0 else dcm_derivative
         return _DiodeConductionResult(
-            controlled, diode, total, resistance_factor, derivative, in_dcm,
+            controlled, diode, total, resistance_factor, derivative, in_dcm, current_ratio,
         )
 
-    def _branch_equations(self, branch) -> _DiodeConductionResult:
-        return self.equations(
-            branch.state.i,
-            branch.inp.q,
-            branch.inp.u1,
-            branch.inp.u2,
-            branch.inp.u_dc,
-            branch.L,
-            branch.R,
+    def set_outputs(self, _t: float) -> None:
+        result = self.equations(
+            self.inp.current, self.inp.q, self.inp.voltage, self.inp.supply,
         )
+        out = self.out
+        (out.controlled, out.diode, out.total, out.resistance_factor,
+         out.derivative, out.in_dcm, out.current_ratio) = result
+        out.maximum_step = self.period / 10.0 if result.in_dcm else math.inf
 
-    def fractions(self, branch) -> tuple[float, float, float, float]:
-        result = self._branch_equations(branch)
-        return (result.controlled, result.diode, result.total,
-                result.resistance_factor)
+    def rhs(self, _t: float):
+        return ()
 
-    def derivative(self, branch) -> float:
-        return self._branch_equations(branch).derivative
-
-    def maximum_step(self, branch) -> float:
-        _controlled, _diode, total, _rms = self.fractions(branch)
-        return self.period / 10.0 if total < 1.0 else math.inf
-
-    def resistance_factor(self, branch) -> float:
-        return self.fractions(branch)[3]
-
-
-@dataclass(frozen=True, slots=True)
-class _FullBridgeResult:
-    voltage: float
-    dc_current: float
-    loss: float
-    paths: tuple[str, str]
-    blocked: bool
-    channels: tuple[float, float, float, float]
-    diodes: tuple[float, float, float, float]
+    def diode_maximum_step(self) -> float:
+        """Return the state-dependent resolution limit produced by the latest evaluation."""
+        return self.out.maximum_step
 
 
 @_register_topology
@@ -645,15 +559,7 @@ class FullBridge:
     neutral_duty = 0.5
     config_fields = frozenset()
     set_dc_current = staticmethod(_set_scalar_dc_current)
-    __slots__ = ("left", "right", "devices")
-
-    gates = {
-        "positive": (1, 0, 0, 1),
-        "negative": (0, 1, 1, 0),
-        "zero_high": (1, 0, 1, 0),
-        "zero_low": (0, 1, 0, 1),
-        "blocked": (0, 0, 0, 0),
-    }
+    __slots__ = ()
 
     @staticmethod
     def switching_state(states) -> float:
@@ -669,11 +575,6 @@ class FullBridge:
     def command_duties(output):
         duty = output.duty
         return duty, 1.0 - duty
-
-    def __init__(self, devices: DeviceParameters | None = None) -> None:
-        self.left = HalfBridge(devices)
-        self.right = HalfBridge(self.left.devices)
-        self.devices = self.left.devices
 
     @classmethod
     def from_config(cls, _cfg: Any) -> "FullBridge":
@@ -692,83 +593,6 @@ class FullBridge:
         current, voltage = np.real(current), np.real(voltage)
         feedforward = 0.5 * (1.0 + voltage / supply) if supply > 0.0 else 0.5
         return current, voltage, supply, feedforward
-
-    def _gates(self, gates) -> tuple[int, int, int, int]:
-        if isinstance(gates, str):
-            try:
-                return self.gates[gates]
-            except KeyError as exc:
-                raise ConfigError("unknown full-bridge gate state") from exc
-        if len(gates) != 4:
-            raise ConfigError("a full bridge needs four binary gates")
-        result = tuple(gates)
-        self.left._gate_word(result[:2])
-        self.right._gate_word(result[2:])
-        return result
-
-    def voltage_bounds(self, gates, vdc: float) -> tuple[float, float]:
-        values = self._gates(gates)
-        left_low, left_high = self.left.bounds(values[:2], vdc, 0.0)
-        right_low, right_high = self.right.bounds(values[2:], vdc, 0.0)
-        return left_low - right_high, left_high - right_low
-
-    def resolve(self, gates, current: float, vdc: float,
-                floating: float = 0.0) -> _FullBridgeResult:
-        if not math.isfinite(vdc) or vdc < 0.0:
-            raise ConfigError("full-bridge DC voltage must be finite and nonnegative")
-        values = self._gates(gates)
-        left_gates, right_gates = values[:2], values[2:]
-        if current == 0.0:
-            left_low, left_high = self.left.bounds(left_gates, vdc, 0.0)
-            right_low, right_high = self.right.bounds(right_gates, vdc, 0.0)
-            target = max(left_low - right_high,
-                         min(left_high - right_low, floating))
-            left_voltage = max(left_low, min(left_high, right_low + target))
-            right_voltage = left_voltage - target
-            left = self.left.resolve(
-                left_gates, 0.0, vdc, floating=left_voltage,
-            )
-            right = self.right.resolve(
-                right_gates, 0.0, vdc, floating=right_voltage,
-            )
-            blocked = (
-                not all((any(left_gates), any(right_gates)))
-                and math.isclose(
-                    target,
-                    floating,
-                    rel_tol=0.0,
-                    abs_tol=1e-12 * max(1.0, vdc, abs(floating)),
-                )
-            )
-        else:
-            left = self.left.resolve(left_gates, current, vdc)
-            right = self.right.resolve(right_gates, -current, vdc)
-            blocked = False
-
-        def currents(leg: _LegResult):
-            upper = leg.path.startswith("upper")
-            channels = (
-                (leg.channel_current, 0.0)
-                if upper else (0.0, -leg.channel_current)
-            )
-            diodes = (
-                (-leg.diode_current, 0.0)
-                if upper else (0.0, leg.diode_current)
-            )
-            return channels, diodes
-
-        left_channels, left_diodes = currents(left)
-        right_channels, right_diodes = currents(right)
-        return _FullBridgeResult(
-            left.voltage - right.voltage,
-            left.upper_current + right.upper_current,
-            left.loss + right.loss,
-            (left.path, right.path),
-            blocked,
-            (*left_channels, *right_channels),
-            (*left_diodes, *right_diodes),
-        )
-
 
 class _DCState(Bag):
     __slots__ = ("u_C",)
@@ -876,6 +700,7 @@ class DCLink:
         u0 = capacitor.state.u_C if capacitor is not None else source.u_dc
         self.inp = _DCInp(i_dc=0.0)
         self.out = _DCOut(u_dc=u0, u_C=u0, i_src=0.0)
+        self.terminal = Terminal(self, "u_dc", "i_dc", -1, drives_voltage=True)
         self.tripped = False
         # The circuit topology cannot change after assembly. Bind its equations once instead of
         # rediscovering the capacitor/source combination at every Runge--Kutta stage.

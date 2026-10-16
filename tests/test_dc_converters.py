@@ -8,7 +8,8 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, from_dict
-from peslite.components import HalfBridge, HalfBridgeDiodeConduction, PWMBridge, RLBranch
+from peslite.components import HalfBridge, HalfBridgeDiodeConduction, PWMBridge
+from peslite.assembly.conduction import DiodeConduction
 from peslite.control import DCVoltageControl, GraphController, InductorCurrentControl
 
 
@@ -70,7 +71,10 @@ def test_dc_converter_is_an_open_unit_connected_through_the_common_terminal_api(
 
     assert isinstance(unit.bridge.topology, peslite.HalfBridge)
     assert unit.bus is simulation.system.buses["output"]
-    assert unit.terminals() == (("output", unit.branch_f.terminal2),)
+    assert ("converter.bus.dc", unit.dclink.terminal) in unit.terminals()
+    assert ("converter.bus.dc", unit.bridge.dc_terminal) in unit.terminals()
+    assert ("converter.bus.power", unit.bridge.power_terminal) in unit.terminals()
+    assert ("output", unit.branch_f.terminal2) in unit.terminals()
     assert {"output", "load", "converter.branch_f", "converter.bridge",
             "converter.dclink"} <= names
     assert not hasattr(unit, "plant")
@@ -150,20 +154,16 @@ def test_light_load_enters_dcm_without_a_mode_setting(tmp_path):
 ])
 def test_averaged_half_bridge_has_the_ccm_or_dcm_operating_point_naturally(
         load, expected_voltage, expected_total):
-    branch = RLBranch(1.0e-3, 0.0, phases=1, unilateral=True)
-    branch.conduction = HalfBridgeDiodeConduction(50.0e-6)
-    branch.inp.q = 0.3
-    branch.inp.u_dc = 48.0
-    branch.inp.u2 = expected_voltage
-    branch.state.i = expected_voltage / load
+    current = expected_voltage / load
+    conduction = HalfBridgeDiodeConduction(50.0e-6, 1.0e-3, 0.0)
+    result = conduction.equations(current, 0.3, expected_voltage, 48.0)
 
-    _controlled, _diode, total, _rms = branch.conduction.fractions(branch)
-
-    assert branch.conduction.derivative(branch) == pytest.approx(0.0, abs=2e-10)
+    assert result.derivative == pytest.approx(0.0, abs=2e-10)
     if expected_total is None:
-        assert total < 1.0
+        assert result.total < 1.0
+        assert result.current_ratio == result.controlled
     else:
-        assert total == expected_total
+        assert result.total == expected_total
 
 
 def test_control_feedforward_depends_on_bridge_structure_not_an_application_name():
@@ -174,32 +174,109 @@ def test_control_feedforward_depends_on_bridge_structure_not_an_application_name
     assert full.control_inputs(1.0, 12.0, 48.0)["meas.duty_feedforward"] == pytest.approx(0.625)
 
 
-def test_explicit_half_bridge_orientation_sets_the_power_port_and_boost_feedforward():
+def test_explicit_half_bridge_orientation_sets_the_named_bus_and_boost_feedforward():
     params = peslite.load(EXAMPLES / "boost-example.pes")
     unit = peslite.Simulation(params).unit()
 
     assert unit.bridge.topology.reverse_port
-    assert unit.terminals() == (("input", unit.branch_f.terminal1),)
+    assert ("converter.bus.power", unit.branch_f.terminal2) in unit.terminals()
+    assert ("input", unit.branch_f.terminal1) in unit.terminals()
     assert unit.ctrl.control_inputs(2.0, 48.0, 24.0)["meas.duty_feedforward"] == pytest.approx(0.5)
 
 
 def test_averaged_boost_enters_dcm_from_its_operating_point():
-    branch = RLBranch(1.0e-3, 0.0, phases=1, unilateral=True)
-    branch.conduction = HalfBridgeDiodeConduction(
-        50.0e-6, HalfBridge(upper_controlled=False, reverse_port=True),
+    conduction = HalfBridgeDiodeConduction(
+        50.0e-6,
+        1.0e-3,
+        0.0,
+        HalfBridge(upper_controlled=False, reverse_port=True),
     )
-    branch.inp.q = 0.7
-    branch.inp.u1 = 24.0
-    branch.inp.u_dc = 48.0
-    branch.state.i = 0.108
+    result = conduction.equations(0.108, 0.7, 48.0, 24.0)
 
-    _controlled, _diode, total, _rms = branch.conduction.fractions(branch)
-
-    assert total == pytest.approx(0.6)
-    assert branch.conduction.derivative(branch) == pytest.approx(0.0, abs=2e-10)
+    assert result.total == pytest.approx(0.6)
+    assert result.current_ratio == result.diode
+    assert result.derivative == pytest.approx(0.0, abs=2e-10)
 
 
-def test_scalar_bridge_feedforward_is_safe_before_the_power_ports_are_energised():
+def test_averaged_dcm_relation_drives_branch_current_loss_and_bridge_dc_current():
+    simulation = peslite.Simulation(_case(model="averaging", load=600.0))
+    unit = simulation.unit()
+    law = unit.conduction
+    connections = simulation.system.model.connections
+
+    assert law is not None
+    assert connections[(unit.branch_f, "di_dt")] == (law, "derivative")
+    assert connections[(unit.branch_f, "loss_factor")] == (
+        law, "resistance_factor",
+    )
+    assert connections[(unit.bridge, "current_ratio")] == (law, "current_ratio")
+
+    current = 32.0993023218081 / 600.0
+    result = law.equations(current, 0.3, 32.0993023218081, 48.0)
+    assert result.in_dcm
+    assert result.current_ratio > 0.3
+
+
+def test_ordinary_bridge_path_does_not_copy_an_unused_current_ratio():
+    simulation = peslite.Simulation(_case(model="pwm_averaging", lower_controlled=True))
+    unit = simulation.unit()
+
+    assert (unit.bridge, "q") in unit.zoh_connections()
+    assert (unit.bridge, "current_ratio") not in unit.zoh_connections()
+    assert (unit.bridge, "current_ratio") not in simulation.system.model.connections
+
+
+def test_strict_energy_audit_rejects_cycle_averaged_dcm_storage():
+    params = _case(model="averaging").replace(**{
+        "simulation.energy_check": "strict",
+    })
+
+    with pytest.raises(ConfigError, match="cycle-averaged DCM current"):
+        peslite.Simulation(params)
+
+
+def test_ratio_one_solver_schedule_still_honours_the_dcm_local_step():
+    params = _case(model="averaging", load=600.0, t_end=50.0e-6).replace(**{
+        "simulation.solver.dt": 50.0e-6,
+        "simulation.solver.subsystems": {"converter.branch_f": 1},
+    })
+    simulation = peslite.Simulation(params)
+    assert type(simulation.solver) is peslite.FixedStepSolver
+    simulation.unit().conduction.diode_maximum_step = lambda: 5.0e-6
+
+    stage = DiodeConduction(simulation.system.model, simulation.solver)
+    initial = simulation.system.model.get_initial_values()
+    before = simulation.solver.n_rhs
+    stage.advance(0.0, 50.0e-6, initial)
+
+    assert simulation.solver.n_rhs - before >= 40
+
+
+def test_dcm_local_step_subsystem_cannot_be_window_averaged():
+    params = _case(model="averaging", load=600.0, t_end=50.0e-6).replace(**{
+        "simulation.solver.subsystems": {"converter.branch_f": 4},
+        "simulation.output.states": 0,
+        "simulation.output.signals": 0,
+        "simulation.output.energy": 0,
+        "simulation.energy_check": "off",
+    })
+    simulation = peslite.Simulation(params)
+
+    with pytest.raises(ConfigError, match="state-dependent local step.*windowed"):
+        simulation.run(out_dir=None)
+
+
+def test_scalar_bus_rating_is_inherited_only_when_connected_unit_ports_agree():
+    buck = peslite.Simulation(_case())
+    storage = buck.system.buses["output"].storage[0]
+    assert buck._ratings()("output", storage) == pytest.approx((48.0, 500.0 / 48.0))
+
+    cascaded = peslite.Simulation(peslite.load(EXAMPLES / "buck-boost-example.pes"))
+    storage = cascaded.system.buses["intermediate"].storage[0]
+    assert cascaded._ratings()("intermediate", storage) is None
+
+
+def test_scalar_bridge_feedforward_is_safe_before_the_named_buses_are_energised():
     forward = HalfBridge()
     reverse = HalfBridge(reverse_port=True)
     full = peslite.FullBridge()
@@ -209,19 +286,31 @@ def test_scalar_bridge_feedforward_is_safe_before_the_power_ports_are_energised(
     assert full.control_values(0.0, 0.0, 0.0)[3] == 0.5
 
 
-def test_unit_and_control_scopes_have_no_closed_circuit_fields():
+def test_unit_and_control_scopes_have_only_shared_and_type_specific_fields():
     params = _case()
     unit = params.unit()
     common = {item.name for item in fields(peslite.assembly.UnitParams)}
 
-    assert {"type", "pwm", "ctrl", "bridge", "s_base"} <= common
-    assert {"bus", "filter", "dclink"}.isdisjoint(common)
+    assert {
+        "type", "pwm", "ctrl", "bridge", "meas", "protection", "s_base", "bus", "dclink",
+    } <= common
+    assert "filter" not in common
     assert unit.bus == "output"
     for old in ("topology", "source_voltage", "inductance", "capacitance",
                 "load_resistance", "series_resistance"):
         assert not hasattr(unit, old)
         with pytest.raises(ConfigError, match="unknown key"):
             params.replace(**{f"units.converter.{old}": 1.0})
+
+
+def test_converter_families_share_one_unit_lifecycle_implementation():
+    lifecycle = {
+        "connect", "start", "states_loaded", "begin", "sense", "actuate", "_set_gates",
+    }
+
+    assert lifecycle <= set(peslite.Unit.__dict__)
+    assert lifecycle.isdisjoint(peslite.VSC.__dict__)
+    assert lifecycle.isdisjoint(peslite.DCConverter.__dict__)
 
 
 def test_dc_converter_rejects_wrong_network_and_bridge_scopes():
@@ -244,3 +333,71 @@ def test_restored_dc_converter_trip_stops_the_common_controller_lifecycle():
     assert not unit.breaker
     assert not unit.gates
     assert unit.trip_cause == "restored"
+
+
+def test_dc_converter_uses_the_common_adc_and_protection_runtime(tmp_path):
+    params = _case(t_end=0.001).replace(**{
+        "units.converter.meas.average": ["current", "voltage", "vin"],
+        "units.converter.meas.window": 50.0e-6,
+        "units.converter.protection.overcurrent.enable": 1,
+        "units.converter.protection.overcurrent.limit_pu": 10.0,
+    })
+    simulation = peslite.Simulation(params)
+    unit = simulation.unit()
+    result = simulation.run(out_dir=tmp_path)
+
+    assert isinstance(unit.adc, peslite.ADC)
+    assert unit.protection is not None
+    assert {"converter.meas.x_current", "converter.meas.x_voltage",
+            "converter.meas.x_vin"} <= set(result.states)
+    assert result.summary["converter.max_current_pu"] > 0.0
+    assert result.summary["converter.trip_cause"] is None
+
+
+def test_dc_converter_rejects_protection_without_a_physical_signal():
+    with pytest.raises(ConfigError, match="does not provide the required signal"):
+        _case().replace(**{
+            "units.converter.protection.frequency.enable": 1,
+            "units.converter.protection.frequency.limit": 1.0,
+        })
+
+
+def test_dc_converter_common_overcurrent_protection_trips_its_unit(tmp_path):
+    params = _case(t_end=0.002).replace(**{
+        "units.converter.protection.overcurrent.enable": 1,
+        "units.converter.protection.overcurrent.limit_pu": 0.01,
+        "simulation.stop_on_trip": 0,
+    })
+    result = peslite.Simulation(params).run(out_dir=tmp_path)
+
+    assert result.summary["converter.trip_cause"] == "overcurrent"
+    assert result.summary["converter.tripped"] == 1
+    assert {"OVERCURRENT", "TRIP_OVERCURRENT"} <= set(
+        result.summary["converter.alarms"]
+    )
+
+
+def test_dc_converter_restart_uses_the_common_named_state_contract(tmp_path):
+    params = _case(
+        bridge_type="full_bridge", lower_controlled=True, t_end=0.002,
+    ).replace(**{
+        "units.converter.meas.average": ["current", "voltage", "vin"],
+        "units.converter.meas.window": 50.0e-6,
+        "simulation.output.period": 5.0e-6,
+    })
+    whole_dir = tmp_path / "whole"
+    whole = peslite.Simulation(params).run(out_dir=whole_dir)
+    start_time = 1.005e-3
+    restarted = peslite.load(
+        whole_dir / "simulation.pes",
+        initial=whole_dir / "states.csv",
+        initial_time=start_time,
+    )
+    continued = peslite.Simulation(restarted).run(out_dir=tmp_path / "continued")
+
+    start = int(np.argmin(abs(whole.t - start_time)))
+    assert np.array_equal(continued.t, whole.t[start:])
+    for name, values in continued.states.items():
+        np.testing.assert_allclose(
+            values, whole.states[name][start:], rtol=1e-12, atol=1e-12, err_msg=name,
+        )

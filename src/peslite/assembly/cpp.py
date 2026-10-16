@@ -28,6 +28,7 @@ from ..control.loops import DCVoltageControl, DVOC, SyncLaw, VSG
 from .conduction import DiodeConduction
 from .params import _unit_items, _unit_leaves, _written_out, dumps
 from .exporter import ExportResult, _exporter
+from .types import unit_type
 
 __all__ = []
 
@@ -396,6 +397,20 @@ class _ModelGenerator:
             for name, unit in self.system.units.items() if unit.continuous
         }
 
+    def breaker_lines(self, branch: RLBranch, open_expression: str) -> list[str]:
+        """Render the state transition implemented by ``RLBranch`` breaker methods."""
+        flag = f"breaker_open_{self.prefix[id(branch)]}"
+        index, is_complex = self.state_index[id(branch.state), "i"]
+        zero = [f"y[{index}] = 0.0;"]
+        if is_complex:
+            zero.append(f"y[{index + 1}] = 0.0;")
+        return [
+            f"{flag} = {open_expression};",
+            f"if ({flag}) {{",
+            *["    " + line for line in zero],
+            "}",
+        ]
+
     def unit_control_inputs(self, unit: Any) -> dict[str, _Expression]:
         """Trace one unit's public control boundary once per export."""
         key = id(unit)
@@ -598,34 +613,6 @@ class _ModelGenerator:
             observation_name = f"solver.{subsystem_name}.{role}.{field}"
             self._solver_observations[key] = (observation_name, record, field)
         return "obs_" + _identifier(self._solver_observations[key][0])
-
-    def _diode_conduction(self, sub: RLBranch, *, solver_scope: bool = False) -> tuple[str, str]:
-        """Render the shared averaged half-bridge diode law for C++."""
-        conduction = sub.conduction
-        if conduction is None:
-            raise RuntimeError("an averaged diode expression needs a conduction law")
-        if solver_scope:
-            index, is_complex = self.state_index[id(sub.state), "i"]
-            if is_complex:
-                raise TypeError("averaged diode conduction requires a scalar current")
-            current = f"y[{index}]"
-            held = self.zoh_fields.get((id(sub.inp), "q"))
-            q = held if held is not None else self.solver_observation(sub.inp, "q")
-            value = lambda field: self.solver_observation(sub.inp, field)
-        else:
-            current = self.value(sub.state, "i")
-            q = self.value(sub.inp, "q")
-            value = lambda field: self.value(sub.inp, field)
-        result = self._trace(lambda: conduction.equations(
-            _Expression(current, "real"),
-            _Expression(q, "real"),
-            _Expression(value("u1"), "real"),
-            _Expression(value("u2"), "real"),
-            _Expression(value("u_dc"), "real"),
-            sub.L,
-            sub.R,
-        ))
-        return result[4].code, result[5].code
 
     def _rl_derivative(self, sub: RLBranch, current: str, value: Any) -> str:
         return (
@@ -842,7 +829,7 @@ class _ModelGenerator:
             zero = ("Complex{0.0, 0.0}"
                     if self.record_types[id(state), "i"] == "Complex" else "0.0")
             value = lambda field: self.value(inp, field)
-            raw = (self._diode_conduction(sub)[0] if sub.conduction is not None
+            raw = (value("di_dt") if (sub, "di_dt") in self.model.connections
                    else self._rl_derivative(sub, i, value))
             if sub.unilateral:
                 raw = f"(({i} <= 0.0 && ({raw}) < 0.0) ? 0.0 : ({raw}))"
@@ -1324,17 +1311,128 @@ class _ControlGenerator:
     def limit_observation(self) -> list[str]:
         return []
 
-    @staticmethod
-    def adc_methods() -> str:
-        return ""
+    def _adc_reading(self, channel: str) -> str:
+        raise NotImplementedError
 
-    @staticmethod
-    def adc_accumulate_call(_duration: str) -> str:
-        return ""
+    def _adc_value(self, channel: str) -> str:
+        adc = self.unit.adc
+        assert adc is not None
+        if channel in adc.channels:
+            return f"({self.m('adc_acc_' + channel)} / {_number(adc.length)})"
+        return self._adc_reading(channel)
 
-    @staticmethod
-    def adc_seed_call() -> str:
-        return ""
+    def _adc_members(self) -> list[str]:
+        adc = self.unit.adc
+        if adc is None or (not adc.averaging and adc.samples == 1):
+            return []
+        lines = [f"long long {self.m('adc_n_samp')} = {int(adc.n_samp)};",
+                 f"bool {self.m('adc_window_open')} = "
+                 f"{'true' if adc.window_open else 'false'};"]
+        for channel in adc.channels:
+            value = adc.accumulated[channel]
+            kind = "Complex" if isinstance(value, complex) else "double"
+            lines += [
+                f"{kind} {self.m('adc_acc_' + channel)} = {self._literal(value)};",
+                f"{kind} {self.m('adc_last_' + channel)} = "
+                f"{self._literal(adc._last[channel])};",
+            ]
+        return lines
+
+    def adc_methods(self) -> str:
+        adc = self.unit.adc
+        if adc is None or (not adc.averaging and adc.samples == 1):
+            return ""
+        methods: list[str] = []
+        if adc.averaging:
+            accumulate = [
+                f"void adc_accumulate_{self.tag}(double dt) {{",
+                "    if (dt <= 0.0) return;",
+            ]
+            seed = [f"void adc_seed_{self.tag}() {{"]
+            for channel in adc.channels:
+                reading = self._adc_reading(channel)
+                accumulate += [
+                    f"    const auto now_{channel} = {reading};",
+                    f"    if ({self.m('adc_window_open')}) "
+                    f"{self.m('adc_acc_' + channel)} += 0.5 * dt * "
+                    f"({self.m('adc_last_' + channel)} + now_{channel});",
+                    f"    {self.m('adc_last_' + channel)} = now_{channel};",
+                ]
+                seed.append(f"    {self.m('adc_last_' + channel)} = {reading};")
+            accumulate.append("}")
+            seed.append("}")
+            methods += ["\n".join(accumulate), "\n".join(seed)]
+        return "\n\n".join(methods)
+
+    def adc_accumulate_call(self, duration: str) -> str:
+        adc = self.unit.adc
+        return (f"adc_accumulate_{self.tag}({duration});"
+                if adc is not None and adc.averaging else "")
+
+    def adc_seed_call(self) -> str:
+        adc = self.unit.adc
+        return (f"adc_seed_{self.tag}();" if adc is not None and adc.averaging else "")
+
+    def _adc_next_values(self) -> list[str]:
+        adc = self.unit.adc
+        if adc is None:
+            return []
+        values: list[str] = []
+        if adc.averaging and not adc._full:
+            values.append(
+                f"({self.m('adc_window_open')} ? std::numeric_limits<double>::infinity() : "
+                f"{self.m('t_interrupt')} - {_number(adc.length)})"
+            )
+        if adc.samples > 1:
+            values.append(
+                f"({self.m('adc_n_samp')} < {adc.samples} ? "
+                f"{self.m('t_interrupt')} - {_number(self.bridge.period)} + "
+                f"{self.m('adc_n_samp')} * {_number(adc.sample_period)} : "
+                "std::numeric_limits<double>::infinity())"
+            )
+        return values
+
+    def _adc_sense_lines(self) -> list[str]:
+        adc = self.unit.adc
+        if adc is None or adc.samples == 1:
+            return []
+        return [
+            f"if (!control_due && {self.m('adc_n_samp')} < {adc.samples}) {{",
+            f"    const double sample_at = {self.m('t_interrupt')} "
+            f"- {_number(self.bridge.period)} + {self.m('adc_n_samp')} "
+            f"* {_number(adc.sample_period)};",
+            f"    if (std::abs(t - sample_at) < time_eps) ++{self.m('adc_n_samp')};",
+            "}",
+        ]
+
+    def _adc_actuate_lines(self) -> list[str]:
+        adc = self.unit.adc
+        if adc is None:
+            return []
+        lines: list[str] = []
+        if adc.averaging:
+            lines += [
+                "if (control_due) {",
+                *[f"    {self.m('adc_acc_' + channel)} = {self._literal(adc._zero[channel])};"
+                  for channel in adc.channels],
+                f"    {self.m('adc_window_open')} = {'true' if adc._full else 'false'};",
+                f"    {self.m('adc_n_samp')} = 1;",
+                "}",
+            ]
+            if not adc._full:
+                lines += [
+                    f"const double window_at = {self.m('t_interrupt')} - {_number(adc.length)};",
+                    f"if (!{self.m('adc_window_open')} && "
+                    "std::abs(t - window_at) < time_eps) {",
+                    *[f"    {self.m('adc_acc_' + channel)} = "
+                      f"{self._literal(adc._zero[channel])};"
+                      for channel in adc.channels],
+                    f"    {self.m('adc_window_open')} = true;",
+                    "}",
+                ]
+        elif adc.samples > 1:
+            lines.append(f"if (control_due) {self.m('adc_n_samp')} = 1;")
+        return lines
 
     def controller_summary(self, stream: str = "summary") -> list[str]:
         return []
@@ -1499,6 +1597,58 @@ class _ControlGenerator:
 class _ProtectionGenerator:
     """Shared allocation-light lowering of one unit's protection subsystem."""
 
+    def unit_members(self) -> list[str]:
+        """Runtime state owned by the common non-composite Unit contract."""
+        unit = self.unit
+        trip = unit.protection.trip
+        return [
+            f"bool {self.m('tripped')} = {'true' if unit.tripped else 'false'};",
+            f"bool {self.m('fault')} = {'true' if unit.protection.fault else 'false'};",
+            f"double {self.m('trip_time')} = "
+            f"{_number(trip.t if trip is not None else math.nan)};",
+            f"std::string {self.m('trip_cause')} = "
+            f"{_cpp_string(trip.cause if trip is not None else '')};",
+            f"double {self.m('max_current')} = "
+            f"{_number(unit.protection.stats.max_current_pu)};",
+            *[f"double {self.m('prot_' + key)} = {_number(value)};"
+              for key, value in unit.protection.get_state().items()],
+            *self.protection_members(),
+            f"bool {self.m('breaker')} = {'true' if unit.breaker else 'false'};",
+            f"bool {self.m('gates')} = {'true' if unit.gates else 'false'};",
+        ]
+
+    def protection_state(self, local: str) -> str | None:
+        if local == "tripped":
+            return self.m("tripped")
+        if local == "fault":
+            return self.m("fault")
+        if local.startswith("prot."):
+            return self.m("prot_" + local[5:])
+        return None
+
+    def _pending_trip_lines(self) -> list[str]:
+        return [
+            f"const bool tripped_now = {self.m('sampled_trip_due')};",
+            f"if (tripped_now) {{ {self.m('sampled_trip_due')} = false; "
+            f"apply_trip_{self.tag}(); }}",
+        ]
+
+    def _terminal_lines(self, open_expression: str) -> list[str]:
+        """Apply the generated equivalent of ``RLBranch.open_breaker``/``close_breaker``."""
+        branch = self.unit.branch_f
+        if branch is None:
+            return []
+        return self.model.breaker_lines(branch, open_expression)
+
+    def actuate_method(self) -> str:
+        """Apply a sampled trip for a continuous converter."""
+        return f'''bool actuate_{self.tag}(double) {{
+    if (!{self.m('sampled_trip_due')}) return false;
+    {self.m('sampled_trip_due')} = false;
+    apply_trip_{self.tag}();
+    return true;
+}}'''
+
     def protection_members(self) -> list[str]:
         protection = self.unit.protection
         stats = protection.stats
@@ -1517,8 +1667,10 @@ class _ProtectionGenerator:
             f"double {self.m('dc_voltage_first_t')} = {observed(stats.dc_voltage_first_t)};",
             f"double {self.m('rocof_first_t')} = {observed(stats.rocof_first_t)};",
             f"double {self.m('rocof_max')} = {_number(stats.rocof_max)};",
-            f"double {self.m('vac_min')} = {observed(stats.vac_min_pu)};",
-            f"double {self.m('vac_max')} = {observed(stats.vac_max_pu)};",
+            f"double {self.m('terminal_voltage_min')} = "
+            f"{observed(stats.terminal_voltage_min_pu)};",
+            f"double {self.m('terminal_voltage_max')} = "
+            f"{observed(stats.terminal_voltage_max_pu)};",
             f"std::array<double, {window}> {self.m('rocof_buffer')}{{}};",
             f"std::size_t {self.m('rocof_index')} = 0;",
             f"bool {self.m('rocof_full')} = false;",
@@ -1527,20 +1679,25 @@ class _ProtectionGenerator:
         ]
 
     def _trip_body(self) -> list[str]:
-        branch = f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]}"
         link = f"dclink_tripped_{self.model.prefix[id(self.unit.dclink)]}"
-        return [f"{self.m('startup_run')} = false;",
-                f"{self.m('gates')} = false;",
-                f"{self.m('breaker')} = false;",
-                f"{branch} = true;",
-                f"{link} = true;"]
+        lines = [f"{self.m('startup_run')} = false;",
+                 f"{self.m('gates')} = false;",
+                 f"{self.m('breaker')} = false;"]
+        if self.unit.branch_f is not None:
+            lines += self._terminal_lines("true")
+        elif not self.unit.continuous:
+            lines.append(f"{self._hold()} = {self._literal(self.unit.bridge.topology.zero)};")
+        lines.append(f"{link} = true;")
+        return lines
 
-    def protection_methods(self) -> str:
+    def protection_method(self) -> str:
         """Fast and sampled protection, plus the one physical trip action."""
         cfg = self.cfg.protection
         period = self.unit.protection.T
         window = max(1, int(cfg.rocof.window / period + 0.5))
         current = f"obs_{_identifier(self.name + '.i_c')}"
+        current_width = len(self.unit._protection_currents())
+        has_frequency = "frequency" in unit_type(self.cfg.type).protection_criteria
 
         def enabled(item: Any) -> str:
             return "true" if item.enable else "false"
@@ -1572,24 +1729,28 @@ class _ProtectionGenerator:
             ]
 
         sampled: list[str] = [
-            f"bool sampled_protect_{self.tag}(double t, double vac, double freq_dev, double vdc_error, bool startup_complete) {{",
-            f"    if (!{self.m('tripped')}) {{",
-            f"        const bool had_old = {self.m('rocof_full')};",
-            f"        const double old = {self.m('rocof_buffer')}[{self.m('rocof_index')}];",
-            f"        {self.m('rocof_buffer')}[{self.m('rocof_index')}] = freq_dev;",
-            f"        {self.m('rocof_index')} = ({self.m('rocof_index')} + 1) % {window};",
-            f"        if ({self.m('rocof_index')} == 0) {self.m('rocof_full')} = true;",
-            "        if (had_old) {",
-            f"            const double rocof = (freq_dev - old) / {_number(window * period)};",
-            f"            {self.m('rocof_max')} = std::max({self.m('rocof_max')}, std::abs(rocof));",
-            f"            if ({enabled(cfg.rocof)} && std::abs(rocof) >= {limit(cfg.rocof, 'limit')} && startup_complete) {{",
-            f"                if (!std::isfinite({first('rocof')})) {first('rocof')} = t;",
-            f"                alarm_{self.tag}(\"ROCOF\");",
-            "            }",
-            "        }",
-            "    }",
-            f"    if ({self.m('tripped')} || !startup_complete) return false;",
+            f"bool sampled_protect_{self.tag}(double t, double terminal_voltage, "
+            "double freq_dev, double vdc_error, bool startup_complete) {",
         ]
+        if has_frequency:
+            sampled += [
+                f"    if (!{self.m('tripped')}) {{",
+                f"        const bool had_old = {self.m('rocof_full')};",
+                f"        const double old = {self.m('rocof_buffer')}[{self.m('rocof_index')}];",
+                f"        {self.m('rocof_buffer')}[{self.m('rocof_index')}] = freq_dev;",
+                f"        {self.m('rocof_index')} = ({self.m('rocof_index')} + 1) % {window};",
+                f"        if ({self.m('rocof_index')} == 0) {self.m('rocof_full')} = true;",
+                "        if (had_old) {",
+                f"            const double rocof = (freq_dev - old) / {_number(window * period)};",
+                f"            {self.m('rocof_max')} = std::max({self.m('rocof_max')}, std::abs(rocof));",
+                f"            if ({enabled(cfg.rocof)} && std::abs(rocof) >= {limit(cfg.rocof, 'limit')} && startup_complete) {{",
+                f"                if (!std::isfinite({first('rocof')})) {first('rocof')} = t;",
+                f"                alarm_{self.tag}(\"ROCOF\");",
+                "            }",
+                "        }",
+                "    }",
+            ]
+        sampled.append(f"    if ({self.m('tripped')} || !startup_complete) return false;")
         sampled += ["    " + line for line in timed(
             cfg.dc_voltage,
             f"std::abs(vdc_error) >= {limit(cfg.dc_voltage, 'limit_pu')}",
@@ -1599,17 +1760,21 @@ class _ProtectionGenerator:
             f"std::abs(freq_dev) >= {limit(cfg.frequency, 'limit')}",
             "frequency", "FREQ_BAND", "hold_freq", "freq")]
         sampled += [
-            f"    {self.m('vac_min')} = std::isfinite({self.m('vac_min')}) ? std::min({self.m('vac_min')}, vac) : vac;",
-            f"    {self.m('vac_max')} = std::isfinite({self.m('vac_max')}) ? std::max({self.m('vac_max')}, vac) : vac;",
+            f"    {self.m('terminal_voltage_min')} = "
+            f"std::isfinite({self.m('terminal_voltage_min')}) ? "
+            f"std::min({self.m('terminal_voltage_min')}, terminal_voltage) : terminal_voltage;",
+            f"    {self.m('terminal_voltage_max')} = "
+            f"std::isfinite({self.m('terminal_voltage_max')}) ? "
+            f"std::max({self.m('terminal_voltage_max')}, terminal_voltage) : terminal_voltage;",
         ]
         sampled += ["    " + line for line in timed(
             cfg.undervoltage,
-            f"vac <= {limit(cfg.undervoltage, 'limit_pu')}",
-            "undervoltage", "VAC_UNDER", "hold_uv", "vac_uv")]
+            f"terminal_voltage <= {limit(cfg.undervoltage, 'limit_pu')}",
+            "undervoltage", "VOLTAGE_UNDER", "hold_uv", "voltage_uv")]
         sampled += ["    " + line for line in timed(
             cfg.overvoltage,
-            f"vac >= {limit(cfg.overvoltage, 'limit_pu')}",
-            "overvoltage", "VAC_OVER", "hold_ov", "vac_ov")]
+            f"terminal_voltage >= {limit(cfg.overvoltage, 'limit_pu')}",
+            "overvoltage", "VOLTAGE_OVER", "hold_ov", "voltage_ov")]
         sampled += ["    return false;", "}"]
 
         apply = [f"void apply_trip_{self.tag}() {{", *["    " + line for line in self._trip_body()], "}"]
@@ -1619,9 +1784,16 @@ class _ProtectionGenerator:
                 f"    const bool edge = std::abs({self.m('next_switch')} - t) < time_eps || std::abs({self.m('load_end')} - t) < time_eps;",
                 "    if (!edge) return false;",
             ]
+        if current_width == 3:
+            fast += [
+                f"    const auto current = phases({current});",
+                "    const double peak_current = std::max({std::abs(current[0]), "
+                "std::abs(current[1]), std::abs(current[2])});",
+            ]
+        else:
+            fast.append(f"    const double peak_current = std::abs({current});")
         fast += [
-            f"    const auto current = phases({current});",
-            f"    const double peak = std::max({{std::abs(current[0]), std::abs(current[1]), std::abs(current[2])}}) / {_number(self.cfg.base.i_phase_peak)};",
+            f"    const double peak = peak_current / {_number(self.unit.protection.i_base)};",
             f"    if (std::isfinite(peak)) {self.m('max_current')} = std::max({self.m('max_current')}, peak);",
             f"    if ({self.m('tripped')} || !{enabled(cfg.overcurrent)} || !(peak > {limit(cfg.overcurrent, 'limit_pu')})) return false;",
             f"    if (!std::isfinite({first('overcurrent')})) {first('overcurrent')} = t;",
@@ -1642,7 +1814,10 @@ class _ProtectionGenerator:
             f"    {self.m('tripped')} = true;",
             f"    {self.m('trip_time')} = t;",
             f"    {self.m('trip_cause')} = cause;",
-            f"    alarm_{self.tag}(std::string(\"TRIP_\") + std::string(cause == \"vac_uv\" ? \"VAC_UV\" : cause == \"vac_ov\" ? \"VAC_OV\" : cause == \"vdc\" ? \"VDC\" : cause == \"freq\" ? \"FREQ\" : \"OVERCURRENT\"));",
+            f"    alarm_{self.tag}(std::string(\"TRIP_\") + std::string("
+            "cause == \"voltage_uv\" ? \"VOLTAGE_UV\" : "
+            "cause == \"voltage_ov\" ? \"VOLTAGE_OV\" : "
+            "cause == \"vdc\" ? \"VDC\" : cause == \"freq\" ? \"FREQ\" : \"OVERCURRENT\"));",
             "    return true;",
             "}",
         ]
@@ -1663,7 +1838,10 @@ class _ProtectionGenerator:
                 f'{stream} << ",\\n  \\"{self.name}.{key}_first_t\\": "; '
                 f'if (std::isfinite({value})) {stream} << {value}; else {stream} << "null";'
             )
-        for key, value in (("vac_min_pu", self.m("vac_min")), ("vac_max_pu", self.m("vac_max"))):
+        for key, value in (
+            ("terminal_voltage_min_pu", self.m("terminal_voltage_min")),
+            ("terminal_voltage_max_pu", self.m("terminal_voltage_max")),
+        ):
             lines.append(
                 f'{stream} << ",\\n  \\"{self.name}.{key}\\": "; '
                 f'if (std::isfinite({value})) {stream} << {value}; else {stream} << "null";'
@@ -1698,9 +1876,6 @@ class _ACControlGenerator(_ProtectionGenerator, _ControlGenerator):
             f"{indent}{self.m('log_v_ref_pu')} = "
             f"{self.source(sources['v_ref_pu'])};",
         ]
-
-    def protection_method(self) -> str:
-        return self.protection_methods()
 
     def controller_summary(self, stream: str = "summary") -> list[str]:
         name = self.name
@@ -1782,16 +1957,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
     def members(self) -> list[str]:
         startup = self.ctrl.startup
         lines = [
-            f"bool {self.m('tripped')} = {'true' if self.unit.tripped else 'false'};",
-            f"bool {self.m('fault')} = {'true' if self.unit.protection.fault else 'false'};",
-            f"double {self.m('trip_time')} = std::numeric_limits<double>::quiet_NaN();",
-            f"std::string {self.m('trip_cause')};",
-            f"double {self.m('max_current')} = 0.0;",
-            *[f"double {self.m('prot_' + key)} = {_number(value)};"
-              for key, value in self.unit.protection.get_state().items()],
-            *self.protection_members(),
-            f"bool {self.m('breaker')} = {'true' if self.unit.breaker else 'false'};",
-            f"bool {self.m('gates')} = {'true' if self.unit.gates else 'false'};",
+            *self.unit_members(),
             f"bool {self.m('startup_run')} = {'true' if startup.run else 'false'};",
             f"double {self.m('startup_ramp')} = {_number(startup.ramp)};",
             f"double {self.m('startup_start')} = {_number(startup.start)};",
@@ -1836,12 +2002,9 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         return lines
 
     def state_expression(self, local: str) -> str:
-        if local == "tripped":
-            return self.m("tripped")
-        if local == "fault":
-            return self.m("fault")
-        if local.startswith("prot."):
-            return self.m("prot_" + local[5:])
+        protected = self.protection_state(local)
+        if protected is not None:
+            return protected
         if local == "startup.run":
             return self.m("startup_run")
         if local == "startup.ramp":
@@ -1919,9 +2082,10 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         lines += [
             f"{self.m('breaker')} = {effective};",
             f"{self.m('gates')} = {effective};",
-            f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
-            f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});",
         ]
+        lines += self._terminal_lines(
+            f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')})"
+        )
         return lines
 
     def sense_method(self) -> str:
@@ -1958,17 +2122,6 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
                   "}"]
         return "\n".join(lines)
 
-    def actuate_method(self) -> str:
-        return f'''bool actuate_{self.tag}(double) {{
-    if (!{self.m('sampled_trip_due')}) return false;
-    {self.m('sampled_trip_due')} = false;
-    apply_trip_{self.tag}();
-    return true;
-}}'''
-
-    def protection_method(self) -> str:
-        return self.protection_methods()
-
 class _UnitGenerator(_ACControlGenerator):
     """Lower one sampled controller/PWM unit to allocation-free specialised methods."""
 
@@ -1993,73 +2146,14 @@ class _UnitGenerator(_ACControlGenerator):
             return self._reference(path[11:])
         return self.g(path)
 
-    def _adc_raw(self, channel: str) -> str:
+    def _adc_reading(self, channel: str) -> str:
         return f"obs_{_identifier(self.name + '.' + channel)}"
-
-    def _adc_value(self, channel: str) -> str:
-        adc = self.unit.adc
-        assert adc is not None
-        if channel in adc.channels:
-            return f"({self.m('adc_acc_' + channel)} / {_number(adc.length)})"
-        return self._adc_raw(channel)
-
-    def _adc_members(self) -> list[str]:
-        adc = self.unit.adc
-        if adc is None or (not adc.averaging and adc.samples == 1):
-            return []
-        lines = [f"long long {self.m('adc_n_samp')} = {int(adc.n_samp)};",
-                 f"bool {self.m('adc_window_open')} = {'true' if adc.window_open else 'false'};"]
-        for channel in adc.channels:
-            value = adc.accumulated[channel]
-            kind = "Complex" if isinstance(value, complex) else "double"
-            lines += [f"{kind} {self.m('adc_acc_' + channel)} = {self._literal(value)};",
-                      f"{kind} {self.m('adc_last_' + channel)} = {self._literal(adc._last[channel])};"]
-        return lines
-
-    def adc_methods(self) -> str:
-        adc = self.unit.adc
-        if adc is None or (not adc.averaging and adc.samples == 1):
-            return ""
-        methods: list[str] = []
-        if adc.averaging:
-            accumulate = [f"void adc_accumulate_{self.tag}(double dt) {{", "    if (dt <= 0.0) return;"]
-            seed = [f"void adc_seed_{self.tag}() {{"]
-            for channel in adc.channels:
-                raw = self._adc_raw(channel)
-                accumulate += [
-                    f"    const auto now_{channel} = {raw};",
-                    f"    if ({self.m('adc_window_open')}) {self.m('adc_acc_' + channel)} += 0.5 * dt * ({self.m('adc_last_' + channel)} + now_{channel});",
-                    f"    {self.m('adc_last_' + channel)} = now_{channel};",
-                ]
-                seed.append(f"    {self.m('adc_last_' + channel)} = {raw};")
-            accumulate.append("}")
-            seed.append("}")
-            methods += ["\n".join(accumulate), "\n".join(seed)]
-        return "\n\n".join(methods)
-
-    def adc_accumulate_call(self, duration: str) -> str:
-        adc = self.unit.adc
-        return (f"adc_accumulate_{self.tag}({duration});"
-                if adc is not None and adc.averaging else "")
-
-    def adc_seed_call(self) -> str:
-        adc = self.unit.adc
-        return (f"adc_seed_{self.tag}();" if adc is not None and adc.averaging else "")
 
     def members(self) -> list[str]:
         unit, ctrl, graph = self.unit, self.ctrl, self.graph
         bridge = unit.bridge
         lines = [
-            f"bool {self.m('tripped')} = {'true' if unit.tripped else 'false'};",
-            f"bool {self.m('fault')} = {'true' if unit.protection.fault else 'false'};",
-            f"double {self.m('trip_time')} = std::numeric_limits<double>::quiet_NaN();",
-            f"std::string {self.m('trip_cause')};",
-            f"double {self.m('max_current')} = 0.0;",
-            *[f"double {self.m('prot_' + key)} = {_number(value)};"
-              for key, value in unit.protection.get_state().items()],
-            *self.protection_members(),
-            f"bool {self.m('breaker')} = {'true' if unit.breaker else 'false'};",
-            f"bool {self.m('gates')} = {'true' if unit.gates else 'false'};",
+            *self.unit_members(),
             f"bool {self.m('startup_run')} = {'true' if ctrl.startup.run else 'false'};",
             f"double {self.m('startup_ramp')} = {_number(ctrl.startup.ramp)};",
             f"long long {self.m('startup_steps')} = {int(ctrl.startup.steps)};",
@@ -2091,12 +2185,9 @@ class _UnitGenerator(_ACControlGenerator):
 
     def state_expression(self, part: Any, local: str) -> str:
         if part is self.unit:
-            if local == "tripped":
-                return self.m("tripped")
-            if local == "fault":
-                return self.m("fault")
-            if local.startswith("prot."):
-                return self.m("prot_" + local[5:])
+            protected = self.protection_state(local)
+            if protected is not None:
+                return protected
         if part is self.unit.bridge:
             bank, _, field = local.rpartition(".")
             word = self.m("shadow" if bank == "shadow" else "active")
@@ -2212,37 +2303,22 @@ class _UnitGenerator(_ACControlGenerator):
         bridge = self.unit.bridge
         hold = self.model.zoh_fields[id(bridge.inp), "q"]
         switching = not isinstance(bridge.modulator, ZOH)
-        next_values = [self.m('t_interrupt'), self.m('t_load'), self.m('next_switch')]
-        adc = self.unit.adc
-        if adc is not None and adc.averaging and not adc._full:
-            next_values.append(
-                f"({self.m('adc_window_open')} ? std::numeric_limits<double>::infinity() : "
-                f"{self.m('t_interrupt')} - {_number(adc.length)})"
-            )
-        if adc is not None and adc.samples > 1:
-            next_values.append(
-                f"({self.m('adc_n_samp')} < {adc.samples} ? {self.m('t_interrupt')} - {_number(bridge.period)} + "
-                f"{self.m('adc_n_samp')} * {_number(adc.sample_period)} : std::numeric_limits<double>::infinity())"
-            )
+        next_values = [
+            self.m("t_interrupt"), self.m("t_load"), self.m("next_switch"),
+            *self._adc_next_values(),
+        ]
         next_expression = "std::min({" + ", ".join(next_values) + "})"
         lines = [
             f"double next_{self.tag}() const noexcept {{ return {next_expression}; }}",
             f"void sense_{self.tag}(double t) {{",
             f"    const bool control_due = std::abs(t - {self.m('t_interrupt')}) < time_eps;",
         ]
-        if adc is not None and adc.samples > 1:
-            lines += [
-                f"    if (!control_due && {self.m('adc_n_samp')} < {adc.samples}) {{",
-                f"        const double sample_at = {self.m('t_interrupt')} - {_number(bridge.period)} + {self.m('adc_n_samp')} * {_number(adc.sample_period)};",
-                f"        if (std::abs(t - sample_at) < time_eps) ++{self.m('adc_n_samp')};",
-                "    }",
-            ]
+        lines += ["    " + line for line in self._adc_sense_lines()]
         lines += [
             f"    if (control_due) controller_{self.tag}(t);",
             "}",
             f"bool actuate_{self.tag}(double t) {{",
-            f"    const bool tripped_now = {self.m('sampled_trip_due')};",
-            f"    if (tripped_now) {{ {self.m('sampled_trip_due')} = false; apply_trip_{self.tag}(); }}",
+            *["    " + line for line in self._pending_trip_lines()],
             f"    const bool control_due = std::abs(t - {self.m('t_interrupt')}) < time_eps;",
             f"    const bool load_due = std::abs(t - {self.m('t_load')}) < time_eps;",
         ]
@@ -2256,36 +2332,19 @@ class _UnitGenerator(_ACControlGenerator):
             hold,
             switching,
             f"{self.m('active')}[{self.width}] != 0.0 && !{self.m('tripped')}",
-            (f"        breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
-             f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});",),
+            tuple(
+                "        " + line
+                for line in self._terminal_lines(
+                    f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')})"
+                )
+            ),
         )
         if bridge.computation > 0.0:
             lines += [f"    if (control_due && {self.m('pending_valid')}) {{",
                       *write, "    }"]
         if switching:
             lines += self._pwm_switch_lines(hold)
-        if adc is not None:
-            if adc.averaging:
-                full = adc._full
-                lines += [
-                    "    if (control_due) {",
-                    *[f"        {self.m('adc_acc_' + channel)} = {self._literal(adc._zero[channel])};"
-                      for channel in adc.channels],
-                    f"        {self.m('adc_window_open')} = {'true' if full else 'false'};",
-                    f"        {self.m('adc_n_samp')} = 1;",
-                    "    }",
-                ]
-                if not full:
-                    lines += [
-                        f"    const double window_at = {self.m('t_interrupt')} - {_number(adc.length)};",
-                        f"    if (!{self.m('adc_window_open')} && std::abs(t - window_at) < time_eps) {{",
-                        *[f"        {self.m('adc_acc_' + channel)} = {self._literal(adc._zero[channel])};"
-                          for channel in adc.channels],
-                        f"        {self.m('adc_window_open')} = true;",
-                        "    }",
-                    ]
-            elif adc.samples > 1:
-                lines += [f"    if (control_due) {self.m('adc_n_samp')} = 1;"]
+        lines += ["    " + line for line in self._adc_actuate_lines()]
         lines += [f"    if (control_due) {self.m('pending_valid')} = false;",
                   "    return tripped_now;", "}"]
         return "\n".join(lines)
@@ -2294,27 +2353,24 @@ class _UnitGenerator(_ACControlGenerator):
         effective = self._effective_command(on)
         lines = [f"{self.m('breaker')} = {effective};"]
         lines += self._controller_command_lines(on, ramp)
-        lines.append(
-            f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
-            f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});"
+        lines += self._terminal_lines(
+            f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')})"
         )
         return lines
 
-class _GraphUnitGenerator(_ControlGenerator):
-    """Lower a unit through its public control and bridge ports.
+class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
+    """Lower a graph-controlled unit through its public control and bridge ports.
 
-    This path has no knowledge of a converter family.  The control interface supplies measured
-    and commanded ports, registered control loops supply their equations and state, and the
-    bridge topology supplies its duty-register width and switching-state encoding.
+    The unit adapter supplies measured ports, registered control loops supply their equations and
+    state, and the bridge topology supplies its duty-register width and switching-state encoding.
     """
 
     def __init__(self, name: str, unit: Any, model: _ModelGenerator) -> None:
-        super().__init__(name, unit, model, "u")
+        _ControlGenerator.__init__(self, name, unit, model, "u")
         self.bridge = unit.bridge
         self.topology = self.bridge.topology
         self.width = len(self.topology.duty_names)
         self.continuous = unit.continuous
-        self.maxima = unit.control_maxima()
         self._control_inputs = model.unit_control_inputs(unit)
         graph_inputs = {path for path in self.graph.interface.inputs if path.startswith("meas.")}
         if set(self._control_inputs) != graph_inputs:
@@ -2322,6 +2378,30 @@ class _GraphUnitGenerator(_ControlGenerator):
                 f"C++ export: {name}.control_inputs() exposes "
                 f"{sorted(self._control_inputs)}, expected {sorted(graph_inputs)}"
             )
+
+    def _adc_reading(self, channel: str) -> str:
+        return f"obs_{_identifier(self.name + '.ctrl.meas.' + channel)}"
+
+    def _sampled_control_inputs(self) -> dict[str, _Expression]:
+        channels = {
+            name: _Expression(self._adc_value(name), "real")
+            for name in self.unit.ports.readers
+        }
+        names = tuple(
+            path for path in self.graph.interface.inputs if path.startswith("meas.")
+        )
+        values = self.model._trace(lambda: tuple(
+            self.unit.control_inputs_from(channels)[name] for name in names
+        ))
+        return dict(zip(names, values))
+
+    def _stage_condition(self, active: str) -> str:
+        """Add the only extra enable required by a direct, breaker-less power port."""
+        terms = [active]
+        if self.unit.branch_f is None:
+            terms.append(self.m("breaker"))
+        terms.append(f"!{self.m('tripped')}")
+        return " && ".join(terms)
 
     @staticmethod
     def _measurement_name(path: str) -> str:
@@ -2357,19 +2437,13 @@ class _GraphUnitGenerator(_ControlGenerator):
 
     def members(self) -> list[str]:
         startup = self.ctrl.startup
-        trip_cause = self.unit.trip_cause
         lines = [
-            f"bool {self.m('tripped')} = {'true' if self.unit.tripped else 'false'};",
-            f"bool {self.m('breaker')} = {'true' if self.unit.breaker else 'false'};",
-            f"bool {self.m('gates')} = {'true' if self.unit.gates else 'false'};",
-            f"std::string {self.m('trip_cause')} = {_cpp_string(trip_cause or '')};",
+            *self.unit_members(),
             f"bool {self.m('startup_run')} = {'true' if startup.run else 'false'};",
             f"double {self.m('startup_ramp')} = {_number(startup.ramp)};",
             *[f"double {self.m('log_' + key)} = std::numeric_limits<double>::quiet_NaN();"
               for key in self.ctrl.log_names()],
         ]
-        lines += [f"double {self.m('maximum_' + key)} = {_number(initial)};"
-                  for key, (_port, _scale, initial) in self.maxima.items()]
         if self.continuous:
             lines += [
                 f"double {self.m('startup_start')} = {_number(startup.start)};",
@@ -2391,17 +2465,15 @@ class _GraphUnitGenerator(_ControlGenerator):
             kind = "Complex" if isinstance(value, complex) else "double"
             lines.append(f"{kind} {self.g(key)} = {self._literal(value)};")
         lines += self._sampled_loop_members()
-        lines += [
-            *self._pwm_members(),
-        ]
+        lines += [*self._pwm_members(), *self._adc_members()]
         return lines
 
     def _measurement_lines(self, *, members: bool) -> list[str]:
         lines = []
+        sampled = None if members else self._sampled_control_inputs()
         for path, value in self._control_inputs.items():
             target = self.m(self._measurement_name(path)) if members else self._measurement_name(path)
-            expression = (value.code if members else
-                          f"obs_{_identifier(self.name + '.ctrl.' + path)}")
+            expression = value.code if members else sampled[path].code
             declaration = "" if members else (
                 "Complex " if value.kind == "complex" else "double "
             )
@@ -2471,6 +2543,11 @@ class _GraphUnitGenerator(_ControlGenerator):
             lines.append(f"    {self.m('pending_d')}[{index}] = {duty.code};")
         lines += ["    " + line for line in self._log_lines()]
         lines += [
+            f"    sampled_protect_{self.tag}(t, "
+            f"std::abs({self._measurement_name('meas.voltage')}) / "
+            f"{_number(self.cfg.dc_base.v)}, 0.0, "
+            f"obs_{_identifier(self.name + '.u_dc')} / "
+            f"{_number(self.cfg.dc_base.v)} - 1.0, {self.m('startup_complete')});",
             f"    {self.m('pending_on')} = {self.m('startup_run')};",
             f"    {self.m('pending_valid')} = true;",
             "}",
@@ -2497,19 +2574,25 @@ class _GraphUnitGenerator(_ControlGenerator):
         hold = self._hold()
         bridge = self.bridge
         switching = not isinstance(bridge.modulator, ZOH)
+        next_values = [
+            self.m("t_interrupt"), self.m("t_load"), self.m("next_switch"),
+            *self._adc_next_values(),
+        ]
         lines = [
-            f"double next_{self.tag}() const noexcept {{ return std::min({{{self.m('t_interrupt')}, "
-            f"{self.m('t_load')}, {self.m('next_switch')}}}); }}",
+            f"double next_{self.tag}() const noexcept {{ return "
+            f"std::min({{{', '.join(next_values)}}}); }}",
             f"void sense_{self.tag}(double t) {{",
-            f"    if (std::abs(t - {self.m('t_interrupt')}) < time_eps) controller_{self.tag}(t);",
+            f"    const bool control_due = "
+            f"std::abs(t - {self.m('t_interrupt')}) < time_eps;",
+            *["    " + line for line in self._adc_sense_lines()],
+            f"    if (control_due) controller_{self.tag}(t);",
             "}",
             f"bool actuate_{self.tag}(double t) {{",
+            *["    " + line for line in self._pending_trip_lines()],
             f"    const bool control_due = std::abs(t - {self.m('t_interrupt')}) < time_eps;",
             f"    const bool load_due = std::abs(t - {self.m('t_load')}) < time_eps;",
         ]
-        write = self._pwm_write_lines(
-            f"{self.m('pending_on')} && {self.m('breaker')} && !{self.m('tripped')}"
-        )
+        write = self._pwm_write_lines(self._stage_condition(self.m("pending_on")))
         if bridge.computation == 0.0:
             lines += [f"    if (control_due && {self.m('pending_valid')}) {{",
                       *write, "    }"]
@@ -2517,15 +2600,16 @@ class _GraphUnitGenerator(_ControlGenerator):
             tail = (f"        if (!{self.m('gates')}) "
                     f"{hold} = {self._literal(self.topology.zero)};",)
         else:
-            tail = (
-                f"        breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
-                f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});",
+            tail = tuple(
+                "        " + line
+                for line in self._terminal_lines(
+                    f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')})"
+                )
             )
         lines += self._pwm_load_lines(
             hold,
             switching,
-            f"{self.m('active')}[{self.width}] != 0.0 && "
-            f"{self.m('breaker')} && !{self.m('tripped')}",
+            self._stage_condition(f"{self.m('active')}[{self.width}] != 0.0"),
             tail,
         )
         if bridge.computation > 0.0:
@@ -2538,15 +2622,17 @@ class _GraphUnitGenerator(_ControlGenerator):
                     f"    if (!{self.m('gates')}) "
                     f"{hold} = {self._literal(self.topology.zero)};"
                 )
+        lines += ["    " + line for line in self._adc_actuate_lines()]
         lines += [f"    if (control_due) {self.m('pending_valid')} = false;",
-                  "    return false;", "}"]
+                  "    return tripped_now;", "}"]
         return "\n".join(lines)
 
     def state_expression(self, *args: Any) -> str:
         if self.continuous:
             local = args[0]
-            if local == "tripped":
-                return self.m("tripped")
+            protected = self.protection_state(local)
+            if protected is not None:
+                return protected
             if local == "startup.run":
                 return self.m("startup_run")
             if local == "startup.ramp":
@@ -2556,8 +2642,9 @@ class _GraphUnitGenerator(_ControlGenerator):
             raise KeyError(local)
         part, local = args
         if part is self.unit:
-            if local == "tripped":
-                return self.m("tripped")
+            protected = self.protection_state(local)
+            if protected is not None:
+                return protected
         if part is self.bridge:
             bank, _, field = local.rpartition(".")
             word = self.m("shadow" if bank == "shadow" else "active")
@@ -2579,6 +2666,8 @@ class _GraphUnitGenerator(_ControlGenerator):
             node = self.graph.nodes.get(loop_name)
             if node is not None and public in node.get_state():
                 return self.node(loop_name, public)
+        if part is self.unit.adc and local.startswith("x_"):
+            return self.m("adc_acc_" + local[2:])
         raise KeyError(local)
 
     def command_lines(self, on: bool, ramp: float, t: str = "t") -> list[str]:
@@ -2588,14 +2677,13 @@ class _GraphUnitGenerator(_ControlGenerator):
         if self.continuous:
             lines.append(f"{self.m('gates')} = {effective};")
             if self.unit.branch_f is not None:
-                lines.append(
-                    f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
-                    f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});"
+                lines += self._terminal_lines(
+                    f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')})"
                 )
         else:
+            active = f"{self.m('active')}[{self.width}] != 0.0"
             lines.append(
-                f"{self.m('gates')} = {self.m('active')}[{self.width}] != 0.0 && "
-                f"{self.m('breaker')} && !{self.m('tripped')};"
+                f"{self.m('gates')} = {self._stage_condition(active)};"
             )
             if self.unit.branch_f is None:
                 lines.append(
@@ -2603,38 +2691,20 @@ class _GraphUnitGenerator(_ControlGenerator):
                     f"{self._hold()} = {self._literal(self.topology.zero)};"
                 )
             else:
-                lines.append(
-                    f"breaker_open_{self.model.prefix[id(self.unit.branch_f)]} = "
-                    f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')});"
+                lines += self._terminal_lines(
+                    f"!({self.m('breaker')} && {self.m('gates')} && !{self.m('tripped')})"
                 )
         return lines
 
     def sense_method(self) -> str:
-        return f"void sense_{self.tag}(double) {{}}"
-
-    def actuate_method(self) -> str:
-        return f"bool actuate_{self.tag}(double) {{ return false; }}"
-
-    def protection_method(self) -> str:
-        lines = [f"bool protect_{self.tag}(double) {{"]
-        for key, (port, _scale, _initial) in self.maxima.items():
-            observed = f"obs_{_identifier(self.name + '.ctrl.' + port)}"
-            member = self.m("maximum_" + key)
-            lines.append(f"    {member} = std::max({member}, std::abs({observed}));")
-        lines += ["    return false;", "}"]
-        return "\n".join(lines)
-
-    def protection_summary(self, stream: str = "summary") -> list[str]:
-        lines = [
-            f'{stream} << ",\\n  \\"{self.name}.trip_cause\\": "; if ({self.m("trip_cause")}.empty()) {stream} << "null"; else {stream} << \'"\' << {self.m("trip_cause")} << \'"\';',
-        ]
-        lines += [
-            f'{stream} << ",\\n  \\"{self.name}.{key}\\": " << '
-            f'{self.m("maximum_" + key)} / {_number(scale)};'
-            for key, (_port, scale, _initial) in self.maxima.items()
-        ]
-        lines.append(f'{stream} << ",\\n  \\"{self.name}.alarms\\": []";')
-        return lines
+        voltage = f"obs_{_identifier(self.name + '.ctrl.meas.voltage')}"
+        dc = f"obs_{_identifier(self.name + '.u_dc')}"
+        return f'''void sense_{self.tag}(double t) {{
+    sampled_protect_{self.tag}(t, std::abs({voltage}) / {_number(self.cfg.dc_base.v)},
+        0.0, {dc} / {_number(self.cfg.dc_base.v)} - 1.0,
+        {self.m('startup_run')} && ({self.m('startup_ramp')} <= 0.0 ||
+        t - {self.m('startup_start')} >= {self.m('startup_ramp')} - time_eps));
+}}'''
 
 def _make_unit_generator(name: str, unit: Any, model: _ModelGenerator) -> Any:
     """Select an optimized controller lowering or the public-port graph lowering."""
@@ -2726,17 +2796,20 @@ class _CppGenerator:
                     ]
                 elif target in self.system.sources:
                     branch = self.system.sources[target].branch
-                    lines = [f"breaker_open_{model.prefix[id(branch)]} = {'false' if on else 'true'};"]
+                    lines = model.breaker_lines(branch, "false" if on else "true")
                 elif target in self.system.branches:
                     branch = self.system.branches[target]
-                    lines = [f"breaker_open_{model.prefix[id(branch)]} = {'false' if on else 'true'};"]
+                    lines = model.breaker_lines(branch, "false" if on else "true")
                 elif target in self.system.named_elements:
                     element = self.system.named_elements[target]
                     breakers = getattr(element, "breakers", ())
                     if hasattr(element, "branch"):
                         breakers = (element.branch,)
-                    lines = [f"breaker_open_{model.prefix[id(branch)]} = {'false' if on else 'true'};"
-                             for branch in breakers]
+                    lines = [
+                        line
+                        for branch in breakers
+                        for line in model.breaker_lines(branch, "false" if on else "true")
+                    ]
                     if not lines:
                         raise TypeError(f"C++ export: element event target {target!r} has no static breaker")
                 else:
@@ -2845,11 +2918,6 @@ class _CppGenerator:
 
         def powers(check: Any) -> tuple[str, str]:
             sub = check.subsystem
-            if isinstance(sub, RLBranch):
-                current = model.value(sub.state, "i")
-                squared = (f"std::norm({current})" if sub.phases == 3
-                           else f"({current}) * ({current})")
-                return "0.0", f"{_number(sub.power_scale * sub.R)} * {squared}"
             if isinstance(sub, RCNode):
                 current = model.value(sub.inp, "i")
                 squared = (f"std::norm({current})" if sub.phases == 3
@@ -2974,21 +3042,12 @@ class _CppGenerator:
             diode_blocking_guards.append(guard)
         diode_step_limits = []
         for subsystem in diode_conduction.resolution_subsystems:
-            if isinstance(subsystem, RLBranch) and subsystem.conduction is not None:
-                _derivative, in_dcm = model._diode_conduction(
-                    subsystem, solver_scope=True
-                )
-                diode_step_limits.append(
-                    f"({in_dcm} ? {_number(subsystem.conduction.period / 10.0)} "
-                    ": std::numeric_limits<double>::infinity())"
-                )
-            else:
-                enabled = model.enabled_by.get(id(subsystem))
-                attributes = ({"enabled": _Expression(enabled, "bool")}
-                              if enabled is not None else None)
-                diode_step_limits.append(model.trace_solver_method(
-                    subsystem, "diode_maximum_step", attributes
-                ))
+            enabled = model.enabled_by.get(id(subsystem))
+            attributes = ({"enabled": _Expression(enabled, "bool")}
+                          if enabled is not None else None)
+            diode_step_limits.append(model.trace_solver_method(
+                subsystem, "diode_maximum_step", attributes
+            ))
         raw_projection_call = "" if diode_conduction else projection_call
         member_lines = model.members()
         for generator in sampled.values():

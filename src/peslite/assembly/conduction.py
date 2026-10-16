@@ -16,7 +16,7 @@ class DiodeConduction:
     A plant participates by declaring a zero lower state bound and providing
     ``diode_blocks_reverse_current()`` for an exact-switching diode path, or
     ``diode_maximum_step()`` when its averaged diode law needs a local resolution limit.
-    The underlying solver remains unaware of either device behavior.
+    Solvers receive that limit through their generic per-call ``advance`` interface.
     """
 
     def __init__(self, model: Any, solver: Any = None) -> None:
@@ -31,9 +31,11 @@ class DiodeConduction:
         )
         self.resolution_subsystems = tuple(
             subsystem for subsystem in model.subsystems
-            if getattr(subsystem, "conduction", None) is not None
-            and callable(getattr(subsystem, "diode_maximum_step", None))
+            if callable(getattr(subsystem, "diode_maximum_step", None))
         )
+        validate = getattr(solver, "validate_local_step", None)
+        if validate is not None:
+            validate(self.resolution_subsystems)
 
     def __bool__(self) -> bool:
         return bool(self.current_states or self.resolution_subsystems)
@@ -89,22 +91,20 @@ class DiodeConduction:
         if not self.resolution_subsystems:
             return self.solver(self.model.rhs, t0, t1, state).y
 
-        configured_dt = getattr(self.solver, "dt", None)
-        if configured_dt is not None:
-            self.model.set_states(state)
-            maximum_step = min(
-                subsystem.diode_maximum_step()
-                for subsystem in self.resolution_subsystems
-            )
-            self.solver.dt = min(configured_dt, maximum_step)
-            try:
-                return self.solver(self.model.rhs, t0, t1, state).y
-            finally:
-                self.solver.dt = configured_dt
+        self.model.sync(t0, state)
+        maximum_step = min(
+            subsystem.diode_maximum_step()
+            for subsystem in self.resolution_subsystems
+        )
+        advance = getattr(self.solver, "advance", None)
+        if advance is not None:
+            return advance(
+                self.model.rhs, t0, t1, state, max_step=maximum_step,
+            ).y
 
         t = t0
         while t < t1 - 1e-15:
-            self.model.set_states(state)
+            self.model.sync(t, state)
             maximum_step = min(
                 subsystem.diode_maximum_step()
                 for subsystem in self.resolution_subsystems

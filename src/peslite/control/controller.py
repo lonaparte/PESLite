@@ -42,8 +42,9 @@ __all__ = ["Measurement", "ConverterMeasurement", "ControlMeasurement", "Control
 class Measurement:
     """SI sample at ``t``: peak-scaled alpha-beta AC vectors (V, A) and DC voltage (V).
 
-    Windowed channels hold means over ``(t - T_avg, t]``; ``*_raw`` and ``i_abc`` are instantaneous.
-    ``samples`` holds an oversampled update's samples, oldest first, this one last; otherwise empty.
+    Windowed channels hold means over ``(t - T_avg, t]``. ``samples`` holds the instantaneous
+    ADC conversions in chronological order, including the conversion at ``t``; an instantaneous
+    entry has no nested samples. ``i_abc`` is always derived from the final conversion.
     """
 
     t: float
@@ -51,9 +52,6 @@ class Measurement:
     i_c: complex  # converter current (A), positive out of the bridge
     u_dc: float  # dc-link voltage (V)
     i_abc: NDArray[np.float64]  # instantaneous phase currents (A)
-    u_g_raw: Optional[complex] = None  # before window averaging
-    i_c_raw: Optional[complex] = None
-    u_dc_raw: Optional[float] = None
     extras: dict[str, float] = field(default_factory=dict)
     samples: tuple["Measurement", ...] = ()
 
@@ -1270,13 +1268,14 @@ class VSCController(_GraphRuntime):
     def _raw_log(self, meas: Measurement, theta: float) -> dict[str, float]:
         """The pre-average sample in the ``theta`` frame as ``*_raw_pu`` log entries (empty if not averaged)."""
         out: dict[str, float] = {}
-        if meas.u_g_raw is not None and (meas.u_g_raw != meas.u_g or meas.i_c_raw != meas.i_c):
+        reading = meas.samples[-1] if meas.samples else meas
+        if reading.u_g != meas.u_g or reading.i_c != meas.i_c:
             rot = cmath.exp(-1j * theta)
-            v, i = meas.u_g_raw * rot, meas.i_c_raw * rot
+            v, i = reading.u_g * rot, reading.i_c * rot
             out.update({"vd_raw_pu": v.real / self.v_base, "vq_raw_pu": v.imag / self.v_base,
                         "id_raw_pu": i.real / self.i_base, "iq_raw_pu": i.imag / self.i_base})
-        if meas.u_dc_raw is not None and meas.u_dc_raw != meas.u_dc:
-            out["vdc_raw_pu"] = meas.u_dc_raw / self.v_dc_base
+        if reading.u_dc != meas.u_dc:
+            out["vdc_raw_pu"] = reading.u_dc / self.v_dc_base
         return out
 
     def log_names(self) -> tuple[str, ...]:
@@ -1574,10 +1573,12 @@ def _dc_converter_wiring(cfg):
 class ConverterMeasurement:
     """SI sample at a scalar converter's public control boundary."""
 
+    t: float = 0.0
     current: float = 0.0
     voltage: float = 0.0
     vin: float = 0.0
     duty_feedforward: float = 0.0
+    samples: tuple["ConverterMeasurement", ...] = ()
 
 
 class _ConverterControlState:

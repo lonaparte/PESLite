@@ -101,10 +101,18 @@ class FixedStepSolver:
         self.n_rhs = 0
 
     def __call__(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64]) -> SolverStep:
+        return self.advance(f, t0, t1, y0)
+
+    def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
+                max_step: float = math.inf) -> SolverStep:
+        """Integrate with an optional per-call maximum step without changing configuration."""
         span = t1 - t0
         if span <= 0.0:
             return SolverStep(t1, y0, 0)
-        n = max(1, int(math.ceil(span / self.dt - 1e-9)))
+        step = min(self.dt, max_step)
+        if step <= 0.0:
+            raise ValueError("max_step must be positive")
+        n = max(1, int(math.ceil(span / step - 1e-9)))
         h = span / n
         c, a, _b = TABLEAUS[self.method]
         self.n_rhs += len(c) * n
@@ -186,14 +194,22 @@ class AdaptiveSolver:
         self.n_rhs = 0
 
     def __call__(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64]) -> SolverStep:
+        return self.advance(f, t0, t1, y0)
+
+    def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
+                max_step: float = math.inf) -> SolverStep:
+        """Integrate with an optional per-call maximum step without changing configuration."""
         span = t1 - t0
         if span <= 0.0:
             return SolverStep(t1, y0, 0)
         kwargs = dict(method=self.method, rtol=self.rtol, atol=self.atol)
-        if math.isfinite(self.max_step):
-            kwargs["max_step"] = self.max_step
+        step = min(self.max_step, max_step)
+        if step <= 0.0:
+            raise ValueError("max_step must be positive")
+        if math.isfinite(step):
+            kwargs["max_step"] = step
         if self.warm_start and self._h_last is not None:
-            kwargs["first_step"] = min(self._h_last, span)
+            kwargs["first_step"] = min(self._h_last, span, step)
         sol = self._solve_ivp(f, (t0, t1), y0, **kwargs)
         if not sol.success:
             raise RuntimeError(f"solve_ivp failed on [{t0}, {t1}]: {sol.message}")
@@ -231,16 +247,24 @@ class DormandPrince45:
         self.n_rejected = 0
 
     def __call__(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64]) -> SolverStep:
+        return self.advance(f, t0, t1, y0)
+
+    def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
+                max_step: float = math.inf) -> SolverStep:
+        """Integrate with an optional per-call maximum step without changing configuration."""
         span = t1 - t0
         if span <= 0.0:
             return SolverStep(t1, y0, 0)
+        step = min(self.max_step, max_step)
+        if step <= 0.0:
+            raise ValueError("max_step must be positive")
         lists = getattr(getattr(f, "__self__", None), "rhs_list", None)
         if lists is not None:
-            return self._call_lists(lists, t0, t1, y0)
+            return self._call_lists(lists, t0, t1, y0, step)
         a, b, c, e = self._a, self._b, self._c, self._e
         t, y = t0, np.asarray(y0, dtype=float)
         h = self._h if self._h is not None else span
-        h = min(h, span, self.max_step)
+        h = min(h, span, step)
         k1 = f(t, y)
         self.n_rhs += 1
         while t < t1 - 1e-15 * max(1.0, abs(t1)):
@@ -267,7 +291,7 @@ class DormandPrince45:
                     factor = self.safety * err ** -0.14 * self._err_prev ** 0.08
                     factor = min(5.0, max(0.2, factor))
                 self._err_prev = max(err, 1e-4)
-                h = min(h * factor, self.max_step)
+                h = min(h * factor, step)
             else:
                 self.n_rejected += 1
                 h = h * max(0.1, self.safety * err ** -0.25)
@@ -275,7 +299,7 @@ class DormandPrince45:
         return SolverStep(t1, y, self.n_rhs)
 
     def _call_lists(self, f, t0: float, t1: float,
-                    y0: NDArray[np.float64]) -> SolverStep:
+                    y0: NDArray[np.float64], max_step: float) -> SolverStep:
         """The same DP5(4) pair on Python floats when the model provides ``rhs_list``."""
         span = t1 - t0
         a, b, c, e = self._a, self._b, self._c, self._e
@@ -290,7 +314,7 @@ class DormandPrince45:
         atol, rtol = self.atol, self.rtol
         t, y = t0, y0.tolist()
         h = self._h if self._h is not None else span
-        h = min(h, span, self.max_step)
+        h = min(h, span, max_step)
         k1 = f(t, y)
         self.n_rhs += 1
         end_eps = 1e-15 * max(1.0, abs(t1))
@@ -331,7 +355,7 @@ class DormandPrince45:
                     factor = self.safety * err ** -0.14 * self._err_prev ** 0.08
                     factor = min(5.0, max(0.2, factor))
                 self._err_prev = max(err, 1e-4)
-                h = min(h * factor, self.max_step)
+                h = min(h * factor, max_step)
             else:
                 self.n_rejected += 1
                 h = h * max(0.1, self.safety * err ** -0.25)

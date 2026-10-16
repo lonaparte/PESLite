@@ -52,9 +52,10 @@ Physical component state and parameters are SI quantities. Components declare po
 derivatives and energy/storage relationships without knowing the global system order.
 
 Every physical network attachment uses the same construction-time `Terminal` contract. A terminal
-names its voltage and current once, with positive direction defined into the component; a one-port
-component binds `bus`, while a branch or other two-port component binds `bus1` and `bus2`. System
-assembly lowers this metadata to direct model connections before integration begins.
+names its voltage and current once, with positive direction defined into the component, and states
+whether it drives or follows the bus voltage. Each named bus has exactly one voltage driver. System
+assembly fans that voltage out, sums every signed terminal current into the driver, and lowers the
+result to direct model connections before integration begins.
 
 ## Control
 
@@ -92,6 +93,20 @@ bridge and `DCConverter` a selectable scalar half or full bridge. The same
 `DCConverter` also serves as each full-bridge port of a resonant link. Each assembled specialization
 owns its power stage, controller, sensing, startup interface, breakers and gates.
 
+The contract also assembles two internal power boundaries. `<unit>.bus.dc` connects a DCLink
+voltage driver to the bridge DC terminal. `<unit>.bus.power` always denotes the bridge power-side
+bus: it connects the bridge to a series filter or, for an unfiltered nested converter, directly to
+a WPT link. A filter's other terminal connects to the public bus selected by the unit's `bus`
+parameter. The scoped internal names disappear into direct connections; there is no runtime bus
+lookup or WPT-specific solver path. Every Unit exposes named ports and one default port. A
+single-port Unit selects it automatically; a multi-port Unit type must select one explicitly.
+Composite ports forward existing child ports without copying their electrical base. WPT exposes
+`primary` and `secondary` and selects `primary` by default, so common assembly, event scaling and
+solver ratings never interpret those WPT-specific names.
+
+A source needs no internal bus. Its `<source>.emf` is wired directly to `<source>.branch`, whose
+second terminal attaches to the configured public bus.
+
 Every entry in `Params.units` is a `UnitParams`. Its `type` selects `vsc`, `dc_converter` or the
 composite `wpt`; type-specific schema selection and runtime construction happen once while the
 system is assembled. A WPT configuration contains `primary` and `secondary` UnitParams plus one
@@ -107,9 +122,9 @@ Parameter ownership is explicit:
 
 | Scope | Selector | Fields interpreted in that scope |
 |---|---|---|
-| Common unit | none | `pwm`, `ctrl`, `bridge`, `s_base`, resolved `base`, and unit events |
-| VSC only | `unit.type: vsc` | `bus`, `ac_filter`, `dclink`, `meas`, and `protection` |
-| DC converter only | `unit.type: dc_converter` | `bus`, `filter`, and `dclink`; a composite parent may bind the power port internally instead of naming a bus |
+| Common converter unit | none | `bus`, `dclink`, `pwm`, `ctrl`, `bridge`, `meas`, `protection`, `s_base`, resolved `base`, and unit events |
+| VSC only | `unit.type: vsc` | `ac_filter` |
+| DC converter only | `unit.type: dc_converter` | `filter`; a composite parent may omit it and the common `bus`, creating a scoped internal power bus |
 | WPT composite only | `unit.type: wpt` | `primary`, `secondary`, and `link`; it has no bridge, PWM or controller of its own |
 | Common bridge | none | `type` selects `three_phase_bridge`, `half_bridge`, or `full_bridge`; `model` independently selects switching, PWM averaging, or ideal averaging |
 | Half bridge only | `bridge.type: half_bridge` | `upper_controlled`, `lower_controlled`, and `reverse_port` |

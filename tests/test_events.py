@@ -95,11 +95,24 @@ def test_event_entries_reject_unknown_missing_and_nonfinite_values(entry, messag
         _gfl().replace(**_event("bad", **entry))
 
 
-def test_named_targets_are_unique_and_switching_sequences_are_checked():
+def test_cross_section_names_are_scoped_and_ambiguous_event_targets_are_rejected():
     tree = read_tree(EXAMPLES / "gfl-example.pes")
     tree["sources"]["vsc"] = tree["sources"].pop("grid")
-    with pytest.raises(ConfigError, match="name is already used"):
+    tree["events"] = {}
+    params = from_dict(tree)
+    system = peslite.System(params)
+
+    assert "vsc" in params.sources and "vsc" in params.units
+    with pytest.raises(ValueError, match="ambiguous.*sources.*units"):
+        system.switch("vsc", False, 0.0)
+
+    tree = read_tree(EXAMPLES / "gfl-example.pes")
+    tree["sources"]["vsc"] = tree["sources"].pop("grid")
+    with pytest.raises(ConfigError, match="target.*ambiguous.*sources.*units"):
         from_dict(tree)
+
+
+def test_switching_sequences_are_checked():
 
     with pytest.raises(ConfigError, match="already connected"):
         _gfl().replace(**_event("again", type="connect", target="vsc", t=0.3))

@@ -1,9 +1,11 @@
 """Built-in R-L load and switching events in a running network."""
 
 import numpy as np
+import pytest
 
 import peslite
-from peslite.assembly.params import from_dict
+from conftest import EXAMPLES
+from peslite.assembly.params import ConfigError, from_dict
 
 
 def _current(result, name):
@@ -51,15 +53,82 @@ def test_every_network_component_uses_the_same_terminal_assembly(case):
 
     assert system.model.connections[(line, "u1")] == (system.buses["pcc"], "u")
     assert system.model.connections[(line, "u2")] == (system.buses["b2"], "u")
-    assert system.sources["grid"].terminals() == (
-        ("pcc", system.sources["grid"].branch.terminal2),
-    )
-    assert system.units["vsc"].terminals() == (
-        ("pcc", system.units["vsc"].branch_f.terminal2),
-    )
+    source = system.sources["grid"]
+    assert source.terminals() == (("pcc", source.branch.terminal2),)
+    assert system.model.connections[(source.branch, "u1")] == (source.emf, "e_g")
+    assert system.model.connections[(source.emf, "i")] == [(source.branch, "i", 1.0)]
+    unit = system.units["vsc"]
+    assert ("vsc.bus.dc", unit.dclink.terminal) in unit.terminals()
+    assert ("vsc.bus.dc", unit.bridge.dc_terminal) in unit.terminals()
+    assert ("vsc.bus.power", unit.bridge.power_terminal) in unit.terminals()
+    assert ("pcc", unit.branch_f.terminal2) in unit.terminals()
     assert system.named_elements["load"].terminals() == (
         ("b2", system.named_elements["load"].branch.terminal1),
     )
+
+
+def test_public_bus_may_have_no_attached_component(case):
+    tree = case()
+    tree["buses"]["unused"] = dict(tree["buses"]["pcc"])
+    system = peslite.System(from_dict(tree))
+    node = system.buses["unused"]
+
+    assert node.terminal.current_sources == []
+    assert (node, "i") not in system.model.connections
+
+
+def test_assembly_rejects_a_subsystem_name_collision(case):
+    params = from_dict(case())
+    unit = peslite.System(params).units["vsc"]
+    original = unit.subsystems()
+    unit.subsystems = lambda: {**original, "pcc": unit.bridge}
+
+    with pytest.raises(ConfigError, match="subsystem name collision.*pcc"):
+        peslite.System(params, parts={"vsc": unit})
+
+
+def test_assembly_rejects_a_continuous_and_held_target_collision(case):
+    params = from_dict(case())
+    unit = peslite.System(params).units["vsc"]
+    unit.zoh_connections = lambda: {(unit.branch_f, "u1"): "duplicate"}
+
+    with pytest.raises(ConfigError, match="driven both continuously"):
+        peslite.System(params, parts={"vsc": unit})
+
+
+def test_state_alias_reuse_requires_the_same_target():
+    params = peslite.load(EXAMPLES / "two-converters-example.pes")
+    units = peslite.System(params).units
+    for unit in units.values():
+        unit.aliases = lambda: {"shared": "same.state"}
+
+    system = peslite.System(params, parts=units)
+    assert system.state_aliases["shared"] == "same.state"
+
+    first, second = units.values()
+    first.aliases = lambda: {"shared": "first.state"}
+    second.aliases = lambda: {"shared": "second.state"}
+
+    with pytest.raises(ConfigError, match="state alias collision.*shared"):
+        peslite.System(params, parts=units)
+
+
+def test_signal_collection_rejects_a_name_collision(case):
+    system = peslite.System(from_dict(case()))
+    system.sources["grid"].signals = lambda: {"shared": 1.0}
+    system.units["vsc"].signals = lambda: {"shared": 2.0}
+
+    with pytest.raises(ConfigError, match="signal name collision.*shared"):
+        system.signals(0.0)
+
+
+def test_signal_collection_allows_the_same_producer_to_be_reused(case):
+    system = peslite.System(from_dict(case()))
+    source = system.sources["grid"]
+    system.composite_signal_sources += (source,)
+
+    signals = system.signals(0.0)
+    assert signals["grid.i"] == source.branch.out.i
 
 
 def test_small_load_can_model_a_switched_fault(case, tmp_path):

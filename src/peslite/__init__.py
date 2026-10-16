@@ -10,11 +10,11 @@ pu bases.
 from . import solver, control, components, assembly
 from .solver import (AdaptiveSolver, DormandPrince45, FixedStepSolver, Model, MultirateSolver, make_solver)
 from .control import OutputStage, VSCController, make_controller, register_loop_type
-from .components import (ADC, PWM, PWMBridge, ZOH, AveragingBridge, SwitchingBridge,
+from .components import (ADC, ADCSample, PWM, PWMBridge, ZOH, AveragingBridge, SwitchingBridge,
                          ThreePhaseBridge, CarrierComparison, FullBridge, HalfBridge,
                          MeasurementPorts, make_bridge,
                          make_modulator, register_element_type)
-from .assembly import (DCConverter, Params, Protection,
+from .assembly import (DCConverter, Params, Protection, ProtectionSample,
                        SourceScenario, System, Unit, VSC,
                        dump, dumps, load, register_event_type)
 from .solver.simulation import Simulation, SimulationResult, main
@@ -29,10 +29,10 @@ __version__ = "0.4.0"
 __all__ = [
     "solver", "control", "components", "assembly", "addons",
     "Params", "load", "dump", "dumps", "System", "Unit", "VSC",
-    "DCConverter", "Protection", "MeasurementPorts", "Model", "SourceScenario",
+    "DCConverter", "Protection", "ProtectionSample", "MeasurementPorts", "Model", "SourceScenario",
     "Simulation", "SimulationResult", "ExportResult", "export", "VSCController", "main", "make_controller", "make_modulator", "make_solver",
     "register_loop_type", "register_element_type", "register_event_type",
-    "OutputStage", "ADC", "PWM", "SwitchingBridge", "PWMBridge", "AveragingBridge",
+    "OutputStage", "ADC", "ADCSample", "PWM", "SwitchingBridge", "PWMBridge", "AveragingBridge",
     "ThreePhaseBridge", "make_bridge",
     "HalfBridge", "FullBridge",
     "CarrierComparison", "ZOH",

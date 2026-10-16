@@ -13,6 +13,7 @@ import numpy as np
 
 from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, OutputMethod
+from .network import Terminal
 
 __all__ = ["SSLink", "LCCLink", "make_wpt_link"]
 
@@ -73,6 +74,8 @@ class _CoupledLink:
         self._mode_secondary = (float(vectors[1, 0]), float(vectors[1, 1]))
         self.inp = _LinkInp()
         self.out = _LinkOut()
+        self.primary_terminal = Terminal(self, "u_primary", "i_primary", 1)
+        self.secondary_terminal = Terminal(self, "u_secondary", "i_secondary", 1)
 
     def _coil_currents(self) -> tuple[float, float]:
         i1, i2 = self.state.i_mode_1, self.state.i_mode_2

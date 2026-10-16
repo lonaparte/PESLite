@@ -12,12 +12,47 @@ from ..components.network import ELEMENT_TYPES, RCNode, RLBranch, Terminal, Thre
 from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather
-from .events import SWITCHING, SourceScenario
+from .events import SWITCHABLE, SWITCHING, SourceScenario
 from .params import Change, Params, _unit_at, _unit_leaves
 from .types import unit_type
 from .unit import DCConverter, Unit, VSC
 
 __all__ = ["System"]
+
+
+def _names(values) -> list[str]:
+    """Return sortable labels for configuration keys which may contain runtime objects."""
+    return sorted(repr(value) for value in values)
+
+
+def _check_unique(target: Mapping, values: Mapping, what: str) -> None:
+    """Reject keys already owned by an assembly mapping."""
+    overlap = set(target) & set(values)
+    if overlap:
+        raise ConfigError(f"{what} collision: {_names(overlap)}")
+
+
+def _merge_unique(target: dict, values: Mapping, what: str) -> None:
+    """Merge a named assembly mapping after checking ownership."""
+    _check_unique(target, values, what)
+    target.update(values)
+
+
+def _merge_matching(target: dict, values: Mapping, what: str) -> None:
+    """Merge keys whose repeated values agree, rejecting only conflicting definitions."""
+    conflicts = {key for key in set(target) & set(values) if target[key] != values[key]}
+    if conflicts:
+        raise ConfigError(f"{what} collision: {_names(conflicts)}")
+    target.update(values)
+
+
+@dataclass(frozen=True)
+class _UnitPort:
+    """One named Unit boundary, preserving its rating owner through composition."""
+
+    bus: str
+    owner: str
+    domain: str
 
 
 @dataclass
@@ -26,30 +61,45 @@ class _UnitAssembly:
 
     units: dict[str, Unit] = field(default_factory=dict)
     subsystems: dict[str, Any] = field(default_factory=dict)
-    connections: dict = field(default_factory=dict)
     signal_sources: tuple[Any, ...] = ()
-    power_port: Any = None
+    terminals: tuple[tuple[str, Terminal], ...] = ()
+    ports: dict[str, _UnitPort] = field(default_factory=dict)
+    default_port: Optional[str] = None
+    port_bindings: dict[str, tuple[_UnitPort, ...]] = field(default_factory=dict)
+
+    def port(self, name: Optional[str] = None) -> _UnitPort:
+        """Return a named port, or this Unit's explicitly selected default port."""
+        if name is None:
+            if len(self.ports) == 1:
+                return next(iter(self.ports.values()))
+            name = self.default_port
+        if name is None or name not in self.ports:
+            raise ConfigError(
+                f"unit port {name!r} is unavailable; known ports: {sorted(self.ports)}"
+            )
+        return self.ports[name]
+
+    def attach(self, terminal: Terminal, where: str, port: Optional[str] = None) -> None:
+        """Attach one parent terminal to a named port or the Unit's default port."""
+        try:
+            selected = self.port(port)
+        except ConfigError as exc:
+            raise ConfigError(f"{where}: {exc}") from None
+        self.terminals += ((selected.bus, terminal),)
 
     def include(self, other: "_UnitAssembly") -> None:
         """Merge one child assembly while preserving its single public unit mapping."""
-        unit_overlap = set(self.units) & set(other.units)
-        subsystem_overlap = set(self.subsystems) & set(other.subsystems)
-        connection_overlap = set(self.connections) & set(other.connections)
-        if unit_overlap:
-            raise ConfigError(f"assembled unit name collision: {sorted(unit_overlap)}")
-        if subsystem_overlap:
-            raise ConfigError(
-                f"assembled subsystem name collision: {sorted(subsystem_overlap)}"
-            )
-        if connection_overlap:
-            raise ConfigError(
-                f"assembled connection target collision: "
-                f"{[repr(item) for item in connection_overlap]}"
-            )
+        _check_unique(self.units, other.units, "assembled unit name")
+        _check_unique(self.subsystems, other.subsystems, "assembled subsystem name")
         self.units.update(other.units)
         self.subsystems.update(other.subsystems)
-        self.connections.update(other.connections)
         self.signal_sources += other.signal_sources
+        self.terminals += other.terminals
+        for target, ports in other.port_bindings.items():
+            existing = self.port_bindings.setdefault(target, ())
+            self.port_bindings[target] = existing + tuple(
+                port for port in ports if port not in existing
+            )
 
 
 class _WPTSignals:
@@ -94,8 +144,10 @@ class _Source:
         return {f"{self.name}.emf": self.emf, f"{self.name}.branch": self.branch}
 
     def connections(self) -> dict:
-        return {(self.branch, "u1"): (self.emf, "e_g"),
-                (self.emf, "i"): (self.branch, "i")}  # energy accounting only
+        return {
+            (self.branch, "u1"): (self.emf, "e_g"),
+            (self.emf, "i"): [(self.branch, "i", 1.0)],
+        }
 
     def terminals(self) -> tuple[tuple[str, Terminal], ...]:
         return ((self.cfg.bus, self.branch.terminal2),)
@@ -146,7 +198,21 @@ def _assemble_vsc(name: str, cfg: Any, system: "System",
         ctrl=_part(parts, name, "ctrl"),
         modulator=_part(parts, name, "modulator"),
     )
-    return _UnitAssembly(units={name: unit})
+    ports = {
+        "dc": _UnitPort(unit.dc_bus, name, "dc"),
+        "power": _UnitPort(cfg.bus, name, "ac"),
+    }
+    return _UnitAssembly(
+        units={name: unit},
+        ports=ports,
+        default_port=unit_type(cfg.type).default_port,
+        port_bindings={
+            unit.dc_bus: (ports["dc"],),
+            cfg.bus: (ports["power"],),
+            f"{name}.dclink": (ports["dc"],),
+            f"{name}.branch_f": (ports["power"],),
+        },
+    )
 
 
 def _assemble_dc_converter(name: str, cfg: Any, system: "System",
@@ -159,9 +225,24 @@ def _assemble_dc_converter(name: str, cfg: Any, system: "System",
         ctrl=_part(parts, name, "ctrl"),
         modulator=_part(parts, name, "modulator"),
     )
+    ports = {
+        "dc": _UnitPort(unit.dc_bus, name, "dc"),
+        "power": _UnitPort(cfg.bus or unit.power_bus, name, "dc"),
+    }
+    bindings = {
+        unit.dc_bus: (ports["dc"],),
+        ports["power"].bus: (ports["power"],),
+        f"{name}.dclink": (ports["dc"],),
+    }
+    if unit.branch_f is not None:
+        bindings[f"{name}.branch_f"] = (ports["power"],)
+    if unit.conduction is not None:
+        bindings[f"{name}.conduction"] = (ports["power"],)
     return _UnitAssembly(
         units={name: unit},
-        power_port=unit.connect_power_port if cfg.bus is None else None,
+        ports=ports,
+        default_port=unit_type(cfg.type).default_port,
+        port_bindings=bindings,
     )
 
 
@@ -175,24 +256,22 @@ def _assemble_wpt(name: str, cfg: Any, system: "System",
     assembly = _UnitAssembly(
         subsystems={f"{name}.link": link},
         signal_sources=(_WPTSignals(name, link),),
+        default_port=unit_type(cfg.type).default_port,
     )
     for side in unit_type(cfg.type).children:
         child_name = f"{name}.{side}"
         child_cfg = getattr(cfg, side)
         child = _assemble_unit(child_name, child_cfg, system, parts)
-        if child.power_port is None:
-            raise ConfigError(
-                f"units.{child_name}: {child_cfg.type!r} does not expose a scalar power port"
-            )
-        port_connections = child.power_port(link, f"u_{side}", f"i_{side}")
-        overlap = set(child.connections) & set(port_connections)
-        if overlap:
-            raise ConfigError(
-                f"units.{child_name}: power-port connection target collision: "
-                f"{[repr(item) for item in overlap]}"
-            )
-        child.connections.update(port_connections)
+        terminal = getattr(link, f"{side}_terminal")
+        child.attach(
+            terminal,
+            f"units.{child_name}",
+            "power" if "power" in child.ports else None,
+        )
+        assembly.ports[side] = child.port()
         assembly.include(child)
+    default = assembly.port()
+    assembly.port_bindings[f"{name}.link"] = (default,)
     return assembly
 
 
@@ -201,7 +280,12 @@ def _assemble_unit(name: str, cfg: Any, system: "System",
     assembler = unit_type(cfg.type, f"units.{name}.type").assembler
     if assembler is None:
         raise ConfigError(f"units.{name}.type: {cfg.type!r} has no runtime assembler")
-    return assembler(name, cfg, system, parts)
+    assembly = assembler(name, cfg, system, parts)
+    try:
+        assembly.port()
+    except ConfigError as exc:
+        raise ConfigError(f"units.{name}: {exc}") from None
+    return assembly
 
 
 class System:
@@ -241,11 +325,15 @@ class System:
             assembled.include(_assemble_unit(name, cfg, self, parts))
         self.units = assembled.units
         self.composite_signal_sources = assembled.signal_sources
+        self._port_bindings = assembled.port_bindings
 
         # ---------------------------------------------------------- the wiring
-        subsystems: dict[str, Any] = {**self.buses, **assembled.subsystems}
-        connections: dict = dict(assembled.connections)
-        bus_currents: dict[str, list] = {name: [] for name in self.buses}
+        subsystems: dict[str, Any] = dict(self.buses)
+        _merge_unique(subsystems, assembled.subsystems, "subsystem name")
+        connections: dict = {}
+        bus_terminals: dict[str, list[Terminal]] = {
+            name: [node.terminal] for name, node in self.buses.items()
+        }
         self.named_elements = {name: ELEMENT_TYPES[cfg.type](name, cfg, self.buses, p)
                                for name, cfg in p.elements.items()}
         branch_assemblies = tuple(_BranchAssembly(name, p.branches[name], branch)
@@ -253,10 +341,11 @@ class System:
         elements = (*branch_assemblies, *self.sources.values(), *self.units.values(),
                     *self.named_elements.values())
         for element in elements:
-            subsystems.update(element.subsystems())
-            connections.update(element.connections())
-        # Every network component uses the same terminal contract. Direction is positive into the
-        # component, so the current injected into a bus has the opposite sign.
+            _merge_unique(subsystems, element.subsystems(), "subsystem name")
+        for bus_name, terminal in assembled.terminals:
+            bus_terminals.setdefault(bus_name, []).append(terminal)
+        # Every electrical connection uses the same named-terminal contract. Assembly fans one
+        # driving voltage out to the followers and sums their signed currents into the driver.
         for element in elements:
             for bus_name, terminal in element.terminals():
                 if not isinstance(terminal, Terminal):
@@ -264,30 +353,92 @@ class System:
                         f"{type(element).__name__}.terminals() returned "
                         f"{type(terminal).__name__}, not Terminal"
                     )
-                if bus_name not in self.buses:
-                    raise ConfigError(f"terminal refers to unknown bus {bus_name!r}")
+                bus_terminals.setdefault(bus_name, []).append(terminal)
+        lowered_buses: dict[str, dict] = {}
+        terminal_targets = set(connections)
+        for bus_name, terminals in bus_terminals.items():
+            drivers = [terminal for terminal in terminals if terminal.drives_voltage]
+            if len(drivers) != 1:
+                raise ConfigError(
+                    f"bus {bus_name!r} needs exactly one voltage-driving terminal, got "
+                    f"{len(drivers)}"
+                )
+            driver = drivers[0]
+            followers = [terminal for terminal in terminals if not terminal.drives_voltage]
+            if not followers:
+                if bus_name in self.buses:
+                    driver.bind_current_sources([])
+                    continue
+                raise ConfigError(f"internal bus {bus_name!r} has no attached terminal")
+            voltage_connections = {}
+            for terminal in followers:
                 target = (terminal.subsystem, terminal.voltage)
-                if target in connections:
+                if target in terminal_targets:
                     raise ConfigError(
                         f"{type(terminal.subsystem).__name__}.{terminal.voltage} is connected both "
                         "as an electrical terminal and by connections()"
                     )
-                connections[target] = (self.buses[bus_name], "u")
-                bus_currents[bus_name].append(
-                    (terminal.subsystem, terminal.current, -terminal.direction)
+                voltage_connections[target] = (
+                    driver.subsystem, driver.voltage
                 )
-        for name, node in self.buses.items():
-            if not bus_currents[name]:
-                raise ValueError(f"bus {name!r} has nothing attached to it")
-            connections[(node, "i")] = bus_currents[name]
+                terminal_targets.add(target)
+            current_target = (driver.subsystem, driver.current)
+            if current_target in terminal_targets:
+                raise ConfigError(
+                    f"{type(driver.subsystem).__name__}.{driver.current} is connected both as "
+                    "a bus driver and by connections()"
+                )
+            terminal_targets.add(current_target)
+            current_sources = [
+                (
+                    terminal.subsystem,
+                    terminal.current,
+                    -terminal.direction / driver.direction,
+                )
+                for terminal in followers
+            ]
+            driver.bind_current_sources(current_sources)
+            lowered = lowered_buses.setdefault(bus_name, {})
+            if bus_name not in self.buses:
+                lowered[current_target] = current_sources
+                lowered.update(voltage_connections)
+            else:
+                lowered.update(voltage_connections)
+                lowered[current_target] = current_sources
+        # Keep the established evaluation order: internal power buses, controller and other
+        # component wiring, then the configured external network buses. This only affects the
+        # construction-time ordering of an otherwise identical direct connection graph.
+        for bus_name, lowered in lowered_buses.items():
+            if bus_name not in self.buses:
+                connections.update(lowered)
+        for element in elements:
+            own_connections = element.connections()
+            overlap = (set(connections) | terminal_targets) & set(own_connections)
+            if overlap:
+                raise ConfigError(
+                    f"{type(element).__name__}.connections() duplicates an electrical-terminal "
+                    f"target: {[repr(item) for item in overlap]}"
+                )
+            connections.update(own_connections)
+        for bus_name, lowered in lowered_buses.items():
+            if bus_name in self.buses:
+                connections.update(lowered)
         zoh: dict = {}
         for unit in self.units.values():
-            zoh.update(unit.zoh_connections())
+            own_zoh = unit.zoh_connections()
+            overlap = set(connections) & set(own_zoh)
+            if overlap:
+                raise ConfigError(
+                    "connection target is driven both continuously and through a zero-order "
+                    f"hold: {_names(overlap)}"
+                )
+            _merge_unique(zoh, own_zoh, "zero-order-hold connection target")
         self.model = Model(subsystems, connections, zoh)
 
         self.state_aliases: dict[str, str] = {}
         for unit in self.units.values():
-            self.state_aliases.update(unit.aliases())
+            _merge_matching(self.state_aliases, unit.aliases(), "state alias")
+        self._signal_names_checked = False
 
     # ---------------------------------------------------------------- states
     def state_parts(self) -> list[tuple[str, Any]]:
@@ -354,23 +505,27 @@ class System:
     # ---------------------------------------------------------------- events
     def switch(self, name: str, on: bool, t: float, ramp: float = 0.0) -> None:
         """Connect or disconnect a named unit, source, branch or registered element."""
-        configured = _unit_at(self.p.units, name)
-        if configured is not None:
+        sections = tuple(
+            section for section in self.p.sections_of(name) if section in SWITCHABLE
+        )
+        if len(sections) != 1:
+            detail = "unknown" if not sections else f"ambiguous across {list(sections)}"
+            raise ValueError(f"cannot switch {name!r}: {detail}")
+        section = sections[0]
+        if section == "units":
             for leaf in _unit_leaves(self.p.units, name):
                 self.units[leaf].connect(on, t, ramp)
             return
-        if name in self.sources:
+        if section == "sources":
             breakers = [self.sources[name].branch]
-        elif name in self.branches:
+        elif section == "branches":
             breakers = [self.branches[name]]
-        elif name in self.named_elements:
+        else:
             element = self.named_elements[name]
             if hasattr(element, "connect"):
                 element.connect(on, t, ramp)
                 return
             breakers = element.breakers
-        else:
-            raise ValueError(f"cannot switch {name!r}")
         for breaker in breakers:
             (breaker.close_breaker if on else breaker.open_breaker)()
 
@@ -434,11 +589,28 @@ class System:
     def signals(self, t: float) -> dict[str, float | complex]:
         """Return the plant signals (SI) for the recorder; outputs must be synced to ``t``."""
         out: dict[str, float | complex] = {}
+        checked = self._signal_names_checked
+        owners: dict[str, Any] = {}
+
+        def add(owner: Any, values: Mapping[str, float | complex]) -> None:
+            if checked:
+                out.update(values)
+            else:
+                conflicts = {
+                    name for name in set(out) & set(values)
+                    if owners[name] is not owner
+                }
+                if conflicts:
+                    raise ConfigError(f"signal name collision: {_names(conflicts)}")
+                owners.update({name: owner for name in values})
+                out.update(values)
+
         for element in (*self.sources.values(), *self.units.values(),
                         *self.composite_signal_sources, *self.named_elements.values()):
-            out.update(element.signals() if hasattr(element, "signals") else {})
+            add(element, element.signals() if hasattr(element, "signals") else {})
         for name, branch in self.branches.items():
-            out[f"{name}.i"] = branch.out.i
+            add(branch, {f"{name}.i": branch.out.i})
         for name, node in self.buses.items():
-            out[f"{name}.u"] = node.out.u
+            add(node, {f"{name}.u": node.out.u})
+        self._signal_names_checked = True
         return out

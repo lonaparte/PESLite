@@ -12,7 +12,7 @@ from .params import (BaseValues, ConfigError, ControlParams, LCCLinkParams, Para
                      read_initial, to_dict)
 from .events import (EVENT_TYPES, Event, Scenario, SourceScenario,
                      register_event_type)
-from .protection import Protection
+from .protection import Protection, ProtectionSample
 from .unit import DCConverter, Unit, VSC
 from .system import System
 from .params import _DCConverterUnitFields, _VSCUnitFields, _WPTUnitFields
@@ -25,8 +25,13 @@ register_unit_type(
     "vsc",
     params=_VSCUnitFields,
     default_bridge="three_phase_bridge",
+    default_port="dc",
     phases=3,
     bridge_types=frozenset(("three_phase_bridge",)),
+    measurement_channels=frozenset(("u_g", "i_c", "u_dc")),
+    protection_criteria=frozenset((
+        "overcurrent", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof",
+    )),
     defaults_grid_frequency=True,
     validator=_unit,
     assembler=_assemble_vsc,
@@ -35,22 +40,28 @@ register_unit_type(
     "dc_converter",
     params=_DCConverterUnitFields,
     default_bridge=lambda control: control_type(control.type).default_bridge,
+    default_port="dc",
     phases=1,
     bridge_types=frozenset(("half_bridge", "full_bridge")),
+    measurement_channels=frozenset(("current", "voltage", "vin")),
+    protection_criteria=frozenset((
+        "overcurrent", "undervoltage", "overvoltage", "dc_voltage",
+    )),
     validator=_dc_converter,
     assembler=_assemble_dc_converter,
-    direct_power_port=True,
 )
 register_unit_type(
     "wpt",
     params=_WPTUnitFields,
     children=("primary", "secondary"),
+    default_port="primary",
+    phases=1,
     validator=_wpt,
     assembler=_assemble_wpt,
 )
 
 __all__ = ["Params", "BaseValues", "ConfigError", "load", "dump", "dumps", "from_dict", "to_dict", "read_initial",
            "Event", "EVENT_TYPES", "register_event_type", "Scenario",
-           "SourceScenario", "Protection", "Unit", "VSC", "DCConverter",
+           "SourceScenario", "Protection", "ProtectionSample", "Unit", "VSC", "DCConverter",
            "UnitParams", "ControlParams",
            "SSLinkParams", "LCCLinkParams", "System"]

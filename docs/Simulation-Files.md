@@ -18,7 +18,9 @@ cross-references are reported before the run starts.
 | `simulation` | End time, solver, initial state, output and progress settings. |
 | `meta` | Optional title and description; never affects the model. |
 
-Names in `buses`, `branches`, `sources`, `units` and `elements` are unique together. They must be
+Names are unique within each of `buses`, `branches`, `sources`, `units` and `elements`. The same
+spelling may be used in different sections when their assembled subsystem and signal names remain
+distinct. An event target must still identify exactly one switchable object. Names must be
 non-empty and cannot contain a dot, because dots separate public parameter and state paths.
 
 ## Units and per-unit values
@@ -37,6 +39,11 @@ branches:
 Each converter may define its own `s_base`; otherwise it uses the system base. Controller
 references and loop parameters use that converter's base. Time is in seconds, angles are radians,
 frequencies are hertz unless named `omega`, and switches are written as `0` or `1`.
+
+`pwm`, `ctrl`, `bridge`, `meas` and `protection` are common to every non-composite converter unit.
+The selected `unit.type` contributes only its electrical fields: `vsc` adds `bus`, `ac_filter` and
+`dclink`, while `dc_converter` adds `bus`, `filter` and `dclink`. The common ADC and protection
+lifecycle are not reimplemented by either converter family.
 
 ## Converter section
 
@@ -81,11 +88,14 @@ no objects or runtime state. `VirtualImpedance`, `ActiveDamping` and `ResonantMo
 ordinary registered loops because they have configurable behavior and graph ports.
 
 A WPT unit is a configuration-time composite. It owns no bridge or controller itself; each child
-is an ordinary independently clocked `DCConverter` whose scalar power port is connected to the
-shared link during assembly. The bundled example selects a full bridge and the temporary
-open-loop resonant-modulation loop for each child; neither choice creates a separate converter
-class. `link.type` selects series-series (`ss`) or LCC-LCC (`lcc`) compensation. The complete
-runnable schema is shown in `examples/wpt-example.pes`.
+is an ordinary independently clocked `DCConverter`. Each bridge and its matching link terminal
+attach through the child's own assembly boundary. The WPT exposes `primary` and `secondary` Unit
+ports and explicitly selects `primary` as its default port. Composite event parameters and shared
+subsystem ratings therefore inherit the primary port unless another port is selected. The bundled
+example selects a full bridge and the
+temporary open-loop resonant-modulation loop for each child; neither choice creates a separate
+converter class. `link.type` selects series-series (`ss`) or LCC-LCC (`lcc`) compensation. The
+complete runnable schema is shown in `examples/wpt-example.pes`.
 
 ```yaml
 units:

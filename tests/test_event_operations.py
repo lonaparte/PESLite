@@ -105,10 +105,14 @@ def test_builtin_element_parameters_are_checked(change, message):
         from_dict(tree)
 
 
-def test_element_names_and_registrations_are_checked():
+def test_element_names_are_section_scoped_and_registrations_are_checked():
     tree = _load(_tree(), name="pcc")
-    with pytest.raises(ConfigError, match="already used by buses.pcc"):
-        from_dict(tree)
+    params = from_dict(tree)
+    system = peslite.System(params)
+    signals = system.signals(params.simulation.initial.t)
+
+    assert "pcc" in params.buses and "pcc" in params.elements
+    assert {"pcc.u", "pcc.i"} <= set(signals)
 
     class NoType(Element):
         @dataclass(frozen=True)

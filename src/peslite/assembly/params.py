@@ -433,7 +433,11 @@ class _UnitCommonFields:
     """Fields interpreted identically for every converter unit type."""
 
     pwm: PWMParams
+    dclink: DCLinkParams
+    bus: Optional[str] = None
     bridge: BridgeParams = field(default_factory=BridgeParams)
+    meas: MeasurementParams = field(default_factory=MeasurementParams)
+    protection: ProtectionParams = field(default_factory=ProtectionParams)
     s_base: Optional[float] = None
 
 
@@ -444,7 +448,11 @@ class UnitParams:
     type: str
     pwm: Optional[PWMParams]
     ctrl: Optional[ControlParams]
+    dclink: Optional[DCLinkParams] = None
+    bus: Optional[str] = None
     bridge: Optional[BridgeParams] = None
+    meas: Optional[MeasurementParams] = None
+    protection: Optional[ProtectionParams] = None
     s_base: Optional[float] = None
     _unit_fields: Any = field(repr=False, default=None)
     base: BaseValues = field(init=False, default=None)
@@ -453,17 +461,24 @@ class UnitParams:
 
     def __init__(self, *, type: str, pwm: Optional[PWMParams] = None,
                  ctrl: Optional[ControlParams] = None, _unit_fields: Any,
+                 dclink: Optional[DCLinkParams] = None, bus: Optional[str] = None,
                  bridge: Optional[BridgeParams] = None,
+                 meas: Optional[MeasurementParams] = None,
+                 protection: Optional[ProtectionParams] = None,
                  s_base: Optional[float] = None, **changes: Any) -> None:
         selected = replace(_unit_fields, **changes) if changes else _unit_fields
         object.__setattr__(self, "type", type)
         object.__setattr__(self, "pwm", pwm)
         object.__setattr__(self, "ctrl", ctrl)
+        object.__setattr__(self, "dclink", dclink)
+        object.__setattr__(self, "bus", bus)
         object.__setattr__(
             self,
             "bridge",
             bridge if unit_type(type).composite or bridge is not None else BridgeParams(),
         )
+        object.__setattr__(self, "meas", meas)
+        object.__setattr__(self, "protection", protection)
         object.__setattr__(self, "s_base", s_base)
         object.__setattr__(self, "_unit_fields", selected)
         object.__setattr__(self, "base", None)
@@ -590,28 +605,21 @@ def _unit_leaves(units: Mapping[str, UnitParams], path: str) -> tuple[str, ...]:
 class _VSCUnitFields:
     """Fields unique to a voltage-source converter.
 
-    ``bus``: terminal bus. Plant fields are stored in SI; controller parameters are
-    pu on the unit's rating ``s_base`` (VA) and DC base (``dclink.vdc_ref``).
+    Plant fields are stored in SI; controller parameters are pu on the unit's rating
+    ``s_base`` (VA) and DC base (``dclink.vdc_ref``).
     """
 
-    bus: str
     ac_filter: FilterParams
-    dclink: DCLinkParams
-    meas: MeasurementParams = field(default_factory=MeasurementParams)
-    protection: ProtectionParams = field(default_factory=ProtectionParams)
 
 
 @dataclass(frozen=True, kw_only=True)
 class _DCConverterUnitFields:
     """Fields unique to a scalar converter unit.
 
-    A named ``bus`` and series ``filter`` expose the bridge to the point network. Both are
-    omitted only when a composite parent connects the converter port directly to an internal
-    subsystem, as WPT does.
+    A series ``filter`` exposes the bridge through the common named ``bus``. A composite may omit
+    both and attach the bridge to a scoped internal bus, as WPT does.
     """
 
-    dclink: DCLinkParams
-    bus: Optional[str] = None
     filter: Optional[FilterParams] = None
 
 
@@ -760,8 +768,8 @@ class MetaParams:
 class Params:
     """Complete configuration: system base, network elements, units and run settings.
 
-    ``buses``, ``branches``, ``sources``, ``units`` and ``elements`` map names to entries;
-    their names are unique together and prefix state names.
+    ``buses``, ``branches``, ``sources``, ``units`` and ``elements`` map names to entries.
+    Names are scoped by section and prefix state names.
     """
 
     base: BaseValues  # system base, used for network pu inputs
@@ -789,11 +797,17 @@ class Params:
         known = sorted(name for name, _unit in _unit_items(self.units, leaves_only=False))
         raise ConfigError(f"unknown unit {name!r}; known: {known}")
 
+    def sections_of(self, name: str) -> tuple[str, ...]:
+        """Return every section containing ``name``; nested unit paths belong to ``units``."""
+        sections = [section for section in NAMED if name in getattr(self, section)]
+        if _unit_at(self.units, name) is not None and "units" not in sections:
+            sections.append("units")
+        return tuple(sections)
+
     def section_of(self, name: str) -> Optional[str]:
-        """Return the named section containing ``name``, or ``None``."""
-        if _unit_at(self.units, name) is not None:
-            return "units"
-        return next((section for section in NAMED if name in getattr(self, section)), None)
+        """Return the sole section containing ``name``, or ``None`` if absent or ambiguous."""
+        sections = self.sections_of(name)
+        return sections[0] if len(sections) == 1 else None
 
     @functools.cached_property
     def changes(self) -> tuple["Change", ...]:
@@ -893,7 +907,11 @@ def to_dict(p: Any, derived: bool = False) -> dict:
             **to_dict(p._unit_fields, derived),
             "pwm": to_dict(p.pwm, derived),
             "ctrl": to_dict(p.ctrl, derived),
+            "dclink": to_dict(p.dclink, derived),
+            "bus": p.bus,
             "bridge": to_dict(p.bridge, derived),
+            "meas": to_dict(p.meas, derived),
+            "protection": to_dict(p.protection, derived),
             "s_base": p.s_base,
         }
         if not derived:
@@ -1077,7 +1095,11 @@ def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
         type=kind,
         pwm=common.pwm,
         ctrl=control,
+        dclink=common.dclink,
+        bus=common.bus,
         bridge=replace(common.bridge, type=bridge_type),
+        meas=common.meas,
+        protection=common.protection,
         s_base=common.s_base,
         _unit_fields=unit_fields,
     )
@@ -1121,13 +1143,44 @@ def _loop_entry(name: str, item: Any, path: str) -> Any:
 
 
 def _target_scales(event: Any, parent: dict, base: Any) -> Optional[dict]:
-    """Use a target unit's pu bases for a custom event's electrical parameters."""
+    """Use the target Unit port's base, following a composite's default port."""
     target = event.get("target") if isinstance(event, dict) else None
     units = parent.get("units")
-    if not isinstance(target, str) or not isinstance(units, dict) or not isinstance(units.get(target), dict):
+    if not isinstance(target, str) or not isinstance(units, dict):
         return None
-    unit = units[target]
-    return UnitParams._bases(unit, base, f"units.{target}")[1]
+    parts = target.split(".")
+    if not parts or not isinstance(units.get(parts[0]), dict):
+        return None
+
+    path = parts[0]
+    unit = units[parts[0]]
+    current_base = base
+    index = 1
+    while True:
+        current_base, scales = UnitParams._bases(unit, current_base, f"units.{path}")
+        spec = unit_type(unit.get("type", "vsc"), f"units.{path}.type")
+        if index < len(parts) and parts[index] in spec.children:
+            child = parts[index]
+            value = unit.get(child)
+            if not isinstance(value, dict):
+                return None
+            path += f".{child}"
+            unit = value
+            index += 1
+            continue
+        if spec.composite:
+            port = spec.default_port
+            if port is None or port not in spec.children:
+                raise ConfigError(
+                    f"units.{path}: composite type {spec.name!r} needs a default port"
+                )
+            value = unit.get(port)
+            if not isinstance(value, dict):
+                raise ConfigError(f"units.{path}.{port}: default port Unit is missing")
+            path += f".{port}"
+            unit = value
+            continue
+        return scales
 
 
 def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dict], parent: dict) -> dict:

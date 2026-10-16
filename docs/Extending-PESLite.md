@@ -144,11 +144,13 @@ Modules under `peslite/addons/components/` are discovered automatically. Built-i
 elements follow the same registry mechanism. Public names are namespaced by the element instance,
 so two instances do not share state paths.
 
-An electrical `Terminal` names a subsystem voltage input and current output once. Its direction is
-`+1` when positive current enters the subsystem and `-1` when it leaves. A one-terminal element
-uses `bus` and returns one binding; a multi-terminal element uses `bus1`, `bus2`, and so on and
-returns one binding per terminal. System assembly converts these declarations to direct model
-connections, so terminal metadata adds no work to the integration loop.
+An electrical `Terminal` names a subsystem voltage and current once. Its direction is `+1` when
+positive current enters the subsystem and `-1` when it leaves. The default terminal receives
+voltage through `inp` and publishes current through `out`; `drives_voltage=True` reverses those
+roles. A one-terminal element uses `bus` and returns one binding; a multi-terminal element uses
+`bus1`, `bus2`, and so on. Each bus needs exactly one voltage driver. System assembly converts the
+voltage fan-out and signed current sum to direct model connections, so terminal metadata adds no
+work to the integration loop.
 
 Every entry returned by `signals()` follows the same output path. Complex values become three
 phase columns with `_a`, `_b` and `_c` suffixes, while scalar values retain their declared name;

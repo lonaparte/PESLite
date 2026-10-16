@@ -16,12 +16,14 @@ class UnitTypeSpec:
     params: type | None = None
     default_bridge: str | Callable[[Any], str] | None = None
     children: tuple[str, ...] = ()
+    default_port: str | None = None
     phases: int | None = None
     bridge_types: frozenset[str] = frozenset()
+    measurement_channels: frozenset[str] = frozenset()
+    protection_criteria: frozenset[str] = frozenset()
     defaults_grid_frequency: bool = False
     validator: Callable[..., None] | None = None
     assembler: Callable[..., Any] | None = None
-    direct_power_port: bool = False
 
     @property
     def composite(self) -> bool:

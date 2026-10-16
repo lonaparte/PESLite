@@ -213,10 +213,11 @@ def test_loop_registration_and_loop_owned_validation():
         }})
 
 
-def test_controller_interfaces_have_one_definition():
-    from peslite.components.adc import Measurement as ADCMeasurement
+def test_adc_sample_and_controller_measurement_have_distinct_scopes():
+    from peslite.components.adc import ADCSample
 
-    assert ADCMeasurement is Measurement
+    assert peslite.ADCSample is ADCSample
+    assert Measurement.__module__ == "peslite.control.controller"
 
 
 def test_control_graph_has_one_typed_boundary_for_inputs_and_outputs(gfl):

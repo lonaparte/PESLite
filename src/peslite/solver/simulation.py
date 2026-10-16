@@ -496,17 +496,33 @@ class Simulation:
         """Return a function giving the rated (effort, flow) of a storage, or ``None``."""
         base = self.p.base
         system_ac = (base.v_phase_peak, base.i_phase_peak)
-        units = tuple(_unit_items(self.p.units))
+
+        def port_rating(port: Any) -> tuple[float, float]:
+            cfg = self.p.unit(port.owner)
+            if port.domain == "dc":
+                dc = cfg.dc_base
+                return dc.v, dc.i
+            return cfg.base.v_phase_peak, cfg.base.i_phase_peak
+
+        port_bindings = self.system._port_bindings
+        subsystems = dict(zip(self.system.model.names, self.system.model.subsystems))
 
         def rating(name: str, storage: Any) -> Optional[tuple[float, float]]:
-            cfg = next((value for unit_name, value in sorted(units, key=lambda item: len(item[0]), reverse=True)
-                        if name == unit_name or name.startswith(unit_name + ".")), None)
-            if storage.scale == 1.0:  # dc quantities: that unit's dc base
-                if cfg is None:
-                    return None
-                dc = cfg.dc_base
-                return (dc.v, dc.i) if dc.v > 0 else None
-            return (cfg.base.v_phase_peak, cfg.base.i_phase_peak) if cfg is not None else system_ac
+            candidates = []
+            for port in port_bindings.get(name, ()):
+                value = port_rating(port)
+                if value not in candidates:
+                    candidates.append(value)
+            if candidates:
+                return candidates[0] if len(candidates) == 1 else None
+            if name in self.p.buses:
+                if self.p.buses[name].phases == 3:
+                    return system_ac
+                return None
+            subsystem = subsystems.get(name)
+            if getattr(subsystem, "phases", None) == 3:
+                return system_ac
+            return None
 
         return rating
 
@@ -529,6 +545,11 @@ class Simulation:
             if not getattr(unit, "continuous", False)
         }
         self.ph_report = report = model.ph_report(zoh=zoh, groups=groups, hold=hold)
+        report.warnings.extend(
+            f"{name}: {sub.energy_audit_note}"
+            for name, sub in zip(model.names, model.subsystems)
+            if getattr(sub, "energy_audit_note", None)
+        )
         problems = list(report.problems)
         if report.defaulted:
             problems.append(f"default energy declaration (black box, net power inferred from the neighbours) "

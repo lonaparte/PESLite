@@ -161,14 +161,16 @@ def test_changing_bridge_model_keeps_the_same_bridge_power_boundary(gfl):
     ).unit()
 
     assert tuple(switching.bridge.inp.__slots__) == tuple(averaging.bridge.inp.__slots__)
-    assert set(switching.bridge.inp.__slots__) == {"q", "u_dc", "i_c"}
+    assert set(switching.bridge.inp.__slots__) == {
+        "q", "current_ratio", "u_dc", "i_c",
+    }
     assert [port for _component, port in switching.zoh_connections()] == ["q"]
     assert averaging.zoh_connections() == {}
     assert (averaging.bridge, "q") in averaging.connections()
     assert averaging.connections()[(averaging.ctrl, "u_dc")] == (averaging.dclink, "u_dc")
-    for port in ("u_dc", "i_c"):
-        assert (switching.bridge, port) in switching.connections()
-        assert (averaging.bridge, port) in averaging.connections()
+    for unit in (switching, averaging):
+        assert unit.bridge.dc_terminal in [terminal for _bus, terminal in unit.terminals()]
+        assert unit.bridge.power_terminal in [terminal for _bus, terminal in unit.terminals()]
 
 
 def test_only_exact_switching_bridge_enters_the_switching_event_loop(gfl):

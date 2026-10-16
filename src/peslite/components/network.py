@@ -7,7 +7,7 @@ Quantities are SI; ac quantities are peak-scaled space vectors. Breakers expose
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import Any, Callable, ClassVar, Optional
 
 from ..solver.energy import PowerPort, StoragePort
@@ -23,29 +23,44 @@ __all__ = [
 class Terminal:
     """One electrical terminal of a subsystem.
 
-    ``voltage`` is an ``inp`` field and ``current`` an ``out`` field of ``subsystem``.
-    ``direction`` is +1 when positive current enters the subsystem and -1 when it leaves.  These
-    are construction-time references; System lowers them to ordinary Model connections.
+    ``direction`` is +1 when positive current enters the subsystem and -1 when it leaves.
+    A voltage-following terminal receives voltage through ``inp`` and publishes current through
+    ``out``. A voltage-driving terminal does the reverse. These are construction-time references;
+    System lowers a named bus directly to ordinary Model connections.
     """
 
     subsystem: Any
     voltage: str
     current: str
     direction: int
+    drives_voltage: bool = False
+    current_sources: Any = field(init=False, repr=False, compare=False, default=None)
 
     def __post_init__(self) -> None:
+        if type(self.drives_voltage) is not bool:
+            raise TypeError(
+                f"terminal drives_voltage must be bool, got {type(self.drives_voltage).__name__}"
+            )
         if self.direction not in (-1, 1) or isinstance(self.direction, bool):
             raise ValueError(f"terminal direction must be +1 or -1, got {self.direction!r}")
-        if not hasattr(self.subsystem.inp, self.voltage):
+        voltage_record = self.subsystem.out if self.drives_voltage else self.subsystem.inp
+        current_record = self.subsystem.inp if self.drives_voltage else self.subsystem.out
+        voltage_scope = "out" if self.drives_voltage else "inp"
+        current_scope = "inp" if self.drives_voltage else "out"
+        if not hasattr(voltage_record, self.voltage):
             raise ValueError(
-                f"{type(self.subsystem).__name__}.inp has no terminal voltage {self.voltage!r}"
+                f"{type(self.subsystem).__name__}.{voltage_scope} has no terminal voltage "
+                f"{self.voltage!r}"
             )
-        if not hasattr(self.subsystem.out, self.current):
+        if not hasattr(current_record, self.current):
             raise ValueError(
-                f"{type(self.subsystem).__name__}.out has no terminal current {self.current!r}"
+                f"{type(self.subsystem).__name__}.{current_scope} has no terminal current "
+                f"{self.current!r}"
             )
+        effort = f"{voltage_scope}.{self.voltage}"
+        flow = f"{current_scope}.{self.current}"
         for port in getattr(self.subsystem, "ports", ()):
-            if (port.effort, port.flow) == (f"inp.{self.voltage}", f"out.{self.current}"):
+            if (port.effort, port.flow) == (effort, flow):
                 if port.sign != self.direction:
                     raise ValueError(
                         f"terminal direction {self.direction:+d} does not match the energy-port "
@@ -53,12 +68,18 @@ class Terminal:
                     )
                 break
 
+    def bind_current_sources(self, sources: list[tuple]) -> None:
+        """Remember the already-lowered current fan-in for driver-side observers."""
+        if not self.drives_voltage:
+            raise ValueError("only a voltage-driving terminal owns the bus current target")
+        object.__setattr__(self, "current_sources", sources)
+
 
 class _BranchState(Bag):
     __slots__ = ("i",)
 
 class _BranchInp(Bag):
-    __slots__ = ("u1", "u2", "q", "u_dc")
+    __slots__ = ("u1", "u2", "di_dt", "loss_factor")
 
 class _BranchOut(Bag):
     __slots__ = ("i",)
@@ -90,16 +111,17 @@ class RLBranch:
             "i", L, self.power_scale, (("inp.u1", 1.0), ("inp.u2", -1.0)), "inductor",
         ),)
         self.state = _BranchState(i=initial)
-        self.inp = _BranchInp(u1=self.zero, u2=self.zero, q=0.0, u_dc=0.0)
+        self.inp = _BranchInp(
+            u1=self.zero, u2=self.zero, di_dt=self.zero, loss_factor=1.0,
+        )
         self.out = _BranchOut(i=initial)
         self.terminal1 = Terminal(self, "u1", "i", 1)
         self.terminal2 = Terminal(self, "u2", "i", -1)
         self.breaker_open = False
-        self.conduction = None
         if self.unilateral:
             self.state_bounds = {"i": (0.0, None)}
         if type(self) is RLBranch:
-            self.rhs = self._rhs_closed
+            self.rhs = self._rhs_ordinary
 
     def open_breaker(self) -> None:
         self.breaker_open = True
@@ -111,7 +133,7 @@ class RLBranch:
         """Close the breaker; current resumes from zero after an opening."""
         self.breaker_open = False
         if type(self) is RLBranch:
-            self.rhs = self._rhs_closed
+            self.rhs = self._closed_rhs
 
     def retune(self, L: float, R: float) -> None:
         """Change inductance and resistance without changing the current state."""
@@ -133,26 +155,33 @@ class RLBranch:
     def _rhs_open(self, t: float):
         return (self.zero,)
 
-    def _rhs_closed(self, t: float):
-        if self.conduction is not None:
-            return (self.conduction.derivative(self),)
+    def _rhs_ordinary(self, t: float):
         derivative = (self.inp.u1 - self.inp.u2 - self.R * self.state.i) / self.L
         if self.unilateral and self.state.i <= 0.0 and derivative < 0.0:
             derivative = 0.0
         return (derivative,)
 
+    _closed_rhs = _rhs_ordinary
+
+    def _rhs_conduction(self, _t: float):
+        return (self.inp.di_dt,)
+
+    def use_external_conduction(self) -> None:
+        """Take derivative and copper-loss factor from a connected constitutive subsystem."""
+        self._closed_rhs = self._rhs_conduction
+        self.energy_audit_note = (
+            "cycle-averaged DCM current does not have the branch's linear instantaneous "
+            "storage function"
+        )
+        if not self.breaker_open and type(self) is RLBranch:
+            self.rhs = self._closed_rhs
+
     def diode_blocks_reverse_current(self) -> bool:
         """Return whether this branch represents a diode-bounded current path."""
         return self.unilateral
 
-    def diode_maximum_step(self) -> float:
-        """Return the local step requested by an attached averaged conduction law."""
-        return math.inf if self.conduction is None else self.conduction.maximum_step(self)
-
     def dissipated_power(self) -> float:
-        factor = (1.0 if self.conduction is None
-                  else self.conduction.resistance_factor(self))
-        return self.power_scale * self.R * factor * abs(self.state.i) ** 2
+        return self.power_scale * self.R * self.inp.loss_factor * abs(self.state.i) ** 2
 
     def supplied_power(self) -> float:
         return 0.0
@@ -187,6 +216,7 @@ class RCNode:
         self.state = _NodeState(u_C=initial)
         self.inp = _NodeInp(i=zero)
         self.out = _NodeOut(u=initial)
+        self.terminal = Terminal(self, "u", "i", 1, drives_voltage=True)
 
     def set_outputs(self, t: float) -> None:
         self.out.u = self.state.u_C + self.R_d * self.inp.i
@@ -234,6 +264,7 @@ class ThreePhaseSource:
         self.state = Empty()
         self.inp = _SourceInp(i=0j)
         self.out = _SourceOut()
+        self.terminal = Terminal(self, "e_g", "i", -1, drives_voltage=True)
 
     def set_outputs(self, t: float) -> None:
         phi = self.phi(t) if self.phi is not None else 0.0
@@ -457,7 +488,7 @@ class _VoltageSourceModel:
 
 @register_element_type
 class VoltageSource(Element):
-    """Scalar point-network voltage source behind a positive series resistance."""
+    """Scalar named-bus voltage source behind a positive series resistance."""
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
@@ -478,7 +509,7 @@ class VoltageSource(Element):
 
     def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
         if buses[cfg.bus].phases != 1:
-            raise ConfigError("a point-network voltage source needs a single-phase bus")
+            raise ConfigError("a scalar voltage source needs a single-phase bus")
         self.name, self.cfg = name, cfg
         self.source = _VoltageSourceModel(cfg.v, cfg.r)
 
