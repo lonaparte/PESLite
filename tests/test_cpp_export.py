@@ -128,6 +128,23 @@ def _quick(mode: str):
     })
 
 
+def _quick_gfm(mode: str):
+    solver = ("adaptive", "DP45") if mode == "averaging" else ("fixed", "rk4")
+    return peslite.load(EXAMPLES / "gfm-psc-example.pes").replace(**{
+        "units.vsc.bridge.model": mode,
+        "units.vsc.ctrl.loops.PSC.power_filter.enable": 1,
+        "units.vsc.ctrl.loops.PSC.power_filter.bandwidth": 5.0,
+        "events.connect_vsc.t": 0.0,
+        "events.connect_vsc.ramp": 0.0,
+        "simulation.solver.type": solver[0],
+        "simulation.solver.method": solver[1],
+        "simulation.solver.subsystems": {},
+        "simulation.t_end": 0.004,
+        "simulation.output.period": 1e-3,
+        "simulation.energy_check": "off",
+    })
+
+
 def test_python_export_api_uses_export_run(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = peslite.export(_quick("pwm_averaging"), "cpp")
@@ -179,6 +196,22 @@ def test_generated_cpp_runs_all_bridge_modes(mode, tmp_path):
     actual = _final_csv(cpp_out / "states.csv")
     assert actual.keys() == expected.keys()
     assert _summary(cpp_out).keys() == _summary(python_out).keys()
+    scale = max(1.0, max(abs(value) for value in expected.values()))
+    tolerance = 2e-5 if mode == "averaging" else 2e-8
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= tolerance * scale
+
+
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
+def test_generated_cpp_runs_gfm_function_owned_power_filter(mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = _quick_gfm(mode)
+    _source, cpp_out, python_out = _run_generated(params, tmp_path / mode, compiler)
+
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
+    assert actual.keys() == expected.keys()
     scale = max(1.0, max(abs(value) for value in expected.values()))
     tolerance = 2e-5 if mode == "averaging" else 2e-8
     assert max(abs(actual[key] - expected[key]) for key in expected) <= tolerance * scale

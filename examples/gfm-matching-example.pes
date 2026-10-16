@@ -21,9 +21,8 @@ units:
     ctrl:
       type: gfm
       loops:
-        power: {type: power}
-        sync: {type: matching, k_q_pu: 0.05}
-        vi: {type: virtual_impedance}
+        Matching: {k_q_pu: 0.05}
+        VirtualImpedance: {}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 events:
   connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 1.0}

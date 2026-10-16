@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
 
 from ..components.network import ELEMENT_TYPES, element_buses
-from ..control.loops import LOOP_TYPES
+from ..control.loops import LOOP_TYPES, loop_key_type, loop_type
 from ..control.profiles import ReferenceParams, control_type
 from ..solver.model import ConfigError
 from .events import EVENT_TYPES, NAMED, events_for
@@ -342,8 +342,8 @@ class ControlParams:
     discrete timing settings are retained in the file but ignored.
 
     ``type`` selects the reference-field schema and default wiring. ``connections`` and ``outputs``
-    override that wiring. Each ``loops`` entry is validated against the schema registered for its
-    own ``type``.
+    override that wiring. A ``loops`` key names a registered loop class. The optional
+    ``ClassName[label]`` form distinguishes repeated uses of the same class.
     """
 
     type: str
@@ -809,7 +809,7 @@ class Params:
         return base, base.parameter_scales()
 
     def replace(self, **path_values: Any) -> "Params":
-        """Return a copy with dotted paths replaced, e.g. ``replace(**{"units.vsc.ctrl.loops.pll.kp_pu": 20})``."""
+        """Return a copy with dotted paths replaced, for example a loop-class gain path."""
         d = to_dict(self)
         assigned = set()
         free = ("simulation.initial.states.", "simulation.solver.subsystems.")  # dotted keys themselves
@@ -903,6 +903,13 @@ def to_dict(p: Any, derived: bool = False) -> dict:
                 for key in head:
                     node = node[key]
                 node[last] = None
+        return d
+    if isinstance(p, ControlParams):
+        d = {f.name: to_dict(getattr(p, f.name), derived) for f in fields(p) if f.init}
+        for name, loop in p.loops.items():
+            direct = loop_key_type(name)
+            if direct is not None and direct.type == loop.type:
+                d["loops"][name].pop("type", None)
         return d
     if is_dataclass(p) and not isinstance(p, type):
         d = {f.name: to_dict(getattr(p, f.name), derived) for f in fields(p) if f.init}
@@ -1079,9 +1086,38 @@ def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
 def _typed_class(what: str, data: Any, path: str) -> type:
     registry, hint = _TYPED[what]
     kind = data.get("type") if isinstance(data, dict) else None
+    if what == "loop":
+        return loop_type(kind, f"{path}.type").Params
     if not isinstance(kind, str) or kind not in registry:
         raise ConfigError(f"{path}.type: unknown {what} type {kind!r}; known: {sorted(registry)}{hint}")
     return registry[kind].Params
+
+
+def _loop_entry(name: str, item: Any, path: str) -> Any:
+    """Resolve a class-qualified loop entry without creating a loop object.
+
+    YAML parses a bare ``ClassName:`` entry as ``None``. In this one scope it is the concise
+    spelling of an empty parameter mapping.
+    """
+    if item is None:
+        item = {}
+    if is_dataclass(item):
+        item = to_dict(item)
+    if not isinstance(item, dict):
+        raise ConfigError(f"{path}: expected a mapping, got {type(item).__name__}")
+    values = dict(item)
+    direct = loop_key_type(name, path)
+    selected = values.get("type")
+    if direct is None:
+        if selected is not None:
+            values["type"] = loop_type(selected, f"{path}.type").type
+        return values
+    if selected is not None and loop_type(selected, f"{path}.type") is not direct:
+        raise ConfigError(
+            f"{path}.type: {selected!r} conflicts with loop class {name!r}"
+        )
+    values["type"] = direct.type
+    return values
 
 
 def _target_scales(event: Any, parent: dict, base: Any) -> Optional[dict]:
@@ -1110,7 +1146,9 @@ def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dic
         if item_cls == "unit":
             out[name] = _build_unit_params(item, where, base)
         elif item_cls in _TYPED:
-            if is_dataclass(item):
+            if item_cls == "loop":
+                item = _loop_entry(name, item, where)
+            elif is_dataclass(item):
                 item = to_dict(item)
             here = (_target_scales(item, parent, base) if item_cls == "event" else None) or scales
             out[name] = _build(_typed_class(item_cls, item, where), item, where, base, here)
@@ -1225,7 +1263,7 @@ RUNTIME = (
     "branches.*.l", "branches.*.r",
     "sources.*.v", "sources.*.f", "sources.*.angle", "sources.*.l", "sources.*.r",
     "units.*.ctrl.references.*",
-    "units.*.ctrl.loops.*.** (not type, period)",
+    "units.*.ctrl.loops.*.** (not period)",
     "units.*.protection.**",
     "units.*.dclink.source.* (not type)",
     "elements.*.* (not type, bus)",

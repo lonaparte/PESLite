@@ -69,23 +69,23 @@ def test_controller_states_in_pu_are_named_as_pu(examples):
     gfl_names = peslite.Simulation(peslite.load(examples / "gfl-example.pes")).state_names()
     psc_names = peslite.Simulation(peslite.load(
         examples / "gfm-psc-example.pes",
-        **{"units.vsc.ctrl.loops.power.filter.enable": 1,
-           "units.vsc.ctrl.loops.power.filter.bandwidth": 5.0},
+        **{"units.vsc.ctrl.loops.PSC.power_filter.enable": 1,
+           "units.vsc.ctrl.loops.PSC.power_filter.bandwidth": 5.0},
     )).state_names()
     assert {
-        "vsc.ctrl.pll.integral_pu",
-        "vsc.ctrl.dvc.integral",
-        "vsc.ctrl.cc.integral_pu.re",
+        "vsc.ctrl.SRFPLL.integral_pu",
+        "vsc.ctrl.DCVoltageControl.integral",
+        "vsc.ctrl.CurrentLoop.integral_pu.re",
         "vsc.tripped",
     } <= set(gfl_names)
     assert {
-        "vsc.ctrl.power.p_pu",
-        "vsc.ctrl.power.q_pu",
-        "vsc.ctrl.sync.v_int_pu",
+        "vsc.ctrl.PSC.p_pu",
+        "vsc.ctrl.PSC.q_pu",
+        "vsc.ctrl.PSC.v_int_pu",
     } <= set(psc_names)
     assert not {
-        "vsc.ctrl.pll.integral",
-        "vsc.ctrl.power.p",
+        "vsc.ctrl.SRFPLL.integral",
+        "vsc.ctrl.PSC.p",
         "vsc.breaker_open",
     } & set(gfl_names + psc_names)
     assert not any(name.startswith(("plant.", "ctrl.", "pwm.", "meas."))
@@ -124,8 +124,8 @@ def test_continuation_uses_the_renamed_states(gfl, tmp_path):
     continued = _run(restarted, tmp_path / "continued")
     index = int(np.argmin(abs(result.states["t"] - 0.003)))
     continued_index = int(np.argmin(abs(continued.states["t"] - 0.003)))
-    assert continued.states["vsc.ctrl.pll.integral_pu"][continued_index] == pytest.approx(
-        result.states["vsc.ctrl.pll.integral_pu"][index], rel=1e-9
+    assert continued.states["vsc.ctrl.SRFPLL.integral_pu"][continued_index] == pytest.approx(
+        result.states["vsc.ctrl.SRFPLL.integral_pu"][index], rel=1e-9
     )
 
 

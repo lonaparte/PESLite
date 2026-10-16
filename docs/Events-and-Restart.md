@@ -61,7 +61,7 @@ simulation:
     states:
       pcc.u_C: source
       vsc.dclink.u_C: rated
-      vsc.ctrl.sync.theta: 0.1
+      vsc.ctrl.PSC.theta: 0.1
 ```
 
 The state names are the `states.csv` columns. Complex state can use a two-element value or `.re`

@@ -187,7 +187,7 @@ class ProjectLocalElement(Load):
     case = root / "local-case.pes"
     case.write_text(
         (examples / "gfl-example.pes").read_text(encoding="utf-8").replace(
-            "type: srf_pll", "type: project_local_pll", 1
+            "SRFPLL:", "ProjectLocalPLL:", 1
         ) + "\nelements:\n  project_load: {type: project_local_element, bus: pcc, l: 0.001, r: 1.0}\n",
         encoding="utf-8",
     )
@@ -198,7 +198,7 @@ class ProjectLocalElement(Load):
         "peslite.addons.functions.project_local_function"
     )
 
-    assert type(simulation.unit().ctrl.graph.nodes["pll"]).__name__ == "ProjectLocalPLL"
+    assert type(simulation.unit().ctrl.graph.nodes["ProjectLocalPLL"]).__name__ == "ProjectLocalPLL"
     assert params.elements["project_load"].type == "project_local_element"
     assert local_function.VALUE == 42
     assert str((root / "PESaddons").resolve()) in peslite.addons.__path__
@@ -220,16 +220,16 @@ def test_custom_pll_assembles_with_builtin_loops_and_runs(examples, tmp_path, mo
     simulation = peslite.Simulation(params)
     nodes = simulation.unit().ctrl.graph.nodes
 
-    assert set(nodes) == {"pll", "cc", "dvc"}
-    assert isinstance(nodes["pll"], VoltageAdaptivePLL)
-    assert type(nodes["pll"]).sample is Loop.sample
-    assert type(nodes["pll"]).flow_path is Loop.flow_path
-    assert set(nodes["pll"]._state_blocks) == {"theta", "omega_g", "u_g_pu"}
-    assert nodes["cc"].type == "dq_current_pi"
-    assert nodes["dvc"].type == "dc_voltage_control"
+    assert set(nodes) == {"VoltageAdaptivePLL", "CurrentLoop", "DCVoltageControl"}
+    assert isinstance(nodes["VoltageAdaptivePLL"], VoltageAdaptivePLL)
+    assert type(nodes["VoltageAdaptivePLL"]).sample is Loop.sample
+    assert type(nodes["VoltageAdaptivePLL"]).flow_path is Loop.flow_path
+    assert set(nodes["VoltageAdaptivePLL"]._state_blocks) == {"theta", "omega_g", "u_g_pu"}
+    assert nodes["CurrentLoop"].type == "dq_current_pi"
+    assert nodes["DCVoltageControl"].type == "dc_voltage_control"
 
     result = simulation.run(out_dir=tmp_path / model)
-    theta = result.states["vsc.ctrl.pll.theta"]
+    theta = result.states["vsc.ctrl.VoltageAdaptivePLL.theta"]
     assert np.isfinite(theta).all()
     assert theta[-1] > 1.0
     assert not result.tripped

@@ -194,9 +194,9 @@ def test_averaging_silently_ignores_all_sampled_timing_semantics(tmp_path):
     configured = peslite.load(EXAMPLES / "gfl-example.pes", **common, **{
         "units.vsc.ctrl.period": 37e-6,
         "units.vsc.ctrl.computation": 1.0,
-        "units.vsc.ctrl.loops.pll.period": 31e-6,
-        "units.vsc.ctrl.loops.cc.period": 43e-6,
-        "units.vsc.ctrl.loops.dvc.period": 59e-6,
+        "units.vsc.ctrl.loops.SRFPLL.period": 31e-6,
+        "units.vsc.ctrl.loops.CurrentLoop.period": 43e-6,
+        "units.vsc.ctrl.loops.DCVoltageControl.period": 59e-6,
         "units.vsc.meas.period": 7e-6,
         "units.vsc.meas.window": 0.2,
         "units.vsc.meas.average": ["u_g", "i_c", "u_dc"],
@@ -212,7 +212,11 @@ def test_averaging_silently_ignores_all_sampled_timing_semantics(tmp_path):
     second_sim = peslite.Simulation(configured)
     assert second_sim.unit().adc is None
     assert second_sim.unit().periods == []
-    assert second_sim.unit().ctrl.periods == {"pll": 31e-6, "cc": 43e-6, "dvc": 59e-6}
+    assert second_sim.unit().ctrl.periods == {
+        "SRFPLL": 31e-6,
+        "CurrentLoop": 43e-6,
+        "DCVoltageControl": 59e-6,
+    }
     second = second_sim.run(out_dir=tmp_path / "configured")
     for name, value in first.final_states().items():
         assert second.final_states()[name] == pytest.approx(value, rel=1e-13, abs=1e-13)
@@ -299,8 +303,9 @@ def test_pwm_averaging_accepts_synchronous_pwm(gfl, tmp_path):
 def test_ideal_averaging_has_continuous_control_states_and_no_sampled_hardware_states(gfl):
     simulation = peslite.Simulation(gfl(**{"units.vsc.bridge.model": "averaging"}))
     names = set(simulation.state_names())
-    assert {"vsc.ctrl.pll.theta", "vsc.ctrl.pll.integral_pu",
-            "vsc.ctrl.cc.integral_pu.re", "vsc.ctrl.cc.integral_pu.im"} <= names
+    assert {"vsc.ctrl.SRFPLL.theta", "vsc.ctrl.SRFPLL.integral_pu",
+            "vsc.ctrl.CurrentLoop.integral_pu.re",
+            "vsc.ctrl.CurrentLoop.integral_pu.im"} <= names
     assert not any(name.startswith(("vsc.pwm.", "vsc.bridge.", "vsc.meas."))
                    for name in names)
 

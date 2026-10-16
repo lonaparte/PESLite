@@ -271,15 +271,17 @@ CONTROL_INTERFACE = ControlInterface(
 
 
 class ControlGraph:
-    """The loops of ``cfg.ctrl.loops`` wired by typed ports and run by the control interrupt.
+    """The active loops of ``cfg.ctrl.loops`` wired by typed ports and run by the control interrupt.
 
     Loop inputs are held outputs of other loops, the pu measurement (``meas.u_g``, ``.i_c``,
     ``.u_dc``) or the references (``references.<name>``); ``connections`` and ``outputs`` are the
     default wiring, which ``cfg.ctrl.connections`` and ``.outputs`` override. Loops run in signal
     order, every interrupt or every n-th interrupt according to their periods.
 
-    Retuned parameters are queued by :meth:`schedule` and take effect at the next update. Changed
-    loops are rebuilt from their new parameters and continue from their named states.
+    Dependencies are traced backward from controller outputs before loop objects are constructed,
+    so declarations outside the active graph use no runtime object. Retuned parameters are queued
+    by :meth:`schedule` and take effect at the next update. Changed active loops are rebuilt from
+    their new parameters and continue from their named states.
     """
 
     def __init__(self, cfg, startup, connections, outputs, *, interface=CONTROL_INTERFACE):
@@ -306,45 +308,80 @@ class ControlGraph:
         }
         if declared_references != set(self.references):
             raise RuntimeError("controller reference fields and input ports differ")
+        classes = {}
         types = dict(self.interface.inputs)
         for name, loop in cfg.ctrl.loops.items():
             cls = LOOP_TYPES.get(loop.type)
             if cls is None:
                 raise ConfigError(f"ctrl.loops.{name}: no loop type {loop.type!r} is registered")
+            classes[name] = cls
+            types.update({f"{name}.{port}": spec for port, spec in cls.outputs.items()})
+        targets = {
+            f"{name}.{port}": spec
+            for name, cls in classes.items()
+            for port, spec in cls.inputs.items()
+        }
+        unknown_connections = set(self.connections) - set(targets)
+        if unknown_connections:
+            raise ConfigError(
+                f"ctrl.connections: unknown input ports {sorted(unknown_connections)}"
+            )
+        for target, source in self.connections.items():
+            if source not in types:
+                raise ConfigError(
+                    f"ctrl.connections.{target}: missing or unknown source {source!r}"
+                )
+            if not types[source].compatible(targets[target]):
+                raise ConfigError(
+                    f"ctrl.connections.{target}: incompatible signal {source!r}: "
+                    f"{types[source]} -> {targets[target]}"
+                )
+        unknown_outputs = set(self.outputs) - set(self.interface.outputs)
+        if unknown_outputs:
+            raise ConfigError(f"ctrl.outputs: unknown output ports {sorted(unknown_outputs)}; "
+                              f"known: {sorted(self.interface.outputs)}")
+        active = set()
+        pending_sources = []
+        for port, spec in self.interface.outputs.items():
+            source = self.outputs.get(port)
+            if source not in types or not types[source].compatible(spec):
+                raise ConfigError(f"ctrl.outputs.{port}: missing or incompatible source {source!r}")
+            pending_sources.append(source)
+        while pending_sources:
+            owner = pending_sources.pop().partition(".")[0]
+            if owner not in classes or owner in active:
+                continue
+            active.add(owner)
+            for port in classes[owner].inputs:
+                target = f"{owner}.{port}"
+                source = self.connections.get(target)
+                if source not in types:
+                    raise ConfigError(
+                        f"ctrl.connections.{target}: missing or unknown source {source!r}"
+                    )
+                pending_sources.append(source)
+        self.connections = {
+            target: source for target, source in self.connections.items()
+            if target.partition(".")[0] in active
+        }
+        for name, loop in cfg.ctrl.loops.items():
+            if name not in active:
+                continue
+            cls = classes[name]
             self.nodes[name] = node = cls(loop, cfg, startup)
             self._out_specs[name] = tuple((port, f"{name}.{port}", spec.complex_value)
                                           for port, spec in node.outputs.items())
             self.periods[name] = loop.period
             self._store(name, node.initial_outputs())
-            types.update({f"{name}.{port}": spec for port, spec in node.outputs.items()})
         self._samples = {name: node.sample for name, node in self.nodes.items()}
         dependencies = {name: set() for name in self.nodes}
-        targets = set()
         for name, node in self.nodes.items():
             for port, spec in node.inputs.items():
                 target = f"{name}.{port}"
-                targets.add(target)
-                source = self.connections.get(target)
-                if source not in types:
-                    raise ConfigError(f"ctrl.connections.{target}: missing or unknown source {source!r}")
-                if not types[source].compatible(spec):
-                    raise ConfigError(f"ctrl.connections.{target}: incompatible signal {source!r}: "
-                                      f"{types[source]} -> {spec}")
+                source = self.connections[target]
                 owner = source.partition(".")[0]
-                # A delayed input breaks a cycle only in the sampled implementation.  Continuous
-                # averaging has no held previous sample, so its present-time dependency remains.
-                if owner in self.nodes and (self.continuous or port not in node.delayed):
+                if owner in self.nodes:
                     dependencies[name].add(owner)
-        if set(self.connections) - targets:
-            raise ConfigError(f"ctrl.connections: unknown input ports {sorted(set(self.connections) - targets)}")
-        unknown_outputs = set(self.outputs) - set(self.interface.outputs)
-        if unknown_outputs:
-            raise ConfigError(f"ctrl.outputs: unknown output ports {sorted(unknown_outputs)}; "
-                              f"known: {sorted(self.interface.outputs)}")
-        for port, spec in self.interface.outputs.items():
-            source = self.outputs.get(port)
-            if source not in types or not types[source].compatible(spec):
-                raise ConfigError(f"ctrl.outputs.{port}: missing or incompatible source {source!r}")
         self.order = []
         if not self.continuous:
             pending = {name: set(deps) for name, deps in dependencies.items()}
@@ -353,7 +390,7 @@ class ControlGraph:
                 if not ready:
                     raise ConfigError(
                         "ctrl.connections: instantaneous cycle in sampled control; "
-                        "insert an explicit unit_delay"
+                        "store one dependency's previous sample inside its owning loop"
                     )
                 for name in ready:
                     self.order.append(name)
@@ -494,14 +531,11 @@ class ControlGraph:
             else:  # ControlInterface is a package-owned declaration, not user input.
                 raise RuntimeError(f"unknown controller input owner {owner!r}")
         self._wiring = {}
-        self._immediate = {}
         self._port_source = {}
         for name, node in self.nodes.items():
             wiring = tuple((port,) + self._resolve(self.connections[f"{name}.{port}"]) for port in node.inputs)
             self._wiring[name] = wiring
-            self._immediate[name] = tuple(w for w in wiring if w[0] not in node.delayed)
             self._port_source[name] = {w[0]: w[1:] for w in wiring}
-        self._latching = frozenset(n for n, node in self.nodes.items() if node.delayed)
         self._output_source = {port: self._resolve(source) for port, source in self.outputs.items()}
 
     def _prepare_flow(self):
@@ -639,8 +673,8 @@ class ControlGraph:
                 self._rewire()
                 if self.continuous:
                     self._prepare_flow()
-            changed = [name for name, params in ctrl.loops.items()
-                       if params != self.cfg.ctrl.loops[name]]
+            changed = [name for name in self.nodes
+                       if ctrl.loops[name] != self.cfg.ctrl.loops[name]]
             self.cfg = cfg
             for name in changed:
                 self._retune(name)
@@ -727,7 +761,7 @@ class ControlGraph:
         done = set()
         for name in self.order:
             track = getattr(self.nodes[name], "track", None)
-            out = track(self._gather(self._immediate[name], meas)) if track is not None else None
+            out = track(self._gather(self._wiring[name], meas)) if track is not None else None
             if out is not None:
                 self._store(name, out)
                 done.add(name)
@@ -745,7 +779,7 @@ class ControlGraph:
     def sample(self, t, meas, finalize=None):
         """Run the loops due at ``t`` on the pu measurement ``meas``; return their names.
 
-        ``finalize(t, meas, updated)`` runs after them, before the delayed inputs are latched.
+        ``finalize(t, meas, updated)`` runs after the due loops.
         """
         if self._pending:
             self._apply_pending()
@@ -753,17 +787,14 @@ class ControlGraph:
         due = self.due(t)
         if not due:
             return updated
-        samples, gather_, immediate = self._samples, self._gather, self._immediate
+        samples, gather_, wiring = self._samples, self._gather, self._wiring
         for name in self.order:
             if name not in due:
                 continue
-            self._store(name, samples[name](t, gather_(immediate[name], meas)))
+            self._store(name, samples[name](t, gather_(wiring[name], meas)))
             updated.add(name)
         if finalize is not None:
             finalize(t, meas, updated)
-        for name in due:
-            if name in self._latching:
-                self.nodes[name].latch(gather_(self._wiring[name], meas))
         return updated
 
     def flow(self, t, meas, only=None, derivatives=None):
@@ -841,7 +872,7 @@ class ControlGraph:
         return self._read(*self._output_source[port], meas)
 
     def describe(self):
-        return {"loops": {n: {"type": self.cfg.ctrl.loops[n].type, "period": self.periods[n]}
+        return {"loops": {n: {"period": self.periods[n]}
                           for n in self.order}, "connections": dict(self.connections), "outputs": dict(self.outputs)}
 
     # ------------------------------------------------------------ states
@@ -910,7 +941,7 @@ def default_wiring(cfg, family):
     frame = f"{angle}.frame" if angle else "references.theta"
     theta = f"{angle}.theta" if angle else "references.theta"
     omega = f"{angle}.omega" if angle else "references.omega"
-    dc, cc, power = find("dc_voltage"), find("current"), find("power")
+    dc, cc = find("dc_voltage"), find("current")
     va, vi, damping = find("admittance"), find("impedance"), find("damping")
     extra = f"{damping}.extra" if damping else "references.zero_v_pu"
     ports_of = {
@@ -921,8 +952,7 @@ def default_wiring(cfg, family):
                     "id_ref": (f"{va}.id_ref" if va else f"{dc}.current_reference"
                                if dc else "references.id_ref_pu"),
                     "iq_ref": f"{va}.iq_ref" if va else "references.iq_ref_pu"},
-        "power": {"v": "meas.u_g", "i": "meas.i_c"},
-        "sync": {"p": f"{power}.p", "q": f"{power}.q", "v": "meas.u_g", "i": "meas.i_c",
+        "sync": {"v": "meas.u_g", "i": "meas.i_c",
                  "u_dc": "meas.u_dc", "p_ref": "references.p_ref_pu", "q_ref": "references.q_ref_pu",
                  "v_ref": "references.v_ref_pu"},
         "impedance": {"v_ref": f"{sync}.v_ref", "frame": frame, "omega": omega, "i": "meas.i_c",
@@ -1108,7 +1138,21 @@ class VSCController(_GraphRuntime):
         self._frame_source = (graph._port_source[self._frame_cc]["frame"]
                               if self._frame_cc is not None else None)
         self._is_gfl = profile.grid_following
-        self._p_key, self._q_key, self._v_ref_key = f"{first('power')}.p", f"{first('power')}.q", f"{self._sync}.v_ref"
+        if self._is_gfl:
+            mode_log_sources = (
+                {"id_ref_pu": graph.connections[f"{self._log_cc}.id_ref"]}
+                if self._log_cc is not None else {}
+            )
+        else:
+            mode_log_sources = (
+                {"p_pu": f"{self._sync}.p", "q_pu": f"{self._sync}.q",
+                 "p_ref_pu": "references.p_ref_pu",
+                 "v_ref_pu": f"{self._sync}.v_ref"}
+                if self._sync is not None else
+                {"p_ref_pu": "references.p_ref_pu",
+                 "v_ref_pu": "references.v_ref_pu"}
+            )
+        self._mode_log_sources = MappingProxyType(mode_log_sources)
         self._terminal_limit = None
         self._terminal_limit_scale = None
         self._flow_limits = {}
@@ -1252,6 +1296,31 @@ class VSCController(_GraphRuntime):
     def set_logging(self, enabled: bool) -> None:
         """Enable per-interrupt log dictionaries when a run records or watches them."""
         self.logging = bool(enabled)
+
+    def mode_log_sources(self) -> Mapping[str, str]:
+        """Return graph sources for control-family-specific log fields."""
+        return self._mode_log_sources
+
+    def _mode_log(self, t: float, meas: ControlMeasurement) -> dict[str, float]:
+        """Evaluate the control-family-specific part of one controller log."""
+        graph = self.graph
+        values = {
+            name: graph._read(*graph._resolve(source), meas)
+            for name, source in self._mode_log_sources.items()
+        }
+        if self._is_gfl:
+            values.setdefault("id_ref_pu", 0.0)
+        else:
+            values.setdefault("p_pu", 0.0)
+            values.setdefault("q_pu", 0.0)
+            values.setdefault("v_ref_pu", graph.references["v_ref_pu"])
+            values["p_ref_pu"] *= self.startup.value
+        values["freq_dev"] = (self.omega - self.w0) / (2 * math.pi)
+        values["angle_rel"] = (
+            self.theta - self.w0 * t + math.pi
+        ) % (2 * math.pi) - math.pi
+        return values
+
     def _accept_command(self, t, meas, updated):
         """Update the held angle, frequency and sampled voltage command."""
         graph = self.graph
@@ -1287,24 +1356,13 @@ class VSCController(_GraphRuntime):
                                  count=gates)
         log = None
         if self.logging:
-            freq_dev = (self.omega - self.w0) / (2 * math.pi)
-            refs = self.graph.references
             log = {"id_pu": self.i_dq.real, "iq_pu": self.i_dq.imag,
                    "vd_pu": self.v_dq.real, "vq_pu": self.v_dq.imag,
                    "vac_pu": abs(self.v_dq), "vdc_pu": control_meas.u_dc,
                    "m_max": peak_abs(self.stage.m_abc),
                    "in_service": 1.0 if gates else 0.0,
                    **self._raw_log(meas, frame)}
-            angle_rel = (self.theta - self.w0 * t + math.pi) % (2 * math.pi) - math.pi
-            if self._is_gfl:
-                id_ref = self.graph.input(self._log_cc, "id_ref", control_meas) if self._log_cc else 0.0
-                log.update(id_ref_pu=id_ref, freq_dev=freq_dev, angle_rel=angle_rel)
-            else:
-                values = self.graph.values
-                pr = startup.value * refs["p_ref_pu"]
-                log.update(p_pu=values.get(self._p_key, 0.0), q_pu=values.get(self._q_key, 0.0),
-                           p_ref_pu=pr, v_ref_pu=values.get(self._v_ref_key, 1.0),
-                           freq_dev=freq_dev, angle_rel=angle_rel)
+            log.update(self._mode_log(t, control_meas))
             self.last_log = log
         return ControlOutput(duty, log=log, theta=self.theta, omega=self.omega,
                              gates=gates, startup_complete=startup.complete)
@@ -1373,22 +1431,11 @@ class VSCController(_GraphRuntime):
         if not self.logging:
             return None
         meas = self._last_control_meas
-        freq_dev = (self.omega - self.w0) / (2 * math.pi)
-        refs = self.graph.references
         log = {"id_pu": self.i_dq.real, "iq_pu": self.i_dq.imag,
                "vd_pu": self.v_dq.real, "vq_pu": self.v_dq.imag,
                "vac_pu": abs(self.v_dq), "vdc_pu": meas.u_dc,
                "in_service": 1.0 if self.startup.active else 0.0}
-        angle_rel = (self.theta - self.w0 * t + math.pi) % (2 * math.pi) - math.pi
-        if self._is_gfl:
-            id_ref = self.graph.input(self._log_cc, "id_ref", meas) if self._log_cc else 0.0
-            log.update(id_ref_pu=id_ref, freq_dev=freq_dev, angle_rel=angle_rel)
-        else:
-            values = self.graph.values
-            log.update(p_pu=values.get(self._p_key, 0.0), q_pu=values.get(self._q_key, 0.0),
-                       p_ref_pu=self.startup.value * refs["p_ref_pu"],
-                       v_ref_pu=values.get(self._v_ref_key, 1.0),
-                       freq_dev=freq_dev, angle_rel=angle_rel)
+        log.update(self._mode_log(t, meas))
         self.last_log = log
         return log
 

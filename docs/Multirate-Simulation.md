@@ -94,10 +94,9 @@ units:
     ctrl:
       type: gfm
       loops:
-        power: {type: power}
-        sync: {type: psc, k_p_pu: 6.2832, k_vi: 20.0}
-        vi: {type: virtual_impedance}
-        damp: {type: active_damping, r_a_pu: 0.2, alpha_d: 40.0}
+        PSC: {k_p_pu: 6.2832, k_vi: 20.0}
+        VirtualImpedance: {}
+        ActiveDamping: {r_a_pu: 0.2, alpha_d: 40.0}
       references: {p_ref_pu: 0.5}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 

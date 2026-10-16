@@ -70,7 +70,7 @@ connection always binds a loop input to a boundary or loop output. Default wirin
 custom wiring are both lowered to this same graph before the run.
 
 Control ports use one canonical set of signal representations: complex vectors `I_AB`, `V_AB`,
-`I_DQ`, `V_DQ` and `PQ`; scalar `I`, `V` and `POWER`; and scalar `ANGLE` and `FREQUENCY`.
+`I_DQ` and `V_DQ`; scalar `I`, `V` and `POWER`; and scalar `ANGLE` and `FREQUENCY`.
 
 `Startup` owns run/stop and reference-ramp progress. The modulation output stage converts controller
 voltage commands into duty ratios. Protection does not belong to the controller.
@@ -115,7 +115,7 @@ Parameter ownership is explicit:
 | Half bridge only | `bridge.type: half_bridge` | `upper_controlled`, `lower_controlled`, and `reverse_port` |
 | Common control | none | `type`, `period`, `computation`, `loops`, `connections`, and `outputs` |
 | Control architecture | `ctrl.type` | reference fields and default wiring unique to the selected architecture |
-| Control loop | `ctrl.loops.<name>.type` | gains, limits, and other fields unique to the selected loop |
+| Control loop | `ctrl.loops.<ClassName>` | parameters unique to the selected loop class |
 
 Every `ctrl` section is represented by the same `ControlParams` type. Its discriminator narrows the
 valid fields inside that object; it never switches to another public parameter container. The unit

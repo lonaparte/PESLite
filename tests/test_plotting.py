@@ -23,13 +23,13 @@ def _table(path: Path, header: str, rows: str) -> Path:
 def test_plot_csv_writes_an_ieee_width_vector_pdf(tmp_path):
     source = _table(
         tmp_path / "renamed-state-output.csv",
-        "t,vsc.dclink.u_C,vsc.ctrl.pll.theta",
+        "t,vsc.dclink.u_C,vsc.ctrl.SRFPLL.theta",
         "0,1500,0\n0.001,1501,0.01\n0.002,1499,0.02\n",
     )
 
     figure = plot_csv(
         source,
-        ["vsc.dclink.u_C", "vsc.ctrl.pll.theta"],
+        ["vsc.dclink.u_C", "vsc.ctrl.SRFPLL.theta"],
         ylabel=r"$x$ (pu)",
         labels=[r"$u_{dc}$", r"$\theta$"],
         latex=False,
@@ -83,7 +83,7 @@ def test_cli_runs_then_plots_named_waveforms(examples, tmp_path, monkeypatch):
         "--set", "simulation.t_end=0.0001",
         "--set", "simulation.solver.linearisations=0",
         "--out", str(out),
-        "--plot", "vsc.dclink.u_C", "vsc.ctrl.pll.theta",
+        "--plot", "vsc.dclink.u_C", "vsc.ctrl.SRFPLL.theta",
         "--plot-label", r"$u_{dc}$",
         "--plot-label", r"$\theta$",
     ])

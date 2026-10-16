@@ -27,14 +27,12 @@ units:
     ctrl:
       type: dc
       loops:
-        voltage:
-          type: dc_voltage_control
+        DCVoltageControl:
           kp: 0.3
           ki: 80.0
           minimum: 0.0
           maximum: 15.0
-        current:
-          type: inductor_current_control
+        InductorCurrentControl:
           kp: 0.03
           ki: 30.0
           minimum: 0.02
@@ -54,14 +52,12 @@ units:
     ctrl:
       type: dc
       loops:
-        voltage:
-          type: dc_voltage_control
+        DCVoltageControl:
           kp: 0.2
           ki: 30.0
           minimum: 0.0
           maximum: 10.0
-        current:
-          type: inductor_current_control
+        InductorCurrentControl:
           kp: 0.03
           ki: 20.0
           minimum: 0.02

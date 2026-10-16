@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import warnings
 from abc import ABC, abstractmethod
-from typing import Any, Callable, ContextManager, Mapping, Optional, Protocol
+from typing import Any, ContextManager, Mapping, Optional, Protocol
 
 import numpy as np
 
@@ -188,8 +188,7 @@ class Unit(ABC):
         if rest:
             self.ctrl.retune(cfg, rest, t)
 
-    def _actuate_bridge(self, t: float, plant: Plant, enabled: bool,
-                        held_command: Callable[[Any], Any] | None = None) -> None:
+    def _actuate_bridge(self, t: float, plant: Plant, enabled: bool) -> None:
         """Apply one pending command and every bridge edge at the current instant."""
         bridge = self.bridge
         changes = bridge.actuate(t, self._write_due, enabled)
@@ -197,12 +196,8 @@ class Unit(ABC):
         if active != self.gates:
             with plant.change():
                 self._set_gates(active)
-        if held_command is None:
-            for value in changes:
-                plant.hold(self.zoh, value)
-        else:
-            for value in changes:
-                plant.hold(self.zoh, held_command(value))
+        for value in changes:
+            plant.hold(self.zoh, value)
         self._write_due = None
 
     def _shutdown(self, t: float) -> None:
@@ -772,13 +767,9 @@ class DCConverter(Unit):
     def actuate(self, t: float, plant: Plant) -> bool:
         if self.continuous:
             return False
-        held_command = self._held_bridge_command if self.branch_f is None else None
-        self._actuate_bridge(
-            t,
-            plant,
-            self.breaker and not self.tripped,
-            held_command,
-        )
+        self._actuate_bridge(t, plant, self.breaker and not self.tripped)
+        if self.branch_f is None and not self.gates:
+            plant.hold(self.zoh, self.bridge.topology.zero)
         return False
 
     def summary(self) -> dict[str, Any]:

@@ -11,6 +11,12 @@
 - Renamed the AC converter runtime interface from `UniteType` to `VSCController`, and consolidated
   DC-link and capacitor voltage regulation as `DCVoltageControl`. PESLite versions below 1.0 may
   make interface changes in any `0.x.x` release.
+- Control-loop entries now use registered class names directly without duplicate `type` fields;
+  repeated classes use `ClassName[label]`. Assembly constructs only loops in the controller-output
+  dependency graph.
+- Power calculation, coordinate transforms and unit delay are shared functions rather than
+  registered loop nodes. A synchronization law owns its optional power-filter state, and a loop
+  using `unit_delay` explicitly owns and passes the previous sample.
 
 ## 0.3.0
 

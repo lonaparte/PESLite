@@ -38,15 +38,13 @@ def _case(*, model="pwm_averaging", bridge_type="half_bridge",
                 "ctrl": {
                     "type": "dc",
                     "loops": {
-                        "voltage": {
-                            "type": "dc_voltage_control",
+                        "DCVoltageControl": {
                             "kp": 0.3,
                             "ki": 80.0,
                             "minimum": 0.0,
                             "maximum": 15.0,
                         },
-                        "current": {
-                            "type": "inductor_current_control",
+                        "InductorCurrentControl": {
                             "kp": 0.03,
                             "ki": 30.0,
                             "minimum": 0.02,
@@ -76,8 +74,8 @@ def test_dc_converter_is_an_open_unit_connected_through_the_common_terminal_api(
     assert {"output", "load", "converter.branch_f", "converter.bridge",
             "converter.dclink"} <= names
     assert not hasattr(unit, "plant")
-    assert isinstance(unit.ctrl.graph.nodes["voltage"], DCVoltageControl)
-    assert isinstance(unit.ctrl.graph.nodes["current"], InductorCurrentControl)
+    assert isinstance(unit.ctrl.graph.nodes["DCVoltageControl"], DCVoltageControl)
+    assert isinstance(unit.ctrl.graph.nodes["InductorCurrentControl"], InductorCurrentControl)
 
 
 def test_dc_converter_rejects_a_three_phase_point_network():
@@ -88,8 +86,8 @@ def test_dc_converter_rejects_a_three_phase_point_network():
 def test_scalar_control_limits_need_a_nonzero_range():
     with pytest.raises(ConfigError, match="minimum must be below maximum"):
         _case().replace(**{
-            "units.converter.ctrl.loops.current.minimum": 0.95,
-            "units.converter.ctrl.loops.current.maximum": 0.95,
+            "units.converter.ctrl.loops.InductorCurrentControl.minimum": 0.95,
+            "units.converter.ctrl.loops.InductorCurrentControl.maximum": 0.95,
         })
 
 

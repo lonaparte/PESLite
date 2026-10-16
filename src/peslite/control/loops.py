@@ -1,8 +1,9 @@
 """What each control loop computes: the loop types, their typed signals and their registry.
 
-A loop type is one class: its parameters (``Params``, the schema of its ``ctrl.loops`` entry),
-its typed input and output ports, its role in the default wiring, and its sampled/continuous law.
-How loops are connected is not theirs to know (:mod:`.controller`).  Built-in loops also expose
+A loop type is one class: its parameters (``Params``, the schema of its class-named
+``ctrl.loops`` entry), its typed input and output ports, its role in the default wiring, and its
+sampled/continuous law.
+How loops are connected is not theirs to know (:mod:`.controller`). Built-in loops also expose
 their continuous-time outputs and state derivatives for the ideal averaged converter model.
 Grid-control signals use pu and scalar converter signals use SI. Unit-system-independent loops
 declare generic scalar voltage/current ports that bind to either control-graph boundary.
@@ -19,14 +20,15 @@ from typing import Any, ClassVar, Mapping, Optional
 import numpy as np
 
 from ..solver.model import ConfigError, assign, gather, join, scatter
-from .blocks import Filter, Integrator, OutputLimit, PI
+from .blocks import Filter, Integrator, OutputLimit, PI, complex_power
 
 __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
-           "ANGLE", "FREQUENCY", "POWER", "PQ",
+           "ANGLE", "FREQUENCY", "POWER",
            "ROLES", "Loop", "LOOP_TYPES", "register_loop_type", "PowerFilterParams",
            "CurrentLimitParams",
-           "SRFPLL", "CurrentLoop", "DCVoltageControl", "PowerLoop", "SyncLaw", "PSC", "Droop", "VSG", "DVOC",
-           "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping", "UnitDelay",
+           "SRFPLL", "CurrentLoop", "DCVoltageControl", "SyncLawParams", "SyncLaw",
+           "PSC", "Droop", "VSG", "DVOC",
+           "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping",
            "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO", "MODULATION", "HERTZ",
            "InductorCurrentControl", "ResonantModulation"]
 
@@ -67,7 +69,6 @@ V = SignalType("pu_voltage")
 ANGLE = SignalType("rad")
 FREQUENCY = SignalType("rad/s")
 POWER = SignalType("pu_power")
-PQ = SignalType("pu_power", "pq", True)
 GENERIC_CURRENT = SignalType("current")
 GENERIC_VOLTAGE = SignalType("voltage")
 
@@ -75,17 +76,16 @@ GENERIC_VOLTAGE = SignalType("voltage")
 # ------------------------------------------------------------------ the base class and the registry
 
 # The parts a loop can play in the default GFL/GFM wiring assembled by ControllerGraph.
-ROLES = ("pll", "sync", "current", "dc_voltage", "power", "impedance", "admittance",
+ROLES = ("pll", "sync", "current", "dc_voltage", "impedance", "admittance",
          "damping", "modulation")
 
 
 class Loop:
     """A control loop with typed ports, built as ``cls(cfg, unit, startup)``.
 
-    A loop type sets ``type`` (its name in ``ctrl.loops``), ``Params`` (a frozen dataclass with
+    A loop type sets ``type`` (its internal registry name), ``Params`` (a frozen dataclass with
     ``type`` and ``period`` fields; its ``_quantities`` name the fields given in SI or pu),
-    ``inputs`` / ``outputs`` (port name -> :class:`SignalType`), ``delayed`` (inputs read after the
-    update by ``latch(inputs)``, which break instantaneous cycles) and ``role`` (one of
+    ``inputs`` / ``outputs`` (port name -> :class:`SignalType`) and ``role`` (one of
     :data:`ROLES`, or ``None``: wired only by ``ctrl.connections``). With ``outputs_from_state``
     its held outputs are set from its states (``initial_outputs()``) when states are loaded.
     A loop made from standard dynamic blocks registers them with ``state_block()`` and implements
@@ -102,7 +102,6 @@ class Loop:
     Params: ClassVar[type]
     inputs: ClassVar[Mapping[str, SignalType]] = {}
     outputs: ClassVar[Mapping[str, SignalType]] = {}
-    delayed: ClassVar[frozenset[str]] = frozenset()
     role: ClassVar[Optional[str]] = None
     outputs_from_state: ClassVar[bool] = False  # held outputs = initial_outputs() after loading states
     flow_inputs: ClassVar[tuple[str, ...] | None] = None
@@ -125,13 +124,22 @@ class Loop:
         required = ("get_state", "set_state", "state_derivatives", "state_bindings")
         if any(not callable(getattr(block, method, None)) for method in required):
             raise TypeError(f"{type(block).__name__} is not a dynamic control block")
-        existing = set(self.get_state())
+        names = self.state_names
+        existing = set(names) | set(gather(self._state_blocks))
         proposed = {join(name, local) for local in block.get_state()}
         overlap = existing & proposed
         if overlap:
             raise ValueError(f"loop state block {name!r} duplicates states {sorted(overlap)}")
         self._state_blocks[name] = block
         return block
+
+    def _block_state_derivatives(self) -> tuple[Any, ...]:
+        """Return registered block derivatives in public-state order."""
+        return tuple(
+            value
+            for block in self._state_blocks.values()
+            for value in block.state_derivatives().values()
+        )
 
     def equation(self, *inputs):
         """Return outputs from one mode-independent equation using registered state blocks."""
@@ -187,12 +195,7 @@ class Loop:
                 "state with state_block()"
             )
         outputs = tuple(self.equation(*inputs))
-        derivatives = tuple(
-            value
-            for block in self._state_blocks.values()
-            for value in block.state_derivatives().values()
-        )
-        return outputs + derivatives
+        return outputs + self._block_state_derivatives()
 
     def flow_state(self) -> dict[str, Any]:
         """States integrated with the plant in ideal averaging mode."""
@@ -201,7 +204,7 @@ class Loop:
     def flow_state_bindings(self):
         """Optional direct ``state name -> (object, attribute)`` bindings for the flow hot path.
 
-        The default covers loops whose public state names map directly to their attributes.  A
+        The default covers loops whose public state names map directly to their attributes. A
         loop with a custom/nested state representation may return ``None`` and keep using
         :meth:`set_state`, or override this method with equivalent direct bindings.
         """
@@ -242,18 +245,58 @@ class Loop:
         for name in self.carried:
             setattr(self, name, getattr(old, name))
 
+
 LOOP_TYPES: dict[str, type] = {}
 
 
+def loop_type(name: str, where: str = "ctrl.loops") -> type:
+    """Return a registered loop class by internal type or public Python class name.
+
+    ``LOOP_TYPES`` remains the one authoritative registry. Class-name lookup is needed only while
+    loading configuration and deliberately does not add a second registry or any runtime lookup.
+    """
+    if isinstance(name, str):
+        cls = LOOP_TYPES.get(name)
+        if cls is not None:
+            return cls
+        cls = next((candidate for candidate in LOOP_TYPES.values()
+                    if candidate.__name__ == name), None)
+        if cls is not None:
+            return cls
+    known = sorted({*LOOP_TYPES, *(cls.__name__ for cls in LOOP_TYPES.values())})
+    raise ConfigError(f"{where}: unknown loop {name!r}; known: {known}")
+
+
+def loop_key_type(name: str, where: str = "ctrl.loops") -> type | None:
+    """Resolve ``ClassName`` or ``ClassName[label]``; return ``None`` for a legacy node name."""
+    class_name = name
+    if "[" in name or "]" in name:
+        if not name.endswith("]") or name.count("[") != 1 or name.count("]") != 1:
+            raise ConfigError(f"{where}: malformed class-qualified loop name {name!r}")
+        class_name, label = name[:-1].split("[", 1)
+        if not class_name or not label:
+            raise ConfigError(f"{where}: malformed class-qualified loop name {name!r}")
+    try:
+        cls = loop_type(class_name, where)
+    except ConfigError:
+        return None
+    return cls if cls.__name__ == class_name else None
+
+
 def register_loop_type(cls: type) -> type:
-    """Register the loop type ``cls`` (see :class:`Loop`) under ``cls.type``, so that simulation files
-    can use it; its parameters are then checked like those of the built-in loops. Returns ``cls``,
-    so it serves as a class decorator."""
+    """Register ``cls`` (see :class:`Loop`) under its internal ``cls.type`` name.
+
+    Simulation files select the implementation with the Python class name. Its parameters are
+    then checked like those of the built-in loops. The class is returned so this function can be
+    used as a decorator.
+    """
     name = getattr(cls, "type", None)
     if not isinstance(name, str) or not name:
         raise TypeError("a loop type needs a name: the class attribute 'type'")
     if name in LOOP_TYPES:
         raise ValueError(f"loop type {name!r} is already registered")
+    if any(registered.__name__ == cls.__name__ for registered in LOOP_TYPES.values()):
+        raise ValueError(f"loop class name {cls.__name__!r} is already registered")
     params = getattr(cls, "Params", None)
     if not is_dataclass(params) or not {"type", "period"} <= set(params.__dataclass_fields__):
         raise TypeError(f"loop type {name!r}: Params must be a dataclass with type and period")
@@ -276,6 +319,13 @@ class PowerFilterParams:
 
     enable: bool = False
     bandwidth: Optional[float] = None  # Hz
+
+    def __post_init__(self) -> None:
+        if self.bandwidth is not None and (
+                not math.isfinite(self.bandwidth) or self.bandwidth <= 0.0):
+            raise ConfigError("power-filter bandwidth must be finite and positive")
+        if self.enable and self.bandwidth is None:
+            raise ConfigError("enabled power filter needs a bandwidth")
 
 
 @dataclass(frozen=True)
@@ -573,64 +623,13 @@ class DCVoltageControl(Loop):
 
 # ------------------------------------------------------------------ grid forming
 
-@register_loop_type
-class PowerLoop(Loop):
-    """Power feedback ``p + j q = v conj(i)``, optionally low-pass filtered.
 
-    Named states: filtered ``p`` and ``q`` (pu).
-    """
+@dataclass(frozen=True, kw_only=True)
+class SyncLawParams:
+    """Parameters shared by grid-forming synchronization laws."""
 
-    @dataclass(frozen=True, kw_only=True)
-    class Params:
-        period: Optional[float] = None
-        filter: PowerFilterParams = field(default_factory=PowerFilterParams)
-        type: str = "power"
-
-    type = "power"
-    role = "power"
-    inputs = {"v": V_AB, "i": I_AB}
-    outputs = {"p": POWER, "q": POWER}
-    flow_inputs = ("v", "i")
-
-    def __init__(self, cfg, unit, startup):
-        super().__init__(cfg, unit, startup)
-        bandwidth = cfg.filter.bandwidth if cfg.filter.enable else 0.0
-        self.bandwidth = bandwidth
-        pole = 2.0 * math.pi * bandwidth
-        numerator, denominator = ((pole,), (1.0, pole)) if pole > 0.0 else ((1.0,), (1.0,))
-        self.lpf_p = Filter(numerator, denominator, self.block_period)
-        self.lpf_q = Filter(numerator, denominator, self.block_period)
-
-    def initial_outputs(self):
-        return {"p": 0.0, "q": 0.0}
-
-    def sample(self, t, inputs):
-        s = inputs["v"] * inputs["i"].conjugate()
-        return {"p": self.lpf_p(s.real), "q": self.lpf_q(s.imag)}
-
-    def flow_state(self):
-        # With the filter disabled, power is algebraic; do not add two constant dummy states to
-        # the system merely because the sampled implementation owns filter objects.
-        return self.get_state() if self.bandwidth > 0.0 else {}
-
-    def flow_state_bindings(self):
-        if self.bandwidth <= 0.0:
-            return {}
-        return {"p_pu": (self.lpf_p, "x0"), "q_pu": (self.lpf_q, "x0")}
-
-    def flow_path(self, voltage, current):
-        """Positional form used by the construction-time compiled continuous graph."""
-        s = voltage * current.conjugate()
-        if self.bandwidth <= 0.0:
-            return s.real, s.imag
-        p, q = self.lpf_p(s.real), self.lpf_q(s.imag)
-        return p, q, self.lpf_p.derivative[0], self.lpf_q.derivative[0]
-
-    def get_state(self):
-        return gather({"p_pu": self.lpf_p, "q_pu": self.lpf_q})
-
-    def set_state(self, values):
-        scatter({"p_pu": self.lpf_p, "q_pu": self.lpf_q}, values)
+    period: Optional[float] = None
+    power_filter: PowerFilterParams = field(default_factory=PowerFilterParams)
 
 
 class SyncLaw(Loop):
@@ -646,47 +645,74 @@ class SyncLaw(Loop):
 
     role = "sync"
     outputs_from_state = True
-    inputs = {"p": POWER, "q": POWER,
-              "v": V_AB, "i": I_AB, "u_dc": V,
+    inputs = {"v": V_AB, "i": I_AB, "u_dc": V,
               "p_ref": POWER, "q_ref": POWER, "v_ref": V}
-    outputs = {"theta": ANGLE, "frame": ANGLE, "omega": FREQUENCY, "v_ref": V}
+    outputs = {"theta": ANGLE, "frame": ANGLE, "omega": FREQUENCY, "v_ref": V,
+               "p": POWER, "q": POWER}
     state_names = ("theta",)
-    flow_inputs = ("p", "q", "v", "i", "u_dc", "p_ref", "q_ref", "v_ref")
+    flow_inputs = ("v", "i", "u_dc", "p_ref", "q_ref", "v_ref")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
         self.w0, self.T = unit.base.w0, cfg.period
         self.theta, self.omega = 0.0, self.w0
         self.v_mag = unit.ctrl.references.v_ref_pu
+        power_filter = getattr(cfg, "power_filter", None)
+        if power_filter is not None and power_filter.enable:
+            pole = 2.0 * math.pi * power_filter.bandwidth
+            self.lpf_p = self.state_block(
+                "p_pu", Filter((pole,), (1.0, pole), self.block_period)
+            )
+            self.lpf_q = self.state_block(
+                "q_pu", Filter((pole,), (1.0, pole), self.block_period)
+            )
+            self._measure_power = self._filtered_power
+        else:
+            self.lpf_p = self.lpf_q = None
+            self._measure_power = self._instantaneous_power
+
+    @staticmethod
+    def _instantaneous_power(voltage, current):
+        power = complex_power(voltage, current)
+        return power.real, power.imag
+
+    def _filtered_power(self, voltage, current):
+        power = complex_power(voltage, current)
+        return self.lpf_p(power.real), self.lpf_q(power.imag)
 
     def initial_outputs(self):
         return {"theta": self.theta, "frame": self.theta, "omega": self.omega,
-                "v_ref": self.unit.ctrl.references.v_ref_pu}
+                "v_ref": self.unit.ctrl.references.v_ref_pu, "p": 0.0, "q": 0.0}
 
     def sample(self, t, inputs):
         if not self.startup.active:
             out = self.track(inputs)
             if out is not None:
                 return out
+            p, q = self._measure_power(inputs["v"], inputs["i"])
             return {"theta": self.theta, "frame": self.theta, "omega": self.omega,
-                    "v_ref": self.v_mag}
+                    "v_ref": self.v_mag, "p": p, "q": q}
+        p, q = self._measure_power(inputs["v"], inputs["i"])
         frame = self.theta
         rot = _into(frame)
         v, i = inputs["v"] * rot, inputs["i"] * rot
         p_ref = self.startup.value * inputs["p_ref"]
         q_ref, v_ref = inputs["q_ref"], inputs["v_ref"]
         self._sample(
-            self.T, inputs["p"], inputs["q"], abs(v), inputs["u_dc"],
+            self.T, p, q, abs(v), inputs["u_dc"],
             p_ref, q_ref, v_ref, i,
         )
-        return {"theta": self.theta, "frame": frame, "omega": self.omega, "v_ref": self.v_mag}
+        return {"theta": self.theta, "frame": frame, "omega": self.omega,
+                "v_ref": self.v_mag, "p": p, "q": q}
 
     def _sample(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
                 p_ref_pu, q_ref_pu, v_ref_pu, i_dq) -> None:
         raise NotImplementedError
 
-    def flow_path(self, p, q, voltage, current, u_dc, p_ref, q_ref, v_ref):
+    def flow_path(self, voltage, current, u_dc, p_ref, q_ref, v_ref):
         """Shared continuous evaluation for all synchronization laws."""
+        p, q = self._measure_power(voltage, current)
+        block_derivatives = self._block_state_derivatives()
         frame = self.theta
         rot = _into(frame)
         v, i = voltage * rot, current * rot
@@ -699,11 +725,13 @@ class SyncLaw(Loop):
             if derivatives is None:
                 derivatives = (self.w0,) + (0.0,) * (len(self.state_names) - 1)
                 self._inactive_flow = derivatives
-            return self.theta, frame, self.omega, self.v_mag, *derivatives
+            return (self.theta, frame, self.omega, self.v_mag, p, q,
+                    *derivatives, *block_derivatives)
         derivatives = self._flow(
             p, q, abs(v), u_dc, self.startup.value * p_ref, q_ref, v_ref, i
         )
-        return self.theta, frame, self.omega, self.v_mag, *derivatives
+        return (self.theta, frame, self.omega, self.v_mag, p, q,
+                *derivatives, *block_derivatives)
 
     def _flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
               q_ref_pu, v_ref_pu, i_dq) -> tuple[Any, ...]:
@@ -714,11 +742,14 @@ class SyncLaw(Loop):
         voltage = inputs["v"]
         if abs(voltage) <= 0.1:
             return None
+        p, q = self._measure_power(voltage, inputs["i"])
         theta = self.theta
-        delta = np.angle(voltage * np.exp(-1j * theta))
+        rotated = voltage * np.exp(-1j * theta)
+        delta = np.arctan2(rotated.imag, rotated.real)
         theta += delta
         self.follow(theta, abs(voltage), inputs["v_ref"])
-        return {"theta": theta, "frame": theta, "omega": self.omega, "v_ref": self.v_mag}
+        return {"theta": theta, "frame": theta, "omega": self.omega,
+                "v_ref": self.v_mag, "p": p, "q": q}
 
     def follow(self, theta: float, v_mag_pu: float, v_ref_pu: float) -> None:
         self.theta, self.omega, self.v_mag = theta, self.w0, v_mag_pu
@@ -732,8 +763,7 @@ class PSC(SyncLaw):
     """
 
     @dataclass(frozen=True, kw_only=True)
-    class Params:
-        period: Optional[float] = None
+    class Params(SyncLawParams):
         k_p_pu: float  # rad/s per pu
         k_v: float = 0.0  # AVR proportional gain, pu/pu (0: open-loop magnitude)
         k_vi: float = 0.0  # AVR integral gain, 1/s
@@ -755,7 +785,7 @@ class PSC(SyncLaw):
 
     @v_int.setter
     def v_int(self, value):
-        self.voltage_pi.integral = float(value)
+        self.voltage_pi.integral = value
 
     def _sample(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
                 p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
@@ -770,7 +800,10 @@ class PSC(SyncLaw):
         return self.omega, self.voltage_pi.derivative
 
     def flow_state_bindings(self):
-        return {"theta": (self, "theta"), "v_int_pu": (self.voltage_pi, "integral")}
+        bindings = super().flow_state_bindings()
+        if bindings is not None:
+            bindings["v_int_pu"] = (self.voltage_pi, "integral")
+        return bindings
 
     def follow(self, theta, v_mag_pu, v_ref_pu):
         super().follow(theta, v_mag_pu, v_ref_pu)
@@ -787,10 +820,9 @@ class Droop(SyncLaw):
     """P-f / Q-V droop control. Named state: ``theta`` (rad)."""
 
     @dataclass(frozen=True, kw_only=True)
-    class Params:
+    class Params(SyncLawParams):
         m_p_pu: float  # rad/s per pu (P-f droop)
         n_q_pu: float  # pu/pu (Q-V droop)
-        period: Optional[float] = None
         type: str = "droop"
 
         _quantities = {"m_p_pu": "1/power", "n_q_pu": "voltage/power"}
@@ -822,12 +854,11 @@ class VSG(SyncLaw):
     """
 
     @dataclass(frozen=True, kw_only=True)
-    class Params:
+    class Params(SyncLawParams):
         h: float  # inertia constant, s
         d_p_pu: float  # damping, pu power per pu speed deviation
         k_q_pu: float  # Q-V droop, pu/pu
         t_q: float = 0.0  # voltage-magnitude lag time constant, s (0: none)
-        period: Optional[float] = None
         type: str = "vsg"
 
         _quantities = {"d_p_pu": "power/frequency", "k_q_pu": "voltage/power"}
@@ -876,11 +907,10 @@ class DVOC(SyncLaw):
     """
 
     @dataclass(frozen=True, kw_only=True)
-    class Params:
+    class Params(SyncLawParams):
         eta_pu: float  # rad/s
         alpha_pu: float  # magnitude regulation gain
         kappa: float  # rotation of the current error, rad
-        period: Optional[float] = None
         type: str = "dvoc"
 
         _quantities = {"eta_pu": "resistance", "alpha_pu": "1/resistance"}
@@ -920,10 +950,9 @@ class Matching(SyncLaw):
     """
 
     @dataclass(frozen=True, kw_only=True)
-    class Params:
+    class Params(SyncLawParams):
         k_theta_pu: Optional[float] = None  # rad/s per pu dc voltage (dc base)
         k_q_pu: float = 0.0  # Q-V droop, pu/pu
-        period: Optional[float] = None
         type: str = "matching"
 
         _quantities = {"k_theta_pu": "1/dc_voltage", "k_q_pu": "voltage/power"}
@@ -1115,84 +1144,6 @@ class ActiveDamping(Loop):
 
     def set_state(self, values):
         scatter({"hpf_pu": self.lpf}, values)
-
-
-# ------------------------------------------------------------------ delay
-
-_DELAY_SIGNALS = {
-    "i_ab": I_AB,
-    "v_ab": V_AB,
-    "i_dq": I_DQ,
-    "v_dq": V_DQ,
-    "i": I,
-    "v": V,
-    "angle": ANGLE,
-    "frequency": FREQUENCY,
-    "power": POWER,
-    "pq": PQ,
-}
-
-
-@register_loop_type
-class UnitDelay(Loop):
-    """One-period delay of a signal of type ``signal``: breaks an instantaneous cycle of the wiring.
-
-    Named state: ``value_pu`` (``value`` for an angle or frequency).
-    """
-
-    @dataclass(frozen=True, kw_only=True)
-    class Params:
-        period: Optional[float] = None
-        initial: Optional[float] = None  # angle (rad) or frequency (rad/s)
-        initial_pu: Optional[float] = None  # electrical signals
-        signal: str = "i"
-        type: str = "unit_delay"
-
-        _choices = {"signal": tuple(_DELAY_SIGNALS)}
-
-        @staticmethod
-        def _signal_quantities(values):
-            scale = {"i": "current", "i_ab": "current", "i_dq": "current",
-                     "v": "voltage", "v_ab": "voltage", "v_dq": "voltage",
-                     "power": "power", "pq": "power"}.get(values.get("signal", "i"))
-            return {"initial_pu": scale} if scale else {}
-
-        def __post_init__(self) -> None:
-            if self.initial_pu is not None and self.signal in {"angle", "frequency"}:
-                raise ConfigError("initial_pu: angle/frequency delays use initial in rad or rad/s")
-
-    type = "unit_delay"
-    delayed = frozenset({"value"})
-
-    def __init__(self, cfg, unit, startup):
-        super().__init__(cfg, unit, startup)
-        self.inputs = self.outputs = {"value": _DELAY_SIGNALS[cfg.signal]}
-        electrical = cfg.signal not in {"angle", "frequency"}
-        initial = cfg.initial_pu if electrical else cfg.initial
-        self.value = 0.0 if initial is None else initial
-        if _DELAY_SIGNALS[cfg.signal].complex_value:
-            self.value = complex(self.value)
-        self.state_name = "value_pu" if electrical else "value"
-
-    def initial_outputs(self):
-        return {"value": self.value}
-
-    def sample(self, t, inputs):
-        return {"value": self.value}
-
-    def latch(self, inputs):
-        self.value = inputs["value"]
-
-    def get_state(self):
-        return {self.state_name: self.value}
-
-    def flow_state_bindings(self):
-        return {self.state_name: (self, "value")}
-
-    def set_state(self, values):
-        if set(values) - {self.state_name}:
-            raise KeyError(f"unit_delay has the state {self.state_name}")
-        self.value = values.get(self.state_name, self.value)
 
 
 # ------------------------------------------------------------------ scalar SI converter loops

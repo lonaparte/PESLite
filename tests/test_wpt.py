@@ -48,7 +48,7 @@ def test_wpt_assembly_flattens_only_once_and_shares_one_link():
         assert not hasattr(unit, "side")
         assert unit._external_current[0] is subsystems["charger.link"]
         assert type(unit.ctrl) is GraphController
-        assert isinstance(unit.ctrl.graph.nodes["modulation"], ResonantModulation)
+        assert isinstance(unit.ctrl.graph.nodes["ResonantModulation"], ResonantModulation)
     assert not hasattr(simulation.system, "unit_groups")
     assert not simulation.energy_problems
 

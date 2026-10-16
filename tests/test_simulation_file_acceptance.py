@@ -32,6 +32,23 @@ def test_bundled_examples_declare_the_current_interface_version(name):
     assert first_line == f"# PESLite {peslite.__version__}"
 
 
+@pytest.mark.parametrize("name", BUNDLED)
+def test_bundled_examples_use_control_loop_classes_directly(name):
+    tree = read_tree(EXAMPLES / name)
+    class_names = {cls.__name__ for cls in LOOP_TYPES.values()}
+
+    def units(values):
+        for unit in values.values():
+            yield unit
+            if unit.get("type") == "wpt":
+                yield from units({side: unit[side] for side in ("primary", "secondary")})
+
+    for unit in units(tree["units"]):
+        for loop_name, parameters in unit.get("ctrl", {}).get("loops", {}).items():
+            assert loop_name in class_names
+            assert parameters is None or "type" not in parameters
+
+
 def _leaves(tree, path=()):
     if isinstance(tree, dict):
         for key, value in tree.items():

@@ -84,9 +84,9 @@ def test_controller_needs_only_samples_and_host_commands(gfl):
 
 def test_pwm_start_clears_error_integrators_once(gfl):
     controller = peslite.VSCController(gfl().unit("vsc"))
-    pll = controller.graph.nodes["pll"]
-    dvc = controller.graph.nodes["dvc"]
-    cc = controller.graph.nodes["cc"]
+    pll = controller.graph.nodes["SRFPLL"]
+    dvc = controller.graph.nodes["DCVoltageControl"]
+    cc = controller.graph.nodes["CurrentLoop"]
     pll.integral, dvc.integral, cc.integral = 1.0, 2.0, 3.0 + 4.0j
 
     controller.command(False)
@@ -106,7 +106,7 @@ def test_presynchronisation_does_not_seed_a_pwm_start_integrator():
     )
     cfg = params.unit("vsc")
     controller = peslite.VSCController(cfg)
-    sync = controller.graph.nodes["sync"]
+    sync = controller.graph.nodes["PSC"]
     sync.v_int = 4.0
     controller.track(Measurement(0.0, cfg.base.v_phase_peak, 0j, cfg.dclink.vdc_ref, np.zeros(3)))
     assert sync.v_int == 0.0

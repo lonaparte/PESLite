@@ -24,9 +24,7 @@ from ..components.network import RCNode, RLBranch, ThreePhaseSource
 from ..components.pwm import CarrierComparison, SynchronousCarrier, ZOH
 from ..control.blocks import OutputLimit
 from ..control.controller import GraphController, VSCController
-from ..control.loops import (ActiveDamping, CurrentLoop, DCVoltageControl, Droop, DVOC,
-                             Matching, PowerLoop, PSC, SRFPLL, SyncLaw, UnitDelay,
-                             VirtualAdmittance, VirtualImpedance, VSG)
+from ..control.loops import DCVoltageControl, DVOC, SyncLaw, VSG
 from .conduction import DiodeConduction
 from .params import _unit_items, _unit_leaves, _written_out, dumps
 from .exporter import ExportResult, _exporter
@@ -439,6 +437,8 @@ class _ModelGenerator:
                     for key, item in value.items()}
         if isinstance(value, (tuple, list)):
             return tuple(_ModelGenerator._normalise_trace(item) for item in value)
+        if isinstance(value, (_Expression, numbers.Number)):
+            return _Expression.of(value)
         if hasattr(value, "shape") and hasattr(value, "flat"):
             return tuple(_ModelGenerator._normalise_trace(item) for item in value.flat)
         return _Expression.of(value)
@@ -1043,6 +1043,36 @@ class _ControlGenerator:
     def d(self, name: str, field: str) -> str:
         return self.m(f"d_{name}_{field}")
 
+    def _sampled_loop_members(self) -> list[str]:
+        """Declare sampled loop state and carried runtime values from their own contracts."""
+        lines: list[str] = []
+        for loop_name, node in self.graph.nodes.items():
+            for local, value in node.get_state().items():
+                kind = "Complex" if isinstance(value, complex) else "double"
+                lines.append(
+                    f"{kind} {self.node(loop_name, local)} = {self._literal(value)};"
+                )
+            if isinstance(node, DCVoltageControl):
+                lines.append(
+                    f"bool {self.node(loop_name, 'limit_exceeded')} = "
+                    f"{'true' if node.limit_exceeded else 'false'};"
+                )
+            for carried in node.carried:
+                value = getattr(node, carried)
+                if carried == "first_limit_t":
+                    lines.append(
+                        f"double {self.node(loop_name, carried)} = "
+                        f"{_number(value if value is not None else math.nan)};"
+                    )
+                    continue
+                kind = ("bool" if isinstance(value, bool) else
+                        "std::size_t" if isinstance(value, int) else
+                        "Complex" if isinstance(value, complex) else "double")
+                lines.append(
+                    f"{kind} {self.node(loop_name, carried)} = {self._literal(value)};"
+                )
+        return lines
+
     def _effective_command(self, on: bool) -> str:
         """C++ expression for a host command after the unit trip latch is applied."""
         return f"!{self.m('tripped')}" if on else "false"
@@ -1146,7 +1176,9 @@ class _ControlGenerator:
         }
         for attribute, value in vars(node).items():
             replacement = cloned_owners.get(id(value))
-            if replacement is not None:
+            if getattr(value, "__self__", None) is node:
+                setattr(clone, attribute, self.model._rebind(value, clone))
+            elif replacement is not None:
                 setattr(clone, attribute, replacement)
             elif isinstance(value, OutputLimit):
                 limit = copy.copy(value)
@@ -1650,24 +1682,21 @@ class _ACControlGenerator(_ProtectionGenerator, _ControlGenerator):
     def __init__(self, name: str, unit: Any, model: _ModelGenerator, prefix: str) -> None:
         _ControlGenerator.__init__(self, name, unit, model, prefix)
 
-    def _mode_log_lines(self, indent: str, current_name: str | None) -> list[str]:
+    def _mode_log_lines(self, indent: str) -> list[str]:
         """Generate the control-family-specific suffix of the AC controller log."""
-        if self.unit.ctrl._is_gfl:
-            idref = self.input(current_name, "id_ref") if current_name is not None else "0.0"
+        sources = self.ctrl.mode_log_sources()
+        if self.ctrl._is_gfl:
+            idref = self.source(sources["id_ref_pu"]) if "id_ref_pu" in sources else "0.0"
             return [f"{indent}{self.m('log_id_ref_pu')} = {idref};"]
-        power_name = next((name for name, node in self.graph.nodes.items()
-                           if isinstance(node, PowerLoop)), None)
-        sync_name = next((name for name, node in self.graph.nodes.items()
-                          if isinstance(node, SyncLaw)), None)
         return [
             f"{indent}{self.m('log_p_pu')} = "
-            f"{self.g(power_name + '.p') if power_name else '0.0'};",
+            f"{self.source(sources['p_pu']) if 'p_pu' in sources else '0.0'};",
             f"{indent}{self.m('log_q_pu')} = "
-            f"{self.g(power_name + '.q') if power_name else '0.0'};",
+            f"{self.source(sources['q_pu']) if 'q_pu' in sources else '0.0'};",
             f"{indent}{self.m('log_p_ref_pu')} = {self.m('startup_value')} * "
-            f"{self._reference('p_ref_pu')};",
+            f"{self.source(sources['p_ref_pu'])};",
             f"{indent}{self.m('log_v_ref_pu')} = "
-            f"{self.g(sync_name + '.v_ref') if sync_name else self._reference('v_ref_pu')};",
+            f"{self.source(sources['v_ref_pu'])};",
         ]
 
     def protection_method(self) -> str:
@@ -1689,10 +1718,8 @@ class _ACControlGenerator(_ProtectionGenerator, _ControlGenerator):
                 f'if (std::isfinite({self.m("mod_first_t")})) '
                 f'{stream} << {self.m("mod_first_t")}; else {stream} << "null";',
             ]
-        dc_entry = next(((loop_name, node) for loop_name, node in self.graph.nodes.items()
-                         if isinstance(node, DCVoltageControl)), None)
-        if dc_entry is not None:
-            loop_name, _node = dc_entry
+        loop_name = self.ctrl._dc
+        if loop_name is not None:
             if self.unit.continuous:
                 checks = self.m(loop_name + "_limit_checks")
                 exceeded = self.m(loop_name + "_limit_exceeded")
@@ -1707,8 +1734,7 @@ class _ACControlGenerator(_ProtectionGenerator, _ControlGenerator):
                 f'{stream} << ",\\n  \\"{name}.id_ref_limit_first_t\\": "; '
                 f'if (std::isfinite({first})) {stream} << {first}; else {stream} << "null";',
             ]
-        sync_node = next((node for node in self.graph.nodes.values()
-                          if isinstance(node, SyncLaw)), None)
+        sync_node = self.graph.nodes.get(self.ctrl._sync)
         if sync_node is not None:
             lines.append(
                 f'{stream} << ",\\n  \\"{name}.law\\": \\"{sync_node.type}\\"";'
@@ -1866,8 +1892,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         return lines
 
     def _log_lines(self) -> list[str]:
-        current_name = next((name for name, node in self.graph.nodes.items()
-                             if isinstance(node, CurrentLoop)), None)
+        current_name = self.ctrl._frame_cc
         frame = (self.input(current_name, "frame") if current_name is not None
                  else self.m("theta"))
         current = f"({self.m('meas_i_c')} * Complex{{std::cos({frame}), -std::sin({frame})}})"
@@ -1880,7 +1905,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
                  f"{self.m('log_in_service')} = {self.m('startup_run')} ? 1.0 : 0.0;",
                  f"{self.m('log_freq_dev')} = ({self.m('omega')} - {_number(self.cfg.base.w0)}) / (2.0 * pi);",
                  f"{self.m('log_angle_rel')} = std::remainder({self.m('theta')} - {_number(self.cfg.base.w0)} * t, 2.0 * pi);"]
-        lines += self._mode_log_lines("", current_name)
+        lines += self._mode_log_lines("")
         return lines
 
     def command_lines(self, on: bool, ramp: float) -> list[str]:
@@ -2059,48 +2084,7 @@ class _UnitGenerator(_ACControlGenerator):
         ]
         for key, value in graph.values.items():
             lines.append(f"{'Complex' if isinstance(value, complex) else 'double'} {self.g(key)} = {self._literal(value)};")
-        for loop_name, node in graph.nodes.items():
-            if isinstance(node, SRFPLL):
-                lines += [f"double {self.node(loop_name, 'theta')} = {_number(node.theta)};",
-                          f"double {self.node(loop_name, 'omega')} = {_number(node.omega)};",
-                          f"double {self.node(loop_name, 'integral')} = {_number(node.integral)};"]
-                if node.u_g is not None:
-                    lines.append(f"double {self.node(loop_name, 'u_g')} = {_number(node.u_g)};")
-            elif isinstance(node, CurrentLoop):
-                lines.append(f"Complex {self.node(loop_name, 'integral')} = {_complex(node.integral)};")
-            elif isinstance(node, DCVoltageControl):
-                lines += [f"double {self.node(loop_name, 'integral')} = {_number(node.integral)};",
-                          f"bool {self.node(loop_name, 'limit_exceeded')} = {'true' if node.limit_exceeded else 'false'};",
-                          f"std::size_t {self.node(loop_name, 'n_updates')} = {int(node.n_updates)};",
-                          f"std::size_t {self.node(loop_name, 'n_limit_exceeded')} = {int(node.n_limit_exceeded)};",
-                          f"std::size_t {self.node(loop_name, 'n_reverse')} = {int(node.n_reverse)};",
-                          f"double {self.node(loop_name, 'first_limit_t')} = {_number(node.first_limit_t if node.first_limit_t is not None else math.nan)};"]
-            elif isinstance(node, PowerLoop):
-                if node.bandwidth > 0.0:
-                    lines += [f"double {self.node(loop_name, 'p')} = {_number(node.lpf_p.x0)};",
-                              f"double {self.node(loop_name, 'q')} = {_number(node.lpf_q.x0)};"]
-            elif isinstance(node, SyncLaw):
-                lines += [f"double {self.node(loop_name, 'theta')} = {_number(node.theta)};",
-                          f"double {self.node(loop_name, 'omega')} = {_number(node.omega)};",
-                          f"double {self.node(loop_name, 'v_mag')} = {_number(node.v_mag)};"]
-                if isinstance(node, PSC):
-                    lines.append(f"double {self.node(loop_name, 'v_int')} = {_number(node.v_int)};")
-                elif isinstance(node, VSG):
-                    lines.append(f"double {self.node(loop_name, 'dw')} = {_number(node.dw_pu)};")
-            elif isinstance(node, VirtualAdmittance):
-                lines.append(f"Complex {self.node(loop_name, 'i_ref')} = {_complex(node.i_ref)};")
-            elif isinstance(node, ActiveDamping):
-                lines.append(f"Complex {self.node(loop_name, 'low')} = {_complex(node.lpf.x0)};")
-            elif isinstance(node, UnitDelay):
-                kind = "Complex" if isinstance(node.value, complex) else "double"
-                lines.append(f"{kind} {self.node(loop_name, 'value')} = {self._literal(node.value)};")
-            elif isinstance(node, VirtualImpedance):
-                pass
-            else:
-                raise TypeError(
-                    f"C++ export: controller loop {self.name}.{loop_name} has unsupported type "
-                    f"{type(node).__name__}"
-                )
+        lines += self._sampled_loop_members()
         if not unit.continuous:
             lines += self._pwm_members()
         return lines
@@ -2140,29 +2124,8 @@ class _UnitGenerator(_ACControlGenerator):
                 return self.m("startup_steps")
             loop_name, _, public = local.partition(".")
             node = self.graph.nodes.get(loop_name)
-            if node is not None:
-                if isinstance(node, SRFPLL):
-                    aliases = {"theta": "theta", "integral_pu": "integral", "u_g_pu": "u_g"}
-                    if public in aliases:
-                        return self.node(loop_name, aliases[public])
-                if isinstance(node, CurrentLoop) and public == "integral_pu":
-                    return self.node(loop_name, "integral")
-                if isinstance(node, DCVoltageControl):
-                    if public == "integral":
-                        return self.node(loop_name, "integral")
-                if isinstance(node, PowerLoop) and public in ("p_pu", "q_pu"):
-                    return self.node(loop_name, public[0])
-                if isinstance(node, SyncLaw):
-                    aliases = {"theta": "theta", "v_int_pu": "v_int",
-                               "dw_pu": "dw", "v_mag_pu": "v_mag"}
-                    if public in aliases:
-                        return self.node(loop_name, aliases[public])
-                if isinstance(node, ActiveDamping) and public == "hpf_pu":
-                    return self.node(loop_name, "low")
-                if isinstance(node, VirtualAdmittance) and public == "i_ref_pu":
-                    return self.node(loop_name, "i_ref")
-                if isinstance(node, UnitDelay) and public == node.state_name:
-                    return self.node(loop_name, "value")
+            if node is not None and public in node.get_state():
+                return self.node(loop_name, public)
         raise KeyError(local)
 
     def controller_method(self) -> str:
@@ -2198,8 +2161,7 @@ class _UnitGenerator(_ACControlGenerator):
         return "\n".join(lines)
 
     def _log_lines(self, indent: str) -> list[str]:
-        current_name = next((name for name, node in self.graph.nodes.items()
-                             if isinstance(node, CurrentLoop)), None)
+        current_name = self.ctrl._frame_cc
         frame = (self.input(current_name, "frame") if current_name is not None
                  else self.m("theta"))
         current = f"(meas_i_c * Complex{{std::cos({frame}), -std::sin({frame})}})"
@@ -2216,7 +2178,7 @@ class _UnitGenerator(_ACControlGenerator):
                  f"{indent}{self.m('log_in_service')} = {self.m('startup_run')} ? 1.0 : 0.0;",
                  f"{indent}{self.m('log_freq_dev')} = ({self.m('omega')} - {_number(self.cfg.base.w0)}) / (2.0 * pi);",
                  f"{indent}{self.m('log_angle_rel')} = std::remainder({self.m('theta')} - {_number(self.cfg.base.w0)} * t, 2.0 * pi);"]
-        lines += self._mode_log_lines(indent, current_name)
+        lines += self._mode_log_lines(indent)
         return lines
 
     def _modulation_lines(self, indent: str) -> list[str]:
@@ -2342,7 +2304,7 @@ class _GraphUnitGenerator(_ControlGenerator):
     """Lower a unit through its public control and bridge ports.
 
     This path has no knowledge of a converter family.  The control interface supplies measured
-    and commanded ports, registered control blocks supply their equations and state, and the
+    and commanded ports, registered control loops supply their equations and state, and the
     bridge topology supplies its duty-register width and switching-state encoding.
     """
 
@@ -2428,29 +2390,7 @@ class _GraphUnitGenerator(_ControlGenerator):
         for key, value in self.graph.values.items():
             kind = "Complex" if isinstance(value, complex) else "double"
             lines.append(f"{kind} {self.g(key)} = {self._literal(value)};")
-        for loop_name, node in self.graph.nodes.items():
-            for local, value in node.get_state().items():
-                kind = "Complex" if isinstance(value, complex) else "double"
-                lines.append(f"{kind} {self.node(loop_name, local)} = {self._literal(value)};")
-            if isinstance(node, DCVoltageControl):
-                lines.append(
-                    f"bool {self.node(loop_name, 'limit_exceeded')} = "
-                    f"{'true' if node.limit_exceeded else 'false'};"
-                )
-            for carried in node.carried:
-                value = getattr(node, carried)
-                if carried == "first_limit_t":
-                    lines.append(
-                        f"double {self.node(loop_name, carried)} = "
-                        f"{_number(value if value is not None else math.nan)};"
-                    )
-                    continue
-                kind = ("bool" if isinstance(value, bool) else
-                        "std::size_t" if isinstance(value, int) else
-                        "Complex" if isinstance(value, complex) else "double")
-                lines.append(
-                    f"{kind} {self.node(loop_name, carried)} = {self._literal(value)};"
-                )
+        lines += self._sampled_loop_members()
         lines += [
             *self._pwm_members(),
         ]

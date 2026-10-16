@@ -82,8 +82,9 @@ unambiguous within the assembled system.
 
 Yes. Modules in `peslite.addons.control` and `peslite.addons.components` are discovered into the
 same registries as built-in types. Types elsewhere may use the public registration functions for
-control loops, circuit elements, events and solvers. The YAML entry then uses the registered type
-name and goes through normal parameter validation. See [Extending PESLite](Extending-PESLite.md).
+control loops, circuit elements, events and solvers. A control-loop entry uses the registered class
+name; the other extension entries use their registered type names. All entries go through normal
+parameter validation. See [Extending PESLite](Extending-PESLite.md).
 
 ## Is the exported C++ simulator a wrapper around Python?
 

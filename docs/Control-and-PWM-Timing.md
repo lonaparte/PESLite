@@ -30,13 +30,16 @@ Individual loops may run more slowly:
 ctrl:
   period: 50e-6
   loops:
-    current: {type: dq_current_pi, period: 50e-6}
-    dc_voltage: {type: dc_voltage_control, period: 500e-6}
+    CurrentLoop: {period: 50e-6}
+    DCVoltageControl: {period: 500e-6}
 ```
 
-`current` and `dc_voltage` in this example are graph-local instance names. The respective `type`
-fields select the registered implementations; connections address the instance names. Instances
-are constructed only from entries present in `ctrl.loops`—unused loop classes are not instantiated.
+The class names are also the graph-node names used by `connections`, outputs and state paths.
+Configuration loading resolves them to parameter schemas without constructing control objects.
+During assembly, PESLite traces dependencies backward from controller outputs and constructs only
+the nodes on that active graph; an unreferenced declaration consumes no runtime loop object.
+If a class occurs more than once, an optional label remains part of the node name, for example
+`Observer[voltage]` and `Observer[current]`. No loop entry needs a `type` field.
 
 A loop period must be an integer multiple of `ctrl.period`. If omitted, it inherits the controller
 period. Loop state is preserved when run-time parameter changes rebuild a loop.

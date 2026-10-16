@@ -125,7 +125,6 @@ def _custom_case(case):
     unit["ctrl"] = {
         "type": "gfm",
         "loops": {
-            "power": {"type": "power", "period": 5e-5},
             "sync": {"type": "test_lagged_psc", "period": 5e-5,
                      "k_p_pu": 6.2832, "tau": 0.02},
             "vi": {"type": "virtual_impedance"},

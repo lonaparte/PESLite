@@ -26,7 +26,7 @@ units:
         type: resonant
         computation: 0.0
         loops:
-          modulation: {type: resonant_modulation}
+          ResonantModulation: {}
         references:
           modulation: 0.8
           frequency: 85000.0
@@ -43,7 +43,7 @@ units:
         type: resonant
         computation: 0.0
         loops:
-          modulation: {type: resonant_modulation}
+          ResonantModulation: {}
         references:
           modulation: 0.7
           frequency: 85000.0

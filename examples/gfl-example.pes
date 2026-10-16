@@ -77,20 +77,17 @@ units:                     # converters, one entry each
       # period: 50.0e-6    # sampled modes: control interrupt (ignored by averaging)
       # computation: 1.0e-6  # sampled modes: sample-to-PWM-load eligibility (ignored by averaging)
       loops:               # sampled by interrupts, or integrated continuously by averaging
-        pll:
-          type: srf_pll
+        SRFPLL:
           # period: 50.0e-6  # sampled modes only; ignored by averaging
           kp_pu: 20.0
           ki_pu: 1200.0
           # normalisation: rated  # rated | amplitude
-        cc:
-          type: dq_current_pi
+        CurrentLoop:
           bandwidth: 200.0 # Hz; gains from the bandwidth unless kp_pu, ki_pu are given
           # decoupling: 1
           # feedforward: 1
           # antiwindup: 1     # tracking anti-windup after controller output limiting
-        dvc:
-          type: dc_voltage_control
+        DCVoltageControl:
           kp: 0.8
           ki: 90.0
           minimum: 0.0
@@ -98,8 +95,8 @@ units:                     # converters, one entry each
           feedforward: 0.9 # current feed-forward, raised with the start-up
           output_polarity: -1.0 # positive d-axis export current lowers the DC-link voltage
           # antiwindup: 1
-      # connections: {cc.id_ref: dvc.current_reference} # input port -> output port
-      # outputs: {u_dq: cc.u_dq, theta: pll.theta, omega: pll.omega}
+      # connections: {CurrentLoop.id_ref: DCVoltageControl.current_reference}
+      # outputs: {u_dq: CurrentLoop.u_dq, theta: SRFPLL.theta, omega: SRFPLL.omega}
       # references:        # constant inputs, pu on this unit's base
       #   id_ref_pu: 0.0
       #   iq_ref_pu: 0.0
@@ -110,8 +107,8 @@ units:                     # converters, one entry each
       #   theta: 0.0       # rad
       #   omega: 314.159   # rad/s (default: 2 pi f0)
       #   zero_v_pu: 0.0
-      # A custom loop type, registered with peslite.register_loop_type, is written here
-      # like the built-in ones and its parameters are checked the same way.
+      # A registered custom loop class is written here like a built-in class and its parameters
+      # are checked the same way.
 
     protection:            # trips only this converter (gates blocked, AC and DC sides opened)
       overcurrent: {enable: 1, limit_pu: 1.15}   # unit protection: checked at PWM edges, armed from start

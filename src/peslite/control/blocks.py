@@ -16,7 +16,8 @@ from numpy.typing import NDArray
 
 from ..solver.model import ConfigError
 
-__all__ = ["A120", "abc2complex", "complex2abc", "phases", "clamp", "smoothstep", "peak_abs",
+__all__ = ["A120", "abc2complex", "complex2abc", "phases", "complex_power",
+           "unit_delay", "clamp", "smoothstep", "peak_abs",
            "Integrator", "PI", "OutputLimit", "Filter", "HoldTimer", "MovingWindow"]
 
 
@@ -43,6 +44,16 @@ def phases(u: complex) -> tuple[float, float, float]:
 def complex2abc(u: complex) -> NDArray[np.float64]:
     """Convert a space vector to a phase-quantity array."""
     return np.array(phases(u))
+
+
+def complex_power(voltage, current):
+    """Return ``p + j q`` from voltage and current space vectors."""
+    return voltage * current.conjugate()
+
+
+def unit_delay(value, previous):
+    """Return ``(previous output, next state)`` for a one-sample delay."""
+    return previous, value
 
 
 # ------------------------------------------------------------------ scalar helpers

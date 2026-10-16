@@ -55,20 +55,30 @@ units:
     ctrl:
       type: gfm
       loops:
-        power: {type: power}
-        sync: {type: psc, k_p_pu: 6.2832, k_vi: 20.0}
-        vi: {type: virtual_impedance}
-        damp: {type: active_damping, r_a_pu: 0.2, alpha_d: 40.0}
+        PSC: {k_p_pu: 6.2832, k_vi: 20.0}
+        VirtualImpedance: {}
+        ActiveDamping: {r_a_pu: 0.2, alpha_d: 40.0}
       references: {p_ref_pu: 0.5}
 ```
 
 `ctrl.type` selects the controller architecture: its reference schema, public ports and default
 wiring. Built-in architectures include `gfl`, `gfm`, scalar `dc` and `resonant`; a custom graph can
-override loop connections and controller outputs explicitly. A key under `ctrl.loops` is only the
-instance name used by those connections. The nested loop `type` selects the registered loop class,
-so an instance such as `voltage` is not implicitly mapped to `DCVoltageControl`. See
+override loop connections and controller outputs explicitly. Normally, each key under `ctrl.loops`
+is the registered loop class name and also its graph-node name; no duplicate `type` field is
+needed. PESLite builds only nodes that can reach a controller output through the connection graph.
+Examples use `{}` for an empty parameter mapping. A bare key or explicit YAML `null` is accepted
+as an equivalent input in `ctrl.loops`.
+Repeated uses of one class use a class-qualified name, such as `Observer[voltage]` and
+`Observer[current]`; connections address those complete names. See
 [Control and PWM Timing](Control-and-PWM-Timing.md) and
 [Converter and Bridge Models](Converter-and-Bridge-Models.md).
+
+Shared operations such as `complex_power`, coordinate transforms and `unit_delay` are functions,
+not configurable graph nodes. A synchronization law calls `complex_power` directly and owns its
+optional power-filter states. A loop that needs a one-sample delay owns the previous value and
+passes it explicitly to `unit_delay(value, previous)`. Consequently, unused helper functions create
+no objects or runtime state. `VirtualImpedance`, `ActiveDamping` and `ResonantModulation` remain
+ordinary registered loops because they have configurable behavior and graph ports.
 
 A WPT unit is a configuration-time composite. It owns no bridge or controller itself; each child
 is an ordinary independently clocked `DCConverter` whose scalar power port is connected to the
@@ -89,7 +99,7 @@ units:
         type: resonant
         computation: 0.0
         loops:
-          modulation: {type: resonant_modulation}
+          ResonantModulation: {}
         references: {modulation: 0.8, frequency: 85000.0}
     secondary:
       # The same fields, with its own DC link, PWM clock and phase command.
@@ -100,7 +110,7 @@ units:
         type: resonant
         computation: 0.0
         loops:
-          modulation: {type: resonant_modulation}
+          ResonantModulation: {}
         references: {modulation: 0.7, frequency: 85000.0, phase: -1.5708}
     link:
       type: ss

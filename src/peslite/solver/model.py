@@ -7,7 +7,7 @@ state) named ``<subsystem>.<state>`` and evaluates their outputs and connections
 Strongly connected output/input dependencies are detected during assembly and reduced to
 internally solved algebraic groups; individual subsystems do not need case-specific break rules.
 Every part with a state (a model, a controller, a PWM peripheral, a solver) is :class:`Stateful`: it
-gives its state by name, parts are composed by dotted names (``vsc.ctrl.pll``), flattened to the
+gives its state by name, parts are composed by dotted names (``vsc.ctrl.SRFPLL``), flattened to the
 real columns of ``states.csv`` and resolved from ``initial.states`` values.
 """
 

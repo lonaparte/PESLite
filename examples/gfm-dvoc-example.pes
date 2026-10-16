@@ -20,9 +20,8 @@ units:
     ctrl:
       type: gfm
       loops:
-        power: {type: power}
-        sync: {type: dvoc, eta_pu: 6.2832, alpha_pu: 62.832, kappa: 1.5708}
-        vi: {type: virtual_impedance, x_v_pu: 0.05}
+        DVOC: {eta_pu: 6.2832, alpha_pu: 62.832, kappa: 1.5708}
+        VirtualImpedance: {x_v_pu: 0.05}
       references: {p_ref_pu: 0.5}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 events:

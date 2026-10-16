@@ -64,7 +64,8 @@ def test_timing_defaults_follow_the_carrier(gfl):
     ({"units.vsc.ctrl.computation": 5e-5}, "shorter than the control period"),
     ({"units.vsc.ctrl.computation": -1e-6}, "must be at least 0"),
     ({"units.vsc.ctrl.computation": math.nan}, "computation"),
-    ({"units.vsc.ctrl.loops.dvc.period": 7.5e-5}, "not a multiple of ctrl.period"),
+    ({"units.vsc.ctrl.loops.DCVoltageControl.period": 7.5e-5},
+     "not a multiple of ctrl.period"),
     ({"units.vsc.meas.period": 2e-5}, "does not divide ctrl.period"),
     ({"units.vsc.meas.period": 1e-4}, "longer than ctrl.period"),
     ({"units.vsc.meas.average": "window"}, "expected a list of channels"),
@@ -129,11 +130,13 @@ def test_timing_follows_an_asynchronous_carrier_phase(gfl, tmp_path):
 
 
 def test_a_slow_loop_runs_at_every_nth_interrupt(gfl):
-    sim = peslite.Simulation(gfl(**{"units.vsc.ctrl.loops.dvc.period": 4 * T}))
+    sim = peslite.Simulation(gfl(**{
+        "units.vsc.ctrl.loops.DCVoltageControl.period": 4 * T,
+    }))
     graph = sim.unit().ctrl.graph
     due = [graph.due(k * T) for k in range(8)]
-    assert [("dvc" in names) for names in due] == [True, False, False, False] * 2
-    assert all({"pll", "cc"} <= names for names in due)
+    assert [("DCVoltageControl" in names) for names in due] == [True, False, False, False] * 2
+    assert all({"SRFPLL", "CurrentLoop"} <= names for names in due)
 
 
 def _pwm(computation):
@@ -232,7 +235,7 @@ def test_initial_and_end_times_are_not_moved_to_a_pwm_grid(gfl, tmp_path):
 
 def test_an_oversampled_continuation_starts_at_an_interrupt(gfl):
     over = {"units.vsc.meas.period": 2.5e-5, "units.vsc.pwm.carrier_phase": 0.3}
-    state = {"simulation.initial.states": {"vsc.ctrl.pll.integral_pu": 0.0}}
+    state = {"simulation.initial.states": {"vsc.ctrl.SRFPLL.integral_pu": 0.0}}
     gfl(**over, **state, **{"simulation.initial.t": 3.5e-5 + 1e-4})
     with pytest.raises(ConfigError, match="between two control interrupts"):
         gfl(**over, **state, **{"simulation.initial.t": 1.25e-4})

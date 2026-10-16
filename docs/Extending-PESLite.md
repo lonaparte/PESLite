@@ -27,7 +27,7 @@ restartable PESLite states.
 
 ## Custom control loops
 
-Register a loop class with `register_loop_type`:
+Register a control-loop class with `register_loop_type`:
 
 ```python
 from dataclasses import dataclass
@@ -64,8 +64,16 @@ class LaggedSync(SyncLaw):
 ```
 
 The nested frozen `Params` dataclass defines the file schema and defaults. A module stored under
-`peslite/addons/control/` is discovered automatically; the registered name is then available at
-`units.<u>.ctrl.loops.<loop>.type` exactly like a built-in loop.
+`peslite/addons/control/` is discovered automatically; the class name is then available directly
+under `units.<u>.ctrl.loops` exactly like a built-in loop:
+
+```yaml
+loops:
+  LaggedPSC: {k_p_pu: 6.2832, tau: 0.02}
+```
+
+When one graph needs the same class more than once, append a graph-local label without adding a
+second type selector, for example `Observer[voltage]` and `Observer[current]`.
 
 A specialized loop may expose separate sampled and continuous-flow laws. When its dynamics can be
 built from the standard blocks, define one `equation()` instead: the graph supplies its inputs,
