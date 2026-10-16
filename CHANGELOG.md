@@ -2,15 +2,15 @@
 
 ## 0.4.0
 
-- Added Buck, Boost and Buck-Boost `DCConverter` units using the shared `UnitParams`, control graph,
-  bridge simulation forms and solver infrastructure.
+- Added an open `DCConverter` unit using the shared `UnitParams`, control graph, bridge simulation
+  forms and solver infrastructure, with Buck, Boost and single-inductor Buck-Boost examples.
 - Added `HalfBridge` and `FullBridge` topologies and composed them with switching, PWM-period
   averaging and ideal averaging behavior.
 - Added natural CCM/DCM operation, dedicated diode-conduction handling and matching standalone C++
   export without adding device behavior to the generic integrators.
-- Renamed the AC converter runtime interface from `UniteType` to `VSCController`, and consolidated
-  DC-link and capacitor voltage regulation as `DCVoltageControl`. PESLite versions below 1.0 may
-  make interface changes in any `0.x.x` release.
+- Shared converter lifecycle behavior through `Unit` with `VSC` and `DCConverter` assemblies, and
+  consolidated DC-link and capacitor voltage regulation as `DCVoltageControl`. PESLite versions
+  below 1.0 may make interface changes in any `0.x.x` release.
 - Control-loop entries now use registered class names directly without duplicate `type` fields;
   repeated classes use `ClassName[label]`. Assembly constructs only loops in the controller-output
   dependency graph.

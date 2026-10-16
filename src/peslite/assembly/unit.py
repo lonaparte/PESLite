@@ -712,9 +712,11 @@ class DCConverter(Unit):
             unilateral=topology.unilateral,
         )
         self.bridge = make_bridge(cfg, modulator, topology=topology)
+        self._external_lower_rail = getattr(topology, "external_terminal", None) == "lower_rail"
         power_voltage_port = (bus, "u") if bus is not None else (self.bridge, "u_c")
         self._control_voltage_port = (
-            (self.dclink, "u_dc") if topology.reverse_port else power_voltage_port
+            power_voltage_port if self._external_lower_rail or not topology.reverse_port
+            else (self.dclink, "u_dc")
         )
         self._control_supply_port = (
             power_voltage_port if topology.reverse_port else (self.dclink, "u_dc")
@@ -730,7 +732,7 @@ class DCConverter(Unit):
             )
             self.conduction.local_step_state = self.branch_f
             self.branch_f.use_external_conduction()
-            self.bridge.use_current_transfer_ratio()
+            self.bridge.use_current_transfer_ratios()
         self.continuous = bool(getattr(self.bridge, "continuous", False))
         self.ctrl = ctrl if ctrl is not None else make_controller(cfg, topology=topology)
         if bool(getattr(self.ctrl, "continuous", False)) != self.continuous:
@@ -774,16 +776,26 @@ class DCConverter(Unit):
             assert self.branch_f is not None
             connections.update({
                 (self.conduction, "current"): (self.branch_f, "i"),
-                (self.conduction, "voltage"): self._control_voltage_port,
-                (self.conduction, "supply"): self._control_supply_port,
+                (self.conduction, "upper"): (self.dclink, "u_dc"),
                 (self.branch_f, "di_dt"): (self.conduction, "derivative"),
                 (self.branch_f, "loss_factor"): (
                     self.conduction, "resistance_factor",
                 ),
-                (self.bridge, "current_ratio"): (
-                    self.conduction, "current_ratio",
+                (self.bridge, "upper_current_ratio"): (
+                    self.conduction, "upper_current_ratio",
+                ),
+                (self.bridge, "lower_current_ratio"): (
+                    self.conduction, "lower_current_ratio",
                 ),
             })
+            if self._external_lower_rail:
+                connections[(self.conduction, "lower")] = self._control_voltage_port
+            else:
+                connections[(self.conduction, "reference")] = (
+                    self._control_supply_port
+                    if self.bridge.topology.reverse_port
+                    else self._control_voltage_port
+                )
         if self.continuous:
             connections.update({
                 (self.ctrl, "current"): self._current_connection(),
@@ -806,6 +818,13 @@ class DCConverter(Unit):
     def terminals(self) -> tuple:
         if self.branch_f is None:
             return self._power_terminals()
+        if self._external_lower_rail:
+            assert self.bridge.lower_terminal is not None
+            return (
+                *self._power_terminals(),
+                (self.power_bus, self.branch_f.terminal1),
+                (self.cfg.bus, self.bridge.lower_terminal),
+            )
         if self.bridge.topology.reverse_port:
             bridge_side, network_side = self.branch_f.terminal2, self.branch_f.terminal1
         else:

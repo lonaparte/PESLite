@@ -70,6 +70,7 @@ units:                     # converters, one entry each
     #   upper_controlled: 1        # half-bridge device placement; ignored by three/full bridges
     #   lower_controlled: 1
     #   reverse_port: 0            # half-bridge scalar-port orientation
+    #   external_terminal: midpoint # half bridge: midpoint | lower_rail
     #                              # CLI: --averaging | --pwm-averaging | --switching
 
     ctrl:

@@ -246,9 +246,14 @@ def _unit(u, base, where: str, *, nested: bool = False) -> None:
 
 def _dc_converter(u, base, where: str, *, nested: bool = False) -> None:
     """Check one open scalar converter."""
-    _topology, continuous = _converter(u, base, where)
+    topology, continuous = _converter(u, base, where)
     if (u.bus is None) != (u.filter is None):
         raise ConfigError(f"{where}: bus and filter must be specified together")
+    if (getattr(topology, "external_terminal", None) == "lower_rail"
+            and (u.bus is None or u.filter is None)):
+        raise ConfigError(
+            f"{where}.bridge.external_terminal: lower_rail needs a bus and a midpoint filter"
+        )
     if nested and u.bus is not None:
         raise ConfigError(f"{where}: a composite child uses its parent's scoped power bus")
     if not nested and u.bus is None:

@@ -96,9 +96,12 @@ owns its power stage, controller, sensing, startup interface, breakers and gates
 The contract also assembles two internal power boundaries. `<unit>.bus.dc` connects a DCLink
 voltage driver to the bridge DC terminal. `<unit>.bus.power` always denotes the bridge power-side
 bus: it connects the bridge to a series filter or, for an unfiltered nested converter, directly to
-a WPT link. A filter's other terminal connects to the public bus selected by the unit's `bus`
-parameter. The scoped internal names disappear into direct connections; there is no runtime bus
-lookup or WPT-specific solver path. Every Unit exposes named ports and one default port. A
+a WPT link. Normally, a filter's other terminal connects to the public bus selected by the unit's
+`bus` parameter. For a half bridge with `external_terminal: lower_rail`, that public bus instead
+connects to the lower rail, while the filter connects the midpoint power bus to the common point.
+This is the single-inductor Buck-Boost connection. The scoped internal names disappear into direct
+connections; there is no runtime bus lookup or WPT-specific solver path. Every Unit exposes named
+ports and one default port. A
 single-port Unit selects it automatically; a multi-port Unit type must select one explicitly.
 Composite ports forward existing child ports without copying their electrical base. WPT exposes
 `primary` and `secondary` and selects `primary` by default, so common assembly, event scaling and
@@ -127,7 +130,7 @@ Parameter ownership is explicit:
 | DC converter only | `unit.type: dc_converter` | `filter`; a composite parent may omit it and the common `bus`, creating a scoped internal power bus |
 | WPT composite only | `unit.type: wpt` | `primary`, `secondary`, and `link`; it has no bridge, PWM or controller of its own |
 | Common bridge | none | `type` selects `three_phase_bridge`, `half_bridge`, or `full_bridge`; `model` independently selects switching, PWM averaging, or ideal averaging |
-| Half bridge only | `bridge.type: half_bridge` | `upper_controlled`, `lower_controlled`, and `reverse_port` |
+| Half bridge only | `bridge.type: half_bridge` | `upper_controlled`, `lower_controlled`, `reverse_port`, and `external_terminal` |
 | Common control | none | `type`, `period`, `computation`, `loops`, `connections`, and `outputs` |
 | Control architecture | `ctrl.type` | reference fields and default wiring unique to the selected architecture |
 | Control loop | `ctrl.loops.<ClassName>` | parameters unique to the selected loop class |

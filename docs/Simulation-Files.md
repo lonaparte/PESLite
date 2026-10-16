@@ -40,10 +40,10 @@ Each converter may define its own `s_base`; otherwise it uses the system base. C
 references and loop parameters use that converter's base. Time is in seconds, angles are radians,
 frequencies are hertz unless named `omega`, and switches are written as `0` or `1`.
 
-`pwm`, `ctrl`, `bridge`, `meas` and `protection` are common to every non-composite converter unit.
-The selected `unit.type` contributes only its electrical fields: `vsc` adds `bus`, `ac_filter` and
-`dclink`, while `dc_converter` adds `bus`, `filter` and `dclink`. The common ADC and protection
-lifecycle are not reimplemented by either converter family.
+`bus`, `dclink`, `pwm`, `ctrl`, `bridge`, `meas`, `protection` and `s_base` are common to every
+non-composite converter unit. The selected `unit.type` contributes its own electrical fields:
+`vsc` adds `ac_filter`, while `dc_converter` adds `filter`. The common ADC and protection lifecycle
+are shared by both converter families.
 
 ## Converter section
 

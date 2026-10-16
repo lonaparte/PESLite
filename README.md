@@ -12,27 +12,15 @@ API—designed as a deterministic simulation backend for LLM reasoning and verif
 
 ## Features
 
-- Converter networks with buses, branches, grid sources, R-L loads and multiple independently
-  named converter units.
-- Grid-following and grid-forming controllers assembled from typed control loops.
-- Per-converter `switching`, PWM-period-averaged and ideal continuously averaged bridge models.
-- Open single-phase DC converters for Buck, Boost, cascaded Buck-Boost and resonant applications.
-- Composite SS and LCC-LCC wireless-power-transfer units with independently clocked full-bridge
-  primary and secondary converters assembled from one nested unit tree.
-- ADC sampling windows, controller interrupts, computation time, PWM shadow/active registers,
-  startup sequencing and unit-owned protection.
+- AC and DC converter networks, including grid-connected and wireless-power-transfer systems.
+- Configurable grid-following, grid-forming and DC converter control.
+- Switching, PWM-period-averaged and continuously averaged models.
+- Digital control timing, sensing and converter protection.
 - Fixed-step, adaptive and multirate integration with exact event boundaries.
-- Connect, disconnect and validated parameter-change events, plus continuation from saved states.
-- Streamed CSV output, energy accounting, port-Hamiltonian structure reporting and a lazy Python
-  result API.
-- Optional IEEE/LaTeX-style vector PDF plots from completed CSV results.
-- Optional project-local extensibility through a `PESaddons/` directory beside a simulation file, plus
-  registration APIs for custom control loops, circuit elements, events and solvers.
-- Export as a parameter-specialized, standalone C++17 simulator with no third-party C++ runtime
-  dependencies.
-
-Plant quantities use SI units. Controller quantities ending in `_pu` use each converter's own
-per-unit base.
+- Simulation events and continuation from saved states.
+- Streamed waveform output, optional plotting and energy accounting.
+- Custom control loops, circuit elements, events and solvers through the Python extension API.
+- Standalone C++17 export with no third-party C++ runtime dependencies.
 
 ## Install
 
@@ -67,11 +55,8 @@ peslite case.pes --pwm-averaging
 peslite case.pes --averaging
 ```
 
-- `--switching` uses exact switching bridges with fixed-step RK4 integration.
-- `--pwm-averaging` averages each PWM period while retaining sampled digital-control timing and
-  uses fixed-step RK4 integration.
-- `--averaging` uses ideal averaged controlled-voltage-source bridges, continuous control and
-  adaptive DP45 integration.
+See [Converter and Bridge Models](https://github.com/lonaparte/PESLite/wiki/Converter-and-Bridge-Models)
+for model fidelity, control timing and solver presets.
 
 Use `peslite --help` for the full interface.
 
@@ -103,6 +88,7 @@ for compilation, runtime configuration and current backend limits.
 ## Documentation
 
 - [Getting Started](https://github.com/lonaparte/PESLite/wiki/Getting-Started)
+- [Examples](https://github.com/lonaparte/PESLite/wiki/Examples)
 - [Simulation Files](https://github.com/lonaparte/PESLite/wiki/Simulation-Files)
 - [Converter and Bridge Models](https://github.com/lonaparte/PESLite/wiki/Converter-and-Bridge-Models)
 - [Control and PWM Timing](https://github.com/lonaparte/PESLite/wiki/Control-and-PWM-Timing)

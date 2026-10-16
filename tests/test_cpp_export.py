@@ -328,7 +328,9 @@ def test_generated_cpp_matches_python_for_adaptive_dcm(mode, tmp_path):
     ("boost-example.pes", "switching"),
     ("boost-example.pes", "pwm_averaging"),
     ("boost-example.pes", "averaging"),
+    ("buck-boost-example.pes", "switching"),
     ("buck-boost-example.pes", "pwm_averaging"),
+    ("buck-boost-example.pes", "averaging"),
 ))
 def test_generated_cpp_matches_open_dc_converter_compositions(
         example, mode, tmp_path):

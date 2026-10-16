@@ -376,6 +376,7 @@ class _ModelGenerator:
         self.record_fields: dict[int, dict[str, str]] = {}
         self.record_types: dict[tuple[int, str], str] = {}
         self._unit_control_inputs: dict[int, dict[str, _Expression]] = {}
+        self._unit_measurements: dict[int, dict[str, _Expression]] = {}
         self._solver_observations: dict[tuple[int, str], tuple[str, Any, str]] = {}
         self.state_index: dict[tuple[int, str], tuple[int, bool]] = {
             (id(state), name): (index, is_complex)
@@ -417,6 +418,13 @@ class _ModelGenerator:
         if key not in self._unit_control_inputs:
             self._unit_control_inputs[key] = self.trace_element_values(unit, unit.control_inputs)
         return self._unit_control_inputs[key]
+
+    def unit_measurements(self, unit: Any) -> dict[str, _Expression]:
+        """Trace the physical channels read by one unit's ADC once per export."""
+        key = id(unit)
+        if key not in self._unit_measurements:
+            self._unit_measurements[key] = self.trace_element_values(unit, unit.ports.read)
+        return self._unit_measurements[key]
 
     def _discover_records(self) -> None:
         for sub in self.model.subsystems:
@@ -744,10 +752,7 @@ class _ModelGenerator:
         if isinstance(owner, RCNode):
             return [f"{self.value(out, 'u')} = {self.value(state, 'u_C')} + {_number(owner.R_d)} * {self.value(inp, 'i')};"]
         if isinstance(owner, _BridgeModel):
-            if name == "set_dc_current":
-                return self.trace_outputs(method)
-            if name == "set_ac_voltage":
-                return [f"{self.value(out, 'u_c')} = {self.value(inp, 'q')} * {self.value(inp, 'u_dc')};"]
+            return self.trace_outputs(method)
         if isinstance(owner, DCLink):
             return self._dclink_output(owner, name)
         generator = self.continuous_units.get(id(owner))
@@ -972,6 +977,12 @@ class _ModelGenerator:
                         "bool" if value.kind == "bool" else "double"
                     )
                     add(f"{name}.ctrl.{port}", value.code, kind)
+                if not unit.continuous:
+                    for channel, value in self.unit_measurements(unit).items():
+                        kind = "Complex" if value.kind == "complex" else (
+                            "bool" if value.kind == "bool" else "double"
+                        )
+                        add(f"{name}.adc.{channel}", value.code, kind)
         for name, element in self.system.named_elements.items():
             signals = getattr(element, "signals", None)
             if signals is not None:
@@ -2380,7 +2391,7 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
             )
 
     def _adc_reading(self, channel: str) -> str:
-        return f"obs_{_identifier(self.name + '.ctrl.meas.' + channel)}"
+        return f"obs_{_identifier(self.name + '.adc.' + channel)}"
 
     def _sampled_control_inputs(self) -> dict[str, _Expression]:
         channels = {

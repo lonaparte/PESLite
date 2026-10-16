@@ -35,19 +35,35 @@ The bus capacitor, load and any further branches remain independent network comp
 Boost, resonant conversion and similar names describe assembled applications rather than
 additional bridge structures.
 
-A half bridge independently declares whether its upper and lower positions are controlled. For a
-diode-bounded Buck application, the upper position is controlled and the lower position is a
-diode; its external named bus is the output. For a diode-bounded Boost application, the
-lower position is controlled and the upper position is a diode; the same external terminal is the
-input and its branch orientation follows the positive power-flow direction. A fully controlled
-half bridge and a full bridge remain bidirectional. `buck-example.pes`, `boost-example.pes` and the
-two-stage `buck-boost-example.pes` use these structures without adding application-specific plant
-classes.
+A half bridge has an upper rail, a midpoint and a lower rail. Its upper rail connects to the unit's
+DC link. `upper_controlled` and `lower_controlled` declare the device at each position; a false
+value leaves that position's diode available. A fully controlled half bridge and a full bridge
+remain bidirectional.
+
+The same half bridge and filter support these application connections:
+
+| Application | Half-bridge settings | Inductor connection | External `bus` |
+|---|---|---|---|
+| Buck | `lower_controlled: 0` | Midpoint to output | Output bus; lower rail at the common point |
+| Boost | `upper_controlled: 0`, `reverse_port: 1` | Input to midpoint | Input bus; upper rail and DC link form the output |
+| Buck-Boost | `lower_controlled: 0`, `external_terminal: lower_rail` | Midpoint to common point | Negative output bus on the lower rail |
+
+`bridge.external_terminal` defaults to `midpoint`, which exposes the midpoint through the series
+filter. With `lower_rail`, the named external bus connects to the lower rail instead, and the
+filter connects the midpoint to the common point. This setting requires both `bus` and `filter`
+and uses `reverse_port: 0`. The DC link supplies the input in the Buck and Buck-Boost examples;
+it stores the output voltage in the Boost example.
+
+`buck-boost-example.pes` contains one DCConverter and one inductor. Its electrical output voltage,
+including `output.u_C`, is negative relative to the common point. The control adapter supplies its
+positive magnitude to the voltage loop, so `ctrl.references.voltage` remains positive. The three
+application examples use the same bridge simulation forms and solver path.
 
 `InductorCurrentControl` is structure-independent. Its feedforward comes from the selected bridge:
-`u_out/u_in` for an upper-controlled half bridge, `1 - u_in/u_out` for a lower-controlled half
-bridge and `(1 + u/Vdc)/2` for a full bridge. The loop itself is responsible only for current
-regulation and limits.
+`u_out/u_in` for the Buck connection, `1 - u_in/u_out` for the Boost connection,
+`u_out/(u_in + u_out)` for the negative-output Buck-Boost connection (using the output magnitude),
+and `(1 + u/Vdc)/2` for a full bridge. The loop itself is responsible only for current regulation
+and limits.
 
 A diode current is unilateral. The dedicated `DiodeConduction` assembly stage owns that device
 behavior; it is not part of RK4, DP45 or another generic integrator. In `switching`, the stage uses
@@ -58,11 +74,12 @@ reverse current and does not receive this boundary handling.
 
 The averaged forms store cycle-mean filter current, which remains positive in DCM even though the
 instantaneous current has a zero-current interval. They derive the controlled, diode and idle
-fractions from duty, carrier period, mean current and the external terminal voltage. The diode law
-belongs to the half bridge while the R-L state remains in the external filter branch. One explicit
-algebraic conduction subsystem supplies the branch derivative, the bridge DC-current transfer
-ratio, the copper-loss factor and the local step request. Consequently the averaged DCM conversion
-ratio and DC-terminal current are not forced to their CCM duty-ratio relation, Python and exported
+fractions from duty, carrier period, mean current and the upper, lower and filter-reference
+voltages. The diode law belongs to the half bridge while the R-L state remains in the external
+filter branch. One explicit algebraic conduction subsystem supplies the branch derivative, both
+rail-current transfer ratios, the copper-loss factor and the local step request. Consequently the
+averaged DCM conversion ratio and DC-terminal current are not forced to their CCM duty-ratio
+relation, Python and exported
 C++ use the same loss equation, and no output capacitor or load is hidden inside the converter
 Unit.
 

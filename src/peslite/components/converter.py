@@ -24,11 +24,22 @@ __all__ = ["ThreePhaseBridge", "SwitchingBridge", "PWMBridge", "AveragingBridge"
 
 
 class _BridgeInp(Bag):
-    __slots__ = ("q", "current_ratio", "u_dc", "i_c")
+    __slots__ = ("q", "u_dc", "i_c")
 
 
 class _BridgeOut(Bag):
     __slots__ = ("u_c", "i_dc")
+
+
+class _HalfBridgeInp(Bag):
+    __slots__ = (
+        "q", "upper_current_ratio", "lower_current_ratio",
+        "u_dc", "u_lower", "i_c",
+    )
+
+
+class _HalfBridgeOut(Bag):
+    __slots__ = ("u_c", "i_dc", "i_lower")
 
 
 def _set_three_phase_dc_current(bridge, _t: float) -> None:
@@ -39,8 +50,21 @@ def _set_scalar_dc_current(bridge, _t: float) -> None:
     bridge.out.i_dc = (bridge.inp.q * bridge.inp.i_c).real
 
 
-def _set_scalar_transferred_current(bridge, _t: float) -> None:
-    bridge.out.i_dc = (bridge.inp.current_ratio * bridge.inp.i_c).real
+def _set_half_bridge_currents(bridge, _t: float) -> None:
+    q, current = bridge.inp.q, bridge.inp.i_c
+    bridge.out.i_dc = (q * current).real
+    bridge.out.i_lower = ((1.0 - q) * current).real
+
+
+def _set_half_bridge_transferred_currents(bridge, _t: float) -> None:
+    current = bridge.inp.i_c
+    bridge.out.i_dc = (bridge.inp.upper_current_ratio * current).real
+    bridge.out.i_lower = (bridge.inp.lower_current_ratio * current).real
+
+
+def _set_half_bridge_voltage(bridge, _t: float) -> None:
+    q = bridge.inp.q
+    bridge.out.u_c = q * bridge.inp.u_dc + (1.0 - q) * bridge.inp.u_lower
 
 
 class ThreePhaseBridge:
@@ -108,21 +132,50 @@ class _BridgeModel:
         OutputMethod("set_dc_current", inputs=("q", "i_c"), outputs=("i_dc",)),
         OutputMethod("set_ac_voltage", inputs=("q", "u_dc"), outputs=("u_c",)),
     )
-    _transferred_current_stages: ClassVar[tuple[OutputMethod, ...]] = (
+    _half_bridge_stages: ClassVar[tuple[OutputMethod, ...]] = (
         OutputMethod(
-            "set_dc_current", inputs=("current_ratio", "i_c"), outputs=("i_dc",)
+            "set_dc_current", inputs=("q", "i_c"), outputs=("i_dc", "i_lower")
         ),
-        OutputMethod("set_ac_voltage", inputs=("q", "u_dc"), outputs=("u_c",)),
+        OutputMethod(
+            "set_ac_voltage", inputs=("q", "u_dc", "u_lower"), outputs=("u_c",)
+        ),
+    )
+    _half_bridge_transferred_current_stages: ClassVar[tuple[OutputMethod, ...]] = (
+        OutputMethod(
+            "set_dc_current",
+            inputs=("upper_current_ratio", "lower_current_ratio", "i_c"),
+            outputs=("i_dc", "i_lower"),
+        ),
+        OutputMethod(
+            "set_ac_voltage", inputs=("q", "u_dc", "u_lower"), outputs=("u_c",)
+        ),
     )
 
     def __init__(self, topology=None) -> None:
         self.topology = topology if topology is not None else ThreePhaseBridge()
         self.state = Empty()
         zero = self.topology.zero
-        self.inp = _BridgeInp(q=zero, current_ratio=zero, u_dc=0.0, i_c=zero)
-        self.out = _BridgeOut(u_c=zero, i_dc=0.0)
+        if isinstance(self.topology, HalfBridge):
+            self.inp = _HalfBridgeInp(
+                q=zero,
+                upper_current_ratio=zero,
+                lower_current_ratio=zero,
+                u_dc=0.0,
+                u_lower=0.0,
+                i_c=zero,
+            )
+            self.out = _HalfBridgeOut(u_c=zero, i_dc=0.0, i_lower=0.0)
+            self.output_stages = self._half_bridge_stages
+            self.set_ac_voltage = _set_half_bridge_voltage.__get__(self, type(self))
+        else:
+            self.inp = _BridgeInp(q=zero, u_dc=0.0, i_c=zero)
+            self.out = _BridgeOut(u_c=zero, i_dc=0.0)
         self.dc_terminal = Terminal(self, "u_dc", "i_dc", 1)
         self.power_terminal = Terminal(self, "u_c", "i_c", -1, drives_voltage=True)
+        self.lower_terminal = (
+            Terminal(self, "u_lower", "i_lower", 1)
+            if isinstance(self.topology, HalfBridge) else None
+        )
         self.set_dc_current = self.topology.set_dc_current.__get__(self, type(self))
 
     def set_ac_voltage(self, t: float) -> None:
@@ -133,12 +186,12 @@ class _BridgeModel:
         self.set_dc_current(t)
         self.set_ac_voltage(t)
 
-    def use_current_transfer_ratio(self) -> None:
-        """Drive DC current from an explicit ratio while voltage remains driven by ``q``."""
+    def use_current_transfer_ratios(self) -> None:
+        """Drive both half-bridge rail currents from explicit conduction ratios."""
         if not isinstance(self.topology, HalfBridge):
-            raise TypeError("an independent current-transfer ratio requires a half bridge")
-        self.set_dc_current = _set_scalar_transferred_current.__get__(self, type(self))
-        self.output_stages = self._transferred_current_stages
+            raise TypeError("independent current-transfer ratios require a half bridge")
+        self.set_dc_current = _set_half_bridge_transferred_currents.__get__(self, type(self))
+        self.output_stages = self._half_bridge_transferred_current_stages
 
     def rhs(self, t: float):
         return ()
@@ -362,9 +415,11 @@ class HalfBridge:
     duty_names = ("d",)
     zero = 0.0
     neutral_duty = 0.0
-    config_fields = frozenset(("upper_controlled", "lower_controlled", "reverse_port"))
-    set_dc_current = staticmethod(_set_scalar_dc_current)
-    __slots__ = ("_gate_mask", "_reverse_port")
+    config_fields = frozenset((
+        "upper_controlled", "lower_controlled", "reverse_port", "external_terminal",
+    ))
+    set_dc_current = staticmethod(_set_half_bridge_currents)
+    __slots__ = ("_gate_mask", "_reverse_port", "_external_terminal")
 
     def switching_state(self, states) -> float:
         state = states[0]
@@ -380,7 +435,8 @@ class HalfBridge:
 
     def __init__(self, *, upper_controlled: bool = True,
                  lower_controlled: bool = True,
-                 reverse_port: bool = False) -> None:
+                 reverse_port: bool = False,
+                 external_terminal: str = "midpoint") -> None:
         if any(type(value) is not bool for value in (
                 upper_controlled, lower_controlled, reverse_port)):
             raise TypeError("controlled-device and port-orientation flags must be bool")
@@ -390,8 +446,17 @@ class HalfBridge:
             raise ConfigError("a reverse half bridge needs a controlled lower device")
         if not reverse_port and not upper_controlled:
             raise ConfigError("a forward half bridge needs a controlled upper device")
+        if external_terminal not in ("midpoint", "lower_rail"):
+            raise ConfigError(
+                "a half bridge external_terminal must be 'midpoint' or 'lower_rail'"
+            )
+        if external_terminal == "lower_rail" and reverse_port:
+            raise ConfigError(
+                "a lower-rail external terminal uses the forward half-bridge orientation"
+            )
         self._gate_mask = int(upper_controlled) | (int(lower_controlled) << 1)
         self._reverse_port = reverse_port
+        self._external_terminal = external_terminal
 
     @classmethod
     def from_config(cls, cfg: Any) -> "HalfBridge":
@@ -399,6 +464,7 @@ class HalfBridge:
             upper_controlled=cfg.upper_controlled,
             lower_controlled=cfg.lower_controlled,
             reverse_port=cfg.reverse_port,
+            external_terminal=cfg.external_terminal,
         )
 
     def state_from_duty(self, duty: float) -> float:
@@ -411,6 +477,11 @@ class HalfBridge:
         return self._reverse_port
 
     @property
+    def external_terminal(self) -> str:
+        """The half-bridge terminal exposed as the converter's external bus."""
+        return self._external_terminal
+
+    @property
     def unilateral(self) -> bool:
         """Whether one device position is diode-only and therefore blocks reverse current."""
         return self.upper_controlled != self.lower_controlled
@@ -418,7 +489,11 @@ class HalfBridge:
     def control_values(self, current, voltage, supply):
         """Return canonical control measurements and the topology's feed-forward duty."""
         current, voltage = np.real(current), np.real(voltage)
-        if self._reverse_port:
+        if self._external_terminal == "lower_rail":
+            voltage = -voltage
+            denominator = supply + voltage
+            feedforward = voltage / denominator if denominator > 0.0 else 0.0
+        elif self._reverse_port:
             feedforward = 1.0 - supply / voltage if voltage > 0.0 else 0.0
         else:
             feedforward = voltage / supply if supply > 0.0 else 0.0
@@ -441,17 +516,18 @@ class _DiodeConductionResult(NamedTuple):
     resistance_factor: Any
     derivative: Any
     in_dcm: Any
-    current_ratio: Any
+    upper_current_ratio: Any
+    lower_current_ratio: Any
 
 
 class _ConductionInp(Bag):
-    __slots__ = ("current", "q", "voltage", "supply")
+    __slots__ = ("current", "q", "upper", "lower", "reference")
 
 
 class _ConductionOut(Bag):
     __slots__ = (
         "controlled", "diode", "total", "resistance_factor", "derivative",
-        "in_dcm", "current_ratio", "maximum_step",
+        "in_dcm", "upper_current_ratio", "lower_current_ratio", "maximum_step",
     )
 
 
@@ -469,10 +545,10 @@ class HalfBridgeDiodeConduction:
     output_stages: ClassVar[tuple[OutputMethod, ...]] = (
         OutputMethod(
             "set_outputs",
-            inputs=("current", "q", "voltage", "supply"),
+            inputs=("current", "q", "upper", "lower", "reference"),
             outputs=(
                 "controlled", "diode", "total", "resistance_factor", "derivative",
-                "in_dcm", "current_ratio", "maximum_step",
+                "in_dcm", "upper_current_ratio", "lower_current_ratio", "maximum_step",
             ),
         ),
     )
@@ -486,7 +562,9 @@ class HalfBridgeDiodeConduction:
         if not isinstance(self.topology, HalfBridge) or not self.topology.unilateral:
             raise TypeError("diode conduction requires a unilateral half-bridge topology")
         self.state = Empty()
-        self.inp = _ConductionInp(current=0.0, q=0.0, voltage=0.0, supply=0.0)
+        self.inp = _ConductionInp(
+            current=0.0, q=0.0, upper=0.0, lower=0.0, reference=0.0,
+        )
         self.out = _ConductionOut(
             controlled=0.0,
             diode=0.0,
@@ -494,16 +572,23 @@ class HalfBridgeDiodeConduction:
             resistance_factor=1.0,
             derivative=0.0,
             in_dcm=False,
-            current_ratio=0.0,
+            upper_current_ratio=0.0,
+            lower_current_ratio=0.0,
             maximum_step=math.inf,
         )
 
-    def equations(self, current: Any, q: Any, voltage: Any,
-                  supply: Any) -> _DiodeConductionResult:
-        """Evaluate the one conduction law used by Python and generated backends."""
+    def equations(self, current: Any, q: Any, upper: Any, lower: Any,
+                  reference: Any) -> _DiodeConductionResult:
+        """Evaluate conduction between explicit upper, lower and midpoint-reference rails."""
         current = max(0.0, current)
-        duty = 1.0 - q if self.topology.reverse_port else q
-        bias = supply if self.topology.reverse_port else supply - voltage
+        reverse = self.topology.reverse_port
+        duty = 1.0 - q if reverse else q
+        direction = -1.0 if reverse else 1.0
+        controlled_rail = lower if reverse else upper
+        diode_rail = upper if reverse else lower
+        controlled_voltage = direction * (controlled_rail - reference)
+        diode_voltage = direction * (diode_rail - reference)
+        bias = controlled_voltage
         denominator = 2.0 * self.inductance + self.resistance * duty * self.period
         critical = duty * self.period * bias / denominator
         in_dcm = duty > 0.0 and duty < 1.0 and bias > 0.0 and current < critical
@@ -517,28 +602,28 @@ class HalfBridgeDiodeConduction:
             controlled = duty
             diode = 1.0 - duty
             resistance_factor = 1.0
-        if self.topology.reverse_port:
-            dcm_derivative = total * (
-                supply - diode * voltage - self.resistance * resistance_factor * current
-            ) / self.inductance
-            current_ratio = diode
-        else:
-            dcm_derivative = total * (
-                controlled * supply - voltage - self.resistance * resistance_factor * current
-            ) / self.inductance
-            current_ratio = controlled
+        dcm_derivative = total * (
+            controlled * controlled_voltage
+            + diode * diode_voltage
+            - self.resistance * resistance_factor * current
+        ) / self.inductance
+        upper_current_ratio = diode if reverse else controlled
+        lower_current_ratio = controlled if reverse else diode
         derivative = max(0.0, dcm_derivative) if current == 0.0 else dcm_derivative
         return _DiodeConductionResult(
-            controlled, diode, total, resistance_factor, derivative, in_dcm, current_ratio,
+            controlled, diode, total, resistance_factor, derivative, in_dcm,
+            upper_current_ratio, lower_current_ratio,
         )
 
     def set_outputs(self, _t: float) -> None:
         result = self.equations(
-            self.inp.current, self.inp.q, self.inp.voltage, self.inp.supply,
+            self.inp.current, self.inp.q, self.inp.upper, self.inp.lower,
+            self.inp.reference,
         )
         out = self.out
         (out.controlled, out.diode, out.total, out.resistance_factor,
-         out.derivative, out.in_dcm, out.current_ratio) = result
+         out.derivative, out.in_dcm, out.upper_current_ratio,
+         out.lower_current_ratio) = result
         out.maximum_step = self.period / 10.0 if result.in_dcm else math.inf
 
     def rhs(self, _t: float):

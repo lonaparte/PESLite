@@ -422,9 +422,11 @@ class BridgeParams:
     upper_controlled: bool = True
     lower_controlled: bool = True
     reverse_port: bool = False
+    external_terminal: str = "midpoint"
 
     _choices = {
         "model": ("switching", "pwm_averaging", "averaging"),
+        "external_terminal": ("midpoint", "lower_rail"),
     }
 
 
