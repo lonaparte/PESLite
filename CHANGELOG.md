@@ -2,6 +2,22 @@
 
 ## 0.4.0
 
+- Added independent shunt/series resistor loads on named Unit ports, assembly-time measurement
+  selection and shared RMS statistics/protection. Load-resistance steps and optional RMS windows
+  use the ordinary event, ADC, protection and native-export paths without a WPT-specific runtime.
+- Reduced optional RMS overhead by sharing ADC channel reads, caching reported values and
+  refreshing only integration endpoints after native bridge transitions. Sampling clocks,
+  integration rules and protection thresholds are unchanged. Continuous-mode RMS initialization
+  now synchronizes physical outputs before seeding the first integration interval.
+- Added SS and LCC-LCC WPT power-feedback examples using the existing converter graph, ADC window,
+  PI/filter/limit blocks and resonant modulation. Modulation-amplitude and phase feedback share one
+  law; optional measured power is averaged after multiplication, not after separate channel means.
+- Bound scalar power measurement to the actual external electrical terminal, enabled optional
+  inputs only for active control paths, and shared measurement adaptation across control entry
+  points. Phase control translates its signed command to a nonnegative limiting interval and back,
+  preserving the shared limiter and PI anti-windup without angle wrapping.
+- Aligned C++ reference changes with actual event actions and refreshed continuous measurement logs
+  after model synchronization, including open-loop controllers with non-loading measurement inputs.
 - Added an open `DCConverter` unit using the shared `UnitParams`, control graph, bridge simulation
   forms and solver infrastructure, with Buck, Boost and single-inductor Buck-Boost examples.
 - Added `HalfBridge` and `FullBridge` topologies and composed them with switching, PWM-period

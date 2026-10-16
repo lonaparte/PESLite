@@ -320,3 +320,115 @@ def test_wpt_restart_derives_both_child_clock_positions(tmp_path):
         )
 
 
+@pytest.mark.parametrize("case,side,loop", [
+    ("ss", "primary", "PowerControl"),
+    ("lcc", "secondary", "PhasePowerControl"),
+])
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
+def test_wpt_power_feedback_uses_only_local_ports_and_the_shared_graph(case, side, loop, mode):
+    tree = read_tree(EXAMPLES / f"wpt-{case}-example.pes")
+    for child in ("primary", "secondary"):
+        tree["units"]["charger"][child]["bridge"] = {"model": mode}
+    simulation = peslite.Simulation(_short(tree))
+    unit = simulation.units[f"charger.{side}"]
+    graph = unit.ctrl.graph
+
+    assert type(unit.ctrl) is GraphController
+    assert set(graph.nodes) == {loop, "ResonantModulation"}
+    assert graph.connections[f"{loop}.power"] == "meas.power"
+    assert unit._control_voltage_port == (unit.bridge, "u_c")
+    assert unit.windowed is (mode != "averaging")
+    result = simulation.run(out_dir=None)
+    assert result.summary["ph_verdict"] == "port-hamiltonian"
+    assert np.isfinite(simulation.system.model.get_initial_values()).all()
+
+
+def test_wpt_power_reference_rejects_voltage_signal_connections():
+    tree = read_tree(EXAMPLES / "wpt-ss-example.pes")
+    tree["units"]["charger"]["primary"]["ctrl"]["connections"][
+        "PowerControl.reference"
+    ] = "meas.voltage"
+    with pytest.raises(ConfigError, match="incompatible signal"):
+        peslite.System(from_dict(tree))
+
+
+@pytest.mark.parametrize("case,side,loop,command,targets", [
+    ("ss", "primary", "PowerControl", "modulation", (1200.0, 1800.0)),
+    ("lcc", "secondary", "PhasePowerControl", "phase", (-500.0, -800.0)),
+])
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
+def test_wpt_tracks_both_power_plateaus_without_remote_measurements(
+        case, side, loop, command, targets, mode, tmp_path):
+    params = peslite.load(EXAMPLES / f"wpt-{case}-example.pes").replace(**{
+        "units.charger.primary.bridge.model": mode,
+        "units.charger.secondary.bridge.model": mode,
+        "simulation.solver.dt": 250.0e-9,
+        "simulation.output.states": False,
+        "simulation.output.energy": False,
+        "simulation.output.record_every": 1,
+        "simulation.energy_check": "off",
+    })
+    result = peslite.Simulation(params).run(out_dir=tmp_path)
+    prefix = f"charger.{side}"
+    for begin, end, target in ((0.0024, 0.0028, targets[0]),
+                               (0.0054, 0.0058, targets[1])):
+        selected = (result.t >= begin - 1e-12) & (result.t <= end + 1e-12)
+        for name in ("power", f"{loop}.power"):
+            values = result.plant[f"{prefix}.{name}"][selected]
+            mean = np.sum(0.5 * (values[1:] + values[:-1])
+                          * np.diff(result.t[selected])) / (end - begin)
+            assert mean == pytest.approx(target, rel=0.005), (mode, name, target, mean)
+    limits = params.unit(prefix).ctrl.loops[loop]
+    commands = result.plant[f"{prefix}.{command}"]
+    finite = commands[np.isfinite(commands)]
+    assert np.min(finite) >= limits.minimum - 1e-12
+    assert np.max(finite) <= limits.maximum + 1e-12
+
+
+@pytest.mark.parametrize("mode", ["pwm_averaging", "averaging"])
+def test_wpt_power_feedback_restart_preserves_filter_pi_and_adc_window(mode, tmp_path):
+    params = peslite.load(EXAMPLES / "wpt-ss-example.pes").replace(**{
+        "units.charger.primary.bridge.model": mode,
+        "units.charger.secondary.bridge.model": mode,
+        "simulation.t_end": 80.0e-6,
+        "simulation.output.period": 0.5e-6,
+        "simulation.output.signals": False,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    })
+    whole_dir = tmp_path / "whole"
+    whole = peslite.Simulation(params).run(out_dir=whole_dir)
+    continued_params = peslite.load(
+        whole_dir / "simulation.pes", initial=whole_dir / "states.csv", initial_time=40.5e-6,
+    )
+    continued = peslite.Simulation(continued_params).run(out_dir=tmp_path / "continued")
+    start = int(np.argmin(abs(whole.t - continued.t[0])))
+    for name, values in continued.states.items():
+        np.testing.assert_allclose(
+            values, whole.states[name][start:], rtol=1e-10, atol=1e-10, err_msg=name,
+        )
+
+
+def test_power_measurement_is_optional_and_precedes_adc_channel_averaging():
+    from peslite.components.adc import ADC, MeasurementPorts
+
+    plain = peslite.System(from_dict(_tree())).units["charger.primary"]
+    assert set(plain.ports.readers) == {"current", "voltage", "vin"}
+    assert "meas.power" not in plain.ctrl.graph.interface.inputs
+
+    time = 0.0
+    ports = MeasurementPorts({
+        "voltage": lambda: 10.0 * np.cos(2.0 * np.pi * time),
+        "current": lambda: 2.0 * np.cos(2.0 * np.pi * time),
+        "power": lambda: 20.0 * np.cos(2.0 * np.pi * time) ** 2,
+    })
+    adc = ADC(ports, 1.0, 1.0, 1.0, {"voltage": 0.0, "current": 0.0, "power": 0.0})
+    adc.seed()
+    for time in np.linspace(0.001, 1.0, 1000):
+        adc.accumulate(0.001)
+    sample = adc.measure(1.0)
+    assert sample.values["voltage"] == pytest.approx(0.0, abs=1e-12)
+    assert sample.values["current"] == pytest.approx(0.0, abs=1e-12)
+    assert sample.values["power"] == pytest.approx(10.0)
+
+

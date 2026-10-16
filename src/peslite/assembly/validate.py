@@ -153,7 +153,7 @@ def _control(c, dclink, pwm, where: str, continuous: bool = False) -> None:
 
 def _measurement(m, T_c: Optional[float], where: str,
                  channels: frozenset[str]) -> None:
-    """Check ADC oversampling and averaging windows within one control period."""
+    """Validate source bindings, ADC timing and multi-period RMS windows."""
     if not isinstance(m.average, (list, tuple)):
         raise ConfigError(f"{where}.average: expected a list of channels, got {m.average!r}")
     unknown = set(m.average) - channels
@@ -162,6 +162,17 @@ def _measurement(m, T_c: Optional[float], where: str,
                           f"known: {sorted(channels)}")
     if len(set(m.average)) != len(m.average):
         raise ConfigError(f"{where}.average: channels must not be repeated")
+    for name in ("sources", "rms"):
+        values = getattr(m, name)
+        if not isinstance(values, dict) or set(values) - channels:
+            raise ConfigError(f"{where}.{name}: expected a mapping of known channels")
+    if any(not isinstance(value, str) or not value for value in m.sources.values()):
+        raise ConfigError(f"{where}.sources: expected physical output names")
+    for channel, window in m.rms.items():
+        if not isinstance(window, (int, float)) or not math.isfinite(window) or window <= 0:
+            raise ConfigError(f"{where}.rms.{channel}: expected a positive window in seconds")
+        if T_c is not None and not _whole(window / T_c):
+            raise ConfigError(f"{where}.rms.{channel}: window must contain whole sample periods")
     for key in ("period", "window"):
         value = getattr(m, key)
         if value is not None and (not math.isfinite(value) or value <= 0.0):
@@ -217,7 +228,7 @@ def _converter(u, base, where: str):
         spec.measurement_channels,
     )
     protection = u.protection
-    for name in ("overcurrent", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof"):
+    for name in ("overcurrent", "rms_current", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof"):
         criterion = getattr(protection, name)
         _switched(criterion, f"{where}.protection.{name}")
         if criterion.enable and name not in spec.protection_criteria:
@@ -230,6 +241,10 @@ def _converter(u, base, where: str):
     if not math.isfinite(protection.rocof.window) or protection.rocof.window <= 0:
         raise ConfigError(f"{where}.protection.rocof.window must be finite and positive, "
                           f"got {protection.rocof.window}")
+    if protection.rms_current.enable:
+        current = spec.current_channel
+        if current not in u.meas.rms:
+            raise ConfigError(f"{where}.protection.rms_current requires meas.rms.{current}")
     return topology, continuous
 
 
@@ -323,7 +338,7 @@ def _network(p: Params) -> None:
         name: unit for name, unit in _unit_items(p.units)
         if getattr(unit, "bus", None) is not None
     }
-    if (connected_units or p.branches or p.sources or p.elements) and not p.buses:
+    if (connected_units or p.branches or p.sources) and not p.buses:
         raise ConfigError("buses: a connected electrical network needs at least one bus")
     for name, bus in p.buses.items():
         if bus.c <= 0.0:
@@ -334,6 +349,16 @@ def _network(p: Params) -> None:
     def _bus_of(where: str, bus: str) -> None:
         if bus not in p.buses:
             raise ConfigError(f"{where}: unknown bus {bus!r}; known: {sorted(p.buses)}")
+
+    def _element_bus(where: str, bus: str) -> None:
+        if bus in p.buses:
+            return
+        for name, unit in _unit_items(p.units, leaves_only=False):
+            spec = unit_type(unit.type)
+            if bus == name or (bus.startswith(name + ".")
+                               and bus[len(name) + 1:] in (spec.children or spec.ports)):
+                return
+        _bus_of(where, bus)
     for name, br in p.branches.items():
         _bus_of(f"branches.{name}.bus1", br.bus1)
         _bus_of(f"branches.{name}.bus2", br.bus2)
@@ -363,7 +388,7 @@ def _network(p: Params) -> None:
             )
     for name, element in p.elements.items():
         for key, bus in element_buses(element).items():
-            _bus_of(f"elements.{name}.{key}", bus)
+            _element_bus(f"elements.{name}.{key}", bus)
         for key, value in vars(element).items():
             if isinstance(value, float) and not math.isfinite(value):
                 raise ConfigError(f"elements.{name}.{key} must be finite")
@@ -499,6 +524,16 @@ def validate(p: Params) -> Params:
         if check is None:
             raise ConfigError(f"units.{name}.type: {unit.type!r} has no validator")
         check(unit, p.base, f"units.{name}")
+    from .params import _unit_items
+    for name, unit in _unit_items(p.units):
+        if unit.bridge.model == "averaging" and unit.meas.rms:
+            period = p.simulation.output.period
+            if not math.isfinite(period) or period <= 0:
+                raise ConfigError("simulation.output.period must be finite and positive")
+            for channel, window in unit.meas.rms.items():
+                if not _whole(window / period):
+                    raise ConfigError(f"units.{name}.meas.rms.{channel}: window must contain "
+                                      "whole protection/output periods in continuous mode")
     _solver(p.simulation.solver)
     _events(p)
     _progress(p.simulation.progress)

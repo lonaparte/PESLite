@@ -26,12 +26,13 @@ class TripEvent:
 
 @dataclass(frozen=True, slots=True)
 class ProtectionSample:
-    """Controller-rate observations available to common converter protection."""
+    """Protection-rate observations available to common converter protection."""
 
     terminal_voltage_pu: float | None = None
     frequency_deviation: float | None = None
     dc_voltage_error_pu: float | None = None
     startup_complete: bool = True
+    rms_current_pu: float | None = None
 
 
 @dataclass(slots=True)
@@ -39,6 +40,7 @@ class ProtectionStats:
     """Protection observations; absent crossings and samples are ``None``."""
 
     overcurrent_first_t: Optional[float] = None
+    rms_current_first_t: Optional[float] = None
     undervoltage_first_t: Optional[float] = None
     overvoltage_first_t: Optional[float] = None
     frequency_first_t: Optional[float] = None
@@ -59,13 +61,15 @@ class Protection:
     gate, breaker and DC-source action.
     """
 
-    def __init__(self, cfg: Any, T: float, i_base: float) -> None:
+    def __init__(self, cfg: Any, T: float, i_base: float, *, rms_available: bool = False) -> None:
         self.cfg, self.T, self.i_base = cfg, float(T), float(i_base)
         self.trip: TripEvent | None = None
         self.fault = False
         self.stats = ProtectionStats()
         self._timers = {"hold_uv": HoldTimer(T), "hold_ov": HoldTimer(T),
                         "hold_freq": HoldTimer(T), "hold_vdc": HoldTimer(T)}
+        if rms_available:
+            self._timers["hold_rms"] = HoldTimer(T)
         self._configure(cfg)
 
     def _configure(self, cfg: Any) -> None:
@@ -78,6 +82,9 @@ class Protection:
             self._requested_rocof_window = cfg.rocof.window
         self.fast_enabled = bool(cfg.overcurrent.enable)
         self.needs_frequency = bool(cfg.frequency.enable or cfg.rocof.enable)
+        self.rms_enabled = bool(getattr(getattr(cfg, "rms_current", None), "enable", False))
+        if self.rms_enabled:
+            self._timers.setdefault("hold_rms", HoldTimer(self.T))
 
     def retune(self, cfg: Any) -> None:
         """Apply new settings without changing latches, timers or observations."""
@@ -161,6 +168,11 @@ class Protection:
                     self._raise("ROCOF")
         if self.tripped or not sample.startup_complete:
             return False
+        rms = sample.rms_current_pu
+        if self.rms_enabled and rms is not None and self._timed(
+                t, rms > cfg.rms_current.limit_pu,
+                "rms_current", "RMS_OVERCURRENT", "hold_rms"):
+            return self.latch(t, "rms_current", f"RMS current={rms:.4f} pu held {cfg.hold} s")
         vdc_error = sample.dc_voltage_error_pu
         if cfg.dc_voltage.enable and vdc_error is not None and self._timed(
                 t, abs(vdc_error) >= cfg.dc_voltage.limit_pu,
@@ -206,6 +218,6 @@ class Protection:
             "terminal_voltage_min_pu": stats.terminal_voltage_min_pu,
             "terminal_voltage_max_pu": stats.terminal_voltage_max_pu,
             **{f"{criterion}_first_t": getattr(stats, f"{criterion}_first_t")
-               for criterion in ("undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof")},
+               for criterion in ("rms_current", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof")},
             "alarms": list(stats.alarms),
         }

@@ -152,6 +152,18 @@ roles. A one-terminal element uses `bus` and returns one binding; a multi-termin
 voltage fan-out and signed current sum to direct model connections, so terminal metadata adds no
 work to the integration loop.
 
+Configured element buses may also name an assembled Unit default or named port. An optional
+`series_connections()` mapping `{downstream_bus: inlet_bus}` inserts an element after the original
+voltage driver; its ordinary `terminals()` still declares both electrical boundaries. This is a
+construction-time operation, not a new network solver. The built-in `Resistor(series=True)` is a
+stateless reference implementation.
+
+An optional `parameter_bindings()` mapping `{field: (subsystem, attribute)}` exposes retunable
+scalar parameters to C++ event lowering. Implement `retune()` using the same bindings so Python
+and native output/energy equations share one parameter definition. Structural changes, such as
+changing the element's series connection, remain assembly-time configuration. Mark structural
+parameter fields with dataclass metadata `{"runtime": False}` to reject their `set` events.
+
 Every entry returned by `signals()` follows the same output path. Complex values become three
 phase columns with `_a`, `_b` and `_c` suffixes, while scalar values retain their declared name;
 custom signal names do not require recorder-specific code.

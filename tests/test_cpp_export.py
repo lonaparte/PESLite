@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import numpy as np
 import yaml
 
 import peslite
@@ -17,6 +18,7 @@ from conftest import EXAMPLES
 from peslite.assembly.params import from_dict
 from peslite.components import Bag, Element, Terminal, register_element_type
 from peslite.solver.simulation import convert_main
+from test_measurement_network import load_case
 
 
 class _ConditionalState(Bag):
@@ -126,6 +128,113 @@ def _quick(mode: str):
         "simulation.output.period": 1e-3,
         "simulation.energy_check": "off",
     })
+
+
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
+@pytest.mark.parametrize("link", ["ss", "lcc"])
+def test_native_named_load_step_and_rms_match_python(mode, link, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    tree = load_case(mode, link=link)
+    tree["simulation"]["output"].update(states=True, signals=True, energy=True)
+    for side in ("primary", "secondary"):
+        rms = tree["units"]["charger"][side]["meas"]["rms"]
+        rms.update(voltage=rms["current"], power=rms["current"])
+    if link == "lcc":
+        tree["units"]["charger"]["secondary"]["meas"].update(
+            sources={"power": "load.power"}, average=["power"],
+        )
+    tree["events"] = {"step": {"type": "set", "t": 15e-6, "set": {"elements.load.r": 3.0}}}
+    _, native, python = _run_generated(from_dict(tree), tmp_path / "loaded", compiler)
+    for filename in ("states.csv", "plant.csv", "energy.csv"):
+        actual = np.genfromtxt(native / filename, delimiter=",", names=True)
+        expected = np.genfromtxt(python / filename, delimiter=",", names=True)
+        assert set(actual.dtype.names) == set(expected.dtype.names)
+        for column in expected.dtype.names:
+            np.testing.assert_allclose(actual[column], expected[column],
+                                       rtol=2e-6, atol=2e-6, equal_nan=True,
+                                       err_msg=f"{filename}:{column}")
+
+
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging", "mixed"])
+@pytest.mark.parametrize("side", ["primary", "secondary"])
+def test_native_rms_trip_matches_python_on_either_independent_side(mode, side, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    tree = load_case("pwm_averaging" if mode == "mixed" else mode)
+    if mode == "mixed":
+        tree["units"]["charger"]["primary"]["bridge"]["model"] = "averaging"
+    tree["simulation"]["output"].update(states=True, signals=True)
+    tree["units"]["charger"][side]["protection"] = {
+        "rms_current": {"enable": True, "limit_pu": 0.001},
+        "hold": 4.5e-6 if mode == "mixed" else 0.0,
+    }
+    _, native, python = _run_generated(from_dict(tree), tmp_path / "trip", compiler)
+    a, b = _summary(native), _summary(python)
+    for field in ("trip_cause", "trip_time", "tripped", "rms_current_first_t", "alarms"):
+        key = f"charger.{side}.{field}"
+        assert a[key] == b[key]
+
+
+def test_native_loaded_example_regulates_power_across_the_load_step(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "wpt-load-example.pes")
+    _, native, python = _run_generated(params, tmp_path / "load-example", compiler)
+    for output in (native, python):
+        with (output / "plant.csv").open(newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        for start, end in ((0.0025, 0.003), (0.0055, 0.006)):
+            powers = [float(row["load.power"]) for row in rows if start <= float(row["t"]) < end]
+            assert sum(powers) / len(powers) == pytest.approx(500.0, rel=0.02)
+        summary = _summary(output)
+        assert not summary["charger.primary.tripped"]
+        assert not summary["charger.secondary.tripped"]
+
+
+def test_native_power_measurement_can_select_another_named_port(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    tree = load_case("averaging", link="lcc")
+    tree["simulation"]["output"].update(states=True, signals=True)
+    tree["units"]["charger"]["secondary"]["meas"]["sources"] = {
+        "power": "charger.primary.dc.power",
+    }
+    _, native, python = _run_generated(from_dict(tree), tmp_path / "port", compiler)
+    a, b = _final_csv(native / "states.csv"), _final_csv(python / "states.csv")
+    np.testing.assert_allclose(list(a.values()), list(b.values()), rtol=2e-6, atol=2e-6)
+
+
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
+def test_native_vsc_uses_the_same_measurement_binding_and_rms(mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "gfl-example.pes").replace(**{
+        "units.vsc.bridge.model": mode,
+        "units.vsc.meas.sources": {"u_g": "grid.emf.e_g", "i_c": "vsc.branch_f.i"},
+        "units.vsc.meas.rms": {"i_c": 1e-3},
+        "units.vsc.protection.overcurrent.enable": False,
+        "units.vsc.protection.undervoltage.enable": False,
+        "units.vsc.protection.overvoltage.enable": False,
+        "events.connect_vsc.t": 0.0,
+        "events.connect_vsc.ramp": 0.0,
+        "simulation.t_end": 1.5e-3,
+        "simulation.solver.dt": 2e-6,
+        "simulation.solver.linearisations": 0,
+        "simulation.solver.subsystems": {},
+        "simulation.output.period": 0.1e-3,
+        "simulation.output.signals": True,
+    })
+    _, native, python = _run_generated(params, tmp_path / "vsc-rms", compiler)
+    for filename in ("states.csv", "plant.csv"):
+        a, b = _final_csv(native / filename), _final_csv(python / filename)
+        assert a.keys() == b.keys()
+        np.testing.assert_allclose(list(a.values()), list(b.values()), rtol=2e-6, atol=2e-6)
 
 
 def _quick_gfm(mode: str):
@@ -397,6 +506,98 @@ def test_generated_cpp_matches_composite_wpt_with_independent_clocks(mode, tmp_p
     assert _final_csv(cpp_out / "plant.csv").keys() == _final_csv(
         python_out / "plant.csv"
     ).keys()
+
+
+@pytest.mark.parametrize("case", ("ss", "lcc"))
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
+def test_generated_cpp_matches_wpt_power_feedback_and_reference_step(case, mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / f"wpt-{case}-example.pes").replace(**{
+        "units.charger.primary.bridge.model": mode,
+        "units.charger.secondary.bridge.model": mode,
+        "events.power_step.t": 40.0e-6,
+        "simulation.t_end": 80.0e-6,
+        "simulation.output.period": 1.0e-6,
+        "simulation.output.record_every": 1,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    })
+    _source, cpp_out, python_out = _run_generated(
+        params, tmp_path / f"wpt-power-{case}-{mode}", compiler,
+    )
+    for filename in ("states.csv", "plant.csv", "ctrl.charger.primary.csv",
+                     "ctrl.charger.secondary.csv"):
+        with (python_out / filename).open(newline="", encoding="utf-8") as stream:
+            expected = list(csv.DictReader(stream))
+        with (cpp_out / filename).open(newline="", encoding="utf-8") as stream:
+            actual = list(csv.DictReader(stream))
+        assert len(actual) == len(expected)
+        for left, right in zip(actual, expected):
+            assert left.keys() == right.keys()
+            for key in left:
+                assert bool(left[key]) == bool(right[key]), (filename, key)
+                if left[key]:
+                    actual_value, expected_value = float(left[key]), float(right[key])
+                    if np.isnan(expected_value):
+                        assert np.isnan(actual_value), (filename, key)
+                    else:
+                        assert actual_value == pytest.approx(
+                            expected_value, rel=2e-7, abs=2e-8,
+                        ), (filename, key)
+
+
+@pytest.mark.parametrize("case", ("buck", "boost", "buck-boost"))
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
+def test_generated_cpp_uses_electrical_port_power_in_scalar_feedback(case, mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / f"{case}-example.pes").replace(**{
+        "units.converter.bridge.model": mode,
+        "units.converter.meas.average": ["power"],
+        "units.converter.ctrl": {
+            "type": "resonant",
+            "references": {"modulation": 0.5, "frequency": 2000.0, "phase": 0.3,
+                           "power": -120.0 if case == "boost" else 120.0},
+            "loops": {
+                "ResonantModulation": {},
+                "PowerControl": {"kp": 0.001, "ki": 0.1, "minimum": 0.0, "maximum": 0.9},
+            },
+            "connections": {
+                "PowerControl.reference": "references.power",
+                "PowerControl.power": "meas.power",
+                "PowerControl.feedforward": "references.modulation",
+                "ResonantModulation.modulation": "PowerControl.modulation",
+            },
+        },
+        "simulation.t_end": 100.0e-6,
+        "simulation.solver.type": "fixed",
+        "simulation.solver.method": "rk4",
+        "simulation.solver.dt": 0.5e-6,
+        "simulation.solver.linearisations": 0,
+        "simulation.output.period": 5.0e-6,
+        "simulation.output.record_every": 1,
+        "simulation.output.states": True,
+        "simulation.output.signals": True,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    })
+    source, cpp_out, python_out = _run_generated(
+        params, tmp_path / f"port-power-{case}-{mode}", compiler,
+    )
+    for filename in ("states.csv", "plant.csv", "ctrl.converter.csv"):
+        actual = np.genfromtxt(cpp_out / filename, delimiter=",", names=True)
+        expected = np.genfromtxt(python_out / filename, delimiter=",", names=True)
+        assert actual.dtype.names == expected.dtype.names
+        for column in actual.dtype.names:
+            scale = max(1.0, float(np.nanmax(np.abs(expected[column]))))
+            np.testing.assert_allclose(actual[column], expected[column], rtol=2e-7,
+                                       atol=2e-8 * scale, err_msg=f"{filename}:{column}")
+    if mode == "averaging":
+        # One declaration and one snapshot assignment, with no RHS-time log write.
+        assert source.read_text(encoding="utf-8").count("u_converter_log_power =") == 2
 
 
 def test_generated_cpp_matches_composite_wpt_switching_events(tmp_path):

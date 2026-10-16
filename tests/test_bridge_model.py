@@ -115,7 +115,8 @@ def test_every_bundled_file_runs_with_every_completed_model(path, model, tmp_pat
         warnings.simplefilter("error")
         params = peslite.load(path, **{"simulation.solver.linearisations": 0})
         duration = min(0.004, params.simulation.t_end)
-        params = params.replace(**{"simulation.t_end": duration})
+        params = params.replace(**{"simulation.t_end": duration,
+                                   "simulation.output.states": True})
         params = _with_model(params, model)
     result = peslite.Simulation(params).run(out_dir=tmp_path / f"{path.stem}-{model}")
     assert np.isfinite(result.states["t"]).all()

@@ -29,8 +29,8 @@ __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "SRFPLL", "CurrentLoop", "DCVoltageControl", "SyncLawParams", "SyncLaw",
            "PSC", "Droop", "VSG", "DVOC",
            "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping",
-           "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO", "MODULATION", "HERTZ",
-           "InductorCurrentControl", "ResonantModulation"]
+           "SI_CURRENT", "SI_VOLTAGE", "SI_POWER", "DUTY_RATIO", "MODULATION", "HERTZ",
+           "InductorCurrentControl", "PowerControl", "PhasePowerControl", "ResonantModulation"]
 
 
 # ------------------------------------------------------------------ signals
@@ -96,6 +96,7 @@ class Loop:
     states and from attributes listed in ``carried``.
     ``cfg``: the loop's parameters; ``unit``: the unit's parameters; ``startup``: the controller's
     current run/ramp state.
+    ``log_outputs`` optionally names output ports to include in controller observations.
     """
 
     type: ClassVar[str]
@@ -107,6 +108,7 @@ class Loop:
     flow_inputs: ClassVar[tuple[str, ...] | None] = None
     state_names: tuple[str, ...] | Mapping[str, str] = ()
     carried: ClassVar[tuple[str, ...]] = ()
+    log_outputs: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self, cfg: Any, unit: Any, startup: Any) -> None:
         self.cfg, self.unit, self.startup = cfg, unit, startup
@@ -1150,6 +1152,7 @@ class ActiveDamping(Loop):
 
 SI_CURRENT = SignalType("A", "scalar")
 SI_VOLTAGE = SignalType("V", "scalar")
+SI_POWER = SignalType("W", "scalar")
 DUTY_RATIO = SignalType("1", "duty_ratio")
 MODULATION = SignalType("1", "modulation")
 HERTZ = SignalType("Hz")
@@ -1170,7 +1173,12 @@ class _LimitedScalarPI(Loop):
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
         self.pi = self.state_block("integral", PI(cfg.kp, cfg.ki, self.block_period))
-        self.limit = OutputLimit(cfg.maximum, lower=cfg.minimum, pi=self.pi)
+        lower, upper = self._limit_bounds(cfg)
+        self.limit = OutputLimit(upper, lower=lower, pi=self.pi)
+
+    @staticmethod
+    def _limit_bounds(cfg):
+        return cfg.minimum, cfg.maximum
 
     def constrain(self, requested):
         if self.block_period is None:
@@ -1204,13 +1212,88 @@ class InductorCurrentControl(_LimitedScalarPI):
         return self.constrain(requested), requested
 
 
+@dataclass(frozen=True, kw_only=True)
+class _PowerControlParams(_ScalarPIParams):
+    power_filter: PowerFilterParams = field(default_factory=PowerFilterParams)
+
+
+class _PowerFeedbackControl(_LimitedScalarPI):
+    """Local signed port power with the existing filter, PI and output constraint."""
+
+    flow_inputs = ("reference", "power", "feedforward")
+    log_outputs = ("power",)
+
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
+        self.power_filter = None
+        if cfg.power_filter.enable:
+            pole = 2.0 * math.pi * cfg.power_filter.bandwidth
+            self.power_filter = self.state_block(
+                "power", Filter((pole,), (1.0, pole), self.block_period)
+            )
+
+    def initial_outputs(self):
+        command, power = self.outputs
+        return {command: self.cfg.minimum, power: 0.0}
+
+    def equation(self, reference, power, feedforward):
+        if self.power_filter is not None:
+            power = self.power_filter(power)
+        requested = self.pi(self.startup.value * reference, power, feedforward)
+        return self.constrain(requested), power
+
+
+@register_loop_type
+class PowerControl(_PowerFeedbackControl):
+    """Signed power feedback in watts; output is modulation amplitude.
+
+    Positive power leaves the measured port. Under PWM, use the ADC's mean of instantaneous
+    voltage times current, not their separately averaged waveforms or a carrier-boundary product.
+    Gains are modulation/W and modulation/(W*s); feedforward is a modulation amplitude.
+    """
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params(_PowerControlParams):
+        type: str = "power_control"
+
+    type = "power_control"
+    inputs = {"reference": SI_POWER, "power": SI_POWER, "feedforward": MODULATION}
+    outputs = {"modulation": MODULATION, "power": SI_POWER}
+
+
+@register_loop_type
+class PhasePowerControl(_PowerFeedbackControl):
+    """The same local power-feedback law with a phase command in radians.
+
+    Gains are rad/W and rad/(W*s). Choose their sign and phase limits for a monotonic operating
+    branch of the connected circuit; phase-to-power polarity is not a converter-type property.
+    Only the constraint uses a translated coordinate: phase - minimum is bounded in
+    [0, maximum - minimum], then translated back. The shared limiter and PI tracking are unchanged.
+    """
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params(_PowerControlParams):
+        type: str = "phase_power_control"
+
+    type = "phase_power_control"
+    inputs = {"reference": SI_POWER, "power": SI_POWER, "feedforward": ANGLE}
+    outputs = {"phase": ANGLE, "power": SI_POWER}
+
+    @staticmethod
+    def _limit_bounds(cfg):
+        return 0.0, cfg.maximum - cfg.minimum
+
+    def constrain(self, requested):
+        minimum = self.cfg.minimum
+        return minimum + _LimitedScalarPI.constrain(self, requested - minimum)
+
+
 @register_loop_type
 class ResonantModulation(Loop):
-    """Temporary open-loop sinusoidal modulation for a resonant converter application.
+    """Sinusoidal modulation from amplitude, frequency and phase graph inputs.
 
-    It is an ordinary registered loop: the DC converter still uses the same control graph,
-    scheduling and bridge boundary as feedback-controlled applications. A later feedback loop can
-    replace this loop without changing the converter implementation.
+    References provide open-loop operation; feedback loops may drive amplitude or phase through
+    the same typed inputs without changing the converter or its modulation implementation.
     """
 
     @dataclass(frozen=True, kw_only=True)

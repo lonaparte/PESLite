@@ -65,6 +65,67 @@ def _case(*, model="pwm_averaging", bridge_type="half_bridge",
     })
 
 
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
+@pytest.mark.parametrize("case,voltage,current,expected", [
+    ("buck", 24.0, 5.0, 120.0),
+    ("boost", 24.0, 5.0, -120.0),
+    ("buck-boost", -48.0, 2.5, 120.0),
+])
+def test_scalar_power_uses_the_external_terminal_not_control_feedback(
+        mode, case, voltage, current, expected):
+    params = peslite.load(EXAMPLES / f"{case}-example.pes").replace(**{
+        "units.converter.bridge.model": mode,
+        "units.converter.meas.average": ["power"],
+    })
+    unit = peslite.System(params).units["converter"]
+    terminal, = (terminal for bus, terminal in unit.terminals() if bus == unit.cfg.bus)
+    assert unit._power_terminal is terminal
+    setattr(terminal.subsystem.inp, terminal.voltage, voltage)
+    setattr(terminal.subsystem.out, terminal.current, current)
+    # Keep the regulation feedback deliberately different from the measured power port.
+    unit.branch_f.out.i = 5.0
+    unit.bus.out.u = voltage
+    unit.dclink.out.u_dc = 48.0 if case == "boost" else 24.0
+    assert unit.ports.value("power") == pytest.approx(expected)
+    if case != "buck":
+        control_voltage = unit._port_value(unit._control_voltage_port)
+        assert unit.ports.value("power") != control_voltage * unit._current()
+
+
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
+def test_scalar_feedback_binds_the_same_terminal_power_for_sampled_and_continuous_modes(mode):
+    params = peslite.load(EXAMPLES / "boost-example.pes").replace(**{
+        "units.converter.bridge.model": mode,
+        "units.converter.ctrl": {
+            "type": "resonant",
+            "references": {"modulation": 0.5, "frequency": 100.0, "power": -120.0},
+            "loops": {
+                "ResonantModulation": {},
+                "PowerControl": {"kp": 0.001, "ki": 0.1, "minimum": 0.0, "maximum": 0.9},
+            },
+            "connections": {
+                "PowerControl.reference": "references.power",
+                "PowerControl.power": "meas.power",
+                "PowerControl.feedforward": "references.modulation",
+                "ResonantModulation.modulation": "PowerControl.modulation",
+            },
+        },
+    })
+    unit = peslite.System(params).units["converter"]
+    terminal = unit._power_terminal
+    terminal.subsystem.inp.u1 = 24.0
+    terminal.subsystem.out.i = 5.0
+    assert unit.control_inputs()["meas.power"] == -120.0
+    if mode == "averaging":
+        connections = unit.connections()
+        voltage_source, current_source = terminal.signal_sources()
+        assert connections[unit.ctrl, "power_voltage"] == voltage_source
+        assert connections[unit.ctrl, "power_current"] == current_source
+        unit.ctrl.inp.power_voltage = 24.0
+        unit.ctrl.inp.power_current = 5.0
+        assert unit.ctrl._flow_measurement().power == -120.0
+
+
 class _FixedDutyController:
     """Test-only source used to validate the power circuit independently of its control loops."""
 

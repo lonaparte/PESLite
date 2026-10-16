@@ -12,23 +12,24 @@ solver's kernel: the hardware adapts to its interface (:class:`Measurement`, :cl
 from ..solver import ConfigError
 from .blocks import Filter, Integrator, OutputLimit, PI, complex_power, unit_delay
 from .loops import (ANGLE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES, POWER, V, V_AB, V_DQ,
-                    DUTY_RATIO, HERTZ, MODULATION, SI_CURRENT, SI_VOLTAGE, DCVoltageControl,
-                    InductorCurrentControl, ResonantModulation,
+                    DUTY_RATIO, HERTZ, MODULATION, SI_CURRENT, SI_VOLTAGE, SI_POWER, DCVoltageControl,
+                    InductorCurrentControl, PowerControl, PhasePowerControl, ResonantModulation,
                     Loop, SignalType, SyncLaw, register_loop_type)
 from .modulation import ModulationLimiter, OutputStage
 from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, ControlMeasurement,
-                         BridgeControlOutput, ControlOutput, Controller, GraphController, Measurement,
+                         BridgeControlOutput, ControlOutput, Controller, ConverterMeasurement,
+                         GraphController, Measurement,
                          Startup, VSCController, default_wiring,
                          make_controller)
 
 __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter",
            "complex_power", "unit_delay", "SignalType", "ConfigError",
-           "SI_CURRENT", "SI_VOLTAGE", "DUTY_RATIO", "MODULATION", "HERTZ",
-           "DCVoltageControl", "InductorCurrentControl", "ResonantModulation",
+           "SI_CURRENT", "SI_VOLTAGE", "SI_POWER", "DUTY_RATIO", "MODULATION", "HERTZ",
+           "DCVoltageControl", "InductorCurrentControl", "PowerControl", "PhasePowerControl", "ResonantModulation",
            "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER",
            "LOOP_TYPES", "register_loop_type", "ControlInterface", "CONTROL_INTERFACE",
            "ControlGraph", "default_wiring",
            "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
-           "BridgeControlOutput", "Controller", "Startup", "VSCController", "GraphController",
+           "BridgeControlOutput", "ConverterMeasurement", "Controller", "Startup", "VSCController", "GraphController",
            "make_controller"]

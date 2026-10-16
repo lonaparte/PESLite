@@ -74,6 +74,7 @@ class ThreePhaseBridge:
     __slots__ = ()
     duty_names = ("d_a", "d_b", "d_c")
     zero = 0j
+    power_scale = 1.5
     neutral_duty = 0.5
     reverse_port = False
     unilateral = False
@@ -170,6 +171,12 @@ class _BridgeModel:
         else:
             self.inp = _BridgeInp(q=zero, u_dc=0.0, i_c=zero)
             self.out = _BridgeOut(u_c=zero, i_dc=0.0)
+        self.ports = (
+            PowerPort("inp.u_dc", "out.i_dc"),
+            PowerPort("out.u_c", "inp.i_c", self.topology.power_scale, -1.0),
+        )
+        if isinstance(self.topology, HalfBridge):
+            self.ports += (PowerPort("inp.u_lower", "out.i_lower"),)
         self.dc_terminal = Terminal(self, "u_dc", "i_dc", 1)
         self.power_terminal = Terminal(self, "u_c", "i_c", -1, drives_voltage=True)
         self.lower_terminal = (
@@ -414,6 +421,7 @@ class HalfBridge:
     type = "half_bridge"
     duty_names = ("d",)
     zero = 0.0
+    power_scale = 1.0
     neutral_duty = 0.0
     config_fields = frozenset((
         "upper_controlled", "lower_controlled", "reverse_port", "external_terminal",
@@ -641,6 +649,7 @@ class FullBridge:
     type = "full_bridge"
     duty_names = ("d_left", "d_right")
     zero = 0.0
+    power_scale = 1.0
     neutral_duty = 0.5
     config_fields = frozenset()
     set_dc_current = staticmethod(_set_scalar_dc_current)

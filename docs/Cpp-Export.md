@@ -152,6 +152,14 @@ Composite WPT configurations are expanded before export exactly as they are for 
 Their primary and secondary remain ordinary `DCConverter` units with independent clocks, while the
 shared compensated link is lowered through its fixed scalar state equations.
 
+Named measurement bindings, independent series/shunt resistors and configured RMS windows use
+the same assembly as Python. `set` events may change an element scalar declared by its
+`parameter_bindings()` contract; the built-in resistor declares `r`. The generated parameter is
+shared by output and energy equations, and a load step does not recreate electrical/controller
+state. This event support does not make the field a command-line `--set` variable: the retained
+variable list above remains authoritative. RMS protection uses the common trip path, not a WPT
+phase override.
+
 ## Current limitations
 
 - Supported solvers are fixed `euler`, `heun` and `rk4`, plus adaptive `DP45`.

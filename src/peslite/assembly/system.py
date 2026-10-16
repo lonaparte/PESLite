@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
 from ..components.network import ELEMENT_TYPES, RCNode, RLBranch, Terminal, ThreePhaseSource
+from ..components.adc import _PortMeasurement
 from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather
@@ -53,6 +54,7 @@ class _UnitPort:
     bus: str
     owner: str
     domain: str
+    phases: int = 1
 
 
 @dataclass
@@ -66,6 +68,7 @@ class _UnitAssembly:
     ports: dict[str, _UnitPort] = field(default_factory=dict)
     default_port: Optional[str] = None
     port_bindings: dict[str, tuple[_UnitPort, ...]] = field(default_factory=dict)
+    endpoints: dict[str, _UnitPort] = field(default_factory=dict)
 
     def port(self, name: Optional[str] = None) -> _UnitPort:
         """Return a named port, or this Unit's explicitly selected default port."""
@@ -95,6 +98,7 @@ class _UnitAssembly:
         self.subsystems.update(other.subsystems)
         self.signal_sources += other.signal_sources
         self.terminals += other.terminals
+        _merge_unique(self.endpoints, other.endpoints, "unit endpoint")
         for target, ports in other.port_bindings.items():
             existing = self.port_bindings.setdefault(target, ())
             self.port_bindings[target] = existing + tuple(
@@ -200,7 +204,7 @@ def _assemble_vsc(name: str, cfg: Any, system: "System",
     )
     ports = {
         "dc": _UnitPort(unit.dc_bus, name, "dc"),
-        "power": _UnitPort(cfg.bus, name, "ac"),
+        "power": _UnitPort(cfg.bus, name, "ac", phases=3),
     }
     return _UnitAssembly(
         units={name: unit},
@@ -285,6 +289,9 @@ def _assemble_unit(name: str, cfg: Any, system: "System",
         assembly.port()
     except ConfigError as exc:
         raise ConfigError(f"units.{name}: {exc}") from None
+    assembly.endpoints[name] = assembly.port()
+    assembly.endpoints.update({f"{name}.{port}": value
+                               for port, value in assembly.ports.items()})
     return assembly
 
 
@@ -334,8 +341,13 @@ class System:
         bus_terminals: dict[str, list[Terminal]] = {
             name: [node.terminal] for name, node in self.buses.items()
         }
-        self.named_elements = {name: ELEMENT_TYPES[cfg.type](name, cfg, self.buses, p)
+        network_buses = {**assembled.endpoints, **self.buses}
+        self.named_elements = {name: ELEMENT_TYPES[cfg.type](name, cfg, network_buses, p)
                                for name, cfg in p.elements.items()}
+
+        def resolve_bus(name: str) -> str:
+            port = assembled.endpoints.get(name) if name not in self.buses else None
+            return port.bus if port is not None else name
         branch_assemblies = tuple(_BranchAssembly(name, p.branches[name], branch)
                                   for name, branch in self.branches.items())
         elements = (*branch_assemblies, *self.sources.values(), *self.units.values(),
@@ -347,13 +359,20 @@ class System:
         # Every electrical connection uses the same named-terminal contract. Assembly fans one
         # driving voltage out to the followers and sums their signed currents into the driver.
         for element in elements:
+            for bus, inlet in getattr(element, "series_connections", lambda: {})().items():
+                terminals = bus_terminals.setdefault(resolve_bus(bus), [])
+                drivers = [terminal for terminal in terminals if terminal.drives_voltage]
+                if len(drivers) != 1:
+                    raise ConfigError(f"series inlet {bus!r} needs one existing voltage driver")
+                terminals.remove(drivers[0])
+                bus_terminals.setdefault(resolve_bus(inlet), []).append(drivers[0])
             for bus_name, terminal in element.terminals():
                 if not isinstance(terminal, Terminal):
                     raise TypeError(
                         f"{type(element).__name__}.terminals() returned "
                         f"{type(terminal).__name__}, not Terminal"
                     )
-                bus_terminals.setdefault(bus_name, []).append(terminal)
+                bus_terminals.setdefault(resolve_bus(bus_name), []).append(terminal)
         lowered_buses: dict[str, dict] = {}
         terminal_targets = set(connections)
         for bus_name, terminals in bus_terminals.items():
@@ -381,6 +400,7 @@ class System:
                 voltage_connections[target] = (
                     driver.subsystem, driver.voltage
                 )
+                terminal.bind_voltage_source(voltage_connections[target])
                 terminal_targets.add(target)
             current_target = (driver.subsystem, driver.current)
             if current_target in terminal_targets:
@@ -433,6 +453,45 @@ class System:
                     f"hold: {_names(overlap)}"
                 )
             _merge_unique(zoh, own_zoh, "zero-order-hold connection target")
+        # Resolve physical measurement outputs once, before Model schedules its dependencies.
+        port_measurements = {}
+        for unit in self.units.values():
+            for channel, source in unit.cfg.meas.sources.items():
+                owner, _, output = source.rpartition(".")
+                subsystem = subsystems.get(owner)
+                if subsystem is None and owner in network_buses and output in (
+                        "voltage", "current", "power"):
+                    bus = resolve_bus(owner)
+                    if bus not in port_measurements:
+                        terminal, = (item for item in bus_terminals[bus] if item.drives_voltage)
+                        observer = _PortMeasurement(terminal)
+                        voltage, current = terminal.signal_sources()
+                        # Preserve the domain in record metadata before Model packs the graph.
+                        observer.inp.voltage = getattr(terminal.subsystem.out, terminal.voltage)
+                        observer.inp.current = getattr(terminal.subsystem.inp, terminal.current)
+                        observer.out.voltage = observer.inp.voltage
+                        observer.out.current = observer.inp.current
+                        _merge_unique(subsystems, {f"measurements.{owner}": observer},
+                                      "subsystem name")
+                        connections[(observer, "voltage")] = voltage
+                        connections[(observer, "current")] = current
+                        port_measurements[bus] = observer
+                    subsystem = port_measurements[bus]
+                if subsystem is None or not hasattr(subsystem.out, output):
+                    raise ConfigError(f"units.{unit.name}.meas.sources.{channel}: "
+                                      f"unknown physical output {source!r}")
+                if (isinstance(getattr(subsystem.out, output), complex)
+                        and not isinstance(unit.ports.value(channel), complex)):
+                    raise ConfigError(f"units.{unit.name}.meas.sources.{channel}: "
+                                      "a complex output cannot drive a scalar channel")
+                unit.ports.readers[channel] = (
+                    lambda sub=subsystem, field=output: getattr(sub.out, field)
+                )
+                if unit.continuous:
+                    if not hasattr(unit.ctrl.inp, channel):
+                        raise ConfigError(f"units.{unit.name}.meas.sources.{channel}: "
+                                          "controller has no matching continuous input")
+                    connections[(unit.ctrl, channel)] = (subsystem, output)
         self.model = Model(subsystems, connections, zoh)
 
         self.state_aliases: dict[str, str] = {}
@@ -608,6 +667,9 @@ class System:
         for element in (*self.sources.values(), *self.units.values(),
                         *self.composite_signal_sources, *self.named_elements.values()):
             add(element, element.signals() if hasattr(element, "signals") else {})
+        for unit in self.units.values():
+            if unit.cfg.meas.rms:
+                add(unit, unit.measurement_signals())
         for name, branch in self.branches.items():
             add(branch, {f"{name}.i": branch.out.i})
         for name, node in self.buses.items():

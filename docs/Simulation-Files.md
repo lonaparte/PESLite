@@ -45,6 +45,13 @@ non-composite converter unit. The selected `unit.type` contributes its own elect
 `vsc` adds `ac_filter`, while `dc_converter` adds `filter`. The common ADC and protection lifecycle
 are shared by both converter families.
 
+`meas.sources` optionally maps existing channel names to physical subsystem outputs or named
+port quantities. `meas.rms` maps channels to sliding RMS windows in seconds. Both use the same
+measurement path for VSC and DCConverter; no WPT-specific channel schema is required. Configured
+RMS overcurrent criteria use `protection.rms_current` and the existing `hold` and trip latch.
+For wiring, window semantics and an independent load example, see
+[Independent loads and measurement selection](Examples.md#independent-loads-and-measurement-selection).
+
 ## Converter section
 
 A unit names its terminal bus and groups its physical and control configuration:
@@ -92,10 +99,12 @@ is an ordinary independently clocked `DCConverter`. Each bridge and its matching
 attach through the child's own assembly boundary. The WPT exposes `primary` and `secondary` Unit
 ports and explicitly selects `primary` as its default port. Composite event parameters and shared
 subsystem ratings therefore inherit the primary port unless another port is selected. The bundled
-example selects a full bridge and the
-temporary open-loop resonant-modulation loop for each child; neither choice creates a separate
-converter class. `link.type` selects series-series (`ss`) or LCC-LCC (`lcc`) compensation. The
-complete runnable schema is shown in `examples/wpt-example.pes`.
+open-loop example selects a full bridge and `ResonantModulation` for each child; neither choice
+creates a separate converter class. `link.type` selects series-series (`ss`) or LCC-LCC (`lcc`)
+compensation. `wpt-ss-example` and `wpt-lcc-example` connect ordinary power-feedback loops to the
+same modulation inputs. The `resonant` profile's `references.power` is signed watts; `modulation`,
+`frequency` and `phase` remain amplitude, hertz and radians. The complete runnable schemas are
+shown in [Examples](Examples.md#wpt-power-feedback).
 
 ```yaml
 units:

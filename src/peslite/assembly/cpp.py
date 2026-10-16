@@ -25,6 +25,7 @@ from ..components.pwm import CarrierComparison, SynchronousCarrier, ZOH
 from ..control.blocks import OutputLimit
 from ..control.controller import GraphController, VSCController
 from ..control.loops import DCVoltageControl, DVOC, SyncLaw, VSG
+from ..solver.energy import re_product
 from .conduction import DiodeConduction
 from .params import _unit_items, _unit_leaves, _written_out, dumps
 from .exporter import ExportResult, _exporter
@@ -383,6 +384,19 @@ class _ModelGenerator:
             for state, name, index, is_complex in self.model._state_ops
         }
         self.zoh_fields: dict[tuple[int, str], str] = {}
+        self.element_parameters: dict[str, tuple[str, Any, str]] = {}
+        self._parameter_attributes: dict[int, dict[str, _Expression]] = {}
+        changed_paths = {path for change in self.p.changes for path in change.paths}
+        for name, element in self.system.named_elements.items():
+            for field, (subsystem, attribute) in getattr(
+                    element, "parameter_bindings", lambda: {})().items():
+                path = f"elements.{name}.{field}"
+                if path in changed_paths:
+                    member = "element_" + _identifier(name + "_" + field)
+                    self.element_parameters[path] = (member, subsystem, attribute)
+                    self._parameter_attributes.setdefault(id(subsystem), {})[attribute] = (
+                        _Expression(member, "real")
+                    )
         for label, targets in self.model._zoh_targets.items():
             member = f"hold_{_identifier(label)}"
             for record, field in targets:
@@ -526,7 +540,8 @@ class _ModelGenerator:
                     "complex" if kind == "Complex" else "bool" if kind == "bool" else "real",
                 ))
             setattr(clone, role, record)
-        for name, value in (attributes or {}).items():
+        for name, value in {**self._parameter_attributes.get(id(owner), {}),
+                            **(attributes or {})}.items():
             setattr(clone, name, value)
         return clone
 
@@ -904,6 +919,8 @@ class _ModelGenerator:
 
     def members(self) -> list[str]:
         lines = []
+        for member, subsystem, attribute in self.element_parameters.values():
+            lines.append(f"double {member} = {_number(getattr(subsystem, attribute))};")
         for label, targets in self.model._zoh_targets.items():
             record, field = targets[0]
             value = getattr(record, field)
@@ -935,7 +952,7 @@ class _ModelGenerator:
             lines.extend(generator.members())
         return lines
 
-    def observations(self) -> tuple[list[str], list[str]]:
+    def observations(self, generators: dict) -> tuple[list[str], list[str]]:
         """Members and assignments for values consumed by scheduling and public output."""
         members: list[str] = []
         assigns: list[str] = []
@@ -977,12 +994,16 @@ class _ModelGenerator:
                         "bool" if value.kind == "bool" else "double"
                     )
                     add(f"{name}.ctrl.{port}", value.code, kind)
-                if not unit.continuous:
-                    for channel, value in self.unit_measurements(unit).items():
-                        kind = "Complex" if value.kind == "complex" else (
-                            "bool" if value.kind == "bool" else "double"
-                        )
-                        add(f"{name}.adc.{channel}", value.code, kind)
+            if not unit.continuous or unit.adc is not None or unit.cfg.meas.sources:
+                for channel, value in self.unit_measurements(unit).items():
+                    kind = "Complex" if value.kind == "complex" else (
+                        "bool" if value.kind == "bool" else "double"
+                    )
+                    add(f"{name}.adc.{channel}", value.code, kind)
+            if unit.adc is not None and unit.adc.rms:
+                generator = generators[name]
+                for channel in unit.adc.rms:
+                    add(f"{name}.meas.{channel}_rms", generator._rms_value(channel), "double")
         for name, element in self.system.named_elements.items():
             signals = getattr(element, "signals", None)
             if signals is not None:
@@ -1024,6 +1045,12 @@ class _ControlGenerator:
         self.cfg, self.ctrl = unit.cfg, unit.ctrl
         self.graph = self.ctrl.graph
         self.prefix = f"{prefix}_{self.tag}_"
+        reference_prefix = f"units.{name}.ctrl.references."
+        self._changing_references = {
+            path[len(reference_prefix):]
+            for change in self.p.changes for path in change.paths
+            if path.startswith(reference_prefix)
+        }
 
     @property
     def p(self):
@@ -1105,16 +1132,27 @@ class _ControlGenerator:
         return _number(value)
 
     def _reference(self, name: str) -> str:
-        values = [(self.p.simulation.initial.t, getattr(self.cfg.ctrl.references, name))]
-        for change in self.p.changes:
-            current = getattr(change.params.unit(self.name).ctrl.references, name)
-            if current != values[-1][1]:
-                values.append((change.t, current))
+        if name in self._changing_references:
+            return self.m("reference_" + name)
         path = f"units.{self.name}.ctrl.references.{name}"
-        expression = self.model.runtime.value(path, values[0][1])
-        for at, value in values[1:]:
-            expression = f"(t >= {_number(at)} ? {self._literal(value)} : {expression})"
-        return expression
+        return self.model.runtime.value(path, getattr(self.cfg.ctrl.references, name))
+
+    def reference_members(self) -> list[str]:
+        """Only event-modified references need storage, updated at the actual event boundary.
+
+        Time expressions would change an RK endpoint before the event is applied and can miss a
+        coincident sampled interrupt through rounding. Unchanged references remain constants.
+        """
+        return [
+            f"double {self.m('reference_' + name)} = "
+            f"{self.model.runtime.value(f'units.{self.name}.ctrl.references.{name}', value)};"
+            for name, value in self.graph.references.items()
+            if name in self._changing_references
+        ]
+
+    def log_observation_lines(self) -> list[str]:
+        """Optional log refresh after every model output has been synchronized."""
+        return []
 
     def input(self, loop: str, port: str) -> str:
         return self.source(self.graph.connections[f"{loop}.{port}"])
@@ -1323,7 +1361,7 @@ class _ControlGenerator:
         return []
 
     def _adc_reading(self, channel: str) -> str:
-        raise NotImplementedError
+        return f"obs_{_identifier(self.name + '.adc.' + channel)}"
 
     def _adc_value(self, channel: str) -> str:
         adc = self.unit.adc
@@ -1334,7 +1372,7 @@ class _ControlGenerator:
 
     def _adc_members(self) -> list[str]:
         adc = self.unit.adc
-        if adc is None or (not adc.averaging and adc.samples == 1):
+        if adc is None or (not adc.accumulating and adc.samples == 1):
             return []
         lines = [f"long long {self.m('adc_n_samp')} = {int(adc.n_samp)};",
                  f"bool {self.m('adc_window_open')} = "
@@ -1347,42 +1385,85 @@ class _ControlGenerator:
                 f"{kind} {self.m('adc_last_' + channel)} = "
                 f"{self._literal(adc._last[channel])};",
             ]
+        for channel, window in adc.rms.items():
+            member = self.m("adc_rms_" + channel)
+            buf = ", ".join(_number(value) for value in window.window.buf)
+            lines.append(f"RMSWindow<{window.window.n}> {member}{{"
+                         f"{{{{{buf}}}, {window.window.idx}, {window.count}}}, "
+                         f"{_number(window.area)}, {_number(window.duration)}, "
+                         f"{_number(window.last)}, {_number(window.total)}}};")
         return lines
+
+    def _rms_state(self, local: str) -> str:
+        channel, _, field = local.removeprefix("rms_").partition(".")
+        member = self.m("adc_rms_" + channel)
+        if field.startswith("sample_"):
+            return f"{member}.window.buf[{int(field[7:])}]"
+        if field in ("index", "count"):
+            return f"{member}.window.{field}"
+        return f"{member}.{field}"
+
+    def _rms_value(self, channel: str) -> str:
+        return f"{self.m('adc_rms_' + channel)}.value()"
+
+    def _rms_square(self, channel: str, *, direct: bool = False) -> str:
+        reading = self.model.unit_measurements(self.unit)[channel]
+        value = reading if direct else _Expression(self._adc_reading(channel), reading.kind)
+        return self.model._trace(lambda: re_product(value, value)).code
+
+    def adc_seed_lines(self) -> list[str]:
+        adc = self.unit.adc
+        if adc is None or not adc.accumulating:
+            return []
+        readings = self.model.unit_measurements(self.unit)
+        return [
+            *(f"{self.m('adc_last_' + channel)} = {readings[channel].code};"
+              for channel in adc.channels),
+            *(f"{self.m('adc_rms_' + channel)}.last = "
+              f"{self._rms_square(channel, direct=True)};" for channel in adc.rms),
+        ]
+
+    def _rms_sample_lines(self) -> list[str]:
+        adc = self.unit.adc
+        if adc is None or not adc.rms:
+            return []
+        lines = [f"{self.m('adc_rms_' + channel)}.sample({_number(adc.period)});"
+                 for channel in adc.rms]
+        if self.unit.continuous:
+            period = _number(adc.period)
+            return [f"const bool rms_fresh = std::abs(t - std::round(t / {period}) * {period}) < time_eps;",
+                    "if (rms_fresh) {",
+                    *["    " + line for line in lines], "}"]
+        return lines
+
+    def _rms_protection_argument(self) -> str:
+        adc = self.unit.adc
+        return ", rms_fresh" if self.unit.continuous and adc is not None and adc.rms else ""
 
     def adc_methods(self) -> str:
         adc = self.unit.adc
-        if adc is None or (not adc.averaging and adc.samples == 1):
+        if adc is None or not adc.accumulating:
             return ""
-        methods: list[str] = []
-        if adc.averaging:
-            accumulate = [
-                f"void adc_accumulate_{self.tag}(double dt) {{",
-                "    if (dt <= 0.0) return;",
+        lines = [f"void adc_accumulate_{self.tag}(double dt) {{",
+                 "    if (dt <= 0.0) return;"]
+        for channel in adc.channels:
+            reading = self._adc_reading(channel)
+            lines += [
+                f"    const auto now_{channel} = {reading};",
+                f"    if ({self.m('adc_window_open')}) "
+                f"{self.m('adc_acc_' + channel)} += 0.5 * dt * "
+                f"({self.m('adc_last_' + channel)} + now_{channel});",
+                f"    {self.m('adc_last_' + channel)} = now_{channel};",
             ]
-            seed = [f"void adc_seed_{self.tag}() {{"]
-            for channel in adc.channels:
-                reading = self._adc_reading(channel)
-                accumulate += [
-                    f"    const auto now_{channel} = {reading};",
-                    f"    if ({self.m('adc_window_open')}) "
-                    f"{self.m('adc_acc_' + channel)} += 0.5 * dt * "
-                    f"({self.m('adc_last_' + channel)} + now_{channel});",
-                    f"    {self.m('adc_last_' + channel)} = now_{channel};",
-                ]
-                seed.append(f"    {self.m('adc_last_' + channel)} = {reading};")
-            accumulate.append("}")
-            seed.append("}")
-            methods += ["\n".join(accumulate), "\n".join(seed)]
-        return "\n\n".join(methods)
+        for channel in adc.rms:
+            member = self.m("adc_rms_" + channel)
+            lines.append(f"    {member}.accumulate(dt, {self._rms_square(channel)});")
+        return "\n".join([*lines, "}"])
 
     def adc_accumulate_call(self, duration: str) -> str:
         adc = self.unit.adc
         return (f"adc_accumulate_{self.tag}({duration});"
-                if adc is not None and adc.averaging else "")
-
-    def adc_seed_call(self) -> str:
-        adc = self.unit.adc
-        return (f"adc_seed_{self.tag}();" if adc is not None and adc.averaging else "")
+                if adc is not None and adc.accumulating else "")
 
     def _adc_next_values(self) -> list[str]:
         adc = self.unit.adc
@@ -1672,6 +1753,7 @@ class _ProtectionGenerator:
         return [
             f"bool {self.m('sampled_trip_due')} = false;",
             f"double {self.m('overcurrent_first_t')} = {observed(stats.overcurrent_first_t)};",
+            f"double {self.m('rms_current_first_t')} = {observed(stats.rms_current_first_t)};",
             f"double {self.m('undervoltage_first_t')} = {observed(stats.undervoltage_first_t)};",
             f"double {self.m('overvoltage_first_t')} = {observed(stats.overvoltage_first_t)};",
             f"double {self.m('frequency_first_t')} = {observed(stats.frequency_first_t)};",
@@ -1682,9 +1764,7 @@ class _ProtectionGenerator:
             f"{observed(stats.terminal_voltage_min_pu)};",
             f"double {self.m('terminal_voltage_max')} = "
             f"{observed(stats.terminal_voltage_max_pu)};",
-            f"std::array<double, {window}> {self.m('rocof_buffer')}{{}};",
-            f"std::size_t {self.m('rocof_index')} = 0;",
-            f"bool {self.m('rocof_full')} = false;",
+            f"MovingWindow<{window}> {self.m('rocof_window')};",
             f"std::vector<std::string> {self.m('alarms')}"
             "{" + ", ".join(_cpp_string(value) for value in stats.alarms) + "};",
         ]
@@ -1741,16 +1821,13 @@ class _ProtectionGenerator:
 
         sampled: list[str] = [
             f"bool sampled_protect_{self.tag}(double t, double terminal_voltage, "
-            "double freq_dev, double vdc_error, bool startup_complete) {",
+            "double freq_dev, double vdc_error, bool startup_complete, bool rms_fresh = true) {",
         ]
         if has_frequency:
             sampled += [
                 f"    if (!{self.m('tripped')}) {{",
-                f"        const bool had_old = {self.m('rocof_full')};",
-                f"        const double old = {self.m('rocof_buffer')}[{self.m('rocof_index')}];",
-                f"        {self.m('rocof_buffer')}[{self.m('rocof_index')}] = freq_dev;",
-                f"        {self.m('rocof_index')} = ({self.m('rocof_index')} + 1) % {window};",
-                f"        if ({self.m('rocof_index')} == 0) {self.m('rocof_full')} = true;",
+                f"        const bool had_old = {self.m('rocof_window')}.count == {window};",
+                f"        const double old = {self.m('rocof_window')}.push(freq_dev);",
                 "        if (had_old) {",
                 f"            const double rocof = (freq_dev - old) / {_number(window * period)};",
                 f"            {self.m('rocof_max')} = std::max({self.m('rocof_max')}, std::abs(rocof));",
@@ -1762,6 +1839,17 @@ class _ProtectionGenerator:
                 "    }",
             ]
         sampled.append(f"    if ({self.m('tripped')} || !startup_complete) return false;")
+        if cfg.rms_current.enable:
+            channel = unit_type(self.cfg.type).current_channel
+            rms = f"({self._rms_value(channel)} / {_number(self.unit.protection.i_base)})"
+            criterion = timed(
+                cfg.rms_current,
+                f"std::isfinite({rms}) && {rms} > {limit(cfg.rms_current, 'limit_pu')}",
+                "rms_current", "RMS_OVERCURRENT", "hold_rms", "rms_current")
+            if self.unit.continuous:
+                criterion = ["if (rms_fresh) {",
+                             *["    " + line for line in criterion], "}"]
+            sampled += ["    " + line for line in criterion]
         sampled += ["    " + line for line in timed(
             cfg.dc_voltage,
             f"std::abs(vdc_error) >= {limit(cfg.dc_voltage, 'limit_pu')}",
@@ -1828,7 +1916,8 @@ class _ProtectionGenerator:
             f"    alarm_{self.tag}(std::string(\"TRIP_\") + std::string("
             "cause == \"voltage_uv\" ? \"VOLTAGE_UV\" : "
             "cause == \"voltage_ov\" ? \"VOLTAGE_OV\" : "
-            "cause == \"vdc\" ? \"VDC\" : cause == \"freq\" ? \"FREQ\" : \"OVERCURRENT\"));",
+            "cause == \"vdc\" ? \"VDC\" : cause == \"freq\" ? \"FREQ\" : "
+            "cause == \"rms_current\" ? \"RMS_CURRENT\" : \"OVERCURRENT\"));",
             "    return true;",
             "}",
         ]
@@ -1843,7 +1932,7 @@ class _ProtectionGenerator:
             f'{stream} << ",\\n  \\"{self.name}.max_current_pu\\": " << {self.m("max_current")};',
             f'{stream} << ",\\n  \\"{self.name}.rocof_max\\": " << {self.m("rocof_max")};',
         ]
-        for key in ("overcurrent", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof"):
+        for key in ("overcurrent", "rms_current", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof"):
             value = self.m(key + "_first_t")
             lines.append(
                 f'{stream} << ",\\n  \\"{self.name}.{key}_first_t\\": "; '
@@ -1990,6 +2079,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
                     f"{_number(node.first_limit_t if node.first_limit_t is not None else math.nan)};",
                     f"bool {self.m(loop_name + '_limit_active')} = false;",
                 ]
+        lines += self._adc_members()
         return lines
 
     def limit_observation(self) -> list[str]:
@@ -2102,7 +2192,10 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
     def sense_method(self) -> str:
         observed = f"obs_{_identifier(self.name + '.u_g')}"
         dc = f"obs_{_identifier(self.name + '.u_dc')}"
+        if self.cfg.meas.sources:
+            observed, dc = self._adc_reading("u_g"), self._adc_reading("u_dc")
         lines = [f"void sense_{self.tag}(double t) {{",
+                 *["    " + line for line in self._rms_sample_lines()],
                  f"    if ({self.m('track_due')}) {{"]
         for loop_name, node in self.graph.nodes.items():
             if not isinstance(node, SyncLaw):
@@ -2129,7 +2222,8 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
                   f"        ({self.m('omega')} - {_number(self.cfg.base.w0)}) / (2.0 * pi),",
                   f"        {dc} / {_number(self.cfg.dc_base.v)} - {self._reference('vdc_ref_pu')},",
                   f"        {self.m('startup_run')} && ({self.m('startup_ramp')} <= 0.0 || "
-                  f"t - {self.m('startup_start')} >= {self.m('startup_ramp')} - time_eps));",
+                  f"t - {self.m('startup_start')} >= {self.m('startup_ramp')} - time_eps)"
+                  f"{self._rms_protection_argument()});",
                   "}"]
         return "\n".join(lines)
 
@@ -2156,9 +2250,6 @@ class _UnitGenerator(_ACControlGenerator):
         if path.startswith("references."):
             return self._reference(path[11:])
         return self.g(path)
-
-    def _adc_reading(self, channel: str) -> str:
-        return f"obs_{_identifier(self.name + '.' + channel)}"
 
     def members(self) -> list[str]:
         unit, ctrl, graph = self.unit, self.ctrl, self.graph
@@ -2253,6 +2344,7 @@ class _UnitGenerator(_ACControlGenerator):
                   f"    {self.m('command_theta')} = {self.m('theta')};"]
         lines += self._modulation_lines(indent="    ")
         lines += self._log_lines("    ")
+        lines += ["    " + line for line in self._rms_sample_lines()]
         lines += [f"    sampled_protect_{self.tag}(t, std::abs(meas_u_g),",
                   f"        ({self.m('omega')} - {_number(self.cfg.base.w0)}) / (2.0 * pi),",
                   f"        meas_u_dc - {self._reference('vdc_ref_pu')}, {self.m('startup_complete')});",
@@ -2389,22 +2481,25 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
                 f"C++ export: {name}.control_inputs() exposes "
                 f"{sorted(self._control_inputs)}, expected {sorted(graph_inputs)}"
             )
+        if self.continuous:
+            # Equations must read the controller's wired inputs at its scheduled ODE stage.
+            # Physical-port observations are read only after the complete model is synchronized.
+            controller = model._equation_clone(self.ctrl)
+            controller._last_measurement = copy.copy(self.ctrl._last_measurement)
 
-    def _adc_reading(self, channel: str) -> str:
-        return f"obs_{_identifier(self.name + '.adc.' + channel)}"
+            def read():
+                measurement = controller._flow_measurement()
+                return {path: getattr(measurement, path.partition(".")[2])
+                        for path in self._control_inputs}
+
+            self._flow_inputs = model._trace(read)
 
     def _sampled_control_inputs(self) -> dict[str, _Expression]:
         channels = {
             name: _Expression(self._adc_value(name), "real")
             for name in self.unit.ports.readers
         }
-        names = tuple(
-            path for path in self.graph.interface.inputs if path.startswith("meas.")
-        )
-        values = self.model._trace(lambda: tuple(
-            self.unit.control_inputs_from(channels)[name] for name in names
-        ))
-        return dict(zip(names, values))
+        return self.model._trace(lambda: self.unit.control_inputs_from(channels))
 
     def _stage_condition(self, active: str) -> str:
         """Add the only extra enable required by a direct, breaker-less power port."""
@@ -2463,6 +2558,7 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
             lines += [f"bool {self.m(loop_name + '_limit_active')} = false;"
                       for loop_name, node in self.graph.nodes.items()
                       if isinstance(node, DCVoltageControl)]
+            lines += self._adc_members()
             return lines
         lines += [
             f"long long {self.m('startup_steps')} = {int(startup.steps)};",
@@ -2484,7 +2580,7 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
         sampled = None if members else self._sampled_control_inputs()
         for path, value in self._control_inputs.items():
             target = self.m(self._measurement_name(path)) if members else self._measurement_name(path)
-            expression = value.code if members else sampled[path].code
+            expression = self._flow_inputs[path].code if members else sampled[path].code
             declaration = "" if members else (
                 "Complex " if value.kind == "complex" else "double "
             )
@@ -2494,7 +2590,17 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
     def _log_lines(self) -> list[str]:
         sources = self.ctrl.log_sources()
         return [f"{self.m('log_' + key)} = {self.source(sources[key])};"
-                for key in self.ctrl.log_names()]
+                for key in self.ctrl.log_names()
+                if not (self.continuous and sources[key].startswith("meas."))]
+
+    def log_observation_lines(self) -> list[str]:
+        # An open-loop controller may run before its unused measurement inputs are wired.
+        # Read those logs from final model observations, not from its early output evaluation.
+        return [
+            f"{self.m('log_' + key)} = obs_{_identifier(self.name + '.ctrl.' + source)};"
+            for key, source in self.ctrl.log_sources().items()
+            if source.startswith("meas.")
+        ]
 
     def output_lines(self) -> list[str]:
         lines = self._measurement_lines(members=True)
@@ -2536,6 +2642,7 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
 
     def controller_method(self) -> str:
         lines = [f"void controller_{self.tag}(double t) {{"]
+        lines += ["    " + line for line in self._rms_sample_lines()]
         lines += ["    " + line for line in self._measurement_lines(members=False)]
         lines += [
             f"    if ({self.m('startup_run')} && !{self.m('startup_complete')}) {{",
@@ -2711,10 +2818,11 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
         voltage = f"obs_{_identifier(self.name + '.ctrl.meas.voltage')}"
         dc = f"obs_{_identifier(self.name + '.u_dc')}"
         return f'''void sense_{self.tag}(double t) {{
+    {chr(10).join(self._rms_sample_lines())}
     sampled_protect_{self.tag}(t, std::abs({voltage}) / {_number(self.cfg.dc_base.v)},
         0.0, {dc} / {_number(self.cfg.dc_base.v)} - 1.0,
         {self.m('startup_run')} && ({self.m('startup_ramp')} <= 0.0 ||
-        t - {self.m('startup_start')} >= {self.m('startup_ramp')} - time_eps));
+        t - {self.m('startup_start')} >= {self.m('startup_ramp')} - time_eps){self._rms_protection_argument()});
 }}'''
 
 def _make_unit_generator(name: str, unit: Any, model: _ModelGenerator) -> Any:
@@ -2752,10 +2860,14 @@ class _CppGenerator:
                 if part is self.model:
                     values = [ode[column] for column in state.columns]
                 else:
+                    statistics = next((item for item in (*sampled.values(), *continuous.values())
+                                       if part is item.unit.adc), None)
                     generator = next((item for name, item in sampled.items()
                                       if part in (item.unit, item.ctrl, item.unit.bridge,
                                                   item.unit.adc)), None)
-                    if generator is not None:
+                    if statistics is not None and state.local_name.startswith("rms_"):
+                        value = statistics._rms_state(state.local_name)
+                    elif generator is not None:
                         value = generator.state_expression(part, state.local_name)
                     else:
                         generator_c = next((item for name, item in continuous.items()
@@ -2826,11 +2938,12 @@ class _CppGenerator:
                 else:
                     raise TypeError(f"C++ export: unknown event target {target!r}")
             elif hasattr(action, "paths"):
-                # References and source waveforms are compiled as time expressions. Other built-in
-                # component coefficients are checked below until their piecewise emitters are used.
+                # Reference updates use the common event action, not a time-dependent RHS.
+                # Source waveforms retain their existing piecewise representation.
                 handled = all(
                     (path.startswith("sources.") and path.rsplit(".", 1)[-1] in {"v", "f", "angle"})
                     or (path.startswith("units.") and ".ctrl.references." in path)
+                    or path in model.element_parameters
                     for path in action.paths
                 )
                 if not handled:
@@ -2838,6 +2951,22 @@ class _CppGenerator:
                         f"C++ export: set event {action.event!r} changes unsupported paths "
                         f"{list(action.paths)}"
                     )
+                for path in action.paths:
+                    if path in model.element_parameters:
+                        member, _, _ = model.element_parameters[path]
+                        _, element, field = path.split(".")
+                        value = getattr(action.params.elements[element], field)
+                        lines.append(f"{member} = {_number(value)};")
+                        continue
+                    owner, separator, reference = path.removeprefix("units.").partition(
+                        ".ctrl.references."
+                    )
+                    if separator and path.startswith("units."):
+                        generator = sampled.get(owner) or continuous[owner]
+                        value = getattr(action.params.unit(owner).ctrl.references, reference)
+                        lines.append(
+                            f"{generator._reference(reference)} = {generator._literal(value)};"
+                        )
             else:
                 raise TypeError(f"C++ export: custom event {kind!r} needs a C++ lowering hook")
             cases += [f"        case {index}:", *["            " + line for line in lines],
@@ -3063,10 +3192,12 @@ class _CppGenerator:
         member_lines = model.members()
         for generator in sampled.values():
             member_lines.extend(generator.members())
+        for generator in (*sampled.values(), *continuous.values()):
+            member_lines.extend(generator.reference_members())
         members = "\n    ".join(member_lines)
         rhs = "\n        ".join(model.body())
         sync_body = "\n        ".join(model.body(derivatives=False))
-        observation_members, observation_assignments = model.observations()
+        observation_members, observation_assignments = model.observations({**sampled, **continuous})
         observations = "\n        ".join(observation_assignments)
         members = "\n    ".join([members, *observation_members])
         methods = []
@@ -3076,7 +3207,7 @@ class _CppGenerator:
                         generator.protection_method()]
         methods += [method for generator in continuous.values()
                     for method in (generator.sense_method(), generator.actuate_method(),
-                                   generator.protection_method())]
+                                   generator.protection_method(), generator.adc_methods())]
         energy_method, energy_columns = self._energy_method(model)
         if energy_method:
             methods.append(energy_method)
@@ -3091,10 +3222,16 @@ class _CppGenerator:
         protect = [f"trip_now = protect_{(sampled.get(name) or continuous[name]).tag}(t) || trip_now;"
                    for name in unit_names]
         adc_accumulate = [generator.adc_accumulate_call("t - interval_start")
-                          for generator in sampled.values()]
+                          for generator in (*sampled.values(), *continuous.values())]
         adc_accumulate = [line for line in adc_accumulate if line]
-        adc_seed = [generator.adc_seed_call() for generator in sampled.values()]
-        adc_seed = [line for line in adc_seed if line]
+        adc_seed = [line for generator in (*sampled.values(), *continuous.values())
+                    for line in generator.adc_seed_lines()]
+        sync_template = "template <bool seed_adc = false>" if adc_seed else ""
+        sync_update = observations
+        if adc_seed:
+            # Share one model body; each instantiation retains only its required stores.
+            sync_update = ("if constexpr (seed_adc) {\n" + "\n".join(adc_seed)
+                           + "\n} else {\n" + observations + "\n}")
         action_times, action_cases = self._actions(model, sampled, continuous)
         times = ", ".join(_number(value) for value in action_times)
         snapshot_values = "\n            ".join(f"states << ',' << ({value});" for value in state_values)
@@ -3136,6 +3273,7 @@ class _CppGenerator:
                     ]
                 else:
                     continuous_ctrl_rows += [
+                        *generator.log_observation_lines(),
                         f"if (snapshot_index % {max(1, output.record_every)} == 0) {{",
                         row,
                         "}",
@@ -3443,6 +3581,42 @@ using State = std::array<double, state_count>;
 constexpr double pi = 3.141592653589793238462643383279502884;
 constexpr double time_eps = 1e-10;
 
+template <std::size_t N> struct MovingWindow {{
+    std::array<double, N> buf{{}};
+    std::size_t index = 0, count = 0;
+    double push(double value) {{
+        const double old = count == N ? buf[index] : 0.0;
+        buf[index] = value;
+        index = (index + 1) % N;
+        count = std::min(N, count + 1);
+        return old;
+    }}
+}};
+
+template <std::size_t N> struct RMSWindow {{
+    MovingWindow<N> window;
+    double area = 0.0, duration = 0.0, last = 0.0, total = 0.0;
+    mutable double cached_value = std::numeric_limits<double>::quiet_NaN();
+    void accumulate(double dt, double square) {{
+        area += 0.5 * dt * (last + square);
+        duration += dt;
+        last = square;
+    }}
+    void sample(double period) {{
+        if (duration >= period * (1.0 - 1e-9)) {{
+            const double mean = area / duration;
+            total += mean - window.push(mean);
+            cached_value = std::numeric_limits<double>::quiet_NaN();
+        }}
+        area = duration = 0.0;
+    }}
+    double value() const {{
+        if (window.count != N) return std::numeric_limits<double>::quiet_NaN();
+        if (std::isnan(cached_value)) cached_value = std::sqrt(std::max(0.0, total / N));
+        return cached_value;
+    }}
+}};
+
 {runtime_declarations}
 
 inline std::string_view trim(std::string_view text) {{
@@ -3607,9 +3781,10 @@ public:
     }}
 
 {projection_method}
+    {sync_template}
     inline void sync(double t) {{
         {sync_body}
-        {observations}
+        {sync_update}
     }}
 
 {solver_code}
@@ -3695,7 +3870,7 @@ public:
             if constexpr ({'true' if self.p.simulation.stop_on_trip else 'false'}) {{
                 if (trip_now) {{ snapshot(true); break; }}
             }}
-            {'sync(t); ' + ' '.join(adc_seed) if adc_seed else ''}
+            {'sync<true>(t);' if adc_seed else ''}
             if (t >= end - time_eps) {{ snapshot(true); break; }}
             if (std::abs(next_output - t) < time_eps) {{
                 snapshot();

@@ -1,0 +1,92 @@
+# PESLite 0.4.0
+# SS WPT with primary-side power feedback driving modulation amplitude.
+# Both sides measure only their own port. Positive power leaves each converter.
+# The existing ADC averages instantaneous power over its PWM/control interval.
+
+base:
+  s_base: 5000.0
+  v_ll_rms: 400.0
+  f0: 50.0
+
+buses: {}
+
+units:
+  charger:
+    type: wpt
+    primary:
+      type: dc_converter
+      dclink:
+        vdc_ref: 400.0
+        source: {type: voltage}
+      pwm:
+        f_sw: 1.0e6
+      meas:
+        average: [power]
+      ctrl:
+        type: resonant
+        computation: 0.0
+        loops:
+          PowerControl:
+            kp: 0.0001
+            ki: 0.6
+            minimum: 0.05
+            maximum: 0.95
+            power_filter: {enable: true, bandwidth: 1000.0}
+          ResonantModulation: {}
+        references:
+          power: 1200.0
+          modulation: 0.35
+          frequency: 85000.0
+        connections:
+          PowerControl.reference: references.power
+          PowerControl.power: meas.power
+          PowerControl.feedforward: references.modulation
+          ResonantModulation.modulation: PowerControl.modulation
+
+    secondary:
+      type: dc_converter
+      dclink:
+        vdc_ref: 300.0
+        source: {type: voltage}
+      pwm:
+        f_sw: 800.0e3
+      ctrl:
+        type: resonant
+        computation: 0.0
+        loops:
+          ResonantModulation: {}
+        references:
+          modulation: 0.7
+          frequency: 85000.0
+          phase: 1.5707963267948966
+
+    link:
+      type: ss
+      primary_inductance: 100.0e-6
+      secondary_inductance: 100.0e-6
+      mutual_inductance: 20.0e-6
+      primary_capacitance: 35.05923348e-9
+      secondary_capacitance: 35.05923348e-9
+      primary_resistance: 0.5
+      secondary_resistance: 0.5
+
+events:
+  power_step:
+    type: set
+    t: 0.003
+    set:
+      units.charger.primary.ctrl.references.power: 1800.0
+
+simulation:
+  t_end: 0.006
+  solver:
+    dt: 100.0e-9
+    linearisations: 0
+  output:
+    period: 2.0e-6
+    record_every: 4
+    signals: 1
+
+meta:
+  title: SS WPT power control
+  description: Local primary port-power PI controls bridge amplitude through the shared control graph.

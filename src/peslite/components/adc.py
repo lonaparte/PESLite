@@ -1,4 +1,4 @@
-"""The common converter ADC: instantaneous named samples or window means in SI units."""
+"""Shared converter measurements: named SI samples, window means and optional RMS statistics."""
 
 from __future__ import annotations
 
@@ -7,8 +7,99 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
 from .pwm import TIME_EPS
+from ..control.blocks import MovingWindow
+from ..solver.energy import PowerPort, port_power, re_product
+from ..solver.model import Bag, Empty
 
 __all__ = ["ADCSample", "MeasurementPorts", "ADC"]
+
+
+class _PortMeasurementInp(Bag):
+    __slots__ = ("voltage", "current")
+
+
+class _PortMeasurementOut(Bag):
+    __slots__ = ("voltage", "current", "power")
+
+
+class _PortMeasurement:
+    """Non-loading observation of an already assembled electrical terminal."""
+
+    observer = True
+    outputs_need_inputs = True
+    state_names = ()
+
+    def __init__(self, terminal) -> None:
+        port = terminal.power_port
+        self.ports = (PowerPort("inp.voltage", "inp.current", port.scale, -port.sign),)
+        self.state = Empty()
+        self.inp = _PortMeasurementInp()
+        self.out = _PortMeasurementOut()
+
+    def set_outputs(self, t: float) -> None:
+        self.out.voltage = self.inp.voltage
+        self.out.current = self.inp.current
+        self.out.power = port_power(self, self.ports[0])
+
+    def rhs(self, t: float):
+        return ()
+
+
+class _RMSWindow:
+    """Sliding mean-square over complete sampling periods, integrated before sampling."""
+
+    def __init__(self, period: float, length: float) -> None:
+        count = round(length / period)
+        if count < 1 or not math.isclose(length, count * period, rel_tol=1e-9):
+            raise ValueError("an RMS window must contain whole sampling periods")
+        self.period = period
+        self.window = MovingWindow(count)
+        self.area = self.duration = self.last = self.total = 0.0
+        self.count = 0
+        self._value: float | None = None
+
+    def accumulate(self, dt: float, value: complex | float) -> None:
+        square = re_product(value, value)
+        self.area += 0.5 * dt * (self.last + square)
+        self.duration += dt
+        self.last = square
+
+    def sample(self) -> None:
+        # Do not manufacture a full period from a partial initial interval.
+        if self.duration >= self.period * (1.0 - 1e-9):
+            value = self.area / self.duration
+            old = self.window.push(value)
+            self.total += value - (0.0 if old is None else old)
+            self.count = min(self.window.n, self.count + 1)
+            self._value = None
+        self.area = self.duration = 0.0
+
+    @property
+    def value(self) -> float | None:
+        if self._value is None and self.window.full:
+            self._value = math.sqrt(max(0.0, self.total / self.count))
+        return self._value
+
+    def get_state(self) -> dict[str, float]:
+        return {"area": self.area, "duration": self.duration, "last": self.last,
+                "total": self.total, "count": self.count, "index": self.window.idx,
+                **{f"sample_{i}": value for i, value in enumerate(self.window.buf)}}
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        self._value = None
+        for name in ("area", "duration", "last", "total"):
+            if name in values:
+                setattr(self, name, float(values[name]))
+        count = int(values.get("count", self.count))
+        index = int(values.get("index", self.window.idx))
+        if (count != values.get("count", count) or index != values.get("index", index)
+                or not 0 <= count <= self.window.n or not 0 <= index < self.window.n):
+            raise ValueError("invalid RMS window position")
+        self.count, self.window.idx = count, index
+        self.window.full = count == self.window.n
+        for i in range(self.window.n):
+            if f"sample_{i}" in values:
+                self.window.buf[i] = float(values[f"sample_{i}"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,7 +118,7 @@ class ADCSample:
 
 @dataclass(frozen=True, slots=True)
 class MeasurementPorts:
-    """Named zero-argument readers at a converter's control boundary."""
+    """Named, non-loading zero-argument readers at a converter's control boundary."""
 
     readers: Mapping[str, Callable[[], complex | float]]
 
@@ -46,11 +137,14 @@ class ADC:
     The named channels in ``channels`` are averaged over a window of ``length`` s ending at the
     interrupt; all other ports are instantaneous.
     Named state per averaged channel ``c``: ``x_c``, the integral accumulated in the open window.
+    Optional RMS windows integrate squared signals on the same timeline and retain only their
+    configured number of complete control/protection periods; they do not alter sample clocks.
     """
 
     def __init__(self, ports: MeasurementPorts, period: float, sample_period: float,
                  length: Optional[float] = None,
-                 channels: Mapping[str, complex | float] | None = None) -> None:
+                 channels: Mapping[str, complex | float] | None = None,
+                 rms: Mapping[str, float] | None = None) -> None:
         self.ports = ports
         channels = dict(channels or {})
         if channels and (length is None or length <= 0.0):
@@ -66,6 +160,16 @@ class ADC:
         self.n_samp = 1  # sample 0 of a period is its control interrupt
         # the next interrupt's window is open (a full-period window opens at the interrupt itself)
         self.window_open = self.length is None or self._full
+        self.rms = {channel: _RMSWindow(period, window)
+                    for channel, window in (rms or {}).items()}
+        self._integrated = tuple(
+            (channel, channel in channels, self.rms.get(channel))
+            for channel in dict.fromkeys((*self.channels, *self.rms))
+        )
+
+    @property
+    def accumulating(self) -> bool:
+        return self.averaging or bool(self.rms)
 
     @property
     def _full(self) -> bool:
@@ -98,8 +202,12 @@ class ADC:
     # ------------------------------------------------------------ the window
     def seed(self) -> None:
         """Start the next integration interval from the values after changes at this instant."""
-        values = self.ports.read()
-        self._last = {channel: values[channel] for channel in self.channels}
+        for channel, averaged, window in self._integrated:
+            value = self.ports.readers[channel]()
+            if averaged:
+                self._last[channel] = value
+            if window is not None:
+                window.last = re_product(value, value)
 
     def held_before(self, duration: float) -> None:
         """Count the current values as held for ``duration`` seconds before the run starts."""
@@ -108,15 +216,17 @@ class ADC:
 
     def accumulate(self, dt: float) -> None:
         """Add the trapezoidal integral over the interval of length ``dt`` (s) ending now."""
-        if dt <= 0.0 or not self.channels:
+        if dt <= 0.0:
             return
-        values = self.ports.read()
         half = 0.5 * dt
-        for channel in self.channels:
-            now = values[channel]
-            if self.window_open:
-                self.accumulated[channel] += half * (self._last[channel] + now)
-            self._last[channel] = now
+        for channel, averaged, window in self._integrated:
+            value = self.ports.readers[channel]()
+            if averaged:
+                if self.window_open:
+                    self.accumulated[channel] += half * (self._last[channel] + value)
+                self._last[channel] = value
+            if window is not None:
+                window.accumulate(dt, value)
 
     def open(self) -> None:
         """Start the window ending at the next control interrupt."""
@@ -141,6 +251,7 @@ class ADC:
         """Take the sample at the control interrupt ``t``, with the preceding oversamples,
         and rearm the averaging window."""
         meas = self.measure(t)
+        self.sample_rms()
         if self.length is not None:
             self.window_open = self._full
             if self.window_open:
@@ -151,6 +262,14 @@ class ADC:
         self.peeks, self.n_samp = [], 1
         return meas
 
+    def sample_rms(self, t: float | None = None) -> bool:
+        """Finish one statistics period without changing instantaneous control measurements."""
+        if t is not None and abs(t - round(t / self.period) * self.period) >= TIME_EPS:
+            return False
+        for window in self.rms.values():
+            window.sample()
+        return True
+
     def measure(self, t: float) -> ADCSample:
         """Read every named channel at ``t`` and apply configured window means."""
         reading = self.ports.read()
@@ -160,7 +279,9 @@ class ADC:
 
     # ------------------------------------------------------------ its states
     def get_state(self) -> dict[str, Any]:
-        return {f"x_{channel}": value for channel, value in self.accumulated.items()}
+        return {**{f"x_{channel}": value for channel, value in self.accumulated.items()},
+                **{f"rms_{channel}.{key}": value for channel, window in self.rms.items()
+                   for key, value in window.get_state().items()}}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         for channel, zero in self._zero.items():
@@ -168,3 +289,7 @@ class ADC:
             key = f"x_{channel}"
             if key in values:
                 self.accumulated[channel] = cast(values[key])
+        for channel, window in self.rms.items():
+            prefix = f"rms_{channel}."
+            window.set_state({key[len(prefix):]: value for key, value in values.items()
+                              if key.startswith(prefix)})

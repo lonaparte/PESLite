@@ -20,6 +20,9 @@ EXPECTED = {
     "gfm-vsg-example.pes",
     "two-converters-example.pes",
     "wpt-example.pes",
+    "wpt-ss-example.pes",
+    "wpt-lcc-example.pes",
+    "wpt-load-example.pes",
 }
 
 

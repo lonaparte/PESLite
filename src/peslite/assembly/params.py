@@ -325,11 +325,15 @@ class MeasurementParams:
     ``average`` lists any of ``u_g``, ``i_c`` and ``u_dc`` which use a mean over ``window``
     (s, at most the control period). Channels not listed are instantaneous.
     ``period`` is the ADC oversampling period; it defaults to the control period.
+    ``sources`` selects physical outputs for existing channels. ``rms`` selects sliding
+    mean-square windows, in whole control periods (protection/output periods in ideal averaging).
     """
 
     average: list[str] = field(default_factory=list)
     window: Optional[float] = None  # s; default: the control period
     period: Optional[float] = None  # s; default: the control period
+    sources: dict[str, str] = field(default_factory=dict)  # channel -> physical output name
+    rms: dict[str, float] = field(default_factory=dict)  # channel -> window duration (s)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -397,6 +401,7 @@ class ProtectionParams:
     """Trip criteria and the ROCOF alarm, each switched by ``enable`` (1/0)."""
 
     overcurrent: OvercurrentParams = field(default_factory=OvercurrentParams)
+    rms_current: OvercurrentParams = field(default_factory=OvercurrentParams)
     undervoltage: VoltageLimitParams = field(default_factory=VoltageLimitParams)
     overvoltage: VoltageLimitParams = field(default_factory=VoltageLimitParams)
     frequency: FrequencyLimitParams = field(default_factory=FrequencyLimitParams)
@@ -1321,7 +1326,7 @@ RUNTIME = (
     "units.*.ctrl.loops.*.** (not period)",
     "units.*.protection.**",
     "units.*.dclink.source.* (not type)",
-    "elements.*.* (not type, bus)",
+    "elements.*.* (not type, bus or declared structural fields)",
 )
 
 
@@ -1363,7 +1368,9 @@ def runtime_changeable(path: str, p: Params) -> bool:
         return keys[:2] == ["dclink", "source"] and len(keys) == 3 and keys[2] != "type"
     if section == "elements":
         element = p.elements.get(name)
-        return (element is not None and len(keys) == 1 and keys[0] != "type"
+        field = element.__dataclass_fields__.get(rest) if element is not None else None
+        return (field is not None and len(keys) == 1 and keys[0] != "type"
+                and field.metadata.get("runtime", True)
                 and keys[0] not in element_buses(element))
     return False
 

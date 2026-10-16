@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 
 from ..solver.model import ConfigError
+
+if TYPE_CHECKING:
+    from .controller import ControlInterface
 
 
 @dataclass(frozen=True)
@@ -38,11 +41,12 @@ class ScalarVoltageReferenceParams:
 
 @dataclass(frozen=True)
 class ResonantReferenceParams:
-    """Open-loop fundamental command for a resonant full bridge."""
+    """Fundamental commands and an optional signed port-power reference (W)."""
 
     modulation: float
     frequency: float
     phase: float = 0.0
+    power: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -52,9 +56,9 @@ class ControlTypeSpec:
     name: str
     references: type | None = None
     unit_types: frozenset[str] = field(default_factory=frozenset)
-    interface: Any = None
+    interface: ControlInterface | None = None
     wiring: Callable[..., Any] | None = None
-    log_sources: Any = None
+    log_sources: Mapping[str, str] | None = None
     grid_following: bool = False
     default_bridge: str | None = None
     controller_factory: Callable[..., Any] | None = None
@@ -73,6 +77,8 @@ def validate_resonant_references(references: Any, where: str) -> None:
         raise ConfigError(f"{where}.frequency must be finite and positive")
     if not math.isfinite(references.phase):
         raise ConfigError(f"{where}.phase must be finite")
+    if not math.isfinite(references.power):
+        raise ConfigError(f"{where}.power must be finite")
 
 
 CONTROL_TYPES: dict[str, ControlTypeSpec] = {}

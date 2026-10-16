@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import warnings
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from typing import Any, ContextManager, Mapping, Optional, Protocol
 
 import numpy as np
@@ -25,6 +26,7 @@ from ..control.controller import (Controller, ConverterMeasurement, Measurement,
 from .events import Scenario
 from .params import SimulationParams, UnitParams
 from .protection import Protection, ProtectionSample
+from .types import unit_type
 
 __all__ = ["Plant", "Unit", "VSC", "DCConverter"]
 
@@ -62,7 +64,8 @@ class Unit(ABC):
         """Build the sensing, protection and lifecycle state shared by converter units."""
         self.ports = ports
         protection_period = sim.output.period if self.continuous else self.cfg.ctrl.period
-        self.protection = Protection(self.cfg.protection, protection_period, current_base)
+        self.protection = Protection(self.cfg.protection, protection_period, current_base,
+                                     rms_available=bool(self.cfg.meas.rms))
         self._trip_due = False
         self._track_due = False
         self._write_due: Optional[tuple[float, Any]] = None
@@ -70,21 +73,23 @@ class Unit(ABC):
         self.breaker = True
         self.gates = False
 
-        if self.continuous:
+        if self.continuous and not self.cfg.meas.rms:
             self.adc = None
             self.windowed = self._oversamples = False
             return
         meas = self.cfg.meas
-        sample_period = meas.period if meas.period is not None else self.cfg.ctrl.period
-        channels = {name: channel_zeros[name] for name in meas.average}
+        period = protection_period if self.continuous else self.cfg.ctrl.period
+        sample_period = meas.period if meas.period is not None else period
+        channels = {} if self.continuous else {name: channel_zeros[name] for name in meas.average}
         self.adc = ADC(
             ports,
-            self.cfg.ctrl.period,
+            period,
             sample_period,
-            meas.window if meas.window is not None else self.cfg.ctrl.period,
+            meas.window if meas.window is not None else period,
             channels,
+            rms=meas.rms,
         )
-        self.windowed = self.adc.averaging
+        self.windowed = self.adc.accumulating
         self.accumulate, self.restart_windows = self.adc.accumulate, self.adc.seed
         self._oversamples = self.adc.samples > 1
 
@@ -126,7 +131,7 @@ class Unit(ABC):
         parts = [(self.name, self), (f"{self.name}.ctrl", self.ctrl),
                  (f"{self.name}.{self.bridge.state_prefix}", self.bridge.state_owner)]
         adc = getattr(self, "adc", None)
-        if adc is not None and adc.averaging:
+        if adc is not None and adc.accumulating:
             parts.append((f"{self.name}.meas", adc))
         return parts
 
@@ -230,6 +235,9 @@ class Unit(ABC):
         self._track_due = False
         if self.continuous:
             self._start_continuous_bridge(t)
+            if self.adc is not None:
+                plant.outputs(t)
+                self.adc.seed()
             return
         initial_sync = getattr(self.ctrl, "initial_sync", None)
         sync = initial_sync() if initial_sync is not None else (None, None)
@@ -258,7 +266,9 @@ class Unit(ABC):
                     plant.outputs(t)
                 self._track_due = False
             self.ctrl.startup.at(t)
-            self._check_sampled_protection(t, self._instantaneous_measurement(t))
+            rms_fresh = self.adc is not None and self.adc.sample_rms(t)
+            self._check_sampled_protection(t, self._instantaneous_measurement(t),
+                                           rms_fresh=rms_fresh)
             return None
         measurement = self._sample_control(t, plant)
         if measurement is None:
@@ -435,12 +445,28 @@ class Unit(ABC):
         return self._control_measurement(ADCSample(t=t, values=values, samples=(reading,)))
 
     def _check_sampled_protection(self, t: float, measurement: Any,
-                                  output: Any | None = None) -> None:
+                                  output: Any | None = None, *, rms_fresh: bool = True) -> None:
+        if self.tripped:
+            return
+        sample = self._protection_sample(measurement, output)
+        if self.protection.rms_enabled:
+            window = self.adc.rms[unit_type(self.cfg.type).current_channel]
+            value = window.value if rms_fresh else None
+            sample = replace(sample, rms_current_pu=(
+                None if value is None else value / self.protection.i_base
+            ))
         if (not self.tripped
-                and self.protection.check_sampled(
-                    t, self._protection_sample(measurement, output)
-                )):
+                and self.protection.check_sampled(t, sample)):
             self._trip_due = True
+
+    def measurement_signals(self) -> dict[str, float]:
+        if self.adc is None:
+            return {}
+        signals = {}
+        for channel, window in self.adc.rms.items():
+            value = window.value
+            signals[f"{self.name}.meas.{channel}_rms"] = math.nan if value is None else value
+        return signals
 
     def _held_start_command(self, value: Any) -> Any:
         """Adapt the reconstructed bridge command to the unit's physical boundary."""
@@ -620,11 +646,10 @@ class VSC(Unit):
 
     def signals(self) -> dict[str, float | complex]:
         """Return this unit's recorded signals (SI); outputs must be synced first."""
-        ports = self.ports
         return {
-            f"{self.name}.i_c": ports.value("i_c"),
-            f"{self.name}.u_g": ports.value("u_g"),
-            f"{self.name}.u_dc": ports.value("u_dc"),
+            f"{self.name}.i_c": self.branch_f.out.i,
+            f"{self.name}.u_g": self.bus.out.u,
+            f"{self.name}.u_dc": self.dclink.out.u_dc,
             f"{self.name}.i_dc": self.dclink.inp.i_dc,
         }
 
@@ -750,10 +775,23 @@ class DCConverter(Unit):
             "voltage": lambda: self._port_value(self._control_voltage_port),
             "vin": lambda: self._port_value(self._control_supply_port),
         })
+        channel_zeros = {"current": 0.0, "voltage": 0.0, "vin": 0.0}
+        interface = getattr(self.ctrl, "interface", None)
+        needs_power = interface is not None and "meas.power" in interface.inputs
+        if (needs_power or "power" in cfg.meas.average or "power" in cfg.meas.rms
+                or "power" in cfg.meas.sources):
+            external_bus = cfg.bus if cfg.bus is not None else self.power_bus
+            self._power_terminal, = (
+                terminal for bus_name, terminal in self.terminals() if bus_name == external_bus
+            )
+            self.ports.readers["power"] = lambda: -self._power_terminal.power()
+            channel_zeros["power"] = 0.0
+            if needs_power:
+                self.ctrl.bind_power_port(self._power_terminal.power_port)
         self._configure_runtime(
             sim,
             self.ports,
-            {"current": 0.0, "voltage": 0.0, "vin": 0.0},
+            channel_zeros,
             cfg.dc_base.i,
         )
 
@@ -805,6 +843,10 @@ class DCConverter(Unit):
             })
             if self.conduction is not None:
                 connections[(self.conduction, "q")] = (self.ctrl, "q")
+            if "meas.power" in self.ctrl.interface.inputs and "power" not in self.cfg.meas.sources:
+                voltage, current = self._power_terminal.signal_sources()
+                connections[(self.ctrl, "power_voltage")] = voltage
+                connections[(self.ctrl, "power_current")] = current
         return connections
 
     def zoh_connections(self) -> dict:
@@ -857,6 +899,7 @@ class DCConverter(Unit):
     ) -> dict[str, Any]:
         return self.ctrl.control_inputs(
             values["current"], values["voltage"], values["vin"],
+            values.get("power"),
         )
 
     def source_preset(self) -> float:
@@ -886,6 +929,7 @@ class DCConverter(Unit):
             current=float(values["current"]),
             voltage=float(values["voltage"]),
             vin=float(values["vin"]),
+            power=values.get("power"),
             samples=tuple(self._control_measurement(item) for item in sample.samples),
         )
 

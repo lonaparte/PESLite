@@ -17,9 +17,11 @@ class UnitTypeSpec:
     default_bridge: str | Callable[[Any], str] | None = None
     children: tuple[str, ...] = ()
     default_port: str | None = None
+    ports: tuple[str, ...] = ()
     phases: int | None = None
     bridge_types: frozenset[str] = frozenset()
     measurement_channels: frozenset[str] = frozenset()
+    current_channel: str | None = None
     protection_criteria: frozenset[str] = frozenset()
     defaults_grid_frequency: bool = False
     validator: Callable[..., None] | None = None

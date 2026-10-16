@@ -129,7 +129,7 @@ def energy_rate(sub: Any, derivatives: dict[str, Any], spec: EnergySpec) -> floa
 
 def re_product(e: Any, f: Any) -> float:
     """``Re(e conj(f))`` for real or complex signals."""
-    return float((e * f.conjugate()).real) if isinstance(e, complex) or isinstance(f, complex) else float(e * f)
+    return (e * f.conjugate()).real
 
 
 def port_power(sub: Any, port: PowerPort) -> float:

@@ -56,7 +56,13 @@ normally sends the result to `InductorCurrentControl`; a VSC sends it to the d-a
 ## ADC sampling
 
 Every sampled converter uses the same ADC implementation. A VSC exposes `u_g`, `i_c` and `u_dc`;
-a scalar DC converter exposes `current`, `voltage` and `vin`. Channels not listed under
+a scalar DC converter exposes `current`, `voltage` and `vin`. An active control path using
+`meas.power`, or an explicit `meas.average: [power]` request, also enables instantaneous outward
+power at the unit's external `power` terminal. This uses that terminal's paired voltage/current,
+direction and power coefficient, not a product of potentially different control feedback ports.
+An unused loop does not enable this channel. Direct controller calls must supply port power when
+the active graph requires it; missing power is not interpreted as a measured zero.
+The optional channel is not evaluated in configurations that do not request it. Channels not listed under
 `meas.average` are instantaneous at the controller interrupt. Listed channels use the mean over a
 window ending at that interrupt:
 
@@ -70,6 +76,11 @@ meas:
 `meas.period` is the oversampling period and defaults to `ctrl.period`. `meas.window` defaults to
 the control period and cannot exceed it. Window integrals are named states so a saved run can
 restore an open window; the individual intermediate oversamples are not persisted.
+
+For oscillating scalar ports, average `power` itself rather than multiplying separately averaged
+voltage and current. A carrier-boundary voltage sample may be zero even during nonzero power
+transfer. The WPT feedback cases use the ordinary ADC window for that product and an ordinary
+power-loop low-pass filter for the remaining excitation ripple; see [Examples](Examples.md#wpt-power-feedback).
 
 ## Computation time
 

@@ -651,7 +651,7 @@ class Simulation:
             self._states.load(values, [f"{name}.ctrl", bridge_prefix])
             if any(key.startswith((f"{name}.ctrl.", bridge_prefix + ".")) for key in values):
                 self._continued.add(name)
-            if unit.adc is not None and unit.adc.averaging:
+            if unit.adc is not None and unit.adc.accumulating:
                 self._states.load(values, [f"{name}.meas"])
                 if any(key.startswith(f"{name}.meas.") for key in values):
                     self._windows_given.add(name)

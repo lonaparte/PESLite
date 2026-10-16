@@ -76,6 +76,19 @@ def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():
     assert not hasattr(unit, "computation_delay")
 
 
+@pytest.mark.parametrize("phases,voltage,current,expected", [
+    (1, 24.0, 5.0, 120.0), (3, 3.0 + 4.0j, 2.0 - 1.0j, 3.0),
+])
+def test_terminal_power_reuses_the_declared_energy_convention(phases, voltage, current, expected):
+    branch = RLBranch(0.1, 0.01, phases=phases)
+    branch.inp.u1 = branch.inp.u2 = voltage
+    branch.out.i = current
+    assert branch.terminal1.power_port is branch.ports[0]
+    assert branch.terminal2.power_port is branch.ports[1]
+    assert branch.terminal1.power() == pytest.approx(expected)
+    assert branch.terminal2.power() == pytest.approx(-expected)
+
+
 def test_adc_owns_oversampling_and_averaging_window_state():
     values = {"v": 1 + 0j, "i": 2 + 0j, "dc": 10.0}
     ports = MeasurementPorts({

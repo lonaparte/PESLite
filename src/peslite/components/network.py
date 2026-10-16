@@ -10,8 +10,8 @@ import math
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import Any, Callable, ClassVar, Optional
 
-from ..solver.energy import PowerPort, StoragePort
-from ..solver.model import Bag, ConfigError, Empty
+from ..solver.energy import PowerPort, StoragePort, port_power
+from ..solver.model import Bag, ConfigError, Empty, OutputMethod
 
 __all__ = [
     "Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
@@ -35,6 +35,8 @@ class Terminal:
     direction: int
     drives_voltage: bool = False
     current_sources: Any = field(init=False, repr=False, compare=False, default=None)
+    voltage_source: Any = field(init=False, repr=False, compare=False, default=None)
+    power_port: PowerPort = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if type(self.drives_voltage) is not bool:
@@ -67,6 +69,29 @@ class Terminal:
                         f"direction {port.sign:+g}"
                     )
                 break
+        else:
+            port = PowerPort(effort, flow, sign=self.direction)
+        object.__setattr__(self, "power_port", port)
+
+    def power(self):
+        """Instantaneous power entering this terminal, using its energy-port convention."""
+        return port_power(self.subsystem, self.power_port)
+
+    def bind_voltage_source(self, source: tuple) -> None:
+        """Remember the already-lowered voltage source for follower-side observers."""
+        if self.drives_voltage:
+            raise ValueError("only a voltage-following terminal receives a bus voltage")
+        object.__setattr__(self, "voltage_source", source)
+
+    def signal_sources(self) -> tuple[Any, Any]:
+        """Ordinary output connections for observing the paired voltage and current."""
+        voltage = ((self.subsystem, self.voltage) if self.drives_voltage
+                   else self.voltage_source)
+        current = (self.current_sources if self.drives_voltage
+                   else (self.subsystem, self.current))
+        if voltage is None or current is None:
+            raise RuntimeError("the terminal's bus has not been assembled")
+        return voltage, current
 
     def bind_current_sources(self, sources: list[tuple]) -> None:
         """Remember the already-lowered current fan-in for driver-side observers."""
@@ -293,7 +318,11 @@ class Element:
     An instance supplies ``subsystems()``, ``connections()`` and ``terminals()``.  Each terminal
     binds a configured bus name to a :class:`Terminal`; one- and multi-terminal elements use the
     same interface. Optional ``breakers`` or ``connect()`` enable switching; optional ``retune()``
-    enables runtime parameter changes.
+    enables runtime parameter changes. Optional ``series_connections()`` maps a bus to an inlet
+    bus: assembly moves the original voltage driver to that inlet, inserting a two-port element
+    before the bus's followers without adding an artificial energy-storage state.
+    Optional ``parameter_bindings()`` maps retunable scalar fields to ``(subsystem, attribute)``
+    pairs so native export uses the same parameters as Python, including energy equations.
     """
 
     type: ClassVar[str]
@@ -373,37 +402,59 @@ class Load(Element):
 
 
 class _ResistorInp(Bag):
-    __slots__ = ("u",)
+    __slots__ = ("u", "i")
 
 
 class _ResistorOut(Bag):
-    __slots__ = ("i",)
+    __slots__ = ("i", "u", "power")
 
 
 class _ResistorModel:
-    """One scalar or space-vector resistance from a node to ground."""
+    """One resistance, in shunt admittance or series voltage-drop form."""
 
     state_names: ClassVar[tuple[str, ...]] = ()
     outputs_need_inputs: ClassVar[bool] = True
     storage: ClassVar[tuple[StoragePort, ...]] = ()
 
-    def __init__(self, resistance: float, phases: int) -> None:
+    def __init__(self, resistance: float, phases: int, series: bool = False) -> None:
         self.resistance = resistance
+        self.series = series
         self.power_scale = 1.5 if phases == 3 else 1.0
         zero = 0j if phases == 3 else 0.0
         self.state = Empty()
-        self.inp = _ResistorInp(u=zero)
-        self.out = _ResistorOut(i=zero)
+        self.inp = _ResistorInp(u=zero, i=zero)
+        self.out = _ResistorOut(i=zero, u=zero, power=0.0)
         self.ports = (PowerPort("inp.u", "out.i", self.power_scale),)
         self.terminal = Terminal(self, "u", "i", 1)
+        if series:
+            self.ports += (PowerPort("out.u", "inp.i", self.power_scale, -1.0),)
+            self.output_terminal = Terminal(self, "u", "i", -1, drives_voltage=True)
+        self.output_stages = (
+            OutputMethod("set_current", ("i",) if series else ("u",), ("i",)),
+            OutputMethod("set_voltage", ("u", "i") if series else (), ("u",), rhs=series),
+            OutputMethod("set_power", ("i",) if series else ("u",), ("power",), rhs=False),
+        )
 
     def set_outputs(self, t: float) -> None:
-        self.out.i = self.inp.u / self.resistance
+        self.set_current(t)
+        self.set_voltage(t)
+        self.set_power(t)
+
+    def set_current(self, t: float) -> None:
+        self.out.i = self.inp.i if self.series else self.inp.u / self.resistance
+
+    def set_voltage(self, t: float) -> None:
+        self.out.u = self.inp.u - self.resistance * self.inp.i if self.series else 0.0
+
+    def set_power(self, t: float) -> None:
+        self.out.power = self.dissipated_power()
 
     def rhs(self, t: float):
         return ()
 
     def dissipated_power(self) -> float:
+        if self.series:
+            return self.power_scale * self.resistance * abs(self.inp.i) ** 2
         return self.power_scale * abs(self.inp.u) ** 2 / self.resistance
 
     def supplied_power(self) -> float:
@@ -412,25 +463,28 @@ class _ResistorModel:
 
 @register_element_type
 class Resistor(Element):
-    """Resistance from one electrical bus to ground."""
+    """Shunt resistance, or a series resistance inserted after a bus's voltage driver."""
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
         type: str = "resistor"
         bus: str
         r: float
+        series: bool = field(default=False, metadata={"runtime": False})
 
         _quantities = {"r": "resistance"}
 
         def __post_init__(self) -> None:
             if not self.r > 0.0:
                 raise ConfigError(f"r must be > 0, got {self.r}")
+            if type(self.series) is not bool:
+                raise ConfigError("series must be bool")
 
     type = "resistor"
 
     def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
         self.name, self.cfg = name, cfg
-        self.resistor = _ResistorModel(cfg.r, buses[cfg.bus].phases)
+        self.resistor = _ResistorModel(cfg.r, buses[cfg.bus].phases, cfg.series)
 
     def subsystems(self) -> dict[str, Any]:
         return {self.name: self.resistor}
@@ -440,14 +494,26 @@ class Resistor(Element):
         return {}
 
     def terminals(self) -> tuple[tuple[str, Terminal], ...]:
+        if self.cfg.series:
+            return ((f"{self.name}.bus.in", self.resistor.terminal),
+                    (self.cfg.bus, self.resistor.output_terminal))
         return ((self.cfg.bus, self.resistor.terminal),)
 
+    def series_connections(self) -> dict[str, str]:
+        return {self.cfg.bus: f"{self.name}.bus.in"} if self.cfg.series else {}
+
+    def parameter_bindings(self) -> dict[str, tuple[Any, str]]:
+        """Runtime scalar parameters, shared by Python retuning and native export."""
+        return {"r": (self.resistor, "resistance")}
+
     def signals(self) -> dict[str, complex | float]:
-        return {f"{self.name}.i": self.resistor.out.i}
+        return {f"{self.name}.i": self.resistor.out.i,
+                f"{self.name}.power": self.resistor.out.power}
 
     def retune(self, cfg: Any) -> None:
         self.cfg = cfg
-        self.resistor.resistance = cfg.r
+        for name, (subsystem, attribute) in self.parameter_bindings().items():
+            setattr(subsystem, attribute, getattr(cfg, name))
 
 
 class _VoltageSourceInp(Bag):

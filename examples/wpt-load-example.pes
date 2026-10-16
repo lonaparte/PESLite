@@ -1,0 +1,104 @@
+# PESLite 0.4.0
+# Independent series load, explicitly selected load-power feedback and local RMS protection.
+# Measurement routing is explicit; no communication transport or phase-zero override is implied.
+
+base:
+  s_base: 5000.0
+  v_ll_rms: 400.0
+  f0: 50.0
+
+buses: {}
+
+elements:
+  load: {type: resistor, bus: charger.secondary.power, r: 5.0, series: true}
+
+units:
+  charger:
+    type: wpt
+    primary:
+      type: dc_converter
+      dclink:
+        vdc_ref: 400.0
+        source: {type: voltage}
+      pwm:
+        f_sw: 1.0e6
+      meas:
+        sources: {power: load.power}
+        average: [power]
+        rms: {current: 200.0e-6}
+      protection:
+        rms_current: {enable: true, limit_pu: 2.0}
+        hold: 50.0e-6
+      ctrl:
+        type: resonant
+        computation: 0.0
+        loops:
+          PowerControl:
+            kp: 0.0001
+            ki: 0.6
+            minimum: 0.05
+            maximum: 0.95
+            power_filter: {enable: true, bandwidth: 1000.0}
+          ResonantModulation: {}
+        references:
+          power: 500.0
+          modulation: 0.35
+          frequency: 85000.0
+        connections:
+          PowerControl.reference: references.power
+          PowerControl.power: meas.power
+          PowerControl.feedforward: references.modulation
+          ResonantModulation.modulation: PowerControl.modulation
+
+    secondary:
+      type: dc_converter
+      dclink:
+        vdc_ref: 300.0
+        source: {type: voltage}
+      pwm:
+        f_sw: 800.0e3
+      meas:
+        rms: {current: 200.0e-6}
+      protection:
+        rms_current: {enable: true, limit_pu: 2.0}
+        hold: 50.0e-6
+      ctrl:
+        type: resonant
+        computation: 0.0
+        loops:
+          ResonantModulation: {}
+        references:
+          modulation: 0.0
+          frequency: 85000.0
+
+    link:
+      type: ss
+      primary_inductance: 100.0e-6
+      secondary_inductance: 100.0e-6
+      mutual_inductance: 20.0e-6
+      primary_capacitance: 35.05923348e-9
+      secondary_capacitance: 35.05923348e-9
+      primary_resistance: 0.5
+      secondary_resistance: 0.5
+
+events:
+  load_step:
+    type: set
+    t: 0.003
+    set:
+      elements.load.r: 8.0
+
+simulation:
+  t_end: 0.006
+  solver:
+    dt: 100.0e-9
+    linearisations: 0
+  output:
+    period: 2.0e-6
+    record_every: 4
+    states: 0
+    signals: 1
+
+meta:
+  title: WPT independent load-power control
+  description: Shared power feedback regulates a separate series load across a resistance step.
