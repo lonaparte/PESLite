@@ -13,6 +13,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..control.blocks import abc2complex
+from ..solver.model import _integer, _real
 
 __all__ = ["PWM", "TIME_EPS", "SwitchingSequence", "Modulator", "CarrierComparison",
            "SynchronousCarrier", "ZOH", "carrier", "carrier_position", "make_modulator"]
@@ -62,8 +63,8 @@ class PWM:
                  pwm_state: Callable[[Any], Any] | None = None) -> None:
         if not math.isfinite(computation) or computation < 0.0:
             raise ValueError(f"the computation time must be finite and >= 0, got {computation}")
-        self.period, self.load_period, self.offset = float(period), float(load_period), float(offset)
-        self.computation, self.carrier_period = float(computation), float(carrier_period)
+        self.period, self.load_period, self.offset = _real(period), _real(load_period), _real(offset)
+        self.computation, self.carrier_period = _real(computation), _real(carrier_period)
         self._names = (*duty_names, "on") if duty_names is not None else self._NAMES
         self._width = len(self._names) - 1
         self._switching_state = switching_state or abc2complex
@@ -102,8 +103,12 @@ class PWM:
 
     def after(self, t: float, period: Optional[float] = None) -> int:
         """Index of the first timer point after ``t``; a point at ``t`` is not after it."""
+        return int(self.index_after(t, period))
+
+    def index_after(self, t: float, period: Optional[float] = None):
+        """Scalar timer-index equation shared by initialization and standalone execution."""
         T = self.period if period is None else period
-        return int(math.floor((t - self.offset + TIME_EPS) / T)) + 1
+        return np.floor((t - self.offset + TIME_EPS) / T) + 1
 
     def count(self, t_a: float, t_b: float) -> int:
         """Number of control interrupts in ``[t_a, t_b]``, including both ends."""
@@ -302,8 +307,8 @@ class CarrierComparison:
     """
 
     def __init__(self, f_sw: float, phase: float = 0.0, min_interval: float = 1e-12) -> None:
-        self.f_sw = float(f_sw)
-        self.phase = float(phase)
+        self.f_sw = _real(f_sw)
+        self.phase = _real(phase)
         self.min_interval = min_interval
 
     def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],
@@ -350,8 +355,8 @@ class SynchronousCarrier:
     """
 
     def __init__(self, pulse_ratio: int, phase: float = 0.0, min_interval: float = 1e-12) -> None:
-        self.pulse_ratio = int(pulse_ratio)
-        self.phase = float(phase)
+        self.pulse_ratio = _integer(pulse_ratio)
+        self.phase = _real(phase)
         self.min_interval = min_interval
 
     def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],

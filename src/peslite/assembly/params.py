@@ -20,6 +20,7 @@ import json
 import math
 from collections.abc import Mapping as _Mapping
 from copy import deepcopy
+from contextvars import ContextVar
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
@@ -43,6 +44,48 @@ __all__ = [
     "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "ProgressParams",
     "MetaParams", "Params",
 ]
+
+
+_PARAMETER_RECORDER: ContextVar[Any] = ContextVar("peslite_parameter_recorder", default=None)
+
+
+def _parameterized(factory, parameters):
+    """Construct a part normally, optionally recording its parameter initialization.
+
+    The callable is the construction itself, not a second binding table. Exporters can replay it
+    with parameter expressions; ordinary simulations retain neither the callable nor a shadow part.
+    """
+    part = factory(parameters)
+    recorder = _PARAMETER_RECORDER.get()
+    if recorder is not None:
+        recorder(part, factory, parameters)
+    return part
+
+
+def parameter_leaves(value, prefix="", defaulted=frozenset()):
+    """Stored numerical input paths, excluding schema-declared structural fields.
+
+    This describes parameters, not a backend's private list of supported device families.
+    Collections defining layout and boolean feature switches remain structural.
+    """
+    defaulted = defaulted | {f"{prefix}.{path}" if prefix else path
+                             for path in getattr(value, "derived_defaults", ())}
+    if isinstance(value, UnitParams):
+        yield from parameter_leaves(value._unit_fields, prefix, defaulted)
+        items = ((item.name, getattr(value, item.name), item.metadata)
+                 for item in fields(value) if item.init and not item.name.startswith("_"))
+    elif is_dataclass(value):
+        items = ((item.name, getattr(value, item.name), item.metadata)
+                 for item in fields(value) if item.init)
+    elif isinstance(value, dict):
+        items = ((key, item, {}) for key, item in value.items())
+    else:
+        if isinstance(value, (float, int)) and not isinstance(value, bool):
+            yield prefix, value, prefix in defaulted
+        return
+    for name, item, metadata in items:
+        if not metadata.get("structural", False):
+            yield from parameter_leaves(item, f"{prefix}.{name}" if prefix else name, defaulted)
 
 
 # ------------------------------------------------------------------ pu bases and SI/pu inputs
@@ -186,7 +229,7 @@ class BusParams:
 
     c: float
     r_d: float = 0.0
-    phases: int = 3
+    phases: int = field(default=3, metadata={"structural": True})
 
     _quantities = {"c": "capacitance", "r_d": "resistance"}
 
@@ -220,10 +263,16 @@ class SourceParams:
     v: float = 0.0  # emf magnitude, phase-peak V
     f: Optional[float] = None
     angle: float = 0.0
+    derived_defaults: frozenset = field(init=False, default=frozenset(), compare=False)
 
     _quantities = {"l": "inductance", "r": "resistance", "v": "voltage"}
     _input_aliases = {"x_pu": "l_pu"}
     _defaults_pu = {"v": 1.0}
+
+    def resolved(self, base: BaseValues) -> "SourceParams":
+        source = replace(self, f=base.f0 if self.f is None else self.f)
+        object.__setattr__(source, "derived_defaults", frozenset(("f",)) if self.f is None else frozenset())
+        return source
 
 # ------------------------------------------------------------------ a converter unit
 
@@ -735,7 +784,7 @@ class SimulationParams:
 
     t_end: float
     solver: SolverParams = field(default_factory=SolverParams)
-    initial: InitialParams = field(default_factory=InitialParams)
+    initial: InitialParams = field(default_factory=InitialParams, metadata={"structural": True})
     output: OutputParams = field(default_factory=OutputParams)
     stop_on_trip: bool = True
     progress: ProgressParams = field(default_factory=ProgressParams)
@@ -770,7 +819,8 @@ class Params:
     sources: dict[str, SourceParams] = field(default_factory=dict)
     branches: dict[str, BranchParams] = field(default_factory=dict)
     elements: dict[str, Any] = field(default_factory=dict, metadata={"entries": "element"})
-    events: dict[str, Any] = field(default_factory=dict, metadata={"entries": "event"})
+    events: dict[str, Any] = field(default_factory=dict,
+                                   metadata={"entries": "event", "structural": True})
     meta: MetaParams = field(default_factory=MetaParams)
 
     def unit(self, name: Optional[str] = None) -> UnitParams:
@@ -854,8 +904,9 @@ def from_dict(data: dict) -> Params:
 
     p = _build(Params, _normalize(data), "", None, None)
     validate(p)
-    p = replace(p, units={name: _resolve_unit(unit, name, p.base, p.events)
-                          for name, unit in p.units.items()})
+    p = replace(p, sources={name: source.resolved(p.base) for name, source in p.sources.items()},
+                units={name: _resolve_unit(unit, name, p.base, p.events)
+                       for name, unit in p.units.items()})
     p.changes
     return p
 
@@ -1334,6 +1385,23 @@ def runtime_changeable(path: str, p: Params) -> bool:
                 and field.metadata.get("runtime", True)
                 and keys[0] not in element_buses(element))
     return False
+
+
+def _set_assignments(p: Params, event: Any):
+    """Yield explicit set assignments in storage units, using the ordinary quantity schema."""
+    for path, value in event.set.items():
+        *head, name = path.split(".")
+        owner = p
+        for key in head:
+            owner = owner[key] if isinstance(owner, dict) else getattr(owner, key)
+        scales = p.base.parameter_scales()
+        if head[0] == "units":
+            unit = p.unit(_unit_path(p.units, ".".join(head[1:])))
+            scales = unit.base.parameter_scales(
+                unit.dclink.vdc_ref if unit.dclink is not None else 1.0)
+        target = quantity_name(type(owner), name, getattr(owner, "__dict__", None))
+        converted = convert_quantities({name: value}, type(owner), scales, path)
+        yield ".".join((*head, target)), converted[target]
 
 
 def set_changes(p: Params) -> tuple[Change, ...]:

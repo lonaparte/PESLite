@@ -25,7 +25,7 @@ from ..control.blocks import phases
 from ..control.controller import (Controller, ConverterMeasurement, Measurement,
                                   make_controller)
 from .events import Scenario
-from .params import SimulationParams, UnitParams
+from .params import SimulationParams, UnitParams, _parameterized
 from .protection import Protection, ProtectionSample
 from .types import unit_type
 
@@ -95,13 +95,15 @@ class Unit(ABC):
         sim: SimulationParams,
         ports: MeasurementPorts,
         channel_zeros: Mapping[str, complex | float],
-        current_base: float,
+        current_base: Callable[[UnitParams], float],
     ) -> None:
         """Build the sensing, protection and lifecycle state shared by converter units."""
         self.ports = ports
-        protection_period = sim.output.period if self.continuous else self.cfg.ctrl.period
-        self.protection = Protection(self.cfg.protection, protection_period, current_base,
-                                     rms_available=bool(self.cfg.meas.rms))
+        self.protection = _parameterized(lambda values: Protection(
+            values[0].protection,
+            values[1].output.period if self.continuous else values[0].ctrl.period,
+            current_base(values[0]),
+            rms_available=bool(values[0].meas.rms)), (self.cfg, sim))
         self._trip_due = False
         self._track_due = False
         self._write_due: Optional[tuple[float, Any]] = None
@@ -114,17 +116,17 @@ class Unit(ABC):
             self.windowed = self._oversamples = False
             return
         meas = self.cfg.meas
-        period = protection_period if self.continuous else self.cfg.ctrl.period
-        sample_period = meas.period if meas.period is not None else period
         channels = {} if self.continuous else {name: channel_zeros[name] for name in meas.average}
-        self.adc = ADC(
+        self.adc = _parameterized(lambda values: ADC(
             ports,
-            period,
-            sample_period,
-            meas.window if meas.window is not None else period,
+            values[1].output.period if self.continuous else values[0].ctrl.period,
+            values[0].meas.period if values[0].meas.period is not None else (
+                values[1].output.period if self.continuous else values[0].ctrl.period),
+            values[0].meas.window if values[0].meas.window is not None else (
+                values[1].output.period if self.continuous else values[0].ctrl.period),
             channels,
-            rms=meas.rms,
-        )
+            rms=values[0].meas.rms,
+        ), (self.cfg, sim))
         self.windowed = self.adc.accumulating
         self.accumulate, self.restart_windows = self.adc.accumulate, self.adc.seed
         self._oversamples = self.adc.samples > 1
@@ -577,15 +579,15 @@ class VSC(Unit):
         self.scenario = sc = Scenario(cfg.events)
 
         # ------------------------------------------------------------ power
-        self.dclink = make_dclink(cfg.dclink)
+        self.dclink = _parameterized(make_dclink, cfg.dclink)
         t0 = sim.initial.t
         connected, since, ramp = sc.at(t0)
         self.dclink.connect(connected, since, ramp if t0 < since + ramp else 0.0)
         try:
-            self.bridge = make_bridge(cfg, modulator)
+            self.bridge = _parameterized(lambda c: make_bridge(c, modulator), cfg)
         except ValueError as exc:
             raise ValueError(f"{name}: {exc}") from None
-        self.branch_f = RLBranch(cfg.ac_filter.l_f, cfg.ac_filter.r_f)
+        self.branch_f = _parameterized(lambda c: RLBranch(c.l_f, c.r_f), cfg.ac_filter)
         self.continuous = bool(getattr(self.bridge, "continuous", False))
         self._diodes_warned = False
 
@@ -601,13 +603,13 @@ class VSC(Unit):
             sim,
             self.ports,
             {"u_g": 0j, "i_c": 0j, "u_dc": 0.0},
-            cfg.base.i_phase_peak,
+            lambda c: c.base.i_phase_peak,
         )
 
         # ------------------------------------------------------------ bridge actuation and control
         self.bridge.reset(np.full(3, 0.5), on=False)
         self.zoh = f"{name}.q"                   # model label of the bridge's held switching state
-        self.ctrl = ctrl if ctrl is not None else make_controller(cfg)
+        self.ctrl = ctrl if ctrl is not None else _parameterized(make_controller, cfg)
         if bool(getattr(self.ctrl, "continuous", False)) != self.continuous:
             raise TypeError(
                 f"{name}: the controller and bridge must both be sampled or both be continuous"
@@ -757,20 +759,20 @@ class DCConverter(Unit):
         self.scenario = Scenario(cfg.events)
         self.bus = bus
         topology = make_topology(cfg.bridge)
-        self.dclink = make_dclink(cfg.dclink)
+        self.dclink = _parameterized(make_dclink, cfg.dclink)
         connected, since, ramp = self.scenario.at(sim.initial.t)
         self.dclink.connect(
             connected,
             since,
             ramp if sim.initial.t < since + ramp else 0.0,
         )
-        self.branch_f = None if cfg.filter is None else RLBranch(
-            cfg.filter.l_f,
-            cfg.filter.r_f,
+        self.branch_f = None if cfg.filter is None else _parameterized(lambda c: RLBranch(
+            c.l_f,
+            c.r_f,
             phases=1,
             unilateral=topology.unilateral,
-        )
-        self.bridge = make_bridge(cfg, modulator, topology=topology)
+        ), cfg.filter)
+        self.bridge = _parameterized(lambda c: make_bridge(c, modulator, topology=topology), cfg)
         self._external_lower_rail = getattr(topology, "external_terminal", None) == "lower_rail"
         power_voltage_port = (bus, "u") if bus is not None else (self.bridge, "u_c")
         self._control_voltage_port = (
@@ -783,17 +785,18 @@ class DCConverter(Unit):
         self.conduction = None
         if (self.branch_f is not None and self.branch_f.unilateral
                 and cfg.bridge.model != "switching"):
-            self.conduction = HalfBridgeDiodeConduction(
-                cfg.pwm.switching_period,
-                self.branch_f.L,
-                self.branch_f.R,
+            self.conduction = _parameterized(lambda c: HalfBridgeDiodeConduction(
+                c.pwm.switching_period,
+                c.filter.l_f,
+                c.filter.r_f,
                 topology,
-            )
+            ), cfg)
             self.conduction.local_step_state = self.branch_f
             self.branch_f.use_external_conduction()
             self.bridge.use_current_transfer_ratios()
         self.continuous = bool(getattr(self.bridge, "continuous", False))
-        self.ctrl = ctrl if ctrl is not None else make_controller(cfg, topology=topology)
+        self.ctrl = ctrl if ctrl is not None else _parameterized(
+            lambda c: make_controller(c, topology=topology), cfg)
         if bool(getattr(self.ctrl, "continuous", False)) != self.continuous:
             raise TypeError(
                 f"{name}: the controller and bridge must both be sampled or both be continuous"
@@ -826,7 +829,7 @@ class DCConverter(Unit):
             sim,
             self.ports,
             channel_zeros,
-            cfg.dc_base.i,
+            lambda c: c.dc_base.i,
         )
 
     def subsystems(self) -> dict[str, Any]:

@@ -30,7 +30,7 @@ import numpy as np
 
 from ..assembly.events import EVENT_TYPES, SWITCHING, connected_at, switching_schedule
 from ..assembly.conduction import DiodeConduction
-from ..assembly.params import (Change, Params, _unit_at, _unit_items, _unit_leaves,
+from ..assembly.params import (Change, Params, _parameterized, _unit_at, _unit_items, _unit_leaves,
                                dump, dumps, load)
 from ..assembly.system import System
 from ..assembly.types import unit_type
@@ -407,7 +407,7 @@ class Simulation:
         for name, cfg in _unit_items(p.units):
             for key in (name, f"{name}.ctrl", f"{name}.modulator"):
                 if key in self._factories:
-                    unit_parts[key] = self._factories[key](cfg)
+                    unit_parts[key] = _parameterized(self._factories[key], cfg)
                 elif key in given:
                     unit_parts[key] = given[key]
         if "system" in self._factories:
@@ -605,8 +605,8 @@ class Simulation:
         """Return the state-table column names after ``t``, i.e. the valid ``initial.states`` keys."""
         return list(self._states.columns)
 
-    def _apply_initial(self, t0: float) -> np.ndarray:
-        """Load ``initial.states`` into the parts; return the solver vector."""
+    def _initial_values(self, t0: float) -> dict:
+        """Resolve explicit initial states and automatic bus presets without loading them."""
         system = self.system
         aliases = dict(getattr(system, "state_aliases", {}))
         presets_of = getattr(system, "state_presets", None)
@@ -629,6 +629,12 @@ class Simulation:
             if aliases:
                 msg += f". Aliases: {', '.join(f'{a} -> {c}' for a, c in aliases.items())}"
             raise ConfigError(msg) from None
+        return values
+
+    def _apply_initial(self, t0: float) -> np.ndarray:
+        """Load ``initial.states`` into the parts; return the solver vector."""
+        system = self.system
+        values = self._initial_values(t0)
         # 1. power stage (unset states stay zero), events up to t0, then the solver vector
         self._states.load(values, ["", *system.units])
         if hasattr(system, "switch"):
@@ -1222,7 +1228,7 @@ def main(argv=None) -> int:
                     help="output directory (default: output/<file name>, or "
                          "a bridge-mode suffix with --switching/--pwm-averaging/--averaging)")
     ap.add_argument("--export", nargs="+", default=None, metavar="FORMAT_OR_PARAM",
-                    help="export a standalone simulator: FORMAT followed by optional variable parameter paths")
+                    help="export a standalone simulator: FORMAT followed by parameter paths, common or all")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
                     help="print a progress line every SECONDS of simulated time")
     ap.add_argument("--watch", action="append", default=None, metavar="NAME",
@@ -1332,6 +1338,8 @@ def main(argv=None) -> int:
                                 variables=export_variables)
         except (TypeError, ValueError) as exc:
             ap.error(str(exc))
+        for diagnostic in result.diagnostics:
+            print("warning:", diagnostic["message"], file=sys.stderr)
         print("wrote", ", ".join(str(path) for path in result.files))
         return 0
     units = ", ".join(f"{n} ({u.ctrl.type}, {u.bridge.model.replace('_', ' ')}, "
@@ -1408,7 +1416,7 @@ def convert_main(argv=None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
     if values and values[0] in ("-h", "--help"):
         print("usage: peslite-convert PESFILE [PARAM ...] [--out DIRECTORY]")
-        print("export one self-contained peslite.cpp; PARAM may be a variable path or all")
+        print("export one self-contained peslite.cpp; PARAM may be a variable path, common or all")
         return 0
     if not values:
         print("usage: peslite-convert PESFILE [PARAM ...]", file=sys.stderr)

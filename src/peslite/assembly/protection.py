@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Any, Mapping, Optional, Sequence
 
 from ..control.blocks import HoldTimer, MovingWindow, peak_abs
-from ..solver.model import gather, scatter
+from ..solver.model import _real, gather, scatter
 
 __all__ = ["Protection", "ProtectionSample", "TripEvent", "ProtectionStats"]
 
@@ -62,7 +63,7 @@ class Protection:
     """
 
     def __init__(self, cfg: Any, T: float, i_base: float, *, rms_available: bool = False) -> None:
-        self.cfg, self.T, self.i_base = cfg, float(T), float(i_base)
+        self.cfg, self.T, self.i_base = cfg, _real(T), _real(i_base)
         self.trip: TripEvent | None = None
         self.fault = False
         self.stats = ProtectionStats()
@@ -76,10 +77,9 @@ class Protection:
         """Cache the enabled paths and rebuild a changed ROCOF window."""
         old_window = getattr(self, "_requested_rocof_window", None)
         if old_window != cfg.rocof.window:
-            n = max(1, int(cfg.rocof.window / self.T + 0.5))
             self._rocof = None
-            self._rocof_count = n
-            self._rocof_window = n * self.T
+            vars(self).pop("_rocof_count", None)
+            vars(self).pop("_rocof_window", None)
             self._requested_rocof_window = cfg.rocof.window
         self.fast_enabled = bool(cfg.overcurrent.enable)
         self.needs_frequency = bool(cfg.frequency.enable or cfg.rocof.enable)
@@ -91,6 +91,14 @@ class Protection:
         """Apply new settings without changing latches, timers or observations."""
         self._configure(cfg)
         self.cfg = cfg
+
+    @cached_property
+    def _rocof_count(self):
+        return max(1, int(self._requested_rocof_window / self.T + 0.5))
+
+    @cached_property
+    def _rocof_window(self):
+        return self._rocof_count * self.T
 
     @property
     def tripped(self) -> bool:

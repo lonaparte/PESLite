@@ -14,7 +14,7 @@ from typing import Any, Mapping
 import numpy as np
 from numpy.typing import NDArray
 
-from ..solver.model import ConfigError
+from ..solver.model import ConfigError, _real
 
 __all__ = ["A120", "abc2complex", "complex2abc", "phases", "complex_power",
            "unit_delay", "clamp", "smoothstep", "peak_abs",
@@ -101,7 +101,7 @@ class Integrator:
     def __init__(self, period: float | None, initial=0.0) -> None:
         if period is not None and (not math.isfinite(period) or period <= 0.0):
             raise ValueError(f"integrator period must be finite and positive, got {period}")
-        self.T = None if period is None else float(period)
+        self.T = None if period is None else _real(period)
         self.initial = initial
         self.value = initial
         self.derivative = initial * 0
@@ -161,8 +161,8 @@ class PI:
                  antiwindup: bool = True, initial=0.0) -> None:
         if period is not None and (not math.isfinite(period) or period <= 0.0):
             raise ValueError(f"PI period must be finite and positive, got {period}")
-        self.kp, self.ki = float(kp), float(ki)
-        self.T = None if period is None else float(period)
+        self.kp, self.ki = _real(kp), _real(ki)
+        self.T = None if period is None else _real(period)
         self.antiwindup_enabled = bool(antiwindup)
         self.initial = initial
         self.integral = initial
@@ -230,7 +230,7 @@ class OutputLimit:
 
     def __init__(self, limit, *, lower=None, pi=None, active=None, observer=None):
         self.pi = pi
-        self.limit = float(limit)
+        self.limit = _real(limit)
         self.lower = lower
         self.active = active
         self.observer = observer
@@ -272,7 +272,7 @@ class OutputLimit:
 
 def _coefficients(values, name: str) -> tuple[float, ...]:
     try:
-        result = tuple(float(value) for value in values)
+        result = tuple(_real(value) for value in values)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"filter {name} must be a finite coefficient sequence") from exc
     if not result or not all(math.isfinite(value) for value in result):
@@ -334,7 +334,7 @@ class Filter:
         )
         self.num, self.den = numerator, denominator
         self.order = order
-        self.T = None if period is None else float(period)
+        self.T = None if period is None else _real(period)
         self.derivative = ()
 
         if order == 0:
@@ -343,34 +343,34 @@ class Filter:
 
         # Observable canonical form.  It makes the state of a first-order low-pass filter equal
         # to its output, while remaining a general proper transfer-function realisation.
-        a = np.asarray(den_n[1:], dtype=float)
-        b0 = num_n[0]
-        dynamic_num = np.asarray(num_n[1:], dtype=float) - a * b0
-        A = np.zeros((order, order), dtype=float)
-        A[:, 0] = -a
-        if order > 1:
-            A[:-1, 1:] += np.eye(order - 1)
-        B = dynamic_num
-        C = np.zeros(order, dtype=float)
-        C[0] = 1.0
-        D = b0
-
         if order == 1:
+            a, d = -den_n[1], num_n[0]
+            b = num_n[1] + a * d
             values = (initial,) if not isinstance(initial, (tuple, list, np.ndarray)) else tuple(initial)
             if len(values) != 1:
                 raise ValueError("first-order filter initial state must contain one value")
             self.x0 = values[0]
             self._initial = values
             if self.T is None:
-                self._a, self._b, self._c, self._d = A[0, 0], B[0], C[0], D
+                self._a, self._b, self._c, self._d = a, b, 1.0, d
             else:
                 h = 0.5 * self.T
-                inv = 1.0 / (1.0 - h * A[0, 0])
-                self._ad = inv * (1.0 + h * A[0, 0])
-                self._bd = inv * self.T * B[0]
-                self._cd = C[0] * inv
-                self._dd = D + h * C[0] * inv * B[0]
+                inv = 1.0 / (1.0 - h * a)
+                self._ad = inv * (1.0 + h * a)
+                self._bd = inv * self.T * b
+                self._cd = inv
+                self._dd = d + h * inv * b
             return
+
+        a = np.asarray(den_n[1:], dtype=float)
+        b0 = num_n[0]
+        B = np.asarray(num_n[1:], dtype=float) - a * b0
+        A = np.zeros((order, order), dtype=float)
+        A[:, 0] = -a
+        A[:-1, 1:] += np.eye(order - 1)
+        C = np.zeros(order, dtype=float)
+        C[0] = 1.0
+        D = b0
 
         if isinstance(initial, (tuple, list, np.ndarray)):
             values = tuple(initial)

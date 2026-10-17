@@ -91,21 +91,80 @@ separate C++-only configuration.
 
 ## Exported variables
 
-The exact list depends on the selected solver and the entities in the case. The current backend can
-retain:
+Numerical inputs are discovered from the ordinary parameter schemas, not from a separate C++
+device whitelist. This includes network R/L/C, converter filters and DC supplies, WPT link
+inductances/capacitances/mutual inductance, controller gains and limits, references, protection
+thresholds and numerical timing/solver settings. The same paths apply to AC, DC and nested Units.
+You can select one field, a section, `all`, or `common`:
 
-- `simulation.t_end` and `simulation.output.period`;
-- `simulation.solver.dt` for a fixed solver;
-- `simulation.solver.rtol`, `atol` and `max_step` for adaptive DP45;
-- source voltage, frequency and angle;
-- controller reference fields for each unit.
+```bash
+peslite-convert buck-example elements.load units.converter.filter
+peslite-convert wpt-example all
+peslite-convert buck-example common
+```
 
-`all` means all parameters supported by this backend, not every field in the original file. Use the
-generated program's `--list-params` as the authoritative list.
+`common` means `all` minus the parameters identified by the existing structural sensitivity
+check. It keeps those detected parameters constant at their configured values; every other
+available numerical parameter remains adjustable. No separate parameter list is maintained.
+For the default Buck model this freezes `buses.output.r_d` and
+`units.converter.dclink.source.r`. The export diagnostic lists the actual exclusions, and
+`--list-params` lists the parameters still adjustable with `--set`. Use
+`variables=["common"]` for the same selection through the Python API.
 
-Runtime values are stored as direct typed fields. Configuration parsing and path lookup happen once
-before simulation and do not introduce dictionary lookup in the integration hot path. Exporting
-`all` mainly increases source and executable size; it does not change the simulated state layout.
+Selection uses one `all` analysis, then the ordinary constant specialization for the filtered
+set. It does not repeatedly search for more exclusions, and does not guarantee constant-build
+performance or detect every possible performance-sensitive parameter. If the check finds no
+sensitive parameters, `common` is equivalent to `all` and reuses that analysis.
+
+After compilation, use the same simulation-file paths:
+
+```bash
+./peslite --set elements.load.r=8 --set units.converter.filter.l_f=0.002
+```
+
+`all` retains the existing numerical leaves, including resolved numerical defaults. An omitted
+control period still follows the PWM period; omitted loop periods still follow the control period.
+Retaining a field does not make its default explicit. An actual `--set` or `--config` value does,
+just as an explicit value in a Python simulation file does. Saved configuration includes the
+effective values after these dependencies have been recomputed. `--list-params` is the authoritative
+list for a generated program. Unset optional fields with no numerical default are not invented.
+
+Types, connections, feature switches, initial-state specifications and event schedules remain structural.
+So do represented history dimensions: numerical periods/windows can change together, but a different
+ADC oversample count or RMS/ROCOF history size requires a new export. Parameter validation and
+checked initialization branches come from the ordinary schemas and constructors. Invalid values
+and changes outside the compiled specialization fail before simulation output is created.
+Clock changes that would alter an already initialized switching-edge sequence also require a new export.
+
+Runtime values are stored as direct typed fields. Component construction is recorded during export
+and replayed with parameter expressions, reusing the normal numerical initialization rather than
+another set of physical formulas. Derived coefficients, including PI/filter coefficients and the
+two-winding modal transform, are initialized once in the executable. Both equations and energy
+declarations use those values. Configuration parsing and path lookup do not enter the integration
+hot path. Unretained inputs remain constants and the simulated state layout is unchanged.
+Zero-coefficient dependency elimination also applies to retained parameters: a checked numerical
+condition selects the existing straight-line plan when feedback vanishes, and the ordinary
+algebraic solver remains in use otherwise. Retaining all parameters can still cost more than a
+fully constant build; select only the fields you need when maximum specialization matters.
+
+Export also reports retained parameters that control conditional dependencies inside algebraic
+loops. The command prints these diagnostics; the Python API exposes the same records through
+`project.diagnostics`, including `parameters`, `condition`, `dependencies` and `loop`. For example,
+the Buck model reports `buses.output.r_d` and `units.converter.dclink.source.r`, with their public
+input-to-output dependency paths. These names are discovered from the traced equations, not a
+device or parameter list. They remain adjustable with `--set`.
+
+The check reuses the existing equation trace and topological sort. Only cyclic residual graphs
+need SCC analysis. Products with parameter-only coefficients and parameter-controlled scalar
+branches identify conditional edges; reads that remain unconditional are not reported. Derived
+coefficients resolve through the existing initializer dependencies. No parameter-value sweep,
+simulation, Jacobian or runtime instrumentation is performed. Repeated lowering uses the cached
+result. An empty diagnostic list does not prove parameter insensitivity: opaque export hooks and
+code outside the supported scalar analysis remain unclassified. A diagnostic indicates a potential
+structural performance change, not a guaranteed slowdown or a numerical timing prediction. The
+`condition` describes suppression of one traced contribution, not necessarily the entire edge or
+loop; parallel contributions may need to vanish together. Reachability under all parameter
+validation constraints is not proved by this basic check.
 
 ## Results
 
@@ -158,6 +217,9 @@ Exporting an unrun `Simulation` reconstructs it with its `parts` factories witho
 caller. A supplied ready-made `system`, `solver` or other `instances` entry is rejected because it
 cannot be safely reconstructed from parameters. Solver replacements must match a supported solver
 and its configured numerical settings; they are never silently replaced by a default solver.
+With retained parameters, numerical customization must also be reproducible from the construction
+inputs. A later mutation of a recorded component that cannot be reproduced is rejected rather than
+silently overwritten by parameter initialization.
 Native execution adapters check the execution callbacks they replace and the implementation
 methods referenced by those callbacks. Unrelated presentation methods do not prevent export.
 Overrides of controller-host, solver or modulator execution need backend support and are rejected
@@ -175,9 +237,10 @@ Named measurement bindings, independent series/shunt resistors and configured RM
 the same assembly as Python. `set` events may change an element scalar declared by its
 `parameter_bindings()` contract; the built-in resistor declares `r`. The generated parameter is
 shared by output and energy equations, and a load step does not recreate electrical/controller
-state. This event support does not make the field a command-line `--set` variable: the retained
-variable list above remains authoritative. RMS protection uses the common trip path, not a WPT
-phase override.
+state. A retained initial resistance and a scheduled resistance step share that same model
+parameter. Starting a new run with different parameters is distinct from changing them during a
+run: event changes retain their existing state-continuity restrictions. RMS protection uses the
+common trip path, not a WPT phase override.
 
 ## Current limitations
 

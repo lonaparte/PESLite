@@ -6,10 +6,12 @@ import math
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
+import numpy as np
+
 from .pwm import TIME_EPS
 from ..control.blocks import MovingWindow
 from ..solver.energy import PowerPort, port_power, re_product
-from ..solver.model import Bag, Empty
+from ..solver.model import Bag, Empty, _real
 
 __all__ = ["ADCSample", "MeasurementPorts", "ADC"]
 
@@ -49,7 +51,7 @@ class _RMSWindow:
     """Sliding mean-square over complete sampling periods, integrated before sampling."""
 
     def __init__(self, period: float, length: float) -> None:
-        count = round(length / period)
+        count = int(round(length / period))
         if count < 1 or not math.isclose(length, count * period, rel_tol=1e-9):
             raise ValueError("an RMS window must contain whole sampling periods")
         self.period = period
@@ -149,7 +151,7 @@ class ADC:
         channels = dict(channels or {})
         if channels and (length is None or length <= 0.0):
             raise ValueError(f"an averaging window must be longer than zero, got {length}")
-        self.length = float(length) if channels else None  # None: instantaneous sampling
+        self.length = _real(length) if channels else None  # None: instantaneous sampling
         self.channels = tuple(channels)
         self._zero = channels
         self.accumulated = dict(channels)
@@ -192,7 +194,7 @@ class ADC:
         length = self.length
         self.window_open = length is None or self._full or t >= next_ - length - TIME_EPS
         if length is not None and held and self.window_open:
-            self.held_before(max(0.0, t - (next_ - length)))
+            self.held_before(_real(np.maximum(0.0, t - (next_ - length))))
         self.peeks = []
         if self.n_samp > 1:  # a new run between interrupts: earlier samples use its start values
             values = self.ports.read()

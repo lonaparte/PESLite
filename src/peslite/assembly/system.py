@@ -14,7 +14,7 @@ from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather
 from .events import SWITCHABLE, SWITCHING, SourceScenario
-from .params import Change, Params, _unit_at, _unit_leaves
+from .params import Change, Params, _parameterized, _set_assignments, _unit_at, _unit_leaves
 from .types import unit_type
 from .unit import DCConverter, Unit, VSC
 
@@ -123,14 +123,24 @@ class _WPTSignals:
         }
 
 
+def _source_scenario(p: Params, name: str) -> SourceScenario:
+    """Construct a source's complete waveform timeline from the common parameter tree."""
+    paths = {f"sources.{name}.{field}" for field in ("v", "f", "angle")}
+    steps = [(change.t, change.params.sources[name]) for change in p.changes
+             if any(path in paths for path, _ in _set_assignments(p, p.events[change.event]))]
+    return SourceScenario(p.sources[name], p.base.f0, steps)
+
+
 class _Source:
     """Voltage source (emf) behind a series R-L branch."""
 
-    def __init__(self, name: str, cfg, base, steps, t0: float) -> None:
+    def __init__(self, name: str, p: Params, t0: float) -> None:
+        cfg, base = p.sources[name], p.base
         self.name, self.cfg = name, cfg
-        self.scenario = SourceScenario(cfg, base.f0, steps)
-        self.emf = ThreePhaseSource(base.w0, *self.scenario.law(t0))
-        self.branch = RLBranch(cfg.l, cfg.r)
+        self.scenario = _source_scenario(p, name)
+        self.emf = _parameterized(
+            lambda b: ThreePhaseSource(b.w0, *self.scenario.law(t0)), base)
+        self.branch = _parameterized(lambda c: RLBranch(c.l, c.r), cfg)
 
     def retune(self, cfg, paths: list[str], t: float) -> None:
         """Apply changed source impedance, magnitude, frequency or angle at ``t``."""
@@ -256,7 +266,7 @@ def _assemble_wpt(name: str, cfg: Any, system: "System",
         raise ConfigError(
             f"parts.{name}: a composite WPT unit is assembled from its primary and secondary parts"
         )
-    link = make_wpt_link(cfg.link)
+    link = _parameterized(make_wpt_link, cfg.link)
     assembly = _UnitAssembly(
         subsystems={f"{name}.link": link},
         signal_sources=(_WPTSignals(name, link),),
@@ -309,24 +319,20 @@ class System:
         base = p.base
         # ---------------------------------------------------------- the elements
         # Three-phase buses start at one pu; scalar buses start de-energized unless overridden.
-        self.buses = {name: RCNode(
-                          cfg.c,
-                          cfg.r_d,
-                          u0=base.v_phase_peak if cfg.phases == 3 else 0.0,
-                          phases=cfg.phases,
-                      )
+        self.buses = {name: _parameterized(lambda values: RCNode(
+                          values[0].c,
+                          values[0].r_d,
+                          u0=values[1].v_phase_peak if values[0].phases == 3 else 0.0,
+                          phases=values[0].phases,
+                      ), (cfg, base))
                       for name, cfg in p.buses.items()}
-        self.branches = {name: RLBranch(
-                             cfg.l,
-                             cfg.r,
-                             phases=p.buses[cfg.bus1].phases,
-                         )
+        self.branches = {name: _parameterized(lambda values: RLBranch(
+                             values[0].l,
+                             values[0].r,
+                             phases=values[1],
+                         ), (cfg, p.buses[cfg.bus1].phases))
                          for name, cfg in p.branches.items()}
-        self.sources = {name: _Source(name, cfg, base, [
-                            (change.t, change.params.sources[name]) for change in p.changes
-                            if set(change.touches(f"sources.{name}.")) & {"v", "f", "angle"}],
-                            p.simulation.initial.t)
-                        for name, cfg in p.sources.items()}
+        self.sources = {name: _Source(name, p, p.simulation.initial.t) for name in p.sources}
         assembled = _UnitAssembly()
         for name, cfg in p.units.items():
             assembled.include(_assemble_unit(name, cfg, self, parts))
@@ -342,7 +348,9 @@ class System:
             name: [node.terminal] for name, node in self.buses.items()
         }
         network_buses = {**assembled.endpoints, **self.buses}
-        self.named_elements = {name: ELEMENT_TYPES[cfg.type](name, cfg, network_buses, p)
+        self.named_elements = {name: _parameterized(
+                                  lambda values, name=name: ELEMENT_TYPES[values[0].type](
+                                      name, values[0], network_buses, values[1]), (cfg, p))
                                for name, cfg in p.elements.items()}
 
         def resolve_bus(name: str) -> str:

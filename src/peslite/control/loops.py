@@ -12,14 +12,13 @@ Time is in s, angles in rad and frequencies in rad/s.
 
 from __future__ import annotations
 
-import cmath
 import math
 from dataclasses import dataclass, field, is_dataclass
 from typing import Any, ClassVar, Mapping, Optional
 
 import numpy as np
 
-from ..solver.model import ConfigError, assign, gather, join, scatter
+from ..solver.model import ConfigError, _complex, assign, gather, join, scatter
 from .blocks import Filter, Integrator, OutputLimit, PI, complex_power
 
 __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
@@ -923,7 +922,7 @@ class DVOC(SyncLaw):
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
         self.eta, self.alpha = cfg.eta_pu, cfg.alpha_pu
-        self.rot = cmath.exp(1j * cfg.kappa)
+        self.rot = _complex(np.exp(1j * cfg.kappa))
 
     def _sample(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
                 p_ref_pu, q_ref_pu, v_ref_pu, i_dq):

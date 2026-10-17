@@ -12,7 +12,7 @@ from typing import Any, ClassVar
 import numpy as np
 
 from ..solver.energy import PowerPort, StoragePort
-from ..solver.model import Bag, OutputMethod
+from ..solver.model import Bag, OutputMethod, _real
 from .network import Terminal
 
 __all__ = ["SSLink", "LCCLink", "make_wpt_link"]
@@ -57,21 +57,21 @@ class _CoupledLink:
 
     def __init__(self, primary_inductance: float, secondary_inductance: float,
                  mutual_inductance: float) -> None:
-        matrix = np.array(
-            [[primary_inductance, mutual_inductance],
-             [mutual_inductance, secondary_inductance]],
-            dtype=float,
-        )
-        values, vectors = np.linalg.eigh(matrix)
-        # Eigenvector signs are physically arbitrary.  Fix them so identical configurations
-        # produce identical state coordinates across supported NumPy versions.
-        for column in range(2):
-            pivot = int(np.argmax(np.abs(vectors[:, column])))
-            if vectors[pivot, column] < 0.0:
-                vectors[:, column] *= -1.0
-        self._inductance = (float(values[0]), float(values[1]))
-        self._mode_primary = (float(vectors[0, 0]), float(vectors[0, 1]))
-        self._mode_secondary = (float(vectors[1, 0]), float(vectors[1, 1]))
+        # Closed-form orthogonal diagonalization of this two-winding matrix. Scalar arithmetic
+        # keeps the same initialization available to parameterized standalone backends.
+        angle = 0.5 * np.arctan2(2.0 * mutual_inductance,
+                               primary_inductance - secondary_inductance)
+        cosine, sine = np.cos(angle), np.sin(angle)
+        mean = 0.5 * (primary_inductance + secondary_inductance)
+        radius = np.sqrt((0.5 * (primary_inductance - secondary_inductance)) ** 2
+                         + mutual_inductance ** 2)
+        first_sign = np.where(abs(sine) >= abs(cosine),
+                              np.where(sine > 0.0, -1.0, 1.0), 1.0)
+        second_sign = np.where(abs(sine) > abs(cosine),
+                               np.where(sine < 0.0, -1.0, 1.0), 1.0)
+        self._inductance = (_real(mean - radius), _real(mean + radius))
+        self._mode_primary = (_real(-sine * first_sign), _real(cosine * second_sign))
+        self._mode_secondary = (_real(cosine * first_sign), _real(sine * second_sign))
         self.inp = _LinkInp()
         self.out = _LinkOut()
         self.primary_terminal = Terminal(self, "u_primary", "i_primary", 1)
@@ -112,8 +112,8 @@ class SSLink(_CoupledLink):
         self.secondary_resistance = cfg.secondary_resistance
         self.state = _SSState()
         self.storage = (
-            StoragePort("i_mode_1", float(self._inductance[0]), kind="inductor"),
-            StoragePort("i_mode_2", float(self._inductance[1]), kind="inductor"),
+            StoragePort("i_mode_1", self._inductance[0], kind="inductor"),
+            StoragePort("i_mode_2", self._inductance[1], kind="inductor"),
             StoragePort("u_primary_cap", self.primary_capacitance, kind="capacitor"),
             StoragePort("u_secondary_cap", self.secondary_capacitance, kind="capacitor"),
         )
@@ -175,8 +175,8 @@ class LCCLink(_CoupledLink):
             StoragePort("i_secondary_comp", self.secondary_compensation_inductance, kind="inductor"),
             StoragePort("u_primary_parallel", self.primary_parallel_capacitance, kind="capacitor"),
             StoragePort("u_secondary_parallel", self.secondary_parallel_capacitance, kind="capacitor"),
-            StoragePort("i_mode_1", float(self._inductance[0]), kind="inductor"),
-            StoragePort("i_mode_2", float(self._inductance[1]), kind="inductor"),
+            StoragePort("i_mode_1", self._inductance[0], kind="inductor"),
+            StoragePort("i_mode_2", self._inductance[1], kind="inductor"),
             StoragePort("u_primary_series", self.primary_series_capacitance, kind="capacitor"),
             StoragePort("u_secondary_series", self.secondary_series_capacitance, kind="capacitor"),
         )

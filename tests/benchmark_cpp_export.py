@@ -38,6 +38,7 @@ def benchmark_cpp_export(config: str | Path, work: str | Path, *,
                          compiler: str | Sequence[str] | None = None,
                          t_end: float | None = None,
                          optimization: str = "-O3", cpp_repeats: int = 5,
+                         variables: Sequence[str] = (),
                          ) -> list[dict[str, float | int | str]]:
     """Build and time all bridge presets for one simulation file."""
     compiler_command = _compiler(compiler)
@@ -55,7 +56,7 @@ def benchmark_cpp_export(config: str | Path, work: str | Path, *,
         params = loaded.replace(**changes)
         project = root / mode
         start = time.perf_counter()
-        peslite.export(params, "cpp", project, name=mode)
+        peslite.export(params, "cpp", project, name=mode, variables=variables)
         export_seconds = time.perf_counter() - start
         executable = project / "peslite"
         start = time.perf_counter()
@@ -104,10 +105,12 @@ def main() -> int:
     parser.add_argument("--optimization", choices=("-O0", "-O1", "-O2", "-O3", "-Os"),
                         default="-O3")
     parser.add_argument("--cpp-repeats", type=int, default=5)
+    parser.add_argument("--variables", nargs="+", default=(),
+                        help="Parameter paths to retain, or 'all' (same as C++ export)")
     args = parser.parse_args()
     rows = benchmark_cpp_export(args.config, args.work, t_end=args.t_end,
                                 optimization=args.optimization,
-                                cpp_repeats=args.cpp_repeats)
+                                cpp_repeats=args.cpp_repeats, variables=args.variables)
     print("| mode | export | compile | Python | C++ | process | speedup | error | source | executable |")
     print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for row in rows:

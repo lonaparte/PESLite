@@ -189,11 +189,10 @@ class SourceScenario:
         self._v_from, self._v = [-math.inf], [cfg.v]
         changes = [(-math.inf, frequency(cfg), cfg.angle)]
         for event_t, value in sorted(steps, key=lambda step: step[0]):
-            if value.v != self._v[-1]:
-                self._v_from.append(event_t)
-                self._v.append(value.v)
-            if (frequency(value), value.angle) != changes[-1][1:]:
-                changes.append((event_t, frequency(value), value.angle))
+            # A currently redundant assignment can become meaningful after an initial override.
+            self._v_from.append(event_t)
+            self._v.append(value.v)
+            changes.append((event_t, frequency(value), value.angle))
 
         self._angle_from: list[float] = []
         self._angle: list[tuple[float, float, float]] = []

@@ -13,7 +13,7 @@ from numpy.typing import NDArray
 
 from ..control.blocks import smoothstep
 from ..solver.energy import PowerPort, StoragePort
-from ..solver.model import Bag, ConfigError, Empty, OutputMethod
+from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _real
 from .network import Terminal
 from .pwm import TIME_EPS, Modulator, PWM, ZOH, make_modulator
 
@@ -698,8 +698,8 @@ class DCCapacitor:
     """Capacitor ``C`` (F) with series resistance ``R_esr`` (ohm); current positive into the capacitor."""
 
     def __init__(self, u0: float, C: float, R_esr: float = 0.0) -> None:
-        self.C, self.R_esr = float(C), float(R_esr)
-        self.state = _DCState(u_C=float(u0))
+        self.C, self.R_esr = _real(C), _real(R_esr)
+        self.state = _DCState(u_C=_real(u0))
 
     def terminal_voltage(self, i: float) -> float:
         return self.state.u_C + self.R_esr * i
@@ -722,7 +722,7 @@ class DCCurrentSource:
     """
 
     def __init__(self, i_nom: float, k_dc: float = 0.0, u_ref: float = 0.0) -> None:
-        self.i_nom, self.k_dc, self.u_ref = float(i_nom), float(k_dc), float(u_ref)
+        self.i_nom, self.k_dc, self.u_ref = _real(i_nom), _real(k_dc), _real(u_ref)
         self.ramp: Optional[Callable[[float], float]] = None
 
     def connect(self, on: bool, t: float, ramp: float = 0.0) -> None:
@@ -746,7 +746,7 @@ class DCVoltageSource:
     """Constant dc voltage source ``u_dc`` (V) with series resistance ``R`` (ohm)."""
 
     def __init__(self, u_dc: float, R: float = 0.0) -> None:
-        self.u_dc, self.R = float(u_dc), float(R)
+        self.u_dc, self.R = _real(u_dc), _real(R)
 
     def terminal_voltage(self, i: float) -> float:
         return self.u_dc - self.R * i

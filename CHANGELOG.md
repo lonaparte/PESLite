@@ -2,6 +2,10 @@
 
 ## 0.4.0
 
+- Discovered retained C++ parameters from the ordinary schemas and recorded component construction,
+  removing the separate small device-parameter whitelist. Numerical physical/control parameters,
+  derived defaults, initialization and energy coefficients now share their normal parameter paths;
+  structural/history-layout changes remain checked specializations.
 - Reused assembled component output, derivative and energy equations during native export,
   preserving subclass hooks and unilateral-current clamping. Native algebraic loops now match
   the scalar secant solve and fail explicitly on nonconvergence. Export preserves construction

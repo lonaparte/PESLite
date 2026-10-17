@@ -10,8 +10,9 @@ import math
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import Any, Callable, ClassVar, Optional
 
+
 from ..solver.energy import PowerPort, StoragePort, port_power
-from ..solver.model import Bag, ConfigError, Empty, OutputMethod
+from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _complex, _real
 
 __all__ = [
     "Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
@@ -129,7 +130,7 @@ class RLBranch:
         self.power_scale = 1.5 if phases == 3 else 1.0
         self.zero = 0j if phases == 3 else 0.0
         self.unilateral = bool(unilateral)
-        initial = complex(i0) if phases == 3 else float(i0.real if isinstance(i0, complex) else i0)
+        initial = _complex(i0) if phases == 3 else _real(i0.real if isinstance(i0, complex) else i0)
         self.ports = (PowerPort("inp.u1", "out.i", self.power_scale, 1.0),
                       PowerPort("inp.u2", "out.i", self.power_scale, -1.0))
         self.storage = (StoragePort(
@@ -231,7 +232,7 @@ class RCNode:
         self.C, self.R_d = C, R_d
         self.phases = phases
         self.power_scale = 1.5 if phases == 3 else 1.0
-        initial = complex(u0) if phases == 3 else float(u0.real if isinstance(u0, complex) else u0)
+        initial = _complex(u0) if phases == 3 else _real(u0.real if isinstance(u0, complex) else u0)
         zero = 0j if phases == 3 else 0.0
         self.ports = (PowerPort("out.u", "inp.i", self.power_scale),)
         self.storage = (StoragePort("u_C", C, self.power_scale, (("inp.i", 1.0),)),)

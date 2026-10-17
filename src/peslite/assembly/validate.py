@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import warnings
+import numpy as np
 from dataclasses import fields, is_dataclass
 
 from typing import TYPE_CHECKING, Optional
@@ -30,7 +31,7 @@ __all__ = ["validate"]
 def _whole(r: float) -> bool:
     """Is ``r`` a whole number of at least one?"""
     n = round(r)
-    return n >= 1 and abs(r - n) <= 1e-9 * max(1.0, r)
+    return n >= 1 and abs(r - n) <= 1e-9 * np.maximum(1.0, r)
 
 
 def _switched(section, where: str) -> None:
@@ -79,7 +80,7 @@ def _pwm(w, base, where: str, continuous: bool = False) -> None:
         raise ConfigError(f"{where}.carrier_phase must be finite, got {w.carrier_phase}")
     if not continuous and w.sync == "synchronous":
         ratio = w.f_sw / base.f0
-        if abs(ratio - round(ratio)) > 1e-9 * max(1.0, ratio):
+        if abs(ratio - round(ratio)) > 1e-9 * np.maximum(1.0, ratio):
             raise ConfigError(f"{where}.sync = 'synchronous' needs an integer pulse ratio "
                               f"pwm.f_sw / base.f0, got {w.f_sw} / {base.f0} = {ratio}")
 
@@ -400,6 +401,11 @@ def _solver(s) -> None:
         raise ConfigError(f"simulation.solver.method {s.method!r} is not one of {FIXED_METHODS}")
     if s.type == "adaptive" and s.method not in ADAPTIVE_METHODS:
         raise ConfigError(f"simulation.solver.method {s.method!r} is not one of {ADAPTIVE_METHODS}")
+    names = ("dt",) if s.type == "fixed" else ("rtol", "atol", "max_step")
+    for name in names:
+        value = getattr(s, name)
+        if value <= 0.0 or math.isnan(value) or (name != "max_step" and not math.isfinite(value)):
+            raise ConfigError(f"simulation.solver.{name} must be positive")
     if s.sweeps < 1:
         raise ConfigError("simulation.solver.sweeps must be >= 1")
     if s.linearisations < 0:
@@ -476,6 +482,8 @@ def _initial(p: Params) -> None:
     from .params import _unit_items
 
     t0 = p.simulation.initial.t
+    if not math.isfinite(p.simulation.output.period) or p.simulation.output.period <= 0.0:
+        raise ConfigError("simulation.output.period must be finite and positive")
     if t0 < 0.0:
         raise ConfigError("simulation.initial.t must be >= 0")
     for name, u in _unit_items(p.units):

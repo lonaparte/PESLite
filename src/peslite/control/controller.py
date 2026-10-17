@@ -19,7 +19,7 @@ from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
-from ..solver.model import Bag, ConfigError, gather, scatter
+from ..solver.model import Bag, ConfigError, _complex, _real, gather, scatter
 from ..solver.energy import PowerPort, port_power
 from .blocks import OutputLimit, abc2complex, complex_power, peak_abs, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODULATION, POWER,
@@ -141,7 +141,7 @@ class Startup:
     """
 
     def __init__(self, T: float, run: bool = True, ramp: float = 0.0) -> None:
-        self.T = float(T)
+        self.T = _real(T)
         self.run = bool(run)
         self.ramp = float(ramp)
         self.steps = 0
@@ -299,7 +299,7 @@ class ControlGraph:
         self.nodes = {}
         self.periods = {}
         self.continuous = cfg.bridge.model == "averaging"
-        self._T = None if self.continuous else float(cfg.ctrl.period)
+        self._T = None if self.continuous else _real(cfg.ctrl.period)
         self._t0 = cfg.pwm.grid_offset
         self.values: dict[str, Any] = {}
         self._out_specs: dict[str, tuple] = {}
@@ -385,7 +385,7 @@ class ControlGraph:
             self._out_specs[name] = tuple((port, f"{name}.{port}", spec.complex_value)
                                           for port, spec in node.outputs.items())
             self.periods[name] = loop.period
-            self._store(name, node.initial_outputs())
+            self._store(name, node.initial_outputs(), real=_real, complex=_complex)
         self._samples = {name: node.sample for name, node in self.nodes.items()}
         dependencies = {name: set() for name in self.nodes}
         for name, node in self.nodes.items():
@@ -439,11 +439,16 @@ class ControlGraph:
         if self.continuous:
             self._prepare_flow()
         self._every = (() if self.continuous else
-                       tuple((name, max(1, int(round(T / self._T))))
+                       tuple((name, int(self.period_stride(T, self._T)))
                              for name, T in self.periods.items()))
         self._every_interrupt = (None if self.continuous else
                                  frozenset(name for name, every in self._every)
                                  if all(every == 1 for _name, every in self._every) else None)
+
+    @staticmethod
+    def period_stride(period, interrupt_period):
+        """Interrupt count per loop update; configuration validation requires an integer ratio."""
+        return np.maximum(1.0, np.rint(period / interrupt_period))
 
     def limit_output(self, name, port, limit):
         """Attach a controller-owned limit to one sampled loop output."""
@@ -539,7 +544,7 @@ class ControlGraph:
             elif owner == "references":
                 value = self.references[port]
                 self._boundary_sources[path] = (
-                    _CONSTANT, complex(value) if spec.complex_value else value
+                        _CONSTANT, _complex(value) if spec.complex_value else value
                 )
             else:  # ControlInterface is a package-owned declaration, not user input.
                 raise RuntimeError(f"unknown controller input owner {owner!r}")
@@ -743,7 +748,7 @@ class ControlGraph:
                 out[port] = key
         return out
 
-    def _store(self, name, outputs):
+    def _store(self, name, outputs, *, real=float, complex=complex):
         specs = self._out_specs[name]
         values = self.values
         isfinite = math.isfinite
@@ -753,7 +758,7 @@ class ControlGraph:
                 value = complex(value)
                 finite = isfinite(value.real) and isfinite(value.imag)
             else:
-                value = float(value)
+                value = real(value)
                 finite = isfinite(value)
             if not finite:
                 raise FloatingPointError(f"control loop {name}.{port} returned a non-finite value")
@@ -1263,7 +1268,7 @@ class VSCController(_GraphRuntime):
 
     def initial_sync(self):
         values = {**self.graph.values, **{f"references.{k}": v for k, v in self.graph.references.items()}}
-        return float(values[self.graph.outputs["theta"]]), float(values[self.graph.outputs["omega"]])
+        return _real(values[self.graph.outputs["theta"]]), _real(values[self.graph.outputs["omega"]])
 
     def track(self, meas):
         """Pre-synchronise grid-forming laws to an SI terminal sample."""
