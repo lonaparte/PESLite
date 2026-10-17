@@ -77,14 +77,15 @@ class Protection:
         old_window = getattr(self, "_requested_rocof_window", None)
         if old_window != cfg.rocof.window:
             n = max(1, int(cfg.rocof.window / self.T + 0.5))
-            self._rocof = MovingWindow(n)
+            self._rocof = None
+            self._rocof_count = n
             self._rocof_window = n * self.T
             self._requested_rocof_window = cfg.rocof.window
         self.fast_enabled = bool(cfg.overcurrent.enable)
         self.needs_frequency = bool(cfg.frequency.enable or cfg.rocof.enable)
         self.rms_enabled = bool(getattr(getattr(cfg, "rms_current", None), "enable", False))
-        if self.rms_enabled:
-            self._timers.setdefault("hold_rms", HoldTimer(self.T))
+        if self.rms_enabled and "hold_rms" not in self._timers:
+            self._timers["hold_rms"] = HoldTimer(self.T)
 
     def retune(self, cfg: Any) -> None:
         """Apply new settings without changing latches, timers or observations."""
@@ -157,6 +158,8 @@ class Protection:
         cfg, stats = self.cfg, self.stats
         freq_dev = sample.frequency_deviation
         if not self.tripped and freq_dev is not None:
+            if self._rocof is None:
+                self._rocof = MovingWindow(self._rocof_count)
             old = self._rocof.push(freq_dev)
             if old is not None:
                 rocof = (freq_dev - old) / self._rocof_window

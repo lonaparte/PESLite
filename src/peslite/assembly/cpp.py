@@ -8,30 +8,77 @@ standard library and never calls Python.
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import math
 import numbers
 import re
-from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields
+from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from ..components.converter import _BridgeModel, DCLink, DCVoltageSource
-from ..components.network import RCNode, RLBranch, ThreePhaseSource
+from ..components.converter import DCLink
+from ..components.network import RLBranch, ThreePhaseSource
 from ..components.pwm import CarrierComparison, SynchronousCarrier, ZOH
 from ..control.blocks import OutputLimit
 from ..control.controller import GraphController, VSCController
-from ..control.loops import DCVoltageControl, DVOC, SyncLaw, VSG
+from ..control.loops import DVOC, SyncLaw, VSG
 from ..solver.energy import re_product
+from ..solver.integrators import DormandPrince45, FixedStepSolver, TABLEAUS
 from .conduction import DiodeConduction
 from .params import _unit_items, _unit_leaves, _written_out, dumps
 from .exporter import ExportResult, _exporter
 from .types import unit_type
+from .unit import Plant
 
 __all__ = []
+
+
+_ALGEBRAIC_SOLVER = r'''
+#if defined(_MSC_VER)
+#define PESLITE_FORCEINLINE __forceinline
+#define PESLITE_INLINE_LAMBDA
+#elif defined(__GNUC__) || defined(__clang__)
+#define PESLITE_FORCEINLINE inline __attribute__((always_inline))
+#define PESLITE_INLINE_LAMBDA __attribute__((always_inline))
+#else
+#define PESLITE_FORCEINLINE inline
+#define PESLITE_INLINE_LAMBDA
+#endif
+
+template <typename Value, typename Sweep>
+PESLITE_FORCEINLINE void solve_algebraic(Sweep sweep, Value& current, Value& inverse, bool& has_inverse,
+                            int iterations, double rtol, double atol, double step_limit,
+                            const char* error) {
+    auto finite = [](Value x) {
+        return std::isfinite(std::real(x)) && std::isfinite(std::imag(x));
+    };
+    auto close = [&](Value a, Value b) {
+        return std::abs(a - b) <= atol + rtol * std::max({1.0, std::abs(a), std::abs(b)});
+    };
+    Value x0 = current, y0 = sweep(x0), r0 = y0 - x0;
+    if (close(y0, x0)) return;
+    Value x1 = has_inverse ? x0 - inverse * r0 : y0;
+    if (!finite(x1) || std::abs(x1 - x0) > step_limit * std::max({1.0, std::abs(x0), std::abs(y0)}))
+        x1 = y0;
+    for (int iteration = 0; iteration < iterations - 1; ++iteration) {
+        const Value y1 = sweep(x1), r1 = y1 - x1, denominator = r1 - r0;
+        if (denominator != Value{}) {
+            const Value estimate = (x1 - x0) / denominator;
+            if (finite(estimate)) { inverse = estimate; has_inverse = true; }
+        }
+        if (close(y1, x1)) { current = x1; return; }
+        Value x2 = has_inverse ? x1 - inverse * r1 : y1;
+        if (!finite(x2) || std::abs(x2 - x1) > step_limit * std::max({1.0, std::abs(x1), std::abs(y1)}))
+            x2 = y1;
+        x0 = x1; r0 = r1; x1 = x2;
+    }
+    throw std::runtime_error(error);
+}
+'''
 
 
 def _number(value: float) -> str:
@@ -56,6 +103,34 @@ def _identifier(value: str) -> str:
     return value
 
 
+def _uses_implementation(obj: Any, implementation: type, *operations: str) -> bool:
+    """Check only replaced execution paths and the implementation methods they reference."""
+    if not isinstance(obj, implementation):
+        return False
+    pending = list(operations or ("__call__",))
+    checked = set()
+    while pending:
+        name = pending.pop()
+        if name in checked:
+            continue
+        checked.add(name)
+        expected = inspect.getattr_static(implementation, name, None)
+        # Special methods use Python's type-level lookup, ordinary methods use the instance.
+        actual = inspect.getattr_static(type(obj) if name.startswith("__") else obj, name, None)
+        if getattr(actual, "__func__", actual) is not getattr(expected, "__func__", expected):
+            return False
+        function = expected.fget if isinstance(expected, property) else getattr(expected, "__func__", expected)
+        codes = [function.__code__] if hasattr(function, "__code__") else []
+        while codes:
+            code = codes.pop()
+            for field in code.co_names:
+                member = inspect.getattr_static(implementation, field, None)
+                if callable(member) or isinstance(member, (property, staticmethod, classmethod)):
+                    pending.append(field)
+            codes.extend(value for value in code.co_consts if inspect.iscode(value))
+    return True
+
+
 def _fields(record: Any) -> tuple[str, ...]:
     """Record fields in their declared order, including dynamic controller-state records."""
     names: list[str] = []
@@ -72,6 +147,32 @@ def _fields(record: Any) -> tuple[str, ...]:
 def _complex(value: complex) -> str:
     value = complex(value)
     return f"Complex{{{_number(value.real)}, {_number(value.imag)}}}"
+
+
+def _weighted_sum(weights, names) -> str:
+    """Unroll a shared RK coefficient row; no coefficient lookup reaches the executable."""
+    return " + ".join(name if weight == 1.0 else f"{_number(weight)} * {name}"
+                      for weight, name in zip(weights, names) if weight) or "0.0"
+
+
+def _fixed_step(method: str) -> str:
+    c, a, b = TABLEAUS[method]
+    names = tuple(f"k{index}" for index in range(len(c)))
+    lines = ["    inline void step(double& t, double h) {",
+             "        State " + ", ".join(f"{name}{{}}" for name in names)
+             + (", x{};" if len(c) > 1 else ";"),
+             f"        rhs(t, y, {names[0]});"]
+    for index in range(1, len(c)):
+        lines += ["        for (std::size_t i = 0; i < state_count; ++i) "
+                  f"x[i] = y[i] + h * ({_weighted_sum(a[index - 1], (name + '[i]' for name in names))});",
+                  f"        rhs(t + {_number(c[index])} * h, x, {names[index]});"]
+    factor = min(abs(value) for value in b if value)
+    weighted = _weighted_sum((value / factor for value in b),
+                             (name + "[i]" for name in names))
+    lines += ["        for (std::size_t i = 0; i < state_count; ++i) "
+              f"y[i] += (h / {_number(1.0 / factor)}) * ({weighted});",
+              "        t += h;", "    }"]
+    return "\n".join(lines)
 
 
 class _Expression:
@@ -118,14 +219,7 @@ class _Expression:
         return _Expression(f"(({self.code}) {op} ({right.code}))", self._result(self, right))
 
     def _rbinary(self, other: Any, op: str) -> "_Expression":
-        left = self.of(other)
-        if op == "+" and left.code == "0.0":
-            return self
-        if op == "*" and left.code == "1.0":
-            return self
-        if op == "*" and (left.code == "0.0" or self.code == "0.0"):
-            return _Expression("0.0", self._result(left, self))
-        return _Expression(f"(({left.code}) {op} ({self.code}))", self._result(left, self))
+        return self.of(other)._binary(self, op)
 
     def __add__(self, other: Any): return self._binary(other, "+")
     def __radd__(self, other: Any): return self._rbinary(other, "+")
@@ -379,6 +473,9 @@ class _ModelGenerator:
         self._unit_control_inputs: dict[int, dict[str, _Expression]] = {}
         self._unit_measurements: dict[int, dict[str, _Expression]] = {}
         self._solver_observations: dict[tuple[int, str], tuple[str, Any, str]] = {}
+        self._algebraic_index = {id(loop): index
+                                 for index, loop in enumerate(self.model.algebraic_loops)}
+        self._algebraic_plans: dict[int, tuple[str, ...] | None] = {}
         self.state_index: dict[tuple[int, str], tuple[int, bool]] = {
             (id(state), name): (index, is_complex)
             for state, name, index, is_complex in self.model._state_ops
@@ -411,6 +508,19 @@ class _ModelGenerator:
             id(unit.ctrl): _make_unit_generator(name, unit, self)
             for name, unit in self.system.units.items() if unit.continuous
         }
+        # Retain exactly the record fields read at the start of the next iterative solve.
+        self._algebraic_fields = {}
+        for loop in self.model.algebraic_loops:
+            if self._algebraic_plan(loop) is not None:
+                continue
+            for dst, field, src, source_field, fanin in loop.tears:
+                seeds = (((dst, field),) if len(loop.tears) == 1 else
+                         ((src, source_field),) if fanin is None else
+                         tuple((record, name) for record, name, _gain in fanin))
+                for record, name in seeds:
+                    self._algebraic_fields[id(record), name] = record
+        for key in self.state_index.keys() | self.zoh_fields.keys():
+            self._algebraic_fields.pop(key, None)
 
     def breaker_lines(self, branch: RLBranch, open_expression: str) -> list[str]:
         """Render the state transition implemented by ``RLBranch`` breaker methods."""
@@ -459,6 +569,11 @@ class _ModelGenerator:
             return self.record_fields[id(record)][field]
         except KeyError as exc:  # an exporter bug, not a configuration restriction
             raise RuntimeError(f"C++ export: unregistered record field {field!r}") from exc
+
+    def state_value(self, key: tuple[int, str]) -> str:
+        """Read one declared ODE state in solver scope, outside output evaluation."""
+        index, is_complex = self.state_index[key]
+        return f"Complex{{y[{index}], y[{index + 1}]}}" if is_complex else f"y[{index}]"
 
     def _literal(self, value: Any) -> str:
         if isinstance(value, complex):
@@ -527,6 +642,7 @@ class _ModelGenerator:
     def _equation_clone(self, owner: Any,
                         attributes: dict[str, _Expression] | None = None) -> Any:
         clone = copy.copy(owner)
+        records = {}
         for name, value in (vars(owner).items() if hasattr(owner, "__dict__") else ()):
             if getattr(value, "__self__", None) is owner:
                 setattr(clone, name, self._rebind(value, clone))
@@ -540,6 +656,15 @@ class _ModelGenerator:
                     "complex" if kind == "Complex" else "bool" if kind == "bool" else "real",
                 ))
             setattr(clone, role, record)
+            records[id(original)] = record
+        # Composite parts may alias a parent's state record (for example a DC capacitor).
+        # Preserve that alias in the equation copy without cloning the connected model graph.
+        for name, value in (vars(owner).items() if hasattr(owner, "__dict__") else ()):
+            record = records.get(id(getattr(value, "state", None)))
+            if record is not None:
+                part = copy.copy(value)
+                part.state = record
+                setattr(clone, name, part)
         for name, value in {**self._parameter_attributes.get(id(owner), {}),
                             **(attributes or {})}.items():
             setattr(clone, name, value)
@@ -596,10 +721,9 @@ class _ModelGenerator:
                             attributes: dict[str, _Expression] | None = None) -> str:
         """Trace a scalar capability for solver scope, where states are read from ``y``."""
         code = self.trace_scalar_method(sub, name, attributes)
-        for (record_id, field), (index, is_complex) in self.state_index.items():
+        for record_id, field in self.state_index:
             local = self.record_fields[record_id][field]
-            value = (f"Complex{{y[{index}], y[{index + 1}]}}" if is_complex
-                     else f"y[{index}]")
+            value = self.state_value((record_id, field))
             code = code.replace(local, value)
         for (record_id, field), held in self.zoh_fields.items():
             code = code.replace(self.record_fields[record_id][field], held)
@@ -636,12 +760,6 @@ class _ModelGenerator:
             observation_name = f"solver.{subsystem_name}.{role}.{field}"
             self._solver_observations[key] = (observation_name, record, field)
         return "obs_" + _identifier(self._solver_observations[key][0])
-
-    def _rl_derivative(self, sub: RLBranch, current: str, value: Any) -> str:
-        return (
-            f"({value('u1')} - {value('u2')} - {_number(sub.R)} * {current}) / "
-            f"{_number(sub.L)}"
-        )
 
     def trace_element_signals(self, element: Any) -> dict[str, _Expression]:
         return self.trace_element_values(element, element.signals)
@@ -685,12 +803,12 @@ class _ModelGenerator:
                     if name in declared:
                         continue
                     declared.add(name)
+                    if (id(record), field) in self._algebraic_fields:
+                        continue
                     state = self.state_index.get((id(record), field))
                     kind = self.record_types[id(record), field]
                     if state is not None:
-                        index, is_complex = state
-                        initial = (f"Complex{{y[{index}], y[{index + 1}]}}" if is_complex
-                                   else f"y[{index}]")
+                        initial = self.state_value((id(record), field))
                     elif (id(record), field) in self.zoh_fields:
                         initial = self.zoh_fields[id(record), field]
                     else:
@@ -753,66 +871,52 @@ class _ModelGenerator:
 
     def _output(self, method: Any) -> list[str]:
         owner = method.__self__
-        name = method.__name__
-        inp, out, state = owner.inp, owner.out, owner.state
-        if isinstance(owner, ThreePhaseSource):
+        out = owner.out
+        hook = getattr(owner, "cpp_outputs", None)
+        if hook is not None:
+            return list(hook(self))
+        if (isinstance(owner, ThreePhaseSource)
+                and method.__func__ is ThreePhaseSource.set_outputs):
             magnitude, phi = self._source_values(owner)
             return [
                 f"{self.value(out, 'phi')} = {phi};",
                 f"{self.value(out, 'theta')} = {_number(owner.w0)} * t + {self.value(out, 'phi')};",
                 f"{self.value(out, 'e_g')} = {magnitude} * Complex{{std::cos({self.value(out, 'theta')}), std::sin({self.value(out, 'theta')})}};",
             ]
-        if isinstance(owner, RLBranch):
-            return [f"{self.value(out, 'i')} = {self.value(state, 'i')};"]
-        if isinstance(owner, RCNode):
-            return [f"{self.value(out, 'u')} = {self.value(state, 'u_C')} + {_number(owner.R_d)} * {self.value(inp, 'i')};"]
-        if isinstance(owner, _BridgeModel):
-            return self.trace_outputs(method)
-        if isinstance(owner, DCLink):
-            return self._dclink_output(owner, name)
         generator = self.continuous_units.get(id(owner))
         if generator is not None:
             return generator.output_lines()
-        hook = getattr(owner, "cpp_outputs", None)
-        if hook is not None:
-            return list(hook(self))
         label = self.subsystem_name.get(id(owner), type(owner).__name__)
         try:
-            enabled = self.enabled_by.get(id(owner))
-            attributes = ({"enabled": _Expression(enabled, "bool")}
-                          if enabled is not None else None)
-            return self.trace_outputs(method, attributes)
+            return self.trace_outputs(method, self._equation_attributes(owner))
         except Exception as exc:
             raise TypeError(
                 f"C++ export: cannot lower the output equation of subsystem {label!r} "
                 f"({type(owner).__name__}): {exc}"
             ) from exc
 
-    def _dclink_output(self, link: DCLink, name: str) -> list[str]:
-        inp, out, state = link.inp, link.out, link.state
-        i_dc = self.value(inp, "i_dc")
-        u_dc, u_c, i_src = (self.value(out, field) for field in ("u_dc", "u_C", "i_src"))
-        cap, source = link.capacitor, link.source
-        if name == "set_stored_voltage":
-            value = self.value(state, "u_C") if cap is not None else _number(source.u_dc)
-            return [f"{u_c} = {value};"]
-        if cap is None:
-            return [f"{u_dc} = {u_c} = {_number(source.u_dc)} - {_number(source.R)} * {i_dc};",
-                    f"{i_src} = {i_dc};"]
-        stored = self.value(state, "u_C")
-        if source is None:
-            current = "0.0"
-        elif hasattr(source, "u_dc"):
-            current = (f"(dclink_tripped_{self.prefix[id(link)]} ? 0.0 : "
-                       f"({_number(source.u_dc)} - {stored} + {_number(cap.R_esr)} * {i_dc}) / "
-                       f"{_number(source.R + cap.R_esr)})")
-        else:
-            ramp = f"source_ramp_{self.prefix[id(link)]}(t)"
-            current = (f"(dclink_tripped_{self.prefix[id(link)]} ? 0.0 : "
-                       f"{ramp} * {_number(source.i_nom)} + {_number(source.k_dc)} * "
-                       f"({_number(source.u_ref)} - {stored}))")
-        return [f"{i_src} = {current};", f"{u_c} = {stored};",
-                f"{u_dc} = {stored} + {_number(cap.R_esr)} * ({i_src} - {i_dc});"]
+    def _equation_attributes(self, owner: Any) -> dict:
+        """Bind dynamic lifecycle values without restating component equations."""
+        attributes = {}
+        enabled = self.enabled_by.get(id(owner))
+        if enabled is not None:
+            attributes["enabled"] = _Expression(enabled, "bool")
+        if isinstance(owner, RLBranch):
+            attributes["breaker_open"] = _Expression(
+                f"breaker_open_{self.prefix[id(owner)]}", "bool"
+            )
+        if isinstance(owner, DCLink):
+            attributes["tripped"] = _Expression(
+                f"dclink_tripped_{self.prefix[id(owner)]}", "bool"
+            )
+            source = owner.source
+            if source is not None and hasattr(source, "i_nom"):
+                source = copy.copy(source)
+                source.ramp = lambda t: _Expression(
+                    f"source_ramp_{self.prefix[id(owner)]}({t.code})", "real"
+                )
+                attributes["source"] = source
+        return attributes
 
     def _operation(self, operation: tuple, indent: str = "") -> list[str]:
         kind, item = operation
@@ -825,7 +929,26 @@ class _ModelGenerator:
         raise RuntimeError(f"C++ export: unknown model operation {kind!r}")
 
     def _algebraic(self, loop: Any, indent: str) -> list[str]:
-        lines = [indent + "for (int algebraic_sweep = 0; algebraic_sweep < 16; ++algebraic_sweep) {"]
+        straight = self._algebraic_plan(loop)
+        if straight is not None:
+            return [indent + line for line in straight]
+        label = _cpp_string("algebraic loop did not converge: " + ", ".join(loop.labels))
+        if len(loop.tears) == 1:
+            tear, = loop.tears
+            index = self._algebraic_index[id(loop)]
+            current = self.value(tear[0], tear[1])
+            lines = [indent + f"solve_algebraic([&](auto x) PESLITE_INLINE_LAMBDA {{",
+                     indent + f"    {current} = x;"]
+            for operation in loop.operations:
+                lines.extend(self._operation(operation, indent + "    "))
+            lines += [indent + f"    return {self._copy_expression(tear)};",
+                      indent + f"}}, {current}, algebraic_inverse_{index}, "
+                      f"algebraic_has_inverse_{index}, {loop.max_sweeps}, "
+                      f"{_number(loop.rtol)}, {_number(loop.atol)}, "
+                      f"{_number(loop.step_limit)}, {label});"]
+            return lines
+        lines = [indent + "{", indent + "bool algebraic_converged = false;",
+                 indent + f"for (int algebraic_sweep = 0; algebraic_sweep < {loop.max_sweeps}; ++algebraic_sweep) {{"]
         for tear in loop.tears:
             lines.append(indent + "    " + f"{self.value(tear[0], tear[1])} = {self._copy_expression(tear)};")
         for operation in loop.operations:
@@ -834,35 +957,60 @@ class _ModelGenerator:
         for index, tear in enumerate(loop.tears):
             current = self.value(tear[0], tear[1])
             target = self._copy_expression(tear)
-            kind = self.record_types[id(tear[0]), tear[1]]
             delta = f"std::abs({current} - ({target}))"
             scale = f"std::max({{1.0, std::abs({current}), std::abs({target})}})"
-            checks.append(f"({delta} <= 1e-10 + 1e-8 * {scale})")
-        lines.append(indent + "    if (" + " && ".join(checks or ["true"]) + ") break;")
-        lines.append(indent + "}")
+            checks.append(f"({delta} <= {_number(loop.atol)} + {_number(loop.rtol)} * {scale})")
+        lines += [indent + "    if (" + " && ".join(checks or ["true"])
+                  + ") { algebraic_converged = true; break; }",
+                  indent + "}",
+                  indent + f"if (!algebraic_converged) throw std::runtime_error({label});",
+                  indent + "}"]
         return lines
 
+    def _algebraic_plan(self, loop: Any) -> tuple[str, ...] | None:
+        """Remove only feedback dependencies eliminated by parameter specialization.
+
+        The runtime model conservatively retains input dependencies even when a coefficient is
+        zero. Traced scalar assignments can then form a DAG instead of a genuine algebraic loop.
+        A standard topological sort emits that DAG once; other code keeps the shared solver.
+        """
+        key = id(loop)
+        if key in self._algebraic_plans:
+            return self._algebraic_plans[key]
+        self._algebraic_plans[key] = None
+        lines = []
+        for kind, item in loop.operations:
+            if kind == "algebraic":
+                return None
+            if kind == "out":
+                owner = item.__self__
+                if getattr(owner, "cpp_outputs", None) is not None:
+                    return None
+            lines.extend(self._operation((kind, item)))
+        lines.extend(f"{self.value(tear[0], tear[1])} = {self._copy_expression(tear)};"
+                     for tear in loop.tears)
+        assignments = {}
+        for line in lines:
+            match = re.fullmatch(r"(?:const (?:auto|double|Complex) )?(\w+) = (.+);", line)
+            if match is None or match[1] in assignments:
+                return None
+            assignments[match[1]] = (line, set(re.findall(r"\b\w+\b", match[2])))
+        targets = set(assignments)
+        try:
+            order = TopologicalSorter({
+                name: dependencies & targets
+                for name, (_line, dependencies) in assignments.items()
+            }).static_order()
+            plan = tuple(assignments[name][0] for name in order)
+        except CycleError:
+            return None
+        self._algebraic_plans[key] = plan
+        return plan
+
     def _rhs(self, sub: Any) -> list[str]:
-        state, inp, out = sub.state, sub.inp, sub.out
-        if isinstance(sub, RLBranch):
-            i = self.value(state, "i")
-            zero = ("Complex{0.0, 0.0}"
-                    if self.record_types[id(state), "i"] == "Complex" else "0.0")
-            value = lambda field: self.value(inp, field)
-            raw = (value("di_dt") if (sub, "di_dt") in self.model.connections
-                   else self._rl_derivative(sub, i, value))
-            if sub.unilateral:
-                raw = f"(({i} <= 0.0 && ({raw}) < 0.0) ? 0.0 : ({raw}))"
-            derivative = f"(breaker_open_{self.prefix[id(sub)]} ? {zero} : ({raw}))"
-            return [derivative]
-        if isinstance(sub, RCNode):
-            return [f"{self.value(inp, 'i')} / {_number(sub.C)}"]
-        if isinstance(sub, (ThreePhaseSource, _BridgeModel)):
-            return []
-        if isinstance(sub, DCLink):
-            if sub.capacitor is None:
-                return []
-            return [f"({self.value(out, 'i_src')} - {self.value(inp, 'i_dc')}) / {_number(sub.capacitor.C)}"]
+        hook = getattr(sub, "cpp_rhs", None)
+        if hook is not None:
+            return list(hook(self))
         generator = self.continuous_units.get(id(sub))
         if generator is not None:
             return generator.derivatives()
@@ -880,12 +1028,13 @@ class _ModelGenerator:
                 return list(hook(self))
             label = self.subsystem_name.get(id(sub), "controller")
             raise TypeError(f"C++ export: continuous controller {label!r} is not yet lowered")
-        hook = getattr(sub, "cpp_rhs", None)
-        if hook is not None:
-            return list(hook(self))
         label = self.subsystem_name.get(id(sub), type(sub).__name__)
         try:
-            return self.trace_rhs(sub)
+            method = sub.rhs
+            if (type(sub) is RLBranch and getattr(method, "__func__", None) in
+                    (RLBranch._rhs_ordinary, RLBranch._rhs_open, RLBranch._rhs_conduction)):
+                method = RLBranch.rhs.__get__(sub)
+            return self.trace_rhs(sub, method, self._equation_attributes(sub))
         except Exception as exc:
             raise TypeError(
                 f"C++ export: cannot lower the state equation of subsystem {label!r} "
@@ -918,7 +1067,19 @@ class _ModelGenerator:
         return lines
 
     def members(self) -> list[str]:
-        lines = []
+        lines = [f"{self.record_types[key]} {self.value(record, key[1])} = "
+                 f"{self._literal(getattr(record, key[1]))};"
+                 for key, record in self._algebraic_fields.items()]
+        for loop in self.model.algebraic_loops:
+            if len(loop.tears) == 1 and self._algebraic_plan(loop) is None:
+                tear, = loop.tears
+                index = self._algebraic_index[id(loop)]
+                kind = self.record_types[id(tear[0]), tear[1]]
+                inverse = loop._inverse
+                lines += [f"{kind} algebraic_inverse_{index} = "
+                          f"{self._literal(0.0 if inverse is None else inverse)};",
+                          f"bool algebraic_has_inverse_{index} = "
+                          f"{'false' if inverse is None else 'true'};"]
         for member, subsystem, attribute in self.element_parameters.values():
             lines.append(f"double {member} = {_number(getattr(subsystem, attribute))};")
         for label, targets in self.model._zoh_targets.items():
@@ -1044,6 +1205,13 @@ class _ControlGenerator:
         self.tag = _identifier(name)
         self.cfg, self.ctrl = unit.cfg, unit.ctrl
         self.graph = self.ctrl.graph
+        modulator = getattr(unit.bridge, "modulator", None)
+        if modulator is not None and not any(
+                _uses_implementation(modulator, cls)
+                for cls in (CarrierComparison, SynchronousCarrier, ZOH)):
+            raise TypeError(
+                f"C++ export: modulator {type(modulator).__name__!r} has no native adapter"
+            )
         self.prefix = f"{prefix}_{self.tag}_"
         reference_prefix = f"units.{name}.ctrl.references."
         self._changing_references = {
@@ -1068,33 +1236,22 @@ class _ControlGenerator:
     def d(self, name: str, field: str) -> str:
         return self.m(f"d_{name}_{field}")
 
-    def _sampled_loop_members(self) -> list[str]:
-        """Declare sampled loop state and carried runtime values from their own contracts."""
+    def _loop_members(self) -> list[str]:
+        """Declare loop-owned values; continuous ODE states already live in ``y``."""
         lines: list[str] = []
         for loop_name, node in self.graph.nodes.items():
-            for local, value in node.get_state().items():
+            states = {} if self.continuous else node.get_state()
+            for local, value in states.items():
                 kind = "Complex" if isinstance(value, complex) else "double"
                 lines.append(
                     f"{kind} {self.node(loop_name, local)} = {self._literal(value)};"
                 )
-            if isinstance(node, DCVoltageControl):
-                lines.append(
-                    f"bool {self.node(loop_name, 'limit_exceeded')} = "
-                    f"{'true' if node.limit_exceeded else 'false'};"
-                )
             for carried in node.carried:
-                value = getattr(node, carried)
-                if carried == "first_limit_t":
-                    lines.append(
-                        f"double {self.node(loop_name, carried)} = "
-                        f"{_number(value if value is not None else math.nan)};"
-                    )
-                    continue
-                kind = ("bool" if isinstance(value, bool) else
-                        "std::size_t" if isinstance(value, int) else
-                        "Complex" if isinstance(value, complex) else "double")
+                value = _Expression.of(getattr(node, carried))
+                kind = {"bool": "bool", "complex": "Complex", "real": "double"}[value.kind]
                 lines.append(
-                    f"{kind} {self.node(loop_name, carried)} = {self._literal(value)};"
+                    f"{kind} {self.node(loop_name, carried)} = "
+                    f"{value.code};"
                 )
         return lines
 
@@ -1184,7 +1341,7 @@ class _ControlGenerator:
                     setattr(cloned, name, getattr(block, name))
         return cloned
 
-    def _clone_loop(self, loop_name: str, node: Any) -> Any:
+    def _clone_loop(self, loop_name: str, node: Any, *, state_values: dict | None = None) -> Any:
         clone = copy.copy(node)
         if node.startup is not None:
             startup = copy.copy(node.startup)
@@ -1204,10 +1361,12 @@ class _ControlGenerator:
             target = clone if owner is node else cloned_owners[id(owner)]
             value = node.get_state()[public]
             kind = "complex" if isinstance(value, complex) else "real"
-            setattr(target, attribute, _Expression(self._state(loop_name, public), kind))
+            code = self._state(loop_name, public) if state_values is None else state_values[public]
+            setattr(target, attribute, _Expression(code, kind))
 
         clone._state_blocks = {
-            name: cloned_owners.get(id(block), self._copy_block(block))
+            name: (cloned_owners[id(block)] if id(block) in cloned_owners
+                   else self._copy_block(block))
             for name, block in node._state_blocks.items()
         }
         for attribute, value in vars(node).items():
@@ -1222,13 +1381,10 @@ class _ControlGenerator:
                     limit.pi = cloned_owners[id(limit.pi)]
                 setattr(clone, attribute, limit)
 
-        if not self.continuous:
-            for name in node.carried:
-                if name == "first_limit_t":
-                    continue
-                value = getattr(node, name)
-                kind = "bool" if isinstance(value, bool) else "real"
-                setattr(clone, name, _Expression(self.node(loop_name, name), kind))
+        for name in node.carried:
+            value = getattr(node, name)
+            member = self.node(loop_name, name)
+            setattr(clone, name, _Expression(member, _Expression.of(value).kind))
         return clone
 
     def _trace_loop(self, loop_name: str, node: Any) -> tuple[tuple[_Expression, ...],
@@ -1238,9 +1394,8 @@ class _ControlGenerator:
                        for port, spec in node.inputs.items())
         input_map = dict(zip(node.inputs, inputs))
         state_names = tuple(node.flow_state() if self.continuous else node.get_state())
-        carried = (() if self.continuous else
-                   tuple(name for name in node.carried if name != "first_limit_t"))
-        internal_limit = isinstance(node, DCVoltageControl)
+        carried = () if self.continuous else node.carried
+        internal_limit = self.continuous and loop_name in getattr(self.ctrl, "_flow_limits", {})
         external_limit = not self.continuous and loop_name in self.graph._limits
 
         def run():
@@ -1284,40 +1439,16 @@ class _ControlGenerator:
 
     def _loop_lines(self, loop_name: str, node: Any) -> list[str]:
         values, carried, internal_limit, external_limit = self._trace_loop(loop_name, node)
-        temporary = tuple(
-            self.m(f"value_{loop_name}_{index}") for index in range(len(values))
-        )
-        lines = [f"const auto {name} = {value.code};"
-                 for name, value in zip(temporary, values)]
-        n_outputs = len(node.outputs)
+        targets = [self.g(loop_name + '.' + port) for port in node.outputs]
         state_names = tuple(node.flow_state() if self.continuous else node.get_state())
-        n_states = len(state_names)
-        lines += [f"{self.g(loop_name + '.' + port)} = {value};"
-                  for port, value in zip(node.outputs, temporary[:n_outputs])]
-        state_values = temporary[n_outputs:n_outputs + n_states]
-        if self.continuous:
-            lines += [f"{self.d(loop_name, local)} = {value};"
-                      for local, value in zip(state_names, state_values)]
-        else:
-            lines += [f"{self._state(loop_name, local)} = {value};"
-                      for local, value in zip(state_names, state_values)]
-        offset = n_outputs + n_states
-        lines += [f"{self.node(loop_name, name)} = {value};"
-                  for name, value in zip(carried,
-                                         temporary[offset:offset + len(carried)])]
-        offset += len(carried)
+        targets += [self.d(loop_name, local) if self.continuous else self._state(loop_name, local)
+                    for local in state_names]
+        targets += [self.node(loop_name, name) for name in carried]
         if internal_limit:
-            target = (self.m(loop_name + "_limit_active") if self.continuous
-                      else self.node(loop_name, "limit_exceeded"))
-            lines.append(f"{target} = {temporary[offset]};")
-            offset += 1
-            if not self.continuous and "first_limit_t" in node.carried:
-                first = self.node(loop_name, "first_limit_t")
-                lines.append(
-                    f"if ({target} && !std::isfinite({first})) {first} = t;"
-                )
+            targets.append(self.node(loop_name, "limit_exceeded"))
         if external_limit:
-            lines.append(f"{self.m('command_saturated')} = {temporary[offset]};")
+            targets.append(self.m('command_saturated'))
+        lines = self._assign_values(f"value_{loop_name}", zip(targets, values, strict=True))
         if self.continuous:
             return lines
         period = self.graph.periods[loop_name]
@@ -1327,21 +1458,70 @@ class _ControlGenerator:
         guard = f"{self.m('pwm_k')} % {every} == 0"
         return [f"if ({guard}) {{", *["    " + line for line in lines], "}"]
 
+    def _assign_values(self, prefix: str, assignments) -> list[str]:
+        """Evaluate every new value before writing any destination, including aliased states."""
+        assignments = tuple(assignments)
+        temporary = tuple(self.m(f"{prefix}_{index}") for index in range(len(assignments)))
+        return ([f"const auto {name} = {value.code};"
+                 for name, (_target, value) in zip(temporary, assignments)]
+                + [f"{target} = {name};"
+                   for (target, _value), name in zip(assignments, temporary)])
+
+    def _flow_values(self, *, members: bool) -> list[str]:
+        """Only actual control-feedback outputs need warm-start storage across RHS calls."""
+        cyclic = {key for keys in self.graph._flow_cycle_keys.values() for key in keys}
+        return [f"{'Complex' if isinstance(value, complex) else 'double'} "
+                f"{self.g(key)} = {self._literal(value)};"
+                for key, value in self.graph.values.items() if (key in cyclic) == members]
+
+    def _flow_lines(self) -> list[str]:
+        """Lower the same controller SCC plan for every continuous control boundary."""
+        lines = []
+        graph = self.graph
+        for group in graph._continuous_plan:
+            emitted = [line for name in group
+                       for line in self._loop_lines(name, graph.nodes[name])]
+            if group not in graph._continuous_cycles:
+                lines.extend(emitted)
+                continue
+            keys = graph._flow_cycle_keys[group]
+            lines += ["{", "bool control_converged = false;",
+                      f"for (int control_sweep = 0; control_sweep < {graph._cycle_iterations}; ++control_sweep) {{"]
+            lines += [f"    const auto previous_{i} = {self.g(key)};"
+                      for i, key in enumerate(keys)]
+            lines += ["    " + line for line in emitted]
+            checks = [f"std::abs({self.g(key)} - previous_{i}) <= {_number(graph._cycle_atol)} + "
+                      f"{_number(graph._cycle_rtol)} * std::max({{1.0, std::abs({self.g(key)}), "
+                      f"std::abs(previous_{i})}})" for i, key in enumerate(keys)]
+            lines += ["    if (" + " && ".join(checks or ["true"])
+                      + ") { control_converged = true; break; }", "}",
+                      "if (!control_converged) throw std::runtime_error("
+                      + _cpp_string("continuous control algebraic loop did not converge: "
+                                    + ", ".join(group)) + ");", "}"]
+        return lines
+
     def _reset_integrators(self) -> list[str]:
-        """Trace each loop's own reset operation and assign only states it changes."""
+        """Trace the loop's reset and commit declared state and carried values together."""
         lines: list[str] = []
         for loop_name, node in self.graph.nodes.items():
             state_names = tuple(node.get_state())
+            state_values = {
+                local: (self.model.state_value((id(self.ctrl.state), f"{loop_name}.{local}"))
+                        if self.continuous else self._state(loop_name, local))
+                for local in state_names
+            }
 
             def run():
-                clone = self._clone_loop(loop_name, node)
+                clone = self._clone_loop(loop_name, node, state_values=state_values)
                 clone.reset_integrator()
                 state = clone.get_state()
-                return tuple(state[name] for name in state_names)
+                return (tuple(state[name] for name in state_names)
+                        + tuple(getattr(clone, name) for name in node.carried))
 
             values = tuple(self.model._trace(run))
+            assignments = []
             for local, value in zip(state_names, values):
-                current = self._state(loop_name, local)
+                current = state_values[local]
                 if value.code == current:
                     continue
                 if self.continuous:
@@ -1349,12 +1529,17 @@ class _ControlGenerator:
                         (id(self.ctrl.state), f"{loop_name}.{local}")
                     ]
                     if is_complex:
-                        lines += [f"y[{index}] = std::real({value.code});",
-                                  f"y[{index + 1}] = std::imag({value.code});"]
+                        assignments += [(f"y[{index}]", value.real),
+                                        (f"y[{index + 1}]", value.imag)]
                     else:
-                        lines.append(f"y[{index}] = {value.code};")
+                        assignments.append((f"y[{index}]", value))
                 else:
-                    lines.append(f"{current} = {value.code};")
+                    assignments.append((current, value))
+            for name, value in zip(node.carried, values[len(state_names):]):
+                current = self.node(loop_name, name)
+                if value.code != current:
+                    assignments.append((current, value))
+            lines += self._assign_values(f"reset_{loop_name}", assignments)
         return lines
 
     def limit_observation(self) -> list[str]:
@@ -1576,6 +1761,7 @@ class _ControlGenerator:
         values = tuple(f"q[{index}]" for index in range(self.width))
         encoded = self._topology_expression(self.topology.switching_state, values)
         q_kind = "Complex" if isinstance(self.topology.zero, complex) else "double"
+        minimum_interval = _number(self.bridge.modulator.min_interval)
         return f'''void make_switches_{self.tag}(double t, double span, double frequency,
         double phase, {q_kind}& held) {{
     if (!(frequency > 0.0)) throw std::runtime_error("PWM frequency is not positive");
@@ -1611,13 +1797,17 @@ class _ControlGenerator:
     for (const auto& edge : edges) {{
         const double at = std::get<0>(edge);
         q[std::get<1>(edge)] = std::get<2>(edge);
-        if (at - previous > 1e-12) {{
+        if (at - previous > {minimum_interval}) {{
             {self.m('switches')}.emplace_back(t + at, {encoded});
             previous = at;
         }} else if (!{self.m('switches')}.empty()) {{
             {self.m('switches')}.back().second = {encoded};
+        }} else {{
+            held = {encoded};
         }}
     }}
+    if (!{self.m('switches')}.empty() && span - previous <= {minimum_interval})
+        {self.m('switches')}.pop_back();
     {self.m('next_switch')} = {self.m('switches')}.empty()
         ? std::numeric_limits<double>::infinity() : {self.m('switches')}[0].first;
 }}
@@ -1764,7 +1954,8 @@ class _ProtectionGenerator:
             f"{observed(stats.terminal_voltage_min_pu)};",
             f"double {self.m('terminal_voltage_max')} = "
             f"{observed(stats.terminal_voltage_max_pu)};",
-            f"MovingWindow<{window}> {self.m('rocof_window')};",
+            *([f"MovingWindow<{window}> {self.m('rocof_window')};"]
+              if "frequency" in unit_type(self.cfg.type).protection_criteria else []),
             f"std::vector<std::string> {self.m('alarms')}"
             "{" + ", ".join(_cpp_string(value) for value in stats.alarms) + "};",
         ]
@@ -1995,14 +2186,9 @@ class _ACControlGenerator(_ProtectionGenerator, _ControlGenerator):
             ]
         loop_name = self.ctrl._dc
         if loop_name is not None:
-            if self.unit.continuous:
-                checks = self.m(loop_name + "_limit_checks")
-                exceeded = self.m(loop_name + "_limit_exceeded")
-                first = self.m(loop_name + "_limit_first_t")
-            else:
-                checks = self.node(loop_name, "n_updates")
-                exceeded = self.node(loop_name, "n_limit_exceeded")
-                first = self.node(loop_name, "first_limit_t")
+            checks = self.node(loop_name, "n_updates")
+            exceeded = self.node(loop_name, "n_limit_exceeded")
+            first = self.node(loop_name, "first_limit_t")
             lines += [
                 f'{stream} << ",\\n  \\"{name}.id_ref_limit_fraction\\": " << '
                 f'(static_cast<double>({exceeded}) / std::max<std::size_t>(1, {checks}));',
@@ -2045,9 +2231,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
             f"double {self.m('meas_u_dc')}{{}};",
             f"double {self.m('startup_value')}{{}};",
         ]
-        for key, value in self.graph.values.items():
-            kind = "Complex" if isinstance(value, complex) else "double"
-            lines.append(f"{kind} {self.g(key)} = {self._literal(value)};")
+        lines += self._flow_values(members=False)
         for loop_name, node in self.graph.nodes.items():
             for local, value in node.flow_state().items():
                 kind = "Complex" if isinstance(value, complex) else "double"
@@ -2058,6 +2242,8 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         startup = self.ctrl.startup
         lines = [
             *self.unit_members(),
+            *self._flow_values(members=True),
+            *self._loop_members(),
             f"bool {self.m('startup_run')} = {'true' if startup.run else 'false'};",
             f"double {self.m('startup_ramp')} = {_number(startup.ramp)};",
             f"double {self.m('startup_start')} = {_number(startup.start)};",
@@ -2071,33 +2257,23 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         for loop_name, node in self.graph.nodes.items():
             if isinstance(node, SyncLaw):
                 lines.append(f"double {self.m(loop_name + '_v_mag')} = {_number(node.v_mag)};")
-            elif isinstance(node, DCVoltageControl):
-                lines += [
-                    f"std::size_t {self.m(loop_name + '_limit_checks')} = {int(node.n_updates)};",
-                    f"std::size_t {self.m(loop_name + '_limit_exceeded')} = {int(node.n_limit_exceeded)};",
-                    f"double {self.m(loop_name + '_limit_first_t')} = "
-                    f"{_number(node.first_limit_t if node.first_limit_t is not None else math.nan)};",
-                    f"bool {self.m(loop_name + '_limit_active')} = false;",
-                ]
         lines += self._adc_members()
         return lines
 
     def limit_observation(self) -> list[str]:
         """Observe ideal-controller limits once per output snapshot, outside the RHS."""
         lines: list[str] = []
-        for loop_name, node in self.graph.nodes.items():
-            if not isinstance(node, DCVoltageControl):
-                continue
-            checks = self.m(loop_name + "_limit_checks")
-            exceeded = self.m(loop_name + "_limit_exceeded")
-            first = self.m(loop_name + "_limit_first_t")
-            active = self.m(loop_name + "_limit_active")
+        for loop_name, (_path, alarm, _node) in self.ctrl._flow_limits.items():
+            checks = self.node(loop_name, "n_updates")
+            exceeded = self.node(loop_name, "n_limit_exceeded")
+            first = self.node(loop_name, "first_limit_t")
+            active = self.node(loop_name, "limit_exceeded")
             lines += [
                 f"++{checks};",
                 f"if ({active}) {{",
                 f"    ++{exceeded};",
                 f"    if (!std::isfinite({first})) {first} = t;",
-                f"    alarm_{self.tag}(\"ID_REF_LIMIT\");",
+                f"    alarm_{self.tag}({_cpp_string(alarm)});",
                 "}",
             ]
         return lines
@@ -2125,18 +2301,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
             f"{self.m('meas_u_dc')} = {self.model.value(self.ctrl.inp, 'u_dc')} / {_number(self.cfg.dc_base.v)};",
             f"{self.m('startup_value')} = !{self.m('startup_run')} ? 0.0 : ({self.m('startup_ramp')} <= 0.0 ? 1.0 : smoothstep((t - {self.m('startup_start')}) / {self.m('startup_ramp')}));",
         ]
-        for group in self.graph._continuous_plan:
-            cyclic = group in self.graph._continuous_cycles
-            if cyclic:
-                lines.append("for (int control_sweep = 0; control_sweep < 16; ++control_sweep) {")
-            for loop_name in group:
-                emitted = self._loop_lines(loop_name, self.graph.nodes[loop_name])
-                lines += (["    " + line for line in emitted] if cyclic else emitted)
-            if cyclic:
-                # The outer Model algebraic solver also checks its electrical tear.  Fixed built-in
-                # controller SCCs are rare; sixteen allocation-free Gauss--Seidel sweeps match the
-                # configured Python bound without constructing a dynamic convergence vector.
-                lines.append("}")
+        lines += self._flow_lines()
         theta = self.source(self.graph.outputs["theta"])
         omega = self.source(self.graph.outputs["omega"])
         command = self.source(self.graph.outputs["u_dq"])
@@ -2194,7 +2359,8 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         dc = f"obs_{_identifier(self.name + '.u_dc')}"
         if self.cfg.meas.sources:
             observed, dc = self._adc_reading("u_g"), self._adc_reading("u_dc")
-        lines = [f"void sense_{self.tag}(double t) {{",
+        lines = [f"bool sense_{self.tag}(double t) {{",
+                 "    bool changed = false;",
                  *["    " + line for line in self._rms_sample_lines()],
                  f"    if ({self.m('track_due')}) {{"]
         for loop_name, node in self.graph.nodes.items():
@@ -2203,6 +2369,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
             index, _ = self.model.state_index[(id(self.ctrl.state), f"{loop_name}.theta")]
             magnitude = f"std::abs({observed}) / {_number(self.cfg.base.v_phase_peak)}"
             lines += [f"        if (std::abs({observed}) > 0.1) {{",
+                      "            changed = true;",
                       f"            y[{index}] += std::remainder(std::arg({observed}) - y[{index}], 2.0 * pi);",
                       f"            {self.m(loop_name + '_v_mag')} = {magnitude};"]
             if isinstance(node, (DVOC, VSG)) and (
@@ -2224,6 +2391,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
                   f"        {self.m('startup_run')} && ({self.m('startup_ramp')} <= 0.0 || "
                   f"t - {self.m('startup_start')} >= {self.m('startup_ramp')} - time_eps)"
                   f"{self._rms_protection_argument()});",
+                  "    return changed;",
                   "}"]
         return "\n".join(lines)
 
@@ -2280,7 +2448,7 @@ class _UnitGenerator(_ACControlGenerator):
         ]
         for key, value in graph.values.items():
             lines.append(f"{'Complex' if isinstance(value, complex) else 'double'} {self.g(key)} = {self._literal(value)};")
-        lines += self._sampled_loop_members()
+        lines += self._loop_members()
         if not unit.continuous:
             lines += self._pwm_members()
         return lines
@@ -2413,12 +2581,13 @@ class _UnitGenerator(_ACControlGenerator):
         next_expression = "std::min({" + ", ".join(next_values) + "})"
         lines = [
             f"double next_{self.tag}() const noexcept {{ return {next_expression}; }}",
-            f"void sense_{self.tag}(double t) {{",
+            f"bool sense_{self.tag}(double t) {{",
             f"    const bool control_due = std::abs(t - {self.m('t_interrupt')}) < time_eps;",
         ]
         lines += ["    " + line for line in self._adc_sense_lines()]
         lines += [
             f"    if (control_due) controller_{self.tag}(t);",
+            "    return false;",
             "}",
             f"bool actuate_{self.tag}(double t) {{",
             *["    " + line for line in self._pending_trip_lines()],
@@ -2532,9 +2701,7 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
         for path, value in self._control_inputs.items():
             kind = "Complex" if value.kind == "complex" else "double"
             lines.append(f"{kind} {self.m(self._measurement_name(path))}{{}};")
-        for key, value in self.graph.values.items():
-            kind = "Complex" if isinstance(value, complex) else "double"
-            lines.append(f"{kind} {self.g(key)} = {self._literal(value)};")
+        lines += self._flow_values(members=False)
         for loop_name, node in self.graph.nodes.items():
             for local, value in node.flow_state().items():
                 kind = "Complex" if isinstance(value, complex) else "double"
@@ -2545,6 +2712,7 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
         startup = self.ctrl.startup
         lines = [
             *self.unit_members(),
+            *self._loop_members(),
             f"bool {self.m('startup_run')} = {'true' if startup.run else 'false'};",
             f"double {self.m('startup_ramp')} = {_number(startup.ramp)};",
             *[f"double {self.m('log_' + key)} = std::numeric_limits<double>::quiet_NaN();"
@@ -2552,12 +2720,10 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
         ]
         if self.continuous:
             lines += [
+                *self._flow_values(members=True),
                 f"double {self.m('startup_start')} = {_number(startup.start)};",
                 f"double {self.m('startup_value')} = {_number(startup.value)};",
             ]
-            lines += [f"bool {self.m(loop_name + '_limit_active')} = false;"
-                      for loop_name, node in self.graph.nodes.items()
-                      if isinstance(node, DCVoltageControl)]
             lines += self._adc_members()
             return lines
         lines += [
@@ -2571,7 +2737,6 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
         for key, value in self.graph.values.items():
             kind = "Complex" if isinstance(value, complex) else "double"
             lines.append(f"{kind} {self.g(key)} = {self._literal(value)};")
-        lines += self._sampled_loop_members()
         lines += [*self._pwm_members(), *self._adc_members()]
         return lines
 
@@ -2609,15 +2774,7 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
             f"({self.m('startup_ramp')} <= 0.0 ? 1.0 : smoothstep("
             f"std::clamp((t - {self.m('startup_start')}) / {self.m('startup_ramp')}, 0.0, 1.0)));"
         ] if self.continuous else []
-        for group in self.graph._continuous_plan:
-            cyclic = group in self.graph._continuous_cycles
-            if cyclic:
-                lines.append("for (int control_sweep = 0; control_sweep < 16; ++control_sweep) {")
-            for loop_name in group:
-                emitted = self._loop_lines(loop_name, self.graph.nodes[loop_name])
-                lines += (["    " + line for line in emitted] if cyclic else emitted)
-            if cyclic:
-                lines.append("}")
+        lines += self._flow_lines()
         outputs = tuple(self.graph.interface.outputs)
         if len(outputs) != 1:
             raise TypeError(
@@ -2699,11 +2856,12 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
         lines = [
             f"double next_{self.tag}() const noexcept {{ return "
             f"std::min({{{', '.join(next_values)}}}); }}",
-            f"void sense_{self.tag}(double t) {{",
+            f"bool sense_{self.tag}(double t) {{",
             f"    const bool control_due = "
             f"std::abs(t - {self.m('t_interrupt')}) < time_eps;",
             *["    " + line for line in self._adc_sense_lines()],
             f"    if (control_due) controller_{self.tag}(t);",
+            "    return false;",
             "}",
             f"bool actuate_{self.tag}(double t) {{",
             *["    " + line for line in self._pending_trip_lines()],
@@ -2817,19 +2975,24 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
     def sense_method(self) -> str:
         voltage = f"obs_{_identifier(self.name + '.ctrl.meas.voltage')}"
         dc = f"obs_{_identifier(self.name + '.u_dc')}"
-        return f'''void sense_{self.tag}(double t) {{
+        return f'''bool sense_{self.tag}(double t) {{
     {chr(10).join(self._rms_sample_lines())}
     sampled_protect_{self.tag}(t, std::abs({voltage}) / {_number(self.cfg.dc_base.v)},
         0.0, {dc} / {_number(self.cfg.dc_base.v)} - 1.0,
         {self.m('startup_run')} && ({self.m('startup_ramp')} <= 0.0 ||
         t - {self.m('startup_start')} >= {self.m('startup_ramp')} - time_eps){self._rms_protection_argument()});
+    return false;
 }}'''
 
 def _make_unit_generator(name: str, unit: Any, model: _ModelGenerator) -> Any:
     """Select an optimized controller lowering or the public-port graph lowering."""
-    if isinstance(unit.ctrl, GraphController):
+    # These are the existing host execution callbacks replaced by native code. Follow their
+    # implementation dependencies; metadata readers invoked during export remain ordinary Python.
+    operations = ("__call__", "command", "command_at", "track", "retune", "set_logging", "set_outputs", "rhs",
+                  "continuous_log", "observe_limits", "summary")
+    if _uses_implementation(unit.ctrl, GraphController, *operations):
         return _GraphUnitGenerator(name, unit, model)
-    if isinstance(unit.ctrl, VSCController):
+    if _uses_implementation(unit.ctrl, VSCController, *operations):
         return (_ContinuousUnitGenerator(name, unit, model) if unit.continuous
                 else _UnitGenerator(name, unit, model))
     raise TypeError(
@@ -3058,34 +3221,14 @@ class _CppGenerator:
 
         def powers(check: Any) -> tuple[str, str]:
             sub = check.subsystem
-            if isinstance(sub, RCNode):
-                current = model.value(sub.inp, "i")
-                squared = (f"std::norm({current})" if sub.phases == 3
-                           else f"({current}) * ({current})")
-                return "0.0", f"{_number(sub.power_scale * sub.R_d)} * {squared}"
-            if isinstance(sub, ThreePhaseSource):
-                supplied = product(sub.out, "e_g", sub.inp, "i")
-                return f"1.5 * ({supplied})", "0.0"
-            if isinstance(sub, DCLink):
-                i_dc = model.value(sub.inp, "i_dc")
-                i_src = model.value(sub.out, "i_src")
-                supplied = (f"{_number(sub.source.u_dc)} * {i_src}"
-                            if isinstance(sub.source, DCVoltageSource)
-                            else f"{model.value(sub.out, 'u_dc')} * {i_src}")
-                losses = []
-                if sub.capacitor is not None:
-                    losses.append(f"{_number(sub.capacitor.R_esr)} * ({i_src} - {i_dc}) * ({i_src} - {i_dc})")
-                if isinstance(sub.source, DCVoltageSource):
-                    used = i_src if sub.capacitor is not None else i_dc
-                    losses.append(f"{_number(sub.source.R)} * {used} * {used}")
-                return supplied, " + ".join(losses) if losses else "0.0"
             hook = getattr(sub, "cpp_energy", None)
             if hook is not None:
                 supplied, dissipated = hook(model)
                 return str(supplied), str(dissipated)
             try:
-                return (model.trace_scalar_method(sub, "supplied_power"),
-                        model.trace_scalar_method(sub, "dissipated_power"))
+                attributes = model._equation_attributes(sub)
+                return (model.trace_scalar_method(sub, "supplied_power", attributes),
+                        model.trace_scalar_method(sub, "dissipated_power", attributes))
             except Exception as exc:
                 raise TypeError(
                     f"C++ export: cannot lower the energy equation of {check.name!r} "
@@ -3216,7 +3359,7 @@ class _CppGenerator:
         sense = []
         for name in unit_names:
             generator = sampled.get(name) or continuous.get(name)
-            sense += [f"sense_{generator.tag}(t);", "sync(t);"]
+            sense.append(f"if (sense_{generator.tag}(t)) sync(t);")
         actuate = [f"trip_now = actuate_{(sampled.get(name) or continuous[name]).tag}(t) || trip_now;"
                    for name in unit_names]
         protect = [f"trip_now = protect_{(sampled.get(name) or continuous[name]).tag}(t) || trip_now;"
@@ -3226,6 +3369,9 @@ class _CppGenerator:
         adc_accumulate = [line for line in adc_accumulate if line]
         adc_seed = [line for generator in (*sampled.values(), *continuous.values())
                     for line in generator.adc_seed_lines()]
+        # Exact-edge loops have a larger event body; keep their observation refresh out of line.
+        sync_qualifier = ("PESLITE_NOINLINE" if any(unit.bridge.has_switching_events
+                          for unit in self.system.units.values()) else "inline")
         sync_template = "template <bool seed_adc = false>" if adc_seed else ""
         sync_update = observations
         if adc_seed:
@@ -3348,42 +3494,20 @@ class _CppGenerator:
         adaptive_max_step = self.runtime.value("simulation.solver.max_step", solver.max_step)
         adaptive_atol = self.runtime.value("simulation.solver.atol", solver.atol)
         adaptive_rtol = self.runtime.value("simulation.solver.rtol", solver.rtol)
+        adaptive_safety = _number(self.simulation.solver.safety) if adaptive else ""
         run_end = self.runtime.value("simulation.t_end", self.p.simulation.t_end)
         output_period_value = self.runtime.value("simulation.output.period", output.period)
+        integration_name = "integrate_solver" if diode_conduction else "integrate"
+        local_limit = bool(diode_step_limits and not diode_current_states)
+        integration_args = ", double maximum_step" if local_limit else ""
+        if local_limit:
+            fixed_dt = f"std::min({fixed_dt}, maximum_step)"
+            adaptive_max_step = f"std::min({adaptive_max_step}, maximum_step)"
         if fixed:
-            if solver.method == "euler":
-                step_code = '''    inline void step(double& t, double h) {
-        State a{};
-        rhs(t, y, a);
-        for (std::size_t i = 0; i < state_count; ++i) y[i] += h * a[i];
-        t += h;
-    }'''
-            elif solver.method == "heun":
-                step_code = '''    inline void step(double& t, double h) {
-        State a{}, b{}, x{};
-        rhs(t, y, a);
-        for (std::size_t i = 0; i < state_count; ++i) x[i] = y[i] + h * a[i];
-        rhs(t + h, x, b);
-        for (std::size_t i = 0; i < state_count; ++i) y[i] += 0.5 * h * (a[i] + b[i]);
-        t += h;
-    }'''
-            else:
-                step_code = '''    inline void step(double& t, double h) {
-        State a{}, b{}, c{}, d{}, x{};
-        rhs(t, y, a);
-        for (std::size_t i = 0; i < state_count; ++i) x[i] = y[i] + 0.5 * h * a[i];
-        rhs(t + 0.5 * h, x, b);
-        for (std::size_t i = 0; i < state_count; ++i) x[i] = y[i] + 0.5 * h * b[i];
-        rhs(t + 0.5 * h, x, c);
-        for (std::size_t i = 0; i < state_count; ++i) x[i] = y[i] + h * c[i];
-        rhs(t + h, x, d);
-        for (std::size_t i = 0; i < state_count; ++i)
-            y[i] += (h / 6.0) * (a[i] + 2.0 * (b[i] + c[i]) + d[i]);
-        t += h;
-    }'''
+            step_code = _fixed_step(solver.method)
             solver_code = step_code + f'''
 
-    void integrate(double& t, double target) {{
+    void {integration_name}(double& t, double target{integration_args}) {{
         const double span = target - t;
         if (span <= 0.0) return;
         const std::size_t count = std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(span / {fixed_dt} - 1e-9)));
@@ -3393,7 +3517,15 @@ class _CppGenerator:
         t = target;
     }}'''
         else:
-            solver_code = f'''    void integrate(double& t, double target) {{
+            actual = self.simulation.solver
+            c, a, b, e = actual._c, actual._a, actual._b, actual._e
+            names = tuple(f"k{index + 1}[i]" for index in range(len(c)))
+            stages = []
+            for index in range(1, len(c) - 1):
+                stages += ["            for (std::size_t i = 0; i < state_count; ++i) "
+                           f"x[i] = y[i] + h * ({_weighted_sum(a[index], names)});",
+                           f"            rhs(t + h * {_number(c[index])}, x, k{index + 1});"]
+            solver_code = f'''    void {integration_name}(double& t, double target{integration_args}) {{
         const double span = target - t;
         if (span <= 0.0) return;
         double h = std::isfinite(adaptive_h) ? adaptive_h : span;
@@ -3403,34 +3535,25 @@ class _CppGenerator:
         const double end_epsilon = 1e-15 * std::max(1.0, std::abs(target));
         while (t < target - end_epsilon) {{
             if (t + h > target) h = target - t;
-            for (std::size_t i = 0; i < state_count; ++i) x[i] = y[i] + h * (1.0 / 5.0) * k1[i];
-            rhs(t + h * (1.0 / 5.0), x, k2);
-            for (std::size_t i = 0; i < state_count; ++i) x[i] = y[i] + h * ((3.0 / 40.0) * k1[i] + (9.0 / 40.0) * k2[i]);
-            rhs(t + h * (3.0 / 10.0), x, k3);
-            for (std::size_t i = 0; i < state_count; ++i) x[i] = y[i] + h * ((44.0 / 45.0) * k1[i] - (56.0 / 15.0) * k2[i] + (32.0 / 9.0) * k3[i]);
-            rhs(t + h * (4.0 / 5.0), x, k4);
-            for (std::size_t i = 0; i < state_count; ++i) x[i] = y[i] + h * ((19372.0 / 6561.0) * k1[i] - (25360.0 / 2187.0) * k2[i] + (64448.0 / 6561.0) * k3[i] - (212.0 / 729.0) * k4[i]);
-            rhs(t + h * (8.0 / 9.0), x, k5);
-            for (std::size_t i = 0; i < state_count; ++i) x[i] = y[i] + h * ((9017.0 / 3168.0) * k1[i] - (355.0 / 33.0) * k2[i] + (46732.0 / 5247.0) * k3[i] + (49.0 / 176.0) * k4[i] - (5103.0 / 18656.0) * k5[i]);
-            rhs(t + h, x, k6);
-            for (std::size_t i = 0; i < state_count; ++i) y1[i] = y[i] + h * ((35.0 / 384.0) * k1[i] + (500.0 / 1113.0) * k3[i] + (125.0 / 192.0) * k4[i] - (2187.0 / 6784.0) * k5[i] + (11.0 / 84.0) * k6[i]);
+{chr(10).join(stages)}
+            for (std::size_t i = 0; i < state_count; ++i) y1[i] = y[i] + h * ({_weighted_sum(b, names)});
             rhs(t + h, y1, k7);
             double error = 0.0;
             for (std::size_t i = 0; i < state_count; ++i) {{
-                const double estimate = std::abs(h * ((71.0 / 57600.0) * k1[i] - (71.0 / 16695.0) * k3[i] + (71.0 / 1920.0) * k4[i] - (17253.0 / 339200.0) * k5[i] + (22.0 / 525.0) * k6[i] - (1.0 / 40.0) * k7[i]));
+                const double estimate = std::abs(h * ({_weighted_sum(e, names)}));
                 error = std::max(error, estimate / ({adaptive_atol} + {adaptive_rtol} * std::max(std::abs(y[i]), std::abs(y1[i]))));
             }}
             if (error <= 1.0 || h <= 1e-15) {{
                 t += h;
                 y = y1;
                 k1 = k7;
-                double factor = error == 0.0 ? 5.0 : 0.9 * std::pow(error, -0.14) * std::pow(adaptive_error, 0.08);
+                double factor = error == 0.0 ? 5.0 : {adaptive_safety} * std::pow(error, -0.14) * std::pow(adaptive_error, 0.08);
                 factor = std::clamp(factor, 0.2, 5.0);
                 adaptive_error = std::max(error, 1e-4);
                 h = std::min(h * factor, {adaptive_max_step});
             }} else {{
                 ++n_rejected;
-                h *= std::max(0.1, 0.9 * std::pow(error, -0.25));
+                h *= std::max(0.1, {adaptive_safety} * std::pow(error, -0.25));
             }}
         }}
         adaptive_h = h;
@@ -3455,23 +3578,6 @@ class _CppGenerator:
         )
         diode_advance_body = ""
         if diode_step_limits and not diode_current_states:
-            solver_code = solver_code.replace(
-                "void integrate(double& t, double target)",
-                "void integrate_solver(double& t, double target, double maximum_step)",
-            )
-            if fixed:
-                solver_code = solver_code.replace(
-                    f"span / {fixed_dt} - 1e-9",
-                    f"span / std::min({fixed_dt}, maximum_step) - 1e-9",
-                )
-            else:
-                solver_code = solver_code.replace(
-                    f"std::min(span, {adaptive_max_step})",
-                    f"std::min(span, std::min({adaptive_max_step}, maximum_step))",
-                ).replace(
-                    f"std::min(h * factor, {adaptive_max_step})",
-                    f"std::min(h * factor, std::min({adaptive_max_step}, maximum_step))",
-                )
             diode_advance_body = f'''
             double diode_step = target - t;
             {diode_step_update}
@@ -3503,10 +3609,6 @@ class _CppGenerator:
                 zeroes.append(
                     f"if (std::abs(root_{index} - first) <= 2e-14) sim.y[{index}] = 0.0;"
                 )
-            solver_code = solver_code.replace(
-                "void integrate(double& t, double target)",
-                "void integrate_solver(double& t, double target)",
-            )
             diode_advance_body = f'''
             double diode_step = target - t;
             {diode_step_update}
@@ -3546,9 +3648,9 @@ class _CppGenerator:
     }};'''
             advance_method = "diode_conduction.advance"
             diode_declaration = "DiodeConduction diode_conduction(*this);"
-        adaptive_members = ('''std::size_t n_rejected = 0;
-    double adaptive_h = std::numeric_limits<double>::quiet_NaN();
-    double adaptive_error = 1.0;''' if adaptive else "")
+        adaptive_members = (f'''std::size_t n_rejected = 0;
+    double adaptive_h = {_number(math.nan if self.simulation.solver._h is None else self.simulation.solver._h)};
+    double adaptive_error = {_number(self.simulation.solver._err_prev)};''' if adaptive else "")
         # The execution backend is deliberately emitted as one TU: whole-program optimisation can
         # inline the configured RHS and remove unused output paths without crossing a library ABI.
         return f'''// Generated by PESLite.  Do not edit: regenerate from the source simulation file.
@@ -3573,6 +3675,15 @@ class _CppGenerator:
 #include <utility>
 #include <vector>
 
+// Keep observation refreshes out of the numerical hot loop's instruction footprint.
+#if defined(_MSC_VER)
+#define PESLITE_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define PESLITE_NOINLINE __attribute__((noinline))
+#else
+#define PESLITE_NOINLINE
+#endif
+
 namespace peslite_generated {{
 
 using Complex = std::complex<double>;
@@ -3580,6 +3691,8 @@ constexpr std::size_t state_count = {len(state_names)};
 using State = std::array<double, state_count>;
 constexpr double pi = 3.141592653589793238462643383279502884;
 constexpr double time_eps = 1e-10;
+
+{_ALGEBRAIC_SOLVER if any(len(loop.tears) == 1 for loop in self.model.algebraic_loops) else ""}
 
 template <std::size_t N> struct MovingWindow {{
     std::array<double, N> buf{{}};
@@ -3782,7 +3895,7 @@ public:
 
 {projection_method}
     {sync_template}
-    inline void sync(double t) {{
+    {sync_qualifier} void sync(double t) {{
         {sync_body}
         {sync_update}
     }}
@@ -3852,16 +3965,19 @@ public:
             }}
             sync(t);
             {' '.join(adc_accumulate)}
+            bool actions_applied = false;
             while (action_index < action_times.size() && action_times[action_index] <= t + time_eps) {{
                 apply_action(action_index, t);
+                actions_applied = true;
                 ++action_index;
             }}
-            sync(t);
+            if (actions_applied) sync(t);
             bool trip_now = false;
             {' '.join(protect)}
             if constexpr ({'true' if self.p.simulation.stop_on_trip else 'false'}) {{
                 if (trip_now) {{ snapshot(true); break; }}
             }}
+            if (trip_now) sync(t);
             {' '.join(sense)}
             if constexpr ({'true' if output.signals else 'false'}) {{
                 {sampled_ctrl_text}
@@ -3964,41 +4080,38 @@ def _export_cpp(simulation: Any, out_dir: Path, name: str,
     # probe with the real initial held inputs and controller state.
     from ..solver.simulation import Simulation
 
-    prepared = simulation if reusable else Simulation(simulation.p)
+    if not simulation._rebuildable:
+        raise TypeError(
+            "C++ export cannot safely reconstruct supplied instances; use parts factories instead"
+        )
+    prepared = simulation if reusable else Simulation(simulation.p, parts=simulation._factories)
     if prepared.p.simulation.solver.subsystems:
         raise TypeError(
             "C++ export does not yet lower multirate subsystem schedules; use a single-rate "
             "fixed or DP45 solver for the exported simulator"
         )
+    settings = prepared.p.simulation.solver
+    actual = prepared.solver
+    supported = (_uses_implementation(actual, FixedStepSolver)
+                 and settings.type == "fixed"
+                 and actual.method == settings.method and actual.dt == settings.dt)
+    supported = supported or (_uses_implementation(actual, DormandPrince45)
+                              and settings.type == "adaptive" and settings.method == "DP45"
+                              and (actual.rtol, actual.atol, actual.max_step)
+                              == (settings.rtol, settings.atol, settings.max_step))
+    if not supported:
+        raise TypeError("C++ export needs a supported solver matching simulation.solver; "
+                        "a solver replacement cannot be silently substituted")
     t0 = prepared.p.simulation.initial.t
     model = prepared.system.model
     y = prepared._apply_initial(t0)
-    synced_at: float | None = None
+    project = model.project_states if model.has_state_bounds else None
+    plant = Plant(model, project(y) if project is not None else y, project=project)
+    prepared._begin_units(t0, plant)
+    plant.outputs(t0)
 
-    def outputs(t: float) -> None:
-        nonlocal synced_at
-        if synced_at != t:
-            model.sync(t, y)
-            synced_at = t
-
-    def hold(label: str, value: Any) -> None:
-        model.set_zoh_input(label, value)
-
-    @contextmanager
-    def change():
-        nonlocal y, synced_at
-        yield
-        y = model.get_initial_values()
-        synced_at = None
-
-    plant = SimpleNamespace(outputs=outputs, hold=hold, change=change)
-    for unit in prepared.system.units.values():
-        unit.begin(t0, plant, unit.name in prepared._continued,
-                   unit.name in prepared._windows_given)
-    y = model.get_initial_values()
-    model.sync(t0, y)
-
+    code = _CppGenerator(prepared, name, variables).source()
     out_dir.mkdir(parents=True, exist_ok=True)
     source = out_dir / "peslite.cpp"
-    source.write_text(_CppGenerator(prepared, name, variables).source(), encoding="utf-8")
+    source.write_text(code, encoding="utf-8")
     return ExportResult("cpp", out_dir, (source,))

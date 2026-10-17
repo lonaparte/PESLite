@@ -172,10 +172,7 @@ class RLBranch:
     def rhs(self, t: float):
         if self.breaker_open:
             return (self.zero,)
-        derivative = (self.inp.u1 - self.inp.u2 - self.R * self.state.i) / self.L
-        if self.unilateral and self.state.i <= 0.0 and derivative < 0.0:
-            derivative = 0.0
-        return (derivative,)
+        return self._closed_rhs(t)
 
     def _rhs_open(self, t: float):
         return (self.zero,)

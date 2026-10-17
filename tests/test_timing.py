@@ -7,7 +7,39 @@ import pytest
 
 import peslite
 from peslite.assembly.params import ConfigError
+from peslite.assembly.unit import Plant
+from peslite.components.network import RCNode
 from peslite.components.pwm import PWM, ZOH, carrier_position
+from peslite.solver.model import Model
+
+
+def test_shared_plant_refreshes_same_time_held_changes_and_discontinuous_states(monkeypatch):
+    nodes = {name: RCNode(1.0, 1.0, phases=1) for name in ("first", "second")}
+    model = Model(nodes, {}, {(node, "i"): name for name, node in nodes.items()})
+    calls = []
+    for method in ("sync", "sync_zoh"):
+        original = getattr(model, method)
+
+        def traced(*args, method=method, original=original):
+            calls.append(method)
+            return original(*args)
+
+        monkeypatch.setattr(model, method, traced)
+    plant = Plant(model, model.get_initial_values())
+    plant.hold("first", 1.0)
+    plant.outputs(0.0)
+    plant.hold("second", 2.0)
+    plant.outputs(0.0)
+    plant.outputs(0.0)
+    assert nodes["first"].out.u == 1.0
+    assert nodes["second"].out.u == 2.0
+    assert calls == ["sync", "sync_zoh"]
+    with plant.change():
+        nodes["first"].state.u_C = 3.0
+    plant.outputs(0.0)
+    assert nodes["first"].out.u == 4.0
+    assert plant.inputs_changed
+    assert calls == ["sync", "sync_zoh", "sync"]
 
 
 T = 5e-5  # carrier period of examples/gfl-example.pes (20 kHz)

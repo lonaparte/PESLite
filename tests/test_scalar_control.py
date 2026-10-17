@@ -347,6 +347,7 @@ def test_converter_control_entry_points_share_explicit_port_power():
 
     params = peslite.load(EXAMPLES / "wpt-ss-example.pes")
     controllers = [peslite.System(params).units["charger.primary"].ctrl for _ in range(2)]
+    buffers = [controller._last_measurement for controller in controllers]
     for controller in controllers:
         controller.command(True)
     direct = controllers[0].sample(0.0, 5.0, 48.0, 24.0, power=0.0)
@@ -354,6 +355,8 @@ def test_converter_control_entry_points_share_explicit_port_power():
         current=5.0, voltage=48.0, vin=24.0, power=0.0,
     ))
     assert direct == protocol
+    assert all(controller._last_measurement is buffer
+               for controller, buffer in zip(controllers, buffers))
     assert direct.log["power"] == 0.0
     assert controllers[0].control_inputs(5.0, 48.0, 24.0, power=-120.0)["meas.power"] == -120.0
     for measurement in (ConverterMeasurement(current=5.0, voltage=48.0, vin=24.0),

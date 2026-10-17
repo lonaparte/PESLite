@@ -435,62 +435,46 @@ class BridgeParams:
     }
 
 
-@dataclass(frozen=True, kw_only=True)
-class _UnitCommonFields:
-    """Fields interpreted identically for every converter unit type."""
-
-    pwm: PWMParams
-    dclink: DCLinkParams
-    bus: Optional[str] = None
-    bridge: BridgeParams = field(default_factory=BridgeParams)
-    meas: MeasurementParams = field(default_factory=MeasurementParams)
-    protection: ProtectionParams = field(default_factory=ProtectionParams)
-    s_base: Optional[float] = None
-
-
 @dataclass(frozen=True, init=False)
 class UnitParams:
     """Common converter-unit parameters plus one ``type``-selected field set."""
 
     type: str
-    pwm: Optional[PWMParams]
-    ctrl: Optional[ControlParams]
-    dclink: Optional[DCLinkParams] = None
+    pwm: Optional[PWMParams] = field(default=None, metadata={"required": True})
+    ctrl: Optional[ControlParams] = None
+    dclink: Optional[DCLinkParams] = field(default=None, metadata={"required": True})
     bus: Optional[str] = None
-    bridge: Optional[BridgeParams] = None
-    meas: Optional[MeasurementParams] = None
-    protection: Optional[ProtectionParams] = None
+    bridge: BridgeParams = field(default_factory=BridgeParams)
+    meas: MeasurementParams = field(default_factory=MeasurementParams)
+    protection: ProtectionParams = field(default_factory=ProtectionParams)
     s_base: Optional[float] = None
     _unit_fields: Any = field(repr=False, default=None)
     base: BaseValues = field(init=False, default=None)
     derived_defaults: frozenset = field(init=False, default=frozenset(), compare=False)
     events: tuple = field(init=False, default=(), compare=False)
 
-    def __init__(self, *, type: str, pwm: Optional[PWMParams] = None,
-                 ctrl: Optional[ControlParams] = None, _unit_fields: Any,
-                 dclink: Optional[DCLinkParams] = None, bus: Optional[str] = None,
-                 bridge: Optional[BridgeParams] = None,
-                 meas: Optional[MeasurementParams] = None,
-                 protection: Optional[ProtectionParams] = None,
-                 s_base: Optional[float] = None, **changes: Any) -> None:
+    def __init__(self, *, type: str, _unit_fields: Any, **values: Any) -> None:
+        schema = fields(UnitParams)
+        known = {item.name for item in schema if item.init}
+        changes = {name: value for name, value in values.items() if name not in known}
         selected = replace(_unit_fields, **changes) if changes else _unit_fields
-        object.__setattr__(self, "type", type)
-        object.__setattr__(self, "pwm", pwm)
-        object.__setattr__(self, "ctrl", ctrl)
-        object.__setattr__(self, "dclink", dclink)
-        object.__setattr__(self, "bus", bus)
-        object.__setattr__(
-            self,
-            "bridge",
-            bridge if unit_type(type).composite or bridge is not None else BridgeParams(),
-        )
-        object.__setattr__(self, "meas", meas)
-        object.__setattr__(self, "protection", protection)
-        object.__setattr__(self, "s_base", s_base)
-        object.__setattr__(self, "_unit_fields", selected)
-        object.__setattr__(self, "base", None)
-        object.__setattr__(self, "derived_defaults", frozenset())
-        object.__setattr__(self, "events", ())
+        values = {**values, "type": type, "_unit_fields": selected}
+        composite = unit_type(type).composite
+        for item in schema:
+            if item.init and item.name in values:
+                value = values[item.name]
+            elif item.default_factory is not dataclasses.MISSING:
+                value = None if composite else item.default_factory()
+            else:
+                value = item.default
+            object.__setattr__(self, item.name, value)
+
+    @classmethod
+    def _common_fields(cls, *, composite: bool = False) -> frozenset[str]:
+        """Public common fields, interpreted from this one schema at every boundary."""
+        return frozenset(item.name for item in fields(cls)
+                         if item.init and item.name not in {"type", "ctrl", "_unit_fields"}
+                         and (not composite or item.name == "s_base"))
 
     def __getattr__(self, name: str) -> Any:
         """Expose the selected schema's fields without storing a second copy."""
@@ -555,7 +539,7 @@ class UnitParams:
         object.__setattr__(unit, "events", tuple(events))
         return unit
 
-    @property
+    @functools.cached_property
     def dc_base(self) -> DCBase:
         if unit_type(self.type).composite:
             raise AttributeError("a composite WPT unit has no single DC base")
@@ -903,23 +887,12 @@ def to_dict(p: Any, derived: bool = False) -> dict:
     so rebuilding the mapping derives them from any replacements again.
     """
     if isinstance(p, UnitParams):
-        if unit_type(p.type).composite:
-            return {
-                "type": p.type,
-                **to_dict(p._unit_fields, derived),
-                "s_base": p.s_base,
-            }
+        common = p._common_fields(composite=unit_type(p.type).composite)
         d = {
             "type": p.type,
             **to_dict(p._unit_fields, derived),
-            "pwm": to_dict(p.pwm, derived),
-            "ctrl": to_dict(p.ctrl, derived),
-            "dclink": to_dict(p.dclink, derived),
-            "bus": p.bus,
-            "bridge": to_dict(p.bridge, derived),
-            "meas": to_dict(p.meas, derived),
-            "protection": to_dict(p.protection, derived),
-            "s_base": p.s_base,
+            **{item.name: to_dict(getattr(p, item.name), derived) for item in fields(p)
+               if item.name in common or (item.name == "ctrl" and p.ctrl is not None)},
         }
         if not derived:
             for path in p.derived_defaults:
@@ -1053,39 +1026,23 @@ def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
     unit_fields_cls = _unit_params_class(data, path)
     kind = data.get("type", "vsc")
     spec = unit_type(kind, f"{path}.type")
-    if spec.composite:
-        unit_field_names = {item.name for item in fields(unit_fields_cls) if item.init}
-        known = {"type", "s_base", *unit_field_names}
-        unknown = set(data) - known
-        if unknown:
-            raise ConfigError(f"{path}: unknown key(s) {sorted(unknown)}; known: {sorted(known)}")
-        unit_base, unit_scales = UnitParams._bases(data, base, path)
-        unit_fields = _build(
-            unit_fields_cls,
-            {name: data[name] for name in unit_field_names if name in data},
-            path,
-            unit_base,
-            unit_scales,
-        )
-        return UnitParams(
-            type=kind,
-            s_base=unit_base.s_base if data.get("s_base") is not None else None,
-            _unit_fields=unit_fields,
-        )
-    common_names = {item.name for item in fields(_UnitCommonFields) if item.init}
+    common_names = UnitParams._common_fields(composite=spec.composite)
     unit_field_names = {item.name for item in fields(unit_fields_cls) if item.init}
-    known = {"type", "ctrl", *common_names, *unit_field_names}
+    known = {"type", *common_names, *unit_field_names}
+    if not spec.composite:
+        known.add("ctrl")
     unknown = set(data) - known
     if unknown:
         raise ConfigError(f"{path}: unknown key(s) {sorted(unknown)}; known: {sorted(known)}")
 
     unit_base, unit_scales = UnitParams._bases(data, base, path)
-    common = _build(
-        _UnitCommonFields,
+    common = _build_fields(
+        UnitParams,
         {name: data[name] for name in common_names if name in data},
         path,
         unit_base,
         unit_scales,
+        names=common_names,
     )
     unit_fields = _build(
         unit_fields_cls,
@@ -1094,21 +1051,17 @@ def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
         unit_base,
         unit_scales,
     )
-    control = _build_control_params(
-        data.get("ctrl"), f"{path}.ctrl", unit_base, unit_scales, kind
-    )
-    bridge_type = common.bridge.type or unit_type(kind).bridge_for(control)
+    if not spec.composite:
+        control = _build_control_params(
+            data.get("ctrl"), f"{path}.ctrl", unit_base, unit_scales, kind
+        )
+        bridge = common["bridge"]
+        common["bridge"] = replace(bridge, type=bridge.type or spec.bridge_for(control))
+        common["ctrl"] = control
     return UnitParams(
         type=kind,
-        pwm=common.pwm,
-        ctrl=control,
-        dclink=common.dclink,
-        bus=common.bus,
-        bridge=replace(common.bridge, type=bridge_type),
-        meas=common.meas,
-        protection=common.protection,
-        s_base=common.s_base,
         _unit_fields=unit_fields,
+        **common,
     )
 
 
@@ -1235,18 +1188,33 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
         data = convert_quantities(data, cls, scales, path)
         if hasattr(cls, "_scaled_defaults"):
             data = {**cls._scaled_defaults(data, scales), **data}
+    kwargs = _build_fields(cls, data, path, base, scales)
+    try:
+        obj = cls(**kwargs)
+    except ConfigError as exc:
+        raise ConfigError(f"{path}.{exc}" if path else str(exc)) from None
+    for name, choices in getattr(cls, "_choices", {}).items():
+        if getattr(obj, name) not in choices:
+            raise ConfigError(f"{path or cls.__name__}.{name}: {getattr(obj, name)!r} not in {choices}")
+    return obj
+
+
+def _build_fields(cls, data: dict, path: str, base: Any, scales: Optional[dict],
+                  *, names: Optional[frozenset[str]] = None) -> dict:
+    """Parse selected dataclass fields through the same rules as an ordinary section."""
     hints = get_type_hints(cls)
-    known = {f.name for f in fields(cls) if f.init}
+    selected = tuple(f for f in fields(cls) if f.init and (names is None or f.name in names))
+    known = {f.name for f in selected}
     unknown = set(data) - known
     if unknown:
         hint = getattr(cls, "_unknown_hint", "")
         raise ConfigError(f"{path}: unknown key(s) {sorted(unknown)}; known: {sorted(known)}"
                           + (f". {hint}" if hint else ""))
     kwargs = {}
-    for f in fields(cls):
-        if not f.init:
-            continue
+    for f in selected:
         key = f"{path}.{f.name}" if path else f.name
+        if f.metadata.get("required") and data.get(f.name) is None:
+            raise ConfigError(f"{key}: required value missing")
         tp = hints[f.name]
         optional, inner = _is_optional(tp)
         if f.name in data:
@@ -1306,14 +1274,7 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
                               else f.default_factory())  # type: ignore[misc]
         else:
             raise ConfigError(f"{key}: required value missing")
-    try:
-        obj = cls(**kwargs)
-    except ConfigError as exc:  # checks of the class itself
-        raise ConfigError(f"{path}.{exc}" if path else str(exc)) from None
-    for name, choices in getattr(cls, "_choices", {}).items():
-        if getattr(obj, name) not in choices:
-            raise ConfigError(f"{path or cls.__name__}.{name}: {getattr(obj, name)!r} not in {choices}")
-    return obj
+    return kwargs
 
 
 # ------------------------------------------------------------------ set events

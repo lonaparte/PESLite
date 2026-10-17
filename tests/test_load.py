@@ -4,8 +4,25 @@ import numpy as np
 import pytest
 
 import peslite
+from dataclasses import replace
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, from_dict
+
+
+def test_unit_dc_base_is_reused_but_replaced_parameters_get_a_fresh_base():
+    params = peslite.load(EXAMPLES / "buck-example.pes")
+    unit = params.unit()
+    original = unit.dc_base
+    assert unit.dc_base is original
+    changed = replace(unit, dclink=replace(unit.dclink, vdc_ref=2.0 * original.v))
+    changed = changed.resolved(unit.base)
+    assert changed.dc_base is changed.dc_base
+    assert changed.dc_base is not original
+    assert changed.dc_base.v == 2.0 * original.v
+    assert changed.dc_base.i == original.i / 2.0
+    assert unit.dc_base is original
+    from peslite.assembly.params import to_dict
+    assert "dc_base" not in to_dict(unit, derived=True)
 
 
 def _current(result, name):

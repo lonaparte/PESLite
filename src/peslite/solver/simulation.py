@@ -21,11 +21,9 @@ import time
 import warnings
 from collections import deque
 from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
@@ -36,7 +34,7 @@ from ..assembly.params import (Change, Params, _unit_at, _unit_items, _unit_leav
                                dump, dumps, load)
 from ..assembly.system import System
 from ..assembly.types import unit_type
-from ..assembly.unit import Unit
+from ..assembly.unit import Plant, Unit
 from ..components.pwm import Modulator
 from ..control.blocks import abc2complex, complex2abc
 from ..control.controller import Controller
@@ -660,6 +658,13 @@ class Simulation:
         return system.model.get_initial_values()
 
     # ------------------------------------------------------------ the loop
+    def _begin_units(self, t: float, plant: Plant) -> None:
+        """Initialize all units through the same state and output boundary used during a run."""
+        for unit in self.system.units.values():
+            unit.begin(t, plant, unit.name in self._continued,
+                       unit.name in self._windows_given)
+        plant.read_state()
+
     def run(self, t_end: float | None = None, *, out_dir: str | Path | None = "output/run",
             info: Mapping[str, Any] | None = None) -> SimulationResult:
         """Run once, streaming configured histories directly into ``out_dir``.
@@ -694,9 +699,9 @@ class Simulation:
         if t_end <= t_start + _EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         t_final = t_end
-        y = self._apply_initial(t_start)
+        plant = Plant(mdl, self._apply_initial(t_start), project=project)
         if project is not None:
-            y = project(y)
+            plant.state = project(plant.state)
         if parameters_changed is not None:
             parameters_changed()
         windowed = [unit for unit in units if unit.windowed]
@@ -725,19 +730,7 @@ class Simulation:
         stop_reason = ""
         coarse_reported = False
         stopped = False
-        adc_inputs_changed = False
-        synced_at: float | None = None
-        zoh_changed = False
-
-        def sync_if_needed(t_now: float) -> None:
-            """Bring plant outputs to ``t_now``, refreshing only held-input descendants when possible."""
-            nonlocal synced_at, zoh_changed
-            if synced_at != t_now:
-                mdl.sync(t_now, y)
-                synced_at = t_now
-            elif zoh_changed:
-                mdl.sync_zoh(t_now)
-            zoh_changed = False
+        sync_if_needed = plant.outputs
 
         def snapshot(t_now: float, final: bool = False) -> None:
             nonlocal snapshot_index, continuous_record_index
@@ -763,8 +756,8 @@ class Simulation:
                     rec.plant_snapshot(t_now, signals)
                     if rec.keep_states or final:
                         rec.state_row(t_now, self._states.read_flat())
-                    if audit_due and _finite(y):
-                        rep = mdl.energy_balance(t_now, y)
+                    if audit_due and _finite(plant.state):
+                        rep = mdl.energy_balance(t_now, plant.state)
                         if rec.keep_energy:
                             rec.energy_row(t_now, rep.columns())
                         scale = rep.scale
@@ -805,22 +798,22 @@ class Simulation:
 
         def advance(t_a: float, t_b: float, event: bool = False) -> bool:
             """Integrate over ``[t_a, t_b]``; ``event`` means the model changes at ``t_b``."""
-            nonlocal y, t_local, stop_reason, coarse_reported, synced_at
-            synced_at = None
+            nonlocal t_local, stop_reason, coarse_reported
+            plant.invalidate()
             try:
-                y = integrate(t_a, t_b, y, event)
+                plant.state = integrate(t_a, t_b, plant.state, event)
             except (OverflowError, FloatingPointError):
                 stop_reason = f"diverged: the states overflowed between t = {t_a:.6g} s and {t_b:.6g} s"
                 t_local = t_a
                 return True
             t_local = t_b
-            finite = _finite(y)
+            finite = _finite(plant.state)
             if windowed and finite:
                 sync_if_needed(t_b)
                 for unit in windowed:
                     unit.accumulate(t_b - t_a)
             elif finite:
-                mdl.set_states(y)
+                mdl.set_states(plant.state)
             if not finite:
                 stop_reason = f"diverged: non-finite states at t = {t_b:.6g} s"
                 return True
@@ -839,52 +832,26 @@ class Simulation:
 
         def settle_now() -> None:
             """Finish deferred integration with the plant as it is, before it changes now."""
-            nonlocal y
             if settle is not None:
-                y = settle(t_local, y)
+                plant.state = settle(t_local, plant.state)
                 if project is not None:
-                    y = project(y)
-                mdl.set_states(y)
+                    plant.state = project(plant.state)
+                mdl.set_states(plant.state)
+                plant.invalidate()
 
-        # The plant operations exposed to a converter unit. The run loop owns the continuous-state vector;
-        # a unit can only request current outputs, change one held input, or make a discontinuous
-        # plant change inside the context manager.
-        def hold(label: str, value: Any) -> None:
-            nonlocal zoh_changed
-            mdl.set_zoh_input(label, value)
-            zoh_changed = True
-
-        @contextmanager
-        def change() -> Iterator[None]:
-            nonlocal y, adc_inputs_changed, synced_at
-            settle_now()
-            yield
-            y = mdl.get_initial_values()
-            if project is not None:
-                y = project(y)
-            adc_inputs_changed = True
-            synced_at = None
-
-        plant = SimpleNamespace(outputs=sync_if_needed, hold=hold, change=change)
+        plant.settle = settle_now
 
         def window_edge(t_now: float, changed: bool) -> None:
             """Restart ADC integrals from the values on the new side of a plant/input jump."""
-            if windowed and (changed or zoh_changed):
+            if windowed and (changed or plant.zoh_changed):
                 sync_if_needed(t_now)
                 for unit in windowed:
                     unit.restart_windows()
 
         # ---------------------------------------------------------------- the event grid
-        for unit in units:
-            unit.begin(t_start, plant, unit.name in self._continued,
-                       unit.name in self._windows_given)
-        # Continuous controllers may pre-synchronise their ODE states in begin().
-        y = mdl.get_initial_values()
-        if project is not None:
-            y = project(y)
-        synced_at = None
+        self._begin_units(t_start, plant)
         while True:
-            adc_inputs_changed = False
+            plant.inputs_changed = False
             t_log = n_log * log_period
             t_stop = t_log
             for unit in units:
@@ -902,18 +869,15 @@ class Simulation:
             # File events run before the coincident protection/control/PWM events.
             if event_due:
                 if advancing:  # advance() already settled at t_stop
-                    mdl.set_states(y)
+                    mdl.set_states(plant.state)
                 else:
                     settle_now()
                 while actions and actions[0][0] <= t_stop + _EPS:
                     self._act(actions.popleft()[2], t_stop)
                 if parameters_changed is not None:
                     parameters_changed()
-                y = mdl.get_initial_values()
-                if project is not None:
-                    y = project(y)
-                adc_inputs_changed = True
-                synced_at = None
+                plant.read_state()
+                plant.inputs_changed = True
             # Every unit protects first, then every unit samples, then every unit actuates.  This
             # makes coincident multi-unit events independent of the units' dictionary order.
             for unit in units:
@@ -936,7 +900,7 @@ class Simulation:
             if stopped:
                 snapshot(t_local, final=True)
                 break
-            window_edge(t_local, adc_inputs_changed)
+            window_edge(t_local, plant.inputs_changed)
             if t_stop >= t_final - _EPS:
                 snapshot(t_local, final=True)
                 break

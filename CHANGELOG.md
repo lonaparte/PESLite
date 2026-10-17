@@ -2,6 +2,19 @@
 
 ## 0.4.0
 
+- Reused assembled component output, derivative and energy equations during native export,
+  preserving subclass hooks and unilateral-current clamping. Native algebraic loops now match
+  the scalar secant solve and fail explicitly on nonconvergence. Export preserves construction
+  factories and rejects replacements it cannot reproduce instead of silently substituting defaults.
+- Shared AC current/impedance equations across sampled and continuous control. Native loop tracing
+  uses numeric carried diagnostics without guessing optional-state semantics; RK coefficients
+  come from the existing tables and actual solver object, and local diode step limits are
+  generated directly. Native loop resets share simultaneous state updates with sampled control,
+  preserve declared runtime values, and use the same storage in sampled and continuous modes.
+- Shared plant synchronization and unit initialization between Python execution and native export,
+  including same-time held-input changes. Native sensing refreshes observations only when state
+  changes require it. Unit parameters use one common-field schema and reuse their derived DC base;
+  frequency-history buffers and converter measurement objects are allocated only when needed.
 - Added independent shunt/series resistor loads on named Unit ports, assembly-time measurement
   selection and shared RMS statistics/protection. Load-resistance steps and optional RMS windows
   use the ordinary event, ADC, protection and native-export paths without a WPT-specific runtime.

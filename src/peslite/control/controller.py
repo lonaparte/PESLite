@@ -24,7 +24,7 @@ from ..solver.energy import PowerPort, port_power
 from .blocks import OutputLimit, abc2complex, complex_power, peak_abs, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODULATION, POWER,
                     SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ, CurrentLoop,
-                    DCVoltageControl, Loop, SignalType, SyncLaw)
+                    Loop, SignalType, SyncLaw)
 from .modulation import CONFIGURED, OutputStage
 from .profiles import (ReferenceParams, ResonantReferenceParams,
                        ScalarVoltageReferenceParams, control_type,
@@ -284,6 +284,10 @@ class ControlGraph:
     by :meth:`schedule` and take effect at the next update. Changed active loops are rebuilt from
     their new parameters and continue from their named states.
     """
+
+    _cycle_iterations = 16
+    _cycle_atol = 1e-10
+    _cycle_rtol = 1e-8
 
     def __init__(self, cfg, startup, connections, outputs, *, interface=CONTROL_INTERFACE):
         self.cfg, self.startup = cfg, startup
@@ -849,7 +853,7 @@ class ControlGraph:
                     derivatives[self._flow_derivative_index[key]] = flow[local]
                 continue
             previous = tuple(values[key] for key in keys)
-            for _iteration in range(16):
+            for _iteration in range(self._cycle_iterations):
                 for (_name, evaluate, wiring, inputs, outputs, flow,
                      out_specs, flow_specs) in steps:
                     for port, kind, key in wiring:
@@ -865,13 +869,14 @@ class ControlGraph:
                     for local, key in flow_specs:
                         derivatives[self._flow_derivative_index[key]] = flow[local]
                 current = tuple(values[key] for key in keys)
-                if all(abs(new - old) <= 1e-10 + 1e-8 * max(1.0, abs(new), abs(old))
+                if all(abs(new - old) <= self._cycle_atol + self._cycle_rtol * max(1.0, abs(new), abs(old))
                        for new, old in zip(current, previous)):
                     break
                 previous = current
             else:
                 raise FloatingPointError(
-                    "continuous control algebraic loop did not converge after 16 iterations: "
+                    "continuous control algebraic loop did not converge after "
+                    f"{self._cycle_iterations} iterations: "
                     + ", ".join(group)
                 )
         return dict(zip(self.flow_state_names, derivatives)) if named else derivatives
@@ -1189,7 +1194,8 @@ class VSCController(_GraphRuntime):
             self._terminal_limit_scale = None
             if self.stage is not None:
                 self.stage._command_saturated = False
-        if isinstance(node, DCVoltageControl) and self.continuous:
+        if (self.continuous and name == self._dc
+                and callable(getattr(node, "observe_limit", None))):
             self._flow_limits[name] = (f"{name}.current_reference", "ID_REF_LIMIT", node)
         if (not self.continuous and name == self._terminal
                 and isinstance(node, CurrentLoop) and self.stage is not None):
@@ -1495,7 +1501,9 @@ class VSCController(_GraphRuntime):
         if self._dc is not None:
             dc = self.graph.nodes[self._dc]
             summary["id_ref_limit_fraction"] = dc.n_limit_exceeded / max(1, dc.n_updates)
-            summary["id_ref_limit_first_t"] = dc.first_limit_t
+            summary["id_ref_limit_first_t"] = (
+                dc.first_limit_t if math.isfinite(dc.first_limit_t) else None
+            )
         if self._sync is not None:
             summary["law"] = self.p.ctrl.loops[self._sync].type
         summary["alarms"] = list(self.alarms)
@@ -1730,7 +1738,7 @@ class GraphController(_GraphRuntime):
         """Evaluate one sampled control interrupt from physical plant values."""
         if self.continuous:
             raise RuntimeError("an ideal averaged converter controller is evaluated by the ODE solver")
-        measurement = self._measurement(current, voltage, vin, power=power)
+        measurement = self._measurement(current, voltage, vin, self._last_measurement, power=power)
         if self.startup.in_progress:
             self.startup.advance()
         self.graph.sample(t, measurement)

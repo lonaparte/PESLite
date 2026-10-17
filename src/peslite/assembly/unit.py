@@ -10,8 +10,9 @@ from __future__ import annotations
 import math
 import warnings
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import replace
-from typing import Any, ContextManager, Mapping, Optional, Protocol
+from typing import Any, Callable, Iterator, Mapping, Optional
 
 import numpy as np
 
@@ -31,14 +32,49 @@ from .types import unit_type
 __all__ = ["Plant", "Unit", "VSC", "DCConverter"]
 
 
-class Plant(Protocol):
-    """The plant operations a unit may use during a run."""
+class Plant:
+    """Shared state and output synchronization for execution and export initialization.
 
-    def outputs(self, t: float) -> None: ...
+    Units only call ``outputs``, ``hold`` and ``change``. The host owns integration, supplies
+    its current state vector and invalidates outputs whenever that state changes.
+    """
 
-    def hold(self, label: str, value: Any) -> None: ...
+    def __init__(self, model: Any, state: Any, *,
+                 project: Optional[Callable] = None, settle: Optional[Callable] = None) -> None:
+        self.model, self.state = model, state
+        self.project, self.settle = project, settle
+        self.inputs_changed = self.zoh_changed = False
+        self._synced_at: Optional[float] = None
 
-    def change(self) -> ContextManager[None]: ...
+    def invalidate(self) -> None:
+        self._synced_at = None
+
+    def read_state(self) -> None:
+        """Repack states after a lifecycle or file event, applying the model's bounds."""
+        self.state = self.model.get_initial_values()
+        if self.project is not None:
+            self.state = self.project(self.state)
+        self.invalidate()
+
+    def outputs(self, t: float) -> None:
+        if self._synced_at != t:
+            self.model.sync(t, self.state)
+            self._synced_at = t
+        elif self.zoh_changed:
+            self.model.sync_zoh(t)
+        self.zoh_changed = False
+
+    def hold(self, label: str, value: Any) -> None:
+        self.model.set_zoh_input(label, value)
+        self.zoh_changed = True
+
+    @contextmanager
+    def change(self) -> Iterator[None]:
+        if self.settle is not None:
+            self.settle()
+        yield
+        self.read_state()
+        self.inputs_changed = True
 
 
 class Unit(ABC):
@@ -440,9 +476,7 @@ class Unit(ABC):
         """Adapt one controller-rate observation to common protection quantities."""
 
     def _instantaneous_measurement(self, t: float) -> Any:
-        values = self.ports.read()
-        reading = ADCSample(t=t, values=values)
-        return self._control_measurement(ADCSample(t=t, values=values, samples=(reading,)))
+        return self._control_measurement(ADCSample(t=t, values=self.ports.read()))
 
     def _check_sampled_protection(self, t: float, measurement: Any,
                                   output: Any | None = None, *, rms_fresh: bool = True) -> None:

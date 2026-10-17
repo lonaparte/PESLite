@@ -241,9 +241,22 @@ def test_unused_rms_has_no_window_allocation_and_invalid_sources_fail_at_assembl
     tree = load_case(rms=False)
     sim = peslite.Simulation(from_dict(tree))
     assert all(not unit.adc.rms for unit in sim.units.values())
+    assert all(unit.protection._rocof is None for unit in sim.units.values())
     tree["units"]["charger"]["primary"]["meas"] = {"sources": {"power": "missing.power"}}
     with pytest.raises(ConfigError, match="unknown physical output"):
         peslite.Simulation(from_dict(tree))
+
+
+def test_instantaneous_measurement_has_no_duplicate_raw_conversion(monkeypatch):
+    import peslite.assembly.unit as unit_module
+
+    sim = peslite.Simulation(from_dict(load_case()))
+    sim.system.model.sync(0.0, sim.system.model.get_initial_values())
+    constructor = Mock(wraps=unit_module.ConverterMeasurement)
+    monkeypatch.setattr(unit_module, "ConverterMeasurement", constructor)
+    sample = sim.units["charger.primary"]._instantaneous_measurement(0.0)
+    assert constructor.call_count == 1
+    assert sample.samples == ()
 
 
 def test_continuous_rms_hold_uses_its_own_existing_protection_clock():

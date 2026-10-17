@@ -484,15 +484,14 @@ class CurrentLoop(Loop):
         return {"u_dq": 0j, "extra": 0j}
 
     def sample(self, t, inputs):
-        rot = _into(inputs["frame"])
-        self.extra = inputs["extra"]
-        i, u_ff, omega = inputs["i"] * rot, inputs["v"] * rot, inputs["omega"]
-        reference = i if not self.startup.active else inputs["id_ref"] + 1j * inputs["iq_ref"]
-        ff = self.feedforward_voltage(i, u_ff, omega, self.extra)
-        return {"u_dq": self.pi(reference, i, ff), "extra": self.extra}
+        output, extra, _derivative = self._evaluate(
+            inputs["id_ref"], inputs["iq_ref"], inputs["v"], inputs["i"],
+            inputs["frame"], inputs["omega"], inputs["extra"],
+        )
+        return {"u_dq": output, "extra": extra}
 
-    def flow_path(self, id_ref, iq_ref, voltage, current, frame, omega, extra):
-        """Positional form used by the construction-time compiled continuous graph."""
+    def _evaluate(self, id_ref, iq_ref, voltage, current, frame, omega, extra):
+        """One law for both PI realizations; the flow path binds directly to this call."""
         rot = _into(frame)
         self.extra = extra
         i, u_ff = current * rot, voltage * rot
@@ -500,6 +499,8 @@ class CurrentLoop(Loop):
         ff = self.feedforward_voltage(i, u_ff, omega, self.extra)
         output = self.pi(reference, i, ff)
         return output, self.extra, self.pi.derivative
+
+    flow_path = _evaluate
 
     def feedforward_voltage(self, i: complex, u_ff: complex, omega: float,
                             extra: complex = 0j) -> complex:
@@ -557,7 +558,7 @@ class DCVoltageControl(Loop):
     inputs = {"reference": GENERIC_VOLTAGE, "voltage": GENERIC_VOLTAGE}
     outputs = {"current_reference": GENERIC_CURRENT}
     flow_inputs = ("reference", "voltage")
-    carried = ("n_updates", "n_limit_exceeded", "n_reverse", "first_limit_t")
+    carried = ("n_updates", "n_limit_exceeded", "n_reverse", "first_limit_t", "limit_exceeded")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -575,7 +576,7 @@ class DCVoltageControl(Loop):
         self.limit_exceeded = False
         self.n_updates = self.n_limit_exceeded = 0
         self.n_reverse = 0
-        self.first_limit_t: float | None = None
+        self.first_limit_t = math.inf
 
     @property
     def integral(self):
@@ -615,8 +616,7 @@ class DCVoltageControl(Loop):
         self.limit_exceeded = output != intended
         if count and self.limit_exceeded:
             self.n_limit_exceeded += 1
-            if self.first_limit_t is None:
-                self.first_limit_t = t
+            self.first_limit_t = min(self.first_limit_t, t)
 
     def reset_integrator(self):
         self.pi.reset()
@@ -1013,14 +1013,16 @@ class VirtualImpedance(Loop):
         return {"u_dq": 0j}
 
     def sample(self, t, inputs):
-        i = inputs["i"] * _into(inputs["frame"])
-        drop = (self.r_pu + 1j * inputs["omega"] / self.w0 * self.x_pu) * i
-        return {"u_dq": inputs["v_ref"] - drop + inputs["extra"]}
+        output, = self.equation(inputs["v_ref"], inputs["i"], inputs["frame"],
+                                inputs["omega"], inputs["extra"])
+        return {"u_dq": output}
 
-    def flow_path(self, v_ref, current, frame, omega, extra):
+    def equation(self, v_ref, current, frame, omega, extra):
         i = current * _into(frame)
         drop = (self.r_pu + 1j * omega / self.w0 * self.x_pu) * i
         return (v_ref - drop + extra,)
+
+    flow_path = equation
 
 
 @register_loop_type

@@ -135,18 +135,37 @@ These choices are fixed when `peslite.cpp` is generated:
 Specialization lets the compiler inline the configured RHS and remove generic dispatch. To change a
 fixed choice, update the source `.pes` file and run `peslite-convert` again.
 
-Built-in plant and converter modules have dedicated lowering for their complete switching,
-protection and scheduling semantics. A custom continuous subsystem also has a fallback: PESLite
-traces its fixed `state`, `inp`, `out`, `set_outputs()` and `rhs()` scalar equations while exporting,
+Discrete switching, protection and scheduling have native execution adapters. Numerical component
+outputs, derivatives and energy equations reuse the assembled Python equations, including those of
+R-L branches, capacitor nodes and DC links. PESLite traces each component's fixed `state`, `inp`,
+`out`, `set_outputs()` and `rhs()` scalar equations while exporting,
 specialises configuration-dependent branches and loops, and emits ordinary static C++. Common
 arithmetic, complex operations, state-dependent branches and NumPy scalar ufuncs are lowered. The
 generated binary does not contain an expression interpreter or Python runtime, so using the
 fallback does not add a generic dispatch layer to each solver stage.
 
-The dedicated modules remain preferable when they fit: their event and timing semantics are fully
-covered, their generated expressions are deliberately tuned, and unsupported behavior is found
-before a long build. The fallback is intended for pure numerical component equations with a fixed
-state and port layout.
+Subclass overrides and explicit component export hooks are respected. Runtime event state is bound
+during tracing rather than by maintaining another copy of the physical formula. RK coefficients
+come from the shared fixed-step tables or the actual DP45 solver object's coefficients, including
+factory-supplied instance and subclass values. Algebraic loops use matching tolerances and
+iteration limits, and nonconvergence is an error rather than an accepted approximate result.
+Dependencies eliminated by fixed parameter values are reduced to straight-line assignments by a
+conservative assignment analysis and standard topological sorting. Unrecognized code keeps the
+iterative solver. Genuine feedback retains its convergence checks and the same record fields
+between calls as the Python model; it does not keep a second value cache.
+
+Exporting an unrun `Simulation` reconstructs it with its `parts` factories without mutating the
+caller. A supplied ready-made `system`, `solver` or other `instances` entry is rejected because it
+cannot be safely reconstructed from parameters. Solver replacements must match a supported solver
+and its configured numerical settings; they are never silently replaced by a default solver.
+Native execution adapters check the execution callbacks they replace and the implementation
+methods referenced by those callbacks. Unrelated presentation methods do not prevent export.
+Overrides of controller-host, solver or modulator execution need backend support and are rejected
+rather than silently executed as the parent implementation. Registered numerical loops inside the
+shared controller graph continue to use ordinary tracing. Loop resets use that loop's own reset
+method, include declared `carried` values, and evaluate all new values before writing any state.
+Sampled and continuous controllers use the same owned-value storage and update rules; continuous
+ODE states are read and written directly in the solver vector rather than duplicated in members.
 
 Composite WPT configurations are expanded before export exactly as they are for Python execution.
 Their primary and secondary remain ordinary `DCConverter` units with independent clocks, while the
@@ -172,6 +191,10 @@ phase override.
 - Custom controller loops with non-traceable Python behavior, events and modulators still need
   backend support because they alter the discrete schedule rather than only contributing
   continuous scalar equations.
+- Traced loop state and `carried` values must remain numeric scalars (including Boolean and
+  complex values). `None` and transitions to nonnumeric values are rejected; the exporter does not
+  infer an optional-value protocol from a field's initial value. Built-in first-occurrence times
+  use numeric sentinels internally and report absent occurrences as JSON `null`.
 - Only parameters reported by `--list-params` can change in the compiled simulator.
 
 The exporter supports the built-in switching, PWM-period-averaged and ideal averaged bridge models.

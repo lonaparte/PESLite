@@ -258,7 +258,8 @@ class ADC:
                 self.open()
             else:
                 self.accumulated = dict(self._zero)
-        meas = ADCSample(meas.t, meas.values, tuple(self.peeks) + meas.samples)
+        if self.peeks:
+            meas = ADCSample(meas.t, meas.values, tuple(self.peeks) + meas.samples)
         self.peeks, self.n_samp = [], 1
         return meas
 

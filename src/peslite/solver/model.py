@@ -432,12 +432,13 @@ class _AlgebraicLoop:
     """Automatically solved strongly connected group of output stages and signal copies.
 
     A small set of connection copies is selected as tear variables while the model is assembled.
-    The remaining operations are acyclic.  Repeated Gauss--Seidel sweeps enforce the torn
-    connections without assigning the responsibility to any participating subsystem.
+    The remaining operations are acyclic. Scalar groups use warm-started secant iteration;
+    general groups use Gauss--Seidel sweeps. No participating subsystem owns the loop solve.
     """
 
     __slots__ = ("operations", "tears", "owners", "labels", "max_sweeps", "rtol", "atol",
                  "_inverse", "_scalar_sweep")
+    step_limit = 10.0
 
     def __init__(self, operations: tuple, tears: tuple, owners: tuple,
                  labels: tuple[str, ...],
@@ -522,7 +523,7 @@ class _AlgebraicLoop:
         inverse = self._inverse
         x1 = x0 - inverse * r0 if inverse is not None else y0
         scale = max(1.0, abs(x0), abs(y0))
-        if (not self._finite_scalar(x1)) or abs(x1 - x0) > 10.0 * scale:
+        if (not self._finite_scalar(x1)) or abs(x1 - x0) > self.step_limit * scale:
             x1 = y0
         for _iteration in range(self.max_sweeps - 1):
             y1 = self._evaluate_scalar(t, x1)
@@ -537,7 +538,7 @@ class _AlgebraicLoop:
             inverse = self._inverse
             x2 = x1 - inverse * r1 if inverse is not None else y1
             scale = max(1.0, abs(x1), abs(y1))
-            if (not self._finite_scalar(x2)) or abs(x2 - x1) > 10.0 * scale:
+            if (not self._finite_scalar(x2)) or abs(x2 - x1) > self.step_limit * scale:
                 x2 = y1
             x0, r0, x1 = x1, r1, x2
         raise FloatingPointError(

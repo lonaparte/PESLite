@@ -372,13 +372,7 @@ class AveragingBridge(_BridgeModel):
 
 def make_topology(cfg: Any):
     """Build the bridge topology selected by ``cfg.type``."""
-    try:
-        topology_type = TOPOLOGY_TYPES[cfg.type]
-    except KeyError:
-        raise ConfigError(
-            f"unknown bridge topology {cfg.type!r}; known: {sorted(TOPOLOGY_TYPES)}"
-        ) from None
-    return topology_type.from_config(cfg)
+    return topology_type(cfg.type).from_config(cfg)
 
 
 def topology_type(name: str, where: str = "bridge.type") -> type:
