@@ -8,8 +8,6 @@ base:
   v_ll_rms: 400.0
   f0: 50.0
 
-buses: {}
-
 units:
   charger:
     type: wpt
