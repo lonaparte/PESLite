@@ -24,8 +24,8 @@ ramp its reference over `ramp` seconds. A unit with a latched protection trip re
 
 ### `disconnect`
 
-Disconnects the target at `t`. For a converter, the normal hardware path blocks PWM, opens the AC
-terminal and stops the controller command.
+Disconnects the target at `t`. For a converter, the common unit path stops the controller command,
+opens its series branch when present, and blocks an unfiltered bridge on its named power bus.
 
 ### `set`
 
@@ -61,7 +61,7 @@ simulation:
     states:
       pcc.u_C: source
       vsc.dclink.u_C: rated
-      vsc.ctrl.sync.theta: 0.1
+      vsc.ctrl.PSC.theta: 0.1
 ```
 
 The state names are the `states.csv` columns. Complex state can use a two-element value or `.re`

@@ -20,27 +20,72 @@ import json
 import math
 from collections.abc import Mapping as _Mapping
 from copy import deepcopy
+from contextvars import ContextVar
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
 
 from ..components.network import ELEMENT_TYPES, element_buses
-from ..control.loops import LOOP_TYPES
+from ..control.loops import LOOP_TYPES, loop_key_type, loop_type
+from ..control.profiles import ReferenceParams, control_type
 from ..solver.model import ConfigError
 from .events import EVENT_TYPES, NAMED, events_for
-from .validate import validate
+from .types import unit_type
 
 __all__ = [
     "ConfigError", "load", "dump", "dumps", "read_tree", "read_initial", "from_dict", "to_dict",
     "BaseValues", "DCBase",
     "BusParams", "BranchParams", "SourceParams",
-    "ACFilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams",
+    "FilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams",
     "MeasurementParams", "ReferenceParams", "ControlParams", "OvercurrentParams", "VoltageLimitParams",
     "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
-    "BridgeParams", "UnitParams", "RUNTIME", "Change", "runtime_changeable", "set_changes",
+    "BridgeParams", "SSLinkParams", "LCCLinkParams", "UnitParams",
+    "RUNTIME", "Change", "runtime_changeable", "set_changes",
     "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "ProgressParams",
     "MetaParams", "Params",
 ]
+
+
+_PARAMETER_RECORDER: ContextVar[Any] = ContextVar("peslite_parameter_recorder", default=None)
+
+
+def _parameterized(factory, parameters):
+    """Construct a part normally, optionally recording its parameter initialization.
+
+    The callable is the construction itself, not a second binding table. Exporters can replay it
+    with parameter expressions; ordinary simulations retain neither the callable nor a shadow part.
+    """
+    part = factory(parameters)
+    recorder = _PARAMETER_RECORDER.get()
+    if recorder is not None:
+        recorder(part, factory, parameters)
+    return part
+
+
+def parameter_leaves(value, prefix="", defaulted=frozenset()):
+    """Stored numerical input paths, excluding schema-declared structural fields.
+
+    This describes parameters, not a backend's private list of supported device families.
+    Collections defining layout and boolean feature switches remain structural.
+    """
+    defaulted = defaulted | {f"{prefix}.{path}" if prefix else path
+                             for path in getattr(value, "derived_defaults", ())}
+    if isinstance(value, UnitParams):
+        yield from parameter_leaves(value._unit_fields, prefix, defaulted)
+        items = ((item.name, getattr(value, item.name), item.metadata)
+                 for item in fields(value) if item.init and not item.name.startswith("_"))
+    elif is_dataclass(value):
+        items = ((item.name, getattr(value, item.name), item.metadata)
+                 for item in fields(value) if item.init)
+    elif isinstance(value, dict):
+        items = ((key, item, {}) for key, item in value.items())
+    else:
+        if isinstance(value, (float, int)) and not isinstance(value, bool):
+            yield prefix, value, prefix in defaulted
+        return
+    for name, item, metadata in items:
+        if not metadata.get("structural", False):
+            yield from parameter_leaves(item, f"{prefix}.{name}" if prefix else name, defaulted)
 
 
 # ------------------------------------------------------------------ pu bases and SI/pu inputs
@@ -176,14 +221,15 @@ def _scale(expression: str, scales: dict[str, float]) -> float:
 
 @dataclass(frozen=True)
 class BusParams:
-    """AC network node with a shunt capacitor to ground.
+    """Electrical node with a shunt capacitor to ground.
 
-    ``c``: capacitance, F (must be > 0); ``r_d``: series damping resistor, ohm.
-    pu inputs use the system base.
+    ``phases`` is 3 for the peak-scaled AC space-vector domain and 1 for a real scalar domain.
+    ``c`` is capacitance in F and ``r_d`` is series damping resistance in ohm.
     """
 
     c: float
     r_d: float = 0.0
+    phases: int = field(default=3, metadata={"structural": True})
 
     _quantities = {"c": "capacitance", "r_d": "resistance"}
 
@@ -217,18 +263,24 @@ class SourceParams:
     v: float = 0.0  # emf magnitude, phase-peak V
     f: Optional[float] = None
     angle: float = 0.0
+    derived_defaults: frozenset = field(init=False, default=frozenset(), compare=False)
 
     _quantities = {"l": "inductance", "r": "resistance", "v": "voltage"}
     _input_aliases = {"x_pu": "l_pu"}
     _defaults_pu = {"v": 1.0}
 
+    def resolved(self, base: BaseValues) -> "SourceParams":
+        source = replace(self, f=base.f0 if self.f is None else self.f)
+        object.__setattr__(source, "derived_defaults", frozenset(("f",)) if self.f is None else frozenset())
+        return source
+
 # ------------------------------------------------------------------ a converter unit
 
 @dataclass(frozen=True)
-class ACFilterParams:
-    """Series R-L branch of the converter's AC filter (``l_f`` H, ``r_f`` ohm).
+class FilterParams:
+    """Series R-L branch at a converter terminal (``l_f`` H, ``r_f`` ohm).
 
-    pu inputs use the unit's AC base. The filter capacitor is set on the bus (:class:`BusParams`).
+    The shunt capacitor is set on the connected bus (:class:`BusParams`).
     """
 
     l_f: float
@@ -322,53 +374,38 @@ class MeasurementParams:
     ``average`` lists any of ``u_g``, ``i_c`` and ``u_dc`` which use a mean over ``window``
     (s, at most the control period). Channels not listed are instantaneous.
     ``period`` is the ADC oversampling period; it defaults to the control period.
+    ``sources`` selects physical outputs for existing channels. ``rms`` selects sliding
+    mean-square windows, in whole control periods (protection/output periods in ideal averaging).
     """
 
     average: list[str] = field(default_factory=list)
     window: Optional[float] = None  # s; default: the control period
     period: Optional[float] = None  # s; default: the control period
-
-
-@dataclass(frozen=True)
-class ReferenceParams:
-    """Controller references, all electrical quantities in this unit's pu bases."""
-
-    id_ref_pu: float = 0.0
-    iq_ref_pu: float = 0.0
-    p_ref_pu: float = 0.0
-    q_ref_pu: float = 0.0
-    v_ref_pu: float = 1.0
-    vdc_ref_pu: float = 1.0
-    theta: float = 0.0
-    omega: Optional[float] = None  # rad/s; defaults to the system frequency
-    zero_v_pu: float = 0.0
-
-    _quantities = {"id_ref_pu": "current", "iq_ref_pu": "current", "p_ref_pu": "power",
-                   "q_ref_pu": "power", "v_ref_pu": "voltage", "vdc_ref_pu": "dc_voltage",
-                   "zero_v_pu": "voltage"}
+    sources: dict[str, str] = field(default_factory=dict)  # channel -> physical output name
+    rms: dict[str, float] = field(default_factory=dict)  # channel -> window duration (s)
 
 
 @dataclass(frozen=True, kw_only=True)
 class ControlParams:
-    """Digital controller interrupt, computation, loops, wiring and references.
+    """Digital controller fields shared by every controller architecture.
 
     For switching and PWM-period averaging, ``period`` defaults to one carrier period and
     ``computation`` defaults to 1 us: the time from the ADC sample until the new shadow duty
-    ratios may be loaded.  With the ideal averaging bridge the controller is continuous; these
+    ratios may be loaded. With the ideal averaging bridge the controller is continuous; these
     discrete timing settings are retained in the file but ignored.
-    ``type`` selects the default wiring; ``connections`` and ``outputs`` override it.
-    Each ``loops`` entry is validated against the schema registered for its ``type``.
+
+    ``type`` selects the reference-field schema and default wiring. ``connections`` and ``outputs``
+    override that wiring. A ``loops`` key names a registered loop class. The optional
+    ``ClassName[label]`` form distinguishes repeated uses of the same class.
     """
 
-    type: str  # "gfl" | "gfm" | "custom"
+    type: str
     period: Optional[float] = None  # s; default: one carrier period
     computation: Optional[float] = None  # s; sampled default 1 us; ignored by continuous averaging
-    loops: dict[str, Any] = field(metadata={"entries": "loop"})  # each built with the parameters of its type
-    connections: dict = field(default_factory=dict)  # input port -> output port
-    outputs: dict = field(default_factory=dict)  # u_dq, theta, omega -> output port
-    references: ReferenceParams = field(default_factory=ReferenceParams)
-
-    _choices = {"type": ("gfl", "gfm", "custom")}
+    loops: dict[str, Any] = field(metadata={"entries": "loop"})
+    connections: dict = field(default_factory=dict)
+    outputs: dict = field(default_factory=dict)
+    references: Any = None  # built from the schema selected by type
 
 
 @dataclass(frozen=True)
@@ -413,6 +450,7 @@ class ProtectionParams:
     """Trip criteria and the ROCOF alarm, each switched by ``enable`` (1/0)."""
 
     overcurrent: OvercurrentParams = field(default_factory=OvercurrentParams)
+    rms_current: OvercurrentParams = field(default_factory=OvercurrentParams)
     undervoltage: VoltageLimitParams = field(default_factory=VoltageLimitParams)
     overvoltage: VoltageLimitParams = field(default_factory=VoltageLimitParams)
     frequency: FrequencyLimitParams = field(default_factory=FrequencyLimitParams)
@@ -429,60 +467,100 @@ class BridgeParams:
     PWM timer, duty registers and load timing but applies each active duty ratio continuously until
     the next compare-register load. ``"averaging"`` is an ideal controlled voltage source driven
     by continuous measurement and control equations, with no ADC, interrupt, computation or PWM
-    timing.
+    events. For a unilateral half bridge, ``pwm.f_sw`` still defines the physical cycle used by
+    the averaged DCM conduction law; it does not schedule carrier events.
     """
 
     model: str = "pwm_averaging"
+    type: Optional[str] = None
+    upper_controlled: bool = True
+    lower_controlled: bool = True
+    reverse_port: bool = False
+    external_terminal: str = "midpoint"
 
-    _choices = {"model": ("switching", "pwm_averaging", "averaging")}
+    _choices = {
+        "model": ("switching", "pwm_averaging", "averaging"),
+        "external_terminal": ("midpoint", "lower_rail"),
+    }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class UnitParams:
-    """One converter unit: rating, plant components, controller and protection.
+    """Common converter-unit parameters plus one ``type``-selected field set."""
 
-    ``bus``: terminal bus. Plant fields are stored in SI; controller parameters are
-    pu on the unit's rating ``s_base`` (VA) and DC base (``dclink.vdc_ref``).
-    """
-
-    bus: str
-    ac_filter: ACFilterParams
-    dclink: DCLinkParams
-    pwm: PWMParams
-    ctrl: ControlParams
+    type: str
+    pwm: Optional[PWMParams] = field(default=None, metadata={"required": True})
+    ctrl: Optional[ControlParams] = None
+    dclink: Optional[DCLinkParams] = field(default=None, metadata={"required": True})
+    bus: Optional[str] = None
     bridge: BridgeParams = field(default_factory=BridgeParams)
-    s_base: Optional[float] = None  # rating (VA); default: the system base
     meas: MeasurementParams = field(default_factory=MeasurementParams)
     protection: ProtectionParams = field(default_factory=ProtectionParams)
-    base: BaseValues = field(init=False, default=None)  # set by resolved()
+    s_base: Optional[float] = None
+    _unit_fields: Any = field(repr=False, default=None)
+    base: BaseValues = field(init=False, default=None)
     derived_defaults: frozenset = field(init=False, default=frozenset(), compare=False)
     events: tuple = field(init=False, default=(), compare=False)
 
+    def __init__(self, *, type: str, _unit_fields: Any, **values: Any) -> None:
+        schema = fields(UnitParams)
+        known = {item.name for item in schema if item.init}
+        changes = {name: value for name, value in values.items() if name not in known}
+        selected = replace(_unit_fields, **changes) if changes else _unit_fields
+        values = {**values, "type": type, "_unit_fields": selected}
+        composite = unit_type(type).composite
+        for item in schema:
+            if item.init and item.name in values:
+                value = values[item.name]
+            elif item.default_factory is not dataclasses.MISSING:
+                value = None if composite else item.default_factory()
+            else:
+                value = item.default
+            object.__setattr__(self, item.name, value)
+
+    @classmethod
+    def _common_fields(cls, *, composite: bool = False) -> frozenset[str]:
+        """Public common fields, interpreted from this one schema at every boundary."""
+        return frozenset(item.name for item in fields(cls)
+                         if item.init and item.name not in {"type", "ctrl", "_unit_fields"}
+                         and (not composite or item.name == "s_base"))
+
+    def __getattr__(self, name: str) -> Any:
+        """Expose the selected schema's fields without storing a second copy."""
+        return getattr(object.__getattribute__(self, "_unit_fields"), name)
+
     @staticmethod
     def _bases(data: dict, base: BaseValues, where: str) -> tuple[BaseValues, dict[str, float]]:
-        """The unit's own base (its ``s_base``, default the system's) and its pu scales (dc: ``dclink.vdc_ref``)."""
+        """Resolve the common rating and the selected unit's electrical scaling base."""
         if data.get("s_base") is not None:
-            base = _build(BaseValues, {"s_base": data["s_base"], "v_ll_rms": base.v_ll_rms, "f0": base.f0},
-                          where, None, None)
-        dc = data.get("dclink")
-        if not isinstance(dc, dict) or "vdc_ref" not in dc:
-            raise ConfigError(f"{where}.dclink.vdc_ref: required value missing")
-        vdc_ref = _numeric_string(dc["vdc_ref"])
-        if (isinstance(vdc_ref, bool) or not isinstance(vdc_ref, (int, float))
-                or not math.isfinite(vdc_ref) or vdc_ref <= 0):
-            raise ConfigError(f"{where}.dclink.vdc_ref must be finite and positive")
-        return base, base.parameter_scales(vdc_ref)
+            base = _build(
+                BaseValues,
+                {"s_base": data["s_base"], "v_ll_rms": base.v_ll_rms, "f0": base.f0},
+                where,
+                None,
+                None,
+            )
+        kind = data.get("type", "vsc")
+        if unit_type(kind, f"{where}.type").composite:
+            return base, base.parameter_scales()
+        dclink = data.get("dclink")
+        voltage = _numeric_string(dclink.get("vdc_ref")) if isinstance(dclink, dict) else None
+        label = "dclink.vdc_ref"
+        if (isinstance(voltage, bool) or not isinstance(voltage, (int, float))
+                or not math.isfinite(voltage) or voltage <= 0.0):
+            raise ConfigError(f"{where}.{label} must be finite and positive")
+        return base, base.parameter_scales(float(voltage))
 
-    def resolved(self, system_base: BaseValues, events: tuple = ()) -> UnitParams:
-        """Return a copy with its base, target events and dependent defaults resolved.
-
-        A sampled controller's period defaults to one carrier period and every loop period to the
-        control period.  An ideal averaged bridge instead resolves a continuous controller:
-        omitted periods and computation stay unset; explicitly written sampled timing remains
-        stored so the same file can switch models, but is ignored by the
-        continuous implementation.  The reference frequency defaults to the system frequency in
-        either case. Derived paths stay dependent through :meth:`Params.replace`.
-        """
+    def resolved(self, system_base: BaseValues, events: tuple = ()) -> "UnitParams":
+        if unit_type(self.type).composite:
+            unit = replace(self)
+            base = system_base if self.s_base is None else BaseValues(
+                self.s_base, system_base.v_ll_rms, system_base.f0,
+            )
+            object.__setattr__(unit, "base", base)
+            object.__setattr__(unit, "events", tuple(events))
+            return unit
+        assert self.ctrl is not None and self.pwm is not None and self.bridge is not None
         derived = set()
         ctrl = self.ctrl
         continuous = self.bridge.model == "averaging"
@@ -492,28 +570,148 @@ class UnitParams:
         if not continuous and ctrl.computation is None:
             ctrl = replace(ctrl, computation=1.0e-6)
             derived.add("ctrl.computation")
-        references = ctrl.references
-        if references.omega is None:
-            references = replace(references, omega=system_base.w0)
+        if unit_type(self.type).defaults_grid_frequency and ctrl.references.omega is None:
+            references = replace(ctrl.references, omega=system_base.w0)
+            ctrl = replace(ctrl, references=references)
             derived.add("ctrl.references.omega")
         loops = dict(ctrl.loops)
         for name, loop in loops.items():
             if not continuous and loop.period is None:
                 loops[name] = replace(loop, period=ctrl.period)
                 derived.add(f"ctrl.loops.{name}.period")
-        ctrl = replace(ctrl, references=references, loops=loops)
-        unit = replace(self, ctrl=ctrl)
+        unit = replace(self, ctrl=replace(ctrl, loops=loops))
         base = system_base if self.s_base is None else BaseValues(
-            self.s_base, system_base.v_ll_rms, system_base.f0)
+            self.s_base, system_base.v_ll_rms, system_base.f0,
+        )
         object.__setattr__(unit, "base", base)
         object.__setattr__(unit, "derived_defaults", frozenset(derived))
         object.__setattr__(unit, "events", tuple(events))
         return unit
 
-    @property
+    @functools.cached_property
     def dc_base(self) -> DCBase:
-        """This unit's DC base (:class:`DCBase`)."""
+        if unit_type(self.type).composite:
+            raise AttributeError("a composite WPT unit has no single DC base")
         return self.base.dc(self.dclink.vdc_ref)
+
+
+def _unit_items(units: Mapping[str, UnitParams], *, leaves_only: bool = True,
+                prefix: str = ""):
+    """Iterate the configured unit tree without storing a second flattened mapping."""
+    for name, unit in units.items():
+        path = f"{prefix}.{name}" if prefix else name
+        spec = unit_type(unit.type)
+        if not leaves_only or not spec.composite:
+            yield path, unit
+        if spec.composite:
+            children = {child: getattr(unit, child) for child in spec.children}
+            yield from _unit_items(children, leaves_only=leaves_only, prefix=path)
+
+
+def _unit_at(units: Mapping[str, UnitParams], path: str) -> Optional[UnitParams]:
+    """Return one node from the configured unit tree, or ``None`` when absent."""
+    parts = path.split(".")
+    unit = units.get(parts[0]) if parts and parts[0] else None
+    for part in parts[1:]:
+        if unit is None or part not in unit_type(unit.type).children:
+            return None
+        unit = getattr(unit, part)
+    return unit
+
+
+def _unit_path(units: Mapping[str, UnitParams], value: str) -> Optional[str]:
+    """Return the longest configured unit path which prefixes ``value``."""
+    return next(
+        (name for name, _unit in sorted(
+            _unit_items(units, leaves_only=False), key=lambda item: len(item[0]), reverse=True,
+        ) if value == name or value.startswith(name + ".")),
+        None,
+    )
+
+
+def _unit_leaves(units: Mapping[str, UnitParams], path: str) -> tuple[str, ...]:
+    """Return leaf paths below ``path`` directly from the authoritative unit tree."""
+    unit = _unit_at(units, path)
+    if unit is None:
+        return ()
+    spec = unit_type(unit.type)
+    if not spec.composite:
+        return (path,)
+    children = {child: getattr(unit, child) for child in spec.children}
+    return tuple(name for name, _child in _unit_items(children, prefix=path))
+
+
+@dataclass(frozen=True)
+class _VSCUnitFields:
+    """Fields unique to a voltage-source converter.
+
+    Plant fields are stored in SI; controller parameters are pu on the unit's rating
+    ``s_base`` (VA) and DC base (``dclink.vdc_ref``).
+    """
+
+    ac_filter: FilterParams
+
+
+@dataclass(frozen=True, kw_only=True)
+class _DCConverterUnitFields:
+    """Fields unique to a scalar converter unit.
+
+    A series ``filter`` exposes the bridge through the common named ``bus``. A composite may omit
+    both and attach the bridge to a scoped internal bus, as WPT does.
+    """
+
+    filter: Optional[FilterParams] = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class SSLinkParams:
+    """Series-series compensated two-winding inductive link in SI units."""
+
+    type: str = "ss"
+    primary_inductance: float
+    secondary_inductance: float
+    mutual_inductance: float
+    primary_capacitance: float
+    secondary_capacitance: float
+    primary_resistance: float = 0.0
+    secondary_resistance: float = 0.0
+
+    _choices = {"type": ("ss",)}
+
+
+@dataclass(frozen=True, kw_only=True)
+class LCCLinkParams:
+    """Symmetric-form LCC-LCC compensated two-winding inductive link in SI units.
+
+    Each port has a series compensation inductor, a shunt compensation capacitor and a
+    series coil capacitor.  The two coil inductances are coupled by ``mutual_inductance``.
+    """
+
+    type: str = "lcc"
+    primary_inductance: float
+    secondary_inductance: float
+    mutual_inductance: float
+    primary_series_capacitance: float
+    secondary_series_capacitance: float
+    primary_compensation_inductance: float
+    secondary_compensation_inductance: float
+    primary_parallel_capacitance: float
+    secondary_parallel_capacitance: float
+    primary_resistance: float = 0.0
+    secondary_resistance: float = 0.0
+    primary_compensation_resistance: float = 0.0
+    secondary_compensation_resistance: float = 0.0
+
+    _choices = {"type": ("lcc",)}
+
+
+@dataclass(frozen=True)
+class _WPTUnitFields:
+    """Fields unique to a composite wireless-power-transfer unit."""
+
+    primary: Any = field(metadata={"unit": True})
+    secondary: Any = field(metadata={"unit": True})
+    link: Any = field(metadata={"types": {"ss": SSLinkParams, "lcc": LCCLinkParams}})
 
 
 # ------------------------------------------------------------------ the run
@@ -586,7 +784,7 @@ class SimulationParams:
 
     t_end: float
     solver: SolverParams = field(default_factory=SolverParams)
-    initial: InitialParams = field(default_factory=InitialParams)
+    initial: InitialParams = field(default_factory=InitialParams, metadata={"structural": True})
     output: OutputParams = field(default_factory=OutputParams)
     stop_on_trip: bool = True
     progress: ProgressParams = field(default_factory=ProgressParams)
@@ -610,18 +808,19 @@ class MetaParams:
 class Params:
     """Complete configuration: system base, network elements, units and run settings.
 
-    ``buses``, ``branches``, ``sources``, ``units`` and ``elements`` map names to entries;
-    their names are unique together and prefix state names.
+    ``buses``, ``branches``, ``sources``, ``units`` and ``elements`` map names to entries.
+    Names are scoped by section and prefix state names.
     """
 
     base: BaseValues  # system base, used for network pu inputs
     buses: dict[str, BusParams]
-    units: dict[str, UnitParams]
+    units: dict[str, UnitParams] = field(metadata={"entries": "unit"})
     simulation: SimulationParams
     sources: dict[str, SourceParams] = field(default_factory=dict)
     branches: dict[str, BranchParams] = field(default_factory=dict)
     elements: dict[str, Any] = field(default_factory=dict, metadata={"entries": "element"})
-    events: dict[str, Any] = field(default_factory=dict, metadata={"entries": "event"})
+    events: dict[str, Any] = field(default_factory=dict,
+                                   metadata={"entries": "event", "structural": True})
     meta: MetaParams = field(default_factory=MetaParams)
 
     def unit(self, name: Optional[str] = None) -> UnitParams:
@@ -631,13 +830,25 @@ class Params:
                 raise ConfigError(f"this system has {len(self.units)} units {sorted(self.units)}: "
                                   f"name the one you mean")
             name = next(iter(self.units))
-        if name not in self.units:
-            raise ConfigError(f"unknown unit {name!r}; known: {sorted(self.units)}")
-        return self.units[name]
+        if name in self.units:
+            return self.units[name]
+        unit = _unit_at(self.units, name)
+        if unit is not None:
+            return unit
+        known = sorted(name for name, _unit in _unit_items(self.units, leaves_only=False))
+        raise ConfigError(f"unknown unit {name!r}; known: {known}")
+
+    def sections_of(self, name: str) -> tuple[str, ...]:
+        """Return every section containing ``name``; nested unit paths belong to ``units``."""
+        sections = [section for section in NAMED if name in getattr(self, section)]
+        if _unit_at(self.units, name) is not None and "units" not in sections:
+            sections.append("units")
+        return tuple(sections)
 
     def section_of(self, name: str) -> Optional[str]:
-        """Return the named section containing ``name``, or ``None``."""
-        return next((section for section in NAMED if name in getattr(self, section)), None)
+        """Return the sole section containing ``name``, or ``None`` if absent or ambiguous."""
+        sections = self.sections_of(name)
+        return sections[0] if len(sections) == 1 else None
 
     @functools.cached_property
     def changes(self) -> tuple["Change", ...]:
@@ -653,7 +864,7 @@ class Params:
         return base, base.parameter_scales()
 
     def replace(self, **path_values: Any) -> "Params":
-        """Return a copy with dotted paths replaced, e.g. ``replace(**{"units.vsc.ctrl.loops.pll.kp_pu": 20})``."""
+        """Return a copy with dotted paths replaced, for example a loop-class gain path."""
         d = to_dict(self)
         assigned = set()
         free = ("simulation.initial.states.", "simulation.solver.subsystems.")  # dotted keys themselves
@@ -689,12 +900,35 @@ class Params:
 
 def from_dict(data: dict) -> Params:
     """Build, validate and resolve parameters, including every successive ``set`` event."""
+    from .validate import validate
+
     p = _build(Params, _normalize(data), "", None, None)
     validate(p)
-    p = replace(p, units={name: unit.resolved(p.base, events_for(p.events, name))
-                          for name, unit in p.units.items()})
+    p = replace(p, sources={name: source.resolved(p.base) for name, source in p.sources.items()},
+                units={name: _resolve_unit(unit, name, p.base, p.events)
+                       for name, unit in p.units.items()})
     p.changes
     return p
+
+
+def _resolve_unit(unit: UnitParams, path: str, system_base: BaseValues,
+                  events: dict[str, Any], inherited: tuple = ()) -> UnitParams:
+    """Resolve one configuration node and pass composite switching commands to its leaves."""
+    own_events = tuple(events_for(events, path))
+    active_events = (*inherited, *own_events)
+    spec = unit_type(unit.type)
+    if not spec.composite:
+        return unit.resolved(system_base, active_events)
+    resolved = unit.resolved(system_base, active_events)
+    child_base = resolved.base
+    selected = replace(resolved._unit_fields, **{
+        child: _resolve_unit(
+            getattr(unit, child), f"{path}.{child}", child_base, events, active_events,
+        )
+        for child in spec.children
+    })
+    object.__setattr__(resolved, "_unit_fields", selected)
+    return resolved
 
 
 def to_dict(p: Any, derived: bool = False) -> dict:
@@ -703,6 +937,29 @@ def to_dict(p: Any, derived: bool = False) -> dict:
     Values filled from other parameters are written as ``None`` unless ``derived`` is true,
     so rebuilding the mapping derives them from any replacements again.
     """
+    if isinstance(p, UnitParams):
+        common = p._common_fields(composite=unit_type(p.type).composite)
+        d = {
+            "type": p.type,
+            **to_dict(p._unit_fields, derived),
+            **{item.name: to_dict(getattr(p, item.name), derived) for item in fields(p)
+               if item.name in common or (item.name == "ctrl" and p.ctrl is not None)},
+        }
+        if not derived:
+            for path in p.derived_defaults:
+                *head, last = path.split(".")
+                node = d
+                for key in head:
+                    node = node[key]
+                node[last] = None
+        return d
+    if isinstance(p, ControlParams):
+        d = {f.name: to_dict(getattr(p, f.name), derived) for f in fields(p) if f.init}
+        for name, loop in p.loops.items():
+            direct = loop_key_type(name)
+            if direct is not None and direct.type == loop.type:
+                d["loops"][name].pop("type", None)
+        return d
     if is_dataclass(p) and not isinstance(p, type):
         d = {f.name: to_dict(getattr(p, f.name), derived) for f in fields(p) if f.init}
         if not derived:
@@ -785,21 +1042,156 @@ _TYPED = {
 }
 
 
+def _unit_params_class(data: Any, path: str) -> type:
+    """Select only the unit-type-specific field schema."""
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path}: expected a mapping, got {type(data).__name__}")
+    kind = data.get("type", "vsc")
+    return unit_type(kind, f"{path}.type").params
+
+
+def _build_control_params(data: Any, path: str, base: BaseValues,
+                          scales: dict[str, float], unit_type: str) -> ControlParams:
+    """Build the single controller parameter type using its selected reference schema."""
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path}: expected a mapping, got {type(data).__name__}")
+    kind = data.get("type")
+    spec = control_type(kind, f"{path}.type")
+    if unit_type not in spec.unit_types:
+        raise ConfigError(
+            f"{path}.type: unit type {unit_type!r} cannot use control type {kind!r}"
+        )
+    values = dict(data)
+    values["references"] = _build(
+        spec.references,
+        values.get("references", {}),
+        f"{path}.references",
+        base,
+        scales,
+    )
+    return _build(ControlParams, values, path, base, scales)
+
+
+def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
+    """Build common unit fields and one explicitly scoped set of unique fields."""
+    unit_fields_cls = _unit_params_class(data, path)
+    kind = data.get("type", "vsc")
+    spec = unit_type(kind, f"{path}.type")
+    common_names = UnitParams._common_fields(composite=spec.composite)
+    unit_field_names = {item.name for item in fields(unit_fields_cls) if item.init}
+    known = {"type", *common_names, *unit_field_names}
+    if not spec.composite:
+        known.add("ctrl")
+    unknown = set(data) - known
+    if unknown:
+        raise ConfigError(f"{path}: unknown key(s) {sorted(unknown)}; known: {sorted(known)}")
+
+    unit_base, unit_scales = UnitParams._bases(data, base, path)
+    common = _build_fields(
+        UnitParams,
+        {name: data[name] for name in common_names if name in data},
+        path,
+        unit_base,
+        unit_scales,
+        names=common_names,
+    )
+    unit_fields = _build(
+        unit_fields_cls,
+        {name: data[name] for name in unit_field_names if name in data},
+        path,
+        unit_base,
+        unit_scales,
+    )
+    if not spec.composite:
+        control = _build_control_params(
+            data.get("ctrl"), f"{path}.ctrl", unit_base, unit_scales, kind
+        )
+        bridge = common["bridge"]
+        common["bridge"] = replace(bridge, type=bridge.type or spec.bridge_for(control))
+        common["ctrl"] = control
+    return UnitParams(
+        type=kind,
+        _unit_fields=unit_fields,
+        **common,
+    )
+
+
 def _typed_class(what: str, data: Any, path: str) -> type:
     registry, hint = _TYPED[what]
     kind = data.get("type") if isinstance(data, dict) else None
+    if what == "loop":
+        return loop_type(kind, f"{path}.type").Params
     if not isinstance(kind, str) or kind not in registry:
         raise ConfigError(f"{path}.type: unknown {what} type {kind!r}; known: {sorted(registry)}{hint}")
     return registry[kind].Params
 
 
+def _loop_entry(name: str, item: Any, path: str) -> Any:
+    """Resolve a class-qualified loop entry without creating a loop object.
+
+    YAML parses a bare ``ClassName:`` entry as ``None``. In this one scope it is the concise
+    spelling of an empty parameter mapping.
+    """
+    if item is None:
+        item = {}
+    if is_dataclass(item):
+        item = to_dict(item)
+    if not isinstance(item, dict):
+        raise ConfigError(f"{path}: expected a mapping, got {type(item).__name__}")
+    values = dict(item)
+    direct = loop_key_type(name, path)
+    selected = values.get("type")
+    if direct is None:
+        if selected is not None:
+            values["type"] = loop_type(selected, f"{path}.type").type
+        return values
+    if selected is not None and loop_type(selected, f"{path}.type") is not direct:
+        raise ConfigError(
+            f"{path}.type: {selected!r} conflicts with loop class {name!r}"
+        )
+    values["type"] = direct.type
+    return values
+
+
 def _target_scales(event: Any, parent: dict, base: Any) -> Optional[dict]:
-    """Use a target unit's pu bases for a custom event's electrical parameters."""
+    """Use the target Unit port's base, following a composite's default port."""
     target = event.get("target") if isinstance(event, dict) else None
     units = parent.get("units")
-    if not isinstance(target, str) or not isinstance(units, dict) or not isinstance(units.get(target), dict):
+    if not isinstance(target, str) or not isinstance(units, dict):
         return None
-    return UnitParams._bases(units[target], base, f"units.{target}")[1]
+    parts = target.split(".")
+    if not parts or not isinstance(units.get(parts[0]), dict):
+        return None
+
+    path = parts[0]
+    unit = units[parts[0]]
+    current_base = base
+    index = 1
+    while True:
+        current_base, scales = UnitParams._bases(unit, current_base, f"units.{path}")
+        spec = unit_type(unit.get("type", "vsc"), f"units.{path}.type")
+        if index < len(parts) and parts[index] in spec.children:
+            child = parts[index]
+            value = unit.get(child)
+            if not isinstance(value, dict):
+                return None
+            path += f".{child}"
+            unit = value
+            index += 1
+            continue
+        if spec.composite:
+            port = spec.default_port
+            if port is None or port not in spec.children:
+                raise ConfigError(
+                    f"units.{path}: composite type {spec.name!r} needs a default port"
+                )
+            value = unit.get(port)
+            if not isinstance(value, dict):
+                raise ConfigError(f"units.{path}.{port}: default port Unit is missing")
+            path += f".{port}"
+            unit = value
+            continue
+        return scales
 
 
 def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dict], parent: dict) -> dict:
@@ -815,8 +1207,12 @@ def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dic
         if not name or "." in name:
             raise ConfigError(f"{path}: {name!r} is not a usable name (non-empty, no '.')")
         where = f"{path}.{name}"
-        if item_cls in _TYPED:
-            if is_dataclass(item):
+        if item_cls == "unit":
+            out[name] = _build_unit_params(item, where, base)
+        elif item_cls in _TYPED:
+            if item_cls == "loop":
+                item = _loop_entry(name, item, where)
+            elif is_dataclass(item):
                 item = to_dict(item)
             here = (_target_scales(item, parent, base) if item_cls == "event" else None) or scales
             out[name] = _build(_typed_class(item_cls, item, where), item, where, base, here)
@@ -843,18 +1239,33 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
         data = convert_quantities(data, cls, scales, path)
         if hasattr(cls, "_scaled_defaults"):
             data = {**cls._scaled_defaults(data, scales), **data}
+    kwargs = _build_fields(cls, data, path, base, scales)
+    try:
+        obj = cls(**kwargs)
+    except ConfigError as exc:
+        raise ConfigError(f"{path}.{exc}" if path else str(exc)) from None
+    for name, choices in getattr(cls, "_choices", {}).items():
+        if getattr(obj, name) not in choices:
+            raise ConfigError(f"{path or cls.__name__}.{name}: {getattr(obj, name)!r} not in {choices}")
+    return obj
+
+
+def _build_fields(cls, data: dict, path: str, base: Any, scales: Optional[dict],
+                  *, names: Optional[frozenset[str]] = None) -> dict:
+    """Parse selected dataclass fields through the same rules as an ordinary section."""
     hints = get_type_hints(cls)
-    known = {f.name for f in fields(cls) if f.init}
+    selected = tuple(f for f in fields(cls) if f.init and (names is None or f.name in names))
+    known = {f.name for f in selected}
     unknown = set(data) - known
     if unknown:
         hint = getattr(cls, "_unknown_hint", "")
         raise ConfigError(f"{path}: unknown key(s) {sorted(unknown)}; known: {sorted(known)}"
                           + (f". {hint}" if hint else ""))
     kwargs = {}
-    for f in fields(cls):
-        if not f.init:
-            continue
+    for f in selected:
         key = f"{path}.{f.name}" if path else f.name
+        if f.metadata.get("required") and data.get(f.name) is None:
+            raise ConfigError(f"{key}: required value missing")
         tp = hints[f.name]
         optional, inner = _is_optional(tp)
         if f.name in data:
@@ -863,6 +1274,16 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
                 if not optional:
                     raise ConfigError(f"{key}: null is not allowed")
                 kwargs[f.name] = None
+            elif f.metadata.get("unit"):
+                kwargs[f.name] = _build_unit_params(value, key, base)
+            elif "types" in f.metadata:
+                choices = f.metadata["types"]
+                kind = value.get("type") if isinstance(value, dict) else None
+                if kind not in choices:
+                    raise ConfigError(
+                        f"{key}.type: unknown type {kind!r}; known: {sorted(choices)}"
+                    )
+                kwargs[f.name] = _build(choices[kind], value, key, base, scales)
             elif is_dataclass(inner) and isinstance(inner, type):
                 kwargs[f.name] = _build(inner, value, key, base, scales)
             elif get_origin(inner) in (dict, _Mapping):
@@ -904,14 +1325,7 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
                               else f.default_factory())  # type: ignore[misc]
         else:
             raise ConfigError(f"{key}: required value missing")
-    try:
-        obj = cls(**kwargs)
-    except ConfigError as exc:  # checks of the class itself
-        raise ConfigError(f"{path}.{exc}" if path else str(exc)) from None
-    for name, choices in getattr(cls, "_choices", {}).items():
-        if getattr(obj, name) not in choices:
-            raise ConfigError(f"{path or cls.__name__}.{name}: {getattr(obj, name)!r} not in {choices}")
-    return obj
+    return kwargs
 
 
 # ------------------------------------------------------------------ set events
@@ -921,10 +1335,10 @@ RUNTIME = (
     "branches.*.l", "branches.*.r",
     "sources.*.v", "sources.*.f", "sources.*.angle", "sources.*.l", "sources.*.r",
     "units.*.ctrl.references.*",
-    "units.*.ctrl.loops.*.** (not type, period)",
+    "units.*.ctrl.loops.*.** (not period)",
     "units.*.protection.**",
     "units.*.dclink.source.* (not type)",
-    "elements.*.* (not type, bus)",
+    "elements.*.* (not type, bus or declared structural fields)",
 )
 
 
@@ -944,7 +1358,11 @@ class Change:
 def runtime_changeable(path: str, p: Params) -> bool:
     """Whether stored parameter ``path`` may be changed by a ``set`` event."""
     section, _, rest = path.partition(".")
-    name, _, rest = rest.partition(".")
+    if section == "units":
+        name = _unit_path(p.units, rest) or rest.partition(".")[0]
+        rest = rest[len(name) + 1:]
+    else:
+        name, _, rest = rest.partition(".")
     keys = rest.split(".")
     if section == "buses":
         return keys in (["c"], ["r_d"])
@@ -962,9 +1380,28 @@ def runtime_changeable(path: str, p: Params) -> bool:
         return keys[:2] == ["dclink", "source"] and len(keys) == 3 and keys[2] != "type"
     if section == "elements":
         element = p.elements.get(name)
-        return (element is not None and len(keys) == 1 and keys[0] != "type"
+        field = element.__dataclass_fields__.get(rest) if element is not None else None
+        return (field is not None and len(keys) == 1 and keys[0] != "type"
+                and field.metadata.get("runtime", True)
                 and keys[0] not in element_buses(element))
     return False
+
+
+def _set_assignments(p: Params, event: Any):
+    """Yield explicit set assignments in storage units, using the ordinary quantity schema."""
+    for path, value in event.set.items():
+        *head, name = path.split(".")
+        owner = p
+        for key in head:
+            owner = owner[key] if isinstance(owner, dict) else getattr(owner, key)
+        scales = p.base.parameter_scales()
+        if head[0] == "units":
+            unit = p.unit(_unit_path(p.units, ".".join(head[1:])))
+            scales = unit.base.parameter_scales(
+                unit.dclink.vdc_ref if unit.dclink is not None else 1.0)
+        target = quantity_name(type(owner), name, getattr(owner, "__dict__", None))
+        converted = convert_quantities({name: value}, type(owner), scales, path)
+        yield ".".join((*head, target)), converted[target]
 
 
 def set_changes(p: Params) -> tuple[Change, ...]:
@@ -1111,11 +1548,19 @@ def _written_out(p: Params) -> dict:
         unit = d["units"][name]
         if unit["s_base"] is None:
             unit["s_base"] = u.base.s_base
-        meas = unit["meas"]
-        if meas["period"] is None:
-            meas["period"] = u.ctrl.period
-        if meas["window"] is None and meas["average"]:
-            meas["window"] = u.ctrl.period
+    for name, u in _unit_items(p.units):
+        keys = name.split(".")
+        unit = d["units"][keys[0]]
+        for key in keys[1:]:
+            unit = unit[key]
+        if unit["s_base"] is None:
+            unit["s_base"] = u.base.s_base
+        if "meas" in unit:
+            meas = unit["meas"]
+            if meas["period"] is None:
+                meas["period"] = u.ctrl.period
+            if meas["window"] is None and meas["average"]:
+                meas["window"] = u.ctrl.period
     for name, source in d["sources"].items():
         if source["f"] is None:
             source["f"] = p.base.f0

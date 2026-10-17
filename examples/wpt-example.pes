@@ -1,0 +1,75 @@
+# PESLite 0.4.0
+# Series-series compensated wireless power transfer. The WPT entry is a composite Unit; assembly
+# expands its independently clocked primary and secondary DCConverter children during assembly.
+# Each bridge and matching magnetic-link terminal share one scoped named bus. Electrical plant
+# values are SI.
+
+base:
+  s_base: 5000.0
+  v_ll_rms: 400.0
+  f0: 50.0
+
+buses: {}
+
+units:
+  charger:
+    type: wpt
+
+    primary:
+      type: dc_converter
+      dclink:
+        vdc_ref: 400.0
+        source:
+          type: voltage
+      pwm:
+        f_sw: 1.0e6
+      ctrl:
+        type: resonant
+        computation: 0.0
+        loops:
+          ResonantModulation: {}
+        references:
+          modulation: 0.8
+          frequency: 85000.0
+
+    secondary:
+      type: dc_converter
+      dclink:
+        vdc_ref: 300.0
+        source:
+          type: voltage
+      pwm:
+        f_sw: 800.0e3
+      ctrl:
+        type: resonant
+        computation: 0.0
+        loops:
+          ResonantModulation: {}
+        references:
+          modulation: 0.7
+          frequency: 85000.0
+          phase: -1.5707963267948966
+
+    link:
+      type: ss
+      primary_inductance: 100.0e-6
+      secondary_inductance: 100.0e-6
+      mutual_inductance: 20.0e-6
+      primary_capacitance: 35.07e-9
+      secondary_capacitance: 35.07e-9
+      primary_resistance: 0.5
+      secondary_resistance: 0.5
+
+simulation:
+  t_end: 200.0e-6
+  solver:
+    dt: 50.0e-9
+    linearisations: 0
+  output:
+    period: 1.0e-6
+    record_every: 4
+    signals: 1
+
+meta:
+  title: Series-series WPT charger
+  description: Composite WPT Unit with independently clocked full-bridge primary and secondary converters.

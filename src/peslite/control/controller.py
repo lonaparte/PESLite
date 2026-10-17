@@ -19,15 +19,22 @@ from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
-from ..solver.model import Bag, ConfigError, gather, scatter
-from .blocks import abc2complex, peak_abs, phases, smoothstep
-from .loops import (ANGLE, FREQUENCY, I, I_AB, LOOP_TYPES, POWER, V, V_AB, V_DQ,
-                    CurrentLoop, DCVoltageLoop, Loop, SignalType, SyncLaw)
+from ..solver.model import Bag, ConfigError, _complex, _real, gather, scatter
+from ..solver.energy import PowerPort, port_power
+from .blocks import OutputLimit, abc2complex, complex_power, peak_abs, phases, smoothstep
+from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODULATION, POWER,
+                    SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ, CurrentLoop,
+                    Loop, SignalType, SyncLaw)
 from .modulation import CONFIGURED, OutputStage
+from .profiles import (ReferenceParams, ResonantReferenceParams,
+                       ScalarVoltageReferenceParams, control_type,
+                       register_control_type, validate_resonant_references,
+                       validate_scalar_voltage_references)
 
-__all__ = ["Measurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
+__all__ = ["Measurement", "ConverterMeasurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
            "ControlInterface", "CONTROL_INTERFACE", "ControlGraph", "default_wiring",
-           "UniteType", "make_controller"]
+           "VSCController", "BridgeControlOutput", "GraphController",
+           "make_controller"]
 
 
 # ------------------------------------------------------------------ the interface
@@ -36,8 +43,9 @@ __all__ = ["Measurement", "ControlMeasurement", "ControlOutput", "Controller", "
 class Measurement:
     """SI sample at ``t``: peak-scaled alpha-beta AC vectors (V, A) and DC voltage (V).
 
-    Windowed channels hold means over ``(t - T_avg, t]``; ``*_raw`` and ``i_abc`` are instantaneous.
-    ``samples`` holds an oversampled update's samples, oldest first, this one last; otherwise empty.
+    Windowed channels hold means over ``(t - T_avg, t]``. ``samples`` holds the instantaneous
+    ADC conversions in chronological order, including the conversion at ``t``; an instantaneous
+    entry has no nested samples. ``i_abc`` is always derived from the final conversion.
     """
 
     t: float
@@ -45,9 +53,6 @@ class Measurement:
     i_c: complex  # converter current (A), positive out of the bridge
     u_dc: float  # dc-link voltage (V)
     i_abc: NDArray[np.float64]  # instantaneous phase currents (A)
-    u_g_raw: Optional[complex] = None  # before window averaging
-    i_c_raw: Optional[complex] = None
-    u_dc_raw: Optional[float] = None
     extras: dict[str, float] = field(default_factory=dict)
     samples: tuple["Measurement", ...] = ()
 
@@ -84,6 +89,18 @@ class ControlOutput:
     startup_complete: bool = True
 
 
+@dataclass
+class BridgeControlOutput:
+    """Result of one single-phase bridge control update."""
+
+    duty: float
+    log: dict[str, float] | None = None
+    theta: float | None = None
+    omega: float | None = None
+    gates: bool = True
+    startup_complete: bool = True
+
+
 @runtime_checkable
 class Controller(Protocol):
     """Sampled controller ``(t, Measurement) -> ControlOutput``.
@@ -93,7 +110,7 @@ class Controller(Protocol):
     outside this interface.
     """
 
-    def __call__(self, t: float, meas: Measurement) -> ControlOutput: ...
+    def __call__(self, t: float, meas: Any) -> Any: ...
 
 
 @dataclass(frozen=True)
@@ -103,49 +120,15 @@ class ControlInterface:
     ``inputs`` are sources available to loop input ports. ``outputs`` are controller output ports,
     each driven by one loop output through ``ctrl.outputs``. Direction belongs to the mapping that
     contains a port; its value is the same :class:`SignalType` used by loop port declarations.
+    ``optional_inputs`` are schema ports retained at runtime only when an active path uses them.
     """
 
     inputs: Mapping[str, SignalType]
     outputs: Mapping[str, SignalType]
+    optional_inputs: frozenset[str] = frozenset()
 
 
-class _OutputLimit:
-    """Controller-owned scalar/magnitude limit; sampled use may track a PI."""
-
-    def __init__(self, limit: float, *, lower=None, pi=None, active=None, observer=None):
-        self.pi = pi
-        self.limit = float(limit)
-        self.lower = lower
-        self.active = active
-        self.observer = observer
-        self.saturated = False
-        if not math.isfinite(self.limit) or self.limit <= 0.0:
-            raise ConfigError("a controller output limit must be finite and positive")
-        if lower is not None and (not math.isfinite(lower) or lower >= self.limit):
-            raise ConfigError("a controller output lower limit must be finite and below its upper limit")
-        if pi is not None and pi.antiwindup_enabled and pi.kp == 0.0:
-            raise ConfigError("tracking anti-windup requires a nonzero proportional gain")
-
-    def _apply(self, intended):
-        if self.lower is not None:
-            return min(self.limit, max(self.lower, intended))
-        magnitude = abs(intended)
-        return intended * (self.limit / magnitude) if magnitude > self.limit else intended
-
-    def exceeded(self, intended) -> bool:
-        if self.lower is not None:
-            return intended < self.lower or intended > self.limit
-        return abs(intended) > self.limit
-
-    def sample(self, t, intended):
-        output = self._apply(intended)
-        self.saturated = output != intended
-        if (self.saturated and self.pi is not None
-                and (self.active is None or self.active())):
-            self.pi.antiwindup(intended, output)
-        if self.observer is not None:
-            self.observer(t, intended, output, count=True)
-        return output
+_OutputLimit = OutputLimit
 
 # ------------------------------------------------------------------ the start-up sequence
 
@@ -158,7 +141,7 @@ class Startup:
     """
 
     def __init__(self, T: float, run: bool = True, ramp: float = 0.0) -> None:
-        self.T = float(T)
+        self.T = _real(T)
         self.run = bool(run)
         self.ramp = float(ramp)
         self.steps = 0
@@ -289,20 +272,26 @@ CONTROL_INTERFACE = ControlInterface(
 
 
 class ControlGraph:
-    """The loops of ``cfg.ctrl.loops`` wired by typed ports and run by the control interrupt.
+    """The active loops of ``cfg.ctrl.loops`` wired by typed ports and run by the control interrupt.
 
     Loop inputs are held outputs of other loops, the pu measurement (``meas.u_g``, ``.i_c``,
     ``.u_dc``) or the references (``references.<name>``); ``connections`` and ``outputs`` are the
     default wiring, which ``cfg.ctrl.connections`` and ``.outputs`` override. Loops run in signal
     order, every interrupt or every n-th interrupt according to their periods.
 
-    Retuned parameters are queued by :meth:`schedule` and take effect at the next update. Changed
-    loops are rebuilt from their new parameters and continue from their named states.
+    Dependencies are traced backward from controller outputs before loop objects are constructed,
+    so declarations outside the active graph use no runtime object. Retuned parameters are queued
+    by :meth:`schedule` and take effect at the next update. Changed active loops are rebuilt from
+    their new parameters and continue from their named states.
     """
 
-    def __init__(self, cfg, startup, connections, outputs):
+    _cycle_iterations = 16
+    _cycle_atol = 1e-10
+    _cycle_rtol = 1e-8
+
+    def __init__(self, cfg, startup, connections, outputs, *, interface=CONTROL_INTERFACE):
         self.cfg, self.startup = cfg, startup
-        self.interface = CONTROL_INTERFACE
+        self.interface = interface
         self._pending: list[Any] = []
         self.on_retune = None
         self.connections = {**connections, **cfg.ctrl.connections}
@@ -310,7 +299,7 @@ class ControlGraph:
         self.nodes = {}
         self.periods = {}
         self.continuous = cfg.bridge.model == "averaging"
-        self._T = None if self.continuous else float(cfg.ctrl.period)
+        self._T = None if self.continuous else _real(cfg.ctrl.period)
         self._t0 = cfg.pwm.grid_offset
         self.values: dict[str, Any] = {}
         self._out_specs: dict[str, tuple] = {}
@@ -324,45 +313,88 @@ class ControlGraph:
         }
         if declared_references != set(self.references):
             raise RuntimeError("controller reference fields and input ports differ")
+        classes = {}
         types = dict(self.interface.inputs)
         for name, loop in cfg.ctrl.loops.items():
             cls = LOOP_TYPES.get(loop.type)
             if cls is None:
                 raise ConfigError(f"ctrl.loops.{name}: no loop type {loop.type!r} is registered")
-            self.nodes[name] = node = cls(loop, cfg, startup)
-            self._out_specs[name] = tuple((port, f"{name}.{port}", spec.complex_value)
-                                          for port, spec in node.outputs.items())
-            self.periods[name] = loop.period
-            self._store(name, node.initial_outputs())
-            types.update({f"{name}.{port}": spec for port, spec in node.outputs.items()})
-        self._samples = {name: node.sample for name, node in self.nodes.items()}
-        dependencies = {name: set() for name in self.nodes}
-        targets = set()
-        for name, node in self.nodes.items():
-            for port, spec in node.inputs.items():
-                target = f"{name}.{port}"
-                targets.add(target)
-                source = self.connections.get(target)
-                if source not in types:
-                    raise ConfigError(f"ctrl.connections.{target}: missing or unknown source {source!r}")
-                if types[source] != spec:
-                    raise ConfigError(f"ctrl.connections.{target}: incompatible signal {source!r}: "
-                                      f"{types[source]} -> {spec}")
-                owner = source.partition(".")[0]
-                # A delayed input breaks a cycle only in the sampled implementation.  Continuous
-                # averaging has no held previous sample, so its present-time dependency remains.
-                if owner in self.nodes and (self.continuous or port not in node.delayed):
-                    dependencies[name].add(owner)
-        if set(self.connections) - targets:
-            raise ConfigError(f"ctrl.connections: unknown input ports {sorted(set(self.connections) - targets)}")
+            classes[name] = cls
+            types.update({f"{name}.{port}": spec for port, spec in cls.outputs.items()})
+        targets = {
+            f"{name}.{port}": spec
+            for name, cls in classes.items()
+            for port, spec in cls.inputs.items()
+        }
+        unknown_connections = set(self.connections) - set(targets)
+        if unknown_connections:
+            raise ConfigError(
+                f"ctrl.connections: unknown input ports {sorted(unknown_connections)}"
+            )
+        for target, source in self.connections.items():
+            if source not in types:
+                raise ConfigError(
+                    f"ctrl.connections.{target}: missing or unknown source {source!r}"
+                )
+            if not types[source].compatible(targets[target]):
+                raise ConfigError(
+                    f"ctrl.connections.{target}: incompatible signal {source!r}: "
+                    f"{types[source]} -> {targets[target]}"
+                )
         unknown_outputs = set(self.outputs) - set(self.interface.outputs)
         if unknown_outputs:
             raise ConfigError(f"ctrl.outputs: unknown output ports {sorted(unknown_outputs)}; "
                               f"known: {sorted(self.interface.outputs)}")
+        active = set()
+        pending_sources = []
         for port, spec in self.interface.outputs.items():
             source = self.outputs.get(port)
-            if source not in types or types[source] != spec:
+            if source not in types or not types[source].compatible(spec):
                 raise ConfigError(f"ctrl.outputs.{port}: missing or incompatible source {source!r}")
+            pending_sources.append(source)
+        while pending_sources:
+            owner = pending_sources.pop().partition(".")[0]
+            if owner not in classes or owner in active:
+                continue
+            active.add(owner)
+            for port in classes[owner].inputs:
+                target = f"{owner}.{port}"
+                source = self.connections.get(target)
+                if source not in types:
+                    raise ConfigError(
+                        f"ctrl.connections.{target}: missing or unknown source {source!r}"
+                    )
+                pending_sources.append(source)
+        self.connections = {
+            target: source for target, source in self.connections.items()
+            if target.partition(".")[0] in active
+        }
+        if interface.optional_inputs:
+            used = set(self.connections.values()) | set(self.outputs.values())
+            self.interface = ControlInterface(
+                MappingProxyType({name: spec for name, spec in interface.inputs.items()
+                                  if name not in interface.optional_inputs or name in used}),
+                interface.outputs,
+                interface.optional_inputs,
+            )
+        for name, loop in cfg.ctrl.loops.items():
+            if name not in active:
+                continue
+            cls = classes[name]
+            self.nodes[name] = node = cls(loop, cfg, startup)
+            self._out_specs[name] = tuple((port, f"{name}.{port}", spec.complex_value)
+                                          for port, spec in node.outputs.items())
+            self.periods[name] = loop.period
+            self._store(name, node.initial_outputs(), real=_real, complex=_complex)
+        self._samples = {name: node.sample for name, node in self.nodes.items()}
+        dependencies = {name: set() for name in self.nodes}
+        for name, node in self.nodes.items():
+            for port, spec in node.inputs.items():
+                target = f"{name}.{port}"
+                source = self.connections[target]
+                owner = source.partition(".")[0]
+                if owner in self.nodes:
+                    dependencies[name].add(owner)
         self.order = []
         if not self.continuous:
             pending = {name: set(deps) for name, deps in dependencies.items()}
@@ -371,7 +403,7 @@ class ControlGraph:
                 if not ready:
                     raise ConfigError(
                         "ctrl.connections: instantaneous cycle in sampled control; "
-                        "insert an explicit unit_delay"
+                        "store one dependency's previous sample inside its owning loop"
                     )
                 for name in ready:
                     self.order.append(name)
@@ -407,11 +439,16 @@ class ControlGraph:
         if self.continuous:
             self._prepare_flow()
         self._every = (() if self.continuous else
-                       tuple((name, max(1, int(round(T / self._T))))
+                       tuple((name, int(self.period_stride(T, self._T)))
                              for name, T in self.periods.items()))
         self._every_interrupt = (None if self.continuous else
                                  frozenset(name for name, every in self._every)
                                  if all(every == 1 for _name, every in self._every) else None)
+
+    @staticmethod
+    def period_stride(period, interrupt_period):
+        """Interrupt count per loop update; configuration validation requires an integer ratio."""
+        return np.maximum(1.0, np.rint(period / interrupt_period))
 
     def limit_output(self, name, port, limit):
         """Attach a controller-owned limit to one sampled loop output."""
@@ -507,19 +544,16 @@ class ControlGraph:
             elif owner == "references":
                 value = self.references[port]
                 self._boundary_sources[path] = (
-                    _CONSTANT, complex(value) if spec.complex_value else value
+                        _CONSTANT, _complex(value) if spec.complex_value else value
                 )
             else:  # ControlInterface is a package-owned declaration, not user input.
                 raise RuntimeError(f"unknown controller input owner {owner!r}")
         self._wiring = {}
-        self._immediate = {}
         self._port_source = {}
         for name, node in self.nodes.items():
             wiring = tuple((port,) + self._resolve(self.connections[f"{name}.{port}"]) for port in node.inputs)
             self._wiring[name] = wiring
-            self._immediate[name] = tuple(w for w in wiring if w[0] not in node.delayed)
             self._port_source[name] = {w[0]: w[1:] for w in wiring}
-        self._latching = frozenset(n for n, node in self.nodes.items() if node.delayed)
         self._output_source = {port: self._resolve(source) for port, source in self.outputs.items()}
 
     def _prepare_flow(self):
@@ -657,8 +691,8 @@ class ControlGraph:
                 self._rewire()
                 if self.continuous:
                     self._prepare_flow()
-            changed = [name for name, params in ctrl.loops.items()
-                       if params != self.cfg.ctrl.loops[name]]
+            changed = [name for name in self.nodes
+                       if ctrl.loops[name] != self.cfg.ctrl.loops[name]]
             self.cfg = cfg
             for name in changed:
                 self._retune(name)
@@ -714,7 +748,7 @@ class ControlGraph:
                 out[port] = key
         return out
 
-    def _store(self, name, outputs):
+    def _store(self, name, outputs, *, real=float, complex=complex):
         specs = self._out_specs[name]
         values = self.values
         isfinite = math.isfinite
@@ -724,7 +758,7 @@ class ControlGraph:
                 value = complex(value)
                 finite = isfinite(value.real) and isfinite(value.imag)
             else:
-                value = float(value)
+                value = real(value)
                 finite = isfinite(value)
             if not finite:
                 raise FloatingPointError(f"control loop {name}.{port} returned a non-finite value")
@@ -745,7 +779,7 @@ class ControlGraph:
         done = set()
         for name in self.order:
             track = getattr(self.nodes[name], "track", None)
-            out = track(self._gather(self._immediate[name], meas)) if track is not None else None
+            out = track(self._gather(self._wiring[name], meas)) if track is not None else None
             if out is not None:
                 self._store(name, out)
                 done.add(name)
@@ -763,7 +797,7 @@ class ControlGraph:
     def sample(self, t, meas, finalize=None):
         """Run the loops due at ``t`` on the pu measurement ``meas``; return their names.
 
-        ``finalize(t, meas, updated)`` runs after them, before the delayed inputs are latched.
+        ``finalize(t, meas, updated)`` runs after the due loops.
         """
         if self._pending:
             self._apply_pending()
@@ -771,17 +805,14 @@ class ControlGraph:
         due = self.due(t)
         if not due:
             return updated
-        samples, gather_, immediate = self._samples, self._gather, self._immediate
+        samples, gather_, wiring = self._samples, self._gather, self._wiring
         for name in self.order:
             if name not in due:
                 continue
-            self._store(name, samples[name](t, gather_(immediate[name], meas)))
+            self._store(name, samples[name](t, gather_(wiring[name], meas)))
             updated.add(name)
         if finalize is not None:
             finalize(t, meas, updated)
-        for name in due:
-            if name in self._latching:
-                self.nodes[name].latch(gather_(self._wiring[name], meas))
         return updated
 
     def flow(self, t, meas, only=None, derivatives=None):
@@ -827,7 +858,7 @@ class ControlGraph:
                     derivatives[self._flow_derivative_index[key]] = flow[local]
                 continue
             previous = tuple(values[key] for key in keys)
-            for _iteration in range(16):
+            for _iteration in range(self._cycle_iterations):
                 for (_name, evaluate, wiring, inputs, outputs, flow,
                      out_specs, flow_specs) in steps:
                     for port, kind, key in wiring:
@@ -843,13 +874,14 @@ class ControlGraph:
                     for local, key in flow_specs:
                         derivatives[self._flow_derivative_index[key]] = flow[local]
                 current = tuple(values[key] for key in keys)
-                if all(abs(new - old) <= 1e-10 + 1e-8 * max(1.0, abs(new), abs(old))
+                if all(abs(new - old) <= self._cycle_atol + self._cycle_rtol * max(1.0, abs(new), abs(old))
                        for new, old in zip(current, previous)):
                     break
                 previous = current
             else:
                 raise FloatingPointError(
-                    "continuous control algebraic loop did not converge after 16 iterations: "
+                    "continuous control algebraic loop did not converge after "
+                    f"{self._cycle_iterations} iterations: "
                     + ", ".join(group)
                 )
         return dict(zip(self.flow_state_names, derivatives)) if named else derivatives
@@ -859,7 +891,7 @@ class ControlGraph:
         return self._read(*self._output_source[port], meas)
 
     def describe(self):
-        return {"loops": {n: {"type": self.cfg.ctrl.loops[n].type, "period": self.periods[n]}
+        return {"loops": {n: {"period": self.periods[n]}
                           for n in self.order}, "connections": dict(self.connections), "outputs": dict(self.outputs)}
 
     # ------------------------------------------------------------ states
@@ -894,6 +926,24 @@ class ControlGraph:
 
 # ------------------------------------------------------------------ the default wiring
 
+def _role_finder(cfg, label: str):
+    """Return a resolver which enforces one configured loop per semantic role."""
+    roles = {
+        name: getattr(LOOP_TYPES.get(params.type), "role", None)
+        for name, params in cfg.ctrl.loops.items()
+    }
+
+    def find(role):
+        found = [name for name, value in roles.items() if value == role]
+        if len(found) > 1:
+            raise ConfigError(
+                f"ctrl.loops: ambiguous {label} role {found}; use explicit "
+                "ctrl.connections and ctrl.outputs"
+            )
+        return found[0] if found else None
+
+    return find
+
 def default_wiring(cfg, family):
     """Return the default ``(connections, outputs)`` for family ``"gfl"``, ``"gfm"`` or ``"custom"``.
 
@@ -904,29 +954,24 @@ def default_wiring(cfg, family):
         return {}, {}
     loops = cfg.ctrl.loops
     roles = {name: getattr(LOOP_TYPES.get(p.type), "role", None) for name, p in loops.items()}
-
-    def find(role):
-        found = [n for n, r in roles.items() if r == role]
-        if len(found) > 1:
-            raise ConfigError(f"ctrl.loops: ambiguous {family} role {found}; use ctrl.type = 'custom' "
-                              "and explicit connections/outputs for multiple instances of this role")
-        return found[0] if len(found) == 1 else None
+    find = _role_finder(cfg, family)
     pll, sync = find("pll"), find("sync")
     angle = pll if family == "gfl" else sync
     frame = f"{angle}.frame" if angle else "references.theta"
     theta = f"{angle}.theta" if angle else "references.theta"
     omega = f"{angle}.omega" if angle else "references.omega"
-    dc, cc, power = find("dc_voltage"), find("current"), find("power")
+    dc, cc = find("dc_voltage"), find("current")
     va, vi, damping = find("admittance"), find("impedance"), find("damping")
     extra = f"{damping}.extra" if damping else "references.zero_v_pu"
     ports_of = {
         "pll": {"v": "meas.u_g"},
-        "dc_voltage": {"u_dc": "meas.u_dc", "vdc_ref": "references.vdc_ref_pu"},
+        "dc_voltage": {"voltage": "meas.u_dc", "reference": "references.vdc_ref_pu"},
         "current": {"v": "meas.u_g", "i": "meas.i_c", "frame": frame, "omega": omega,
-                    "extra": extra, "id_ref": f"{va or dc}.id_ref" if va or dc else "references.id_ref_pu",
+                    "extra": extra,
+                    "id_ref": (f"{va}.id_ref" if va else f"{dc}.current_reference"
+                               if dc else "references.id_ref_pu"),
                     "iq_ref": f"{va}.iq_ref" if va else "references.iq_ref_pu"},
-        "power": {"v": "meas.u_g", "i": "meas.i_c"},
-        "sync": {"p": f"{power}.p", "q": f"{power}.q", "v": "meas.u_g", "i": "meas.i_c",
+        "sync": {"v": "meas.u_g", "i": "meas.i_c",
                  "u_dc": "meas.u_dc", "p_ref": "references.p_ref_pu", "q_ref": "references.q_ref_pu",
                  "v_ref": "references.v_ref_pu"},
         "impedance": {"v_ref": f"{sync}.v_ref", "frame": frame, "omega": omega, "i": "meas.i_c",
@@ -954,7 +999,115 @@ class _ContinuousControlInp(Bag):
 class _ContinuousControlOut(Bag):
     __slots__ = ("q",)
 
-class UniteType:
+
+class _GraphRuntime:
+    """Lifecycle and continuous-state mechanics shared by control-graph hosts."""
+
+    @property
+    def interface(self) -> ControlInterface:
+        """The effective typed boundary of the active control graph."""
+        return self.graph.interface
+
+    def _install_flow_state(self, state_type: type, states: list[tuple[str, Mapping]],
+                            inp: Any, out: Any) -> None:
+        """Create one fixed ODE layout from the graph's declared loop states."""
+        state = state_type()
+        names = []
+        for name, values in states:
+            for local, value in values.items():
+                if isinstance(value, bool):
+                    raise ConfigError(
+                        f"ctrl.loops.{name}: boolean state {local!r} "
+                        "cannot be a continuous ODE state"
+                    )
+                key = f"{name}.{local}"
+                names.append(key)
+                setattr(state, key, complex(value) if isinstance(value, complex) else float(value))
+        self.state, self.state_names = state, tuple(names)
+        if self.state_names != self.graph.flow_state_names:
+            raise RuntimeError("continuous controller state and derivative layouts differ")
+        self.inp, self.out = inp, out
+        self._derivatives = [
+            0j if isinstance(getattr(state, name), complex) else 0.0
+            for name in self.state_names
+        ]
+        self._bind_flow_state()
+
+    def _bind_flow_state(self) -> None:
+        direct = []
+        indirect = []
+        known = set(self.state_names)
+        for name in self.graph.order:
+            node = self.graph.nodes[name]
+            values = node.flow_state()
+            bindings = node.flow_state_bindings()
+            if bindings is None or set(bindings) != set(values):
+                indirect.append((node, tuple(
+                    (local, f"{name}.{local}") for local in values
+                )))
+                continue
+            for local, (owner, attribute) in bindings.items():
+                key = f"{name}.{local}"
+                if key not in known:
+                    raise ConfigError(
+                        f"ctrl.loops.{name}: unknown continuous state binding {local!r}"
+                    )
+                direct.append((owner, attribute, key))
+        self._continuous_direct = tuple(direct)
+        self._continuous_indirect = tuple(indirect)
+
+    def _sync_continuous_nodes(self) -> None:
+        state = self.state
+        for owner, attribute, key in self._continuous_direct:
+            setattr(owner, attribute, getattr(state, key))
+        for node, bindings in self._continuous_indirect:
+            node.set_state({local: getattr(state, key) for local, key in bindings})
+
+    def _store_continuous_nodes(self) -> None:
+        known = set(self.state_names)
+        for name in self.graph.order:
+            for local, value in self.graph.nodes[name].flow_state().items():
+                key = f"{name}.{local}"
+                if key in known:
+                    setattr(self.state, key, value)
+
+    def _graph_retuned(self) -> None:
+        if not self.continuous:
+            return
+        if self.graph.flow_state_names != self.state_names:
+            raise ConfigError("a set event cannot reorder continuous controller states")
+        self._bind_flow_state()
+
+    def retune(self, cfg, paths, t: float) -> None:
+        """Queue new controller parameters for the next graph update."""
+        if any(path.startswith("ctrl.") for path in paths):
+            self.graph.schedule(cfg)
+        self.p = cfg
+
+    def command(self, run: bool, ramp: float = 0.0) -> None:
+        """Take the host's run or stop command."""
+        if self.continuous:
+            self.command_at(run, ramp, 0.0)
+            return
+        starting = bool(run) and not self.startup.active
+        if starting:
+            self.graph.reset_integrators()
+        self.startup.command(run, ramp)
+
+    def command_at(self, run: bool, ramp: float, t: float, *, reset: bool = True) -> None:
+        """Take a continuous run or stop command at absolute time ``t``."""
+        if not self.continuous:
+            self.command(run, ramp)
+            return
+        starting = bool(run) and not self.startup.active
+        if starting and reset:
+            self._sync_continuous_nodes()
+            self.graph.reset_integrators()
+            self._store_continuous_nodes()
+        self.startup.command(run, ramp, t)
+
+
+class VSCController(_GraphRuntime):
     """Configurable closed controller block with loops, start-up and output stage.
 
     The host gives it only run/stop commands and parameter updates.  With switching or PWM-period
@@ -969,10 +1122,13 @@ class UniteType:
         self.p = cfg
         self.continuous = cfg.bridge.model == "averaging"
         # A continuous controller already participates in construction-time energy probes, before
-        # Unit.start() applies its scenario. Keep its ideal source off until that command arrives.
+        # VSC.start() applies its scenario. Keep its ideal source off until that command arrives.
         self.startup = ContinuousStartup(run=False) if self.continuous else Startup(cfg.ctrl.period)
-        wires, outputs = default_wiring(cfg, cfg.ctrl.type)
-        self.graph = graph = ControlGraph(cfg, self.startup, wires, outputs)
+        profile = control_type(cfg.ctrl.type)
+        wires, outputs = profile.wiring(cfg)
+        self.graph = graph = ControlGraph(
+            cfg, self.startup, wires, outputs, interface=profile.interface,
+        )
         self.periods = graph.periods
         self.v_base, self.i_base, self.w0 = cfg.base.v_phase_peak, cfg.base.i_phase_peak, cfg.base.w0
         self.v_dc_base = cfg.dc_base.v
@@ -1005,8 +1161,22 @@ class UniteType:
         self._command_source = graph._output_source["u_dq"]
         self._frame_source = (graph._port_source[self._frame_cc]["frame"]
                               if self._frame_cc is not None else None)
-        self._is_gfl = cfg.ctrl.type == "gfl"
-        self._p_key, self._q_key, self._v_ref_key = f"{first('power')}.p", f"{first('power')}.q", f"{self._sync}.v_ref"
+        self._is_gfl = profile.grid_following
+        if self._is_gfl:
+            mode_log_sources = (
+                {"id_ref_pu": graph.connections[f"{self._log_cc}.id_ref"]}
+                if self._log_cc is not None else {}
+            )
+        else:
+            mode_log_sources = (
+                {"p_pu": f"{self._sync}.p", "q_pu": f"{self._sync}.q",
+                 "p_ref_pu": "references.p_ref_pu",
+                 "v_ref_pu": f"{self._sync}.v_ref"}
+                if self._sync is not None else
+                {"p_ref_pu": "references.p_ref_pu",
+                 "v_ref_pu": "references.v_ref_pu"}
+            )
+        self._mode_log_sources = MappingProxyType(mode_log_sources)
         self._terminal_limit = None
         self._terminal_limit_scale = None
         self._flow_limits = {}
@@ -1029,15 +1199,9 @@ class UniteType:
             self._terminal_limit_scale = None
             if self.stage is not None:
                 self.stage._command_saturated = False
-        if isinstance(node, DCVoltageLoop):
-            limit = _OutputLimit(
-                node.limit, lower=node.floor, pi=None if self.continuous else node.pi,
-                observer=node.observe_limit,
-            )
-            if self.continuous:
-                self._flow_limits[name] = (f"{name}.id_ref", limit, "ID_REF_LIMIT", node)
-            else:
-                graph.limit_output(name, "id_ref", limit)
+        if (self.continuous and name == self._dc
+                and callable(getattr(node, "observe_limit", None))):
+            self._flow_limits[name] = (f"{name}.current_reference", "ID_REF_LIMIT", node)
         if (not self.continuous and name == self._terminal
                 and isinstance(node, CurrentLoop) and self.stage is not None):
             limit = self.stage.command_limit(1.0)
@@ -1052,23 +1216,18 @@ class UniteType:
 
     def observe_limits(self, t: float) -> None:
         """Check ideal-model commands at a recorded snapshot without altering their values."""
-        for path, limit, alarm, node in self._flow_limits.values():
-            value = self.graph.values[path]
-            exceeded = limit.exceeded(value)
+        for output_path, alarm, node in self._flow_limits.values():
+            output = self.graph.values[output_path]
             node.n_updates += 1
-            node.limit_exceeded = exceeded
-            if not exceeded:
+            node.observe_limit(t, node.raw, output, count=True)
+            if not node.limit_exceeded:
                 continue
-            node.n_limit_exceeded += 1
-            if node.first_limit_t is None:
-                node.first_limit_t = t
             if alarm not in self.alarms:
                 self.alarms.append(alarm)
 
     def _build_flow_state(self):
         """Create the fixed ODE state layout from each loop's flow-state declaration."""
-        state = _ContinuousControlState()
-        names = []
+        states = []
         for name in self.graph.order:
             node = self.graph.nodes[name]
             try:
@@ -1086,106 +1245,30 @@ class UniteType:
                 values = node.flow_state()
             except NotImplementedError as exc:
                 raise ConfigError(f"ctrl.loops.{name}: {exc}") from None
-            for local, value in values.items():
-                if isinstance(value, bool):
-                    raise ConfigError(
-                        f"ctrl.loops.{name}: boolean state {local!r} cannot be a continuous ODE state"
-                    )
-                key = f"{name}.{local}"
-                names.append(key)
-                setattr(state, key, complex(value) if isinstance(value, complex) else float(value))
-        self.state, self.state_names = state, tuple(names)
-        if self.state_names != self.graph.flow_state_names:
-            raise RuntimeError("continuous controller state and derivative layouts differ")
-        self.inp = _ContinuousControlInp(u_g=0j, i_c=0j, u_dc=self.p.dclink.vdc_ref)
-        self.out = _ContinuousControlOut(q=0j)
-        self._derivatives = [0j if isinstance(getattr(state, name), complex) else 0.0
-                             for name in self.state_names]
+            states.append((name, values))
+        self._install_flow_state(
+            _ContinuousControlState,
+            states,
+            _ContinuousControlInp(u_g=0j, i_c=0j, u_dc=self.p.dclink.vdc_ref),
+            _ContinuousControlOut(q=0j),
+        )
         self._flow_derivative_index = {
             name: index for index, name in enumerate(self.state_names)
         }
         self._continuous_meas = ControlMeasurement(0.0, 0j, 0j, 1.0, np.zeros(3))
         self._last_control_meas = self._continuous_meas
-        self._bind_flow_state()
-
-    def _bind_flow_state(self):
-        """Resolve direct loop-state assignments once, including after a loop is retuned."""
-        direct = []
-        indirect = []
-        known = set(self.state_names)
-        for name in self.graph.order:
-            node = self.graph.nodes[name]
-            values = node.flow_state()
-            bindings = node.flow_state_bindings()
-            if bindings is None or set(bindings) != set(values):
-                indirect.append((node, tuple((local, f"{name}.{local}") for local in values)))
-                continue
-            for local, (owner, attribute) in bindings.items():
-                key = f"{name}.{local}"
-                if key not in known:
-                    raise ConfigError(f"ctrl.loops.{name}: unknown continuous state binding {local!r}")
-                direct.append((owner, attribute, key))
-        self._continuous_direct = tuple(direct)
-        self._continuous_indirect = tuple(indirect)
-
-    def _sync_continuous_nodes(self):
-        """Copy the current packed Model state into the loop instances."""
-        state = self.state
-        for owner, attribute, key in self._continuous_direct:
-            setattr(owner, attribute, getattr(state, key))
-        for node, bindings in self._continuous_indirect:
-            node.set_state({local: getattr(state, key) for local, key in bindings})
-
-    def _store_continuous_nodes(self):
-        """Copy loop states changed by a host action (tracking/reset) into Model state."""
-        for name in self.graph.order:
-            for local, value in self.graph.nodes[name].flow_state().items():
-                key = f"{name}.{local}"
-                if key in self.state_names:
-                    setattr(self.state, key, value)
 
     def _loop_retuned(self, name=None):
         """Rebuild the loop's limit and continuous state bindings after a set event."""
         self._configure_limit(name)
-        if self.continuous:
-            if self.graph.flow_state_names != self.state_names:
-                raise ConfigError("a set event cannot reorder continuous controller states")
-            self._bind_flow_state()
+        self._graph_retuned()
 
     def describe(self):
         return self.graph.describe()
 
-    def retune(self, cfg, paths, t):
-        """Queue new controller parameters for its next interrupt."""
-        if any(path.startswith("ctrl.") for path in paths):
-            self.graph.schedule(cfg)
-        self.p = cfg
-
     def initial_sync(self):
         values = {**self.graph.values, **{f"references.{k}": v for k, v in self.graph.references.items()}}
-        return float(values[self.graph.outputs["theta"]]), float(values[self.graph.outputs["omega"]])
-
-    def command(self, run, ramp=0.0):
-        """Take the host's run/stop command."""
-        if self.continuous:
-            self.command_at(run, ramp, 0.0)
-            return
-        starting = bool(run) and not self.startup.active
-        if starting:
-            self.graph.reset_integrators()
-        self.startup.command(run, ramp)
-
-    def command_at(self, run, ramp, t, *, reset=True):
-        """Take a continuous run/stop command at absolute time ``t``."""
-        if not self.continuous:
-            self.command(run, ramp)
-            return
-        starting = bool(run) and not self.startup.active
-        if starting and reset:
-            self._sync_continuous_nodes()
-            self.graph.reset_integrators()
-            self._store_continuous_nodes()
-        self.startup.command(run, ramp, t)
+        return _real(values[self.graph.outputs["theta"]]), _real(values[self.graph.outputs["omega"]])
 
     def track(self, meas):
         """Pre-synchronise grid-forming laws to an SI terminal sample."""
@@ -1212,13 +1295,14 @@ class UniteType:
     def _raw_log(self, meas: Measurement, theta: float) -> dict[str, float]:
         """The pre-average sample in the ``theta`` frame as ``*_raw_pu`` log entries (empty if not averaged)."""
         out: dict[str, float] = {}
-        if meas.u_g_raw is not None and (meas.u_g_raw != meas.u_g or meas.i_c_raw != meas.i_c):
+        reading = meas.samples[-1] if meas.samples else meas
+        if reading.u_g != meas.u_g or reading.i_c != meas.i_c:
             rot = cmath.exp(-1j * theta)
-            v, i = meas.u_g_raw * rot, meas.i_c_raw * rot
+            v, i = reading.u_g * rot, reading.i_c * rot
             out.update({"vd_raw_pu": v.real / self.v_base, "vq_raw_pu": v.imag / self.v_base,
                         "id_raw_pu": i.real / self.i_base, "iq_raw_pu": i.imag / self.i_base})
-        if meas.u_dc_raw is not None and meas.u_dc_raw != meas.u_dc:
-            out["vdc_raw_pu"] = meas.u_dc_raw / self.v_dc_base
+        if reading.u_dc != meas.u_dc:
+            out["vdc_raw_pu"] = reading.u_dc / self.v_dc_base
         return out
 
     def log_names(self) -> tuple[str, ...]:
@@ -1238,6 +1322,31 @@ class UniteType:
     def set_logging(self, enabled: bool) -> None:
         """Enable per-interrupt log dictionaries when a run records or watches them."""
         self.logging = bool(enabled)
+
+    def mode_log_sources(self) -> Mapping[str, str]:
+        """Return graph sources for control-family-specific log fields."""
+        return self._mode_log_sources
+
+    def _mode_log(self, t: float, meas: ControlMeasurement) -> dict[str, float]:
+        """Evaluate the control-family-specific part of one controller log."""
+        graph = self.graph
+        values = {
+            name: graph._read(*graph._resolve(source), meas)
+            for name, source in self._mode_log_sources.items()
+        }
+        if self._is_gfl:
+            values.setdefault("id_ref_pu", 0.0)
+        else:
+            values.setdefault("p_pu", 0.0)
+            values.setdefault("q_pu", 0.0)
+            values.setdefault("v_ref_pu", graph.references["v_ref_pu"])
+            values["p_ref_pu"] *= self.startup.value
+        values["freq_dev"] = (self.omega - self.w0) / (2 * math.pi)
+        values["angle_rel"] = (
+            self.theta - self.w0 * t + math.pi
+        ) % (2 * math.pi) - math.pi
+        return values
+
     def _accept_command(self, t, meas, updated):
         """Update the held angle, frequency and sampled voltage command."""
         graph = self.graph
@@ -1273,24 +1382,13 @@ class UniteType:
                                  count=gates)
         log = None
         if self.logging:
-            freq_dev = (self.omega - self.w0) / (2 * math.pi)
-            refs = self.graph.references
             log = {"id_pu": self.i_dq.real, "iq_pu": self.i_dq.imag,
                    "vd_pu": self.v_dq.real, "vq_pu": self.v_dq.imag,
                    "vac_pu": abs(self.v_dq), "vdc_pu": control_meas.u_dc,
                    "m_max": peak_abs(self.stage.m_abc),
                    "in_service": 1.0 if gates else 0.0,
                    **self._raw_log(meas, frame)}
-            angle_rel = (self.theta - self.w0 * t + math.pi) % (2 * math.pi) - math.pi
-            if self._is_gfl:
-                id_ref = self.graph.input(self._log_cc, "id_ref", control_meas) if self._log_cc else 0.0
-                log.update(id_ref_pu=id_ref, freq_dev=freq_dev, angle_rel=angle_rel)
-            else:
-                values = self.graph.values
-                pr = startup.value * refs["p_ref_pu"]
-                log.update(p_pu=values.get(self._p_key, 0.0), q_pu=values.get(self._q_key, 0.0),
-                           p_ref_pu=pr, v_ref_pu=values.get(self._v_ref_key, 1.0),
-                           freq_dev=freq_dev, angle_rel=angle_rel)
+            log.update(self._mode_log(t, control_meas))
             self.last_log = log
         return ControlOutput(duty, log=log, theta=self.theta, omega=self.omega,
                              gates=gates, startup_complete=startup.complete)
@@ -1359,22 +1457,11 @@ class UniteType:
         if not self.logging:
             return None
         meas = self._last_control_meas
-        freq_dev = (self.omega - self.w0) / (2 * math.pi)
-        refs = self.graph.references
         log = {"id_pu": self.i_dq.real, "iq_pu": self.i_dq.imag,
                "vd_pu": self.v_dq.real, "vq_pu": self.v_dq.imag,
                "vac_pu": abs(self.v_dq), "vdc_pu": meas.u_dc,
                "in_service": 1.0 if self.startup.active else 0.0}
-        angle_rel = (self.theta - self.w0 * t + math.pi) % (2 * math.pi) - math.pi
-        if self._is_gfl:
-            id_ref = self.graph.input(self._log_cc, "id_ref", meas) if self._log_cc else 0.0
-            log.update(id_ref_pu=id_ref, freq_dev=freq_dev, angle_rel=angle_rel)
-        else:
-            values = self.graph.values
-            log.update(p_pu=values.get(self._p_key, 0.0), q_pu=values.get(self._q_key, 0.0),
-                       p_ref_pu=self.startup.value * refs["p_ref_pu"],
-                       v_ref_pu=values.get(self._v_ref_key, 1.0),
-                       freq_dev=freq_dev, angle_rel=angle_rel)
+        log.update(self._mode_log(t, meas))
         self.last_log = log
         return log
 
@@ -1419,13 +1506,361 @@ class UniteType:
         if self._dc is not None:
             dc = self.graph.nodes[self._dc]
             summary["id_ref_limit_fraction"] = dc.n_limit_exceeded / max(1, dc.n_updates)
-            summary["id_ref_limit_first_t"] = dc.first_limit_t
+            summary["id_ref_limit_first_t"] = (
+                dc.first_limit_t if math.isfinite(dc.first_limit_t) else None
+            )
         if self._sync is not None:
             summary["law"] = self.p.ctrl.loops[self._sync].type
         summary["alarms"] = list(self.alarms)
         return summary
 
 
+_CONVERTER_MEASUREMENT_INPUTS = {
+    "meas.current": SI_CURRENT,
+    "meas.voltage": SI_VOLTAGE,
+    "meas.vin": SI_VOLTAGE,
+    "meas.power": SI_POWER,
+}
+
+
+DC_CONVERTER_INTERFACE = ControlInterface(
+    inputs=MappingProxyType({
+        **_CONVERTER_MEASUREMENT_INPUTS,
+        "meas.duty_feedforward": DUTY_RATIO,
+        "references.voltage": SI_VOLTAGE,
+    }),
+    outputs=MappingProxyType({"duty": DUTY_RATIO}),
+    optional_inputs=frozenset(("meas.power",)),
+)
+
+RESONANT_CONVERTER_INTERFACE = ControlInterface(
+    inputs=MappingProxyType({
+        **_CONVERTER_MEASUREMENT_INPUTS,
+        "references.modulation": MODULATION,
+        "references.frequency": HERTZ,
+        "references.phase": ANGLE,
+        "references.power": SI_POWER,
+    }),
+    outputs=MappingProxyType({"duty": DUTY_RATIO}),
+    optional_inputs=frozenset(("meas.power",)),
+)
+
+
+def _converter_log_sources(**specific: str) -> Mapping[str, str]:
+    """Build the common scalar-converter log boundary in display order."""
+    return MappingProxyType({
+        "current": "meas.current",
+        "voltage": "meas.voltage",
+        "power": "meas.power",
+        **specific,
+        "duty": "duty",
+        "in_service": "startup.active",
+    })
+
+
+_DC_LOG_SOURCES = _converter_log_sources(
+    voltage_reference="references.voltage",
+    input_voltage="meas.vin",
+)
+
+
+_RESONANT_LOG_SOURCES = _converter_log_sources(
+    input_voltage="meas.vin",
+    modulation="references.modulation",
+    frequency="references.frequency",
+    phase="references.phase",
+    power_reference="references.power",
+)
+
+
+def _resonant_converter_wiring(cfg):
+    find = _role_finder(cfg, cfg.ctrl.type)
+    modulation = find("modulation")
+    if modulation is None:
+        return {}, {}
+    return {
+        f"{modulation}.modulation": "references.modulation",
+        f"{modulation}.frequency": "references.frequency",
+        f"{modulation}.phase": "references.phase",
+    }, {"duty": f"{modulation}.duty"}
+
+
+def _dc_converter_wiring(cfg):
+    find = _role_finder(cfg, cfg.ctrl.type)
+    voltage, current = find("dc_voltage"), find("current")
+    wires = {}
+    if voltage is not None:
+        wires.update({
+            f"{voltage}.reference": "references.voltage",
+            f"{voltage}.voltage": "meas.voltage",
+        })
+    if current is not None:
+        wires.update({
+            f"{current}.reference": (
+                f"{voltage}.current_reference" if voltage is not None else None
+            ),
+            f"{current}.current": "meas.current",
+            f"{current}.feedforward": "meas.duty_feedforward",
+        })
+    return wires, ({"duty": f"{current}.duty"} if current is not None else {})
+
+
+@dataclass
+class ConverterMeasurement:
+    """SI sample at a scalar converter's public control boundary."""
+
+    t: float = 0.0
+    current: float = 0.0
+    voltage: float = 0.0
+    vin: float = 0.0
+    duty_feedforward: float = 0.0
+    power: float | None = None
+    samples: tuple["ConverterMeasurement", ...] = ()
+
+
+class _ConverterControlState:
+    """Dynamic attributes containing a converter graph's continuous states."""
+
+
+class _ConverterControlInp(Bag):
+    __slots__ = ("current", "voltage", "vin", "power_voltage", "power_current", "power")
+
+
+class _ConverterControlOut(Bag):
+    __slots__ = ("q",)
+
+
+class GraphController(_GraphRuntime):
+    """Run a DC converter's registered loops through the shared control graph.
+
+    This class supplies only the plant boundary and lifecycle. Feedback and open-loop laws are both
+    ordinary graph loops; no application-specific controller bypasses the graph.
+    """
+
+    outputs_need_inputs = True
+    observer = True
+
+    def __init__(self, cfg, topology) -> None:
+        self.p = cfg
+        self.topology = topology
+        self.continuous = cfg.bridge.model == "averaging"
+        self.startup = (
+            ContinuousStartup(run=False) if self.continuous
+            else Startup(cfg.ctrl.period, run=False)
+        )
+        profile = control_type(cfg.ctrl.type)
+        connections, outputs = profile.wiring(cfg)
+        self.graph = ControlGraph(
+            cfg,
+            self.startup,
+            connections,
+            outputs,
+            interface=profile.interface,
+        )
+        self.outputs_need_inputs = any(
+            isinstance(source, str) and source.startswith("meas.")
+            for source in (*self.graph.connections.values(), *self.graph.outputs.values())
+        )
+        self.graph.on_retune = self._loop_retuned
+        self.periods = self.graph.periods
+        self.logging = True
+        self.last_log: dict[str, float] = {}
+        self._input_values = topology.control_values
+        self._needs_power = "meas.power" in self.graph.interface.inputs
+        self._bound_power = "power" in cfg.meas.sources
+        # Follow overridden default wires when observing a commanded quantity. Observations
+        # belong to port wiring and loop declarations, not to application or signal types.
+        observed = {source: self.graph.connections[target]
+                    for target, source in connections.items()
+                    if target in self.graph.connections}
+        used = set(self.graph.connections.values()) | set(self.graph.outputs.values())
+        self._log_sources = MappingProxyType({
+            **{name: observed.get(source, source)
+               for name, source in profile.log_sources.items()
+               if (not source.startswith("meas.") or source in self.graph.interface.inputs)
+               and (not source.startswith("references.") or source in observed or source in used)},
+            **{f"{name}.{port}": f"{name}.{port}"
+               for name, node in self.graph.nodes.items() for port in node.log_outputs},
+        })
+        self._logs_loop_outputs = any(
+            source in self.graph.values for source in self._log_sources.values()
+        )
+        self._last_measurement = ConverterMeasurement(vin=cfg.dclink.vdc_ref)
+        self._last_duty = topology.neutral_duty
+        if self.continuous:
+            self._build_flow_state()
+
+    def control_inputs(self, current, voltage, vin, power=None) -> dict[str, Any]:
+        """Return canonical measurements and converter feedforward at the control boundary."""
+        measurement = self._measurement(current, voltage, vin, power=power)
+        return {name: getattr(measurement, name.partition(".")[2])
+                for name in self.graph.interface.inputs
+                if name.startswith("meas.")}
+
+    def _measurement(self, current: float, voltage: float, vin: float,
+                     target: ConverterMeasurement | None = None,
+                     power: float | None = None) -> ConverterMeasurement:
+        if self._needs_power and power is None:
+            raise ValueError("meas.power requires a measured electrical-port power in watts")
+        current, voltage, vin, feedforward = self._input_values(current, voltage, vin)
+        measurement = target if target is not None else ConverterMeasurement()
+        measurement.current = current
+        measurement.voltage = voltage
+        measurement.vin = vin
+        measurement.duty_feedforward = feedforward
+        if self._needs_power:
+            measurement.power = power
+        return measurement
+
+    def bind_power_port(self, port: PowerPort) -> None:
+        """Observe outward power with the connected terminal's sign and scale."""
+        self._power_port = PowerPort(
+            "inp.power_voltage", "inp.power_current", port.scale, -port.sign,
+        )
+
+    def _flow_measurement(self) -> ConverterMeasurement:
+        power = ((self.inp.power if self._bound_power else port_power(self, self._power_port))
+                 if self._needs_power else None)
+        return self._measurement(
+            self.inp.current, self.inp.voltage, self.inp.vin, self._last_measurement,
+            power=power,
+        )
+
+    def _build_flow_state(self) -> None:
+        self._install_flow_state(
+            _ConverterControlState,
+            [(name, self.graph.nodes[name].flow_state()) for name in self.graph.order],
+            _ConverterControlInp(current=0.0, voltage=0.0, vin=self.p.dclink.vdc_ref,
+                                 power_voltage=0.0, power_current=0.0, power=0.0),
+            _ConverterControlOut(q=self.topology.zero),
+        )
+
+    def _loop_retuned(self, _name=None) -> None:
+        self._graph_retuned()
+
+    def sample(self, t: float, current: float, voltage: float, vin: float,
+               power: float | None = None) -> BridgeControlOutput:
+        """Evaluate one sampled control interrupt from physical plant values."""
+        if self.continuous:
+            raise RuntimeError("an ideal averaged converter controller is evaluated by the ODE solver")
+        measurement = self._measurement(current, voltage, vin, self._last_measurement, power=power)
+        if self.startup.in_progress:
+            self.startup.advance()
+        self.graph.sample(t, measurement)
+        duty = float(self.graph.output("duty", measurement))
+        self._last_measurement, self._last_duty = measurement, duty
+        gates = self.startup.active
+        log = self._log(duty, gates) if self.logging else None
+        return BridgeControlOutput(
+            duty=duty,
+            log=log,
+            gates=gates,
+            startup_complete=self.startup.complete,
+        )
+
+    def __call__(self, t: float, meas) -> BridgeControlOutput:
+        return self.sample(t, meas.current, meas.voltage, meas.vin, getattr(meas, "power", None))
+
+    def set_outputs(self, t: float) -> None:
+        self._sync_continuous_nodes()
+        self.startup.at(t)
+        measurement = self._flow_measurement()
+        self.graph.flow(t, measurement, derivatives=self._derivatives)
+        duty = float(self.graph.output("duty", measurement))
+        self.out.q = self.topology.state_from_duty(duty) if self.startup.active else self.topology.zero
+        self._last_measurement, self._last_duty = measurement, duty
+
+    def rhs(self, t: float):
+        return self._derivatives
+
+    def _log(self, duty: float, active: bool) -> dict[str, float]:
+        measurement = self._last_measurement
+        values = {
+            "meas.current": measurement.current,
+            "meas.voltage": measurement.voltage,
+            "meas.vin": measurement.vin,
+            "duty": duty,
+            "startup.active": 1.0 if active else 0.0,
+        }
+        if self._needs_power:
+            values["meas.power"] = measurement.power
+        values.update({f"references.{name}": value
+                       for name, value in self.graph.references.items()})
+        if self._logs_loop_outputs:
+            values.update(self.graph.values)
+        self.last_log = {name: values[source] for name, source in self._log_sources.items()}
+        return self.last_log
+
+    def continuous_log(self, t: float) -> dict[str, float] | None:
+        # Non-loading/open-loop outputs may be evaluated before unused inputs are wired. The
+        # model has synchronized every input by the time it asks for a snapshot observation.
+        if self.logging:
+            self._flow_measurement()
+        return self._log(self._last_duty, self.startup.active) if self.logging else None
+
+    def log_names(self) -> tuple[str, ...]:
+        return tuple(self._log_sources)
+
+    def log_sources(self) -> Mapping[str, str]:
+        """Map log columns to public control ports or controller lifecycle values."""
+        return self._log_sources
+
+    def set_logging(self, enabled: bool) -> None:
+        self.logging = bool(enabled)
+
+    def get_state(self) -> dict[str, Any]:
+        startup = {f"startup.{name}": value for name, value in self.startup.get_state().items()}
+        return startup if self.continuous else {**self.graph.get_state(), **startup}
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        startup = {name[8:]: value for name, value in values.items() if name.startswith("startup.")}
+        self.startup.set_state(startup)
+        if not self.continuous:
+            self.graph.set_state({name: value for name, value in values.items()
+                                  if not name.startswith("startup.")})
+
+    def summary(self) -> dict[str, Any]:
+        return {"alarms": []}
+
+
 def make_controller(cfg, **kwargs):
-    """Build the :class:`UniteType` controller of a unit from ``cfg.ctrl``."""
-    return UniteType(cfg, **kwargs)
+    """Build the controller registered for ``cfg.ctrl.type``."""
+    factory = control_type(cfg.ctrl.type).controller_factory
+    if factory is None:
+        raise ConfigError(f"ctrl.type: {cfg.ctrl.type!r} has no controller factory")
+    return factory(cfg, **kwargs)
+
+
+for _control_name in ("gfl", "gfm", "custom"):
+    register_control_type(
+        _control_name,
+        references=ReferenceParams,
+        unit_types=frozenset(("vsc",)),
+        interface=CONTROL_INTERFACE,
+        wiring=lambda cfg, family=_control_name: default_wiring(cfg, family),
+        grid_following=_control_name == "gfl",
+        default_bridge="three_phase_bridge",
+        controller_factory=VSCController,
+    )
+register_control_type(
+    "dc",
+    references=ScalarVoltageReferenceParams,
+    unit_types=frozenset(("dc_converter",)),
+    interface=DC_CONVERTER_INTERFACE,
+    wiring=_dc_converter_wiring,
+    log_sources=_DC_LOG_SOURCES,
+    default_bridge="half_bridge",
+    controller_factory=GraphController,
+    reference_validator=validate_scalar_voltage_references,
+)
+register_control_type(
+    "resonant",
+    references=ResonantReferenceParams,
+    unit_types=frozenset(("dc_converter",)),
+    interface=RESONANT_CONVERTER_INTERFACE,
+    wiring=_resonant_converter_wiring,
+    log_sources=_RESONANT_LOG_SOURCES,
+    default_bridge="full_bridge",
+    controller_factory=GraphController,
+    reference_validator=validate_resonant_references,
+)

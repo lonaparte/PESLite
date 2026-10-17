@@ -59,7 +59,7 @@ Paths are entity-first:
 pcc.u_C
 grid.branch.i
 vsc.dclink.u_C
-vsc.ctrl.pll.theta
+vsc.ctrl.SRFPLL.theta
 vsc.pwm.shadow.d_a
 vsc.meas.x_i_c
 solver.window_end
@@ -107,7 +107,7 @@ The optional plotting add-on operates only after the CSV streams have closed:
 
 ```python
 figure = result.plot(
-    ["vsc.dclink.u_C", "vsc.ctrl.pll.theta"],
+    ["vsc.dclink.u_C", "vsc.ctrl.SRFPLL.theta"],
     labels=[r"$u_{dc}$", r"$\theta$"],
     ylabel=r"$x$ (pu)",
 )

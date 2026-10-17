@@ -1,6 +1,25 @@
 """Protection runtime behavior and output semantics from the issue #2 reference tests."""
 
 import peslite
+from dataclasses import replace
+from peslite.assembly.params import ProtectionParams, RocofParams
+
+
+def test_frequency_history_is_lazy_and_retunes_without_changing_window_timing():
+    cfg = ProtectionParams()
+    protection = peslite.Protection(cfg, 1e-6, 10.0)
+    for index in range(10):
+        protection.check_sampled(index * 1e-6, peslite.ProtectionSample())
+    assert protection._rocof is None
+    cfg = replace(cfg, rocof=RocofParams(enable=True, limit=1.0, window=4e-6))
+    protection.retune(cfg)
+    assert protection._rocof is None
+    for index in range(5):
+        protection.check_sampled(index * 1e-6, peslite.ProtectionSample(
+            frequency_deviation=float(index)))
+    assert protection._rocof.n == 4
+    assert protection.stats.rocof_first_t == 4e-6
+    assert protection.stats.rocof_max == 1e6
 
 
 def _run(params, out):

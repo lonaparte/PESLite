@@ -306,7 +306,7 @@ def test_disconnected_converter_pauses_control_and_a_trip_cannot_reconnect(tmp_p
     })
     result = peslite.Simulation(p).run(out_dir=tmp_path / "disconnected")
     t = result.states["t"]
-    integral = result.states["vsc.ctrl.cc.integral_pu.re"]
+    integral = result.states["vsc.ctrl.CurrentLoop.integral_pu.re"]
     assert np.ptp(integral[t < 0.0002 - 1e-12]) == 0.0
     assert np.ptp(integral[(t > 0.0006 + 1e-12) & (t < 0.0009 - 1e-12)]) == 0.0
 

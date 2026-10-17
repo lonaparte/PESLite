@@ -8,15 +8,19 @@ from __future__ import annotations
 
 import math
 import warnings
+import numpy as np
 from dataclasses import fields, is_dataclass
 
 from typing import TYPE_CHECKING, Optional
 
+from ..components.converter import make_topology
 from ..components.network import element_buses
+from ..control.profiles import control_type
 from ..solver.integrators import ADAPTIVE_METHODS, FIXED_METHODS
 from ..solver.model import ConfigError
 from ..solver.multirate import parse_step
 from .events import NAMED, SWITCHABLE, SWITCHING
+from .types import unit_type
 
 if TYPE_CHECKING:
     from .params import Params
@@ -27,7 +31,7 @@ __all__ = ["validate"]
 def _whole(r: float) -> bool:
     """Is ``r`` a whole number of at least one?"""
     n = round(r)
-    return n >= 1 and abs(r - n) <= 1e-9 * max(1.0, r)
+    return n >= 1 and abs(r - n) <= 1e-9 * np.maximum(1.0, r)
 
 
 def _switched(section, where: str) -> None:
@@ -76,7 +80,7 @@ def _pwm(w, base, where: str, continuous: bool = False) -> None:
         raise ConfigError(f"{where}.carrier_phase must be finite, got {w.carrier_phase}")
     if not continuous and w.sync == "synchronous":
         ratio = w.f_sw / base.f0
-        if abs(ratio - round(ratio)) > 1e-9 * max(1.0, ratio):
+        if abs(ratio - round(ratio)) > 1e-9 * np.maximum(1.0, ratio):
             raise ConfigError(f"{where}.sync = 'synchronous' needs an integer pulse ratio "
                               f"pwm.f_sw / base.f0, got {w.f_sw} / {base.f0} = {ratio}")
 
@@ -129,7 +133,12 @@ def _control(c, dclink, pwm, where: str, continuous: bool = False) -> None:
                 raise ConfigError(f"{where}.loops.{name}.{key} must be finite")
             if is_dataclass(value) and hasattr(value, "enable"):
                 _switched(value, f"{where}.loops.{name}.{key}")
-        if cfg.type == "matching" and dclink.capacitor is None:
+        if (hasattr(cfg, "minimum") and hasattr(cfg, "maximum")
+                and cfg.minimum >= cfg.maximum):
+            raise ConfigError(
+                f"{where}.loops.{name}.minimum must be below maximum"
+            )
+        if cfg.type == "matching" and (dclink is None or dclink.capacitor is None):
             raise ConfigError(f"{where}: matching control needs dclink.capacitor")
         if cfg.type == "matching" and cfg.k_theta_pu is None and c.references.vdc_ref_pu <= 0:
             raise ConfigError(f"{where}.references.vdc_ref_pu must be positive for automatic matching gain")
@@ -138,18 +147,33 @@ def _control(c, dclink, pwm, where: str, continuous: bool = False) -> None:
             continue
         if not isinstance(name, str) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ConfigError(f"{where}.references: expected finite scalar references")
+    reference_validator = control_type(c.type, f"{where}.type").reference_validator
+    if reference_validator is not None:
+        reference_validator(c.references, f"{where}.references")
 
 
-def _measurement(m, T_c: Optional[float], where: str) -> None:
-    """Check ADC oversampling and averaging windows within one control period."""
+def _measurement(m, T_c: Optional[float], where: str,
+                 channels: frozenset[str]) -> None:
+    """Validate source bindings, ADC timing and multi-period RMS windows."""
     if not isinstance(m.average, (list, tuple)):
         raise ConfigError(f"{where}.average: expected a list of channels, got {m.average!r}")
-    unknown = set(m.average) - {"u_g", "i_c", "u_dc"}
+    unknown = set(m.average) - channels
     if unknown:
         raise ConfigError(f"{where}.average: unknown channel(s) {sorted(unknown)}; "
-                          "known: ['i_c', 'u_dc', 'u_g']")
+                          f"known: {sorted(channels)}")
     if len(set(m.average)) != len(m.average):
         raise ConfigError(f"{where}.average: channels must not be repeated")
+    for name in ("sources", "rms"):
+        values = getattr(m, name)
+        if not isinstance(values, dict) or set(values) - channels:
+            raise ConfigError(f"{where}.{name}: expected a mapping of known channels")
+    if any(not isinstance(value, str) or not value for value in m.sources.values()):
+        raise ConfigError(f"{where}.sources: expected physical output names")
+    for channel, window in m.rms.items():
+        if not isinstance(window, (int, float)) or not math.isfinite(window) or window <= 0:
+            raise ConfigError(f"{where}.rms.{channel}: expected a positive window in seconds")
+        if T_c is not None and not _whole(window / T_c):
+            raise ConfigError(f"{where}.rms.{channel}: window must contain whole sample periods")
     for key in ("period", "window"):
         value = getattr(m, key)
         if value is not None and (not math.isfinite(value) or value <= 0.0):
@@ -172,68 +196,200 @@ def _measurement(m, T_c: Optional[float], where: str) -> None:
         warnings.warn(f"{where}.window has no effect: no quantity is window-averaged", stacklevel=4)
 
 
-def _unit(u, base, where: str) -> None:
-    """Check one converter unit."""
+def _converter(u, base, where: str):
+    """Validate fields shared by every non-composite converter unit."""
     if u.s_base is not None and (not math.isfinite(u.s_base) or u.s_base <= 0.0):
         raise ConfigError(f"{where}.s_base must be finite and positive, got {u.s_base}")
-    if u.ac_filter.l_f <= 0.0:
-        raise ConfigError(f"{where}.ac_filter.l_f must be > 0")
+    spec = unit_type(u.type, f"{where}.type")
+    if u.bridge.type not in spec.bridge_types:
+        raise ConfigError(
+            f"{where}.bridge.type: unit type {u.type!r} requires one of "
+            f"{sorted(spec.bridge_types)}"
+        )
+    topology = make_topology(u.bridge)
+    topology_fields = getattr(topology, "config_fields", frozenset())
+    unused = [
+        item.name for item in fields(u.bridge)
+        if item.name not in {"model", "type", *topology_fields}
+        and getattr(u.bridge, item.name) != item.default
+    ]
+    if unused:
+        raise ConfigError(
+            f"{where}.bridge: fields {unused} do not apply to {u.bridge.type!r}"
+        )
     _dclink(u.dclink, f"{where}.dclink")
     continuous = u.bridge.model == "averaging"
     _pwm(u.pwm, base, f"{where}.pwm", continuous)
     _timing(u.ctrl, u.pwm, f"{where}.ctrl", continuous)
     _control(u.ctrl, u.dclink, u.pwm, f"{where}.ctrl", continuous)
-    _measurement(u.meas, None if continuous else _period(u.ctrl, u.pwm), f"{where}.meas")
+    _measurement(
+        u.meas,
+        None if continuous else _period(u.ctrl, u.pwm),
+        f"{where}.meas",
+        spec.measurement_channels,
+    )
     protection = u.protection
-    for name in ("overcurrent", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof"):
-        _switched(getattr(protection, name), f"{where}.protection.{name}")
+    for name in ("overcurrent", "rms_current", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof"):
+        criterion = getattr(protection, name)
+        _switched(criterion, f"{where}.protection.{name}")
+        if criterion.enable and name not in spec.protection_criteria:
+            raise ConfigError(
+                f"{where}.protection.{name}: unit type {u.type!r} does not provide "
+                "the required signal"
+            )
     if not math.isfinite(protection.hold) or protection.hold < 0:
         raise ConfigError(f"{where}.protection.hold must be finite and >= 0, got {protection.hold}")
     if not math.isfinite(protection.rocof.window) or protection.rocof.window <= 0:
         raise ConfigError(f"{where}.protection.rocof.window must be finite and positive, "
                           f"got {protection.rocof.window}")
+    if protection.rms_current.enable:
+        current = spec.current_channel
+        if current not in u.meas.rms:
+            raise ConfigError(f"{where}.protection.rms_current requires meas.rms.{current}")
+    return topology, continuous
+
+
+def _unit(u, base, where: str, *, nested: bool = False) -> None:
+    """Check one converter unit."""
+    if nested:
+        raise ConfigError(f"{where}: a three-phase VSC cannot be used as a scalar composite port")
+    _topology, _continuous = _converter(u, base, where)
+    if u.bus is None:
+        raise ConfigError(f"{where}.bus: a VSC needs a three-phase bus")
+    if u.ac_filter.l_f <= 0.0:
+        raise ConfigError(f"{where}.ac_filter.l_f must be > 0")
+
+
+def _dc_converter(u, base, where: str, *, nested: bool = False) -> None:
+    """Check one open scalar converter."""
+    topology, continuous = _converter(u, base, where)
+    if (u.bus is None) != (u.filter is None):
+        raise ConfigError(f"{where}: bus and filter must be specified together")
+    if (getattr(topology, "external_terminal", None) == "lower_rail"
+            and (u.bus is None or u.filter is None)):
+        raise ConfigError(
+            f"{where}.bridge.external_terminal: lower_rail needs a bus and a midpoint filter"
+        )
+    if nested and u.bus is not None:
+        raise ConfigError(f"{where}: a composite child uses its parent's scoped power bus")
+    if not nested and u.bus is None:
+        raise ConfigError(f"{where}.bus: a standalone DC converter needs a scalar bus")
+    if u.filter is not None and u.filter.l_f <= 0.0:
+        raise ConfigError(f"{where}.filter.l_f must be > 0")
+    if u.pwm.sync != "asynchronous":
+        raise ConfigError(f"{where}.pwm.sync: scalar converters require asynchronous PWM")
+
+
+def _wpt(u, base, where: str, *, nested: bool = False) -> None:
+    """Check a WPT composite and its shared compensated magnetic link."""
+    if u.s_base is not None and (not math.isfinite(u.s_base) or u.s_base <= 0.0):
+        raise ConfigError(f"{where}.s_base must be finite and positive, got {u.s_base}")
+    for side in unit_type(u.type).children:
+        child = getattr(u, side)
+        child_where = f"{where}.{side}"
+        spec = unit_type(child.type, f"{child_where}.type")
+        if spec.phases != 1 or spec.validator is None:
+            raise ConfigError(
+                f"{child_where}: a WPT child needs a scalar unit"
+            )
+        spec.validator(child, base, child_where, nested=True)
+    link = u.link
+    positive = [
+        "primary_inductance", "secondary_inductance",
+    ]
+    if link.type == "ss":
+        positive += ["primary_capacitance", "secondary_capacitance"]
+    else:
+        positive += [
+            "primary_series_capacitance", "secondary_series_capacitance",
+            "primary_compensation_inductance", "secondary_compensation_inductance",
+            "primary_parallel_capacitance", "secondary_parallel_capacitance",
+        ]
+    for name in positive:
+        value = getattr(link, name)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ConfigError(f"{where}.link.{name} must be finite and positive")
+    for name in ("mutual_inductance", "primary_resistance", "secondary_resistance"):
+        value = getattr(link, name)
+        if not math.isfinite(value) or value < 0.0:
+            raise ConfigError(f"{where}.link.{name} must be finite and nonnegative")
+    if link.type == "lcc":
+        for name in ("primary_compensation_resistance", "secondary_compensation_resistance"):
+            value = getattr(link, name)
+            if not math.isfinite(value) or value < 0.0:
+                raise ConfigError(f"{where}.link.{name} must be finite and nonnegative")
+    determinant = (
+        link.primary_inductance * link.secondary_inductance
+        - link.mutual_inductance * link.mutual_inductance
+    )
+    if determinant <= 0.0:
+        raise ConfigError(
+            f"{where}.link: the coupled-inductor matrix must be positive definite "
+            "(mutual_inductance^2 < primary_inductance * secondary_inductance)"
+        )
 
 
 def _network(p: Params) -> None:
     """Check element identities, network values and bus references."""
-    if not p.buses:
-        raise ConfigError("buses: a system needs at least one bus")
+    from .params import _unit_items
+
     if not p.units:
         raise ConfigError("units: a system needs at least one converter")
-    seen: dict[str, str] = {}
-    for kind in NAMED:
-        for name in getattr(p, kind):
-            if name in seen:
-                raise ConfigError(f"{kind}.{name}: the name is already used by {seen[name]}; element "
-                                  f"names are unique across buses, branches, sources, units and elements")
-            seen[name] = f"{kind}.{name}"
+    connected_units = {
+        name: unit for name, unit in _unit_items(p.units)
+        if getattr(unit, "bus", None) is not None
+    }
+    if (connected_units or p.branches or p.sources) and not p.buses:
+        raise ConfigError("buses: a connected electrical network needs at least one bus")
     for name, bus in p.buses.items():
         if bus.c <= 0.0:
             raise ConfigError(f"buses.{name}.c must be > 0: the shunt capacitor is what makes the "
                               f"bus voltage a state (a bus without one would need a node-voltage solver)")
+        if bus.phases not in (1, 3):
+            raise ConfigError(f"buses.{name}.phases must be 1 or 3")
     def _bus_of(where: str, bus: str) -> None:
         if bus not in p.buses:
             raise ConfigError(f"{where}: unknown bus {bus!r}; known: {sorted(p.buses)}")
+
+    def _element_bus(where: str, bus: str) -> None:
+        if bus in p.buses:
+            return
+        for name, unit in _unit_items(p.units, leaves_only=False):
+            spec = unit_type(unit.type)
+            if bus == name or (bus.startswith(name + ".")
+                               and bus[len(name) + 1:] in (spec.children or spec.ports)):
+                return
+        _bus_of(where, bus)
     for name, br in p.branches.items():
         _bus_of(f"branches.{name}.bus1", br.bus1)
         _bus_of(f"branches.{name}.bus2", br.bus2)
         if br.bus1 == br.bus2:
             raise ConfigError(f"branches.{name}: both ends are {br.bus1!r}")
+        if p.buses[br.bus1].phases != p.buses[br.bus2].phases:
+            raise ConfigError(f"branches.{name}: both buses must have the same phase count")
         if br.l <= 0.0:
             raise ConfigError(f"branches.{name}.l must be > 0")
     for name, src in p.sources.items():
         _bus_of(f"sources.{name}.bus", src.bus)
+        if p.buses[src.bus].phases != 3:
+            raise ConfigError(f"sources.{name}.bus: a three-phase source needs a three-phase bus")
         if src.f is not None and (not math.isfinite(src.f) or src.f <= 0.0):
             raise ConfigError(f"sources.{name}.f must be finite and positive, got {src.f}")
         if not math.isfinite(src.angle):
             raise ConfigError(f"sources.{name}.angle must be finite")
         if src.l <= 0.0:
             raise ConfigError(f"sources.{name}.l must be > 0: a source is an emf behind an impedance")
-    for name, u in p.units.items():
+    for name, u in connected_units.items():
         _bus_of(f"units.{name}.bus", u.bus)
+        expected = unit_type(u.type).phases
+        if expected is not None and p.buses[u.bus].phases != expected:
+            phase_name = "single" if expected == 1 else str(expected)
+            raise ConfigError(
+                f"units.{name}.bus: unit type {u.type!r} needs a {phase_name}-phase bus"
+            )
     for name, element in p.elements.items():
         for key, bus in element_buses(element).items():
-            _bus_of(f"elements.{name}.{key}", bus)
+            _element_bus(f"elements.{name}.{key}", bus)
         for key, value in vars(element).items():
             if isinstance(value, float) and not math.isfinite(value):
                 raise ConfigError(f"elements.{name}.{key} must be finite")
@@ -245,6 +401,11 @@ def _solver(s) -> None:
         raise ConfigError(f"simulation.solver.method {s.method!r} is not one of {FIXED_METHODS}")
     if s.type == "adaptive" and s.method not in ADAPTIVE_METHODS:
         raise ConfigError(f"simulation.solver.method {s.method!r} is not one of {ADAPTIVE_METHODS}")
+    names = ("dt",) if s.type == "fixed" else ("rtol", "atol", "max_step")
+    for name in names:
+        value = getattr(s, name)
+        if value <= 0.0 or math.isnan(value) or (name != "max_step" and not math.isfinite(value)):
+            raise ConfigError(f"simulation.solver.{name} must be positive")
     if s.sweeps < 1:
         raise ConfigError("simulation.solver.sweeps must be >= 1")
     if s.linearisations < 0:
@@ -269,6 +430,8 @@ def _solver(s) -> None:
 
 def _events(p: Params) -> None:
     """Check event targets, times, and each target's connect/disconnect sequence."""
+    from .params import _unit_leaves
+
     switched: dict[str, tuple[str, bool]] = {}
     at: dict[tuple[str, float], str] = {}
     for name, event in sorted(p.events.items(), key=lambda item: item[1].t):
@@ -277,35 +440,59 @@ def _events(p: Params) -> None:
             if isinstance(value, float) and not math.isfinite(value):
                 raise ConfigError(f"{where}.{key} must be finite")
         target = getattr(event, "target", None)
-        section = p.section_of(target) if isinstance(target, str) else None
-        if target is not None and section is None:
+        sections = p.sections_of(target) if isinstance(target, str) else ()
+        if target is not None and not sections:
             known = sorted(name for named in NAMED for name in getattr(p, named))
             raise ConfigError(f"{where}.target: unknown name {target!r}; known: {known}")
+        candidates = tuple(section for section in sections if section in SWITCHABLE)
         if event.type not in SWITCHING:
+            if len(sections) > 1:
+                raise ConfigError(
+                    f"{where}.target: {target!r} is ambiguous across {list(sections)}"
+                )
             continue
-        if section not in SWITCHABLE:
+        if not candidates:
             raise ConfigError(f"{where}.target: {target!r} is a bus, which has no breaker; {event.type} "
                               f"switches a unit, source, branch or element")
+        if len(candidates) > 1:
+            raise ConfigError(
+                f"{where}.target: {target!r} is ambiguous across {list(candidates)}"
+            )
         on = event.type == "connect"
-        previous = switched.get(target)
-        if previous is not None and previous[1] == on:
-            raise ConfigError(f"{where}: {target!r} is already {event.type}ed by events.{previous[0]}")
-        if (target, event.t) in at:
-            raise ConfigError(f"{where}: {target!r} is also switched at t = {event.t} "
-                              f"by events.{at[(target, event.t)]}")
-        at[(target, event.t)] = name
-        switched[target] = (name, on)
+        leaves = _unit_leaves(p.units, target)
+        affected = leaves if leaves else (target,)
+        for actual in affected:
+            previous = switched.get(actual)
+            if previous is not None and previous[1] == on:
+                detail = (f"{target!r} is already {event.type}ed"
+                          if actual == target else
+                          f"{target!r} also switches {actual!r}, which is already {event.type}ed")
+                raise ConfigError(f"{where}: {detail} by events.{previous[0]}")
+            if (actual, event.t) in at:
+                detail = (f"{target!r} is also switched at t = {event.t}"
+                          if actual == target else
+                          f"{target!r} also switches {actual!r} at t = {event.t}")
+                raise ConfigError(f"{where}: {detail} by events.{at[(actual, event.t)]}")
+            at[(actual, event.t)] = name
+            switched[actual] = (name, on)
 
 
 def _initial(p: Params) -> None:
     """Check the start/end times and the shape of initial state values."""
+    from .params import _unit_items
+
     t0 = p.simulation.initial.t
+    if not math.isfinite(p.simulation.output.period) or p.simulation.output.period <= 0.0:
+        raise ConfigError("simulation.output.period must be finite and positive")
     if t0 < 0.0:
         raise ConfigError("simulation.initial.t must be >= 0")
-    for name, u in p.units.items():
+    for name, u in _unit_items(p.units):
+        m = getattr(u, "meas", None)
+        if m is None:
+            continue
         if u.bridge.model == "averaging":
             continue
-        m, T_c = u.meas, _period(u.ctrl, u.pwm)
+        T_c = _period(u.ctrl, u.pwm)
         continued = any(key.startswith((f"{name}.ctrl.", f"{name}.pwm.",
                                          f"{name}.bridge.", f"{name}.meas."))
                         for key in p.simulation.initial.states)
@@ -341,9 +528,24 @@ def validate(p: Params) -> Params:
     """Check a :class:`Params` tree and return it unchanged; raise ConfigError if invalid."""
     _network(p)
     for name, unit in p.units.items():
-        _unit(unit, p.base, f"units.{name}")
+        check = unit_type(unit.type, f"units.{name}.type").validator
+        if check is None:
+            raise ConfigError(f"units.{name}.type: {unit.type!r} has no validator")
+        check(unit, p.base, f"units.{name}")
+    from .params import _unit_items
+    for name, unit in _unit_items(p.units):
+        if unit.bridge.model == "averaging" and unit.meas.rms:
+            period = p.simulation.output.period
+            if not math.isfinite(period) or period <= 0:
+                raise ConfigError("simulation.output.period must be finite and positive")
+            for channel, window in unit.meas.rms.items():
+                if not _whole(window / period):
+                    raise ConfigError(f"units.{name}.meas.rms.{channel}: window must contain "
+                                      "whole protection/output periods in continuous mode")
     _solver(p.simulation.solver)
     _events(p)
     _progress(p.simulation.progress)
     _initial(p)
     return p
+
+

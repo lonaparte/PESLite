@@ -11,6 +11,26 @@ from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, dumps, from_dict, read_tree, to_dict
 
 
+@pytest.mark.parametrize("filename", ["gfl-example.pes", "buck-example.pes", "wpt-load-example.pes"])
+def test_shared_unit_schema_round_trips_without_persisting_cached_derived_fields(filename):
+    params = peslite.load(EXAMPLES / filename)
+    from peslite.assembly.params import _unit_items
+    for _name, unit in _unit_items(params.units):
+        assert unit.dc_base is unit.dc_base
+    written = to_dict(params)
+    assert to_dict(from_dict(written)) == written
+    if filename.startswith("wpt"):
+        assert set(written["units"]["charger"]) == {"type", "s_base", "primary", "secondary", "link"}
+
+
+@pytest.mark.parametrize("name", ["pwm", "dclink"])
+def test_required_common_unit_fields_stay_required_under_the_single_schema(name):
+    tree = read_tree(EXAMPLES / "buck-example.pes")
+    tree["units"]["converter"].pop(name)
+    with pytest.raises(ConfigError, match=name):
+        from_dict(tree)
+
+
 def _tree():
     return read_tree(EXAMPLES / "gfl-example.pes")
 
@@ -34,7 +54,7 @@ def test_log_and_old_parameter_names_are_rejected():
         from_dict(tree)
 
     tree = _tree()
-    current = tree["units"]["vsc"]["ctrl"]["loops"]["cc"]
+    current = tree["units"]["vsc"]["ctrl"]["loops"]["CurrentLoop"]
     current["bw_hz"] = current.pop("bandwidth")
     with pytest.raises(ConfigError, match=r"unknown key.*bw_hz"):
         from_dict(tree)
@@ -134,6 +154,60 @@ def test_to_dict_preserves_following_defaults_but_dumps_resolves_them():
     assert complete["units"]["vsc"]["meas"]["period"] == pytest.approx(5e-5)
     assert complete["units"]["vsc"]["s_base"] == 2e6
     assert dumps(from_dict(complete)) == dumps(p)
+
+
+def test_class_named_control_loops_round_trip_without_a_type_field():
+    p = peslite.load(EXAMPLES / "gfl-example.pes")
+    loops = to_dict(p)["units"]["vsc"]["ctrl"]["loops"]
+
+    assert tuple(loops) == ("SRFPLL", "CurrentLoop", "DCVoltageControl")
+    assert all("type" not in parameters for parameters in loops.values())
+    assert from_dict(to_dict(p)) == p
+
+
+def test_a_null_class_named_control_loop_is_an_empty_parameter_mapping():
+    tree = read_tree(EXAMPLES / "gfm-psc-example.pes")
+    tree["units"]["vsc"]["ctrl"]["loops"]["VirtualImpedance"] = yaml.safe_load(
+        "VirtualImpedance:\n"
+    )["VirtualImpedance"]
+
+    p = from_dict(tree)
+
+    assert p.unit().ctrl.loops["VirtualImpedance"].type == "virtual_impedance"
+
+
+def test_a_class_named_control_loop_rejects_a_conflicting_type():
+    tree = _tree()
+    tree["units"]["vsc"]["ctrl"]["loops"]["DCVoltageControl"]["type"] = "srf_pll"
+
+    with pytest.raises(ConfigError, match="conflicts with loop class"):
+        from_dict(tree)
+
+
+def test_a_class_named_control_loop_normalizes_a_redundant_type():
+    tree = _tree()
+    tree["units"]["vsc"]["ctrl"]["loops"]["DCVoltageControl"]["type"] = (
+        "dc_voltage_control"
+    )
+
+    p = from_dict(tree)
+
+    assert "type" not in to_dict(p)["units"]["vsc"]["ctrl"]["loops"]["DCVoltageControl"]
+
+
+def test_a_loop_class_uses_a_class_qualified_name_without_type():
+    tree = _tree()
+    loops = tree["units"]["vsc"]["ctrl"]["loops"]
+    loops["SRFPLL[grid]"] = loops.pop("SRFPLL")
+
+    p = from_dict(tree)
+    written = to_dict(p)["units"]["vsc"]["ctrl"]["loops"]
+    graph = peslite.Simulation(p).unit().ctrl.graph
+
+    assert "SRFPLL[grid]" in p.unit().ctrl.loops
+    assert "type" not in written["SRFPLL[grid]"]
+    assert "SRFPLL[grid]" in graph.nodes
+    assert graph.outputs["theta"] == "SRFPLL[grid].theta"
 
 
 def test_resolved_cli_and_meta_contract(capsys):

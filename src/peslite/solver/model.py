@@ -7,7 +7,7 @@ state) named ``<subsystem>.<state>`` and evaluates their outputs and connections
 Strongly connected output/input dependencies are detected during assembly and reduced to
 internally solved algebraic groups; individual subsystems do not need case-specific break rules.
 Every part with a state (a model, a controller, a PWM peripheral, a solver) is :class:`Stateful`: it
-gives its state by name, parts are composed by dotted names (``vsc.ctrl.pll``), flattened to the
+gives its state by name, parts are composed by dotted names (``vsc.ctrl.SRFPLL``), flattened to the
 real columns of ``states.csv`` and resolved from ``initial.states`` values.
 """
 
@@ -16,6 +16,7 @@ from __future__ import annotations
 import keyword
 import linecache
 import math
+import numbers
 import re
 from collections import Counter, deque
 from dataclasses import dataclass
@@ -26,7 +27,7 @@ from numpy.typing import NDArray
 
 from . import energy as _energy
 
-__all__ = ["ConfigError", "Bag", "Empty", "OutputStage", "Subsystem", "Model", "GroupPlan",
+__all__ = ["ConfigError", "Bag", "Empty", "OutputMethod", "Subsystem", "Model", "GroupPlan",
            "Stateful", "StateRegistry", "join", "gather", "scatter", "flatten", "resolve",
            "expand_aliases", "assign"]
 
@@ -35,6 +36,28 @@ __all__ = ["ConfigError", "Bag", "Empty", "OutputStage", "Subsystem", "Model", "
 
 class ConfigError(ValueError):
     """Invalid model or solver configuration."""
+
+
+def _real(value):
+    """Normalize scalar numbers while preserving their arithmetic semantics."""
+    if hasattr(value, "item"):
+        value = value.item()
+    return value if isinstance(value, numbers.Real) else float(value)
+
+
+def _complex(value):
+    """Normalize complex numbers while preserving their arithmetic semantics."""
+    if hasattr(value, "item"):
+        value = value.item()
+    return value + 0j if isinstance(value, numbers.Number) else complex(value)
+
+
+def _integer(value):
+    """Integral scalar normalization without erasing a number's arithmetic semantics."""
+    if isinstance(value, numbers.Integral):
+        return value
+    truncate = getattr(value, "__trunc__", None)
+    return truncate() if truncate is not None else int(value)
 
 
 class Bag:
@@ -54,16 +77,19 @@ class Empty(Bag):
 
 
 @dataclass(frozen=True)
-class OutputStage:
+class OutputMethod:
     """One output method of a subsystem and its direct input dependencies.
 
     ``method``: name of a method taking ``t``; ``inputs``: ``inp`` fields it reads;
     ``outputs``: ``out`` fields it writes. Every output field needs exactly one producer.
+    ``rhs`` may be false when no state derivative of the owning subsystem reads the stage.  The
+    model still includes it when an RHS-required downstream signal depends on its outputs.
     """
 
     method: str
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
+    rhs: bool = True
 
 
 @runtime_checkable
@@ -72,7 +98,9 @@ class Subsystem(Protocol):
 
     ``state_names``: packing order (a complex state takes two real entries);
     ``outputs_need_inputs``: whether ``set_outputs`` reads ``inp``; optional ``output_stages``
-    (tuple of :class:`OutputStage`) replaces ``set_outputs``.
+    (tuple of :class:`OutputMethod`) replaces ``set_outputs``. A subsystem may declare real-state
+    unilateral constraints as ``state_bounds = {name: (lower, upper)}``, using ``None`` for an
+    open side.
     ``out`` and connected ``inp`` fields are current when ``rhs`` runs.
     """
 
@@ -334,12 +362,12 @@ def _convert(where: str, target: Any, value: Any, presets: Any, name: str = "") 
             raise ValueError(f"{where}: a [re, im] pair only fits a complex state")
         return complex(float(value[0]), float(value[1]))
     if isinstance(target, complex):
-        return complex(value)
+        return _complex(value)
     if isinstance(value, complex):
         raise ValueError(f"{where}: complex value {value} for a real state")
     if isinstance(target, bool):
         return bool(round(float(value)))
-    return float(value)
+    return _real(value)
 
 
 def resolve(template: Mapping[str, Any], given: Mapping[str, Any],
@@ -427,12 +455,13 @@ class _AlgebraicLoop:
     """Automatically solved strongly connected group of output stages and signal copies.
 
     A small set of connection copies is selected as tear variables while the model is assembled.
-    The remaining operations are acyclic.  Repeated Gauss--Seidel sweeps enforce the torn
-    connections without assigning the responsibility to any participating subsystem.
+    The remaining operations are acyclic. Scalar groups use warm-started secant iteration;
+    general groups use Gauss--Seidel sweeps. No participating subsystem owns the loop solve.
     """
 
     __slots__ = ("operations", "tears", "owners", "labels", "max_sweeps", "rtol", "atol",
                  "_inverse", "_scalar_sweep")
+    step_limit = 10.0
 
     def __init__(self, operations: tuple, tears: tuple, owners: tuple,
                  labels: tuple[str, ...],
@@ -517,7 +546,7 @@ class _AlgebraicLoop:
         inverse = self._inverse
         x1 = x0 - inverse * r0 if inverse is not None else y0
         scale = max(1.0, abs(x0), abs(y0))
-        if (not self._finite_scalar(x1)) or abs(x1 - x0) > 10.0 * scale:
+        if (not self._finite_scalar(x1)) or abs(x1 - x0) > self.step_limit * scale:
             x1 = y0
         for _iteration in range(self.max_sweeps - 1):
             y1 = self._evaluate_scalar(t, x1)
@@ -532,7 +561,7 @@ class _AlgebraicLoop:
             inverse = self._inverse
             x2 = x1 - inverse * r1 if inverse is not None else y1
             scale = max(1.0, abs(x1), abs(y1))
-            if (not self._finite_scalar(x2)) or abs(x2 - x1) > 10.0 * scale:
+            if (not self._finite_scalar(x2)) or abs(x2 - x1) > self.step_limit * scale:
                 x2 = y1
             x0, r0, x1 = x1, r1, x2
         raise FloatingPointError(
@@ -611,6 +640,63 @@ def _auto_names(subsystems: Sequence[Any]) -> list[str]:
         seen[b] += 1
         names.append(f"{b}_{seen[b]}" if total[b] > 1 else b)
     return names
+
+
+def _topological_order(dependencies, successors):
+    """Kahn order and the nodes still blocked by cycles (not necessarily in cycles)."""
+    indegree = [len(deps) for deps in dependencies]
+    ready = deque(node for node, degree in enumerate(indegree) if degree == 0)
+    order = []
+    while ready:
+        node = ready.popleft()
+        order.append(node)
+        for nxt in successors[node]:
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0:
+                ready.append(nxt)
+    return order, [node for node, degree in enumerate(indegree) if degree]
+
+
+def _strong_components(successors, nodes):
+    """Iterative Tarjan on the induced subgraph of unsorted nodes only."""
+    selected = set(nodes)
+    indices, low = {}, {}
+    stack, on_stack, components = [], set(), []
+    for root in nodes:
+        if root in indices:
+            continue
+        indices[root] = low[root] = len(indices)
+        stack.append(root)
+        on_stack.add(root)
+        frames = [(root, iter(successors[root]))]
+        while frames:
+            node, edges = frames[-1]
+            nxt = next(edges, None)
+            if nxt is not None:
+                if nxt not in selected:
+                    continue
+                if nxt not in indices:
+                    indices[nxt] = low[nxt] = len(indices)
+                    stack.append(nxt)
+                    on_stack.add(nxt)
+                    frames.append((nxt, iter(successors[nxt])))
+                elif nxt in on_stack:
+                    low[node] = min(low[node], indices[nxt])
+                continue
+            frames.pop()
+            if frames:
+                parent = frames[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] == indices[node]:
+                component = []
+                while True:
+                    member = stack.pop()
+                    on_stack.remove(member)
+                    component.append(member)
+                    if member == node:
+                        break
+                components.append(tuple(sorted(component)))
+    return components
 
 
 class Model:
@@ -703,6 +789,40 @@ class Model:
                         break
             rhs_layout.append((sub, tuple(entries)))
         self._rhs_layout = tuple(rhs_layout)
+        bounds = []
+        for sub, entries in rhs_layout:
+            declared = getattr(sub, "state_bounds", {})
+            if not isinstance(declared, Mapping):
+                raise TypeError(f"{type(sub).__name__}.state_bounds must be a mapping")
+            unknown = set(declared) - set(sub.state_names)
+            if unknown:
+                raise ValueError(
+                    f"{type(sub).__name__}.state_bounds contains unknown states {sorted(unknown)}"
+                )
+            for name, limits in declared.items():
+                if not isinstance(limits, (tuple, list)) or len(limits) != 2:
+                    raise TypeError(
+                        f"{type(sub).__name__}.state_bounds[{name!r}] must be (lower, upper)"
+                    )
+                lower, upper = limits
+                lower = None if lower is None else float(lower)
+                upper = None if upper is None else float(upper)
+                if ((lower is not None and not math.isfinite(lower))
+                        or (upper is not None and not math.isfinite(upper))):
+                    raise ValueError(
+                        f"{type(sub).__name__}.state_bounds[{name!r}] must be finite"
+                    )
+                if lower is not None and upper is not None and lower > upper:
+                    raise ValueError(
+                        f"{type(sub).__name__}.state_bounds[{name!r}] has lower > upper"
+                    )
+                entry = entries[sub.state_names.index(name)]
+                if entry[1]:
+                    raise TypeError(
+                        f"{type(sub).__name__}.state_bounds cannot constrain complex state {name!r}"
+                    )
+                bounds.append((entry[0], lower, upper))
+        self._state_bounds = tuple(bounds)
         # stateful subsystems with complex flags, in vector order
         self._rhs_flags = tuple((sub, tuple(is_c for _idx, is_c in entries))
                                 for sub, entries in rhs_layout if entries)
@@ -714,11 +834,11 @@ class Model:
         if stages is None:
             return None
         if not isinstance(stages, (tuple, list)) or not stages:
-            raise ValueError(f"{name}.output_stages must be a nonempty sequence of OutputStage declarations")
+            raise ValueError(f"{name}.output_stages must be a nonempty sequence of OutputMethod declarations")
         produced, methods = set(), set()
         for stage in stages:
-            if not isinstance(stage, OutputStage):
-                raise TypeError(f"{name}.output_stages: expected OutputStage, got {type(stage).__name__}")
+            if not isinstance(stage, OutputMethod):
+                raise TypeError(f"{name}.output_stages: expected OutputMethod, got {type(stage).__name__}")
             where = f"{name}.output_stages[{stage.method!r}]"
             if not isinstance(stage.method, str) or not callable(getattr(sub, stage.method, None)):
                 raise ValueError(f"{where}: method must name a callable on the subsystem")
@@ -751,14 +871,15 @@ class Model:
         for sub, field in self.connections:
             connected[id(sub)].append(field)
 
-        operations, owners, dependencies, labels = [], [], [], []
+        operations, owners, dependencies, labels, rhs_required = [], [], [], [], []
 
-        def add(operation, owner, sources, label):
+        def add(operation, owner, sources, label, rhs=True):
             index = len(operations)
             operations.append(operation)
-            owners.append((owner, sources))
+            owners.append(((owner,), sources))
             dependencies.append(set())
             labels.append(label)
+            rhs_required.append(rhs)
             return index
 
         producers, legacy, stages = {}, {}, []
@@ -772,7 +893,8 @@ class Model:
                 legacy[id(sub)] = node  # state aliases need no output evaluation
             else:
                 for stage in declared:
-                    node = add(("out", getattr(sub, stage.method)), sub, (), f"{name}.{stage.method}")
+                    node = add(("out", getattr(sub, stage.method)), sub, (),
+                               f"{name}.{stage.method}", stage.rhs)
                     stages.append((node, sub, stage.inputs))
                     for field in stage.outputs:
                         producers[id(sub), field] = node
@@ -808,123 +930,89 @@ class Model:
                 if copy is not None:
                     dependencies[node].add(copy)
 
-        # Collapse every strongly connected component into one automatically solved algebraic
-        # group.  Acyclic models retain one operation per plan entry and therefore pay no
-        # iteration or dispatch cost.
+        # Reuse the scheduling pass: DAGs need neither SCC analysis nor a condensed graph.
         successors = [[] for _ in operations]
         for node, deps in enumerate(dependencies):
             for dep in deps:
                 successors[dep].append(node)
+        order, residual = _topological_order(dependencies, successors)
+        if residual:
+            # Residual nodes can be downstream of a loop. Only cyclic SCCs become solver groups.
+            components = [(node,) for node in order] + _strong_components(successors, residual)
+            component_of = {node: ci for ci, component in enumerate(components) for node in component}
+            compact_ops, compact_owners, compact_deps, compact_rhs = [], [], [], []
+            for ci, component in enumerate(components):
+                members = set(component)
+                cyclic = len(component) > 1 or any(node in dependencies[node] for node in component)
+                if not cyclic:
+                    node = component[0]
+                    operation = operations[node]
+                    own_group, srcs = owners[node]
+                else:
+                    # Retain the existing connection tearing and algebraic solver unchanged.
+                    pending = {node: set(dependencies[node]) & members for node in component}
+                    internal_order: list[int] = []
+                    tears: list[tuple] = []
+                    while pending:
+                        ready = sorted(node for node, deps in pending.items() if not deps)
+                        if not ready:
+                            candidates = sorted(node for node in pending if operations[node][0] == "copy")
+                            if not candidates:
+                                raise ValueError(
+                                    "algebraic output cycle has no connected signal to solve: "
+                                    + ", ".join(labels[node] for node in component)
+                                )
+                            torn = candidates[0]
+                            pending[torn].clear()
+                            tears.append(operations[torn][1])
+                            ready = [torn]
+                        for node in ready:
+                            if node not in pending:
+                                continue
+                            internal_order.append(node)
+                            pending.pop(node)
+                            for deps in pending.values():
+                                deps.discard(node)
+                    own_group = tuple(dict.fromkeys(owner for node in component
+                                                     for owner in owners[node][0]))
+                    srcs = tuple(dict.fromkeys(source for node in component
+                                               for source in owners[node][1]))
+                    operation = ("algebraic", _AlgebraicLoop(
+                        tuple(operations[node] for node in internal_order), tuple(tears),
+                        own_group, tuple(labels[node] for node in component),
+                    ))
+                compact_ops.append(operation)
+                compact_owners.append((own_group, srcs))
+                compact_rhs.append(any(rhs_required[node] for node in component))
+                compact_deps.append({component_of[dep] for node in component
+                                     for dep in dependencies[node] if component_of[dep] != ci})
 
-        index = 0
-        stack: list[int] = []
-        on_stack: set[int] = set()
-        indices = [-1] * len(operations)
-        low = [0] * len(operations)
-        components: list[tuple[int, ...]] = []
-
-        def visit(node: int) -> None:
-            nonlocal index
-            indices[node] = low[node] = index
-            index += 1
-            stack.append(node)
-            on_stack.add(node)
-            for nxt in successors[node]:
-                if indices[nxt] < 0:
-                    visit(nxt)
-                    low[node] = min(low[node], low[nxt])
-                elif nxt in on_stack:
-                    low[node] = min(low[node], indices[nxt])
-            if low[node] == indices[node]:
-                component = []
-                while True:
-                    member = stack.pop()
-                    on_stack.remove(member)
-                    component.append(member)
-                    if member == node:
-                        break
-                components.append(tuple(sorted(component)))
-
-        for node in range(len(operations)):
-            if indices[node] < 0:
-                visit(node)
-
-        component_of = {node: ci for ci, component in enumerate(components) for node in component}
-        compact_ops, compact_owners, compact_labels, compact_deps = [], [], [], []
-        for ci, component in enumerate(components):
-            members = set(component)
-            cyclic = len(component) > 1 or any(node in dependencies[node] for node in component)
-            if not cyclic:
-                node = component[0]
-                operation = operations[node]
-                own, srcs = owners[node]
-                label = labels[node]
-                own_group = (own,)
-            else:
-                # Topologically order the component while automatically tearing connection-copy
-                # nodes only when a cycle leaves no ready operation.  The torn connections are
-                # precisely the residuals checked by _AlgebraicLoop.
-                pending = {node: set(dependencies[node]) & members for node in component}
-                internal_order: list[int] = []
-                tears: list[tuple] = []
-                while pending:
-                    ready = sorted(node for node, deps in pending.items() if not deps)
-                    if not ready:
-                        candidates = sorted(node for node in pending if operations[node][0] == "copy")
-                        if not candidates:
-                            raise ValueError(
-                                "algebraic output cycle has no connected signal to solve: "
-                                + ", ".join(labels[node] for node in component)
-                            )
-                        torn = candidates[0]
-                        pending[torn].clear()
-                        tears.append(operations[torn][1])
-                        ready = [torn]
-                    for node in ready:
-                        if node not in pending:
-                            continue
-                        internal_order.append(node)
-                        pending.pop(node)
-                        for deps in pending.values():
-                            deps.discard(node)
-                own_group = tuple(dict.fromkeys(owners[node][0] for node in component))
-                srcs = tuple(dict.fromkeys(source for node in component
-                                           for source in owners[node][1]))
-                operation = ("algebraic", _AlgebraicLoop(
-                    tuple(operations[node] for node in internal_order), tuple(tears),
-                    own_group, tuple(labels[node] for node in component),
-                ))
-                label = "algebraic(" + ", ".join(labels[node] for node in component) + ")"
-            compact_ops.append(operation)
-            compact_owners.append((own_group, srcs))
-            compact_labels.append(label)
-            compact_deps.append({component_of[dep] for node in component
-                                 for dep in dependencies[node] if component_of[dep] != ci})
-
-        compact_successors = [[] for _ in compact_ops]
-        indegree = [len(deps) for deps in compact_deps]
-        for node, deps in enumerate(compact_deps):
-            for dep in deps:
-                compact_successors[dep].append(node)
-        ready = deque(i for i, degree in enumerate(indegree) if degree == 0)
-        order = []
-        while ready:
-            node = ready.popleft()
-            order.append(node)
-            for nxt in compact_successors[node]:
-                indegree[nxt] -= 1
-                if indegree[nxt] == 0:
-                    ready.append(nxt)
-        if len(order) != len(compact_ops):
-            raise RuntimeError("internal error while collapsing algebraic output groups")
+            operations, owners, dependencies, rhs_required = (
+                compact_ops, compact_owners, compact_deps, compact_rhs)
+            successors = [[] for _ in operations]
+            for node, deps in enumerate(dependencies):
+                for dep in deps:
+                    successors[dep].append(node)
+            order, residual = _topological_order(dependencies, successors)
+            if residual:
+                raise RuntimeError("internal error while collapsing algebraic output groups")
+        # An observational producer is still part of the derivative plan when a required
+        # downstream copy or output stage consumes it.  Propagate liveness towards producers in
+        # reverse topological order; this retains continuous-control signal paths while pruning
+        # unconnected measurements from sampled plant RHS calls.
+        for node in reversed(order):
+            if rhs_required[node]:
+                for dependency in dependencies[node]:
+                    rhs_required[dependency] = True
         position = {node: i for i, node in enumerate(order)}
-        self._plan = tuple(compact_ops[i] for i in order)
-        self._plan_owners = tuple(compact_owners[i] for i in order)
+        self._plan = tuple(operations[i] for i in order)
+        self._plan_rhs = tuple(rhs_required[i] for i in order)
+        self._plan_owners = tuple(owners[i] for i in order)
         self._plan_dependencies = tuple(
-            tuple(position[d] for d in sorted(compact_deps[i])) for i in order
+            tuple(position[d] for d in sorted(dependencies[i])) for i in order
         )
         self.algebraic_loops = tuple(
-            compact_ops[i][1] for i in order if compact_ops[i][0] == "algebraic"
+            operations[i][1] for i in order if operations[i][0] == "algebraic"
         )
         # Minimal output plan reached by a held-input change.  States, time and ordinary
         # parameters are unchanged in this path, so unrelated subsystem outputs need no refresh.
@@ -971,8 +1059,9 @@ class Model:
         load = [put(st, name, f"complex(v[{idx}], v[{idx + 1}])" if is_c else f"v[{idx}]")
                 for st, name, idx, is_c in self._state_ops]
 
-        plan = []
-        for (kind, item), (op_owners, _srcs) in zip(self._plan, self._plan_owners):
+        plan, derivative_plan = [], []
+        for (kind, item), (op_owners, _srcs), rhs_required in zip(
+                self._plan, self._plan_owners, self._plan_rhs):
             if kind in ("out", "algebraic"):
                 line = f"{ref(item)}(t)"
             else:
@@ -985,7 +1074,10 @@ class Model:
                         value = f"({value} + {ref(gain)} * {get(out, name)})"
                 line = put(dst, field, value)
             comment = ", ".join(owners[id(owner)] for owner in op_owners)
-            plan.append(f"{line}  # {comment}")
+            line = f"{line}  # {comment}"
+            plan.append(line)
+            if rhs_required:
+                derivative_plan.append(line)
 
         derive, packed = [], []
         for j, (sub, flags, _all_complex) in enumerate(self._rhs_plan):
@@ -999,7 +1091,8 @@ class Model:
 
         source = "\n".join(function("_load(v)", load) + function("_outputs(t)", plan)
                            + function("_zoh_outputs(t)", [plan[i] for i in self._zoh_plan])
-                           + function("rhs_list(t, v)", load + plan + derive + [f"return [{', '.join(packed)}]"])) + "\n"
+                           + function("rhs_list(t, v)", load + derivative_plan + derive
+                                      + [f"return [{', '.join(packed)}]"])) + "\n"
         filename = f"<peslite model {id(self):#x}>"
         exec(compile(source, filename, "exec"), env)
         linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
@@ -1109,6 +1202,20 @@ class Model:
 
     def set_states(self, y: NDArray[np.float64]) -> None:
         self._load(y.tolist())
+
+    @property
+    def has_state_bounds(self) -> bool:
+        """Whether any subsystem declares a real-state constraint."""
+        return bool(self._state_bounds)
+
+    def project_states(self, y: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Project declared real-state bounds in place and return ``y``."""
+        for index, lower, upper in self._state_bounds:
+            if lower is not None and y[index] < lower:
+                y[index] = lower
+            elif upper is not None and y[index] > upper:
+                y[index] = upper
+        return y
 
     def state_labels(self) -> list[str]:
         """One label per entry of the flat vector (``<subsystem>.<state>[.re|.im]``)."""

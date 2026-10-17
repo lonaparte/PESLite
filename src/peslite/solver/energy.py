@@ -129,7 +129,7 @@ def energy_rate(sub: Any, derivatives: dict[str, Any], spec: EnergySpec) -> floa
 
 def re_product(e: Any, f: Any) -> float:
     """``Re(e conj(f))`` for real or complex signals."""
-    return float((e * f.conjugate()).real) if isinstance(e, complex) or isinstance(f, complex) else float(e * f)
+    return (e * f.conjugate()).real
 
 
 def port_power(sub: Any, port: PowerPort) -> float:
@@ -286,6 +286,10 @@ class _BalancePlan:
 
     def __call__(self, t: float, y: np.ndarray) -> EnergyReport:
         dy = self.model.rhs(t, y)
+        # The derivative plan may omit observational output stages.  Energy ports and
+        # supplied/dissipated-power methods may still read those outputs, so complete the
+        # public-output synchronization promised by balance() before evaluating power.
+        self.model.evaluate_outputs(t)
         into_default = [0.0] * self.n_defaults
         for term in self.transfers:
             other = getattr(term.other_record, term.other_field)
@@ -570,6 +574,8 @@ def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e
             model.set_zoh_input(label, value)
         for k in range(4):
             y = rng.normal(size=model.n_states) * 100.0
+            if getattr(model, "has_state_bounds", False):
+                y = model.project_states(y)
             rep = balance(model, 0.01 * (k + 1), y)
             scale = rep.scale
             for s in rep.subsystems:

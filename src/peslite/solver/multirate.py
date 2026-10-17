@@ -34,6 +34,16 @@ def make_solver(cfg: Any, model: Optional[Any] = None, ratings: Any = None):
         if model is None:
             raise ConfigError("simulation.solver.subsystems needs the model whose subsystems it names")
         try:
+            parsed = {name: parse_step(value)[0] for name, value in cfg.subsystems.items()}
+            if all(ratio == 1.0 for ratio in parsed.values()):
+                unknown = [name for name in parsed if not model.select(name)]
+                if unknown:
+                    raise KeyError(
+                        f"unknown subsystem(s) or namespace(s) {unknown}; this model has {model.names}"
+                    )
+                return integrator(
+                    cfg.method, cfg.dt, cfg.rtol, cfg.atol, cfg.max_step, cfg.warm_start,
+                )
             return MultirateSolver(model, cfg.subsystems, cfg.dt, cfg.method, cfg.sweeps, cfg.rtol, cfg.atol,
                                    ratings)
         except (KeyError, ValueError) as exc:
@@ -197,15 +207,22 @@ class MultirateSolver:
 
     # ------------------------------------------------------------- interface
     def __call__(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64]) -> SolverStep:
+        return self.advance(f, t0, t1, y0)
+
+    def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
+                max_step: float = math.inf) -> SolverStep:
+        """Advance with a local limit applied coherently to every system and inner step."""
+        if max_step <= 0.0:
+            raise ValueError("max_step must be positive")
         if self.inner is None and self.outer is None and not self.force_general:
-            step = self._single(f, t0, t1, y0)
+            step = self._single.advance(f, t0, t1, y0, max_step=max_step)
             self.n_system = self._single.n_rhs
             self.n_rhs = self.n_system + self.n_inner + self.n_outer
             return step
         if t1 - t0 <= 0.0:
             return SolverStep(t1, y0, self.n_rhs)
         if self.outer is None:
-            y = self._advance(t0, t1, y0)
+            y = self._advance(t0, t1, y0, max_step)
             return SolverStep(t1, y, self.n_rhs)
         # re-anchor if the caller changed the outer states, then split the interval at window ends
         y = np.array(y0, dtype=float)
@@ -226,7 +243,7 @@ class MultirateSolver:
             self._sample_outer_rate(t, y)
             t_close = self._window_end
             t_stop = min(t1, t_close)
-            y = self._advance(t, t_stop, y)
+            y = self._advance(t, t_stop, y, max_step)
             t = t_stop
             if t >= t_close - _EPS:
                 self._close_window(y, None if t_close == self._t_anchor + self.window else t_close)
@@ -234,6 +251,26 @@ class MultirateSolver:
                 y[self._mask_outer] = self._anchor
         self._last_returned = y.copy()
         return SolverStep(t1, y, self.n_rhs)
+
+    def validate_local_step(self, providers: tuple[Any, ...]) -> None:
+        """Reject state-dependent local limits assigned to a window-averaged group."""
+        if self.outer is None:
+            return
+        names = []
+        for provider in providers:
+            owner = getattr(provider, "local_step_state", provider)
+            if owner not in self.model.subsystems:
+                continue
+            mask = np.zeros(self.model.n_states, dtype=bool)
+            for state in getattr(owner, "state_names", ()):
+                mask[self.model.state_slice(owner, state)] = True
+            if np.any(mask & self._mask_outer):
+                names.append(self.model.name_of(owner))
+        if names:
+            raise ConfigError(
+                "state-dependent local step limits cannot be assigned to a windowed "
+                f"subsystem: {sorted(set(names))}"
+            )
 
     def settle(self, t: float, y: NDArray[np.float64]) -> NDArray[np.float64]:
         """Finish deferred work at ``t`` before the model changes there.
@@ -402,10 +439,12 @@ class MultirateSolver:
         self._last_returned = None  # a loaded anchor is trusted on the next call
 
     # ------------------------------------------------------ the system step
-    def _advance(self, t0: float, t1: float, y0: NDArray[np.float64]) -> NDArray[np.float64]:
+    def _advance(self, t0: float, t1: float, y0: NDArray[np.float64],
+                 max_step: float = math.inf) -> NDArray[np.float64]:
         """System (and inner) steps over ``[t0, t1]``; outer states extrapolated."""
         span = t1 - t0
-        n = max(1, int(math.ceil(span / self.dt - 1e-9)))
+        step = min(self.dt, max_step)
+        n = max(1, int(math.ceil(span / step - 1e-9)))
         H = span / n
         y, t = y0, t0
         for _ in range(n):

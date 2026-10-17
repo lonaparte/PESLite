@@ -105,10 +105,14 @@ def test_builtin_element_parameters_are_checked(change, message):
         from_dict(tree)
 
 
-def test_element_names_and_registrations_are_checked():
+def test_element_names_are_section_scoped_and_registrations_are_checked():
     tree = _load(_tree(), name="pcc")
-    with pytest.raises(ConfigError, match="already used by buses.pcc"):
-        from_dict(tree)
+    params = from_dict(tree)
+    system = peslite.System(params)
+    signals = system.signals(params.simulation.initial.t)
+
+    assert "pcc" in params.buses and "pcc" in params.elements
+    assert {"pcc.u", "pcc.i"} <= set(signals)
 
     class NoType(Element):
         @dataclass(frozen=True)
@@ -171,7 +175,8 @@ def test_system_switches_units_sources_and_loads():
     source = unit.dclink.source
     system.switch("vsc", False, 0.1)
     assert unit.branch_f.breaker_open and source(0.15, source.u_ref) == 0.0
-    cc, dvc = unit.ctrl.graph.nodes["cc"], unit.ctrl.graph.nodes["dvc"]
+    cc = unit.ctrl.graph.nodes["CurrentLoop"]
+    dvc = unit.ctrl.graph.nodes["DCVoltageControl"]
     cc.integral, dvc.integral = 0.2 + 0.1j, 0.3
     unit.ctrl(0.15, _measurement(p, 0.15))
     assert not unit.ctrl.startup.active
@@ -188,7 +193,7 @@ def test_system_switches_units_sources_and_loads():
 def test_system_applies_retunes_and_control_loops_keep_their_state():
     tree = _line(_load(_tree()))
     tree["units"]["vsc"]["bridge"] = {"model": "pwm_averaging"}
-    tree["units"]["vsc"]["ctrl"]["loops"]["dvc"]["antiwindup"] = 0
+    tree["units"]["vsc"]["ctrl"]["loops"]["DCVoltageControl"]["antiwindup"] = 0
     tree["events"]["connect_vsc"].update(t=0.0, ramp=0.0)
     tree["events"]["retune"] = {"type": "set", "t": 0.001, "set": {
         "buses.pcc.c_pu": 0.03,
@@ -203,8 +208,8 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
         "elements.load.r_pu": 1.0,
         "units.vsc.dclink.source.i_pu": 0.5,
         "units.vsc.ctrl.references.p_ref_pu": 0.4,
-        "units.vsc.ctrl.loops.pll.kp_pu": 10.0,
-        "units.vsc.ctrl.loops.dvc.kp_pu": 0.4,
+        "units.vsc.ctrl.loops.SRFPLL.kp_pu": 10.0,
+        "units.vsc.ctrl.loops.DCVoltageControl.kp": 0.4,
         "units.vsc.protection.hold": 0.01,
         "units.vsc.protection.rocof.window": 0.2,
     }}
@@ -222,9 +227,9 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     source.branch.state.i = 5 + 6j
     line.state.i = 6 + 7j
     load.branch.state.i = 7 + 8j
-    old_pll = unit.ctrl.graph.nodes["pll"]
+    old_pll = unit.ctrl.graph.nodes["SRFPLL"]
     old_pll.theta, old_pll.integral = 1.2, 0.3
-    old_dvc = unit.ctrl.graph.nodes["dvc"]
+    old_dvc = unit.ctrl.graph.nodes["DCVoltageControl"]
     old_dvc.integral, old_dvc.n_updates, old_dvc.n_limit_exceeded = 0.2, 5, 2
     old_dvc.n_reverse, old_dvc.first_limit_t = 1, 4e-4
     system.apply(change)
@@ -244,17 +249,18 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     assert unit.dclink.source.i_nom == current.unit("vsc").dclink.source.i
     assert unit.protection.cfg.hold == 0.01
     assert unit.protection._rocof_window == pytest.approx(0.2)
-    assert unit.ctrl.graph.nodes["pll"] is old_pll  # queued until the next controller update
+    assert unit.ctrl.graph.nodes["SRFPLL"] is old_pll  # queued until the next controller update
 
     unit.ctrl(change.t, _measurement(p, change.t))
-    pll = unit.ctrl.graph.nodes["pll"]
+    pll = unit.ctrl.graph.nodes["SRFPLL"]
     assert pll is not old_pll and pll.kp == 10.0
     # The retuned loop first takes over the old state, then performs this interrupt's update.
     assert pll.integral == pytest.approx(0.3)
     assert pll.theta == pytest.approx(1.2 + pll.T * (pll.w0 + pll.ki * 0.3))
-    dvc = unit.ctrl.graph.nodes["dvc"]
-    assert dvc is not old_dvc and dvc.kp == 0.4 and dvc.integral == 0.2
-    assert (dvc.n_updates, dvc.n_limit_exceeded, dvc.n_reverse, dvc.first_limit_t) == (6, 3, 1, 4e-4)
+    dvc = unit.ctrl.graph.nodes["DCVoltageControl"]
+    assert dvc is not old_dvc and dvc.cfg.kp == 0.4 and dvc.kp == -0.4
+    assert dvc.integral == 0.2
+    assert (dvc.n_updates, dvc.n_limit_exceeded, dvc.n_reverse, dvc.first_limit_t) == (6, 3, 2, 4e-4)
     assert unit.ctrl.graph.references["p_ref_pu"] == 0.4
 
     specs = system.model.energy_specs
@@ -268,8 +274,8 @@ def test_continuous_controller_retune_rebinds_its_ode_states(tmp_path):
     tree = _tree()
     tree["events"]["connect_vsc"].update(t=0.0, ramp=0.0)
     tree["events"]["retune"] = {"type": "set", "t": 1e-4, "set": {
-        "units.vsc.ctrl.loops.pll.kp_pu": 10.0,
-        "units.vsc.ctrl.loops.dvc.kp_pu": 0.4,
+        "units.vsc.ctrl.loops.SRFPLL.kp_pu": 10.0,
+        "units.vsc.ctrl.loops.DCVoltageControl.kp": 0.4,
     }}
     tree["simulation"].update(t_end=2e-4, energy_check="off")
     tree["simulation"]["progress"] = {"enable": 0}
@@ -277,6 +283,6 @@ def test_continuous_controller_retune_rebinds_its_ode_states(tmp_path):
 
     result = simulation.run(out_dir=tmp_path)
 
-    assert simulation.unit().ctrl.graph.nodes["pll"].kp == 10.0
-    assert simulation.unit().ctrl.graph.nodes["dvc"].kp == 0.4
+    assert simulation.unit().ctrl.graph.nodes["SRFPLL"].kp == 10.0
+    assert simulation.unit().ctrl.graph.nodes["DCVoltageControl"].kp == -0.4
     assert all(np.isfinite(values[-1]) for values in result.states.values())

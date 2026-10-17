@@ -18,7 +18,9 @@ cross-references are reported before the run starts.
 | `simulation` | End time, solver, initial state, output and progress settings. |
 | `meta` | Optional title and description; never affects the model. |
 
-Names in `buses`, `branches`, `sources`, `units` and `elements` are unique together. They must be
+Names are unique within each of `buses`, `branches`, `sources`, `units` and `elements`. The same
+spelling may be used in different sections when their assembled subsystem and signal names remain
+distinct. An event target must still identify exactly one switchable object. Names must be
 non-empty and cannot contain a dot, because dots separate public parameter and state paths.
 
 ## Units and per-unit values
@@ -38,6 +40,18 @@ Each converter may define its own `s_base`; otherwise it uses the system base. C
 references and loop parameters use that converter's base. Time is in seconds, angles are radians,
 frequencies are hertz unless named `omega`, and switches are written as `0` or `1`.
 
+`bus`, `dclink`, `pwm`, `ctrl`, `bridge`, `meas`, `protection` and `s_base` are common to every
+non-composite converter unit. The selected `unit.type` contributes its own electrical fields:
+`vsc` adds `ac_filter`, while `dc_converter` adds `filter`. The common ADC and protection lifecycle
+are shared by both converter families.
+
+`meas.sources` optionally maps existing channel names to physical subsystem outputs or named
+port quantities. `meas.rms` maps channels to sliding RMS windows in seconds. Both use the same
+measurement path for VSC and DCConverter; no WPT-specific channel schema is required. Configured
+RMS overcurrent criteria use `protection.rms_current` and the existing `hold` and trip latch.
+For wiring, window semantics and an independent load example, see
+[Independent loads and measurement selection](Examples.md#independent-loads-and-measurement-selection).
+
 ## Converter section
 
 A unit names its terminal bus and groups its physical and control configuration:
@@ -55,16 +69,76 @@ units:
     ctrl:
       type: gfm
       loops:
-        power: {type: power}
-        sync: {type: psc, k_p_pu: 6.2832, k_vi: 20.0}
-        vi: {type: virtual_impedance}
-        damp: {type: active_damping, r_a_pu: 0.2, alpha_d: 40.0}
+        PSC: {k_p_pu: 6.2832, k_vi: 20.0}
+        VirtualImpedance: {}
+        ActiveDamping: {r_a_pu: 0.2, alpha_d: 40.0}
       references: {p_ref_pu: 0.5}
 ```
 
-`ctrl.type` selects built-in GFL/GFM wiring. A custom graph can override loop connections and the
-controller outputs explicitly. See [Control and PWM Timing](Control-and-PWM-Timing.md) and
+`ctrl.type` selects the controller architecture: its reference schema, public ports and default
+wiring. Built-in architectures include `gfl`, `gfm`, scalar `dc` and `resonant`; a custom graph can
+override loop connections and controller outputs explicitly. Normally, each key under `ctrl.loops`
+is the registered loop class name and also its graph-node name; no duplicate `type` field is
+needed. PESLite builds only nodes that can reach a controller output through the connection graph.
+Examples use `{}` for an empty parameter mapping. A bare key or explicit YAML `null` is accepted
+as an equivalent input in `ctrl.loops`.
+Repeated uses of one class use a class-qualified name, such as `Observer[voltage]` and
+`Observer[current]`; connections address those complete names. See
+[Control and PWM Timing](Control-and-PWM-Timing.md) and
 [Converter and Bridge Models](Converter-and-Bridge-Models.md).
+
+Shared operations such as `complex_power`, coordinate transforms and `unit_delay` are functions,
+not configurable graph nodes. A synchronization law calls `complex_power` directly and owns its
+optional power-filter states. A loop that needs a one-sample delay owns the previous value and
+passes it explicitly to `unit_delay(value, previous)`. Consequently, unused helper functions create
+no objects or runtime state. `VirtualImpedance`, `ActiveDamping` and `ResonantModulation` remain
+ordinary registered loops because they have configurable behavior and graph ports.
+
+A WPT unit is a configuration-time composite. It owns no bridge or controller itself; each child
+is an ordinary independently clocked `DCConverter`. Each bridge and its matching link terminal
+attach through the child's own assembly boundary. The WPT exposes `primary` and `secondary` Unit
+ports and explicitly selects `primary` as its default port. Composite event parameters and shared
+subsystem ratings therefore inherit the primary port unless another port is selected. The bundled
+open-loop example selects a full bridge and `ResonantModulation` for each child; neither choice
+creates a separate converter class. `link.type` selects series-series (`ss`) or LCC-LCC (`lcc`)
+compensation. `wpt-ss-example` and `wpt-lcc-example` connect ordinary power-feedback loops to the
+same modulation inputs. The `resonant` profile's `references.power` is signed watts; `modulation`,
+`frequency` and `phase` remain amplitude, hertz and radians. The complete runnable schemas are
+shown in [Examples](Examples.md#wpt-power-feedback).
+
+```yaml
+units:
+  charger:
+    type: wpt
+    primary:
+      type: dc_converter
+      dclink: {vdc_ref: 400.0, source: {type: voltage}}
+      pwm: {f_sw: 1.0e6}
+      ctrl:
+        type: resonant
+        computation: 0.0
+        loops:
+          ResonantModulation: {}
+        references: {modulation: 0.8, frequency: 85000.0}
+    secondary:
+      # The same fields, with its own DC link, PWM clock and phase command.
+      type: dc_converter
+      dclink: {vdc_ref: 300.0, source: {type: voltage}}
+      pwm: {f_sw: 800.0e3}
+      ctrl:
+        type: resonant
+        computation: 0.0
+        loops:
+          ResonantModulation: {}
+        references: {modulation: 0.7, frequency: 85000.0, phase: -1.5708}
+    link:
+      type: ss
+      primary_inductance: 100.0e-6
+      secondary_inductance: 100.0e-6
+      mutual_inductance: 20.0e-6
+      primary_capacitance: 35.07e-9
+      secondary_capacitance: 35.07e-9
+```
 
 ## Simulation settings
 

@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Iterator, Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Iterator, Mapping, Optional, Protocol, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
 
 from ..control.blocks import abc2complex
+from ..solver.model import _integer, _real
 
 __all__ = ["PWM", "TIME_EPS", "SwitchingSequence", "Modulator", "CarrierComparison",
            "SynchronousCarrier", "ZOH", "carrier", "carrier_position", "make_modulator"]
@@ -56,20 +57,38 @@ class PWM:
     _NAMES = ("d_a", "d_b", "d_c", "on")
 
     def __init__(self, period: float, load_period: float, offset: float, computation: float,
-                 carrier_period: float, modulator: Modulator) -> None:
+                 carrier_period: float, modulator: Modulator, *,
+                 duty_names: tuple[str, ...] | None = None,
+                 switching_state: Callable[[Any], Any] | None = None,
+                 pwm_state: Callable[[Any], Any] | None = None) -> None:
         if not math.isfinite(computation) or computation < 0.0:
             raise ValueError(f"the computation time must be finite and >= 0, got {computation}")
-        self.period, self.load_period, self.offset = float(period), float(load_period), float(offset)
-        self.computation, self.carrier_period = float(computation), float(carrier_period)
+        self.period, self.load_period, self.offset = _real(period), _real(load_period), _real(offset)
+        self.computation, self.carrier_period = _real(computation), _real(carrier_period)
+        self._names = (*duty_names, "on") if duty_names is not None else self._NAMES
+        self._width = len(self._names) - 1
+        self._switching_state = switching_state or abc2complex
+        self._pwm_state = pwm_state or ZOH.value
         self.modulator = modulator
         self.k = self.j = 0
         self.t_interrupt, self.t_load = self.interrupt(0), self.load_time(0)
-        self.active, self.shadow = np.zeros(4), np.zeros(4)
+        self.active, self.shadow = np.zeros(self._width + 1), np.zeros(self._width + 1)
         self.sync: tuple[float | None, float | None] = (None, None)
         self.t_sync = 0.0
-        self.schedule: list[tuple[float, complex]] = []
+        self.schedule: list[tuple[float, Any]] = []
         self.next_switch = math.inf
         self.load_end = math.inf
+
+    @property
+    def modulator(self) -> Modulator:
+        return self._modulator
+
+    @modulator.setter
+    def modulator(self, value: Modulator) -> None:
+        self._modulator = value
+        self._switching = (
+            self._pwm_interval if type(value) is ZOH else self._switching_interval
+        )
 
     def interrupt(self, k: int) -> float:
         return self.offset + k * self.period
@@ -84,8 +103,12 @@ class PWM:
 
     def after(self, t: float, period: Optional[float] = None) -> int:
         """Index of the first timer point after ``t``; a point at ``t`` is not after it."""
+        return int(self.index_after(t, period))
+
+    def index_after(self, t: float, period: Optional[float] = None):
+        """Scalar timer-index equation shared by initialization and standalone execution."""
         T = self.period if period is None else period
-        return int(math.floor((t - self.offset + TIME_EPS) / T)) + 1
+        return np.floor((t - self.offset + TIME_EPS) / T) + 1
 
     def count(self, t_a: float, t_b: float) -> int:
         """Number of control interrupts in ``[t_a, t_b]``, including both ends."""
@@ -97,11 +120,13 @@ class PWM:
         return (f"control {1e-3 / self.period:g} kHz, computation {self.computation * 1e6:g} us, "
                 f"{'double' if double else 'single'} update")
 
-    @staticmethod
-    def _word(d_abc: NDArray[np.float64], on: bool) -> NDArray[np.float64]:
-        word = np.empty(4, dtype=float)
-        word[:3] = np.asarray(d_abc, dtype=float).ravel()
-        word[3] = 1.0 if on else 0.0
+    def _word(self, duties: NDArray[np.float64], on: bool) -> NDArray[np.float64]:
+        values = np.asarray(duties, dtype=float).ravel()
+        if values.size != self._width:
+            raise ValueError(f"expected {self._width} duty ratios, got {values.size}")
+        word = np.empty(self._width + 1, dtype=float)
+        word[:-1] = values
+        word[-1] = 1.0 if on else 0.0
         return word
 
     def reset(self, d_abc: NDArray[np.float64], on: bool = False) -> None:
@@ -129,54 +154,56 @@ class PWM:
     @property
     def duty(self) -> NDArray[np.float64]:
         """Duty ratios in the active compare registers."""
-        return self.active[:3].copy()
+        return self.active[:-1].copy()
 
     @property
     def on(self) -> bool:
         """PWM enable in the active compare registers."""
-        return bool(self.active[3])
+        return bool(self.active[-1])
 
-    def start(self, t: float, sync: tuple[float | None, float | None], continued: bool) -> complex:
+    def start(self, t: float, sync: tuple[float | None, float | None], continued: bool):
         """Resume the timer and switching sequence at ``t`` after named states were loaded."""
         self.k, self.j = self.after(t), self.after(t, self.load_period)
         self.t_interrupt, self.t_load = self.interrupt(self.k), self.load_time(self.j)
         last = self.interrupt(self.k - 1)
         self.sync, self.t_sync = sync, min(last, t)
-        q = self._switching(self.load_time(self.j - 1), self.active[:3], t)
+        q = self._switching(self.load_time(self.j - 1), self.active[:-1], t)
         if not continued:
             self.t_sync = t
         return q
 
-    def load(self, t: float) -> complex:
+    def load(self, t: float):
         """Load shadow into active registers and schedule switching until the next load."""
         completed = self.interrupt(self.k - 1) + self.computation
         if completed <= t + TIME_EPS:
             # Writes replace the shadow word, so the active bank can take ownership without a
             # copy. Named-state writes detach the banks before mutating either one in place.
             self.active = self.shadow
-        q = self._switching(t, self.active[:3], t)
+        q = self._switching(t, self.active[:-1], t)
         self.j += 1
         self.t_load = self.load_time(self.j)
         return q
 
-    def _switching(self, t_l: float, d: NDArray[np.float64], t_now: float) -> complex:
-        if type(self.modulator) is ZOH:
-            self.load_end = t_l + self.load_period
-            self.schedule.clear()
-            self.next_switch = math.inf
-            return self.modulator.value(d)
+    def _pwm_interval(self, t_l: float, d: NDArray[np.float64], _t_now: float):
+        self.load_end = t_l + self.load_period
+        self.schedule.clear()
+        self.next_switch = math.inf
+        return self._pwm_state(d)
+
+    def _switching_interval(self, t_l: float, d: NDArray[np.float64], t_now: float):
         theta, omega = self.sync
         if theta is not None and omega is not None and t_l != self.t_sync:
             theta = theta + omega * (t_l - self.t_sync)
-        seq = self.modulator(t_l, self.load_period, d, theta, omega)
+        seq = self._modulator(t_l, self.load_period, d, theta, omega)
         dt = np.asarray(seq.dt, dtype=float).tolist()
         states = np.asarray(seq.q_abc, dtype=float).tolist()
         self.load_end = t_l + self.load_period
-        schedule: list[tuple[float, complex]] = []
-        q_now, t_i = abc2complex(states[0]), t_l
+        schedule: list[tuple[float, Any]] = []
+        encode = self._switching_state
+        q_now, t_i = encode(states[0]), t_l
         for i in range(len(dt) - 1):
             t_i += dt[i]
-            q = abc2complex(states[i + 1])
+            q = encode(states[i + 1])
             if t_i <= t_now + TIME_EPS:
                 q_now = q
             else:
@@ -194,7 +221,7 @@ class PWM:
         """Whether the old switching or held-input interval ends at ``t``."""
         return abs(self.next_switch - t) < TIME_EPS or abs(self.load_end - t) < TIME_EPS
 
-    def switches(self, t: float) -> list[complex]:
+    def switches(self, t: float) -> list[Any]:
         """Return switching states due at ``t`` in order."""
         due = []
         while self.schedule and abs(self.schedule[0][0] - t) < TIME_EPS:
@@ -205,7 +232,7 @@ class PWM:
     def get_state(self) -> dict[str, Any]:
         return {f"{head}{name}": (bool(word[k]) if name == "on" else float(word[k]))
                 for head, word in (("", self.active), ("shadow.", self.shadow))
-                for k, name in enumerate(self._NAMES)}
+                for k, name in enumerate(self._names)}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         names = set(self.get_state())
@@ -218,7 +245,7 @@ class PWM:
             self.active = self.active.copy()
         for key, value in values.items():
             head, _, name = key.rpartition(".")
-            k = self._NAMES.index(name)
+            k = self._names.index(name)
             target = {"": self.active, "shadow": self.shadow}[head]
             target[k] = (1.0 if value else 0.0) if name == "on" else float(value)
 
@@ -280,23 +307,24 @@ class CarrierComparison:
     """
 
     def __init__(self, f_sw: float, phase: float = 0.0, min_interval: float = 1e-12) -> None:
-        self.f_sw = float(f_sw)
-        self.phase = float(phase)
+        self.f_sw = _real(f_sw)
+        self.phase = _real(phase)
         self.min_interval = min_interval
 
     def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence:
         m = np.clip(2.0 * np.asarray(d_abc, dtype=float) - 1.0, -1.0, 1.0).tolist()
+        width = len(m)
         # initial switching state at t
         u_t = carrier_position(t, self.f_sw, self.phase)
         c_t = _value(u_t)
         if u_t < 0.5:
-            q = [1.0 if m[k] > c_t else 0.0 for k in range(3)]
+            q = [1.0 if m[k] > c_t else 0.0 for k in range(width)]
         else:
-            q = [1.0 if m[k] >= c_t else 0.0 for k in range(3)]
+            q = [1.0 if m[k] >= c_t else 0.0 for k in range(width)]
         events: list[tuple[float, int, float]] = []
         for start, seg, rising, c0, slope in _pieces(t, T_s, self.f_sw, self.phase, _EPS, 64):
-            for k in range(3):
+            for k in range(width):
                 x = (m[k] - c0) / slope
                 if 0.0 < x < seg:
                     # rising carrier crosses m from below -> switch off; falling -> on
@@ -327,8 +355,8 @@ class SynchronousCarrier:
     """
 
     def __init__(self, pulse_ratio: int, phase: float = 0.0, min_interval: float = 1e-12) -> None:
-        self.pulse_ratio = int(pulse_ratio)
-        self.phase = float(phase)
+        self.pulse_ratio = _integer(pulse_ratio)
+        self.phase = _real(phase)
         self.min_interval = min_interval
 
     def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],

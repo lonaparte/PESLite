@@ -1,3 +1,4 @@
+# PESLite 0.4.0
 # Two converters, each on its own bus and connected to the PCC by a line:
 # a grid-forming unit (PSC, 2 MVA, 20 kHz) and a grid-following unit (1 MVA, 10 kHz).
 base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
@@ -15,6 +16,7 @@ sources:
     r_pu: 0.04
 units:
   vsc_1:
+    type: vsc
     bus: bus1
     ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
     dclink:
@@ -24,13 +26,13 @@ units:
     ctrl:
       type: gfm
       loops:
-        power: {type: power}
-        sync: {type: psc, k_p_pu: 6.2832, k_vi: 20.0}
-        vi: {type: virtual_impedance}
-        damp: {type: active_damping, r_a_pu: 0.2, alpha_d: 40.0}
+        PSC: {k_p_pu: 6.2832, k_vi: 20.0}
+        VirtualImpedance: {}
+        ActiveDamping: {r_a_pu: 0.2, alpha_d: 40.0}
       references: {p_ref_pu: 0.5}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
   vsc_2:
+    type: vsc
     bus: bus2
     s_base: 1.0e6
     ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
@@ -42,9 +44,10 @@ units:
     ctrl:
       type: gfl
       loops:
-        pll: {type: srf_pll, kp_pu: 20.0, ki_pu: 1200.0}
-        cc: {type: dq_current_pi, bandwidth: 200.0}
-        dvc: {type: dc_voltage_pi, kp_pu: 0.8, ki_pu: 90.0, limit_pu: 1.15, id0_export_pu: 0.9}
+        SRFPLL: {kp_pu: 20.0, ki_pu: 1200.0}
+        CurrentLoop: {bandwidth: 200.0}
+        DCVoltageControl: {kp: 0.8, ki: 90.0, minimum: 0.0, maximum: 1.15,
+                           feedforward: 0.9, output_polarity: -1.0}
     protection:
       overcurrent: {enable: 1, limit_pu: 1.15}
       undervoltage: {enable: 1, limit_pu: 0.5}

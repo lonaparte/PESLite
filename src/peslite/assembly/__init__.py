@@ -6,13 +6,66 @@
 one model.
 """
 
-from .params import BaseValues, ConfigError, Params, dump, dumps, from_dict, load, read_initial, to_dict
+from .params import (BaseValues, ConfigError, ControlParams, LCCLinkParams, Params,
+                     SSLinkParams, UnitParams,
+                     dump, dumps, from_dict, load,
+                     read_initial, to_dict)
 from .events import (EVENT_TYPES, Event, Scenario, SourceScenario,
                      register_event_type)
-from .protection import Protection
-from .unit import Unit
+from .protection import Protection, ProtectionSample
+from .unit import DCConverter, Unit, VSC
 from .system import System
+from .params import _DCConverterUnitFields, _VSCUnitFields, _WPTUnitFields
+from .system import _assemble_dc_converter, _assemble_vsc, _assemble_wpt
+from .types import register_unit_type
+from .validate import _dc_converter, _unit, _wpt
+from ..control.profiles import control_type
+
+register_unit_type(
+    "vsc",
+    params=_VSCUnitFields,
+    default_bridge="three_phase_bridge",
+    default_port="dc",
+    ports=("dc", "power"),
+    phases=3,
+    bridge_types=frozenset(("three_phase_bridge",)),
+    measurement_channels=frozenset(("u_g", "i_c", "u_dc")),
+    current_channel="i_c",
+    protection_criteria=frozenset((
+        "overcurrent", "rms_current", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof",
+    )),
+    defaults_grid_frequency=True,
+    validator=_unit,
+    assembler=_assemble_vsc,
+)
+register_unit_type(
+    "dc_converter",
+    params=_DCConverterUnitFields,
+    default_bridge=lambda control: control_type(control.type).default_bridge,
+    default_port="dc",
+    ports=("dc", "power"),
+    phases=1,
+    bridge_types=frozenset(("half_bridge", "full_bridge")),
+    measurement_channels=frozenset(("current", "voltage", "vin", "power")),
+    current_channel="current",
+    protection_criteria=frozenset((
+        "overcurrent", "rms_current", "undervoltage", "overvoltage", "dc_voltage",
+    )),
+    validator=_dc_converter,
+    assembler=_assemble_dc_converter,
+)
+register_unit_type(
+    "wpt",
+    params=_WPTUnitFields,
+    children=("primary", "secondary"),
+    default_port="primary",
+    phases=1,
+    validator=_wpt,
+    assembler=_assemble_wpt,
+)
 
 __all__ = ["Params", "BaseValues", "ConfigError", "load", "dump", "dumps", "from_dict", "to_dict", "read_initial",
            "Event", "EVENT_TYPES", "register_event_type", "Scenario",
-           "SourceScenario", "Protection", "Unit", "System"]
+           "SourceScenario", "Protection", "ProtectionSample", "Unit", "VSC", "DCConverter",
+           "UnitParams", "ControlParams",
+           "SSLinkParams", "LCCLinkParams", "System"]

@@ -89,7 +89,7 @@ Install the optional plotting dependency, then name the recorded columns after `
 
 ```bash
 pip install "peslite[plot]"
-peslite case.pes --plot vsc.dclink.u_C vsc.ctrl.pll.theta \
+peslite case.pes --plot vsc.dclink.u_C vsc.ctrl.SRFPLL.theta \
   --plot-ylabel '$x$ (pu)'
 ```
 

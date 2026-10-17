@@ -30,18 +30,41 @@ Individual loops may run more slowly:
 ctrl:
   period: 50e-6
   loops:
-    current: {type: dq_current_pi, period: 50e-6}
-    dc_voltage: {type: dc_voltage_pi, period: 500e-6}
+    CurrentLoop: {period: 50e-6}
+    DCVoltageControl: {period: 500e-6}
 ```
+
+The class names are also the graph-node names used by `connections`, outputs and state paths.
+Configuration loading resolves them to parameter schemas without constructing control objects.
+During assembly, PESLite traces dependencies backward from controller outputs and constructs only
+the nodes on that active graph; an unreferenced declaration consumes no runtime loop object.
+If a class occurs more than once, an optional label remains part of the node name, for example
+`Observer[voltage]` and `Observer[current]`. No loop entry needs a `type` field.
 
 A loop period must be an integer multiple of `ctrl.period`. If omitted, it inherits the controller
 period. Loop state is preserved when run-time parameter changes rebuild a loop.
 
+`DCVoltageControl` is the common voltage-to-current loop for VSC and DCConverter control graphs.
+Its error is always `reference - voltage`, and its output is `current_reference`. Parameters use
+the coordinates of the containing controller graph: per-unit values in a VSC graph and SI values
+in a scalar DC graph. `output_polarity` describes the plant direction. It is `+1` when positive
+commanded current charges the controlled capacitor and `-1` when positive commanded current draws
+energy from it, as with the VSC convention that positive d-axis current exports power. A DCConverter
+normally sends the result to `InductorCurrentControl`; a VSC sends it to the d-axis input of
+`CurrentLoop`.
+
 ## ADC sampling
 
-The ADC exposes terminal voltage `u_g`, converter current `i_c` and DC voltage `u_dc`. Channels not
-listed under `meas.average` are instantaneous at the controller interrupt. Listed channels use the
-mean over a window ending at that interrupt:
+Every sampled converter uses the same ADC implementation. A VSC exposes `u_g`, `i_c` and `u_dc`;
+a scalar DC converter exposes `current`, `voltage` and `vin`. An active control path using
+`meas.power`, or an explicit `meas.average: [power]` request, also enables instantaneous outward
+power at the unit's external `power` terminal. This uses that terminal's paired voltage/current,
+direction and power coefficient, not a product of potentially different control feedback ports.
+An unused loop does not enable this channel. Direct controller calls must supply port power when
+the active graph requires it; missing power is not interpreted as a measured zero.
+The optional channel is not evaluated in configurations that do not request it. Channels not listed under
+`meas.average` are instantaneous at the controller interrupt. Listed channels use the mean over a
+window ending at that interrupt:
 
 ```yaml
 meas:
@@ -53,6 +76,11 @@ meas:
 `meas.period` is the oversampling period and defaults to `ctrl.period`. `meas.window` defaults to
 the control period and cannot exceed it. Window integrals are named states so a saved run can
 restore an open window; the individual intermediate oversamples are not persisted.
+
+For oscillating scalar ports, average `power` itself rather than multiplying separately averaged
+voltage and current. A carrier-boundary voltage sample may be zero even during nonzero power
+transfer. The WPT feedback cases use the ordinary ADC window for that product and an ordinary
+power-loop low-pass filter for the remaining excitation ripple; see [Examples](Examples.md#wpt-power-feedback).
 
 ## Computation time
 
@@ -66,7 +94,9 @@ corresponding computation has completed; otherwise the previous active word rema
 
 ## Shadow and active registers
 
-Both register banks contain `d_a`, `d_b`, `d_c` and the PWM enable bit:
+Both register banks contain the selected topology's duty fields and the PWM enable bit. A
+three-phase bridge uses `d_a`, `d_b` and `d_c`; scalar half/full bridges expose their registered
+duty names through the same bridge contract:
 
 - `shadow`: most recently computed duty word waiting for an eligible load;
 - `active`: word currently applied to the modulator and bridge.
@@ -95,9 +125,10 @@ pwm:
 - `single` loads the active register at carrier valleys: one load per switching period;
 - `double` loads at valleys and peaks: two loads per switching period.
 
-`pwm.method` selects `spwm` or `svpwm`. `pwm.sync: asynchronous` places the carrier on absolute
-time and allows `carrier_phase`; `synchronous` locks carrier timing to the controller angle and
-requires an integer pulse ratio `f_sw / base.f0`.
+`pwm.method` selects `spwm` or `svpwm` for a three-phase VSC. `pwm.sync: asynchronous` places the
+carrier on absolute time and allows `carrier_phase`; `synchronous` locks three-phase carrier timing
+to the controller angle and requires an integer pulse ratio `f_sw / base.f0`. Scalar converters use
+the same PWM scheduler with asynchronous timing.
 
 ## Startup and synchronization
 
@@ -112,12 +143,17 @@ free-running angle.
 
 ## Protection clocks
 
-All protection and the trip latch belong to the converter `Unit`:
+All protection and the trip latch belong to the converter `Unit`, independently of its AC or DC
+signal adapter:
 
 - instantaneous overcurrent protection runs at switching or held-bridge edges;
 - voltage, frequency, DC-voltage and ROCOF criteria run from controller-rate measurements;
 - sampled criteria are armed after startup reports completion;
-- a trip blocks the gates, opens the AC terminal and disconnects the DC source.
+- a trip blocks the gates, opens an external terminal when present and disconnects the DC source.
+
+Frequency and ROCOF require the synchronization frequency supplied by a VSC controller. A scalar
+DC converter therefore accepts overcurrent, terminal under/overvoltage and DC-link voltage
+protection, but rejects frequency criteria during validation.
 
 The controller reports measurements and startup status but does not own the physical trip action.
 

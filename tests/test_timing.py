@@ -7,7 +7,39 @@ import pytest
 
 import peslite
 from peslite.assembly.params import ConfigError
+from peslite.assembly.unit import Plant
+from peslite.components.network import RCNode
 from peslite.components.pwm import PWM, ZOH, carrier_position
+from peslite.solver.model import Model
+
+
+def test_shared_plant_refreshes_same_time_held_changes_and_discontinuous_states(monkeypatch):
+    nodes = {name: RCNode(1.0, 1.0, phases=1) for name in ("first", "second")}
+    model = Model(nodes, {}, {(node, "i"): name for name, node in nodes.items()})
+    calls = []
+    for method in ("sync", "sync_zoh"):
+        original = getattr(model, method)
+
+        def traced(*args, method=method, original=original):
+            calls.append(method)
+            return original(*args)
+
+        monkeypatch.setattr(model, method, traced)
+    plant = Plant(model, model.get_initial_values())
+    plant.hold("first", 1.0)
+    plant.outputs(0.0)
+    plant.hold("second", 2.0)
+    plant.outputs(0.0)
+    plant.outputs(0.0)
+    assert nodes["first"].out.u == 1.0
+    assert nodes["second"].out.u == 2.0
+    assert calls == ["sync", "sync_zoh"]
+    with plant.change():
+        nodes["first"].state.u_C = 3.0
+    plant.outputs(0.0)
+    assert nodes["first"].out.u == 4.0
+    assert plant.inputs_changed
+    assert calls == ["sync", "sync_zoh", "sync"]
 
 
 T = 5e-5  # carrier period of examples/gfl-example.pes (20 kHz)
@@ -64,7 +96,8 @@ def test_timing_defaults_follow_the_carrier(gfl):
     ({"units.vsc.ctrl.computation": 5e-5}, "shorter than the control period"),
     ({"units.vsc.ctrl.computation": -1e-6}, "must be at least 0"),
     ({"units.vsc.ctrl.computation": math.nan}, "computation"),
-    ({"units.vsc.ctrl.loops.dvc.period": 7.5e-5}, "not a multiple of ctrl.period"),
+    ({"units.vsc.ctrl.loops.DCVoltageControl.period": 7.5e-5},
+     "not a multiple of ctrl.period"),
     ({"units.vsc.meas.period": 2e-5}, "does not divide ctrl.period"),
     ({"units.vsc.meas.period": 1e-4}, "longer than ctrl.period"),
     ({"units.vsc.meas.average": "window"}, "expected a list of channels"),
@@ -129,11 +162,13 @@ def test_timing_follows_an_asynchronous_carrier_phase(gfl, tmp_path):
 
 
 def test_a_slow_loop_runs_at_every_nth_interrupt(gfl):
-    sim = peslite.Simulation(gfl(**{"units.vsc.ctrl.loops.dvc.period": 4 * T}))
+    sim = peslite.Simulation(gfl(**{
+        "units.vsc.ctrl.loops.DCVoltageControl.period": 4 * T,
+    }))
     graph = sim.unit().ctrl.graph
     due = [graph.due(k * T) for k in range(8)]
-    assert [("dvc" in names) for names in due] == [True, False, False, False] * 2
-    assert all({"pll", "cc"} <= names for names in due)
+    assert [("DCVoltageControl" in names) for names in due] == [True, False, False, False] * 2
+    assert all({"SRFPLL", "CurrentLoop"} <= names for names in due)
 
 
 def _pwm(computation):
@@ -232,7 +267,7 @@ def test_initial_and_end_times_are_not_moved_to_a_pwm_grid(gfl, tmp_path):
 
 def test_an_oversampled_continuation_starts_at_an_interrupt(gfl):
     over = {"units.vsc.meas.period": 2.5e-5, "units.vsc.pwm.carrier_phase": 0.3}
-    state = {"simulation.initial.states": {"vsc.ctrl.pll.integral_pu": 0.0}}
+    state = {"simulation.initial.states": {"vsc.ctrl.SRFPLL.integral_pu": 0.0}}
     gfl(**over, **state, **{"simulation.initial.t": 3.5e-5 + 1e-4})
     with pytest.raises(ConfigError, match="between two control interrupts"):
         gfl(**over, **state, **{"simulation.initial.t": 1.25e-4})

@@ -1,0 +1,98 @@
+# PESLite 0.4.0
+# LCC-LCC WPT with secondary-side power feedback driving phase in radians.
+# Negative secondary port power means that its DC source receives power.
+# Phase limits select one monotonic power-transfer branch; no remote measurements are needed.
+
+base:
+  s_base: 5000.0
+  v_ll_rms: 400.0
+  f0: 50.0
+
+buses: {}
+
+units:
+  charger:
+    type: wpt
+    primary:
+      type: dc_converter
+      dclink:
+        vdc_ref: 400.0
+        source: {type: voltage}
+      pwm:
+        f_sw: 1.0e6
+      ctrl:
+        type: resonant
+        computation: 0.0
+        loops:
+          ResonantModulation: {}
+        references:
+          modulation: 0.8
+          frequency: 85000.0
+
+    secondary:
+      type: dc_converter
+      dclink:
+        vdc_ref: 300.0
+        source: {type: voltage}
+      pwm:
+        f_sw: 800.0e3
+      meas:
+        average: [power]
+      ctrl:
+        type: resonant
+        computation: 0.0
+        loops:
+          PhasePowerControl:
+            kp: 0.0002
+            ki: 2.0
+            minimum: -1.2
+            maximum: 0.1
+            power_filter: {enable: true, bandwidth: 1000.0}
+          ResonantModulation: {}
+        references:
+          power: -500.0
+          modulation: 0.7
+          frequency: 85000.0
+          phase: -0.3
+        connections:
+          PhasePowerControl.reference: references.power
+          PhasePowerControl.power: meas.power
+          PhasePowerControl.feedforward: references.phase
+          ResonantModulation.phase: PhasePowerControl.phase
+
+    link:
+      type: lcc
+      primary_inductance: 100.0e-6
+      secondary_inductance: 100.0e-6
+      mutual_inductance: 20.0e-6
+      primary_series_capacitance: 50.08461926e-9
+      secondary_series_capacitance: 50.08461926e-9
+      primary_compensation_inductance: 30.0e-6
+      secondary_compensation_inductance: 30.0e-6
+      primary_parallel_capacitance: 116.8641116e-9
+      secondary_parallel_capacitance: 116.8641116e-9
+      primary_resistance: 0.5
+      secondary_resistance: 0.5
+      primary_compensation_resistance: 0.1
+      secondary_compensation_resistance: 0.1
+
+events:
+  power_step:
+    type: set
+    t: 0.003
+    set:
+      units.charger.secondary.ctrl.references.power: -800.0
+
+simulation:
+  t_end: 0.006
+  solver:
+    dt: 100.0e-9
+    linearisations: 0
+  output:
+    period: 2.0e-6
+    record_every: 4
+    signals: 1
+
+meta:
+  title: LCC-LCC WPT phase-power control
+  description: Local secondary port-power PI drives bridge phase using the existing modulation loop.

@@ -41,8 +41,14 @@ def test_electrical_terminals_use_the_energy_direction_and_numbered_voltage_port
 
     node = RCNode(0.1, 0.01)
     assert node.inp.__slots__ == ("i",)
+    assert node.terminal.drives_voltage
+    assert (node.terminal.voltage, node.terminal.current, node.terminal.direction) == (
+        "u", "i", 1,
+    )
     with pytest.raises(ValueError, match="direction must be"):
         Terminal(branch, "u1", "i", 0)
+    with pytest.raises(TypeError, match="drives_voltage must be bool"):
+        Terminal(branch, "u1", "i", 1, drives_voltage=1)
     with pytest.raises(ValueError, match="does not match the energy-port direction"):
         Terminal(branch, "u1", "i", -1)
 
@@ -54,6 +60,10 @@ def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():
     )
     unit = peslite.Simulation(p).unit()
 
+    assert type(p.unit()) is peslite.assembly.UnitParams
+    assert p.unit().type == "vsc"
+    assert isinstance(unit, peslite.Unit)
+    assert isinstance(unit, peslite.VSC)
     assert isinstance(unit.adc, ADC)
     assert isinstance(unit.bridge, PWM)
     assert not hasattr(unit, "pwm")
@@ -66,14 +76,26 @@ def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():
     assert not hasattr(unit, "computation_delay")
 
 
+@pytest.mark.parametrize("phases,voltage,current,expected", [
+    (1, 24.0, 5.0, 120.0), (3, 3.0 + 4.0j, 2.0 - 1.0j, 3.0),
+])
+def test_terminal_power_reuses_the_declared_energy_convention(phases, voltage, current, expected):
+    branch = RLBranch(0.1, 0.01, phases=phases)
+    branch.inp.u1 = branch.inp.u2 = voltage
+    branch.out.i = current
+    assert branch.terminal1.power_port is branch.ports[0]
+    assert branch.terminal2.power_port is branch.ports[1]
+    assert branch.terminal1.power() == pytest.approx(expected)
+    assert branch.terminal2.power() == pytest.approx(-expected)
+
+
 def test_adc_owns_oversampling_and_averaging_window_state():
     values = {"v": 1 + 0j, "i": 2 + 0j, "dc": 10.0}
-    ports = MeasurementPorts(
-        u_g=lambda: values["v"],
-        i_c=lambda: values["i"],
-        i_c_state=lambda: values["i"],
-        u_dc=lambda: values["dc"],
-    )
+    ports = MeasurementPorts({
+        "u_g": lambda: values["v"],
+        "i_c": lambda: values["i"],
+        "u_dc": lambda: values["dc"],
+    })
     adc = ADC(ports, period=1.0, sample_period=0.5, length=1.0,
               channels={"u_g": 0j, "i_c": 0j})
     adc.seed()
@@ -84,20 +106,25 @@ def test_adc_owns_oversampling_and_averaging_window_state():
     adc.accumulate(0.5)
     sample = adc.sample(1.0)
 
-    assert sample.u_g == 3 + 0j
-    assert sample.i_c == 4 + 0j
-    assert sample.u_dc == 10.0
+    assert sample.values["u_g"] == 3 + 0j
+    assert sample.values["i_c"] == 4 + 0j
+    assert sample.values["u_dc"] == 10.0
     assert [s.t for s in sample.samples] == [0.5, 1.0]
+    assert sample.samples[-1].values == {
+        "u_g": 5 + 0j,
+        "i_c": 6 + 0j,
+        "u_dc": 10.0,
+    }
+    assert not hasattr(sample, "raw")
     assert set(adc.get_state()) == {"x_u_g", "x_i_c"}
 
 
 def test_adc_reconstructs_its_sampling_position_from_the_start_time():
-    ports = MeasurementPorts(
-        u_g=lambda: 1 + 0j,
-        i_c=lambda: 2 + 0j,
-        i_c_state=lambda: 2 + 0j,
-        u_dc=lambda: 3.0,
-    )
+    ports = MeasurementPorts({
+        "u_g": lambda: 1 + 0j,
+        "i_c": lambda: 2 + 0j,
+        "u_dc": lambda: 3.0,
+    })
     adc = ADC(ports, period=1.0, sample_period=0.25)
     adc.start(0.6, 0.0, 1.0, held=True)
     assert adc.n_samp == 3

@@ -1,0 +1,66 @@
+# PESLite 0.4.0
+# Closed-loop Buck application assembled from an open DCConverter, a scalar output bus and a
+# resistive load. The half bridge owns only its power stage; the filter inductance, bus capacitor
+# and load remain independently connected network components. Electrical values are SI.
+
+base:
+  s_base: 500.0
+  v_ll_rms: 230.0
+  f0: 50.0
+
+buses:
+  output:
+    phases: 1
+    c: 470.0e-6
+
+elements:
+  load:
+    type: resistor
+    bus: output
+    r: 6.0
+
+units:
+  converter:
+    type: dc_converter
+    bus: output
+    filter: {l_f: 1.0e-3, r_f: 0.05}
+    dclink:
+      vdc_ref: 48.0
+      source: {type: voltage}
+
+    pwm:
+      f_sw: 20000.0
+
+    bridge:
+      lower_controlled: false
+      # model: switching  # pwm_averaging (default) | averaging | switching
+
+    ctrl:
+      type: dc
+      loops:
+        DCVoltageControl:
+          kp: 0.3
+          ki: 80.0
+          minimum: 0.0
+          maximum: 15.0
+        InductorCurrentControl:
+          kp: 0.03
+          ki: 30.0
+          minimum: 0.02
+          maximum: 0.95
+      references:
+        voltage: 24.0
+
+simulation:
+  t_end: 0.03
+  solver:
+    dt: 2.5e-6
+    linearisations: 0
+  output:
+    period: 100.0e-6
+    record_every: 2
+    signals: 1
+
+meta:
+  title: Buck converter
+  description: An open half-bridge DCConverter feeding an external L-C output network and load.

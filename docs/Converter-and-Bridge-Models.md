@@ -25,6 +25,75 @@ When `bridge.model` is omitted, the file default is `pwm_averaging`.
 The models answer different questions. Similar low-frequency trajectories do not make them
 numerically identical.
 
+## Scalar converter ports, device placement and DCM
+
+`DCConverter` is an open Unit, not a packaged Buck/Boost circuit. It owns a DC link, a selected
+`half_bridge` or `full_bridge`, its controller and an optional series filter. The common terminal
+contract connects that filter to a named bus. A scalar DC network uses
+`buses.<name>.phases: 1`; a DC converter cannot connect its scalar bridge to a three-phase bus.
+The bus capacitor, load and any further branches remain independent network components. Buck,
+Boost, resonant conversion and similar names describe assembled applications rather than
+additional bridge structures.
+
+A half bridge has an upper rail, a midpoint and a lower rail. Its upper rail connects to the unit's
+DC link. `upper_controlled` and `lower_controlled` declare the device at each position; a false
+value leaves that position's diode available. A fully controlled half bridge and a full bridge
+remain bidirectional.
+
+The same half bridge and filter support these application connections:
+
+| Application | Half-bridge settings | Inductor connection | External `bus` |
+|---|---|---|---|
+| Buck | `lower_controlled: 0` | Midpoint to output | Output bus; lower rail at the common point |
+| Boost | `upper_controlled: 0`, `reverse_port: 1` | Input to midpoint | Input bus; upper rail and DC link form the output |
+| Buck-Boost | `lower_controlled: 0`, `external_terminal: lower_rail` | Midpoint to common point | Negative output bus on the lower rail |
+
+`bridge.external_terminal` defaults to `midpoint`, which exposes the midpoint through the series
+filter. With `lower_rail`, the named external bus connects to the lower rail instead, and the
+filter connects the midpoint to the common point. This setting requires both `bus` and `filter`
+and uses `reverse_port: 0`. The DC link supplies the input in the Buck and Buck-Boost examples;
+it stores the output voltage in the Boost example.
+
+`buck-boost-example.pes` contains one DCConverter and one inductor. Its electrical output voltage,
+including `output.u_C`, is negative relative to the common point. The control adapter supplies its
+positive magnitude to the voltage loop, so `ctrl.references.voltage` remains positive. The three
+application examples use the same bridge simulation forms and solver path.
+
+`InductorCurrentControl` is structure-independent. Its feedforward comes from the selected bridge:
+`u_out/u_in` for the Buck connection, `1 - u_in/u_out` for the Boost connection,
+`u_out/(u_in + u_out)` for the negative-output Buck-Boost connection (using the output magnitude),
+and `(1 + u/Vdc)/2` for a full bridge. The loop itself is responsible only for current regulation
+and limits.
+
+A diode current is unilateral. The dedicated `DiodeConduction` assembly stage owns that device
+behavior; it is not part of RK4, DP45 or another generic integrator. In `switching`, the stage uses
+the selected solver to locate the natural current zero before the bridge is re-evaluated, so the
+discharge interval ends at the physical boundary rather than at the end of a numerical step.
+Projection remains only a numerical safety net. A fully controlled `HalfBridge` remains capable of
+reverse current and does not receive this boundary handling.
+
+The averaged forms store cycle-mean filter current, which remains positive in DCM even though the
+instantaneous current has a zero-current interval. They derive the controlled, diode and idle
+fractions from duty, carrier period, mean current and the upper, lower and filter-reference
+voltages. The diode law belongs to the half bridge while the R-L state remains in the external
+filter branch. One explicit algebraic conduction subsystem supplies the branch derivative, both
+rail-current transfer ratios, the copper-loss factor and the local step request. Consequently the
+averaged DCM conversion ratio and DC-terminal current are not forced to their CCM duty-ratio
+relation, Python and exported
+C++ use the same loss equation, and no output capacitor or load is hidden inside the converter
+Unit.
+
+The cycle-mean DCM state does not have the ordinary instantaneous `L i^2 / 2` storage function.
+Energy reporting therefore keeps the physical port power and copper loss but flags strict energy
+auditing when this averaged conduction relation is present instead of reporting false closure.
+
+For either averaged form, the diode-conduction stage requests a local step of at most one tenth of
+the physical switching period while the operating point is in DCM. In CCM it imposes no extra
+limit, so the configured solver step remains in force. This resolution limit creates no PWM or
+carrier events and applies equally to fixed, adaptive and multirate solvers. A subsystem with a
+state-dependent local limit cannot be placed in a window-averaged group because that group cannot
+resolve its conduction transition.
+
 ## Switching
 
 `switching` evaluates the carrier comparison and changes the ideal bridge state at the exact edge

@@ -1,3 +1,4 @@
+# PESLite 0.4.0
 # Grid-following converter on a Thevenin grid: an annotated simulation file.
 # A simulation file is YAML (named .pes): the model (base, buses, branches, sources, units, elements),
 # what happens during the run (events), how it is simulated (simulation), then notes (meta). A key that
@@ -13,6 +14,7 @@ base:                      # system base
 
 buses:                     # ac nodes; every bus needs a shunt capacitor
   pcc:
+    # phases: 3             # 3: AC space vector (default), 1: real scalar bus
     c_pu: 0.02             # shunt capacitor, pu susceptance at f0
     r_d_pu: 0.5            # damping resistor in series with it
 
@@ -30,6 +32,7 @@ sources:                   # emf behind an impedance, attached to a bus
 
 units:                     # converters, one entry each
   vsc:
+    type: vsc
     bus: pcc               # terminal bus, fed through the filter branch
     # s_base: 2.0e6        # the converter's rating (default: the system base)
 
@@ -48,8 +51,10 @@ units:                     # converters, one entry each
         # k_pu: 0.2        # current-source droop: k_pu * (1 - u_C_pu)
         # voltage source: v_pu (emf, default 1), r_pu (series R)
 
-    # meas:                # sampled modes only; silently ignored by averaging
+    # meas:                # binding/statistics in all modes; ADC timing is sampled-mode only
     #   average: []        # window-averaged channels: any of [u_g, i_c, u_dc]; others instantaneous
+    #   sources: {}        # optional channel -> physical output or <bus/Unit-port>.<quantity>
+    #   rms: {}            # channel -> RMS window in seconds; whole sampling periods
     #   window: 50.0e-6    # averaging window, s (default: ctrl.period)
     #   period: 25.0e-6    # oversampling period, s; divides ctrl.period (default: one sample)
 
@@ -61,7 +66,13 @@ units:                     # converters, one entry each
       # sync: asynchronous # asynchronous | synchronous (carrier locked to the controller angle)
       # carrier_phase: 0.0 # carrier position at t = 0, in periods
 
-    # bridge: {model: pwm_averaging}  # pwm_averaging (default) | averaging | switching
+    # bridge:
+    #   model: pwm_averaging       # pwm_averaging (default) | averaging | switching
+    #   type: three_phase_bridge   # inferred from the unit/control; scalar: half_bridge | full_bridge
+    #   upper_controlled: 1        # half-bridge device placement; ignored by three/full bridges
+    #   lower_controlled: 1
+    #   reverse_port: 0            # half-bridge scalar-port orientation
+    #   external_terminal: midpoint # half bridge: midpoint | lower_rail
     #                              # CLI: --averaging | --pwm-averaging | --switching
 
     ctrl:
@@ -69,28 +80,26 @@ units:                     # converters, one entry each
       # period: 50.0e-6    # sampled modes: control interrupt (ignored by averaging)
       # computation: 1.0e-6  # sampled modes: sample-to-PWM-load eligibility (ignored by averaging)
       loops:               # sampled by interrupts, or integrated continuously by averaging
-        pll:
-          type: srf_pll
+        SRFPLL:
           # period: 50.0e-6  # sampled modes only; ignored by averaging
           kp_pu: 20.0
           ki_pu: 1200.0
           # normalisation: rated  # rated | amplitude
-        cc:
-          type: dq_current_pi
+        CurrentLoop:
           bandwidth: 200.0 # Hz; gains from the bandwidth unless kp_pu, ki_pu are given
           # decoupling: 1
           # feedforward: 1
           # antiwindup: 1     # tracking anti-windup after controller output limiting
-        dvc:
-          type: dc_voltage_pi
-          kp_pu: 0.8
-          ki_pu: 90.0
-          limit_pu: 1.15
-          id0_export_pu: 0.9 # feed-forward, raised with the start-up
-          # bidirectional: 0
+        DCVoltageControl:
+          kp: 0.8
+          ki: 90.0
+          minimum: 0.0
+          maximum: 1.15
+          feedforward: 0.9 # current feed-forward, raised with the start-up
+          output_polarity: -1.0 # positive d-axis export current lowers the DC-link voltage
           # antiwindup: 1
-      # connections: {cc.id_ref: dvc.id_ref}   # input port -> output port, over the default wiring
-      # outputs: {u_dq: cc.u_dq, theta: pll.theta, omega: pll.omega}
+      # connections: {CurrentLoop.id_ref: DCVoltageControl.current_reference}
+      # outputs: {u_dq: CurrentLoop.u_dq, theta: SRFPLL.theta, omega: SRFPLL.omega}
       # references:        # constant inputs, pu on this unit's base
       #   id_ref_pu: 0.0
       #   iq_ref_pu: 0.0
@@ -101,11 +110,12 @@ units:                     # converters, one entry each
       #   theta: 0.0       # rad
       #   omega: 314.159   # rad/s (default: 2 pi f0)
       #   zero_v_pu: 0.0
-      # A custom loop type, registered with peslite.register_loop_type, is written here
-      # like the built-in ones and its parameters are checked the same way.
+      # A registered custom loop class is written here like a built-in class and its parameters
+      # are checked the same way.
 
     protection:            # trips only this converter (gates blocked, AC and DC sides opened)
       overcurrent: {enable: 1, limit_pu: 1.15}   # unit protection: checked at PWM edges, armed from start
+      # rms_current: {enable: 0, limit_pu: 1.0} # needs meas.rms.i_c; same trip latch, held for hold
       #                    # sampled unit criteria use ADC/controller-rate values and arm after the ramp
       undervoltage: {enable: 1, limit_pu: 0.50}  # ac voltage magnitude, held for hold
       overvoltage: {enable: 1, limit_pu: 1.20}

@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .params import Params
 
@@ -22,11 +22,12 @@ __all__ = ["ExportResult", "EXPORTERS", "export"]
 
 @dataclass(frozen=True)
 class ExportResult:
-    """Files of one generated standalone simulator."""
+    """Files and static diagnostics of one generated standalone simulator."""
 
     format: str
     out_dir: Path
     files: tuple[Path, ...]
+    diagnostics: tuple[dict[str, Any], ...] = ()
 
 
 Exporter = Callable[["Simulation", Path, str, tuple[str, ...], bool], ExportResult]
@@ -49,6 +50,7 @@ def export(what: Params | "Simulation", format: str, out_dir: str | Path | None 
     uses ``export/run`` by default, matching ``Simulation.run()``'s ``output/run`` convention.
     ``variables`` names parameters retained for run-time overrides by the exported program;
     ``("all",)`` selects every parameter supported by that backend and configuration.
+    ``("common",)`` keeps that set except parameters flagged by structural sensitivity checks.
     """
     # The local imports avoid making the C++ backend part of ordinary simulation import time.
     from ..solver.simulation import Simulation

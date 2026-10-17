@@ -27,7 +27,7 @@ restartable PESLite states.
 
 ## Custom control loops
 
-Register a loop class with `register_loop_type`:
+Register a control-loop class with `register_loop_type`:
 
 ```python
 from dataclasses import dataclass
@@ -64,8 +64,16 @@ class LaggedSync(SyncLaw):
 ```
 
 The nested frozen `Params` dataclass defines the file schema and defaults. A module stored under
-`peslite/addons/control/` is discovered automatically; the registered name is then available at
-`units.<u>.ctrl.loops.<loop>.type` exactly like a built-in loop.
+`peslite/addons/control/` is discovered automatically; the class name is then available directly
+under `units.<u>.ctrl.loops` exactly like a built-in loop:
+
+```yaml
+loops:
+  LaggedPSC: {k_p_pu: 6.2832, tau: 0.02}
+```
+
+When one graph needs the same class more than once, append a graph-local label without adding a
+second type selector, for example `Observer[voltage]` and `Observer[current]`.
 
 A specialized loop may expose separate sampled and continuous-flow laws. When its dynamics can be
 built from the standard blocks, define one `equation()` instead: the graph supplies its inputs,
@@ -136,11 +144,25 @@ Modules under `peslite/addons/components/` are discovered automatically. Built-i
 elements follow the same registry mechanism. Public names are namespaced by the element instance,
 so two instances do not share state paths.
 
-An electrical `Terminal` names a subsystem voltage input and current output once. Its direction is
-`+1` when positive current enters the subsystem and `-1` when it leaves. A one-terminal element
-uses `bus` and returns one binding; a multi-terminal element uses `bus1`, `bus2`, and so on and
-returns one binding per terminal. System assembly converts these declarations to direct model
-connections, so terminal metadata adds no work to the integration loop.
+An electrical `Terminal` names a subsystem voltage and current once. Its direction is `+1` when
+positive current enters the subsystem and `-1` when it leaves. The default terminal receives
+voltage through `inp` and publishes current through `out`; `drives_voltage=True` reverses those
+roles. A one-terminal element uses `bus` and returns one binding; a multi-terminal element uses
+`bus1`, `bus2`, and so on. Each bus needs exactly one voltage driver. System assembly converts the
+voltage fan-out and signed current sum to direct model connections, so terminal metadata adds no
+work to the integration loop.
+
+Configured element buses may also name an assembled Unit default or named port. An optional
+`series_connections()` mapping `{downstream_bus: inlet_bus}` inserts an element after the original
+voltage driver; its ordinary `terminals()` still declares both electrical boundaries. This is a
+construction-time operation, not a new network solver. The built-in `Resistor(series=True)` is a
+stateless reference implementation.
+
+An optional `parameter_bindings()` mapping `{field: (subsystem, attribute)}` exposes retunable
+scalar parameters to C++ event lowering. Implement `retune()` using the same bindings so Python
+and native output/energy equations share one parameter definition. Structural changes, such as
+changing the element's series connection, remain assembly-time configuration. Mark structural
+parameter fields with dataclass metadata `{"runtime": False}` to reject their `set` events.
 
 Every entry returned by `signals()` follows the same output path. Complex values become three
 phase columns with `_a`, `_b` and `_c` suffixes, while scalar values retain their declared name;
@@ -204,7 +226,7 @@ the optional hooks.
 
 ## Custom controllers and modulators
 
-`UniteType` builds a controller from a parameter tree, PWM method and output stage. A replacement
+`VSCController` builds a three-phase controller from a parameter tree, PWM method and output stage. A replacement
 controller satisfies the `Controller` protocol; a replacement modulator satisfies `Modulator` and
 returns a `SwitchingSequence`. The unit checks these protocols at assembly time.
 

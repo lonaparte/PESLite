@@ -26,6 +26,29 @@ from peslite.control import LOOP_TYPES
 BUNDLED = sorted(path.name for path in EXAMPLES.glob("*-example.pes"))
 
 
+@pytest.mark.parametrize("name", BUNDLED)
+def test_bundled_examples_declare_the_current_interface_version(name):
+    first_line = (EXAMPLES / name).read_text(encoding="utf-8").splitlines()[0]
+    assert first_line == f"# PESLite {peslite.__version__}"
+
+
+@pytest.mark.parametrize("name", BUNDLED)
+def test_bundled_examples_use_control_loop_classes_directly(name):
+    tree = read_tree(EXAMPLES / name)
+    class_names = {cls.__name__ for cls in LOOP_TYPES.values()}
+
+    def units(values):
+        for unit in values.values():
+            yield unit
+            if unit.get("type") == "wpt":
+                yield from units({side: unit[side] for side in ("primary", "secondary")})
+
+    for unit in units(tree["units"]):
+        for loop_name, parameters in unit.get("ctrl", {}).get("loops", {}).items():
+            assert loop_name in class_names
+            assert parameters is None or "type" not in parameters
+
+
 def _leaves(tree, path=()):
     if isinstance(tree, dict):
         for key, value in tree.items():
@@ -54,6 +77,8 @@ def test_bundled_examples_restate_no_defaults(name):
         except ConfigError:
             continue
         if to_dict(reduced) == reference:
+            if len(path) == 3 and path[0] == "units" and path[2] == "type":
+                continue  # keep explicit unit discriminators in published examples
             restated.append(".".join(map(str, path)))
     assert restated == []
 
@@ -62,7 +87,7 @@ def _options(cls, found=None):
     found = set() if found is None else found
     hints = get_type_hints(cls)
     for item in fields(cls):
-        if not item.init:
+        if not item.init or item.name.startswith("_"):
             continue
         found.add((cls, item.name))
         types = (hints[item.name], *get_args(hints[item.name]),
@@ -75,8 +100,9 @@ def _options(cls, found=None):
 
 def test_annotated_gfl_example_lists_every_option():
     text = (EXAMPLES / "gfl-example.pes").read_text(encoding="utf-8")
-    options = _options(Params)
-    for kind in ("srf_pll", "dq_current_pi", "dc_voltage_pi"):
+    vsc_params = type(from_dict(read_tree(EXAMPLES / "gfl-example.pes")).unit()._unit_fields)
+    options = _options(Params) | _options(vsc_params)
+    for kind in ("srf_pll", "dq_current_pi", "dc_voltage_control"):
         options |= _options(LOOP_TYPES[kind].Params)
     for kind in ("connect", "disconnect", "set"):
         options |= _options(EVENT_TYPES[kind].Params)
@@ -92,6 +118,17 @@ def test_annotated_gfl_example_lists_every_option():
                    for spelling in spellings):
             missing.append(f"{cls.__qualname__}.{name}")
     assert sorted(missing) == []
+
+
+def test_legacy_vsc_without_unit_type_keeps_the_vsc_default():
+    tree = read_tree(EXAMPLES / "gfl-example.pes")
+    tree["units"]["vsc"].pop("type")
+
+    unit = from_dict(tree).unit("vsc")
+
+    assert type(unit) is peslite.assembly.UnitParams
+    assert type(unit.ctrl) is peslite.assembly.ControlParams
+    assert unit.type == "vsc"
 
 
 def _bus_start(params, bus, out):

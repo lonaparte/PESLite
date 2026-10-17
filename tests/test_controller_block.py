@@ -1,4 +1,4 @@
-"""Issue #1: the controller is a closed sampled block; all protection belongs to Unit."""
+"""Issue #1: the controller is a closed sampled block; protection belongs to its converter unit."""
 
 import cmath
 from types import SimpleNamespace
@@ -58,7 +58,7 @@ def test_completed_startup_is_not_advanced_again():
 
 def test_controller_needs_only_samples_and_host_commands(gfl):
     cfg = gfl().unit("vsc")
-    controller = peslite.UniteType(cfg)
+    controller = peslite.VSCController(cfg)
     assert not hasattr(controller, "scenario")
     assert not hasattr(controller, "protection")
     voltage, w0 = cfg.base.v_phase_peak, cfg.base.w0
@@ -83,10 +83,10 @@ def test_controller_needs_only_samples_and_host_commands(gfl):
 
 
 def test_pwm_start_clears_error_integrators_once(gfl):
-    controller = peslite.UniteType(gfl().unit("vsc"))
-    pll = controller.graph.nodes["pll"]
-    dvc = controller.graph.nodes["dvc"]
-    cc = controller.graph.nodes["cc"]
+    controller = peslite.VSCController(gfl().unit("vsc"))
+    pll = controller.graph.nodes["SRFPLL"]
+    dvc = controller.graph.nodes["DCVoltageControl"]
+    cc = controller.graph.nodes["CurrentLoop"]
     pll.integral, dvc.integral, cc.integral = 1.0, 2.0, 3.0 + 4.0j
 
     controller.command(False)
@@ -105,8 +105,8 @@ def test_presynchronisation_does_not_seed_a_pwm_start_integrator():
         **{"simulation.solver.linearisations": 0, "simulation.progress.enable": 0},
     )
     cfg = params.unit("vsc")
-    controller = peslite.UniteType(cfg)
-    sync = controller.graph.nodes["sync"]
+    controller = peslite.VSCController(cfg)
+    sync = controller.graph.nodes["PSC"]
     sync.v_int = 4.0
     controller.track(Measurement(0.0, cfg.base.v_phase_peak, 0j, cfg.dclink.vdc_ref, np.zeros(3)))
     assert sync.v_int == 0.0
@@ -166,8 +166,8 @@ def test_fast_unit_protection_trips_during_unarmed_ramp(gfl, tmp_path):
 @pytest.mark.parametrize("criterion, cause, alarm, inputs", [
     ("dc_voltage", "vdc", "VDC_BAND", (1.0, 0.0, 0.2)),
     ("frequency", "freq", "FREQ_BAND", (1.0, 2.0, 0.0)),
-    ("undervoltage", "vac_uv", "VAC_UNDER", (0.5, 0.0, 0.0)),
-    ("overvoltage", "vac_ov", "VAC_OVER", (1.5, 0.0, 0.0)),
+    ("undervoltage", "voltage_uv", "VOLTAGE_UNDER", (0.5, 0.0, 0.0)),
+    ("overvoltage", "voltage_ov", "VOLTAGE_OVER", (1.5, 0.0, 0.0)),
 ])
 def test_sampled_protection_arms_and_holds(criterion, cause, alarm, inputs):
     cfg = SimpleNamespace(
@@ -181,12 +181,22 @@ def test_sampled_protection_arms_and_holds(criterion, cause, alarm, inputs):
     )
     getattr(cfg, criterion).enable = True
     protection = peslite.Protection(cfg, 0.01, 1.0)
-    protection.check_sampled(0.0, *inputs, startup_complete=False)
+    protection.check_sampled(0.0, peslite.ProtectionSample(
+        terminal_voltage_pu=inputs[0],
+        frequency_deviation=inputs[1],
+        dc_voltage_error_pu=inputs[2],
+        startup_complete=False,
+    ))
     assert not protection.tripped and protection.stats.alarms == []
-    protection.check_sampled(0.01, *inputs, startup_complete=True)
+    sample = peslite.ProtectionSample(
+        terminal_voltage_pu=inputs[0],
+        frequency_deviation=inputs[1],
+        dc_voltage_error_pu=inputs[2],
+    )
+    protection.check_sampled(0.01, sample)
     assert not protection.tripped and protection.stats.alarms == [alarm]
-    protection.check_sampled(0.02, *inputs, startup_complete=True)
-    protection.check_sampled(0.03, *inputs, startup_complete=True)
+    protection.check_sampled(0.02, sample)
+    protection.check_sampled(0.03, sample)
     assert protection.trip is not None and protection.trip.cause == cause
 
 
@@ -203,7 +213,14 @@ def test_fast_and_sampled_paths_share_one_trip_latch():
     protection = peslite.Protection(cfg, 0.01, 1.0)
     assert protection.check_fast(0.01, (0.6, 0.0, 0.0))
     first = protection.trip
-    assert not protection.check_sampled(0.02, 1.0, 0.0, 0.2, startup_complete=True)
+    assert not protection.check_sampled(
+        0.02,
+        peslite.ProtectionSample(
+            terminal_voltage_pu=1.0,
+            frequency_deviation=0.0,
+            dc_voltage_error_pu=0.2,
+        ),
+    )
     assert protection.trip is first and protection.trip.cause == "overcurrent"
     assert protection.stats.alarms == ["OVERCURRENT", "TRIP_OVERCURRENT"]
 

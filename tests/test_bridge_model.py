@@ -10,7 +10,7 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import ConfigError
+from peslite.assembly.params import ConfigError, _unit_items
 
 
 SHORT = ["--set", "simulation.t_end=0.004",
@@ -103,7 +103,9 @@ def test_bridge_flags_are_mutually_exclusive(capsys):
 
 
 def _with_model(params, model):
-    return params.replace(**{f"units.{name}.bridge.model": model for name in params.units})
+    return params.replace(**{
+        f"units.{name}.bridge.model": model for name, _unit in _unit_items(params.units)
+    })
 
 
 @pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda path: path.stem)
@@ -111,14 +113,14 @@ def _with_model(params, model):
 def test_every_bundled_file_runs_with_every_completed_model(path, model, tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        params = peslite.load(
-            path,
-            **{"simulation.t_end": 0.004, "simulation.solver.linearisations": 0},
-        )
+        params = peslite.load(path, **{"simulation.solver.linearisations": 0})
+        duration = min(0.004, params.simulation.t_end)
+        params = params.replace(**{"simulation.t_end": duration,
+                                   "simulation.output.states": True})
         params = _with_model(params, model)
     result = peslite.Simulation(params).run(out_dir=tmp_path / f"{path.stem}-{model}")
     assert np.isfinite(result.states["t"]).all()
-    assert result.states["t"][-1] == pytest.approx(0.004)
+    assert result.states["t"][-1] == pytest.approx(duration)
 
 
 def test_units_can_have_different_models(tmp_path):
@@ -160,14 +162,16 @@ def test_changing_bridge_model_keeps_the_same_bridge_power_boundary(gfl):
     ).unit()
 
     assert tuple(switching.bridge.inp.__slots__) == tuple(averaging.bridge.inp.__slots__)
-    assert set(switching.bridge.inp.__slots__) == {"q", "u_dc", "i_c"}
+    assert set(switching.bridge.inp.__slots__) == {
+        "q", "u_dc", "i_c",
+    }
     assert [port for _component, port in switching.zoh_connections()] == ["q"]
     assert averaging.zoh_connections() == {}
     assert (averaging.bridge, "q") in averaging.connections()
     assert averaging.connections()[(averaging.ctrl, "u_dc")] == (averaging.dclink, "u_dc")
-    for port in ("u_dc", "i_c"):
-        assert (switching.bridge, port) in switching.connections()
-        assert (averaging.bridge, port) in averaging.connections()
+    for unit in (switching, averaging):
+        assert unit.bridge.dc_terminal in [terminal for _bus, terminal in unit.terminals()]
+        assert unit.bridge.power_terminal in [terminal for _bus, terminal in unit.terminals()]
 
 
 def test_only_exact_switching_bridge_enters_the_switching_event_loop(gfl):
@@ -193,9 +197,9 @@ def test_averaging_silently_ignores_all_sampled_timing_semantics(tmp_path):
     configured = peslite.load(EXAMPLES / "gfl-example.pes", **common, **{
         "units.vsc.ctrl.period": 37e-6,
         "units.vsc.ctrl.computation": 1.0,
-        "units.vsc.ctrl.loops.pll.period": 31e-6,
-        "units.vsc.ctrl.loops.cc.period": 43e-6,
-        "units.vsc.ctrl.loops.dvc.period": 59e-6,
+        "units.vsc.ctrl.loops.SRFPLL.period": 31e-6,
+        "units.vsc.ctrl.loops.CurrentLoop.period": 43e-6,
+        "units.vsc.ctrl.loops.DCVoltageControl.period": 59e-6,
         "units.vsc.meas.period": 7e-6,
         "units.vsc.meas.window": 0.2,
         "units.vsc.meas.average": ["u_g", "i_c", "u_dc"],
@@ -211,7 +215,11 @@ def test_averaging_silently_ignores_all_sampled_timing_semantics(tmp_path):
     second_sim = peslite.Simulation(configured)
     assert second_sim.unit().adc is None
     assert second_sim.unit().periods == []
-    assert second_sim.unit().ctrl.periods == {"pll": 31e-6, "cc": 43e-6, "dvc": 59e-6}
+    assert second_sim.unit().ctrl.periods == {
+        "SRFPLL": 31e-6,
+        "CurrentLoop": 43e-6,
+        "DCVoltageControl": 59e-6,
+    }
     second = second_sim.run(out_dir=tmp_path / "configured")
     for name, value in first.final_states().items():
         assert second.final_states()[name] == pytest.approx(value, rel=1e-13, abs=1e-13)
@@ -298,8 +306,9 @@ def test_pwm_averaging_accepts_synchronous_pwm(gfl, tmp_path):
 def test_ideal_averaging_has_continuous_control_states_and_no_sampled_hardware_states(gfl):
     simulation = peslite.Simulation(gfl(**{"units.vsc.bridge.model": "averaging"}))
     names = set(simulation.state_names())
-    assert {"vsc.ctrl.pll.theta", "vsc.ctrl.pll.integral_pu",
-            "vsc.ctrl.cc.integral_pu.re", "vsc.ctrl.cc.integral_pu.im"} <= names
+    assert {"vsc.ctrl.SRFPLL.theta", "vsc.ctrl.SRFPLL.integral_pu",
+            "vsc.ctrl.CurrentLoop.integral_pu.re",
+            "vsc.ctrl.CurrentLoop.integral_pu.im"} <= names
     assert not any(name.startswith(("vsc.pwm.", "vsc.bridge.", "vsc.meas."))
                    for name in names)
 

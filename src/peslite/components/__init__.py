@@ -7,16 +7,23 @@ models use the ADC (:mod:`.adc`) and own their PWM timing/register implementatio
 """
 
 from ..solver import Bag, ConfigError, PowerPort, StoragePort
-from .network import (ELEMENT_TYPES, Element, Load, RCNode, RLBranch, Terminal, ThreePhaseSource,
-                      register_element_type)
-from .converter import (AveragingBridge, Bridge, PWMBridge, DCCapacitor, DCCurrentSource, DCLink,
-                        DCVoltageSource, make_bridge, make_dclink)
-from .adc import ADC, MeasurementPorts
+from .network import (ELEMENT_TYPES, Element, Load, Resistor, RCNode, RLBranch, Terminal,
+                      ThreePhaseSource, VoltageSource, register_element_type)
+from .converter import (AveragingBridge, PWMBridge, SwitchingBridge, ThreePhaseBridge,
+                        DCCapacitor, DCCurrentSource, DCLink,
+                        DCVoltageSource, FullBridge, HalfBridge,
+                        HalfBridgeDiodeConduction,
+                        make_bridge, make_dclink)
+from .adc import ADC, ADCSample, MeasurementPorts
 from .pwm import ZOH, CarrierComparison, PWM, SwitchingSequence, SynchronousCarrier, make_modulator
+from .wpt import LCCLink, SSLink, make_wpt_link
 
 __all__ = ["Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
            "Bag", "ConfigError", "PowerPort", "StoragePort",
-           "register_element_type", "Load", "Bridge", "PWMBridge", "make_bridge", "DCLink",
-           "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink", "ADC",
-           "MeasurementPorts", "AveragingBridge", "PWM", "SwitchingSequence",
-           "CarrierComparison", "SynchronousCarrier", "ZOH", "make_modulator"]
+           "register_element_type", "Load", "Resistor", "VoltageSource", "ThreePhaseBridge", "SwitchingBridge",
+           "PWMBridge", "make_bridge", "DCLink",
+           "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink", "ADC", "ADCSample",
+           "MeasurementPorts", "AveragingBridge", "HalfBridge",
+           "FullBridge", "HalfBridgeDiodeConduction", "PWM", "SwitchingSequence",
+           "CarrierComparison", "SynchronousCarrier", "ZOH", "make_modulator",
+           "SSLink", "LCCLink", "make_wpt_link"]

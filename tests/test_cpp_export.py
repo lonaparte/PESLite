@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import csv
+import json
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import numpy as np
 import yaml
 
 import peslite
 from conftest import EXAMPLES
+from peslite.assembly.params import from_dict
 from peslite.components import Bag, Element, Terminal, register_element_type
 from peslite.solver.simulation import convert_main
+from test_measurement_network import load_case
 
 
 class _ConditionalState(Bag):
@@ -90,6 +94,29 @@ def _compiler() -> str | None:
                  if (path := shutil.which(name)) is not None), None)
 
 
+def _summary(path: Path) -> dict:
+    return json.loads((path / "summary.json").read_text(encoding="utf-8"))
+
+
+def _final_csv(path: Path) -> dict[str, float]:
+    with path.open(newline="", encoding="utf-8") as stream:
+        return {key: float(value) for key, value in list(csv.DictReader(stream))[-1].items()}
+
+
+def _run_generated(params, project: Path, compiler: str):
+    peslite.export(params, "cpp", project, name=project.name)
+    source = project / "peslite.cpp"
+    executable = project / "peslite"
+    subprocess.run(
+        [compiler, "-O3", "-DNDEBUG", "-std=c++17", str(source), "-o", str(executable)],
+        check=True,
+    )
+    cpp_out, python_out = project / "cpp-output", project / "python-output"
+    subprocess.run([str(executable), str(cpp_out)], check=True)
+    peslite.Simulation(params).run(out_dir=python_out)
+    return source, cpp_out, python_out
+
+
 def _quick(mode: str):
     solver = ("adaptive", "DP45") if mode == "averaging" else ("fixed", "rk4")
     return peslite.load(EXAMPLES / "gfl-example.pes").replace(**{
@@ -98,6 +125,357 @@ def _quick(mode: str):
         "simulation.solver.method": solver[1],
         "simulation.solver.subsystems": {},
         "simulation.t_end": 0.202,
+        "simulation.output.period": 1e-3,
+        "simulation.energy_check": "off",
+    })
+
+
+def test_export_preserves_system_factories_without_mutating_the_caller(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    calls = []
+
+    def make_system(params):
+        system = peslite.System(params)
+        branch = system.units["vsc"].branch_f
+        branch.retune(1.8 * branch.L, branch.R)
+        calls.append(system)
+        return system
+
+    simulation = peslite.Simulation(_quick("pwm_averaging"), parts={"system": make_system})
+    initial = simulation.system.model.get_initial_values().copy()
+    peslite.export(simulation, "cpp", tmp_path, name="factory")
+    assert len(calls) == 2 and calls[0] is simulation.system
+    np.testing.assert_array_equal(simulation.system.model.get_initial_values(), initial)
+    assert simulation.result is None
+    executable = tmp_path / "peslite"
+    subprocess.run([compiler, "-O3", "-std=c++17", str(tmp_path / "peslite.cpp"),
+                    "-o", str(executable)], check=True)
+    subprocess.run([str(executable), str(tmp_path / "native")], check=True)
+    expected = simulation.run(out_dir=tmp_path / "python").final_states()
+    actual = _final_csv(tmp_path / "native" / "states.csv")
+    np.testing.assert_allclose([actual[key] for key in expected], list(expected.values()),
+                               rtol=2e-9, atol=2e-8)
+
+
+def test_export_rejects_unrebuildable_instances_before_creating_files(tmp_path):
+    params = _quick("pwm_averaging")
+    simulation = peslite.Simulation(params, system=peslite.System(params))
+    destination = tmp_path / "export"
+    with pytest.raises(TypeError, match="supplied instances"):
+        peslite.export(simulation, "cpp", destination)
+    assert not destination.exists()
+
+
+def test_export_rejects_a_silently_changed_solver_factory(tmp_path):
+    from peslite.solver.integrators import FixedStepSolver
+
+    simulation = peslite.Simulation(_quick("pwm_averaging"), parts={
+        "solver": lambda params: FixedStepSolver(params.simulation.solver.dt * 2.0),
+    })
+    with pytest.raises(TypeError, match="solver replacement"):
+        peslite.export(simulation, "cpp", tmp_path / "export")
+
+
+def test_export_does_not_silently_lower_a_controller_subclass_as_its_parent(tmp_path):
+    class ModifiedController(peslite.VSCController):
+        def __call__(self, t, measurement):
+            raise RuntimeError("replacement controller boundary")
+
+    simulation = peslite.Simulation(_quick("pwm_averaging"),
+                                   parts={"vsc.ctrl": ModifiedController})
+    destination = tmp_path / "export"
+    with pytest.raises(TypeError, match="ModifiedController.*no generator"):
+        peslite.export(simulation, "cpp", destination)
+    assert not destination.exists()
+
+
+def test_export_rejects_a_changed_modulator_instead_of_using_its_parent(tmp_path):
+    from peslite.components.pwm import CarrierComparison
+
+    class ModifiedCarrier(CarrierComparison):
+        def __call__(self, t, span, duties, theta=None, omega=None):
+            return super().__call__(t, span, 1.0 - duties, theta, omega)
+
+    simulation = peslite.Simulation(_quick("switching"), parts={
+        "vsc.modulator": lambda cfg: ModifiedCarrier(cfg.pwm.f_sw),
+    })
+    destination = tmp_path / "export"
+    with pytest.raises(TypeError, match="modulator.*no native adapter"):
+        peslite.export(simulation, "cpp", destination)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("minimum_interval", [0.0, 2e-6, 20e-6])
+def test_native_adapters_accept_inherited_behavior_and_read_modulator_settings(minimum_interval, tmp_path):
+    from peslite.components.pwm import CarrierComparison
+    from peslite.solver.integrators import FixedStepSolver
+
+    class InheritedController(peslite.VSCController):
+        def describe(self):
+            return 'Presentation-only controller description'
+
+    class InheritedCarrier(CarrierComparison):
+        pass
+
+    class InheritedSolver(FixedStepSolver):
+        pass
+
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = _quick("switching").replace(**{
+        "simulation.t_end": 2e-4,
+        "events.connect_vsc.t": 0.0,
+        "events.connect_vsc.ramp": 0.0,
+    })
+    simulation = peslite.Simulation(params, parts={
+        "vsc.ctrl": InheritedController,
+        "vsc.modulator": lambda cfg: InheritedCarrier(cfg.pwm.f_sw, min_interval=minimum_interval),
+        "solver": lambda cfg: InheritedSolver(cfg.simulation.solver.dt, cfg.simulation.solver.method),
+    })
+    destination = tmp_path / "inherited"
+    peslite.export(simulation, "cpp", destination)
+    executable = destination / "native"
+    subprocess.run([compiler, "-O3", "-std=c++17", str(destination / "peslite.cpp"),
+                    "-o", str(executable)], check=True)
+    subprocess.run([str(executable), str(destination / "output")], check=True)
+    expected = simulation.run(out_dir=tmp_path / "python").final_states()
+    actual = _final_csv(destination / "output/states.csv")
+    np.testing.assert_allclose([actual[key] for key in expected], list(expected.values()),
+                               rtol=2e-9, atol=2e-8)
+
+
+@pytest.mark.parametrize('location', ['instance', 'class'])
+def test_native_dp45_uses_coefficients_from_the_actual_solver(location, tmp_path):
+    from peslite.solver.integrators import DormandPrince45
+
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip('no C++17 compiler installed')
+
+    class TunedDP45(DormandPrince45):
+        _e = tuple(16.0 * value for value in DormandPrince45._e)
+
+    def solver_factory(cfg):
+        settings = cfg.simulation.solver
+        cls = TunedDP45 if location == 'class' else DormandPrince45
+        solver = cls(settings.rtol, settings.atol, settings.max_step)
+        if location == 'instance':
+            solver._e = TunedDP45._e
+        return solver
+
+    params = _quick('averaging').replace(**{
+        'simulation.t_end': 0.004,
+        'events.connect_vsc.t': 0.0,
+        'events.connect_vsc.ramp': 0.0,
+        'simulation.solver.linearisations': 0,
+    })
+    simulation = peslite.Simulation(params, parts={'solver': solver_factory})
+    project = tmp_path / location
+    peslite.export(simulation, 'cpp', project)
+    executable = project / 'native'
+    subprocess.run([compiler, '-O3', '-std=c++17', str(project / 'peslite.cpp'),
+                    '-o', str(executable)], check=True)
+    subprocess.run([str(executable), str(project / 'output')], check=True)
+    result = simulation.run(out_dir=tmp_path / 'python')
+    actual, expected = _final_csv(project / 'output/states.csv'), result.final_states()
+    np.testing.assert_allclose([actual[key] for key in expected], list(expected.values()),
+                               rtol=2e-9, atol=2e-8)
+    assert _summary(project / 'output')['n_rhs'] == result.n_rhs
+
+
+@pytest.mark.parametrize("method", ["euler", "heun"])
+def test_fixed_solver_lowering_uses_the_shared_tableau(method, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = _quick("pwm_averaging").replace(**{
+        "simulation.solver.method": method,
+        "simulation.solver.dt": 2e-6,
+        "simulation.t_end": 0.2002,
+    })
+    _source, native, python = _run_generated(params, tmp_path / method, compiler)
+    actual, expected = _final_csv(native / "states.csv"), _final_csv(python / "states.csv")
+    np.testing.assert_allclose(list(actual.values()), list(expected.values()),
+                               rtol=2e-9, atol=2e-8)
+
+
+def test_native_continuous_control_feedback_checks_convergence(tmp_path):
+    from test_control import _AffineFeedback  # Register the same pure feedback test loop.
+    from peslite.assembly.params import read_tree
+
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    tree = read_tree(EXAMPLES / "gfl-example.pes")
+    tree["units"]["vsc"]["bridge"] = {"model": "averaging"}
+    tree["units"]["vsc"]["ctrl"] = {
+        "type": "custom",
+        "loops": {"_AffineFeedback[a]": {"gain": 0.25, "bias": 1.0},
+                  "_AffineFeedback[b]": {"gain": 0.5, "bias": 2.0}},
+        "connections": {"_AffineFeedback[a].x": "_AffineFeedback[b].y",
+                        "_AffineFeedback[b].x": "_AffineFeedback[a].y"},
+        "outputs": {"u_dq": "_AffineFeedback[a].y", "theta": "references.theta",
+                    "omega": "references.omega"},
+    }
+    tree["simulation"].update(t_end=1e-4, energy_check="off")
+    tree["simulation"]["solver"].update(type="fixed", method="rk4", dt=1e-6,
+                                        subsystems={}, linearisations=0)
+    source, native, python = _run_generated(from_dict(tree), tmp_path / "feedback", compiler)
+    assert "if (!control_converged) throw" in source.read_text()
+    actual, expected = _final_csv(native / "states.csv"), _final_csv(python / "states.csv")
+    np.testing.assert_allclose(list(actual.values()), list(expected.values()),
+                               rtol=2e-9, atol=2e-8)
+
+
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
+@pytest.mark.parametrize("link", ["ss", "lcc"])
+def test_native_named_load_step_and_rms_match_python(mode, link, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    tree = load_case(mode, link=link)
+    tree["simulation"]["output"].update(states=True, signals=True, energy=True)
+    for side in ("primary", "secondary"):
+        rms = tree["units"]["charger"][side]["meas"]["rms"]
+        rms.update(voltage=rms["current"], power=rms["current"])
+    if link == "lcc":
+        tree["units"]["charger"]["secondary"]["meas"].update(
+            sources={"power": "load.power"}, average=["power"],
+        )
+    tree["events"] = {"step": {"type": "set", "t": 15e-6, "set": {"elements.load.r": 3.0}}}
+    source, native, python = _run_generated(from_dict(tree), tmp_path / "loaded", compiler)
+    assert "_rocof_window;" not in source.read_text()
+    for filename in ("states.csv", "plant.csv", "energy.csv"):
+        actual = np.genfromtxt(native / filename, delimiter=",", names=True)
+        expected = np.genfromtxt(python / filename, delimiter=",", names=True)
+        assert set(actual.dtype.names) == set(expected.dtype.names)
+        for column in expected.dtype.names:
+            np.testing.assert_allclose(actual[column], expected[column],
+                                       rtol=2e-6, atol=2e-6, equal_nan=True,
+                                       err_msg=f"{filename}:{column}")
+
+
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging"])
+def test_native_initialization_reuses_same_time_held_input_refresh(mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    tree = load_case(mode, rms=False)
+    tree["simulation"].update(t_end=10e-6, initial={"t": 0.4e-6, "states": {
+        "charger.primary.pwm.on": True,
+        "charger.primary.pwm.d_left": 0.8, "charger.primary.pwm.d_right": 0.2,
+        "charger.secondary.pwm.on": True,
+        "charger.secondary.pwm.d_left": 0.2, "charger.secondary.pwm.d_right": 0.8,
+    }})
+    tree["simulation"]["output"].update(states=True, signals=True, record_every=1)
+    for side in ("primary", "secondary"):
+        tree["units"]["charger"][side]["meas"] = {"average": ["voltage"]}
+    _, native, python = _run_generated(from_dict(tree), tmp_path / "initial", compiler)
+    for side in ("primary", "secondary"):
+        filename = f"ctrl.charger.{side}.csv"
+        a = np.genfromtxt(native / filename, delimiter=",", names=True)
+        b = np.genfromtxt(python / filename, delimiter=",", names=True)
+        assert a.dtype.names == b.dtype.names
+        for name in a.dtype.names:
+            np.testing.assert_allclose(a[name], b[name], rtol=2e-6, atol=2e-6,
+                                       equal_nan=True, err_msg=f"{filename}:{name}")
+
+
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging", "mixed"])
+@pytest.mark.parametrize("side", ["primary", "secondary"])
+def test_native_rms_trip_matches_python_on_either_independent_side(mode, side, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    tree = load_case("pwm_averaging" if mode == "mixed" else mode)
+    if mode == "mixed":
+        tree["units"]["charger"]["primary"]["bridge"]["model"] = "averaging"
+    tree["simulation"]["output"].update(states=True, signals=True)
+    tree["units"]["charger"][side]["protection"] = {
+        "rms_current": {"enable": True, "limit_pu": 0.001},
+        "hold": 4.5e-6 if mode == "mixed" else 0.0,
+    }
+    _, native, python = _run_generated(from_dict(tree), tmp_path / "trip", compiler)
+    a, b = _summary(native), _summary(python)
+    for field in ("trip_cause", "trip_time", "tripped", "rms_current_first_t", "alarms"):
+        key = f"charger.{side}.{field}"
+        assert a[key] == b[key]
+
+
+def test_native_loaded_example_regulates_power_across_the_load_step(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "wpt-load-example.pes")
+    _, native, python = _run_generated(params, tmp_path / "load-example", compiler)
+    for output in (native, python):
+        with (output / "plant.csv").open(newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        for start, end in ((0.0025, 0.003), (0.0055, 0.006)):
+            powers = [float(row["load.power"]) for row in rows if start <= float(row["t"]) < end]
+            assert sum(powers) / len(powers) == pytest.approx(500.0, rel=0.02)
+        summary = _summary(output)
+        assert not summary["charger.primary.tripped"]
+        assert not summary["charger.secondary.tripped"]
+
+
+def test_native_power_measurement_can_select_another_named_port(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    tree = load_case("averaging", link="lcc")
+    tree["simulation"]["output"].update(states=True, signals=True)
+    tree["units"]["charger"]["secondary"]["meas"]["sources"] = {
+        "power": "charger.primary.dc.power",
+    }
+    _, native, python = _run_generated(from_dict(tree), tmp_path / "port", compiler)
+    a, b = _final_csv(native / "states.csv"), _final_csv(python / "states.csv")
+    np.testing.assert_allclose(list(a.values()), list(b.values()), rtol=2e-6, atol=2e-6)
+
+
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
+def test_native_vsc_uses_the_same_measurement_binding_and_rms(mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "gfl-example.pes").replace(**{
+        "units.vsc.bridge.model": mode,
+        "units.vsc.meas.sources": {"u_g": "grid.emf.e_g", "i_c": "vsc.branch_f.i"},
+        "units.vsc.meas.rms": {"i_c": 1e-3},
+        "units.vsc.protection.overcurrent.enable": False,
+        "units.vsc.protection.undervoltage.enable": False,
+        "units.vsc.protection.overvoltage.enable": False,
+        "events.connect_vsc.t": 0.0,
+        "events.connect_vsc.ramp": 0.0,
+        "simulation.t_end": 1.5e-3,
+        "simulation.solver.dt": 2e-6,
+        "simulation.solver.linearisations": 0,
+        "simulation.solver.subsystems": {},
+        "simulation.output.period": 0.1e-3,
+        "simulation.output.signals": True,
+    })
+    _, native, python = _run_generated(params, tmp_path / "vsc-rms", compiler)
+    for filename in ("states.csv", "plant.csv"):
+        a, b = _final_csv(native / filename), _final_csv(python / filename)
+        assert a.keys() == b.keys()
+        np.testing.assert_allclose(list(a.values()), list(b.values()), rtol=2e-6, atol=2e-6)
+
+
+def _quick_gfm(mode: str):
+    solver = ("adaptive", "DP45") if mode == "averaging" else ("fixed", "rk4")
+    return peslite.load(EXAMPLES / "gfm-psc-example.pes").replace(**{
+        "units.vsc.bridge.model": mode,
+        "units.vsc.ctrl.loops.PSC.power_filter.enable": 1,
+        "units.vsc.ctrl.loops.PSC.power_filter.bandwidth": 5.0,
+        "events.connect_vsc.t": 0.0,
+        "events.connect_vsc.ramp": 0.0,
+        "simulation.solver.type": solver[0],
+        "simulation.solver.method": solver[1],
+        "simulation.solver.subsystems": {},
+        "simulation.t_end": 0.004,
         "simulation.output.period": 1e-3,
         "simulation.energy_check": "off",
     })
@@ -148,23 +526,336 @@ def test_generated_cpp_runs_all_bridge_modes(mode, tmp_path):
         pytest.skip("no C++17 compiler installed")
     params = _quick(mode)
     project = tmp_path / mode
-    peslite.export(params, "cpp", project, name=mode)
-    executable = project / "peslite"
-    subprocess.run([compiler, "-O3", "-DNDEBUG", "-std=c++17",
-                    str(project / "peslite.cpp"), "-o", str(executable)], check=True)
-    cpp_out, python_out = project / "cpp-output", project / "python-output"
-    subprocess.run([str(executable), str(cpp_out)], check=True)
-    peslite.Simulation(params).run(out_dir=python_out)
+    _source, cpp_out, python_out = _run_generated(params, project, compiler)
 
-    def final(path: Path) -> dict[str, float]:
-        with path.open(newline="", encoding="utf-8") as stream:
-            return {key: float(value) for key, value in list(csv.DictReader(stream))[-1].items()}
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
+    assert actual.keys() == expected.keys()
+    assert _summary(cpp_out).keys() == _summary(python_out).keys()
+    scale = max(1.0, max(abs(value) for value in expected.values()))
+    tolerance = 2e-5 if mode == "averaging" else 2e-8
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= tolerance * scale
 
-    expected, actual = final(python_out / "states.csv"), final(cpp_out / "states.csv")
+
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
+def test_generated_cpp_runs_gfm_function_owned_power_filter(mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = _quick_gfm(mode)
+    _source, cpp_out, python_out = _run_generated(params, tmp_path / mode, compiler)
+
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
     assert actual.keys() == expected.keys()
     scale = max(1.0, max(abs(value) for value in expected.values()))
     tolerance = 2e-5 if mode == "averaging" else 2e-8
     assert max(abs(actual[key] - expected[key]) for key in expected) <= tolerance * scale
+
+
+@pytest.mark.parametrize("bridge_type,source,reference,load", (
+    ("half_bridge", 48.0, 24.0, 6.0),
+    ("half_bridge", 48.0, 24.0, 600.0),
+    ("full_bridge", 48.0, 12.0, 6.0),
+))
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
+def test_generated_cpp_uses_public_ports_for_scalar_converters(
+        bridge_type, source, reference, load, mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    changes = {
+        "units.converter.bridge.type": bridge_type,
+        "units.converter.bridge.lower_controlled": bridge_type == "full_bridge",
+        "units.converter.dclink.vdc_ref": source,
+        "units.converter.dclink.source.v": source,
+        "elements.load.r": load,
+        "units.converter.bridge.model": mode,
+        "units.converter.ctrl.references.voltage": reference,
+        "simulation.t_end": 0.004,
+        "simulation.output.states": True,
+        "simulation.output.signals": True,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    }
+    if mode == "averaging":
+        changes.update({
+            "simulation.solver.type": "adaptive",
+            "simulation.solver.method": "DP45",
+            "simulation.solver.max_step": 1e-4,
+        })
+    params = peslite.load(EXAMPLES / "buck-example.pes").replace(**changes)
+    project = tmp_path / f"{bridge_type}-{mode}"
+    source_path, cpp_out, python_out = _run_generated(params, project, compiler)
+    source = source_path.read_text(encoding="utf-8")
+    has_diode_stage = bridge_type == "half_bridge"
+    assert ("class DiodeConduction" in source) is has_diode_stage
+    assert ("diode_conduction.advance(t, boundary)" in source) is has_diode_stage
+
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
+    assert actual.keys() == expected.keys()
+    assert _summary(cpp_out).keys() == _summary(python_out).keys()
+    scale = max(1.0, max(abs(value) for value in expected.values()))
+    # Repeated light-load diode zero crossings are independently root-located by the two
+    # runtimes; their accumulated difference remains below six parts per million.
+    tolerance = 6e-6 if bridge_type == "half_bridge" and load >= 600.0 else 2e-8
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= tolerance * scale
+
+
+def test_generated_cpp_reuses_common_adc_and_protection_for_dc_converter(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "buck-example.pes").replace(**{
+        "units.converter.meas.average": ["current", "voltage", "vin"],
+        "units.converter.meas.window": 50.0e-6,
+        "units.converter.protection.overcurrent.enable": 1,
+        "units.converter.protection.overcurrent.limit_pu": 0.05,
+        "simulation.stop_on_trip": 0,
+        "simulation.t_end": 0.001,
+        "simulation.output.states": True,
+        "simulation.output.signals": False,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    })
+    _source, cpp_out, python_out = _run_generated(
+        params, tmp_path / "dc-common-runtime", compiler
+    )
+
+    actual = _final_csv(cpp_out / "states.csv")
+    expected = _final_csv(python_out / "states.csv")
+    assert actual.keys() == expected.keys()
+    assert max(abs(actual[key] - expected[key]) for key in actual) < 1e-8
+    assert _summary(cpp_out).keys() == _summary(python_out).keys()
+    assert _summary(cpp_out)["converter.trip_cause"] == "overcurrent"
+
+
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
+def test_generated_cpp_matches_python_for_adaptive_dcm(mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "buck-example.pes").replace(**{
+        "units.converter.bridge.model": mode,
+        "elements.load.r": 600.0,
+        "simulation.solver.type": "adaptive",
+        "simulation.solver.method": "DP45",
+        "simulation.solver.max_step": 1e-4,
+        "simulation.t_end": 0.005,
+        "simulation.output.period": 5e-6,
+        "simulation.output.states": True,
+        "simulation.output.signals": False,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    })
+    source, cpp_out, python_out = _run_generated(
+        params, tmp_path / f"adaptive-{mode}", compiler
+    )
+
+    assert source.read_text(encoding="utf-8").count("class DiodeConduction") == 1
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
+    scale = max(1.0, max(abs(value) for value in expected.values()))
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * scale
+
+
+@pytest.mark.parametrize(("example", "mode"), (
+    ("boost-example.pes", "switching"),
+    ("boost-example.pes", "pwm_averaging"),
+    ("boost-example.pes", "averaging"),
+    ("buck-boost-example.pes", "switching"),
+    ("buck-boost-example.pes", "pwm_averaging"),
+    ("buck-boost-example.pes", "averaging"),
+))
+def test_generated_cpp_matches_open_dc_converter_compositions(
+        example, mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / example)
+    changes = {
+        f"units.{name}.bridge.model": mode
+        for name in params.units
+    }
+    changes.update({
+        "simulation.solver.type": "adaptive" if mode == "averaging" else "fixed",
+        "simulation.solver.method": "DP45" if mode == "averaging" else "rk4",
+        "simulation.t_end": 0.002,
+        "simulation.output.states": True,
+        "simulation.output.signals": False,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    })
+    if mode == "averaging":
+        changes["simulation.solver.max_step"] = 1.0e-4
+    params = params.replace(**changes)
+    project = tmp_path / f"{Path(example).stem}-{mode}"
+    _source, cpp_out, python_out = _run_generated(params, project, compiler)
+
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
+    assert actual.keys() == expected.keys()
+    scale = max(1.0, max(abs(value) for value in expected.values()))
+    # Independent floating-point step decisions can differ at a DCM boundary while the resulting
+    # open-converter trajectories remain within two tenths of a part per million.
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-7 * scale
+
+
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
+def test_generated_cpp_matches_composite_wpt_with_independent_clocks(mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    changes = {
+        "units.charger.primary.bridge.model": mode,
+        "units.charger.secondary.bridge.model": mode,
+        "simulation.t_end": 20.0e-6,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    }
+    if mode == "averaging":
+        changes.update({
+            "simulation.solver.type": "adaptive",
+            "simulation.solver.method": "DP45",
+            "simulation.solver.max_step": 50.0e-9,
+        })
+    params = peslite.load(EXAMPLES / "wpt-example.pes").replace(**changes)
+    _source, cpp_out, python_out = _run_generated(
+        params, tmp_path / f"wpt-{mode}", compiler
+    )
+
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
+    assert actual.keys() == expected.keys()
+    scale = max(1.0, max(abs(value) for value in expected.values()))
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * scale
+    assert _final_csv(cpp_out / "plant.csv").keys() == _final_csv(
+        python_out / "plant.csv"
+    ).keys()
+
+
+@pytest.mark.parametrize("case", ("ss", "lcc"))
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
+def test_generated_cpp_matches_wpt_power_feedback_and_reference_step(case, mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / f"wpt-{case}-example.pes").replace(**{
+        "units.charger.primary.bridge.model": mode,
+        "units.charger.secondary.bridge.model": mode,
+        "events.power_step.t": 40.0e-6,
+        "simulation.t_end": 80.0e-6,
+        "simulation.output.period": 1.0e-6,
+        "simulation.output.record_every": 1,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    })
+    _source, cpp_out, python_out = _run_generated(
+        params, tmp_path / f"wpt-power-{case}-{mode}", compiler,
+    )
+    for filename in ("states.csv", "plant.csv", "ctrl.charger.primary.csv",
+                     "ctrl.charger.secondary.csv"):
+        with (python_out / filename).open(newline="", encoding="utf-8") as stream:
+            expected = list(csv.DictReader(stream))
+        with (cpp_out / filename).open(newline="", encoding="utf-8") as stream:
+            actual = list(csv.DictReader(stream))
+        assert len(actual) == len(expected)
+        for left, right in zip(actual, expected):
+            assert left.keys() == right.keys()
+            for key in left:
+                assert bool(left[key]) == bool(right[key]), (filename, key)
+                if left[key]:
+                    actual_value, expected_value = float(left[key]), float(right[key])
+                    if np.isnan(expected_value):
+                        assert np.isnan(actual_value), (filename, key)
+                    else:
+                        assert actual_value == pytest.approx(
+                            expected_value, rel=2e-7, abs=2e-8,
+                        ), (filename, key)
+
+
+@pytest.mark.parametrize("case", ("buck", "boost", "buck-boost"))
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
+def test_generated_cpp_uses_electrical_port_power_in_scalar_feedback(case, mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / f"{case}-example.pes").replace(**{
+        "units.converter.bridge.model": mode,
+        "units.converter.meas.average": ["power"],
+        "units.converter.ctrl": {
+            "type": "resonant",
+            "references": {"modulation": 0.5, "frequency": 2000.0, "phase": 0.3,
+                           "power": -120.0 if case == "boost" else 120.0},
+            "loops": {
+                "ResonantModulation": {},
+                "PowerControl": {"kp": 0.001, "ki": 0.1, "minimum": 0.0, "maximum": 0.9},
+            },
+            "connections": {
+                "PowerControl.reference": "references.power",
+                "PowerControl.power": "meas.power",
+                "PowerControl.feedforward": "references.modulation",
+                "ResonantModulation.modulation": "PowerControl.modulation",
+            },
+        },
+        "simulation.t_end": 100.0e-6,
+        "simulation.solver.type": "fixed",
+        "simulation.solver.method": "rk4",
+        "simulation.solver.dt": 0.5e-6,
+        "simulation.solver.linearisations": 0,
+        "simulation.output.period": 5.0e-6,
+        "simulation.output.record_every": 1,
+        "simulation.output.states": True,
+        "simulation.output.signals": True,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    })
+    source, cpp_out, python_out = _run_generated(
+        params, tmp_path / f"port-power-{case}-{mode}", compiler,
+    )
+    for filename in ("states.csv", "plant.csv", "ctrl.converter.csv"):
+        actual = np.genfromtxt(cpp_out / filename, delimiter=",", names=True)
+        expected = np.genfromtxt(python_out / filename, delimiter=",", names=True)
+        assert actual.dtype.names == expected.dtype.names
+        for column in actual.dtype.names:
+            scale = max(1.0, float(np.nanmax(np.abs(expected[column]))))
+            np.testing.assert_allclose(actual[column], expected[column], rtol=2e-7,
+                                       atol=2e-8 * scale, err_msg=f"{filename}:{column}")
+    if mode == "averaging":
+        # One declaration and one snapshot assignment, with no RHS-time log write.
+        assert source.read_text(encoding="utf-8").count("u_converter_log_power =") == 2
+
+
+def test_generated_cpp_matches_composite_wpt_switching_events(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    tree = yaml.safe_load((EXAMPLES / "wpt-example.pes").read_text(encoding="utf-8"))
+    for side in ("primary", "secondary"):
+        tree["units"]["charger"][side]["bridge"] = {"model": "pwm_averaging"}
+    tree["events"] = {
+        "stop": {"type": "disconnect", "target": "charger", "t": 8.0e-6},
+        "restart": {
+            "type": "connect",
+            "target": "charger",
+            "t": 12.0e-6,
+            "ramp": 2.0e-6,
+        },
+    }
+    tree["simulation"]["t_end"] = 20.0e-6
+    tree["simulation"]["energy_check"] = "off"
+    tree["simulation"]["output"].update({"states": 1, "energy": 0})
+    params = from_dict(tree)
+    _source, cpp_out, python_out = _run_generated(
+        params, tmp_path / "wpt-events", compiler
+    )
+
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
+    assert actual.keys() == expected.keys()
+    scale = max(1.0, max(abs(value) for value in expected.values()))
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * scale
 
 
 def test_generated_cpp_runs_custom_cable_equations(tmp_path):
@@ -178,25 +869,16 @@ def test_generated_cpp_runs_custom_cable_equations(tmp_path):
         "simulation.output.signals": 1,
     })
     project = tmp_path / "cable"
-    peslite.export(params, "cpp", project, name="cable")
-    executable = project / "peslite"
-    subprocess.run([compiler, "-O3", "-DNDEBUG", "-std=c++17",
-                    str(project / "peslite.cpp"), "-o", str(executable)], check=True)
-    cpp_out, python_out = project / "cpp-output", project / "python-output"
-    subprocess.run([str(executable), str(cpp_out)], check=True)
-    peslite.Simulation(params).run(out_dir=python_out)
+    _source, cpp_out, python_out = _run_generated(params, project, compiler)
 
-    def final(path: Path) -> dict[str, float]:
-        with path.open(newline="", encoding="utf-8") as stream:
-            return {key: float(value) for key, value in list(csv.DictReader(stream))[-1].items()}
-
-    expected, actual = final(python_out / "states.csv"), final(cpp_out / "states.csv")
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
     assert actual.keys() == expected.keys()
     assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * max(
         1.0, max(abs(value) for value in expected.values())
     )
-    expected_plant = final(python_out / "plant.csv")
-    actual_plant = final(cpp_out / "plant.csv")
+    expected_plant = _final_csv(python_out / "plant.csv")
+    actual_plant = _final_csv(cpp_out / "plant.csv")
     assert actual_plant.keys() == expected_plant.keys()
     assert {"cable1.i1_a", "cable1.i2_a"} <= actual_plant.keys()
 
@@ -222,29 +904,19 @@ def test_generic_cpp_fallback_lowers_custom_equations_and_state_branches(tmp_pat
     case.write_text(yaml.safe_dump(tree, sort_keys=False), encoding="utf-8")
     params = peslite.load(case)
     project = tmp_path / "conditional"
-    peslite.export(params, "cpp", project, name="conditional")
-    source = (project / "peslite.cpp").read_text(encoding="utf-8")
+    source_path, cpp_out, python_out = _run_generated(params, project, compiler)
+    source = source_path.read_text(encoding="utf-8")
     assert "std::abs" in source and "?" in source
     assert "20.0" in source and "10.0" in source
 
-    executable = project / "peslite"
-    subprocess.run([compiler, "-O3", "-DNDEBUG", "-std=c++17",
-                    str(project / "peslite.cpp"), "-o", str(executable)], check=True)
-    cpp_out, python_out = project / "cpp-output", project / "python-output"
-    subprocess.run([str(executable), str(cpp_out)], check=True)
-    peslite.Simulation(params).run(out_dir=python_out)
-
-    def final(path: Path) -> dict[str, float]:
-        with path.open(newline="", encoding="utf-8") as stream:
-            return {key: float(value) for key, value in list(csv.DictReader(stream))[-1].items()}
-
-    expected, actual = final(python_out / "states.csv"), final(cpp_out / "states.csv")
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
     assert actual.keys() == expected.keys()
     assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * max(
         1.0, max(abs(value) for value in expected.values())
     )
-    expected_plant = final(python_out / "plant.csv")
-    actual_plant = final(cpp_out / "plant.csv")
+    expected_plant = _final_csv(python_out / "plant.csv")
+    actual_plant = _final_csv(cpp_out / "plant.csv")
     assert actual_plant.keys() == expected_plant.keys()
     assert "conditional.i_mag" in actual_plant
 

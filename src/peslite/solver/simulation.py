@@ -21,19 +21,20 @@ import time
 import warnings
 from collections import deque
 from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
 
 from ..assembly.events import EVENT_TYPES, SWITCHING, connected_at, switching_schedule
-from ..assembly.params import Change, Params, dump, dumps, load
+from ..assembly.conduction import DiodeConduction
+from ..assembly.params import (Change, Params, _parameterized, _unit_at, _unit_items, _unit_leaves,
+                               dump, dumps, load)
 from ..assembly.system import System
-from ..assembly.unit import Unit
+from ..assembly.types import unit_type
+from ..assembly.unit import Plant, Unit
 from ..components.pwm import Modulator
 from ..control.blocks import abc2complex, complex2abc
 from ..control.controller import Controller
@@ -59,6 +60,7 @@ def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
                       ctrl_names: Mapping[str, Iterable[str]] | None = None) -> dict[str, float]:
     """Convert one raw plant snapshot into one public, real-valued output row."""
     row: dict[str, float] = {"t": t}
+    unit_names = {name for name, _unit in _unit_items(params.units)}
     for key, value in plant.items():
         head, _, what = key.rpartition(".")
         if np.iscomplexobj(value):
@@ -66,10 +68,10 @@ def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
             prefix = f"{head}." if head else ""
             for phase, phase_value in zip("abc", complex2abc(complex(value))):
                 row[f"{prefix}{stem}_{phase}"] = float(phase_value)
-        elif not ((head in params.units and what in ("u_dc", "i_dc"))
+        elif not ((head in unit_names and what in ("u_dc", "i_dc"))
                   or (head in params.sources and what == "angle")):
             row[key] = float(value)
-    for name in params.units:
+    for name in unit_names:
         for what in ("u_dc", "i_dc"):
             key = f"{name}.{what}"
             if key in plant:
@@ -270,7 +272,7 @@ class Recorder:
         if out_dir is not None:
             out_dir.mkdir(parents=True, exist_ok=True)
             names = ["states.csv", "plant.csv", "energy.csv", "summary.json", "simulation.pes",
-                     *(f"ctrl.{unit}.csv" for unit in params.units)]
+                     *(f"ctrl.{unit}.csv" for unit, _cfg in _unit_items(params.units))]
             for name in names:
                 (out_dir / name).unlink(missing_ok=True)
         self._plant = (_CSVTable(out_dir / "plant.csv", batch_rows)
@@ -390,7 +392,7 @@ class Simulation:
         if solver is not None:
             given["solver"] = solver
         known = {"system", "solver"}
-        for name in p.units:
+        for name, _cfg in _unit_items(p.units):
             known |= {name, f"{name}.ctrl", f"{name}.modulator"}
         for label, what in (("parts", self._factories), ("instances", given)):
             unknown = set(what) - known
@@ -402,10 +404,10 @@ class Simulation:
         self._rebuildable = not given
 
         unit_parts = {}
-        for name, cfg in p.units.items():
+        for name, cfg in _unit_items(p.units):
             for key in (name, f"{name}.ctrl", f"{name}.modulator"):
                 if key in self._factories:
-                    unit_parts[key] = self._factories[key](cfg)
+                    unit_parts[key] = _parameterized(self._factories[key], cfg)
                 elif key in given:
                     unit_parts[key] = given[key]
         if "system" in self._factories:
@@ -451,8 +453,21 @@ class Simulation:
 
     def unit(self, name: Optional[str] = None) -> Unit:
         """Return the named unit, or the only unit when ``name`` is omitted."""
-        self.p.unit(name)  # checks the name
-        return self.system.units[name if name is not None else next(iter(self.p.units))]
+        if name is None:
+            if len(self.system.units) != 1:
+                raise ConfigError(
+                    f"this system has {len(self.system.units)} assembled units "
+                    f"{sorted(self.system.units)}: name the one you mean"
+                )
+            name = next(iter(self.system.units))
+        if name not in self.system.units:
+            configured = _unit_at(self.p.units, name)
+            if configured is not None and unit_type(configured.type).composite:
+                raise ConfigError(
+                    f"unit {name!r} is composite; choose one of {list(_unit_leaves(self.p.units, name))}"
+                )
+            raise ConfigError(f"unknown assembled unit {name!r}; known: {sorted(self.system.units)}")
+        return self.system.units[name]
 
     def export(self, format: str, out_dir: str | Path | None = None, *, name: str = "run",
                variables=()):
@@ -479,16 +494,33 @@ class Simulation:
         """Return a function giving the rated (effort, flow) of a storage, or ``None``."""
         base = self.p.base
         system_ac = (base.v_phase_peak, base.i_phase_peak)
-        units = self.p.units
+
+        def port_rating(port: Any) -> tuple[float, float]:
+            cfg = self.p.unit(port.owner)
+            if port.domain == "dc":
+                dc = cfg.dc_base
+                return dc.v, dc.i
+            return cfg.base.v_phase_peak, cfg.base.i_phase_peak
+
+        port_bindings = self.system._port_bindings
+        subsystems = dict(zip(self.system.model.names, self.system.model.subsystems))
 
         def rating(name: str, storage: Any) -> Optional[tuple[float, float]]:
-            cfg = units.get(name.partition(".")[0])
-            if storage.scale == 1.0:  # dc quantities: that unit's dc base
-                if cfg is None:
-                    return None
-                dc = cfg.dc_base
-                return (dc.v, dc.i) if dc.v > 0 else None
-            return (cfg.base.v_phase_peak, cfg.base.i_phase_peak) if cfg is not None else system_ac
+            candidates = []
+            for port in port_bindings.get(name, ()):
+                value = port_rating(port)
+                if value not in candidates:
+                    candidates.append(value)
+            if candidates:
+                return candidates[0] if len(candidates) == 1 else None
+            if name in self.p.buses:
+                if self.p.buses[name].phases == 3:
+                    return system_ac
+                return None
+            subsystem = subsystems.get(name)
+            if getattr(subsystem, "phases", None) == 3:
+                return system_ac
+            return None
 
         return rating
 
@@ -505,9 +537,17 @@ class Simulation:
         hold = None
         if hasattr(solver, "window") and hasattr(solver, "dt"):
             hold = {"step": solver.dt, "window": solver.window}
-        zoh = {unit.zoh: 0.7 + 0.2j for unit in self.system.units.values()
-               if not getattr(unit, "continuous", False)}
+        zoh = {
+            unit.zoh: (0.7 + 0.2j if isinstance(unit.bridge.topology.zero, complex) else 0.7)
+            for unit in self.system.units.values()
+            if not getattr(unit, "continuous", False)
+        }
         self.ph_report = report = model.ph_report(zoh=zoh, groups=groups, hold=hold)
+        report.warnings.extend(
+            f"{name}: {sub.energy_audit_note}"
+            for name, sub in zip(model.names, model.subsystems)
+            if getattr(sub, "energy_audit_note", None)
+        )
         problems = list(report.problems)
         if report.defaulted:
             problems.append(f"default energy declaration (black box, net power inferred from the neighbours) "
@@ -565,8 +605,8 @@ class Simulation:
         """Return the state-table column names after ``t``, i.e. the valid ``initial.states`` keys."""
         return list(self._states.columns)
 
-    def _apply_initial(self, t0: float) -> np.ndarray:
-        """Load ``initial.states`` into the parts; return the solver vector."""
+    def _initial_values(self, t0: float) -> dict:
+        """Resolve explicit initial states and automatic bus presets without loading them."""
         system = self.system
         aliases = dict(getattr(system, "state_aliases", {}))
         presets_of = getattr(system, "state_presets", None)
@@ -589,6 +629,12 @@ class Simulation:
             if aliases:
                 msg += f". Aliases: {', '.join(f'{a} -> {c}' for a, c in aliases.items())}"
             raise ConfigError(msg) from None
+        return values
+
+    def _apply_initial(self, t0: float) -> np.ndarray:
+        """Load ``initial.states`` into the parts; return the solver vector."""
+        system = self.system
+        values = self._initial_values(t0)
         # 1. power stage (unset states stay zero), events up to t0, then the solver vector
         self._states.load(values, ["", *system.units])
         if hasattr(system, "switch"):
@@ -609,7 +655,7 @@ class Simulation:
             self._states.load(values, [f"{name}.ctrl", bridge_prefix])
             if any(key.startswith((f"{name}.ctrl.", bridge_prefix + ".")) for key in values):
                 self._continued.add(name)
-            if unit.adc is not None and unit.adc.averaging:
+            if unit.adc is not None and unit.adc.accumulating:
                 self._states.load(values, [f"{name}.meas"])
                 if any(key.startswith(f"{name}.meas.") for key in values):
                     self._windows_given.add(name)
@@ -618,6 +664,13 @@ class Simulation:
         return system.model.get_initial_values()
 
     # ------------------------------------------------------------ the loop
+    def _begin_units(self, t: float, plant: Plant) -> None:
+        """Initialize all units through the same state and output boundary used during a run."""
+        for unit in self.system.units.values():
+            unit.begin(t, plant, unit.name in self._continued,
+                       unit.name in self._windows_given)
+        plant.read_state()
+
     def run(self, t_end: float | None = None, *, out_dir: str | Path | None = "output/run",
             info: Mapping[str, Any] | None = None) -> SimulationResult:
         """Run once, streaming configured histories directly into ``out_dir``.
@@ -631,6 +684,7 @@ class Simulation:
         p, system = self.p, self.system
         mdl, solver = system.model, self.solver
         settle = getattr(solver, "settle", None)
+        project = mdl.project_states if mdl.has_state_bounds else None
         parameters_changed = getattr(solver, "parameters_changed", None)
         t_end = p.simulation.t_end if t_end is None else t_end
         output = p.simulation.output
@@ -646,11 +700,14 @@ class Simulation:
         wall0 = time.time()
 
         units = list(system.units.values())
+        diode_conduction = DiodeConduction(mdl, solver)
         t_start = p.simulation.initial.t
         if t_end <= t_start + _EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         t_final = t_end
-        y = self._apply_initial(t_start)
+        plant = Plant(mdl, self._apply_initial(t_start), project=project)
+        if project is not None:
+            plant.state = project(plant.state)
         if parameters_changed is not None:
             parameters_changed()
         windowed = [unit for unit in units if unit.windowed]
@@ -679,19 +736,7 @@ class Simulation:
         stop_reason = ""
         coarse_reported = False
         stopped = False
-        adc_inputs_changed = False
-        synced_at: float | None = None
-        zoh_changed = False
-
-        def sync_if_needed(t_now: float) -> None:
-            """Bring plant outputs to ``t_now``, refreshing only held-input descendants when possible."""
-            nonlocal synced_at, zoh_changed
-            if synced_at != t_now:
-                mdl.sync(t_now, y)
-                synced_at = t_now
-            elif zoh_changed:
-                mdl.sync_zoh(t_now)
-            zoh_changed = False
+        sync_if_needed = plant.outputs
 
         def snapshot(t_now: float, final: bool = False) -> None:
             nonlocal snapshot_index, continuous_record_index
@@ -717,8 +762,8 @@ class Simulation:
                     rec.plant_snapshot(t_now, signals)
                     if rec.keep_states or final:
                         rec.state_row(t_now, self._states.read_flat())
-                    if audit_due and _finite(y):
-                        rep = mdl.energy_balance(t_now, y)
+                    if audit_due and _finite(plant.state):
+                        rep = mdl.energy_balance(t_now, plant.state)
                         if rec.keep_energy:
                             rec.energy_row(t_now, rep.columns())
                         scale = rep.scale
@@ -737,29 +782,44 @@ class Simulation:
                                   f"known: {sorted(values)}")
             return "".join(f"   {name} = {values[name]:.6g}" for name in watch)
 
-        @np.errstate(over="raise")  # overflow counts as divergence
-        def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
-            y = solver(mdl.rhs, t_a, t_b, y).y
-            return settle(t_b, y) if event and settle is not None else y
+        if diode_conduction:
+            @np.errstate(over="raise")
+            def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
+                y = diode_conduction.advance(t_a, t_b, y)
+                if event and settle is not None:
+                    y = settle(t_b, y)
+                return project(y) if project is not None else y
+        elif project is None:
+            @np.errstate(over="raise")  # overflow counts as divergence
+            def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
+                y = solver(mdl.rhs, t_a, t_b, y).y
+                return settle(t_b, y) if event and settle is not None else y
+        else:
+            @np.errstate(over="raise")  # overflow counts as divergence
+            def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
+                y = solver(mdl.rhs, t_a, t_b, y).y
+                if event and settle is not None:
+                    y = settle(t_b, y)
+                return project(y)
 
         def advance(t_a: float, t_b: float, event: bool = False) -> bool:
             """Integrate over ``[t_a, t_b]``; ``event`` means the model changes at ``t_b``."""
-            nonlocal y, t_local, stop_reason, coarse_reported, synced_at
-            synced_at = None
+            nonlocal t_local, stop_reason, coarse_reported
+            plant.invalidate()
             try:
-                y = integrate(t_a, t_b, y, event)
+                plant.state = integrate(t_a, t_b, plant.state, event)
             except (OverflowError, FloatingPointError):
                 stop_reason = f"diverged: the states overflowed between t = {t_a:.6g} s and {t_b:.6g} s"
                 t_local = t_a
                 return True
             t_local = t_b
-            finite = _finite(y)
+            finite = _finite(plant.state)
             if windowed and finite:
                 sync_if_needed(t_b)
                 for unit in windowed:
                     unit.accumulate(t_b - t_a)
             elif finite:
-                mdl.set_states(y)
+                mdl.set_states(plant.state)
             if not finite:
                 stop_reason = f"diverged: non-finite states at t = {t_b:.6g} s"
                 return True
@@ -778,46 +838,26 @@ class Simulation:
 
         def settle_now() -> None:
             """Finish deferred integration with the plant as it is, before it changes now."""
-            nonlocal y
             if settle is not None:
-                y = settle(t_local, y)
-                mdl.set_states(y)
+                plant.state = settle(t_local, plant.state)
+                if project is not None:
+                    plant.state = project(plant.state)
+                mdl.set_states(plant.state)
+                plant.invalidate()
 
-        # The plant operations exposed to a Unit.  The run loop owns the continuous-state vector;
-        # a unit can only request current outputs, change one held input, or make a discontinuous
-        # plant change inside the context manager.
-        def hold(label: str, value: Any) -> None:
-            nonlocal zoh_changed
-            mdl.set_zoh_input(label, value)
-            zoh_changed = True
-
-        @contextmanager
-        def change() -> Iterator[None]:
-            nonlocal y, adc_inputs_changed, synced_at
-            settle_now()
-            yield
-            y = mdl.get_initial_values()
-            adc_inputs_changed = True
-            synced_at = None
-
-        plant = SimpleNamespace(outputs=sync_if_needed, hold=hold, change=change)
+        plant.settle = settle_now
 
         def window_edge(t_now: float, changed: bool) -> None:
             """Restart ADC integrals from the values on the new side of a plant/input jump."""
-            if windowed and (changed or zoh_changed):
+            if windowed and (changed or plant.zoh_changed):
                 sync_if_needed(t_now)
                 for unit in windowed:
                     unit.restart_windows()
 
         # ---------------------------------------------------------------- the event grid
-        for unit in units:
-            unit.begin(t_start, plant, unit.name in self._continued,
-                       unit.name in self._windows_given)
-        # Continuous controllers may pre-synchronise their ODE states in begin().
-        y = mdl.get_initial_values()
-        synced_at = None
+        self._begin_units(t_start, plant)
         while True:
-            adc_inputs_changed = False
+            plant.inputs_changed = False
             t_log = n_log * log_period
             t_stop = t_log
             for unit in units:
@@ -835,16 +875,15 @@ class Simulation:
             # File events run before the coincident protection/control/PWM events.
             if event_due:
                 if advancing:  # advance() already settled at t_stop
-                    mdl.set_states(y)
+                    mdl.set_states(plant.state)
                 else:
                     settle_now()
                 while actions and actions[0][0] <= t_stop + _EPS:
                     self._act(actions.popleft()[2], t_stop)
                 if parameters_changed is not None:
                     parameters_changed()
-                y = mdl.get_initial_values()
-                adc_inputs_changed = True
-                synced_at = None
+                plant.read_state()
+                plant.inputs_changed = True
             # Every unit protects first, then every unit samples, then every unit actuates.  This
             # makes coincident multi-unit events independent of the units' dictionary order.
             for unit in units:
@@ -867,7 +906,7 @@ class Simulation:
             if stopped:
                 snapshot(t_local, final=True)
                 break
-            window_edge(t_local, adc_inputs_changed)
+            window_edge(t_local, plant.inputs_changed)
             if t_stop >= t_final - _EPS:
                 snapshot(t_local, final=True)
                 break
@@ -1189,7 +1228,7 @@ def main(argv=None) -> int:
                     help="output directory (default: output/<file name>, or "
                          "a bridge-mode suffix with --switching/--pwm-averaging/--averaging)")
     ap.add_argument("--export", nargs="+", default=None, metavar="FORMAT_OR_PARAM",
-                    help="export a standalone simulator: FORMAT followed by optional variable parameter paths")
+                    help="export a standalone simulator: FORMAT followed by parameter paths, common or all")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
                     help="print a progress line every SECONDS of simulated time")
     ap.add_argument("--watch", action="append", default=None, metavar="NAME",
@@ -1262,7 +1301,7 @@ def main(argv=None) -> int:
               ("averaging", "adaptive", "DP45") if args.averaging else None)
     if preset is not None:
         model, solver_type, method = preset
-        changes = {f"units.{name}.bridge.model": model for name in p.units
+        changes = {f"units.{name}.bridge.model": model for name, _cfg in _unit_items(p.units)
                    if f"units.{name}.bridge.model" not in set_overrides}
         if not _solver_choice_is_set(set_overrides):
             changes.update({
@@ -1299,11 +1338,13 @@ def main(argv=None) -> int:
                                 variables=export_variables)
         except (TypeError, ValueError) as exc:
             ap.error(str(exc))
+        for diagnostic in result.diagnostics:
+            print("warning:", diagnostic["message"], file=sys.stderr)
         print("wrote", ", ".join(str(path) for path in result.files))
         return 0
     units = ", ".join(f"{n} ({u.ctrl.type}, {u.bridge.model.replace('_', ' ')}, "
                       f"{sim.units[n].bridge.describe()})"
-                      for n, u in p.units.items())
+                      for n, u in _unit_items(p.units))
     print(f"peslite: {config}  units={units}  "
           f"solver={p.simulation.solver.type}/{p.simulation.solver.method}  "
           f"t = {p.simulation.initial.t} .. {p.simulation.t_end} s  "
@@ -1316,7 +1357,7 @@ def main(argv=None) -> int:
     s = r.summary
     print(f"done: wall {r.wall_time:.1f} s, rhs evaluations {r.n_rhs}, stop at {s.get('t_stop', 0):.4f} s, "
           f"tripped={bool(s.get('tripped'))}")
-    for name in p.units:
+    for name, _cfg in _unit_items(p.units):
         print(f"  {name}: max |i| = {s.get(f'{name}.max_current_pu', 0):.4f} pu, "
               f"trip: {s.get(f'{name}.trip_cause') or 'none'}, "
               f"alarms: {', '.join(s.get(f'{name}.alarms') or []) or 'none'}")
@@ -1375,7 +1416,7 @@ def convert_main(argv=None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
     if values and values[0] in ("-h", "--help"):
         print("usage: peslite-convert PESFILE [PARAM ...] [--out DIRECTORY]")
-        print("export one self-contained peslite.cpp; PARAM may be a variable path or all")
+        print("export one self-contained peslite.cpp; PARAM may be a variable path, common or all")
         return 0
     if not values:
         print("usage: peslite-convert PESFILE [PARAM ...]", file=sys.stderr)

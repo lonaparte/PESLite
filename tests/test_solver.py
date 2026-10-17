@@ -9,12 +9,18 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.solver import (AdaptiveSolver, Bag, DormandPrince45, Empty, FixedStepSolver,
-                            Model, MultirateSolver, make_solver)
+                            Model, MultirateSolver, OutputMethod, make_solver)
 from peslite.solver.multirate import parse_step
 
 QUIET = {"simulation.progress.enable": 0, "simulation.solver.linearisations": 0}
 FAST = {"events.connect_vsc.t": 0.0, "events.connect_vsc.ramp": 0.01}
 SOLVER = Path(peslite.solver.__file__).parent
+
+
+def test_solver_and_control_output_stage_names_do_not_collide():
+    assert peslite.solver.OutputMethod is OutputMethod
+    assert not hasattr(peslite.solver, "OutputStage")
+    assert peslite.OutputStage is peslite.control.OutputStage
 
 
 @pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda p: p.stem)
@@ -86,6 +92,64 @@ def test_model_automatically_solves_an_algebraic_output_loop():
     assert len(model.algebraic_loops) == 1
     assert block.inp.x == pytest.approx(2.0)
     assert block.out.y == pytest.approx(2.0)
+
+
+def test_observational_output_stage_is_pruned_or_promoted_by_rhs_dependencies():
+    class State(Bag):
+        __slots__ = ("x",)
+
+    class Input(Bag):
+        __slots__ = ("x",)
+
+    class Output(Bag):
+        __slots__ = ("x",)
+
+    class Producer:
+        state_names = ("x",)
+        outputs_need_inputs = False
+        output_stages = (OutputMethod("observe", (), ("x",), rhs=False),)
+
+        def __init__(self):
+            self.state, self.inp, self.out = State(x=2.0), Empty(), Output()
+            self.observations = 0
+
+        def observe(self, _t):
+            self.observations += 1
+            self.out.x = self.state.x
+
+        def set_outputs(self, t):
+            self.observe(t)
+
+        def rhs(self, _t):
+            return (1.0,)
+
+    class Consumer:
+        state_names = ("x",)
+        outputs_need_inputs = False
+
+        def __init__(self):
+            self.state, self.inp, self.out = State(), Input(), State()
+
+        def set_outputs(self, _t):
+            self.out.x = self.state.x
+
+        def rhs(self, _t):
+            return (self.inp.x,)
+
+    unconnected = Producer()
+    isolated = Model({"producer": unconnected}, {})
+    assert isolated.rhs(0.0, np.array([2.0])).tolist() == [1.0]
+    assert unconnected.observations == 0
+    isolated.sync(0.0, np.array([2.0]))
+    assert unconnected.observations == 1
+
+    producer, consumer = Producer(), Consumer()
+    connected = Model(
+        {"producer": producer, "consumer": consumer},
+        {(consumer, "x"): (producer, "x")},
+    )
+    assert connected.rhs(0.0, np.array([2.0, 0.0])).tolist() == [1.0, 2.0]
+    assert producer.observations == 1
 
 
 def test_a_run_continues_exactly_from_a_saved_state(tmp_path):

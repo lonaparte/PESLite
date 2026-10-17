@@ -1,3 +1,4 @@
+# PESLite 0.4.0
 # Grid-forming converter: matching control (frequency from the dc-link voltage).
 base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
 buses:
@@ -9,6 +10,7 @@ sources:
     r_pu: 0.04
 units:
   vsc:
+    type: vsc
     bus: pcc
     ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
     dclink:
@@ -19,9 +21,8 @@ units:
     ctrl:
       type: gfm
       loops:
-        power: {type: power}
-        sync: {type: matching, k_q_pu: 0.05}
-        vi: {type: virtual_impedance}
+        Matching: {k_q_pu: 0.05}
+        VirtualImpedance: {}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 events:
   connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 1.0}

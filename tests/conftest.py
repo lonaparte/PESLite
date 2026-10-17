@@ -20,6 +20,7 @@ CASE = {
     "buses": {"pcc": {"c_pu": 0.02, "r_d_pu": 0.5}},
     "sources": {"grid": {"bus": "pcc", "x_pu": 0.4, "r_pu": 0.04}},
     "units": {"vsc": {
+        "type": "vsc",
         "bus": "pcc",
         "ac_filter": {"l_f_pu": 0.2, "r_f_pu": 0.01},
         "dclink": {"vdc_ref": 1500.0,
@@ -30,8 +31,9 @@ CASE = {
         "ctrl": {"type": "gfl", "loops": {
             "pll": {"type": "srf_pll", "period": 5e-5, "kp_pu": 20.0, "ki_pu": 1200.0},
             "cc": {"type": "dq_current_pi", "period": 5e-5, "bandwidth": 200.0},
-            "dvc": {"type": "dc_voltage_pi", "period": 5e-5, "kp_pu": 0.8,
-                    "ki_pu": 90.0, "limit_pu": 1.15, "id0_export_pu": 0.9},
+            "dvc": {"type": "dc_voltage_control", "period": 5e-5, "kp": 0.8,
+                    "ki": 90.0, "minimum": 0.0, "maximum": 1.15,
+                    "feedforward": 0.9, "output_polarity": -1.0},
         }},
     }},
     "simulation": {"t_end": 0.004, "solver": {"dt": 12.5e-6, "linearisations": 0}},

@@ -1,0 +1,68 @@
+# PESLite 0.4.0
+# Closed-loop Buck-Boost application using one open DCConverter. The half bridge exposes its lower
+# rail as the negative output, while the filter inductor connects the midpoint to the common point.
+# The upper controlled device charges the inductor from the input; the lower diode transfers its
+# energy to the output. Electrical states retain their physical polarity, so output.u_C is negative.
+
+base:
+  s_base: 500.0
+  v_ll_rms: 230.0
+  f0: 50.0
+
+buses:
+  output:
+    phases: 1
+    c: 470.0e-6
+
+elements:
+  load:
+    type: resistor
+    bus: output
+    r: 12.0
+
+units:
+  converter:
+    type: dc_converter
+    bus: output
+    filter: {l_f: 500.0e-6, r_f: 0.05}
+    dclink:
+      vdc_ref: 24.0
+      source: {type: voltage}
+
+    pwm:
+      f_sw: 20000.0
+
+    bridge:
+      lower_controlled: false
+      external_terminal: lower_rail
+      # model: switching  # pwm_averaging (default) | averaging | switching
+
+    ctrl:
+      type: dc
+      loops:
+        DCVoltageControl:
+          kp: 0.25
+          ki: 40.0
+          minimum: 0.0
+          maximum: 12.0
+        InductorCurrentControl:
+          kp: 0.025
+          ki: 25.0
+          minimum: 0.02
+          maximum: 0.9
+      references:
+        voltage: 36.0
+
+simulation:
+  t_end: 0.03
+  solver:
+    dt: 2.5e-6
+    linearisations: 0
+  output:
+    period: 100.0e-6
+    record_every: 2
+    signals: 1
+
+meta:
+  title: Buck-Boost converter
+  description: A single-inductor half-bridge Buck-Boost with a negative output rail.

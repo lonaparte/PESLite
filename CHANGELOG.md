@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.4.0
+
+- Discovered retained C++ parameters from the ordinary schemas and recorded component construction,
+  removing the separate small device-parameter whitelist. Numerical physical/control parameters,
+  derived defaults, initialization and energy coefficients now share their normal parameter paths;
+  structural/history-layout changes remain checked specializations.
+- Reused assembled component output, derivative and energy equations during native export,
+  preserving subclass hooks and unilateral-current clamping. Native algebraic loops now match
+  the scalar secant solve and fail explicitly on nonconvergence. Export preserves construction
+  factories and rejects replacements it cannot reproduce instead of silently substituting defaults.
+- Shared AC current/impedance equations across sampled and continuous control. Native loop tracing
+  uses numeric carried diagnostics without guessing optional-state semantics; RK coefficients
+  come from the existing tables and actual solver object, and local diode step limits are
+  generated directly. Native loop resets share simultaneous state updates with sampled control,
+  preserve declared runtime values, and use the same storage in sampled and continuous modes.
+- Shared plant synchronization and unit initialization between Python execution and native export,
+  including same-time held-input changes. Native sensing refreshes observations only when state
+  changes require it. Unit parameters use one common-field schema and reuse their derived DC base;
+  frequency-history buffers and converter measurement objects are allocated only when needed.
+- Added independent shunt/series resistor loads on named Unit ports, assembly-time measurement
+  selection and shared RMS statistics/protection. Load-resistance steps and optional RMS windows
+  use the ordinary event, ADC, protection and native-export paths without a WPT-specific runtime.
+- Reduced optional RMS overhead by sharing ADC channel reads, caching reported values and
+  refreshing only integration endpoints after native bridge transitions. Sampling clocks,
+  integration rules and protection thresholds are unchanged. Continuous-mode RMS initialization
+  now synchronizes physical outputs before seeding the first integration interval.
+- Added SS and LCC-LCC WPT power-feedback examples using the existing converter graph, ADC window,
+  PI/filter/limit blocks and resonant modulation. Modulation-amplitude and phase feedback share one
+  law; optional measured power is averaged after multiplication, not after separate channel means.
+- Bound scalar power measurement to the actual external electrical terminal, enabled optional
+  inputs only for active control paths, and shared measurement adaptation across control entry
+  points. Phase control translates its signed command to a nonnegative limiting interval and back,
+  preserving the shared limiter and PI anti-windup without angle wrapping.
+- Aligned C++ reference changes with actual event actions and refreshed continuous measurement logs
+  after model synchronization, including open-loop controllers with non-loading measurement inputs.
+- Added an open `DCConverter` unit using the shared `UnitParams`, control graph, bridge simulation
+  forms and solver infrastructure, with Buck, Boost and single-inductor Buck-Boost examples.
+- Added `HalfBridge` and `FullBridge` topologies and composed them with switching, PWM-period
+  averaging and ideal averaging behavior.
+- Added natural CCM/DCM operation, dedicated diode-conduction handling and matching standalone C++
+  export without adding device behavior to the generic integrators.
+- Shared converter lifecycle behavior through `Unit` with `VSC` and `DCConverter` assemblies, and
+  consolidated DC-link and capacitor voltage regulation as `DCVoltageControl`. PESLite versions
+  below 1.0 may make interface changes in any `0.x.x` release.
+- Control-loop entries now use registered class names directly without duplicate `type` fields;
+  repeated classes use `ClassName[label]`. Assembly constructs only loops in the controller-output
+  dependency graph.
+- Power calculation, coordinate transforms and unit delay are shared functions rather than
+  registered loop nodes. A synchronization law owns its optional power-filter state, and a loop
+  using `unit_delay` explicitly owns and passes the previous sample.
+
 ## 0.3.0
 
 - Unified one- and multi-terminal electrical elements behind the `Terminal` contract, with

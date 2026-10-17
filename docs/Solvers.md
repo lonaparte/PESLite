@@ -66,6 +66,10 @@ slow windows while keeping event boundaries exact. Multirate schedules require
 A solver is called only for the interval presented by `Simulation`. Before a model-changing event,
 an optional `settle(t, y)` hook can finish deferred work such as a multirate window. After a `set`
 event, an optional `parameters_changed()` hook can refresh cached parameter-dependent data.
+Built-in solvers also provide `advance(f, t0, t1, y0, max_step=...)`, which lets a physical
+subsystem request a local resolution limit without changing the configured solver step. When a
+user solver provides only the callable interface, the diode-conduction stage enforces such a limit
+by dividing the requested interval before calling it.
 
 This contract also applies to user solvers. A simple user solver only needs the normal callable
 interface; the hooks are required only when it defers state or caches mutable parameters.

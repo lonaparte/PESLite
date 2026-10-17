@@ -8,6 +8,9 @@ from peslite.solver import simulation
 from peslite.solver.simulation import _config_path
 
 EXPECTED = {
+    "buck-example.pes",
+    "boost-example.pes",
+    "buck-boost-example.pes",
     "cable-gfl-example.pes",
     "custom-pll-example.pes",
     "gfl-example.pes",
@@ -16,6 +19,10 @@ EXPECTED = {
     "gfm-psc-example.pes",
     "gfm-vsg-example.pes",
     "two-converters-example.pes",
+    "wpt-example.pes",
+    "wpt-ss-example.pes",
+    "wpt-lcc-example.pes",
+    "wpt-load-example.pes",
 }
 
 
