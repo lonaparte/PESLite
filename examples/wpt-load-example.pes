@@ -7,8 +7,6 @@ base:
   v_ll_rms: 400.0
   f0: 50.0
 
-buses: {}
-
 elements:
   load: {type: resistor, bus: charger.secondary.power, r: 5.0, series: true}
 

@@ -11,6 +11,30 @@ from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, dumps, from_dict, read_tree, to_dict
 
 
+@pytest.mark.parametrize("filename", [
+    "wpt-example.pes", "wpt-ss-example.pes", "wpt-lcc-example.pes", "wpt-load-example.pes",
+])
+def test_buses_section_may_be_omitted_when_no_public_bus_is_used(filename):
+    tree = read_tree(EXAMPLES / filename)
+    assert "buses" not in tree
+    params = from_dict(tree)
+    explicit = from_dict({**tree, "buses": {}})
+    assert params.buses == {}
+    assert params.buses is not explicit.buses
+    assert to_dict(params) == to_dict(explicit)
+    sim = peslite.Simulation(params.replace(**{
+        "simulation.t_end": 2e-6,
+        "simulation.solver.linearisations": 0,
+        "simulation.progress.enable": False,
+        "simulation.output.states": False,
+        "simulation.output.signals": False,
+        "simulation.output.energy": False,
+    }))
+    assert not sim.system.buses
+    result = sim.run(out_dir=None)
+    assert result.summary["t_stop"] == pytest.approx(2e-6)
+
+
 @pytest.mark.parametrize("filename", ["gfl-example.pes", "buck-example.pes", "wpt-load-example.pes"])
 def test_shared_unit_schema_round_trips_without_persisting_cached_derived_fields(filename):
     params = peslite.load(EXAMPLES / filename)

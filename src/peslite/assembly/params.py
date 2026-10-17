@@ -813,9 +813,9 @@ class Params:
     """
 
     base: BaseValues  # system base, used for network pu inputs
-    buses: dict[str, BusParams]
     units: dict[str, UnitParams] = field(metadata={"entries": "unit"})
     simulation: SimulationParams
+    buses: dict[str, BusParams] = field(default_factory=dict)
     sources: dict[str, SourceParams] = field(default_factory=dict)
     branches: dict[str, BranchParams] = field(default_factory=dict)
     elements: dict[str, Any] = field(default_factory=dict, metadata={"entries": "element"})
