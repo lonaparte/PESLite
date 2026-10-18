@@ -74,10 +74,10 @@ print(result.final_states())
 
 ## C++ export
 
-Select the parameters that should remain variable in the compiled simulator, or use `all`:
+Select the parameters that should remain variable in the compiled simulator, or use `common`:
 
 ```bash
-peslite-convert case.pes all
+peslite-convert case.pes common
 c++ -O3 -DNDEBUG -std=c++17 export/case/peslite.cpp -o export/case/peslite
 ```
 
