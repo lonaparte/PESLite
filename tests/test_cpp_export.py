@@ -524,7 +524,7 @@ def test_generated_cpp_runs_all_bridge_modes(mode, tmp_path):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
-    params = _quick(mode)
+    params = _quick(mode).replace(**{"simulation.output.signals": True})
     project = tmp_path / mode
     _source, cpp_out, python_out = _run_generated(params, project, compiler)
 
@@ -535,6 +535,14 @@ def test_generated_cpp_runs_all_bridge_modes(mode, tmp_path):
     scale = max(1.0, max(abs(value) for value in expected.values()))
     tolerance = 2e-5 if mode == "averaging" else 2e-8
     assert max(abs(actual[key] - expected[key]) for key in expected) <= tolerance * scale
+
+    python_signals = _final_csv(python_out / "plant.csv")
+    cpp_signals = _final_csv(cpp_out / "plant.csv")
+    assert python_signals.keys() == cpp_signals.keys()
+    assert {f"{path}_{phase}" for path in ("pcc.u", "vsc.u_g", "vsc.i_c") for phase in "abc"} <= python_signals.keys()
+    assert not any(name.startswith(("pcc.v_", "vsc.v_", "vsc.i_conv_")) for name in python_signals)
+    signal_scale = max(1.0, max(abs(value) for value in python_signals.values()))
+    assert max(abs(cpp_signals[key] - python_signals[key]) for key in python_signals) <= tolerance * signal_scale
 
 
 @pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))

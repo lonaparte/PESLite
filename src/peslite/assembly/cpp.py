@@ -34,7 +34,7 @@ from .conduction import DiodeConduction
 from .params import (BaseValues, SourceParams, UnitParams, _PARAMETER_RECORDER, _set_assignments,
                      _unit_items, _unit_leaves,
                      _written_out, dumps, parameter_leaves)
-from .exporter import ExportResult, _exporter
+from .exporter import ExportResult, _exporter, _signal_names
 from .system import _source_scenario
 from .types import unit_type
 from .unit import Plant
@@ -3843,9 +3843,7 @@ class _CppGenerator:
         for key, value in signal_values.items():
             head, _, what = key.rpartition(".")
             if isinstance(value, numbers.Complex) and not isinstance(value, numbers.Real):
-                stem = {"u_g": "v", "i_c": "i_conv", "u": "v"}.get(what, what)
-                prefix = f"{head}." if head else ""
-                columns.extend(f"{prefix}{stem}_{phase}" for phase in "abc")
+                columns.extend(_signal_names(key, 3))
                 expressions.extend(self._phase_expressions(f"obs_{_identifier(key)}"))
             elif not ((head in self.system.units and what in ("u_dc", "i_dc"))
                       or (head in self.p.sources and what == "angle")):

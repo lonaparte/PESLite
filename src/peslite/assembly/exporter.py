@@ -20,6 +20,15 @@ if TYPE_CHECKING:  # pragma: no cover - imports used only by type checkers
 __all__ = ["ExportResult", "EXPORTERS", "export"]
 
 
+def _signal_names(path: str, phases: int = 1) -> tuple[str, ...]:
+    """Keep the canonical signal path; three-phase columns only append phase suffixes."""
+    if phases == 1:
+        return (path,)
+    if phases == 3:
+        return path + "_a", path + "_b", path + "_c"
+    raise ValueError(f"signal phases must be 1 or 3, got {phases}")
+
+
 @dataclass(frozen=True)
 class ExportResult:
     """Files and static diagnostics of one generated standalone simulator."""

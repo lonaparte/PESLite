@@ -30,6 +30,7 @@ import numpy as np
 
 from ..assembly.events import EVENT_TYPES, SWITCHING, connected_at, switching_schedule
 from ..assembly.conduction import DiodeConduction
+from ..assembly.exporter import _signal_names
 from ..assembly.params import (Change, Params, _parameterized, _unit_at, _unit_items, _unit_leaves,
                                dump, dumps, load)
 from ..assembly.system import System
@@ -64,10 +65,8 @@ def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
     for key, value in plant.items():
         head, _, what = key.rpartition(".")
         if np.iscomplexobj(value):
-            stem = {"u_g": "v", "i_c": "i_conv", "u": "v"}.get(what, what)
-            prefix = f"{head}." if head else ""
-            for phase, phase_value in zip("abc", complex2abc(complex(value))):
-                row[f"{prefix}{stem}_{phase}"] = float(phase_value)
+            for name, phase_value in zip(_signal_names(key, 3), complex2abc(complex(value))):
+                row[name] = float(phase_value)
         elif not ((head in unit_names and what in ("u_dc", "i_dc"))
                   or (head in params.sources and what == "angle")):
             row[key] = float(value)
