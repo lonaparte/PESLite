@@ -1,0 +1,30 @@
+{
+  "clock_mode": "auto",
+  "sampling_phase": 0.5,
+  "units": {
+    "vsc": {
+      "adc": {
+        "u_g": [
+          {"channel": 0, "device": 0, "sensitivity": 1.0, "offset": 0.0, "sign": 1},
+          {"channel": 1, "device": 0, "sensitivity": 1.0, "offset": 0.0, "sign": 1},
+          {"channel": 2, "device": 0, "sensitivity": 1.0, "offset": 0.0, "sign": 1}
+        ],
+        "i_c": [
+          {"channel": 3, "device": 0, "sensitivity": 1.0, "offset": 0.0, "sign": 1},
+          {"channel": 4, "device": 0, "sensitivity": 1.0, "offset": 0.0, "sign": 1},
+          {"channel": 5, "device": 0, "sensitivity": 1.0, "offset": 0.0, "sign": 1}
+        ],
+        "u_dc": {"channel": 6, "device": 0, "sensitivity": 1.0, "offset": 0.0, "sign": 1}
+      },
+      "pwm": [0, 1, 2],
+      "dead_time": 0.000001,
+      "hardware_overcurrent_configured": false
+    }
+  },
+  "build": {
+    "sdk": "/path/to/imperix-sdk",
+    "command": ["/path/to/sdk-build-wrapper", "{sdk}", "{source}", "{elf}"],
+    "elf_machine": 40,
+    "timeout": 300
+  }
+}

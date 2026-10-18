@@ -130,6 +130,39 @@ def _quick(mode: str):
     })
 
 
+def test_sampled_measurements_reuse_the_parameterized_unit_adapter(monkeypatch):
+    from peslite.assembly.cpp import (_Expression, _ModelGenerator, _RuntimeParameters,
+                                      _make_unit_generator)
+
+    sim = peslite.Simulation(_quick("pwm_averaging"))
+    unit = sim.units["vsc"]
+    original_cfg, original_ctrl = unit.cfg, unit.ctrl
+    runtime = _RuntimeParameters(sim.p, ("base.v_ll_rms", "units.vsc.dclink.vdc_ref"))
+    generator = _make_unit_generator("vsc", unit, _ModelGenerator(sim, runtime))
+    original = type(unit).control_inputs_from
+    calls = []
+
+    def observe_adapter(self, values):
+        calls.append((self.cfg, self.ctrl))
+        return original(self, values)
+
+    monkeypatch.setattr(type(unit), "control_inputs_from", observe_adapter)
+    inputs = generator._sampled_control_inputs()
+    assert len(calls) == 1
+    assert calls[0][0] is generator.cfg
+    assert calls[0][1] is generator.ctrl
+    assert unit.cfg is original_cfg and unit.ctrl is original_ctrl
+    scales = {"u_g": generator.cfg.base.v_phase_peak,
+              "i_c": generator.cfg.base.i_phase_peak, "u_dc": generator.cfg.dc_base.v}
+    for channel, scale in scales.items():
+        reading = _Expression(generator._adc_value(channel), inputs["meas." + channel].kind)
+        assert inputs["meas." + channel].code == (reading / scale).code
+    assert "parameters.param_base_v_ll_rms" in inputs["meas.u_g"].code
+    assert "parameters.param_units_vsc_dclink_vdc_ref" in inputs["meas.u_dc"].code
+    assert generator.cfg.dc_base.i.default == pytest.approx(
+        unit.cfg.base.s_base / unit.cfg.dclink.vdc_ref)
+
+
 def test_export_preserves_system_factories_without_mutating_the_caller(tmp_path):
     compiler = _compiler()
     if compiler is None:

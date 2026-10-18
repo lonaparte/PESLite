@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterable
+from importlib import import_module
 from typing import TYPE_CHECKING, Any, Callable
 
 from .params import Params
@@ -31,7 +32,7 @@ def _signal_names(path: str, phases: int = 1) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class ExportResult:
-    """Files and static diagnostics of one generated standalone simulator."""
+    """Files and static diagnostics of one exported implementation."""
 
     format: str
     out_dir: Path
@@ -39,7 +40,7 @@ class ExportResult:
     diagnostics: tuple[dict[str, Any], ...] = ()
 
 
-Exporter = Callable[["Simulation", Path, str, tuple[str, ...], bool], ExportResult]
+Exporter = Callable[..., ExportResult]
 EXPORTERS: dict[str, Exporter] = {}
 
 
@@ -51,8 +52,8 @@ def _exporter(name: str):
 
 
 def export(what: Params | "Simulation", format: str, out_dir: str | Path | None = None,
-           *, name: str = "run", variables: Iterable[str] = ()) -> ExportResult:
-    """Export a complete configured simulator in ``format``.
+           *, name: str = "run", variables: Iterable[str] = (), **options) -> ExportResult:
+    """Export a configured simulation using the backend selected by ``format``.
 
     ``what`` may be a resolved :class:`Params` tree or an unrun :class:`Simulation`.  With no
     explicit directory the result is written to ``export/<name>``; the Python API consequently
@@ -60,13 +61,15 @@ def export(what: Params | "Simulation", format: str, out_dir: str | Path | None 
     ``variables`` names parameters retained for run-time overrides by the exported program;
     ``("all",)`` selects every parameter supported by that backend and configuration.
     ``("common",)`` keeps that set except parameters flagged by structural sensitivity checks.
+    Backend options (for example Imperix ``target_config``, ``sdk`` and ``build``) are forwarded
+    to the selected exporter; ordinary simulation and other backends do not interpret them.
     """
     # The local imports avoid making the C++ backend part of ordinary simulation import time.
     from ..solver.simulation import Simulation
 
     key = str(format).lower()
-    if key == "cpp" and key not in EXPORTERS:
-        from . import cpp as _cpp  # noqa: F401
+    if key in ("cpp", "imperix") and key not in EXPORTERS:
+        import_module(f".{key}", __package__)
     if key not in EXPORTERS:
         known = ", ".join(sorted(EXPORTERS)) or "none"
         raise ValueError(f"unknown export format {format!r}; known: {known}")
@@ -78,4 +81,4 @@ def export(what: Params | "Simulation", format: str, out_dir: str | Path | None 
     selected = tuple(str(path) for path in variables)
     # Backends may prepare an internally constructed Simulation in place.  A Simulation supplied
     # by the caller remains private to the caller and therefore must still be copied by a backend.
-    return EXPORTERS[key](simulation, destination, name, selected, not caller_owned)
+    return EXPORTERS[key](simulation, destination, name, selected, not caller_owned, **options)

@@ -46,6 +46,34 @@ _ZERO_COEFFICIENTS: ContextVar[dict | None] = ContextVar("peslite_cpp_zero_coeff
 _CONDITIONAL_DEPENDENCIES: ContextVar[tuple | None] = ContextVar(
     "peslite_cpp_conditional_dependencies", default=None)
 
+_MOVING_WINDOW = r'''template <std::size_t N> struct MovingWindow {
+    std::array<double, N> buf{};
+    std::size_t index = 0, count = 0;
+    double push(double value) {
+        const double old = count == N ? buf[index] : 0.0;
+        buf[index] = value;
+        index = (index + 1) % N;
+        count = std::min(N, count + 1);
+        return old;
+    }
+};'''
+
+_CONTROL_MATH = r'''inline double smoothstep(double x) noexcept {
+    x = std::clamp(x, 0.0, 1.0);
+    return x * x * (3.0 - 2.0 * x);
+}
+
+inline Complex abc_to_complex(double a, double b, double c) noexcept {
+    constexpr double root3_2 = 0.866025403784438646763723170752936;
+    return (2.0 / 3.0) * Complex{a - 0.5 * (b + c), root3_2 * (b - c)};
+}
+
+inline std::array<double, 3> phases(Complex value) noexcept {
+    constexpr double root3_2 = 0.866025403784438646763723170752936;
+    return {std::real(value), -0.5 * std::real(value) + root3_2 * std::imag(value),
+            -0.5 * std::real(value) - root3_2 * std::imag(value)};
+}'''
+
 
 def _specialized_zero(value):
     coefficients = _ZERO_COEFFICIENTS.get()
@@ -558,6 +586,8 @@ class _RuntimeParameters:
             )
         self.available = available
         self.selected = tuple(available[path] for path in selected if path not in exclude)
+        if len({item.member for item in self.selected}) != len(self.selected):
+            raise ValueError("exported parameter names collide after C++ identifier normalization")
         self.by_path = {item.path: item for item in self.selected}
         self.guards = {}
         self.initializers = {}
@@ -680,9 +710,13 @@ class _RuntimeParameters:
 
     def validation(self):
         return "\n        ".join(
-            f"if ({'!' if expected else ''}({code})) throw std::runtime_error("
+            f"if ({condition}) throw std::runtime_error("
             f"{_cpp_string('invalid parameter combination or changed structural specialization: ' + code)});"
-            for code, expected in self.guards)
+            for code, condition in self.validation_conditions())
+
+    def validation_conditions(self):
+        return [(code, f"{'!' if expected else ''}({code})")
+                for code, expected in self.guards]
 
     def contains_parameters(self, value):
         if isinstance(value, _InitializationExpression):
@@ -861,14 +895,7 @@ class _RuntimeParameters:
     def setters(self) -> str:
         cases: list[str] = []
         for item in self.selected:
-            checks = []
-            if math.isfinite(item.default):
-                checks.append("!std::isfinite(value)")
-            else:
-                checks.append("std::isnan(value)")
-            if isinstance(item.default, int):
-                checks.append("std::trunc(value) != value")
-            condition = " || ".join(checks)
+            condition = self.invalid_value(item, "value")
             validation = (
                 f" if ({condition}) throw std::runtime_error(\"invalid value for {item.path}\");"
                 if condition else ""
@@ -880,6 +907,14 @@ class _RuntimeParameters:
                 + " return true; }"
             )
         return "\n    ".join(cases)
+
+    @staticmethod
+    def invalid_value(item, value):
+        checks = [f"!std::isfinite({value})" if math.isfinite(item.default)
+                  else f"std::isnan({value})"]
+        if isinstance(item.default, int):
+            checks.append(f"std::trunc({value}) != {value}")
+        return " || ".join(checks)
 
     def listing(self) -> str:
         return "\n    ".join(
@@ -1912,6 +1947,62 @@ class _ControlGenerator:
     def input(self, loop: str, port: str) -> str:
         return self.source(self.graph.connections[f"{loop}.{port}"])
 
+    def _sampled_loop_lines(self) -> list[str]:
+        """The sampled startup and graph update, independent of the execution target."""
+        lines = [
+            f"if ({self.m('startup_run')} && !{self.m('startup_complete')}) {{",
+            f"    const double progress = {self.m('startup_ramp')} <= 0.0 ? 1.0 : "
+            f"std::min(1.0, {self.m('startup_steps')} * {_number(self.cfg.ctrl.period)} / "
+            f"{self.m('startup_ramp')});",
+            f"    {self.m('startup_value')} = smoothstep(progress);",
+            f"    {self.m('startup_complete')} = progress >= 1.0;",
+            f"    if (!{self.m('startup_complete')}) ++{self.m('startup_steps')};",
+            "}",
+        ]
+        for name in self.graph.order:
+            lines += self._loop_lines(name, self.graph.nodes[name])
+        return lines
+
+    def _sampled_control_inputs(self) -> dict[str, _Expression]:
+        channels = {name: _Expression(self._adc_value(name), value.kind)
+                    for name, value in self.model.unit_measurements(self.unit).items()}
+        unit = copy.copy(self.unit)
+        unit.cfg, unit.ctrl = self.cfg, self.ctrl
+        return self.model._trace(lambda: unit.control_inputs_from(channels))
+
+    def _sampled_measurement_lines(self) -> list[str]:
+        return [f"const {'Complex' if value.kind == 'complex' else 'double'} "
+                f"meas_{_identifier(path[5:])} = {value.code};"
+                for path, value in self._sampled_control_inputs().items()]
+
+    def _modulation_values(self, command: str, theta: str, udc: str):
+        stage = self.ctrl.stage
+        if not stage._trusted_pwm or not stage._standard_limiter:
+            raise TypeError("C++ export: a custom VSC output stage has no equation tracer contract")
+        return self.model._trace(lambda: stage.equation(
+            _Expression(command, "complex"),
+            _Expression(f"Complex{{std::cos({theta}), std::sin({theta})}}", "complex"),
+            _Expression(udc, "real"),
+        ))
+
+    def _sampled_due(self, name: str) -> str:
+        every = self.graph.period_stride(self.graph.periods[name], self.cfg.ctrl.period)
+        if isinstance(every, _InitializationExpression):
+            return f"{self.m('pwm_k')} % static_cast<long long>({_number(every)}) == 0"
+        return "true" if int(every) == 1 else f"{self.m('pwm_k')} % {int(every)} == 0"
+
+    def _sampled_vsc_command_lines(self) -> list[str]:
+        """Match VSCController._accept_command, including the held command's coordinate frame."""
+        lines = [f"{self.m('theta')} = {self.source(self.graph.outputs['theta'])};",
+                 f"{self.m('omega')} = {self.source(self.graph.outputs['omega'])};"]
+        due = ([self._sampled_due(self.ctrl._terminal)] if self.ctrl._terminal_in_graph else
+               list(dict.fromkeys(self._sampled_due(name) for name in self.graph.order)))
+        condition = "true" if "true" in due else " || ".join(f"({item})" for item in due) or "false"
+        commit = [f"{self.m('u_cmd')} = {self.source(self.graph.outputs['u_dq'])};",
+                  f"{self.m('command_theta')} = {self.m('theta')};"]
+        return lines + (commit if condition == "true" else
+                        [f"if ({condition}) {{", *["    " + line for line in commit], "}"])
+
     def derivatives(self) -> list[str]:
         return [self.d(*name.split(".", 1)) for name in self.ctrl.state_names]
 
@@ -2049,15 +2140,9 @@ class _ControlGenerator:
         lines = self._assign_values(f"value_{loop_name}", zip(targets, values, strict=True))
         if self.continuous:
             return lines
-        period = self.graph.periods[loop_name]
-        every = self.graph.period_stride(period, self.cfg.ctrl.period)
-        if isinstance(every, _InitializationExpression):
-            guard = f"{self.m('pwm_k')} % static_cast<long long>({_number(every)}) == 0"
-            return [f"if ({guard}) {{", *["    " + line for line in lines], "}"]
-        every = int(every)
-        if every == 1:
+        guard = self._sampled_due(loop_name)
+        if guard == "true":
             return lines
-        guard = f"{self.m('pwm_k')} % {every} == 0"
         return [f"if ({guard}) {{", *["    " + line for line in lines], "}"]
 
     def _assign_values(self, prefix: str, assignments) -> list[str]:
@@ -2519,6 +2604,9 @@ class _ControlGenerator:
 class _ProtectionGenerator:
     """Shared allocation-light lowering of one unit's protection subsystem."""
 
+    def _observes_rocof(self) -> bool:
+        return "frequency" in unit_type(self.cfg.type).protection_criteria
+
     def unit_members(self) -> list[str]:
         """Runtime state owned by the common non-composite Unit contract."""
         unit = self.unit
@@ -2576,7 +2664,7 @@ class _ProtectionGenerator:
         stats = protection.stats
         period = protection.T
         window = (max(1, int(self.cfg.protection.rocof.window / period + 0.5))
-                  if "frequency" in unit_type(self.cfg.type).protection_criteria else 0)
+                  if self._observes_rocof() else 0)
 
         def observed(value: Any) -> str:
             return _number(math.nan if value is None else value)
@@ -2596,10 +2684,13 @@ class _ProtectionGenerator:
             f"double {self.m('terminal_voltage_max')} = "
             f"{observed(stats.terminal_voltage_max_pu)};",
             *([f"MovingWindow<{window}> {self.m('rocof_window')};"]
-              if "frequency" in unit_type(self.cfg.type).protection_criteria else []),
-            f"std::vector<std::string> {self.m('alarms')}"
-            "{" + ", ".join(_cpp_string(value) for value in stats.alarms) + "};",
+              if self._observes_rocof() else []),
+            *self.alarm_members(),
         ]
+
+    def alarm_members(self) -> list[str]:
+        return [f"std::vector<std::string> {self.m('alarms')}"
+                "{" + ", ".join(_cpp_string(value) for value in self.protection.stats.alarms) + "};"]
 
     def _trip_body(self) -> list[str]:
         link = f"dclink_tripped_{self.model.prefix[id(self.unit.dclink)]}"
@@ -2613,13 +2704,11 @@ class _ProtectionGenerator:
         lines.append(f"{link} = true;")
         return lines
 
-    def protection_method(self) -> str:
+    def protection_method(self, *, sampled_only: bool = False) -> str:
         """Fast and sampled protection, plus the one physical trip action."""
         cfg = self.cfg.protection
         period = self.protection.T
-        current = f"obs_{_identifier(self.name + '.i_c')}"
-        current_width = len(self.unit._protection_currents())
-        has_frequency = "frequency" in unit_type(self.cfg.type).protection_criteria
+        has_frequency = self._observes_rocof()
         window = max(1, int(cfg.rocof.window / period + 0.5)) if has_frequency else 0
 
         def enabled(item: Any) -> str:
@@ -2709,32 +2798,40 @@ class _ProtectionGenerator:
         sampled += ["    return false;", "}"]
 
         apply = [f"void apply_trip_{self.tag}() {{", *["    " + line for line in self._trip_body()], "}"]
-        fast = [f"bool protect_{self.tag}(double t) {{"]
-        if not self.unit.continuous:
+        sections = [self._protection_helpers(), apply, sampled]
+        if not sampled_only:
+            current = f"obs_{_identifier(self.name + '.i_c')}"
+            current_width = len(self.unit._protection_currents())
+            fast = [f"bool protect_{self.tag}(double t) {{"]
+            if not self.unit.continuous:
+                fast += [
+                    f"    const bool edge = std::abs({self.m('next_switch')} - t) < time_eps || std::abs({self.m('load_end')} - t) < time_eps;",
+                    "    if (!edge) return false;",
+                ]
+            if current_width == 3:
+                fast += [
+                    f"    const auto current = phases({current});",
+                    "    const double peak_current = std::max({std::abs(current[0]), "
+                    "std::abs(current[1]), std::abs(current[2])});",
+                ]
+            else:
+                fast.append(f"    const double peak_current = std::abs({current});")
             fast += [
-                f"    const bool edge = std::abs({self.m('next_switch')} - t) < time_eps || std::abs({self.m('load_end')} - t) < time_eps;",
-                "    if (!edge) return false;",
+                f"    const double peak = peak_current / {_number(self.protection.i_base)};",
+                f"    if (std::isfinite(peak)) {self.m('max_current')} = std::max({self.m('max_current')}, peak);",
+                f"    if ({self.m('tripped')} || !{enabled(cfg.overcurrent)} || !(peak > {limit(cfg.overcurrent, 'limit_pu')})) return false;",
+                f"    if (!std::isfinite({first('overcurrent')})) {first('overcurrent')} = t;",
+                f"    alarm_{self.tag}(\"OVERCURRENT\");",
+                f"    latch_{self.tag}(t, \"overcurrent\", true);",
+                f"    apply_trip_{self.tag}();",
+                "    return true;",
+                "}",
             ]
-        if current_width == 3:
-            fast += [
-                f"    const auto current = phases({current});",
-                "    const double peak_current = std::max({std::abs(current[0]), "
-                "std::abs(current[1]), std::abs(current[2])});",
-            ]
-        else:
-            fast.append(f"    const double peak_current = std::abs({current});")
-        fast += [
-            f"    const double peak = peak_current / {_number(self.protection.i_base)};",
-            f"    if (std::isfinite(peak)) {self.m('max_current')} = std::max({self.m('max_current')}, peak);",
-            f"    if ({self.m('tripped')} || !{enabled(cfg.overcurrent)} || !(peak > {limit(cfg.overcurrent, 'limit_pu')})) return false;",
-            f"    if (!std::isfinite({first('overcurrent')})) {first('overcurrent')} = t;",
-            f"    alarm_{self.tag}(\"OVERCURRENT\");",
-            f"    latch_{self.tag}(t, \"overcurrent\", true);",
-            f"    apply_trip_{self.tag}();",
-            "    return true;",
-            "}",
-        ]
-        helpers = [
+            sections.append(fast)
+        return "\n\n".join("\n".join(section) for section in sections)
+
+    def _protection_helpers(self) -> list[str]:
+        return [
             f"void alarm_{self.tag}(std::string_view value) {{",
             f"    if (std::find({self.m('alarms')}.begin(), {self.m('alarms')}.end(), value) == {self.m('alarms')}.end())",
             f"        {self.m('alarms')}.emplace_back(value);",
@@ -2753,7 +2850,6 @@ class _ProtectionGenerator:
             "    return true;",
             "}",
         ]
-        return "\n\n".join("\n".join(section) for section in (helpers, apply, sampled, fast))
 
     def protection_summary(self, stream: str = "summary") -> list[str]:
         """C++ statements which append this unit's protection result to a JSON object."""
@@ -3131,26 +3227,10 @@ class _UnitGenerator(_ACControlGenerator):
         raise KeyError(local)
 
     def controller_method(self) -> str:
-        lines = [f"void controller_{self.tag}(double t) {{",
-                 f"    const Complex meas_u_g = {self._adc_value('u_g')} / {_number(self.cfg.base.v_phase_peak)};",
-                 f"    const Complex meas_i_c = {self._adc_value('i_c')} / {_number(self.cfg.base.i_phase_peak)};",
-                 f"    const double meas_u_dc = {self._adc_value('u_dc')} / {_number(self.cfg.dc_base.v)};",
-                 f"    if ({self.m('startup_run')} && !{self.m('startup_complete')}) {{",
-                 f"        const double progress = {self.m('startup_ramp')} <= 0.0 ? 1.0 : std::min(1.0, {self.m('startup_steps')} * {_number(self.cfg.ctrl.period)} / {self.m('startup_ramp')});",
-                 f"        {self.m('startup_value')} = smoothstep(progress);",
-                 f"        {self.m('startup_complete')} = progress >= 1.0;",
-                 f"        if (!{self.m('startup_complete')}) ++{self.m('startup_steps')};",
-                 "    }"]
-        for loop_name in self.graph.order:
-            lines.extend("    " + line for line in
-                         self._loop_lines(loop_name, self.graph.nodes[loop_name]))
-        theta_source = self.source(self.graph.outputs["theta"])
-        omega_source = self.source(self.graph.outputs["omega"])
-        command_source = self.source(self.graph.outputs["u_dq"])
-        lines += [f"    {self.m('theta')} = {theta_source};",
-                  f"    {self.m('omega')} = {omega_source};",
-                  f"    {self.m('u_cmd')} = {command_source};",
-                  f"    {self.m('command_theta')} = {self.m('theta')};"]
+        lines = [f"void controller_{self.tag}(double t) {{"]
+        lines += ["    " + line for line in self._sampled_measurement_lines()]
+        lines += ["    " + line for line in self._sampled_loop_lines()]
+        lines += ["    " + line for line in self._sampled_vsc_command_lines()]
         lines += self._modulation_lines(indent="    ")
         lines += self._log_lines("    ")
         lines += ["    " + line for line in self._rms_sample_lines()]
@@ -3185,20 +3265,10 @@ class _UnitGenerator(_ACControlGenerator):
         return lines
 
     def _modulation_lines(self, indent: str) -> list[str]:
-        stage = self.ctrl.stage
         command = self.m("u_cmd")
         theta = self.m("command_theta")
         udc = f"obs_{_identifier(self.name + '.u_dc')}"
-        if not stage._trusted_pwm or not stage._standard_limiter:
-            raise TypeError(
-                "C++ export: a custom VSC output stage has no equation tracer contract"
-            )
-        traced = self.model._trace(lambda: stage.equation(
-            _Expression(command, "complex"),
-            _Expression(f"Complex{{std::cos({theta}), std::sin({theta})}}", "complex"),
-            _Expression(udc, "real"),
-        ))
-        modulation, output_saturated = traced
+        modulation, output_saturated = self._modulation_values(command, theta, udc)
         lines = [
                   f"{indent}std::array<double, 3> modulation{{"
                   f"{', '.join(value.code for value in modulation)}}};",
@@ -3303,13 +3373,6 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
                         for path in self._control_inputs}
 
             self._flow_inputs = model._trace(read)
-
-    def _sampled_control_inputs(self) -> dict[str, _Expression]:
-        channels = {
-            name: _Expression(self._adc_value(name), "real")
-            for name in self.unit.ports.readers
-        }
-        return self.model._trace(lambda: self.unit.control_inputs_from(channels))
 
     def _stage_condition(self, active: str) -> str:
         """Add the only extra enable required by a direct, breaker-less power port."""
@@ -3442,19 +3505,7 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
         lines = [f"void controller_{self.tag}(double t) {{"]
         lines += ["    " + line for line in self._rms_sample_lines()]
         lines += ["    " + line for line in self._measurement_lines(members=False)]
-        lines += [
-            f"    if ({self.m('startup_run')} && !{self.m('startup_complete')}) {{",
-            f"        const double progress = {self.m('startup_ramp')} <= 0.0 ? 1.0 : "
-            f"std::min(1.0, {self.m('startup_steps')} * {_number(self.cfg.ctrl.period)} / "
-            f"{self.m('startup_ramp')});",
-            f"        {self.m('startup_value')} = smoothstep(progress);",
-            f"        {self.m('startup_complete')} = progress >= 1.0;",
-            f"        if (!{self.m('startup_complete')}) ++{self.m('startup_steps')};",
-            "    }",
-        ]
-        for loop_name in self.graph.order:
-            lines += ["    " + line for line in
-                      self._loop_lines(loop_name, self.graph.nodes[loop_name])]
+        lines += ["    " + line for line in self._sampled_loop_lines()]
         for index, duty in enumerate(self._command_duties()):
             lines.append(f"    {self.m('pending_d')}[{index}] = {duty.code};")
         lines += ["    " + line for line in self._log_lines()]
@@ -3625,20 +3676,26 @@ class _GraphUnitGenerator(_ProtectionGenerator, _ControlGenerator):
     return false;
 }}'''
 
-def _make_unit_generator(name: str, unit: Any, model: _ModelGenerator) -> Any:
-    """Select an optimized controller lowering or the public-port graph lowering."""
+def _controller_implementation(controller: Any, *operations: str) -> type:
+    """Check the execution callbacks replaced by a native target and their dependencies."""
     # These are the existing host execution callbacks replaced by native code. Follow their
     # implementation dependencies; metadata readers invoked during export remain ordinary Python.
-    operations = ("__call__", "command", "command_at", "track", "retune", "set_logging", "set_outputs", "rhs",
-                  "continuous_log", "observe_limits", "summary")
-    if _uses_implementation(unit.ctrl, GraphController, *operations):
-        return _GraphUnitGenerator(name, unit, model)
-    if _uses_implementation(unit.ctrl, VSCController, *operations):
-        return (_ContinuousUnitGenerator(name, unit, model) if unit.continuous
-                else _UnitGenerator(name, unit, model))
+    operations = operations or ("__call__", "command", "command_at", "track", "retune", "set_logging",
+                                "set_outputs", "rhs", "continuous_log", "observe_limits", "summary")
+    for implementation in (GraphController, VSCController):
+        if _uses_implementation(controller, implementation, *operations):
+            return implementation
     raise TypeError(
-        f"C++ export: controller {type(unit.ctrl).__name__!r} has no generator"
+        f"C++ export: controller {type(controller).__name__!r} has no generator"
     )
+
+
+def _make_unit_generator(name: str, unit: Any, model: _ModelGenerator) -> Any:
+    """Select an optimized controller lowering or the public-port graph lowering."""
+    if _controller_implementation(unit.ctrl) is GraphController:
+        return _GraphUnitGenerator(name, unit, model)
+    return (_ContinuousUnitGenerator(name, unit, model) if unit.continuous
+            else _UnitGenerator(name, unit, model))
 
 
 class _CppGenerator:
@@ -4411,17 +4468,7 @@ constexpr double time_eps = 1e-10;
 
 {_ALGEBRAIC_SOLVER if any(len(loop.tears) == 1 for loop in self.model.algebraic_loops) else ""}
 
-template <std::size_t N> struct MovingWindow {{
-    std::array<double, N> buf{{}};
-    std::size_t index = 0, count = 0;
-    double push(double value) {{
-        const double old = count == N ? buf[index] : 0.0;
-        buf[index] = value;
-        index = (index + 1) % N;
-        count = std::min(N, count + 1);
-        return old;
-    }}
-}};
+{_MOVING_WINDOW}
 
 template <std::size_t N> struct RMSWindow {{
     MovingWindow<N> window;
@@ -4557,21 +4604,7 @@ inline std::string resolved_parameters(const RuntimeParameters& parameters) {{
     return text;
 }}
 
-inline double smoothstep(double x) noexcept {{
-    x = std::clamp(x, 0.0, 1.0);
-    return x * x * (3.0 - 2.0 * x);
-}}
-
-inline Complex abc_to_complex(double a, double b, double c) noexcept {{
-    constexpr double root3_2 = 0.866025403784438646763723170752936;
-    return (2.0 / 3.0) * Complex{{a - 0.5 * (b + c), root3_2 * (b - c)}};
-}}
-
-inline std::array<double, 3> phases(Complex value) noexcept {{
-    constexpr double root3_2 = 0.866025403784438646763723170752936;
-    return {{std::real(value), -0.5 * std::real(value) + root3_2 * std::imag(value),
-            -0.5 * std::real(value) - root3_2 * std::imag(value)}};
-}}
+{_CONTROL_MATH}
 
 inline double carrier_position(double t, double frequency, double phase) noexcept {{
     double value = std::fmod(t * frequency + phase, 1.0);
@@ -4792,14 +4825,8 @@ int main(int argc, char** argv) {{
 '''
 
 
-@_exporter("cpp")
-def _export_cpp(simulation: Any, out_dir: Path, name: str,
-                variables: tuple[str, ...], reusable: bool) -> ExportResult:
-    """Write one self-contained, parameter-specialised C++17 translation unit."""
-    # Execute only the ordinary initialisation path.  A caller-owned Simulation is copied to avoid
-    # mutation; the Simulation already created internally by export(Params, ...) can be reused.
-    # Initialisation replaces diagnostic values temporarily used by the port-Hamiltonian structure
-    # probe with the real initial held inputs and controller state.
+def _prepare_export(simulation, variables, reusable):
+    """Rebuild privately and record the ordinary factories for either C++ target."""
     from ..solver.simulation import Simulation
 
     if not simulation._rebuildable:
@@ -4814,6 +4841,39 @@ def _export_cpp(simulation: Any, out_dir: Path, name: str,
                     Simulation(simulation.p, parts=simulation._factories))
     finally:
         _PARAMETER_RECORDER.reset(token)
+    return prepared, initializations
+
+
+def _parameter_generator(prepared, name, variables, initializations, *, constants=None):
+    """Combine target constants and common specialization in one shared parameter rebuild."""
+    common = "common" in variables
+    variables = tuple("all" if path == "common" else path for path in variables)
+    generator = _CppGenerator(prepared, name, variables, initializations)
+    excluded = set(constants(generator.runtime)) if constants is not None else set()
+    model = None
+    diagnostics = []
+    if common:
+        model = _ModelGenerator(prepared, generator.runtime)
+        sensitive = {path for item in model.diagnostics for path in item["parameters"]}
+        if sensitive:
+            diagnostics.append({
+                "code": "common-constants",
+                "parameters": tuple(sorted(sensitive)),
+                "message": "common keeps detected structure-sensitive parameters constant: "
+                + ", ".join(sorted(sensitive)),
+            })
+            excluded.update(sensitive)
+    if excluded:
+        generator = _CppGenerator(prepared, name, variables, initializations, exclude=excluded)
+        model = None
+    return generator, model, diagnostics
+
+
+@_exporter("cpp")
+def _export_cpp(simulation: Any, out_dir: Path, name: str,
+                variables: tuple[str, ...], reusable: bool) -> ExportResult:
+    """Write one self-contained, parameter-specialised C++17 translation unit."""
+    prepared, initializations = _prepare_export(simulation, variables, reusable)
     if prepared.p.simulation.solver.subsystems:
         raise TypeError(
             "C++ export does not yet lower multirate subsystem schedules; use a single-rate "
@@ -4839,23 +4899,7 @@ def _export_cpp(simulation: Any, out_dir: Path, name: str,
     prepared._begin_units(t0, plant)
     plant.outputs(t0)
 
-    common = "common" in variables
-    variables = tuple("all" if path == "common" else path for path in variables)
-    generator = _CppGenerator(prepared, name, variables, initializations)
-    model = None
-    diagnostics = []
-    if common:
-        model = _ModelGenerator(prepared, generator.runtime)
-        sensitive = {path for item in model.diagnostics for path in item["parameters"]}
-        if sensitive:
-            diagnostics.append({
-                "code": "common-constants",
-                "parameters": tuple(sorted(sensitive)),
-                "message": "common keeps detected structure-sensitive parameters constant: "
-                + ", ".join(sorted(sensitive)),
-            })
-            generator = _CppGenerator(prepared, name, variables, initializations, exclude=sensitive)
-            model = None
+    generator, model, diagnostics = _parameter_generator(prepared, name, variables, initializations)
     code = generator.source(model)
     out_dir.mkdir(parents=True, exist_ok=True)
     source = out_dir / "peslite.cpp"

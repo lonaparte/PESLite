@@ -699,7 +699,7 @@ class VSC(Unit):
         return {
             "meas.u_g": values["u_g"] / self.cfg.base.v_phase_peak,
             "meas.i_c": values["i_c"] / self.cfg.base.i_phase_peak,
-            "meas.u_dc": values["u_dc"] / self.cfg.dc_base.v,
+            "meas.u_dc": values["u_dc"] / self.cfg.dclink.vdc_ref,
         }
 
     def _protection_currents(self) -> tuple[float, ...]:

@@ -469,10 +469,10 @@ class Simulation:
         return self.system.units[name]
 
     def export(self, format: str, out_dir: str | Path | None = None, *, name: str = "run",
-               variables=()):
+               variables=(), **options):
         """Export this configured simulation as a standalone implementation."""
         from ..assembly.exporter import export
-        return export(self, format, out_dir, name=name, variables=variables)
+        return export(self, format, out_dir, name=name, variables=variables, **options)
 
     def _actions(self) -> list[tuple[float, int, Any]]:
         """Return file-event actions as ``(time, file_order, action)``."""
@@ -1227,7 +1227,11 @@ def main(argv=None) -> int:
                     help="output directory (default: output/<file name>, or "
                          "a bridge-mode suffix with --switching/--pwm-averaging/--averaging)")
     ap.add_argument("--export", nargs="+", default=None, metavar="FORMAT_OR_PARAM",
-                    help="export a standalone simulator: FORMAT followed by parameter paths, common or all")
+                    help="export an implementation: FORMAT followed by parameter paths, common or all")
+    ap.add_argument("--imperix", action="store_true", help="Imperix ELF export using the official SDK")
+    ap.add_argument("--imperix-config", metavar="FILE", help="ADC/PWM bindings; default: PESFILE.imperix.json")
+    ap.add_argument("--imperix-sdk", metavar="DIRECTORY", help="installed official Imperix SDK")
+    ap.add_argument("--imperix-source-only", action="store_true", help="generate Imperix sources without building an ELF")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
                     help="print a progress line every SECONDS of simulated time")
     ap.add_argument("--watch", action="append", default=None, metavar="NAME",
@@ -1277,8 +1281,16 @@ def main(argv=None) -> int:
     )
     if args.plot is None and plot_option_without_plot:
         ap.error("plot presentation options require --plot NAME [NAME ...]")
-    if args.plot is not None and (args.export or args.list_states or args.ph_report or args.resolved):
+    if args.plot is not None and (args.export or args.imperix or args.list_states or args.ph_report or args.resolved):
         ap.error("--plot requires a simulation run and cannot be combined with inspection or export")
+
+    if args.imperix:
+        if args.export and args.export[0].lower() != "imperix":
+            ap.error("--imperix cannot be combined with another export format")
+        args.export = args.export or ["imperix"]
+    hardware = bool(args.export and args.export[0].lower() == "imperix")
+    if not hardware and (args.imperix_config or args.imperix_sdk or args.imperix_source_only):
+        ap.error("Imperix options require --imperix or --export imperix")
 
     try:
         config = _config_path(args.config)
@@ -1332,10 +1344,14 @@ def main(argv=None) -> int:
     if args.export:
         export_format, *export_variables = args.export
         out = Path(args.out) if args.out else Path("export") / f"{config.stem}{suffix}"
+        options = {}
+        if hardware:
+            options = dict(target_config=args.imperix_config or config.with_suffix(".imperix.json"),
+                           sdk=args.imperix_sdk, build=not args.imperix_source_only)
         try:
             result = sim.export(export_format, out, name=f"{config.stem}{suffix}",
-                                variables=export_variables)
-        except (TypeError, ValueError) as exc:
+                                variables=export_variables, **options)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
             ap.error(str(exc))
         for diagnostic in result.diagnostics:
             print("warning:", diagnostic["message"], file=sys.stderr)
@@ -1411,16 +1427,19 @@ def main(argv=None) -> int:
 
 
 def convert_main(argv=None) -> int:
-    """Export a PESLite simulation file as C++ with optional variable parameter paths."""
+    """Export a standalone C++ simulator or an ELF executable for Imperix hardware."""
     values = list(sys.argv[1:] if argv is None else argv)
     if values and values[0] in ("-h", "--help"):
         print("usage: peslite-convert PESFILE [PARAM ...] [--out DIRECTORY]")
-        print("export one self-contained peslite.cpp; PARAM may be a variable path, common or all")
+        print("export peslite.cpp, or use --imperix for Imperix ELF export")
+        print("Imperix options: --imperix-config FILE, --imperix-sdk DIRECTORY, --imperix-source-only")
+        print("PARAM may be a variable path, common or all")
         return 0
     if not values:
         print("usage: peslite-convert PESFILE [PARAM ...]", file=sys.stderr)
         return 2
-    return main([values[0], "--export", "cpp", *values[1:]])
+    export_format = "imperix" if "--imperix" in values else "cpp"
+    return main([values[0], "--export", export_format, *values[1:]])
 
 
 if __name__ == "__main__":

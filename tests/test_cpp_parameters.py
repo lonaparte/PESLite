@@ -152,6 +152,13 @@ def test_runtime_source_parameters_share_the_normal_initial_bus_preset(tmp_path)
                                _table(python / "states.csv")[1], rtol=3e-6, atol=3e-5)
 
 
+def test_vsc_measurement_bases_remain_adjustable_after_export(tmp_path):
+    p = _case("gfl", "pwm_averaging")
+    binary = _compile(p, tmp_path / "model")
+    _compare_run(p, binary, {"base.v_ll_rms": 720.0, "units.vsc.dclink.vdc_ref": 1600.0},
+                 tmp_path / "run")
+
+
 def test_runtime_reuses_parameter_validation_instead_of_a_cpp_device_whitelist(tmp_path):
     p = _case("buck", "pwm_averaging")
     binary = _compile(p, tmp_path / "model")
