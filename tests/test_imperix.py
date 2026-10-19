@@ -198,7 +198,9 @@ def test_default_probes_publish_calibrated_interface_samples_without_extra_adc_r
     sdk = tmp_path / "sdk"
     _sdk_double(sdk)
     lines = ['#include "user.cpp"', '#include <cassert>', 'int main() {',
-             'assert(UserInit() == SAFE); assert(peslite_run == 0);']
+             'assert(UserInit() == SAFE);']
+    lines += [f'assert({manifest["parameters"][f"units.{name}.connected"]} == 0);'
+              for name in sim.system.units]
     for symbol in manifest["probes"].values():
         lines.append(f"assert({symbol} == 0.0f);")
     for sample in range(2):
@@ -623,7 +625,7 @@ def test_adc_window_is_fixed_before_the_history_layout_is_generated(selector, tm
 #include <cassert>
 int main() {
     assert(UserInit() == SAFE && history_depth[0][1] == 4);
-    assert(UserInterrupt() == SAFE && !peslite_run && !enabled[0][0]);
+    assert(UserInterrupt() == SAFE && !param_units_converter_connected && !enabled[0][0]);
 }
 ''', encoding="utf-8")
     _compile(check, tmp_path / "check", sdk)
@@ -663,11 +665,13 @@ def test_probe_names_reject_collisions_between_scalar_and_phase_channels():
         "adc": {"voltage": channels, "voltage_a": channels[:1]},
     })
     with pytest.raises(ValueError, match="exported names collide"):
-        imperix._source([unit], {}, {}, 50e-6, 0.5, SimpleNamespace(selected=()))
+        imperix._source([unit], {}, {}, 50e-6, 0.5, SimpleNamespace(
+            selected=(), by_path={"units.custom.connected":
+                                  SimpleNamespace(member="param_units_custom_connected")}))
 
 
 @pytest.mark.parametrize("unit_name, channel, variables", [
-    ("peslite", "run", ()),
+    ("param_units", "converter_connected", ()),
     ("param_base", "s_base", ("all",)),
     ("update", "parameters", ("all",)),
     ("stop", "all", ()),
@@ -675,13 +679,13 @@ def test_probe_names_reject_collisions_between_scalar_and_phase_channels():
 def test_probe_names_cannot_shadow_other_exported_symbols(unit_name, channel, variables):
     from peslite.assembly.cpp import _RuntimeParameters
 
-    runtime = _RuntimeParameters(_simulation().p, variables)
+    runtime = _RuntimeParameters(_simulation().p, (*variables, "units.converter.connected"))
+    runtime.by_path[f"units.{unit_name}.connected"] = runtime.by_path["units.converter.connected"]
     unit = SimpleNamespace(name=unit_name, tag=unit_name, binding={
         "adc": {channel: (dict(channel=0, device=0, sign=1),)},
-        "pwm": (), "dead_time": 0.0,
+        "pwm": (), "dead_time": 0.0, "stride": 1,
     }, cfg=SimpleNamespace(ctrl=SimpleNamespace(period=50e-6),
                            pwm=SimpleNamespace(f_sw=20000.0, carrier_phase=0.0)),
-       graph=SimpleNamespace(period_stride=lambda _period, _interrupt: 1),
        topology=SimpleNamespace(unilateral=True), m=lambda field: "test_" + field)
     with pytest.raises(ValueError, match="exported names collide"):
         imperix._source([unit], {}, {}, 50e-6, 0.5, runtime)
@@ -711,16 +715,16 @@ def test_sdk_boundary_calibration_default_stop_run_and_fail_safe(tmp_path):
 #include <cassert>
 #include <limits>
 int main() {
-    assert(UserInit() == SAFE); assert(peslite_run == 0); assert(!enabled[0][0]);
+    assert(UserInit() == SAFE); assert(param_units_converter_connected == 0); assert(!enabled[0][0]);
     input[0][0] = 0.5; input[0][1] = 24; input[0][2] = 48;
     assert(UserInterrupt() == SAFE); assert(!enabled[0][0]);
-    peslite_run = 1; assert(UserInterrupt() == SAFE); assert(!enabled[0][0]);
+    param_units_converter_connected = 1; assert(UserInterrupt() == SAFE); assert(!enabled[0][0]);
     for (int i = 0; i < 4; ++i) assert(UserInterrupt() == SAFE);
     assert(enabled[0][0]);
     assert(duty[0][0] >= 0 && duty[0][0] <= 1);
-    UserError(TEST_FAULT); assert(!enabled[0][0] && peslite_run == 0);
-    peslite_run = 1; input[0][0] = std::numeric_limits<double>::quiet_NaN();
-    assert(UserInterrupt() == UNSAFE); assert(!enabled[0][0] && peslite_run == 0);
+    UserError(TEST_FAULT); assert(!enabled[0][0] && param_units_converter_connected == 0);
+    param_units_converter_connected = 1; input[0][0] = std::numeric_limits<double>::quiet_NaN();
+    assert(UserInterrupt() == UNSAFE); assert(!enabled[0][0] && param_units_converter_connected == 0);
 }
 ''', encoding="utf-8")
     binary = tmp_path / "check"
@@ -729,6 +733,76 @@ int main() {
     manifest = json.loads((result.out_dir / "manifest.json").read_text())
     assert manifest["status"] == "source_only" and manifest["hardware_tested"] is False
     assert not (result.out_dir / "run.elf").exists()
+
+
+def test_unit_command_waits_for_fresh_pwm_after_each_restart_and_rejects_invalid_values(tmp_path):
+    _export(_simulation(), tmp_path / "export")
+    sdk = tmp_path / "sdk"
+    _sdk_double(sdk)
+    source = tmp_path / "export" / "check.cpp"
+    source.write_text('''#include "user.cpp"
+#include <cassert>
+int main() {
+    assert(UserInit() == SAFE);
+    input[0][0] = 0; input[0][1] = 24; input[0][2] = 48;
+    for (int restart = 0; restart < 2; ++restart) {
+        param_units_converter_connected = 1;
+        assert(UserInterrupt() == SAFE && !enabled[0][0]);
+        for (int i = 0; i < 5; ++i) assert(UserInterrupt() == SAFE);
+        assert(enabled[0][0]);
+        param_units_converter_connected = 0;
+        assert(UserInterrupt() == SAFE && !enabled[0][0]);
+    }
+    param_units_converter_connected = 2;
+    assert(UserInterrupt() == UNSAFE);
+    assert(!enabled[0][0] && param_units_converter_connected == 0);
+    assert(peslite_generated::parameters.param_units_converter_connected == 0);
+}
+''', encoding="utf-8")
+    _compile(source, tmp_path / "check", sdk)
+    subprocess.run([tmp_path / "check"], check=True)
+
+
+def test_nested_unit_commands_are_independent_and_cannot_clear_a_trip_latch(tmp_path):
+    sim = _simulation("wpt-ss")
+    directory = tmp_path / "export"
+    _export(sim, directory)
+    manifest = json.loads((directory / "manifest.json").read_text())
+    sdk = tmp_path / "sdk"
+    _sdk_double(sdk)
+    names = tuple(sim.system.units)
+    commands = [manifest["parameters"][f"units.{name}.connected"] for name in names]
+    lines = ['#include "user.cpp"', '#include <cassert>', 'int main() {',
+             'assert(UserInit() == SAFE);']
+    for index, name in enumerate(names):
+        for key, specification in manifest["bindings"][name]["adc"].items():
+            for channel in specification:
+                value = 400 if key == "input_voltage" else 0
+                lines.append(f'input[{channel["device"]}][{channel["channel"]}] = {value};')
+        lines.append(f'assert({commands[index]} == 0);')
+    for index, command in enumerate(commands):
+        lines += [f'{command} = 1;',
+                  'for (int i = 0; i < 12; ++i) assert(UserInterrupt() == SAFE);']
+        for other, name in enumerate(names):
+            for channel in manifest["bindings"][name]["pwm"]:
+                lines.append(f'assert(enabled[{channel["device"]}][{channel["channel"]}] == '
+                             f'{str(other <= index).lower()});')
+    lines += [f'{commands[0]} = 0;', 'assert(UserInterrupt() == SAFE);']
+    for index, name in enumerate(names):
+        for channel in manifest["bindings"][name]["pwm"]:
+            lines.append(f'assert(enabled[{channel["device"]}][{channel["channel"]}] == '
+                         f'{str(index != 0).lower()});')
+    tag = imperix._identifier(names[0])
+    lines += [f'control_{tag}.u_{tag}_tripped = true;', f'{commands[0]} = 1;',
+              'tUserSafe status = SAFE;',
+              'for (int i = 0; i < 12 && status == SAFE; ++i) status = UserInterrupt();',
+              'assert(status == UNSAFE);', f'assert(control_{tag}.u_{tag}_tripped);']
+    lines += [f'assert({command} == 0);' for command in commands]
+    lines += ['}']
+    source = directory / "check.cpp"
+    source.write_text("\n".join(lines), encoding="utf-8")
+    _compile(source, tmp_path / "check", sdk)
+    subprocess.run([tmp_path / "check"], check=True)
 
 
 @pytest.mark.parametrize("name", ["gfl", "wpt-ss"])
@@ -892,10 +966,131 @@ def test_parameter_selection_and_caller_ownership(tmp_path):
     assert "parameters.param_units_converter_ctrl_references_voltage" in header
     assert "u_converter_reference_voltage" not in header
     manifest = json.loads((tmp_path / "manifest.json").read_text())
-    assert manifest["parameters"] == {selected: "param_units_converter_ctrl_references_voltage"}
+    assert manifest["parameters"] == {selected: "param_units_converter_ctrl_references_voltage",
+                                      "units.converter.connected": "param_units_converter_connected"}
     assert sim.units["converter"].ctrl.get_state() == before
     _export(sim, tmp_path / "solver", variables=["simulation.t_end"])
     assert "volatile float param_simulation_t_end" in (tmp_path / "solver" / "user.cpp").read_text()
+
+
+@pytest.mark.parametrize("variables", [(), ("all",), ("common",), ("units.converter.ctrl.references",)])
+@pytest.mark.parametrize("event_t", [0.0, 0.001])
+def test_simulation_event_writes_do_not_replace_hardware_defaults_or_tunables(variables, event_t, tmp_path):
+    base = _simulation()
+    sim = peslite.Simulation(base.p.replace(**{"events.retune": {
+        "type": "set", "t": event_t, "set": {
+            "units.converter.ctrl.references.voltage": 12.0,
+            "units.converter.ctrl.loops.DCVoltageControl.ki": 160.0,
+        },
+    }}))
+    targets = tuple(sorted(sim.p.events["retune"].set))
+    _export(base, tmp_path / "base", variables=(*variables, *targets))
+    _export(sim, tmp_path / "events", variables=variables)
+    for name in ("user.cpp", "peslite_control.hpp", "manifest.json"):
+        assert (tmp_path / "base" / name).read_bytes() == (tmp_path / "events" / name).read_bytes()
+    assert sim.p.events["retune"].set["units.converter.ctrl.references.voltage"] == 12.0
+
+
+@pytest.mark.parametrize("event_t", [0.0, 0.0001])
+def test_event_target_retunes_only_through_the_existing_sdk_parameter(event_t, tmp_path):
+    sim = peslite.Simulation(_simulation().p.replace(**{"events.initial_reference": {
+        "type": "set", "t": event_t, "set": {"units.converter.ctrl.references.voltage": 12.0},
+    }}))
+    path = "units.converter.ctrl.references.voltage"
+    _export(sim, tmp_path / "out")
+    sdk = tmp_path / "sdk"
+    _sdk_double(sdk)
+    unit = sim.units["converter"]
+    unit.ctrl.command(True, 0.0)
+    expected = []
+    symbol = "param_" + imperix._identifier(path)
+    lines = ['#include "user.cpp"', '#include <cassert>', '#include <iostream>', '#include <iomanip>',
+             'int main() { std::cout << std::setprecision(17);',
+             f'assert({symbol} == 24.0f); assert(UserInit() == SAFE); param_units_converter_connected = 1;',
+             'input[0][0] = 1.0; input[0][1] = 23.0; input[0][2] = 48.0;']
+    for index in range(8):
+        if index == 4:
+            updated = sim.p.replace(**{path: 36.0})
+            unit.ctrl.retune(updated.unit("converter"), ["ctrl.references.voltage"],
+                             index * unit.cfg.ctrl.period)
+            lines.append(f"{symbol} = 36.0f;")
+        t = (index + 0.5) * unit.cfg.ctrl.period
+        output = unit.ctrl(t, SimpleNamespace(t=t, current=1.0, voltage=23.0, vin=48.0))
+        expected.append(unit.bridge.topology.command_duties(output))
+        lines += ['assert(UserInterrupt() == SAFE);',
+                  "for (double duty : control_converter.duty) std::cout << duty << ' ';",
+                  "std::cout << '\\n';"]
+    lines.append("}")
+    check = tmp_path / "out" / "check.cpp"
+    check.write_text("\n".join(lines), encoding="utf-8")
+    _compile(check, tmp_path / "check", sdk)
+    result = subprocess.run([str(tmp_path / "check")], check=True, capture_output=True, text=True)
+    actual = [tuple(map(float, line.split())) for line in result.stdout.splitlines()]
+    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-9)
+
+
+def test_event_targets_reuse_normalized_paths_and_custom_bindings(tmp_path):
+    from test_events import _Mark
+
+    base = _simulation("gfl")
+    path = "units.vsc.ctrl.references.p_ref_pu"
+    custom_path = "units.vsc.ctrl.references.iq_ref_pu"
+    p = base.p.replace(events={
+        "power_si": {"type": "set", "t": 0.001,
+                     "set": {"units.vsc.ctrl.references.p_ref": 1e6}},
+        "power_pu": {"type": "set", "t": 0.002, "set": {path: 0.7}},
+        "custom": {"type": _Mark.type, "target": "vsc", "t": 0.003, "level_pu": 0.2},
+    })
+    sim = peslite.Simulation(p)
+    _export(sim, tmp_path / "export", variables=[path])
+    manifest = json.loads((tmp_path / "export" / "manifest.json").read_text())
+    expected = (path, custom_path, "units.vsc.connected")
+    assert manifest["parameters"] == {key: "param_" + imperix._identifier(key) for key in expected}
+    source = (tmp_path / "export" / "user.cpp").read_text()
+    assert source.count(f'volatile float {manifest["parameters"][path]} =') == 1
+    assert "trigger" not in source
+    # Names, times and prescribed step values do not become a hardware event schedule.
+    changed = p.replace(**{"events.power_si.t": 0.0,
+                           "events.power_si.set.units.vsc.ctrl.references.p_ref": 1.2e6,
+                           "events.power_pu.t": 0.004})
+    _export(peslite.Simulation(changed), tmp_path / "changed", variables=[path])
+    for filename in ("user.cpp", "peslite_control.hpp", "manifest.json"):
+        assert (tmp_path / "export" / filename).read_bytes() == (tmp_path / "changed" / filename).read_bytes()
+
+
+def test_nested_event_targets_use_leaf_commands_and_existing_parameter_paths(tmp_path):
+    p = _simulation("wpt-lcc").p.replace(events={
+        "start": {"type": "connect", "target": "charger", "t": 0.001},
+        "stop": {"type": "disconnect", "target": "charger", "t": 0.002},
+        "power": {"type": "set", "t": 0.003,
+                  "set": {"units.charger.secondary.ctrl.references.power": -800.0}},
+    })
+    _export(peslite.Simulation(p), tmp_path)
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    targets = ("units.charger.primary.connected", "units.charger.secondary.connected",
+               "units.charger.secondary.ctrl.references.power")
+    assert manifest["parameters"] == {path: "param_" + imperix._identifier(path) for path in targets}
+
+
+def test_event_targets_cannot_silently_be_frozen_by_common(tmp_path):
+    path = "units.converter.dclink.source.r"
+    p = _simulation().p.replace(events={
+        "source": {"type": "set", "t": 0.001, "set": {path: 0.05}},
+    })
+    with pytest.raises(ValueError, match="event target variables must remain tunable") as error:
+        _export(peslite.Simulation(p), tmp_path / "out", variables=["common"])
+    assert path in str(error.value)
+    assert not (tmp_path / "out").exists()
+
+
+def test_unavailable_event_command_fails_before_writing_files(tmp_path):
+    path = "sources.grid.connected"
+    p = _simulation("gfl").p.replace(events={
+        "grid": {"type": "set", "t": 0.001, "set": {path: False}},
+    })
+    with pytest.raises(ValueError, match=path):
+        _export(peslite.Simulation(p), tmp_path / "out")
+    assert not (tmp_path / "out").exists()
 
 
 @pytest.mark.parametrize("selector", ["all", "common"])
@@ -926,6 +1121,7 @@ def test_parameter_range_and_symbols_match_standalone_cpp_except_fixed_hardware_
     paths = re.findall(r'if \(path == "([^"]+)"\)', cpp)
     fixed = {path for item in result.diagnostics if item["code"] == "hardware-timing-constants"
              for path in item["parameters"]}
+    paths += [f"units.{name}.connected" for name in sim.system.units]
     assert manifest["parameters"] == {path: "param_" + imperix._identifier(path)
                                       for path in paths if path not in fixed}
     if selector in ("all", "common"):
@@ -948,7 +1144,7 @@ def test_online_gains_refresh_coefficients_without_resetting_loop_state(variable
     unit.ctrl.command(True, 0.0)
     expected, lines = [], ['#include "user.cpp"', '#include <iostream>', '#include <iomanip>',
                            'int main() { std::cout << std::setprecision(17);',
-                           'if (UserInit() != SAFE) return 1; peslite_run = 1;',
+                           'if (UserInit() != SAFE) return 1; param_units_converter_connected = 1;',
                            'input[0][0] = 1.0; input[0][1] = 23.0; input[0][2] = 48.0;']
     for index in range(24):
         if index == 8:
@@ -967,7 +1163,7 @@ def test_online_gains_refresh_coefficients_without_resetting_loop_state(variable
                   "std::cout << '\\n';"]
     lines += ['auto accepted = peslite_generated::parameters;',
               'param_units_converter_ctrl_loops_DCVoltageControl_ki = std::numeric_limits<float>::quiet_NaN();',
-              'if (UserInterrupt() != UNSAFE || peslite_run != 0 || enabled[0][0]) return 3;',
+              'if (UserInterrupt() != UNSAFE || param_units_converter_connected != 0 || enabled[0][0]) return 3;',
               'if (peslite_generated::parameters.param_units_converter_ctrl_loops_DCVoltageControl_ki !=',
               '    accepted.param_units_converter_ctrl_loops_DCVoltageControl_ki) return 4;', '}']
     source = tmp_path / "export" / "check.cpp"
@@ -1103,6 +1299,13 @@ def test_factory_derived_timing_traces_dependencies_instead_of_matching_names(tm
     manifest = json.loads((tmp_path / "all" / "manifest.json").read_text())
     assert path not in manifest["parameters"]
     assert "units.vsc.ctrl.loops.DCVoltageControl.kp" in manifest["parameters"]
+    event_params = sim.p.replace(events={
+        "retune": {"type": "set", "t": 0.001, "set": {path: 100.0}},
+    })
+    event_sim = peslite.Simulation(event_params, parts={"vsc.ctrl": factory})
+    with pytest.raises(ValueError, match=path):
+        _export(event_sim, tmp_path / "event")
+    assert not (tmp_path / "event").exists()
 
 
 def test_constant_export_does_not_run_parameter_timing_analysis(monkeypatch, tmp_path):

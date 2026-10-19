@@ -117,6 +117,205 @@ def test_runtime_load_binding_is_shared_with_a_scheduled_set_event(at, tmp_path)
                                _table(python / "states.csv")[1], rtol=2e-8, atol=2e-8)
 
 
+@pytest.mark.parametrize("name, unit, reference", [
+    ("buck", "converter", {"voltage": 12.0}),
+    ("gfl", "vsc", {"vdc_ref_pu": 1.02}),
+])
+@pytest.mark.parametrize("mode", ["pwm_averaging", "averaging"])
+@pytest.mark.parametrize("variables", [(), ("common",), ("all",)])
+def test_initial_control_events_match_direct_configuration_and_python(
+        name, unit, reference, mode, variables, tmp_path):
+    changes = {f"units.{unit}.ctrl.references.{key}": value for key, value in reference.items()}
+    changes[f"units.{unit}.ctrl.loops.DCVoltageControl.ki"] = 160.0
+    p = _case(name, mode).replace(**{
+        "simulation.t_end": 0.001,
+        "simulation.energy_check": "off",
+        "events.initial_control": {"type": "set", "t": 0.0, "set": changes},
+    })
+    binary = _compile(p, tmp_path / "model", variables)
+    _compare_run(p, binary, {}, tmp_path / "run")
+    events = {key: value for key, value in p.events.items() if key != "initial_control"}
+    direct = p.replace(**changes, events=events)
+    peslite.Simulation(direct).run(out_dir=tmp_path / "direct")
+    np.testing.assert_allclose(_table(tmp_path / "run" / "python" / "states.csv")[1],
+                               _table(tmp_path / "direct" / "states.csv")[1],
+                               rtol=2e-8, atol=2e-8)
+
+
+@pytest.mark.parametrize("variables", [(), ("all",)])
+@pytest.mark.parametrize("mode", ["pwm_averaging", "averaging"])
+def test_initial_control_events_preserve_explicit_restart_state(variables, mode, tmp_path):
+    p = _case("buck", mode).replace(**{
+        "simulation.t_end": 0.001,
+        "simulation.initial.t": 0.0004,
+        "simulation.initial.states.converter.ctrl.DCVoltageControl.integral": 0.25,
+        "simulation.energy_check": "off",
+        "events": {
+            "first": {"type": "set", "t": 0.0, "set": {
+                "units.converter.ctrl.references.voltage": 18.0,
+            }},
+            "second": {"type": "set", "t": 0.0002, "set": {
+                "units.converter.ctrl.references.voltage": 12.0,
+                "units.converter.ctrl.loops.DCVoltageControl.ki": 160.0,
+            }},
+        },
+    })
+    binary = _compile(p, tmp_path / "model", variables)
+    _compare_run(p, binary, {}, tmp_path / "run")
+    columns, states = _table(tmp_path / "run" / "native" / "states.csv")
+    assert states[0, columns.index("converter.ctrl.DCVoltageControl.integral")] == 0.25
+
+
+@pytest.mark.parametrize("name, target", [("buck", "converter"), ("gfl", "vsc"), ("wpt", "charger")])
+@pytest.mark.parametrize("mode", ["pwm_averaging", "averaging"])
+def test_explicit_connection_variable_events_match_python(name, target, mode, tmp_path):
+    p = _case(name, mode)
+    end = p.simulation.t_end
+    p = p.replace(**{"events": {
+        "start": {"type": "set", "t": end * 0.2,
+                  "set": {f"units.{target}.connected": True}},
+        "stop": {"type": "set", "t": end * 0.8,
+                 "set": {f"units.{target}.connected": False}},
+    }})
+    binary = _compile(p, tmp_path / "model")
+    _compare_run(p, binary, {}, tmp_path / "run")
+
+
+@pytest.mark.parametrize("name, target", [("buck", "converter"), ("gfl", "vsc"), ("gfm-dvoc", "vsc"),
+                                         ("wpt", "charger.primary")])
+@pytest.mark.parametrize("mode", ["pwm_averaging", "averaging"])
+def test_initial_connection_uses_the_shared_set_interface(name, target, mode, tmp_path):
+    p = _case(name, mode).replace(events={})
+    if name in ("gfl", "gfm-dvoc"):
+        p = p.replace(**{"sources.grid.angle": 0.2})
+    path = f"units.{target}.connected"
+    binary = _compile(p, tmp_path / "model", (path,))
+    for on in (0, 1):
+        _compare_run(p, binary, {path: on}, tmp_path / str(on))
+    rejected = subprocess.run([binary, "--set", f"{path}=2"], capture_output=True, text=True)
+    assert rejected.returncode != 0 and f"invalid value for {path}" in rejected.stderr
+
+
+@pytest.mark.parametrize("at", [0.0, 0.001])
+def test_initial_connection_does_not_replace_a_scheduled_command(at, tmp_path):
+    p = _case("buck", "pwm_averaging").replace(events={
+        "start": {"type": "connect", "target": "converter", "t": at},
+        "stop": {"type": "disconnect", "target": "converter", "t": 0.002},
+    })
+    path = "units.converter.connected"
+    binary = _compile(p, tmp_path / "model", (path,))
+    for on in (0, 1):
+        _compare_run(p, binary, {path: on}, tmp_path / str(on))
+
+
+def test_connection_config_template_keeps_json_values_typed_without_yaml(monkeypatch):
+    import builtins
+    import json
+    from peslite.assembly.cpp import _RuntimeParameters
+
+    runtime = _RuntimeParameters(_case("buck", "pwm_averaging"), ("units.converter.connected",))
+    original_import = builtins.__import__
+
+    def without_yaml(name, *args, **kwargs):
+        if name == "yaml":
+            raise ImportError("YAML is unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_yaml)
+    body, replacements = runtime.resolved_template()
+    assert len(replacements) == 1
+    marker, _expression = replacements[0]
+    assert json.loads(body.replace(marker, "0"))["units"]["converter"]["connected"] == 0
+    assert json.loads(body.replace(marker, "null"))["units"]["converter"]["connected"] is None
+
+
+def test_source_ramp_keeps_its_command_state_when_controller_startup_is_restored(tmp_path):
+    p = _case("gfl", "pwm_averaging").replace(**{
+        "events.connect_vsc.ramp": 0.001,
+        "simulation.initial.states.vsc.ctrl.startup.ramp": 0.002,
+    })
+    binary = _compile(p, tmp_path / "model")
+    _compare_run(p, binary, {}, tmp_path / "run")
+
+
+@pytest.mark.parametrize("name", ["gfm-psc", "gfm-dvoc", "gfm-vsg", "gfm-matching"])
+@pytest.mark.parametrize("mode", ["pwm_averaging", "averaging"])
+@pytest.mark.parametrize("variables", [(), ("all",)])
+def test_cold_start_and_reconnect_use_the_same_tracking_law(name, mode, variables, tmp_path):
+    p = _case(name, mode).replace(**{
+        "sources.grid.angle": 0.2,
+        "units.vsc.protection.overcurrent.enable": 0,
+        "events": {
+            "stop": {"type": "disconnect", "target": "vsc", "t": 0.001},
+            "restart": {"type": "connect", "target": "vsc", "t": 0.002},
+        },
+    })
+    binary = _compile(p, tmp_path / "model", variables)
+    _compare_run(p, binary, {}, tmp_path / "run")
+
+
+@pytest.mark.parametrize("voltage", [0.05, 1.0])
+@pytest.mark.parametrize("variables", [(), ("all",)])
+def test_custom_tracking_callback_is_lowered_without_a_sync_law_adapter(voltage, variables, tmp_path):
+    from test_custom_parts import _TrackingOscillator
+
+    p = _case("gfl", "averaging").replace(**{
+        "sources.grid.angle": 0.2,
+        "sources.grid.v_pu": voltage,
+        "units.vsc.protection.overcurrent.enable": 0,
+        "units.vsc.ctrl": {
+            "type": "custom",
+            "loops": {_TrackingOscillator.__name__: {}},
+            "connections": {f"{_TrackingOscillator.__name__}.voltage": "meas.u_g"},
+            "outputs": {"theta": f"{_TrackingOscillator.__name__}.theta",
+                        "omega": f"{_TrackingOscillator.__name__}.omega",
+                        "u_dq": f"{_TrackingOscillator.__name__}.command"},
+        },
+        "events": {
+            "stop": {"type": "disconnect", "target": "vsc", "t": 0.001},
+            "restart": {"type": "connect", "target": "vsc", "t": 0.002},
+        },
+    })
+    binary = _compile(p, tmp_path / "model", variables)
+    _compare_run(p, binary, {}, tmp_path / "run")
+
+
+@pytest.mark.parametrize("target", ["python", "cpp"])
+def test_tracking_callbacks_keep_the_same_output_contract(target, monkeypatch, tmp_path):
+    from peslite.control.loops import PSC
+
+    p = _case("gfm-psc", "averaging").replace(events={})
+    monkeypatch.setattr(PSC, "track", lambda self, inputs: {})
+    with pytest.raises(KeyError, match="theta"):
+        if target == "python":
+            peslite.Simulation(p).run(out_dir=tmp_path)
+        else:
+            peslite.export(p, "cpp", tmp_path)
+
+
+@pytest.mark.parametrize("mode", ["pwm_averaging", "averaging"])
+@pytest.mark.parametrize("variables", [(), ("all",)])
+def test_restored_control_state_is_not_tracked_again(mode, variables, tmp_path):
+    p = _case("gfm-dvoc", mode).replace(**{
+        "sources.grid.angle": 0.2,
+        "simulation.initial.states.vsc.ctrl.DVOC.theta": 0.7,
+        "simulation.initial.states.vsc.ctrl.DVOC.v_mag_pu": 0.8,
+        "events": {},
+    })
+    binary = _compile(p, tmp_path / "model", variables)
+    _compare_run(p, binary, {}, tmp_path / "run")
+
+
+def test_custom_event_variable_bindings_keep_retained_parameter_dependencies(tmp_path):
+    from test_custom_parts import _LoadStep
+
+    p = _case("buck", "pwm_averaging").replace(**{"events": {
+        "load": {"type": _LoadStep.type, "target": "load", "t": 0.001, "factor": 0.5},
+    }})
+    binary = _compile(p, tmp_path / "model", ("elements.load.r",))
+    _compare_run(p, binary, {"elements.load.r": 9.0}, tmp_path / "run")
+
+
 @pytest.mark.parametrize("changes", [
     {"units.converter.pwm.f_sw": 25000.0},
     {"units.converter.ctrl.period": 100e-6,

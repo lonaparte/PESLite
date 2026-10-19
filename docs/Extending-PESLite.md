@@ -190,27 +190,34 @@ therefore the state layout, so it is fixed when the simulation is assembled.
 ## Custom events
 
 Register an `Event` subclass with `register_event_type`. Its `Params` dataclass contains at least
-`type` and `t`, and `apply(event, system, t)` performs the action:
+`type` and `t`. Its pure `variables(event, params)` function declares the existing variables to
+write; custom events use the same validation and runtime update path as built-in events:
 
 ```python
 from dataclasses import dataclass
 from peslite.assembly import Event, register_event_type
 
 @register_event_type
-class Marker(Event):
+class LoadStep(Event):
     @dataclass(frozen=True, kw_only=True)
     class Params:
         t: float
-        type: str = "marker"
+        target: str
+        factor: float
+        type: str = "load_step"
 
-    type = "marker"
+    type = "load_step"
 
     @staticmethod
-    def apply(event, system, t):
-        pass
+    def variables(event, params):
+        return {f"elements.{event.target}.r": params.elements[event.target].r * event.factor}
 ```
 
-Custom events receive the same exact-boundary scheduling as built-in events.
+Bindings are evaluated against the preceding parameter state during assembly. The named element
+must support the normal `retune(parameters)` interface. A custom connection event can instead
+bind a boolean to `<section>.<object>.connected`; optional `ramp` has the same meaning as for
+`connect`. Empty bindings and action-only `apply()` callbacks are rejected. Event callbacks must
+not perform I/O or mutate the model while bindings are being resolved.
 
 ## Custom solvers
 
@@ -229,6 +236,10 @@ the optional hooks.
 `VSCController` builds a three-phase controller from a parameter tree, PWM method and output stage. A replacement
 controller satisfies the `Controller` protocol; a replacement modulator satisfies `Modulator` and
 returns a `SwitchingSequence`. The unit checks these protocols at assembly time.
+
+An optional controller `initialize()` hook applies queued initial parameter updates before the
+startup command and named-state restoration. The built-in graph controllers use their existing
+retuning path here; later updates still take effect at the next control update.
 
 Keep protection decisions in the unit hardware layer. Controller output contains commands and
 startup status; it should not directly open breakers or mutate the system.

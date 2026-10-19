@@ -29,7 +29,94 @@ def _set(name, t, **values):
     return {f"events.{name}": {"type": "set", "t": t, "set": values}}
 
 
-RUNS = []
+@pytest.mark.parametrize("mode", ["pwm_averaging", "averaging"])
+@pytest.mark.parametrize("t0", [0.0, 0.0004])
+def test_initial_parameter_events_are_applied_before_restoring_control_state(mode, t0):
+    p = peslite.load(EXAMPLES / "buck-example.pes").replace(**{
+        "units.converter.bridge.model": mode,
+        "simulation.initial.t": t0,
+        "simulation.initial.states.converter.ctrl.DCVoltageControl.integral": 0.25,
+        "events": {
+            "initial": {"type": "set", "t": 0.0, "set": {
+                "units.converter.ctrl.references.voltage": 12.0,
+                "units.converter.ctrl.loops.DCVoltageControl.ki": 160.0,
+            }},
+            "later": {"type": "set", "t": 0.001, "set": {
+                "units.converter.ctrl.references.voltage": 18.0,
+            }},
+        },
+    })
+    sim = peslite.Simulation(p)
+    sim._apply_initial(t0)
+    ctrl = sim.units["converter"].ctrl
+    assert ctrl.graph.references["voltage"] == 12.0
+    loop = ctrl.graph.nodes["DCVoltageControl"]
+    assert loop.ki == loop.pi.ki == 160.0
+    assert sim._states.read()["converter.ctrl.DCVoltageControl.integral"] == 0.25
+    assert not ctrl.graph._pending
+
+
+@pytest.mark.parametrize("connected", [False, True])
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
+def test_explicit_initial_command_keeps_source_and_controller_consistent(connected, mode):
+    p = _gfl(**{"units.vsc.connected": connected, "units.vsc.bridge.model": mode,
+                "simulation.initial.states": {},
+                "events.connect_vsc.t": 0.001})
+    sim = peslite.Simulation(p)
+    sim._apply_initial(0.0)
+    unit = sim.units["vsc"]
+    assert unit.breaker == connected
+    assert unit.ctrl.startup.run == connected
+    source = unit.dclink.source
+    assert source(0, source.u_ref) == pytest.approx(source.i_nom if connected else 0)
+
+
+@pytest.mark.parametrize("name", ["gfl", "buck", "wpt"])
+def test_connection_commands_are_initialized_once_after_assembly(name, monkeypatch):
+    from peslite.components.converter import DCLink
+
+    calls = []
+    connect = DCLink.connect
+
+    def record(link, on, t, ramp=0.0):
+        calls.append(link)
+        return connect(link, on, t, ramp)
+
+    monkeypatch.setattr(DCLink, "connect", record)
+    p = peslite.load(EXAMPLES / f"{name}-example.pes")
+    sim = peslite.Simulation(p)
+    assert not calls
+    sim._apply_initial(p.simulation.initial.t)
+    assert calls == [unit.dclink for unit in sim.units.values()]
+
+
+@pytest.mark.parametrize("t0", [0.0001, 0.0006, 0.0012])
+def test_initial_source_command_uses_the_original_ramp_time(t0):
+    from peslite.control.blocks import smoothstep
+
+    since, ramp = 0.0002, 0.001
+    p = _gfl(**{"simulation.initial.t": t0, "events.connect_vsc.t": since,
+                "events.connect_vsc.ramp": ramp, "simulation.initial.states": {}})
+    sim = peslite.Simulation(p)
+    sim._apply_initial(t0)
+    source = sim.units["vsc"].dclink.source
+    expected = smoothstep((t0 - since) / ramp) if t0 >= since else 0.0
+    assert source(t0, source.u_ref) == pytest.approx(source.i_nom * expected)
+    if t0 >= since + ramp:
+        assert source.ramp is None
+
+
+def test_initial_network_disconnect_is_applied_after_loading_physical_state():
+    p = _gfl(**{
+        "simulation.initial.states": {"grid.branch.i": [12.0, -3.0]},
+        "events.grid_on": {"type": "set", "t": 0.001,
+                           "set": {"sources.grid.connected": True}},
+    })
+    sim = peslite.Simulation(p)
+    sim._apply_initial(0.0)
+    branch = sim.system.sources["grid"].branch
+    assert branch.breaker_open
+    assert branch.state.i == 0
 
 
 @register_event_type
@@ -43,8 +130,8 @@ class _MarkAtIntegrationTime(Event):
     type = "test_integration_mark"
 
     @staticmethod
-    def apply(event, system, t):
-        RUNS.append((event.label, system, t))
+    def variables(event, params):
+        return {"sources.grid.r": params.sources["grid"].r}
 
 
 class _HookedHeun:
@@ -128,16 +215,40 @@ def test_event_is_an_exact_stop_and_solver_hooks_bracket_the_model_change(tmp_pa
     assert after_event and all(value == pytest.approx(2 * old_r) for value in after_event)
 
 
-def test_registered_custom_event_runs_once_at_its_exact_time(tmp_path):
+def test_registered_custom_event_runs_once_at_its_exact_time(monkeypatch, tmp_path):
     event_t = 0.000137
     p = _gfl(**{
         "simulation.t_end": 0.0003,
         "events.mark": {"type": "test_integration_mark", "t": event_t, "label": "seen"},
     })
     sim = peslite.Simulation(p)
-    RUNS.clear()
+    runs = []
+    apply = sim.system.apply
+
+    def record(change):
+        runs.append((change.event, change.t))
+        apply(change)
+
+    monkeypatch.setattr(sim.system, "apply", record)
     sim.run(out_dir=tmp_path)
-    assert RUNS == [("seen", sim.system, event_t)]
+    assert runs == [("mark", event_t)]
+
+
+def test_event_variable_bindings_are_resolved_before_the_run(monkeypatch, tmp_path):
+    from peslite.assembly import params
+
+    p = _gfl(**{
+        "simulation.t_end": 0.0003,
+        "events.connect_vsc.t": 0.0,
+        **_set("retune", 0.000137, **{"sources.grid.r_pu": 0.08}),
+    })
+    sim = peslite.Simulation(p)
+
+    def unexpected(*args):
+        pytest.fail("the runtime must use compiled variable bindings")
+
+    monkeypatch.setattr(params, "_event_assignments", unexpected)
+    sim.run(out_dir=tmp_path)
 
 
 def test_set_event_before_restart_time_is_in_force_before_the_first_stage(tmp_path):

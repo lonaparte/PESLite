@@ -66,7 +66,6 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
         super().__init__(name, unit, model, "u")
         self.topology = unit.bridge.topology
         self.binding = binding
-        self._changing_references = set()
 
     def _adc_value(self, channel):
         return "measured." + _identifier(channel)
@@ -267,7 +266,7 @@ def _clock_bindings(units, config, timing):
     return clocks, assigned
 
 
-def _bindings(simulation, config, model):
+def _bindings(simulation, config, model, *, events=None):
     _keys(config, {"units", "interrupt_period", "sampling_phase", "clock_mode", "clocks", "build"}, "imperix")
     units = simulation.system.units
     bindings = config.get("units")
@@ -293,10 +292,9 @@ def _bindings(simulation, config, model):
               f"imperix.units.{name}")
         if cfg.pwm.sync != "asynchronous":
             raise ValueError(f"{name}: angle-locked simulation carriers have no hardware adapter")
-        stride = round(cfg.ctrl.period / period)
-        every = unit.ctrl.graph.period_stride(configured.ctrl.period, period)
+        stride = unit.ctrl.graph.period_stride(configured.ctrl.period, period)
         if (configured.ctrl.period < period * (1.0 - 1e-6)
-                or abs(every * period - configured.ctrl.period) > 1e-6 * configured.ctrl.period):
+                or abs(stride * period - configured.ctrl.period) > 1e-6 * configured.ctrl.period):
             raise ValueError("Unit control periods must be whole multiples of interrupt_period")
         if cfg.meas.rms:
             raise ValueError(f"{name}: hardware RMS requires an ADC-history adapter, not sampled averages")
@@ -319,7 +317,8 @@ def _bindings(simulation, config, model):
             raise ValueError(f"{name}: dead_time must be shorter than half a switching period")
         if cfg.protection.overcurrent.enable and binding.get("hardware_overcurrent_configured") is not True:
             raise ValueError(f"{name}: enabled fast protection requires hardware_overcurrent_configured=true")
-        default_ramp = next((event.ramp for event in configured.events if event.type == "connect"),
+        default_ramp = next((event.ramp for event in (simulation.p.changes if events is None else events)
+                             if event.values.get(f"units.{name}.connected") is True),
                             model.runtime.object(unit.ctrl).startup.ramp)
         ramp = binding.get("startup_ramp", default_ramp)
         _positive(ramp, f"{name}.startup_ramp", zero=True)
@@ -388,15 +387,16 @@ def _parameter_source(runtime, declare):
     for item in runtime.selected:
         kind = "int" if isinstance(item.default, int) else "float"
         value = f"value_{item.member}"
-        effective = _number(runtime.at(runtime.p, item.path))
+        effective = runtime.value(item.path, item.default)
         previous = f"static_cast<{kind}>({effective})"
         declare(item.member, f"volatile {kind} {item.member} = {_number(item.default)};")
         read.append(f"const {kind} {value} = {item.member};")
         changed.append(f"{value} != {previous}")
         assign.append(f"if ({value} != {previous}) {{")
         assign.append(f"    candidate.{item.member} = {value};")
-        if item.derived:
+        if item.derived or isinstance(item.default, bool):
             assign.append(f"    candidate.given_{item.member} = true;")
+        if item.derived:
             publish += [f"if (!peslite_generated::parameters.given_{item.member})",
                         f"    {item.member} = static_cast<{kind}>({effective});"]
         assign.append("}")
@@ -444,7 +444,6 @@ def _source(generators, adc, clocks, period, phase, runtime, *, sampling_period=
             raise ValueError(f"Imperix exported names collide after C++ identifier normalization: {symbol}")
         globals_[symbol] = code
 
-    declare("peslite_run", "volatile int peslite_run = 0;")
     _parameter_source(runtime, declare)
     declare("tick", "namespace { unsigned long long tick = 0; }")
     devices = {item["device"] for item in adc.values()}
@@ -462,13 +461,18 @@ def _source(generators, adc, clocks, period, phase, runtime, *, sampling_period=
     for gen in generators:
         name, tag, binding = gen.name, gen.tag, gen.binding
         instance = f"control_{tag}"
+        command = runtime.by_path[f"units.{name}.connected"].member
+        run = f"peslite_generated::parameters.{command} != 0"
         ready, active = f"ready_{tag}", f"active_{tag}"
         declare(instance, f"peslite_generated::Controller_{tag} {instance};")
         declare(ready, f"unsigned long long {ready} = std::numeric_limits<unsigned long long>::max();")
         declare(active, f"bool {active} = false;")
         init.append(f"{instance} = peslite_generated::Controller_{tag}{{}};")
         init += [f"{ready} = std::numeric_limits<unsigned long long>::max();", f"{active} = false;"]
-        stop += [f"{ready} = std::numeric_limits<unsigned long long>::max();", f"{active} = false;"]
+        init.append(f"{command} = 0; peslite_generated::parameters.{command} = 0;")
+        stop += [f"{command} = 0; peslite_generated::parameters.{command} = 0;",
+                 f"{instance}.command(false);",
+                 f"{ready} = std::numeric_limits<unsigned long long>::max();", f"{active} = false;"]
         read = []
         for key, channels in binding["adc"].items():
             values = [f"({_number(item['sign'])} * {reading(item)})"
@@ -482,7 +486,6 @@ def _source(generators, adc, clocks, period, phase, runtime, *, sampling_period=
             value = ("peslite_generated::abc_to_complex(" + ", ".join(values) + ")"
                      if len(values) == 3 else values[0])
             read.append(f"measured.{_identifier(key)} = {value};")
-        control_stride = _number(gen.graph.period_stride(gen.cfg.ctrl.period, period))
         stride = f"stride_{tag}"
         frequency = _number(gen.cfg.pwm.f_sw)
         depth = max(item.get("history", 1) for channels in binding["adc"].values() for item in channels)
@@ -490,14 +493,14 @@ def _source(generators, adc, clocks, period, phase, runtime, *, sampling_period=
         due = f"tick % {stride} == 0"
         if warmup:
             due += f" && tick >= {warmup}"
-        compute.append(f"const auto {stride} = static_cast<unsigned long long>({control_stride});")
-        compute += [f"{instance}.command(peslite_run != 0);",
-                    f"if (!peslite_run) {ready} = std::numeric_limits<unsigned long long>::max();",
+        compute.append(f"constexpr unsigned long long {stride} = {binding['stride']};")
+        compute += [f"{instance}.command({run});",
+                    f"if (!({run})) {ready} = std::numeric_limits<unsigned long long>::max();",
                     f"if ({due}) {{",
                     f"    peslite_generated::Controller_{tag}::Measurements measured;",
                     *["    " + line for line in read],
                     f"    if (!{instance}.sample(t, measured)) {{ stop_all(); return UNSAFE; }}",
-                    f"    if (peslite_run && {ready} == std::numeric_limits<unsigned long long>::max())",
+                    f"    if (({run}) && {ready} == std::numeric_limits<unsigned long long>::max())",
                     f"        {ready} = tick + static_cast<unsigned long long>(std::ceil(1.0 / ({frequency}) / {_number(period)})) + 1;",
                     "}"]
         mode = "PWMH_ACTIVE" if gen.topology.unilateral else "COMPLEMENTARY"
@@ -522,13 +525,13 @@ def _source(generators, adc, clocks, period, phase, runtime, *, sampling_period=
             deactivate_all.append(deactivate)
         write += [f"if ({due}) {{",
                   *["    " + line for line in duties], "}",
-                  f"const bool enable_{tag} = peslite_run && !{instance}.{gen.m('tripped')} && tick >= {ready};",
+                  f"const bool enable_{tag} = ({run}) && !{instance}.{gen.m('tripped')} && tick >= {ready};",
                   f"if (enable_{tag} != {active}) {{", f"    {active} = enable_{tag};",
                   f"    if ({active}) {{", *["        " + line for line in activate],
                   "    } else {", *["        " + line for line in deactivate_all], "    }", "}"]
-    declare("stop_all", "static void stop_all() {\n    peslite_run = 0;\n"
+    declare("stop_all", "static void stop_all() {\n"
             + "\n".join("    " + line for line in stop) + "\n}\n")
-    declare("UserInit", "tUserSafe UserInit() {\n    peslite_run = 0; tick = 0;\n"
+    declare("UserInit", "tUserSafe UserInit() {\n    tick = 0;\n"
             + ("    if (!update_parameters()) return UNSAFE;\n" if runtime.selected else "")
             + "\n".join("    " + line for line in init) + "\n    return SAFE;\n}\n")
     declare("UserInterrupt", "tUserSafe UserInterrupt() {\n"
@@ -562,7 +565,15 @@ def _export_imperix(simulation, out_dir, name, variables, reusable, *,
         config = target_config
     if simulation.p.simulation.initial.states or simulation.p.simulation.initial.t != 0.0:
         raise ValueError("Imperix starts cold; simulation restart states cannot be deployed")
-    prepared, initializations = _prepare_export(simulation, variables, reusable)
+    # Retain event write targets, not their schedules or assigned values. Hardware and
+    # simulation write the same variables through the existing parameter interface.
+    event_targets = tuple(sorted({path for change in simulation.p.changes
+                                 for path in change.paths}))
+    configurable = bool(variables or event_targets)
+    commands = {f"units.{name}.connected": False for name in simulation.system.units}
+    params = simulation.p.replace(events={}, **commands)
+    variables = tuple(dict.fromkeys((*variables, *event_targets, *commands)))
+    prepared, initializations = _prepare_export(simulation, variables, reusable, params=params)
     fixed = set()
 
     def timing_constants(runtime):
@@ -575,15 +586,19 @@ def _export_imperix(simulation, out_dir, name, variables, reusable, *,
         return fixed
 
     generator, model, diagnostics = _parameter_generator(
-        prepared, name, variables, initializations, constants=timing_constants if variables else None)
+        prepared, name, variables, initializations, constants=timing_constants if configurable else None)
     if fixed:
         diagnostics.append({
             "code": "hardware-timing-constants", "parameters": tuple(sorted(fixed)),
             "message": "Imperix keeps timing parameters constant: " + ", ".join(sorted(fixed)),
         })
     runtime = generator.runtime
+    if missing := set(event_targets) - runtime.by_path.keys():
+        raise ValueError("Imperix event target variables must remain tunable: "
+                         + ", ".join(sorted(missing)))
     model = model if model is not None else _ModelGenerator(prepared, runtime)
-    bindings, adc, clocks, timing, phase, assigned = _bindings(prepared, config, model)
+    bindings, adc, clocks, timing, phase, assigned = _bindings(
+        prepared, config, model, events=simulation.p.changes)
     period = timing["interrupt_period"]
     unit_ids = [_identifier(key) for key in simulation.system.units]
     if len(set(unit_ids)) != len(unit_ids):

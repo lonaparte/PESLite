@@ -204,8 +204,13 @@ It rejects a common period below the SDK's 4 ns clock resolution. Periods still 
 representable on the target, and the resulting CPU rate and execution deadline must be checked
 on hardware; the compiler does not infer a target's ADC throughput or CPU execution budget.
 
-`peslite_run` starts at zero; PWM outputs remain deactivated. Set it from Cockpit only after
-calibration and interlock checks. A new run resets the normal loop integrators. Activation waits
+Every leaf converter exports its `units.<name>.connected` command through the shared parameter
+interface, even when no numeric parameters are selected. Its SDK symbol is
+`param_units_<name>_connected`, using the normal path normalization. Commands start at zero,
+regardless of simulation initial commands; PWM outputs remain deactivated. Set a command to `1`
+from Cockpit only after calibration and interlock checks, and to `0` to block that converter.
+Nested converters have independent commands, listed in `manifest.json`; no global run alias is
+generated. A new run resets the normal loop integrators. Activation waits
 until a freshly computed duty word has had a full carrier period plus one interrupt to latch;
 rapid stop/start cannot immediately re-enable an old compare word. Duty writes occur only on
 controller updates; activation calls occur only on enable transitions. `startup_ramp`
@@ -216,7 +221,7 @@ Sampled voltage/frequency/DC-link protection uses the existing held criteria and
 Enabled fast overcurrent protection requires `hardware_overcurrent_configured: true`: this is
 the operator's declaration of prior hardware setup, not automatic threshold configuration.
 Any generated trip, nonfinite measurement/reference, invalid duty or `UserError`
-deactivates all mapped PWM outputs and clears `peslite_run`. This does not operate external
+deactivates all mapped PWM outputs and clears all connection commands. This does not operate external
 contactors, guarantee behavior after an unhandled CPU/network failure or replace physical interlocks.
 Fault latches require reinitialization; no automatic trip reset is generated.
 The hardware ISR uses fixed-size state without heap allocation or C++ exception handling.
@@ -247,8 +252,10 @@ Unbound physical quantities and controller-internal signals are not automaticall
 
 ## Tunable parameters and Python API
 
-Parameter selection uses the standalone C++ interface: omitted `variables` keeps constants,
-individual paths or sections select numeric parameters, `all` selects available numeric leaves,
+Parameter selection uses the standalone C++ interface: omitted `variables` keeps constants except
+event targets and leaf-unit connection commands, which are always tunable. Individual paths or
+sections select additional numeric parameters and leaf-unit connection commands;
+`all` selects all available leaves,
 and `common` also keeps automatically detected structure-sensitive parameters constant. References
 and controller gains use the same interface, without a separate reference whitelist or naming rule.
 
@@ -272,6 +279,33 @@ Controller states are preserved. Unchanged values do not trigger coefficient rec
 Invalid updates leave the last accepted configuration intact, stop PWM and return `UNSAFE`.
 Derived defaults keep following their source parameters until explicitly changed; their SDK
 variables are refreshed to show the effective values after an accepted update.
+
+Simulation events and Cockpit parameter changes are alternative writers to the same target
+variables. Every normalized event target is automatically included in the ordinary tunable
+parameter selection, even without `all` or an explicit `variables` selection. Repeated events
+writing one target share one variable. Unit composition and SI/pu conversion use the existing
+event bindings; no event-specific naming table is maintained.
+
+The full target path is the variable name. The SDK symbol uses the same
+`param_<path_with_punctuation_replaced_by_underscores>` rule as standalone C++, for example:
+
+| Target variable | SDK symbol | Operation |
+|---|---|---|
+| `units.vsc.connected` | `param_units_vsc_connected` | `1`: start; `0`: stop |
+| `units.vsc.ctrl.references.p_ref_pu` | `param_units_vsc_ctrl_references_p_ref_pu` | Set the power reference |
+| `units.vsc.ctrl.loops.CurrentLoop.bandwidth` | `param_units_vsc_ctrl_loops_CurrentLoop_bandwidth` | Retune the current loop |
+
+`manifest.json` lists the actual paths and symbols under `parameters`. There are no
+`events.<name>.trigger` variables. Event times and event-assigned values are not executed in the
+ELF, including at time zero. Original parameter defaults remain in force until Cockpit writes a
+new value; connection commands still start at zero. Writing a target applies that value through
+the existing checked parameter update or connection lifecycle. It does not replay an event's
+other assignments. Local Python and standalone C++ simulation keep their timed event schedules.
+
+Hardware timing remains fixed. An event target that is not available through the shared parameter
+interface, is a hardware-timing dependency, or would be frozen by `common` fails export rather than
+being silently ignored. Simulated source and branch switching does not create an external hardware
+actuator. Connection commands accept only `0` and `1`.
 
 The ELF contains control code, not the simulated plant or solver. Their selected parameters remain
 exposed, but changing a simulated resistor does not change a physical resistor. SDK hardware limits

@@ -1,6 +1,7 @@
 """Custom loop, element and event example code lives in tests, not examples/."""
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import pytest
@@ -9,7 +10,7 @@ import peslite
 from peslite.assembly import Event, register_event_type
 from peslite.assembly.params import ConfigError, from_dict
 from peslite.components import Element, RLBranch, register_element_type
-from peslite.control import SyncLaw, register_loop_type
+from peslite.control import ANGLE, FREQUENCY, V_AB, V_DQ, Loop, SyncLaw, register_loop_type
 from peslite.solver import SolverStep
 
 
@@ -41,6 +42,48 @@ class _LaggedPSC(SyncLaw):
         self.omega = self.w0 + self.cfg.k_p_pu * (p_ref_pu - self.p_f)
         self.theta += period * self.omega
         self.v_mag = v_ref_pu
+
+
+@register_loop_type
+class _TrackingOscillator(Loop):
+    """An independently implemented loop whose tracking owns nonstandard named state."""
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: Optional[float] = None
+        type: str = "test_tracking_oscillator"
+
+    type = "test_tracking_oscillator"
+    inputs = {"voltage": V_AB}
+    outputs = {"theta": ANGLE, "omega": FREQUENCY, "command": V_DQ}
+    state_names = ("phase", "tracked_magnitude")
+    flow_inputs = ("voltage",)
+    outputs_from_state = True
+
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
+        self.phase = self.tracked_magnitude = 0.0
+
+    def initial_outputs(self):
+        return {"theta": self.phase, "omega": self.unit.base.w0, "command": 1.0 + 0j}
+
+    def track(self, inputs):
+        voltage = inputs["voltage"]
+        if abs(voltage) <= 0.1:
+            return None
+        self.phase = np.arctan2(voltage.imag, voltage.real)
+        self.tracked_magnitude = abs(voltage)
+        return self.initial_outputs()
+
+    def sample(self, t, inputs):
+        if not self.startup.active:
+            self.track(inputs)
+        else:
+            self.phase += self.cfg.period * self.unit.base.w0
+        return self.initial_outputs()
+
+    def flow_path(self, voltage):
+        return self.phase, self.unit.base.w0, 1.0 + 0j, self.unit.base.w0, 0.0
 
 
 @register_element_type
@@ -95,9 +138,8 @@ class _LoadStep(Event):
     type = "test_load_step"
 
     @staticmethod
-    def apply(event, system, _t):
-        branch = system.named_elements[event.target].branch
-        branch.retune(branch.L, branch.R * event.factor)
+    def variables(event, params):
+        return {f"elements.{event.target}.r": params.elements[event.target].r * event.factor}
 
 
 class _Midpoint:
@@ -156,6 +198,18 @@ def test_registered_custom_parts_and_user_solver_work_together(case, tmp_path):
     assert load.R == pytest.approx(0.5 * original_resistance)
     assert any(abs(end - 0.002) < 1e-14 for end in solver.ends)
     assert result.n_rhs > 0
+
+
+def test_custom_variable_bindings_use_the_preceding_parameter_state(case):
+    tree = _custom_case(case)
+    initial = from_dict(tree).elements["load"].r
+    tree["events"]["second_step"] = {
+        "type": "test_load_step", "target": "load", "t": 0.0025, "factor": 0.5,
+    }
+    p = from_dict(tree)
+    changes = [change for change in p.changes if "elements.load.r" in change.values]
+    assert [change.values["elements.load.r"] for change in changes] == pytest.approx(
+        [initial * 0.5, initial * 0.25])
 
 
 @pytest.mark.parametrize(

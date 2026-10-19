@@ -103,6 +103,11 @@ peslite-convert wpt-example all
 peslite-convert buck-example common
 ```
 
+Leaf converters also expose `units.<name>.connected`, the initial connection command. Select it
+individually or through a unit section, `all`, or `common`, and set it to `0` or `1` with `--set`.
+Scheduled connection events retain their normal precedence and timing. The command uses the same
+startup, PWM and protection lifecycle as a local simulation; it is not a writable gate-status flag.
+
 `common` means `all` minus the parameters identified by the existing structural sensitivity
 check. It keeps those detected parameters constant at their configured values; every other
 available numerical parameter remains adjustable. No separate parameter list is maintained.

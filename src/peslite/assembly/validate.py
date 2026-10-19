@@ -429,28 +429,20 @@ def _solver(s) -> None:
 
 
 def _events(p: Params) -> None:
-    """Check event targets, times, and each target's connect/disconnect sequence."""
-    from .params import _unit_leaves
-
-    switched: dict[str, tuple[str, bool]] = {}
-    at: dict[tuple[str, float], str] = {}
+    """Check event payloads; the common variable binder checks writes and switching order."""
     for name, event in sorted(p.events.items(), key=lambda item: item[1].t):
         where = f"events.{name}"
         for key, value in vars(event).items():
             if isinstance(value, float) and not math.isfinite(value):
                 raise ConfigError(f"{where}.{key} must be finite")
+        if event.type not in SWITCHING:
+            continue
         target = getattr(event, "target", None)
         sections = p.sections_of(target) if isinstance(target, str) else ()
         if target is not None and not sections:
             known = sorted(name for named in NAMED for name in getattr(p, named))
             raise ConfigError(f"{where}.target: unknown name {target!r}; known: {known}")
         candidates = tuple(section for section in sections if section in SWITCHABLE)
-        if event.type not in SWITCHING:
-            if len(sections) > 1:
-                raise ConfigError(
-                    f"{where}.target: {target!r} is ambiguous across {list(sections)}"
-                )
-            continue
         if not candidates:
             raise ConfigError(f"{where}.target: {target!r} is a bus, which has no breaker; {event.type} "
                               f"switches a unit, source, branch or element")
@@ -458,23 +450,6 @@ def _events(p: Params) -> None:
             raise ConfigError(
                 f"{where}.target: {target!r} is ambiguous across {list(candidates)}"
             )
-        on = event.type == "connect"
-        leaves = _unit_leaves(p.units, target)
-        affected = leaves if leaves else (target,)
-        for actual in affected:
-            previous = switched.get(actual)
-            if previous is not None and previous[1] == on:
-                detail = (f"{target!r} is already {event.type}ed"
-                          if actual == target else
-                          f"{target!r} also switches {actual!r}, which is already {event.type}ed")
-                raise ConfigError(f"{where}: {detail} by events.{previous[0]}")
-            if (actual, event.t) in at:
-                detail = (f"{target!r} is also switched at t = {event.t}"
-                          if actual == target else
-                          f"{target!r} also switches {actual!r} at t = {event.t}")
-                raise ConfigError(f"{where}: {detail} by events.{at[(actual, event.t)]}")
-            at[(actual, event.t)] = name
-            switched[actual] = (name, on)
 
 
 def _initial(p: Params) -> None:

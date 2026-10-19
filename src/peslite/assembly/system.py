@@ -5,6 +5,7 @@ It also exposes the component operations used by simulation-file events.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
@@ -13,12 +14,27 @@ from ..components.adc import _PortMeasurement
 from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather
-from .events import SWITCHABLE, SWITCHING, SourceScenario
-from .params import Change, Params, _parameterized, _set_assignments, _unit_at, _unit_leaves
+from .events import SWITCHABLE, SourceScenario, connected_at, switching_schedule
+from .params import Change, Params, _parameterized, _unit_at, _unit_leaves
 from .types import unit_type
 from .unit import DCConverter, Unit, VSC
 
 __all__ = ["System"]
+
+
+def _start_connections(system, p: Params, t: float) -> None:
+    """Initialize each connection through its owner, once, before restoring control state."""
+    schedule = switching_schedule(p.changes)
+    for section in SWITCHABLE:
+        owners = getattr(system, "named_elements" if section == "elements" else section, {})
+        for name, owner in owners.items():
+            start = getattr(owner, "start", None)
+            if start is not None:
+                start(t)
+            else:
+                target = f"{section}.{name}"
+                if not connected_at(schedule.get(target, ()), t):
+                    system.switch(target, False, t)
 
 
 def _names(values) -> list[str]:
@@ -127,7 +143,7 @@ def _source_scenario(p: Params, name: str) -> SourceScenario:
     """Construct a source's complete waveform timeline from the common parameter tree."""
     paths = {f"sources.{name}.{field}" for field in ("v", "f", "angle")}
     steps = [(change.t, change.params.sources[name]) for change in p.changes
-             if any(path in paths for path, _ in _set_assignments(p, p.events[change.event]))]
+             if paths.intersection(change.values)]
     return SourceScenario(p.sources[name], p.base.f0, steps)
 
 
@@ -572,15 +588,20 @@ class System:
     # ---------------------------------------------------------------- events
     def switch(self, name: str, on: bool, t: float, ramp: float = 0.0) -> None:
         """Connect or disconnect a named unit, source, branch or registered element."""
-        sections = tuple(
-            section for section in self.p.sections_of(name) if section in SWITCHABLE
-        )
+        section, _, target = name.partition(".")
+        if section in SWITCHABLE and section in self.p.sections_of(target):
+            sections, name = (section,), target
+        else:
+            sections = tuple(section for section in self.p.sections_of(name) if section in SWITCHABLE)
         if len(sections) != 1:
             detail = "unknown" if not sections else f"ambiguous across {list(sections)}"
             raise ValueError(f"cannot switch {name!r}: {detail}")
         section = sections[0]
         if section == "units":
             for leaf in _unit_leaves(self.p.units, name):
+                if on and self.units[leaf].tripped:
+                    warnings.warn(f"t = {t:.6g} s: unit {leaf!r} has tripped, so its connect command "
+                                  "leaves it disconnected", stacklevel=3)
                 self.units[leaf].connect(on, t, ramp)
             return
         if section == "sources":
@@ -597,9 +618,12 @@ class System:
             (breaker.close_breaker if on else breaker.open_breaker)()
 
     def apply(self, change: Change) -> None:
-        """Apply the checked parameter state after one ``set`` event to affected components."""
+        """Write one checked event's parameters and connection commands through existing owners."""
         p, done = change.params, set()
         for path in change.paths:
+            if path in change.connections:
+                self.switch(path.removesuffix(".connected"), change.values[path], change.t, change.ramp)
+                continue
             section, _, remainder = path.partition(".")
             if section == "units":
                 name = _owner(self.units, remainder, remainder.partition(".")[0])
@@ -620,21 +644,21 @@ class System:
                     p.unit(name), change.touches(f"units.{name}."), change.t)
             elif section == "elements":
                 self.named_elements[name].retune(p.elements[name])
-        model = self.model
-        model.energy_specs = {name: spec_of(subsystem)
-                              for name, subsystem in zip(model.names, model.subsystems)}
+        if done:
+            model = self.model
+            model.energy_specs = {name: spec_of(subsystem)
+                                  for name, subsystem in zip(model.names, model.subsystems)}
 
     def check_events(self, p: Params) -> None:
         """Check that custom elements and replacement controllers support their requested events."""
-        for event in p.events.values():
-            if event.type in SWITCHING and event.target in self.named_elements:
-                element = self.named_elements[event.target]
-                if not (hasattr(element, "breakers") or hasattr(element, "connect")):
-                    raise ConfigError(
-                        f"elements.{event.target}: its type has no breakers and no connect(), so "
-                        "connect and disconnect events cannot switch it")
         for change in p.changes:
             for path in change.paths:
+                if path in change.connections:
+                    if path.startswith("elements."):
+                        element = self.named_elements[path[len("elements."):-len(".connected")]]
+                        if not (hasattr(element, "breakers") or hasattr(element, "connect")):
+                            raise ConfigError(f"{path}: its type has no breakers and no connect()")
+                    continue
                 section, _, remainder = path.partition(".")
                 if section == "units":
                     name = _owner(self.units, remainder, remainder.partition(".")[0])

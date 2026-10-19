@@ -28,12 +28,12 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
 
-from ..assembly.events import EVENT_TYPES, SWITCHING, connected_at, switching_schedule
+from ..assembly.events import switching_schedule
 from ..assembly.conduction import DiodeConduction
 from ..assembly.exporter import _signal_names
-from ..assembly.params import (Change, Params, _parameterized, _unit_at, _unit_items, _unit_leaves,
+from ..assembly.params import (Params, _parameterized, _unit_at, _unit_items, _unit_leaves,
                                dump, dumps, load)
-from ..assembly.system import System
+from ..assembly.system import System, _start_connections
 from ..assembly.types import unit_type
 from ..assembly.unit import Plant, Unit
 from ..components.pwm import Modulator
@@ -434,7 +434,7 @@ class Simulation:
         check_events = getattr(self.system, "check_events", None)
         if check_events is not None:
             check_events(p)
-        for needed, what in (("switch", switching_schedule(p.events)), ("apply", p.changes)):
+        for needed, what in (("switch", switching_schedule(p.changes)), ("apply", p.changes)):
             if what and not hasattr(self.system, needed):
                 raise ConfigError(f"the events need a system with {needed}(); "
                                   f"{type(self.system).__name__} has none")
@@ -477,17 +477,7 @@ class Simulation:
     def _actions(self) -> list[tuple[float, int, Any]]:
         """Return file-event actions as ``(time, file_order, action)``."""
         order = {name: index for index, name in enumerate(self.p.events)}
-        actions = [(change.t, order[change.event], change) for change in self.p.changes]
-        actions += [(event.t, order[name], event) for name, event in self.p.events.items()
-                    if event.type != "set"]
-        return sorted(actions, key=lambda action: action[:2])
-
-    def _act(self, what: Any, t: float) -> None:
-        """Apply one file event; the caller repacks the solver vector afterwards."""
-        if isinstance(what, Change):
-            self.system.apply(what)
-        else:
-            EVENT_TYPES[what.type].apply(what, self.system, t)
+        return [(change.t, order[change.event], change) for change in self.p.changes]
 
     def _ratings(self):
         """Return a function giving the rated (effort, flow) of a storage, or ``None``."""
@@ -636,16 +626,13 @@ class Simulation:
         values = self._initial_values(t0)
         # 1. power stage (unset states stay zero), events up to t0, then the solver vector
         self._states.load(values, ["", *system.units])
-        if hasattr(system, "switch"):
-            for name, steps in switching_schedule(self.p.events).items():
-                if not connected_at(steps, t0):
-                    system.switch(name, False, t0)
         for event_t, _, what in self._actions():
-            if event_t <= t0 + _EPS and getattr(what, "type", None) not in SWITCHING:
-                self._act(what, event_t)
-        # 2. each unit's host command as at the start
-        for unit in system.units.values():
-            unit.start(t0)
+            if event_t <= t0 + _EPS:
+                paths = tuple(path for path in what.paths if path not in what.connections)
+                if paths:
+                    system.apply(dataclasses.replace(what, paths=paths, connections=()))
+        # 2. each connection owner establishes its initial command once
+        _start_connections(system, self.p, t0)
         # 3. controllers, PWM registers, measurement windows and solver
         self._continued = set()
         self._windows_given = set()
@@ -878,7 +865,7 @@ class Simulation:
                 else:
                     settle_now()
                 while actions and actions[0][0] <= t_stop + _EPS:
-                    self._act(actions.popleft()[2], t_stop)
+                    system.apply(actions.popleft()[2])
                 if parameters_changed is not None:
                     parameters_changed()
                 plant.read_state()
