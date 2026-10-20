@@ -3,7 +3,7 @@
 PESLite installs two commands:
 
 - `peslite`: run, inspect or export a simulation;
-- `peslite-convert`: export a standalone C++ simulator or an ELF executable for Imperix hardware.
+- `peslite-convert`: export a standalone C++ simulator or an experimental Imperix ELF executable.
 
 Use `peslite --help` and `peslite-convert --help` for the interface of the installed version.
 
@@ -179,7 +179,7 @@ peslite-convert case.pes all --out export/my-simulator
 It emits `peslite.cpp` in `export/<name>/` or the explicit `--out` directory. Compilation and
 backend limitations are documented in [C++ Export](Cpp-Export.md).
 
-Use `--imperix` for [Imperix ELF export](Imperix-Export.md):
+Use `--imperix` for [Imperix ELF export (Experimental)](Imperix-Export.md):
 
 ```bash
 peslite-convert case.pes --imperix

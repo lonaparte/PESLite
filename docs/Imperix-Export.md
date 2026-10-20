@@ -1,4 +1,7 @@
-# Imperix ELF Export
+# Imperix ELF Export (Experimental)
+
+> Experimental: Interfaces and generated output may change. Host-side tests do not establish
+> SDK or hardware acceptance; validate the generated code with the target SDK and hardware before use.
 
 The `imperix` backend exports an ELF executable for Imperix hardware using the official CPP SDK.
 The executable runs the configured sampled control logic, not the simulated power circuit.
