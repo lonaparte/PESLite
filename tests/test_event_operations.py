@@ -214,7 +214,7 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
         "units.vsc.protection.rocof.window": 0.2,
     }}
     p = from_dict(tree)
-    change = p.changes[0]
+    change = next(change for change in p.changes if change.event == "retune")
     system = peslite.System(p)
     system.check_events(p)
 

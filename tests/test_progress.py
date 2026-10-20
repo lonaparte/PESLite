@@ -49,7 +49,7 @@ def test_watch_values_match_result_columns_and_states(gfl, monkeypatch, tmp_path
         "simulation.t_end": 0.002,
         "simulation.progress.enable": 1,
         "simulation.progress.period": 1e-3,
-        "simulation.progress.watch": ["pcc.v_a"],
+        "simulation.progress.watch": ["pcc.u_a"],
     })
     seen = {}
     values_at = peslite.Simulation.watch_values
@@ -64,7 +64,7 @@ def test_watch_values_match_result_columns_and_states(gfl, monkeypatch, tmp_path
     index = int(np.argmin(abs(result.t - t)))
     assert result.t[index] == pytest.approx(t)
     columns = result.columns()
-    for name in ("pcc.v_a", "vsc.u_dc", "vsc.id_pu", "grid.angle"):
+    for name in ("pcc.u_a", "vsc.u_dc", "vsc.id_pu", "grid.angle"):
         assert values[name] == pytest.approx(columns[name][index]), name
     state = complex(result.states["pcc.u_C.re"][index],
                     result.states["pcc.u_C.im"][index])

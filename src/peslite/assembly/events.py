@@ -8,12 +8,9 @@ custom types are classes registered with :func:`register_event_type`.
 from __future__ import annotations
 
 import math
-import warnings
 from bisect import bisect_right
 from dataclasses import dataclass, field, is_dataclass
 from typing import Any, Callable, ClassVar, Iterable, Mapping, Optional
-
-from ..solver.model import ConfigError
 
 __all__ = [
     "NAMED", "SWITCHABLE", "SWITCHING", "Event", "EVENT_TYPES", "register_event_type",
@@ -30,15 +27,15 @@ class Event:
     """Base class of a registered event type.
 
     A type supplies ``type``, a frozen ``Params`` dataclass containing at least ``type`` and ``t``,
-    and ``apply(event, system, t)``. The run calls ``apply`` at the exact event time, after settling
-    the preceding integration interval and before starting the next one.
+    and ``variables(event, params)`` returning the parameter or connection-command paths to write.
+    Bindings are resolved and checked during assembly, not by arbitrary runtime callbacks.
     """
 
     type: ClassVar[str]
     Params: ClassVar[type]
 
     @staticmethod
-    def apply(event: Any, system: Any, t: float) -> None:
+    def variables(event: Any, params: Any) -> Mapping[str, Any]:
         raise NotImplementedError
 
 
@@ -57,8 +54,11 @@ def register_event_type(cls: type) -> type:
         raise TypeError(f"event type {name!r}: Params must be a dataclass with type and t fields")
     if params.__dataclass_fields__["type"].default != name:
         raise TypeError(f"event type {name!r}: Params.type must default to {name!r}")
-    if getattr(cls, "apply", Event.apply) is Event.apply:
-        raise TypeError(f"event type {name!r}: it needs apply(event, system, t), which runs it")
+    variables = getattr(cls, "variables", None)
+    if not callable(variables) or variables is Event.variables:
+        raise TypeError(f"event type {name!r}: it needs variables(event, params), declaring its writes")
+    if hasattr(cls, "apply"):
+        raise TypeError(f"event type {name!r}: use variable bindings, not an apply() callback")
     EVENT_TYPES[name] = cls
     return cls
 
@@ -74,19 +74,12 @@ class Connect(Event):
         t: float
         ramp: float = 0.0
 
-        def __post_init__(self) -> None:
-            if not (math.isfinite(self.ramp) and self.ramp >= 0.0):
-                raise ConfigError(f"ramp must be finite and >= 0, got {self.ramp}")
-
     type = "connect"
 
     @staticmethod
-    def apply(event: Any, system: Any, t: float) -> None:
-        unit = getattr(system, "units", {}).get(event.target)
-        if unit is not None and getattr(unit, "tripped", getattr(unit, "breaker_open", False)):
-            warnings.warn(f"t = {t:.6g} s: unit {event.target!r} has tripped, so its connect event "
-                          f"leaves it disconnected", stacklevel=4)
-        system.switch(event.target, True, t, event.ramp)
+    def variables(event: Any, params: Any) -> Mapping[str, Any]:
+        section, = (section for section in params.sections_of(event.target) if section in SWITCHABLE)
+        return {f"{section}.{event.target}.connected": True}
 
 
 @register_event_type
@@ -102,45 +95,50 @@ class Disconnect(Event):
     type = "disconnect"
 
     @staticmethod
-    def apply(event: Any, system: Any, t: float) -> None:
-        system.switch(event.target, False, t)
+    def variables(event: Any, params: Any) -> Mapping[str, Any]:
+        return {path: False for path in Connect.variables(event, params)}
 
 
+@register_event_type
 class Set(Event):
-    """Set runtime-changeable parameter paths to new values at ``t``."""
+    """Write checked parameter and connection-command variables at ``t``."""
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
         type: str = "set"
         t: float
         set: dict = field(default_factory=dict)
+        ramp: float = 0.0
 
     type = "set"
 
+    @staticmethod
+    def variables(event: Any, params: Any) -> Mapping[str, Any]:
+        return event.set
 
-# A set event is applied through the checked Change object held by Params.changes.
-EVENT_TYPES["set"] = Set
 
-
-def events_for(events: Mapping[str, Any], target: str, type: Optional[str] = None) -> list:
-    """Return events aimed at ``target``, optionally restricted to ``type``, in time order."""
-    found = [event for event in events.values()
-             if getattr(event, "target", None) == target and (type is None or event.type == type)]
+def events_for(events: Iterable[Any], target: str) -> list:
+    """Return checked events writing to a fully scoped target or one of its children."""
+    found = [event for event in events if any(path.startswith(target + ".") for path in event.values)]
     return sorted(found, key=lambda event: event.t)
 
 
-def switching_schedule(events: Mapping[str, Any]) -> dict[str, list[tuple[float, bool]]]:
+def switching_schedule(events: Iterable[Any]) -> dict[str, list[tuple[float, bool]]]:
     """Return each target's time-ordered ``(time, connected)`` steps."""
     out: dict[str, list[tuple[float, bool]]] = {}
-    for event in events.values():
-        if event.type in SWITCHING:
-            out.setdefault(event.target, []).append((event.t, event.type == "connect"))
+    for event in events:
+        for path in event.connections:
+            out.setdefault(path.removesuffix(".connected"), []).append((event.t, event.values[path]))
     return {target: sorted(steps) for target, steps in out.items()}
+
+
+def _initial_connection(steps, initial=None):
+    return initial if initial is not None else not steps[0][1] if steps else True
 
 
 def connected_at(steps: list[tuple[float, bool]], t: float) -> bool:
     """Return a target's state at ``t``; before its first step it is in the opposite state."""
-    state = not steps[0][1] if steps else True
+    state = _initial_connection(steps)
     for event_t, connected in steps:
         if event_t > t + 1e-10:
             break
@@ -155,15 +153,20 @@ class Scenario:
     command into physical connection and controller start-up actions.
     """
 
-    def __init__(self, events: Iterable[Any] = ()) -> None:
+    def __init__(self, events: Iterable[Any] = (), target: Optional[str] = None,
+                 *, initial: Optional[bool] = None) -> None:
         events = sorted(events, key=lambda event: event.t)
-        self._commands = tuple((event.t, event.type == "connect",
-                                event.ramp if event.type == "connect" else 0.0)
-                               for event in events if event.type in SWITCHING)
+        paths = {path for event in events for path in event.connections
+                 if target is None or path == target + ".connected"}
+        if len(paths) > 1:
+            raise ValueError("a connection scenario needs one fully scoped target")
+        self._commands = tuple((event.t, event.values[path], event.ramp)
+                               for event in events for path in event.connections if path in paths)
+        self._initial = _initial_connection(self._commands, initial)
 
     def at(self, t: float) -> tuple[bool, float, float]:
         """Return ``(connected, last_connect_time, ramp)`` in force at ``t``."""
-        connected = not self._commands[0][1] if self._commands else True
+        connected = self._initial
         since, ramp = -math.inf, 0.0
         for event_t, on, requested_ramp in self._commands:
             if event_t > t + 1e-10:

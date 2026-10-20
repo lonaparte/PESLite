@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from peslite.assembly.cpp import (_ALGEBRAIC_SOLVER, _ControlGenerator, _ModelGenerator,
-                                  _number, _uses_implementation)
+                                  _RuntimeParameters, _number, _uses_implementation)
 from peslite.components import Bag
 from peslite.components.converter import DCCapacitor, DCLink, DCVoltageSource
 from peslite.components.network import RLBranch, RCNode, ThreePhaseSource
@@ -16,6 +16,11 @@ from peslite.control import Loop
 from peslite.control.blocks import PI
 from peslite.control.loops import DUTY_RATIO
 from test_cpp_export import _compiler
+
+
+def test_parameter_identifier_collisions_are_rejected_by_the_shared_interface():
+    with pytest.raises(ValueError, match="parameter names collide"):
+        _RuntimeParameters({"same.name": 1.0, "same_name": 2.0}, ("all",))
 
 
 def _generator(model):

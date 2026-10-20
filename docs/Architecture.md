@@ -93,6 +93,14 @@ bridge and `DCConverter` a selectable scalar half or full bridge. The same
 `DCConverter` also serves as each full-bridge port of a resonant link. Each assembled specialization
 owns its power stage, controller, sensing, startup interface, breakers and gates.
 
+Construction assembles these objects without issuing connection commands. Before loading named
+control state, the connection owner initializes its source and controller command once from the
+event timeline. After state loading, cold starts track the physical inputs and restore
+bridge/ADC timing; restarts preserve the supplied control state. Cold-start and reconnect
+tracking use the same loop `track()`
+callbacks in Python and generated C++, including custom loops. Parameter selection does not
+change this initialization sequence.
+
 The contract also assembles two internal power boundaries. `<unit>.bus.dc` connects a DCLink
 voltage driver to the bridge DC terminal. `<unit>.bus.power` always denotes the bridge power-side
 bus: it connects the bridge to a series filter or, for an unfiltered nested converter, directly to
@@ -125,7 +133,7 @@ Parameter ownership is explicit:
 
 | Scope | Selector | Fields interpreted in that scope |
 |---|---|---|
-| Common converter unit | none | `bus`, `dclink`, `pwm`, `ctrl`, `bridge`, `meas`, `protection`, `s_base`, resolved `base`, and unit events |
+| Common converter unit | none | `bus`, initial `connected` command, `dclink`, `pwm`, `ctrl`, `bridge`, `meas`, `protection`, `s_base`, resolved `base`, and unit events |
 | VSC only | `unit.type: vsc` | `ac_filter` |
 | DC converter only | `unit.type: dc_converter` | `filter`; a composite parent may omit it and the common `bus`, creating a scoped internal power bus |
 | WPT composite only | `unit.type: wpt` | `primary`, `secondary`, and `link`; it has no bridge, PWM or controller of its own |

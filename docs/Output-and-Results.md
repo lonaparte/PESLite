@@ -69,6 +69,12 @@ Complex states are split into `.re` and `.im` CSV columns. Boolean state is writ
 Unit prefixes distinguish the same signal on multiple converters, such as `vsc_1.vdc_pu` and
 `vsc_2.vdc_pu`.
 
+Physical signal exports preserve the original field name. Three-phase signals only append
+`_a`, `_b` and `_c`: `vsc.u_g` becomes `vsc.u_g_a`, `vsc.u_g_b`, `vsc.u_g_c`; `vsc.i_c` becomes
+`vsc.i_c_a`, `vsc.i_c_b`, `vsc.i_c_c`; `pcc.u` becomes `pcc.u_a`, `pcc.u_b`, `pcc.u_c`.
+Scalar signals keep their names. Python CSV output and standalone C++ share this naming rule.
+States retain their `.re` / `.im` representation.
+
 Aliases such as `<unit>.i_c` and `<unit>.u_dc` may resolve to the underlying physical state. Use
 `--list-states` to print the exact state columns for one configuration.
 

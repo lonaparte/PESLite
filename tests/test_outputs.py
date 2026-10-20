@@ -3,12 +3,16 @@
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import peslite
+from peslite.assembly.exporter import _signal_names
+from peslite.control.blocks import complex2abc
 from peslite.solver.model import ConfigError
+from peslite.solver.simulation import _plant_output_row
 
 
 UNIT_SUFFIX = re.compile(r"_(s|hz|hz_s|J|rad)$")
@@ -16,6 +20,27 @@ UNIT_SUFFIX = re.compile(r"_(s|hz|hz_s|J|rad)$")
 
 def _run(params, out):
     return peslite.Simulation(params).run(out_dir=out)
+
+
+@pytest.mark.parametrize("path", ["pcc.u", "vsc.u_g", "vsc.i_c", "charger.primary.custom_signal", "signal"])
+def test_signal_names_preserve_arbitrary_paths_and_only_append_phase_suffixes(path):
+    assert _signal_names(path) == (path,)
+    names = tuple(f"{path}_{phase}" for phase in "abc")
+    assert _signal_names(path, 3) == names
+    params = SimpleNamespace(units={}, sources={})
+    row = _plant_output_row(params, 0.0, {path: 2.0 + 3.0j}, {})
+    assert tuple(row) == ("t", *names)
+    np.testing.assert_array_equal([row[name] for name in names], complex2abc(2.0 + 3.0j))
+    assert _plant_output_row(params, 0.0, {path: 2.0}, {}) == {"t": 0.0, path: 2.0}
+
+
+def test_physical_signals_and_watch_preserve_canonical_names(gfl, tmp_path):
+    simulation = peslite.Simulation(gfl(**{"simulation.output.signals": True}))
+    result = simulation.run(out_dir=tmp_path)
+    names = {f"{path}_{phase}" for path in ("pcc.u", "vsc.u_g", "vsc.i_c") for phase in "abc"}
+    assert names <= result.plant.keys()
+    assert names <= simulation.watch_values(result.summary["t_stop"], {}).keys()
+    assert not any(name.startswith(("pcc.v_", "vsc.v_", "vsc.i_conv_")) for name in result.plant)
 
 
 def test_run_uses_a_default_output_directory(gfl, tmp_path, monkeypatch):

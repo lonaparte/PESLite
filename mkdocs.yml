@@ -27,6 +27,7 @@ nav:
       - Output and Results: Output-and-Results.md
   - Advanced:
       - C++ Export: Cpp-Export.md
+      - Imperix Export: Imperix-Export.md
       - Extending PESLite: Extending-PESLite.md
       - Architecture: Architecture.md
   - Reference:

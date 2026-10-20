@@ -34,6 +34,7 @@ units:                     # converters, one entry each
   vsc:
     type: vsc
     bus: pcc               # terminal bus, fed through the filter branch
+    # connected: null      # initial command: 0 | 1; null infers it from connection events
     # s_base: 2.0e6        # the converter's rating (default: the system base)
 
     ac_filter:             # bridge --[R, L]-- bus

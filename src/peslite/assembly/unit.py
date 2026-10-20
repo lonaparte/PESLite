@@ -223,8 +223,7 @@ class Unit(ABC):
         effective = bool(on) and not self.tripped
         self.breaker = effective
         self._update_terminal()
-        self.dclink.connect(effective, t, ramp)
-        self._controller_command(effective, ramp, t)
+        self._connection_command(effective, t, ramp)
         if self.continuous:
             self._track_due = effective and not was_active
             self.bridge.enabled = effective
@@ -249,8 +248,15 @@ class Unit(ABC):
         self._shutdown(t)
 
     def start(self, t: float) -> None:
-        """Prepare the controller command before initial named states are loaded."""
-        since, _ramp = self._start_controller(t)
+        """Initialize the source and controller command before loading named control state."""
+        initialize = getattr(self.ctrl, "initialize", None)
+        if initialize is not None:
+            initialize()
+        self._initially_connected, since, ramp = self.scenario.at(t)
+        start = since if self._initially_connected and math.isfinite(since) else t
+        self._connection_command(self._initially_connected, start,
+                                 ramp if self._initially_connected else 0.0,
+                                 reset=False, at=t)
         if not self._initially_connected or self.continuous:
             return
         states = getattr(self.ctrl, "get_state", None)
@@ -265,11 +271,20 @@ class Unit(ABC):
 
     def begin(self, t: float, plant: Plant, continued: bool, window_given: bool) -> None:
         """Track the initial plant state and restore bridge and ADC timing."""
+        if self._initially_connected and not continued:
+            self.track(t, plant)
+        self.begin_timing(t, plant, continued, window_given)
+
+    def track(self, t: float, plant: Plant) -> None:
+        """Track control state from instantaneous physical inputs, without advancing time."""
         track = getattr(self.ctrl, "track", None)
-        if self._initially_connected and not continued and track is not None:
+        if track is not None:
             plant.outputs(t)
             with plant.change():
                 track(self._instantaneous_measurement(t))
+
+    def begin_timing(self, t: float, plant: Plant, continued: bool, window_given: bool) -> None:
+        """Restore bridge and ADC timing after initial state has been loaded."""
         self._track_due = False
         if self.continuous:
             self._start_continuous_bridge(t)
@@ -297,11 +312,8 @@ class Unit(ABC):
         if self.continuous:
             plant.outputs(t)
             if self._track_due:
-                track = getattr(self.ctrl, "track", None)
-                if track is not None:
-                    with plant.change():
-                        track(self._instantaneous_measurement(t))
-                    plant.outputs(t)
+                self.track(t, plant)
+                plant.outputs(t)
                 self._track_due = False
             self.ctrl.startup.at(t)
             rms_fresh = self.adc is not None and self.adc.sample_rms(t)
@@ -371,17 +383,12 @@ class Unit(ABC):
         if command is not None:
             command(run, ramp)
 
-    def _start_controller(self, t: float) -> tuple[float, float]:
-        """Apply the scenario command before named states are restored."""
-        self._initially_connected, since, ramp = self.scenario.at(t)
-        start = since if self._initially_connected and math.isfinite(since) else t
-        self._controller_command(
-            self._initially_connected,
-            ramp if self._initially_connected else 0.0,
-            start,
-            reset=False,
-        )
-        return since, ramp
+    def _connection_command(self, run: bool, t: float, ramp: float, *, reset: bool = True,
+                            at: float | None = None) -> None:
+        """Apply one source/controller command; completed initial ramps need no live callback."""
+        source_ramp = ramp if at is None or at < t + ramp else 0.0
+        self.dclink.connect(run, t, source_ramp)
+        self._controller_command(run, ramp, t, reset=reset)
 
     def _retune_controller(self, cfg: UnitParams, paths: list[str], t: float,
                            excluded: tuple[str, ...] = ()) -> None:
@@ -576,13 +583,10 @@ class VSC(Unit):
         self.name = name
         self.cfg = cfg
         self.bus = bus
-        self.scenario = sc = Scenario(cfg.events)
+        self.scenario = Scenario(cfg.events, f"units.{name}", initial=cfg.connected)
 
         # ------------------------------------------------------------ power
         self.dclink = _parameterized(make_dclink, cfg.dclink)
-        t0 = sim.initial.t
-        connected, since, ramp = sc.at(t0)
-        self.dclink.connect(connected, since, ramp if t0 < since + ramp else 0.0)
         try:
             self.bridge = _parameterized(lambda c: make_bridge(c, modulator), cfg)
         except ValueError as exc:
@@ -699,7 +703,7 @@ class VSC(Unit):
         return {
             "meas.u_g": values["u_g"] / self.cfg.base.v_phase_peak,
             "meas.i_c": values["i_c"] / self.cfg.base.i_phase_peak,
-            "meas.u_dc": values["u_dc"] / self.cfg.dc_base.v,
+            "meas.u_dc": values["u_dc"] / self.cfg.dclink.vdc_ref,
         }
 
     def _protection_currents(self) -> tuple[float, ...]:
@@ -756,16 +760,10 @@ class DCConverter(Unit):
                  ctrl: Optional[Any] = None, modulator: Optional[Modulator] = None) -> None:
         self.name = name
         self.cfg = cfg
-        self.scenario = Scenario(cfg.events)
+        self.scenario = Scenario(cfg.events, f"units.{name}", initial=cfg.connected)
         self.bus = bus
         topology = make_topology(cfg.bridge)
         self.dclink = _parameterized(make_dclink, cfg.dclink)
-        connected, since, ramp = self.scenario.at(sim.initial.t)
-        self.dclink.connect(
-            connected,
-            since,
-            ramp if sim.initial.t < since + ramp else 0.0,
-        )
         self.branch_f = None if cfg.filter is None else _parameterized(lambda c: RLBranch(
             c.l_f,
             c.r_f,

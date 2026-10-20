@@ -17,6 +17,37 @@ events:
 Event names are user-defined and unique. `target` refers to a named unit, source, branch or element
 for connect/disconnect operations.
 
+Every event is bound to explicit writable variable paths during assembly. The scheduler writes
+those variables at the event time; it does not execute an arbitrary event callback. Parameter
+paths retain their ordinary SI/pu conversion, validation and retuning behavior.
+
+Connection commands use `<section>.<object>.connected`, with boolean values or the usual `1`/`0`
+switch syntax. `connect` and
+`disconnect` are shorthand for writing that same command variable. For example:
+
+```yaml
+events:
+  start: {type: set, t: 0.2, ramp: 0.5, set: {units.vsc.connected: true}}
+  stop: {type: set, t: 2.0, set: {units.vsc.connected: false}}
+```
+
+These are commands, not writable protection or breaker-status flags: the normal unit connection,
+startup and trip-latch logic still determines the physical state. Composite-unit commands bind
+to their existing leaf-unit paths once during assembly. Fully scoped paths distinguish objects
+with the same name in different sections. Multiple events may write the same variable at different
+times; no per-event trigger variable is created. Conflicting writes at one time are rejected.
+
+An individual converter's optional `connected` field supplies its initial command before event
+writes. If unspecified, the existing rule applies: the unit starts in the opposite state to its
+first connection event, or connected when it has no connection events. Events at or before the
+simulation start take precedence; later events continue to write the same command normally.
+
+The same leaf-unit path can be selected for C++ export, for example
+`peslite-convert case.pes units.vsc.connected`, then set before starting the executable with
+`--set units.vsc.connected=0` or `=1`. It is also included by `all` and `common`.
+The command does not reset a protection latch or force a PWM register load. In sampled models,
+startup, control computation and the existing PWM load timing determine when the gates activate.
+
 ### `connect`
 
 Connects the target at `t`. A converter connect also issues its controller startup command and may
@@ -66,6 +97,10 @@ simulation:
 
 The state names are the `states.csv` columns. Complex state can use a two-element value or `.re`
 and `.im` paths. The start time is not aligned or rounded to a PWM or solver grid.
+
+Parameter events at or before the start time, including `t: 0`, take effect before controller
+startup. Explicit controller state overrides are loaded afterward and retain precedence. Python
+simulation and standalone C++ export use the same initialization order.
 
 ## Continue from a saved CSV
 
@@ -127,5 +162,7 @@ The continuation output starts a new result directory; PESLite does not append t
 ## Custom events
 
 Register a custom event class with `register_event_type`. Its frozen `Params` dataclass must include
-`type` and `t`, and `apply(event, system, t)` performs the action. Custom events receive the same
-exact-boundary scheduling as built-in events. See [Extending PESLite](Extending-PESLite.md).
+`type` and `t`. Its pure `variables(event, params)` function declares a nonempty mapping of paths
+to values. Bindings are evaluated against the parameter state preceding the event during assembly;
+the common writer performs the checked update at the exact boundary. Action-only callbacks are
+not supported. See [Extending PESLite](Extending-PESLite.md).

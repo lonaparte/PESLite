@@ -9,7 +9,7 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly import Event, register_event_type
-from peslite.assembly.params import ConfigError, from_dict, read_tree, to_dict
+from peslite.assembly.params import ConfigError, _unit_leaves, from_dict, read_tree, to_dict
 from peslite.components import LCCLink, SSLink
 from peslite.control import GraphController, ResonantModulation
 
@@ -28,8 +28,9 @@ class _PortScaledEvent(Event):
     type = "test_wpt_port_scale"
 
     @staticmethod
-    def apply(event, system, t):
-        pass
+    def variables(event, params):
+        return {f"units.{name}.protection.hold": event.level_pu
+                for name in _unit_leaves(params.units, event.target)}
 
 
 def _tree():
@@ -194,8 +195,10 @@ def test_composite_switching_event_is_inherited_by_both_children():
     }
     params = from_dict(tree)
 
-    for unit in (params.unit("charger.primary"), params.unit("charger.secondary")):
-        assert [(event.type, event.t) for event in unit.events] == [("connect", 5.0e-6)]
+    for name in ("charger.primary", "charger.secondary"):
+        unit = params.unit(name)
+        assert unit.events[0] is params.changes[0]
+        assert [(event.values[f"units.{name}.connected"], event.t) for event in unit.events] == [(True, 5.0e-6)]
 
     system = peslite.System(params)
     system.switch("charger", False, 0.0)

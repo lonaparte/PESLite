@@ -26,9 +26,6 @@ def _set(name, t, **paths):
     return _event(name, type="set", t=t, set=paths)
 
 
-RUNS = []
-
-
 @register_event_type
 class _Mark(Event):
     @dataclass(frozen=True, kw_only=True)
@@ -44,8 +41,8 @@ class _Mark(Event):
     type = "test_mark"
 
     @staticmethod
-    def apply(event, system, t):
-        RUNS.append((event.label, system, t))
+    def variables(event, params):
+        return {f"units.{event.target}.ctrl.references.iq_ref_pu": event.level_pu}
 
 
 def test_builtin_and_custom_event_types_are_registered_and_typed():
@@ -54,12 +51,9 @@ def test_builtin_and_custom_event_types_are_registered_and_typed():
     p = _gfl().replace(**_event("mark", type="test_mark", target="vsc", t=0.3, label="seen"))
     assert p.events["mark"].label == "seen"
     assert [event.t for event in p.unit("vsc").events] == [0.2, 0.3]
-    marker = object()
-    RUNS.clear()
-    EVENT_TYPES["test_mark"].apply(p.events["mark"], marker, 0.3)
-    assert RUNS == [("seen", marker, 0.3)]
+    assert p.changes[-1].values == {"units.vsc.ctrl.references.iq_ref_pu": 0.0}
 
-    with pytest.raises(ConfigError, match="events.mark.target: unknown name"):
+    with pytest.raises(ConfigError, match="units.nope.*unknown writable variable"):
         _gfl().replace(**_event("mark", type="test_mark", target="nope", t=0.3))
     scaled = _gfl().replace(**_event("mark", type="test_mark", target="vsc", t=0.3,
                                      level=_gfl().unit("vsc").base.i_phase_peak))
@@ -75,7 +69,7 @@ def test_builtin_and_custom_event_types_are_registered_and_typed():
 
         type = "test_silent"
 
-    with pytest.raises(TypeError, match="it needs apply"):
+    with pytest.raises(TypeError, match="it needs variables"):
         register_event_type(Silent)
 
 
@@ -127,10 +121,10 @@ def test_switching_schedule_and_scenario_connection_ramps():
         **_event("off", type="disconnect", target="vsc", t=2.0),
         **_event("on", type="connect", target="vsc", t=3.0, ramp=2.0),
     )
-    schedule = switching_schedule(p.events)["vsc"]
+    schedule = switching_schedule(p.changes)["units.vsc"]
     assert schedule == [(0.2, True), (2.0, False), (3.0, True)]
     assert not connected_at(schedule, 0.1) and connected_at(schedule, 1.0)
-    scenario = Scenario(events_for(p.events, "vsc"))
+    scenario = Scenario(events_for(p.changes, "units.vsc"))
     assert not scenario.connected(0.1) and scenario.connected(0.7)
     assert not scenario.connected(2.5) and scenario.connected(4.0)
     assert scenario.since(4.0) == (3.0, 2.0)
@@ -154,9 +148,10 @@ def test_set_events_are_applied_and_validated_in_order():
                                 "units.vsc.protection.frequency.limit": 0.5}),
         **_set("retune", 2.0, **{"units.vsc.protection.frequency.limit": 0.8}),
     )
-    assert [change.event for change in p.changes] == ["enable", "retune"]
-    assert [change.params.unit("vsc").protection.frequency.limit for change in p.changes] == [0.5, 0.8]
-    assert p.changes[0].touches("units.vsc.") == [
+    changes = [change for change in p.changes if not change.connections]
+    assert [change.event for change in changes] == ["enable", "retune"]
+    assert [change.params.unit("vsc").protection.frequency.limit for change in changes] == [0.5, 0.8]
+    assert changes[0].touches("units.vsc.") == [
         "protection.frequency.enable", "protection.frequency.limit"]
 
     with pytest.raises(ConfigError, match="required when enable is 1"):
@@ -170,7 +165,7 @@ def test_set_events_are_applied_and_validated_in_order():
 def test_set_paths_use_si_pu_rules_and_detect_same_time_conflicts():
     p = _gfl().replace(**_set("power", 1.0, **{"units.vsc.ctrl.references.p_ref": 1e6}))
     assert p.events["power"].set == {"units.vsc.ctrl.references.p_ref": 1e6}
-    assert p.changes[0].params.unit("vsc").ctrl.references.p_ref_pu == pytest.approx(0.5)
+    assert p.changes[-1].params.unit("vsc").ctrl.references.p_ref_pu == pytest.approx(0.5)
 
     with pytest.raises(ConfigError, match="is also set at t = 1.0"):
         _gfl().replace(
@@ -187,7 +182,7 @@ def test_source_scenario_preserves_frequency_phase_and_voltage_changes():
         **_set("angle", 2.0, **{"sources.grid.angle": 0.1}),
         **_set("voltage", 3.0, **{"sources.grid.v_pu": 0.9}),
     )
-    steps = [(change.t, change.params.sources["grid"]) for change in p.changes]
+    steps = [(change.t, change.params.sources["grid"]) for change in p.changes if not change.connections]
     scenario = SourceScenario(p.sources["grid"], p.base.f0, steps)
     assert scenario.angle(0.5) == 0.0
     assert scenario.angle(1.5) == pytest.approx(math.pi)
@@ -210,3 +205,96 @@ def test_events_round_trip_in_resolved_file_and_set_paths_are_replaceable():
     rebuilt = from_dict(yaml.safe_load(dumps(q)))
     assert rebuilt.events["power"].set == q.events["power"].set
     assert rebuilt.changes[0].paths == q.changes[0].paths
+
+
+def test_connection_events_and_explicit_variable_writes_have_the_same_binding():
+    original = _gfl()
+    explicit = original.replace(**{"events": {
+        "start": {"type": "set", "t": 0.2, "set": {"units.vsc.connected": True}},
+    }})
+    left, right = original.changes[0], explicit.changes[0]
+    assert left.values == right.values == {"units.vsc.connected": True}
+    assert left.connections == right.connections == ("units.vsc.connected",)
+    assert left.params is None and right.params is None
+    assert switching_schedule(original.changes) == switching_schedule(explicit.changes)
+    scenario = Scenario(explicit.unit("vsc").events)
+    assert not scenario.connected(0.1) and scenario.connected(0.3)
+
+
+@pytest.mark.parametrize("value", [-1, 2, 0.5, "true", None])
+def test_connection_variables_require_boolean_values(value):
+    with pytest.raises(ConfigError, match="expected 1 .* or 0"):
+        _gfl().replace(**_set("stop", 0.3, **{"units.vsc.connected": value}))
+
+
+@pytest.mark.parametrize("value", [False, 0, 0.0])
+def test_connection_variables_follow_the_existing_switch_syntax_and_round_trip(value):
+    p = _gfl().replace(**_set("stop", 0.3, **{"units.vsc.connected": value}))
+    assert p.changes[-1].values == {"units.vsc.connected": False}
+    assert from_dict(yaml.safe_load(dumps(p))).changes[-1].values == p.changes[-1].values
+
+
+def test_variable_binding_detects_mixed_syntax_connection_conflicts():
+    with pytest.raises(ConfigError, match="also switched"):
+        _gfl().replace(**_set("stop", 0.2, **{"units.vsc.connected": False}))
+    with pytest.raises(ConfigError, match="already connected"):
+        _gfl().replace(**_set("start", 0.3, **{"units.vsc.connected": True}))
+
+
+def test_scoped_connection_variables_do_not_confuse_equal_names_in_different_sections():
+    tree = read_tree(EXAMPLES / "gfl-example.pes")
+    tree["sources"]["vsc"] = tree["sources"].pop("grid")
+    tree["events"] = {"stop": {"type": "set", "t": 0.1, "set": {
+        "sources.vsc.connected": False, "units.vsc.connected": False,
+    }}}
+    params = from_dict(tree)
+    system = peslite.System(params)
+    system.apply(params.changes[0])
+    assert system.sources["vsc"].branch.breaker_open
+    assert not system.units["vsc"].breaker
+
+
+def test_custom_event_scope_is_determined_by_its_variable_paths():
+    tree = read_tree(EXAMPLES / "gfl-example.pes")
+    tree["sources"]["vsc"] = tree["sources"].pop("grid")
+    tree["events"] = {"mark": {"type": "test_mark", "target": "vsc", "t": 0.1, "level_pu": 0.2}}
+    p = from_dict(tree)
+    assert p.changes[0].values == {"units.vsc.ctrl.references.iq_ref_pu": 0.2}
+
+
+def test_custom_events_cannot_bypass_declared_variables_with_an_action_callback():
+    class Callback(_Mark):
+        type = "test_callback_event"
+
+        @dataclass(frozen=True, kw_only=True)
+        class Params:
+            type: str = "test_callback_event"
+            t: float
+
+        @staticmethod
+        def apply(event, system, t):
+            pass
+
+    with pytest.raises(TypeError, match="not an apply"):
+        register_event_type(Callback)
+
+
+@pytest.mark.parametrize("bindings", [{}, None, 1])
+def test_custom_events_must_return_nonempty_variable_bindings(bindings, monkeypatch):
+    monkeypatch.setattr(_Mark, "variables", staticmethod(lambda event, params: bindings))
+    with pytest.raises(ConfigError, match="nonempty mapping"):
+        _gfl().replace(**_event("mark", type="test_mark", target="vsc", t=0.3))
+
+
+def test_variable_bindings_reject_duplicate_si_and_per_unit_spellings():
+    with pytest.raises(ConfigError, match="same variable"):
+        _gfl().replace(**_set("bad", 0.3, **{
+            "sources.grid.v": 500.0, "sources.grid.v_pu": 0.9,
+        }))
+
+
+@pytest.mark.parametrize("path", ["units", "units.vsc.", "units.missing.connected"])
+def test_invalid_variable_bindings_report_the_requested_path(path):
+    with pytest.raises(ConfigError) as error:
+        _gfl().replace(**_set("bad", 0.3, **{path: True}))
+    assert path in str(error.value)

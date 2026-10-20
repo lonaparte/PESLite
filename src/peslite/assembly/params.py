@@ -1,4 +1,4 @@
-"""Simulation-file parameters, pu bases, typed construction and runtime ``set`` changes.
+"""Simulation-file parameters, pu bases, typed construction and checked event-variable writes.
 
 Electrical inputs without suffix are SI values; ``_pu`` names are per unit. Plant quantities are
 stored in SI, controller quantities in pu. A field listed in a class's ``_quantities`` may be given
@@ -29,7 +29,7 @@ from ..components.network import ELEMENT_TYPES, element_buses
 from ..control.loops import LOOP_TYPES, loop_key_type, loop_type
 from ..control.profiles import ReferenceParams, control_type
 from ..solver.model import ConfigError
-from .events import EVENT_TYPES, NAMED, events_for
+from .events import EVENT_TYPES, NAMED, SWITCHABLE, events_for
 from .types import unit_type
 
 __all__ = [
@@ -40,7 +40,7 @@ __all__ = [
     "MeasurementParams", "ReferenceParams", "ControlParams", "OvercurrentParams", "VoltageLimitParams",
     "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
     "BridgeParams", "SSLinkParams", "LCCLinkParams", "UnitParams",
-    "RUNTIME", "Change", "runtime_changeable", "set_changes",
+    "RUNTIME", "Change", "runtime_changeable", "event_changes",
     "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "ProgressParams",
     "MetaParams", "Params",
 ]
@@ -86,6 +86,19 @@ def parameter_leaves(value, prefix="", defaulted=frozenset()):
     for name, item, metadata in items:
         if not metadata.get("structural", False):
             yield from parameter_leaves(item, f"{prefix}.{name}" if prefix else name, defaulted)
+
+
+def connection_defaults(p):
+    """Initial leaf-unit commands, before scheduled event writes are applied."""
+    from .events import _initial_connection, switching_schedule
+
+    if not getattr(p, "units", None):
+        return
+    schedule = switching_schedule(p.changes)
+    for name, unit in _unit_items(p.units):
+        path = f"units.{name}.connected"
+        steps = schedule.get(f"units.{name}", ())
+        yield path, _initial_connection(steps, unit.connected)
 
 
 # ------------------------------------------------------------------ pu bases and SI/pu inputs
@@ -196,7 +209,8 @@ def convert_quantities(data: dict, cls, scales: dict[str, float], where: str) ->
             if isinstance(value, bool):
                 raise ConfigError(f"{where}.{name}: expected a number")
             try:
-                value = float(value)
+                if not isinstance(value, (int, float)):
+                    value = float(value)
             except (TypeError, ValueError):
                 raise ConfigError(f"{where}.{name}: expected a number, got {value!r}") from None
             if spelling.endswith("_pu") != target.endswith("_pu"):
@@ -493,6 +507,7 @@ class UnitParams:
     ctrl: Optional[ControlParams] = None
     dclink: Optional[DCLinkParams] = field(default=None, metadata={"required": True})
     bus: Optional[str] = None
+    connected: Optional[bool] = None  # initial command; None preserves event-derived startup
     bridge: BridgeParams = field(default_factory=BridgeParams)
     meas: MeasurementParams = field(default_factory=MeasurementParams)
     protection: ProtectionParams = field(default_factory=ProtectionParams)
@@ -852,8 +867,8 @@ class Params:
 
     @functools.cached_property
     def changes(self) -> tuple["Change", ...]:
-        """The checked parameter state after each ``set`` event, in event order."""
-        return set_changes(self)
+        """Checked variable writes for every event, in time/file order."""
+        return event_changes(self)
 
     @staticmethod
     def _bases(data: dict, base: Any, where: str) -> tuple[Any, Optional[dict[str, float]]]:
@@ -899,31 +914,30 @@ class Params:
 # ------------------------------------------------------------------ construction from mappings
 
 def from_dict(data: dict) -> Params:
-    """Build, validate and resolve parameters, including every successive ``set`` event."""
+    """Build, validate and resolve parameters and every event's explicit variable bindings."""
     from .validate import validate
 
     p = _build(Params, _normalize(data), "", None, None)
     validate(p)
     p = replace(p, sources={name: source.resolved(p.base) for name, source in p.sources.items()},
-                units={name: _resolve_unit(unit, name, p.base, p.events)
+                units={name: _resolve_unit(unit, p.base)
                        for name, unit in p.units.items()})
-    p.changes
+    changes = p.changes
+    for name, unit in _unit_items(p.units, leaves_only=False):
+        object.__setattr__(unit, "events", tuple(events_for(changes, f"units.{name}")))
     return p
 
 
-def _resolve_unit(unit: UnitParams, path: str, system_base: BaseValues,
-                  events: dict[str, Any], inherited: tuple = ()) -> UnitParams:
-    """Resolve one configuration node and pass composite switching commands to its leaves."""
-    own_events = tuple(events_for(events, path))
-    active_events = (*inherited, *own_events)
+def _resolve_unit(unit: UnitParams, system_base: BaseValues) -> UnitParams:
+    """Resolve ratings and defaults once through the configured unit tree."""
     spec = unit_type(unit.type)
     if not spec.composite:
-        return unit.resolved(system_base, active_events)
-    resolved = unit.resolved(system_base, active_events)
+        return unit.resolved(system_base)
+    resolved = unit.resolved(system_base)
     child_base = resolved.base
     selected = replace(resolved._unit_fields, **{
         child: _resolve_unit(
-            getattr(unit, child), f"{path}.{child}", child_base, events, active_events,
+            getattr(unit, child), child_base,
         )
         for child in spec.children
     })
@@ -1221,6 +1235,15 @@ def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dic
     return out
 
 
+def _boolean(value: Any, path: str) -> bool:
+    """Use the same switch syntax for fields and runtime connection commands."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    raise ConfigError(f"{path}: expected 1 (on) or 0 (off), got {value!r}")
+
+
 def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
     """Build the dataclass ``cls`` from a mapping at ``path``: convert its inputs with ``scales`` (SI
     values of one pu; ``None``: no conversion), then check its fields strictly and build its sections.
@@ -1303,12 +1326,7 @@ def _build_fields(cls, data: dict, path: str, base: Any, scales: Optional[dict],
                     raise ConfigError(f"{key}: expected an integer, got {value!r}")
                 kwargs[f.name] = int(value)
             elif inner is bool:
-                if isinstance(value, bool):
-                    kwargs[f.name] = value
-                elif isinstance(value, (int, float)) and value in (0, 1):
-                    kwargs[f.name] = bool(value)
-                else:
-                    raise ConfigError(f"{key}: expected 1 (on) or 0 (off), got {value!r}")
+                kwargs[f.name] = _boolean(value, key)
             elif inner is str:
                 if f.name in getattr(cls, "_text", ()) and not isinstance(value, str):
                     raise ConfigError(f"{key}: expected text, got {value!r}")
@@ -1331,6 +1349,7 @@ def _build_fields(cls, data: dict, path: str, base: Any, scales: Optional[dict],
 # ------------------------------------------------------------------ set events
 
 RUNTIME = (
+    *(f"{section}.*.connected" for section in SWITCHABLE),
     "buses.*.c", "buses.*.r_d",
     "branches.*.l", "branches.*.r",
     "sources.*.v", "sources.*.f", "sources.*.angle", "sources.*.l", "sources.*.r",
@@ -1344,19 +1363,24 @@ RUNTIME = (
 
 @dataclass(frozen=True)
 class Change:
-    """Parameters after one ``set`` event and the stored SI paths changed by it."""
+    """One checked event; command-only writes do not need a parameter snapshot."""
 
     t: float
     event: str
     params: Any
     paths: tuple[str, ...]
+    values: dict = field(default_factory=dict)
+    connections: tuple[str, ...] = ()
+    ramp: float = 0.0
 
     def touches(self, prefix: str) -> list[str]:
         return [path[len(prefix):] for path in self.paths if path.startswith(prefix)]
 
 
 def runtime_changeable(path: str, p: Params) -> bool:
-    """Whether stored parameter ``path`` may be changed by a ``set`` event."""
+    """Whether a stored parameter or connection command may be written during a run."""
+    if _connection_variable(p, path) is not None:
+        return True
     section, _, rest = path.partition(".")
     if section == "units":
         name = _unit_path(p.units, rest) or rest.partition(".")[0]
@@ -1387,13 +1411,30 @@ def runtime_changeable(path: str, p: Params) -> bool:
     return False
 
 
-def _set_assignments(p: Params, event: Any):
-    """Yield explicit set assignments in storage units, using the ordinary quantity schema."""
-    for path, value in event.set.items():
-        *head, name = path.split(".")
+def _event_assignments(p: Params, event: Any):
+    """Resolve every event through the same parameter and connection-command variables."""
+    values = EVENT_TYPES[event.type].variables(event, p)
+    if not isinstance(values, _Mapping) or not values:
+        raise ConfigError("event variable bindings must be a nonempty mapping; nothing to change")
+    for path, value in values.items():
+        parts = path.split(".") if isinstance(path, str) else ()
+        if len(parts) < 3 or parts[0] not in NAMED or not all(parts):
+            raise ConfigError(f"{path}: cannot change during a run; an event needs a scoped variable")
+        connection = _connection_variable(p, path)
+        if connection is not None:
+            value = _boolean(value, path)
+            section, name = connection
+            targets = _unit_leaves(p.units, name) if section == "units" else (name,)
+            for target in targets:
+                yield f"{section}.{target}.connected", value
+            continue
+        *head, name = parts
         owner = p
-        for key in head:
-            owner = owner[key] if isinstance(owner, dict) else getattr(owner, key)
+        try:
+            for key in head:
+                owner = owner[key] if isinstance(owner, dict) else getattr(owner, key)
+        except (AttributeError, KeyError):
+            raise ConfigError(f"{path}: unknown writable variable") from None
         scales = p.base.parameter_scales()
         if head[0] == "units":
             unit = p.unit(_unit_path(p.units, ".".join(head[1:])))
@@ -1404,40 +1445,71 @@ def _set_assignments(p: Params, event: Any):
         yield ".".join((*head, target)), converted[target]
 
 
-def set_changes(p: Params) -> tuple[Change, ...]:
-    """Apply and validate ``set`` events in time/file order and return their resulting parameters."""
+def _connection_variable(p: Params, path: str):
+    """Identify a writable connection command, not an arbitrary field named connected."""
+    section, _, rest = path.partition(".")
+    name, _, field = rest.rpartition(".")
+    if section not in SWITCHABLE or field != "connected":
+        return None
+    if section == "units":
+        exists = _unit_at(p.units, name) is not None
+    else:
+        exists = name in getattr(p, section)
+    return (section, name) if exists else None
+
+
+def event_changes(p: Params) -> tuple[Change, ...]:
+    """Bind every event to checked variable writes, in time/file order, once at assembly."""
     events = [(event.t, index, name, event)
-              for index, (name, event) in enumerate(p.events.items()) if event.type == "set"]
+              for index, (name, event) in enumerate(p.events.items())]
     if not events:
         return ()
     current = replace(p, events={})
-    flat = flat_paths(to_dict(current, derived=True))
+    flat = None
     changed_by: dict[tuple[float, str], str] = {}
+    switched: dict[str, tuple[str, bool]] = {}
     out: list[Change] = []
     for event_t, _index, name, event in sorted(events, key=lambda item: item[:2]):
         where = f"events.{name}"
-        if not event.set:
-            raise ConfigError(f"{where}.set: nothing to change")
-        for path in event.set:
-            if path.split(".", 1)[0] not in NAMED:
-                raise ConfigError(f"{where}.set.{path}: cannot change during a run; a set event changes "
-                                  f"{', '.join(RUNTIME)}")
         try:
-            after = current.replace(**event.set)
-        except ConfigError as exc:
+            values = {}
+            for path, value in _event_assignments(current, event):
+                if path in values:
+                    raise ConfigError(f"{path}: more than one binding writes the same variable")
+                values[path] = value
+            connections = tuple(path for path in values if _connection_variable(current, path) is not None)
+            ramp = getattr(event, "ramp", 0.0)
+            if connections and (isinstance(ramp, bool) or not isinstance(ramp, (int, float))
+                                or not math.isfinite(ramp) or ramp < 0.0):
+                raise ConfigError(f"{where}.ramp must be finite and >= 0")
+            if not connections and ramp != 0.0:
+                raise ConfigError(f"{where}.ramp requires a connection command")
+            parameters = {path: value for path, value in values.items() if path not in connections}
+            if parameters and flat is None:
+                flat = flat_paths(to_dict(current, derived=True))
+            after = current.replace(**parameters) if parameters else current
+        except (ConfigError, AttributeError, KeyError) as exc:
             raise ConfigError(f"{where}: after this event, {exc}") from None
-        new = flat_paths(to_dict(after, derived=True))
-        paths = tuple(path for path in new if new[path] != flat.get(path))
+        new = flat_paths(to_dict(after, derived=True)) if parameters else flat
+        changed = (path for path in new if new[path] != flat.get(path)) if parameters else ()
+        paths = tuple(dict.fromkeys([*changed, *values]))
         for path in paths:
-            if not runtime_changeable(path, after):
-                raise ConfigError(f"{where}: {path} cannot change during a run; a set event changes "
+            if path not in connections and not runtime_changeable(path, after):
+                raise ConfigError(f"{where}: {path} cannot change during a run; an event changes "
                                   f"{', '.join(RUNTIME)}")
             key = (event_t, path)
             if key in changed_by:
-                raise ConfigError(f"{where}: {path} is also set at t = {event_t} "
+                action = "switched" if path in connections else "set"
+                raise ConfigError(f"{where}: {path} is also {action} at t = {event_t} "
                                   f"by events.{changed_by[key]}")
             changed_by[key] = name
-        out.append(Change(event_t, name, after, paths))
+            if path in connections:
+                previous = switched.get(path)
+                if previous is not None and previous[1] == values[path]:
+                    state = "connected" if values[path] else "disconnected"
+                    raise ConfigError(f"{where}: {path} is already {state} by events.{previous[0]}")
+                switched[path] = name, values[path]
+        out.append(Change(event_t, name, after if parameters else None, paths, values, connections, ramp))
         current, flat = after, new
     return tuple(out)
 

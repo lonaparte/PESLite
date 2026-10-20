@@ -105,7 +105,7 @@ class BridgeControlOutput:
 class Controller(Protocol):
     """Sampled controller ``(t, Measurement) -> ControlOutput``.
 
-    Optional host-facing methods are ``command``, ``track``, ``retune``, state access and
+    Optional host-facing methods are ``initialize``, ``command``, ``track``, ``retune``, state access and
     ``summary``; the required target interface is only the sampled call. Protection is deliberately
     outside this interface.
     """
@@ -1022,7 +1022,7 @@ class _GraphRuntime:
                     )
                 key = f"{name}.{local}"
                 names.append(key)
-                setattr(state, key, complex(value) if isinstance(value, complex) else float(value))
+                setattr(state, key, _complex(value) if isinstance(value, complex) else _real(value))
         self.state, self.state_names = state, tuple(names)
         if self.state_names != self.graph.flow_state_names:
             raise RuntimeError("continuous controller state and derivative layouts differ")
@@ -1083,6 +1083,10 @@ class _GraphRuntime:
         if any(path.startswith("ctrl.") for path in paths):
             self.graph.schedule(cfg)
         self.p = cfg
+
+    def initialize(self) -> None:
+        """Apply initial parameter events before startup and named-state restoration."""
+        self.graph._apply_pending()
 
     def command(self, run: bool, ramp: float = 0.0) -> None:
         """Take the host's run or stop command."""
