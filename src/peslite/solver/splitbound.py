@@ -7,48 +7,19 @@ local linear estimate, not a guaranteed bound.
 from __future__ import annotations
 
 import math
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import Any, Sequence
 
 import numpy as np
+
+from .linearization import (DEFAULT_STEP as _FD, LoopMap, coordinate_width as _width,
+                            linearize_loop)
 
 __all__ = ["LoopMap", "split_error_bound"]
 
 _EPS = 1e-9
-_FD = 1e-4  # relative size of the finite-difference step
 _DECAY = 1e-5  # stop following the response below this fraction of its peak
 _MIN_FOLLOW = 200  # minimum number of periods followed
 _MAX_FOLLOW_S = 2.0  # maximum lag followed (s)
-
-
-@runtime_checkable
-class LoopMap(Protocol):
-    """Application interface for linearising its sampled-data loop over one period.
-
-    ``period``: sampling period (s).
-    ``coordinates(names)``: list of ``(kind, names, scale)``; ``kind`` is ``"vector"`` (column pair
-    rotated with the frame), ``"fixed"`` (pair already in the frame), ``"triple"``, ``"scalar"`` or
-    ``"frozen"`` (not perturbed); ``scale`` is the finite-difference step floor.
-    ``"frozen"`` is a flag which must be clear and is not perturbed; ``"mode"`` is a mode or
-    counter which is retained but not perturbed. ``to_frame`` / ``from_frame`` convert a state row
-    to and from the frame vector.
-    ``advance(row, t, view)``: run one period; ``view = (state label, offset, "b" | "c")`` applies
-    the offset to the integration (``"b"``) or the sampler (``"c"``).
-    """
-
-    period: float
-
-    def coordinates(self, names: list[str]) -> list[tuple[str, list[str], float]]: ...
-
-    def to_frame(self, row: dict[str, float], t: float, cols: list) -> np.ndarray: ...
-
-    def from_frame(self, x: np.ndarray, t: float, cols: list, row: dict[str, float]) -> dict[str, float]: ...
-
-    def advance(self, row: dict[str, float], t: float,
-                view: tuple[str, float, str] | None = None) -> dict[str, float]: ...
-
-
-def _width(kind: str) -> int:
-    return 2 if kind in ("vector", "fixed") else 3 if kind == "triple" else 1
 
 
 def _frame_index(cols: list, prefix: str) -> dict[str, list[int]]:
@@ -70,24 +41,9 @@ def _period_map(loop: LoopMap, row: dict[str, float], t0: float, cols: list,
                 held: list[tuple[str, float]]) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """``Phi``, ``B_b``, ``B_c`` at ``row`` by finite differences, plus the evaluation count."""
     t1 = t0 + loop.period
-    base = loop.to_frame(loop.advance(row, t0), t1, cols)
-    x0 = loop.to_frame(row, t0, cols)
-    n = len(x0)
-    phi = np.eye(n)
-    evaluations = 1
-    j = 0
-    for kind, _names, floor in cols:
-        if kind not in ("frozen", "mode"):
-            for w in range(_width(kind)):
-                h = _FD * max(abs(float(x0[j + w])), floor)
-                outs = []
-                for sign in (1.0, -1.0):
-                    xp = x0.copy()
-                    xp[j + w] += sign * h
-                    outs.append(loop.to_frame(loop.advance(loop.from_frame(xp, t0, cols, row), t0), t1, cols))
-                    evaluations += 1
-                phi[:, j + w] = (outs[0] - outs[1]) / (2.0 * h)
-        j += _width(kind)
+    linear = linearize_loop(loop, row, t0, cols)
+    phi, base, evaluations = linear.phi, linear.final, linear.evaluations
+    n = len(base)
     b_b = np.zeros((n, len(held)))
     b_c = np.zeros((n, len(held)))
     for k, (label, scale) in enumerate(held):

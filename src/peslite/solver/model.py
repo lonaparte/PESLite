@@ -231,6 +231,39 @@ class StateRegistry:
                 out[state.name] = values[state.local_name]
         return out
 
+    @property
+    def discrete_names(self) -> frozenset[str]:
+        """Discrete coordinates from state values and optional owner lifecycle declarations.
+
+        This view is requested by post-run loop maps, not maintained as another state layout.
+        Float-valued lifecycle state such as a protection timer must be declared by its owner;
+        boolean and integer state is discrete without a declaration.
+        """
+        names = set()
+        for group in self._groups:
+            declared = set(getattr(group.part, "discrete_state_names", ()))
+            values = group.part.get_state()
+            for state in group.states:
+                if state.local_name in declared or isinstance(values[state.local_name], (bool, int)):
+                    names.add(state.name)
+        return frozenset(names)
+
+    @property
+    def linearization_columns(self) -> tuple[str, ...]:
+        """Existing columns retained by an owner's optional feedback-state declaration.
+
+        Observation-only history remains in restart snapshots without becoming an independent
+        feedback coordinate. Owners without a declaration retain their complete state schema.
+        """
+        columns = []
+        for group in self._groups:
+            selected = getattr(group.part, "linearization_state_names", None)
+            selected = None if selected is None else set(selected)
+            for state in group.states:
+                if selected is None or state.local_name in selected:
+                    columns.extend(state.columns)
+        return tuple(columns)
+
     def read_flat(self, prefixes: Iterable[str] | None = None) -> dict[str, float]:
         """Read the fixed real-valued state-table columns using the registered layout.
 

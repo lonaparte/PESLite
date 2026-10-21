@@ -24,6 +24,7 @@ history and then export it afterward.
 | `ctrl.<unit>.csv` | `simulation.output.signals: 1` | Controller signals for one unit. |
 | `energy.csv` | `simulation.output.energy: 1` | Stored energy and power-balance history. |
 | `summary.json` | Always | Stop reason, solver counts, protection, peaks and diagnostics. |
+| `<name>_report.json` | Python `--report`, with the analysis addon available | Optional report sections, including `small_signal_stability`. |
 | `simulation.pes` | Always | Complete resolved configuration used for the run. |
 
 `simulation.pes` is not a temporary file. It records defaults and command-line changes and can be
