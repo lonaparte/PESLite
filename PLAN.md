@@ -1,6 +1,13 @@
 # Small-Signal Stability Analysis Addon Plan
 
-Status: planning only; no small-signal analysis API is implemented by this document.
+Status: implemented, pending user review. The addon, shared calculation, tests, and maintained
+documentation are present. Keep this temporary plan until acceptance; maintained usage is in
+`docs/Small-Signal-Analysis.md`.
+
+The dynamic addon also provides an opt-in simulation timeline. It consumes existing observations,
+retains only unfinished windows' restart rows, shares the same finite-difference map,
+and reports only changed items. Periodic stability and transient finite-window amplification are
+distinguished explicitly. Static, no-time-integration analysis remains outside this implementation.
 
 Source: [Issue #23: Idea on small signal stability analysis](https://github.com/lonaparte/PESLite/issues/23),
 proposed by [@NoClassDefError](https://github.com/NoClassDefError).
@@ -57,7 +64,7 @@ its one-period linearization proposal in searchable text.
 | Existing implementation | Intended reuse |
 | --- | --- |
 | `SystemLoop` in `src/peslite/solver/simulation.py` | Advance the assembled closed loop and restore its named states between perturbation runs. |
-| `SystemLoop.to_frame()` and `SystemLoop.from_frame()` | Convert rotating alpha-beta states to and from synchronous-frame coordinates. |
+| `SystemLoop.to_frame()` and `SystemLoop.from_frame()` | Reuse coordinate grouping and conversion; the addon uses stationary coordinates and a complete repeating period, while split-error analysis retains its rotating-frame interface. |
 | `_period_map()` in `src/peslite/solver/splitbound.py` | Extract only its reusable `Phi` calculation into a shared helper; retain `B_b`, `B_c`, and error-response calculations in split-error analysis. |
 | `StateRegistry` and the existing named-state restart contract | Select and restore existing state coordinates without maintaining an addon-specific state registry. |
 | Existing simulation and algebraic-loop evaluation | Re-solve algebraic dependencies in every perturbed run using the ordinary execution path. |
@@ -96,6 +103,16 @@ Distinguish the complete restart row from the differentiable coordinates used fo
 - Do not add copies of derived values as new dynamic states or discard genuine sample/hold
   memory just because it resembles another recorded value. Check the existing restoration path
   before changing which coordinates are independent.
+
+The implementation obtains these views from the existing `StateRegistry`: optional owner
+declarations `discrete_state_names` identify lifecycle state, and `linearization_state_names`
+select actual feedback memory when a snapshot also contains observational history. ADC mean
+integrals remain coordinates; RMS history remains restored for protection without introducing
+observation/cache modes. Neither declaration creates another state store or changes normal runs.
+
+Keep the original output time grid when disabling analysis histories, because sampling or
+protection timing can depend on it. Explicit-time loops declare their forcing periods through
+`forcing_periods(inputs)` rather than device-name checks in the addon.
 
 Verify that the selected period actually repeats the relevant control and PWM schedules; the
 existing common-control-period calculation is a starting point, not proof for every model.

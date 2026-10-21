@@ -1310,6 +1310,11 @@ class ResonantModulation(Loop):
     def initial_outputs(self):
         return {"duty": 0.5}
 
+    def forcing_periods(self, inputs):
+        """Periods of the explicit-time modulation law, for post-run loop maps."""
+        frequency = abs(inputs["frequency"])
+        return () if frequency == 0.0 else (1.0 / frequency,)
+
     def _duty(self, t, inputs):
         q = self.startup.value * inputs["modulation"] * np.sin(
             2.0 * math.pi * inputs["frequency"] * t + inputs["phase"]

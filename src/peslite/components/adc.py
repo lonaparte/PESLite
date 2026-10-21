@@ -174,6 +174,16 @@ class ADC:
         return self.averaging or bool(self.rms)
 
     @property
+    def periods(self) -> tuple[float, ...]:
+        """Sampling schedules, also when a continuous unit uses sampled protection."""
+        return self.period, self.sample_period
+
+    @property
+    def linearization_state_names(self) -> tuple[str, ...]:
+        """Only window means feed control; RMS history is observation/protection bookkeeping."""
+        return tuple(f"x_{channel}" for channel in self.accumulated)
+
+    @property
     def _full(self) -> bool:
         return self.length >= self.period * (1.0 - 1e-12)
 

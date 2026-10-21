@@ -1004,6 +1004,11 @@ class _GraphRuntime:
     """Lifecycle and continuous-state mechanics shared by control-graph hosts."""
 
     @property
+    def discrete_state_names(self) -> tuple[str, ...]:
+        """Run/ramp bookkeeping is restored, not differentiated as controller memory."""
+        return tuple(f"startup.{name}" for name in self.startup.get_state())
+
+    @property
     def interface(self) -> ControlInterface:
         """The effective typed boundary of the active control graph."""
         return self.graph.interface

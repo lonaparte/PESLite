@@ -10,13 +10,14 @@ PACKAGE = ROOT / "src" / "peslite"
 PARTS = ("solver", "control", "components", "assembly", "addons")
 
 # What each part may import. The numerical solver kernel is at the bottom; the application runner
-# (solver.simulation) is deliberately at the top.
+# (solver.simulation) is deliberately at the top. Optional analysis addons consume observations,
+# completed simulations and shared solver primitives; core execution does not depend on them.
 BELOW = {
     "solver": {"solver"},
     "control": {"solver", "control"},
     "components": {"solver", "control", "components"},
     "assembly": {"solver", "control", "components", "assembly"},
-    "addons": {"control", "components", "addons"},
+    "addons": {"solver", "control", "components", "addons"},
 }
 TOP = {"solver/simulation.py"}
 

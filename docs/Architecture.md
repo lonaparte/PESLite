@@ -34,6 +34,13 @@ initialisation. Their decorators populate the same registries used by built-in t
 no add-on lookup or dispatch in the simulation hot path. Optional dependencies stay behind the
 `addons/functions` boundary. IEEE-style plotting reads closed result CSV files after a run and is
 absent from the solver path and generated C++ source.
+The optional small-signal analysis functions also live in `addons/functions`. They consume a
+completed simulation or selected observations from a run, and share the solver-side loop-map
+linearization. The runner exposes an optional observation callback on its existing event grid;
+core time stepping never imports the analysis implementation; the CLI loads it only with
+`--report`. Split-error diagnostics use that same
+finite-difference calculation without depending on the stability addon.
+See [Small-Signal Stability Analysis](Small-Signal-Analysis.md).
 
 Loading a simulation file also merges a sibling `PESaddons/` tree into these three package paths.
 Its controller and component modules register before parameter-schema resolution; its function

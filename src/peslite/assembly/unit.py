@@ -175,10 +175,13 @@ class Unit(ABC):
 
     @property
     def periods(self) -> list[float]:
-        if self.continuous:
-            return []
-        return [*self.bridge.event_periods,
-                *(period for period in getattr(self.ctrl, "periods", {}).values() if period)]
+        periods = ([] if self.continuous else [
+            *self.bridge.event_periods,
+            *(period for period in getattr(self.ctrl, "periods", {}).values() if period),
+        ])
+        if self.adc is not None:
+            periods.extend(self.adc.periods)
+        return periods
 
     @property
     def tripped(self) -> bool:
@@ -205,6 +208,11 @@ class Unit(ABC):
             "fault": self.protection.fault,
             **{f"prot.{name}": value for name, value in self.protection.get_state().items()},
         }
+
+    @property
+    def discrete_state_names(self) -> tuple[str, ...]:
+        """Unit-owned state is protection/lifecycle state; electrical state belongs to the model."""
+        return tuple(self.get_state())
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         self.protection.set_state({
