@@ -14,7 +14,8 @@ import pytest
 from scipy.linalg import expm
 
 from conftest import EXAMPLES
-from peslite.addons.functions.small_signal import small_signal
+from peslite.addons.functions.small_signal import small_signal, small_signal_report
+from peslite.components.adc import ADC, MeasurementPorts
 from peslite.solver.linearization import (LoopMap, active_coordinates, coordinate_difference,
                                          linearize_loop)
 from peslite.solver.model import Empty, Model, StateRegistry
@@ -93,6 +94,22 @@ def test_coordinate_difference_handles_wrapped_angles_without_losing_their_mode(
     assert linear.active == (0,)
     assert linear.phi[0, 0] == pytest.approx(1.0, abs=1e-10)
     np.testing.assert_allclose(coordinate_difference(linear.final, linear.initial, loop.cols), 0.0)
+
+
+def test_split_input_differences_use_the_same_wrapped_angle_coordinates():
+    class Wrapped(_AffineMap):
+        cols = [("angle", ["theta"], 1.0)]
+
+        def advance(self, row, t, view=None):
+            offset = view[1] if view is not None else 0.0
+            return {"theta": math.remainder(row["theta"] + offset, math.tau)}
+
+    loop = Wrapped()
+    phi, b_b, b_c, count = _period_map(
+        loop, {"theta": math.pi - 5e-5}, 0.0, loop.cols, [("theta", 1.0)])
+    for matrix in (phi, b_b, b_c):
+        np.testing.assert_allclose(matrix, [[1.0]], atol=1e-10)
+    assert count == 5
 
 
 def test_mode_changes_are_reported_instead_of_becoming_a_smooth_mode():
@@ -292,15 +309,77 @@ def test_adc_memory_and_midperiod_restart_use_the_same_map():
     assert result.stability == "stable"
 
 
-def test_rms_observation_history_does_not_create_feedback_modes():
+@pytest.mark.parametrize("protection", [False, True])
+def test_rms_history_is_checked_without_creating_feedback_modes(protection):
     sim = peslite.Simulation(_params(**{
         "simulation.t_end": 0.05, "units.converter.meas.rms.current": 0.001,
+        "units.converter.protection.rms_current.enable": protection,
+        "units.converter.protection.rms_current.limit_pu": 1.0,
     }))
     sim.run(out_dir=None)
     result = small_signal(sim)
     assert result.stability == "stable"
     assert any(".rms_current." in name for name in sim.result.final_states())
     assert not any(".rms_current." in name for name in result.coordinates)
+
+
+def test_rms_periodicity_uses_logical_history_without_mutating_restart_storage():
+    adc = ADC(MeasurementPorts({"current": lambda: 1.0}), 0.1, 0.1, rms={"current": 0.3})
+    prefix = "rms_current."
+    first = {**adc.get_state(), prefix + "count": 3,
+             **{f"{prefix}sample_{i}": value for i, value in enumerate((1.0, 4.0, 9.0))}}
+    rotated = {**first, prefix + "index": 1,
+               **{f"{prefix}sample_{i}": value for i, value in enumerate((9.0, 1.0, 4.0))}}
+    before = dict(rotated)
+    assert adc.periodic_state(first) == adc.periodic_state(rotated)
+    changed = {**rotated, prefix + "sample_1": 2.0}
+    assert adc.periodic_state(first) != adc.periodic_state(changed)
+    assert rotated == before
+    assert prefix + "index" not in adc.periodic_state(rotated)
+
+
+@pytest.mark.parametrize("limit,trip", [(0.1, True), (1.0, False)])
+def test_rms_warmup_defers_analysis_until_the_complete_operating_state_repeats(monkeypatch,
+                                                                           limit, trip):
+    p = _params(**{"simulation.t_end": 0.05, "units.converter.bridge.model": "averaging",
+                   "units.converter.meas.rms.current": 0.001})
+    settled = peslite.Simulation(p)
+    settled.run(out_dir=None)
+    row = settled.result.final_states()
+    start = row.pop("t")
+    row = {key: value for key, value in row.items()
+           if ".rms_current." not in key and not key.startswith("solver.")}
+    p = p.replace(**{"units.converter.protection.rms_current.enable": True,
+                     "units.converter.protection.rms_current.limit_pu": limit,
+                     "units.converter.protection.hold": 0.0})
+    p = dataclasses.replace(p, simulation=dataclasses.replace(
+        p.simulation, initial=dataclasses.replace(p.simulation.initial, t=start, states=row),
+        t_end=start + 0.002))
+    warmup = peslite.Simulation(p)
+    warmup.run(t_end=start + 0.0001, out_dir=None)
+    module = __import__(small_signal.__module__, fromlist=["linearize_loop"])
+    linearize = module.linearize_loop
+    calls = []
+
+    def record(loop, row, t0, *args, **kwargs):
+        calls.append(t0)
+        return linearize(loop, row, t0, *args, **kwargs)
+
+    monkeypatch.setattr(module, "linearize_loop", record)
+    with pytest.raises(ValueError, match="discrete state.*rms_current.count"):
+        small_signal(warmup, period=0.0001)
+    assert calls == []
+    sim = peslite.Simulation(p)
+    report = small_signal_report(sim, period=0.0001, interval=0.0004, out_dir=None)
+    labels = [entry["changes"]["analysis.stability"] for entry in report.changes
+              if "analysis.stability" in entry["changes"]]
+    assert labels == (["transient", "unavailable"] if trip else ["transient", "stable"])
+    assert sim.result.tripped == trip
+    if trip:
+        assert calls == []
+        assert sim.result.summary["converter.trip_cause"] == "rms_current"
+    else:
+        assert calls and min(calls) >= start + 0.001
 
 
 def test_normal_run_does_not_construct_a_map_or_compute_modes(monkeypatch):

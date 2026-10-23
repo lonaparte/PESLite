@@ -50,3 +50,19 @@ def test_registry_rejects_duplicate_paths_and_flat_columns_during_construction()
 
     with pytest.raises(ConfigError, match="state prefix 'vsc'.*both"):
         StateRegistry([("vsc", _States(a=1.0)), ("vsc", _States(b=2.0))])
+
+
+@pytest.mark.parametrize("prefix", ["", "nested.unit"])
+def test_periodic_projection_uses_the_existing_snapshot_without_changing_restart_columns(prefix):
+    class Logical(_States):
+        def periodic_state(self, values):
+            return {"i": values["i"], "history.x": values["history.x"]}
+
+    states = StateRegistry({prefix: Logical(i=1 + 2j, **{"history.x": 3.0, "index": 1})})
+    row = states.read_flat()
+    index = f"{prefix}.index" if prefix else "index"
+    expected = {key: value for key, value in row.items() if key != index}
+    assert states.periodic_state(row) == expected
+    assert index in row
+    assert index in states.columns
+    assert states.read_flat() == row

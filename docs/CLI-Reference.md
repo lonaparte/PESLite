@@ -96,7 +96,9 @@ is generated; the report filename uses the input stem even with a bridge preset 
 directory. Without the addon, a warning is emitted and the ordinary simulation continues.
 
 The default checks cover the initial state, simulation-file events and the final state, with
-only changed items retained. Use the [Python addon API](Small-Signal-Analysis.md) for custom
+only changed items retained. Stability analysis runs only after a check establishes a periodic
+operating state; earlier checks report `transient` without running perturbations.
+Use the [Python addon API](Small-Signal-Analysis.md) for custom
 analysis times, intervals and watched values. `--report` can accompany `--plot`, but not
 inspection or export options.
 

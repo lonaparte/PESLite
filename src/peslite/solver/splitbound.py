@@ -12,7 +12,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from .linearization import (DEFAULT_STEP as _FD, LoopMap, coordinate_width as _width,
-                            linearize_loop)
+                            coordinate_difference, linearize_loop)
 
 __all__ = ["LoopMap", "split_error_bound"]
 
@@ -48,8 +48,10 @@ def _period_map(loop: LoopMap, row: dict[str, float], t0: float, cols: list,
     b_c = np.zeros((n, len(held)))
     for k, (label, scale) in enumerate(held):
         h = _FD * (scale or 1.0)
-        b_b[:, k] = (loop.to_frame(loop.advance(row, t0, (label, h, "b")), t1, cols) - base) / h
-        b_c[:, k] = (loop.to_frame(loop.advance(row, t0, (label, h, "c")), t1, cols) - base) / h
+        b_b[:, k] = coordinate_difference(
+            loop.to_frame(loop.advance(row, t0, (label, h, "b")), t1, cols), base, cols) / h
+        b_c[:, k] = coordinate_difference(
+            loop.to_frame(loop.advance(row, t0, (label, h, "c")), t1, cols), base, cols) / h
         evaluations += 2
     return phi, b_b, b_c, evaluations
 

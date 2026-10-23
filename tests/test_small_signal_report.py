@@ -4,6 +4,7 @@ import importlib
 import json
 import math
 import weakref
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -26,7 +27,7 @@ def _params(**overrides):
     })
 
 
-def _linear_sim(*, initial=0.0, growth=-4.0, decay_from_load=False, **overrides):
+def _linear_sim(*, initial=0.0, growth=-4.0, decay_from_load=False, fail_at=None, **overrides):
     class Plant:
         state_names = ("x",)
         outputs_need_inputs = False
@@ -40,10 +41,13 @@ def _linear_sim(*, initial=0.0, growth=-4.0, decay_from_load=False, **overrides)
             self.out.x = self.state.x
 
         def rhs(self, t):
+            if fail_at is not None and fail_at + 1e-12 < t <= self.end:
+                raise FloatingPointError("deliberate integration failure")
             return (self.growth * self.state.x,)
 
     def factory(params):
         plant = Plant()
+        plant.end = params.simulation.t_end
         def retune(cfg):
             if decay_from_load:
                 plant.growth = -1.0 / (cfg.elements["load"].r * cfg.buses["output"].c)
@@ -83,15 +87,39 @@ def test_constant_report_has_one_row_and_reuses_main_run_endpoints(monkeypatch):
     assert report.changes[0]["changes"]["analysis.growth_rate"] == pytest.approx(-4.0, rel=1e-7)
 
 
-def test_transient_is_reported_as_finite_time_gain_not_asymptotic_stability():
+def test_transient_skips_perturbations_until_a_periodic_state_is_established(monkeypatch):
+    module = importlib.import_module("peslite.addons.functions.small_signal")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("non-periodic operating states must not be linearized")
+
+    monkeypatch.setattr(module, "linearize_loop", forbidden)
     sim = _linear_sim(initial=1.0)
     report = small_signal_report(sim, period=0.0001, periodic_tolerance=1e-6,
                                  watch=["plant.x"], out_dir=None)
     assert _values(report, "analysis.stability") == [(0.0, "transient")]
     first = report.changes[0]["changes"]
-    assert first["analysis.amplification"] == pytest.approx(math.exp(-4e-4), rel=1e-7)
+    assert "not periodic" in first["analysis.reason"]
+    assert first["analysis.amplification"] is None
     assert first["analysis.growth_rate"] is None
     assert first["analysis.frequency"] is None
+    assert report.evaluations == 1
+
+
+def test_report_starts_analysis_at_the_first_selected_periodic_operating_state(monkeypatch):
+    module = importlib.import_module("peslite.addons.functions.small_signal")
+    linearize = module.linearize_loop
+    calls = []
+
+    def record(loop, row, t0, *args, **kwargs):
+        calls.append(t0)
+        return linearize(loop, row, t0, *args, **kwargs)
+
+    monkeypatch.setattr(module, "linearize_loop", record)
+    sim = _linear_sim(initial=1.0, growth=-4000.0, **{"simulation.t_end": 0.004})
+    report = small_signal_report(sim, period=0.0001, interval=0.0005, out_dir=None)
+    assert _values(report, "analysis.stability") == [(0.0, "transient"), (0.0015, "stable")]
+    assert calls == [0.0015, 0.002, 0.0025, 0.003, 0.0035, 0.004]
 
 
 def test_exact_extra_times_do_not_add_output_rows_or_control_interrupts(tmp_path):
@@ -101,7 +129,7 @@ def test_exact_extra_times_do_not_add_output_rows_or_control_interrupts(tmp_path
     observed = peslite.Simulation(params)
     rows = []
     observed.run(out_dir=tmp_path / "observed", times=[0.000037],
-                 observe=lambda t, states, values: rows.append((t, dict(states), dict(values()))))
+                 observe=lambda t, states, values, **_: rows.append((t, dict(states), dict(values()))))
     assert any(t == 0.000037 for t, _states, _values in rows)
     assert observed.result.t.tolist() == ordinary.result.t.tolist()
     assert observed.unit().bridge.control_index == ordinary.unit().bridge.control_index
@@ -125,7 +153,7 @@ def test_observer_reuses_existing_state_and_signal_reads(monkeypatch):
     monkeypatch.setattr(sim._states, "read", state)
     monkeypatch.setattr(sim.system, "signals", signal)
     rows = []
-    def observe(t, states, read_values):
+    def observe(t, states, read_values, **_):
         values = read_values()
         assert read_values() is values
         rows.append((t, states, values))
@@ -211,18 +239,100 @@ def test_unknown_watch_names_are_not_silently_ignored():
 
 
 def test_observer_errors_are_not_swallowed_as_physical_divergence():
-    def fail(*_args):
+    def fail(*_args, **_metadata):
         raise FloatingPointError("observer failure")
 
     with pytest.raises(FloatingPointError, match="observer failure"):
         _linear_sim().run(out_dir=None, observe=fail)
 
 
+@pytest.mark.parametrize("fail_at", [None, 0.001])
+def test_normal_and_early_termination_use_one_final_observation(fail_at):
+    sim = _linear_sim(initial=1.0, fail_at=fail_at)
+    seen = []
+
+    def observe(t, states, values, *, final, stop_reason):
+        seen.append((t, dict(states), values(), final, stop_reason))
+
+    with warnings.catch_warnings(record=True):
+        result = sim.run(out_dir=None, times=[], observe=observe,
+                         observe_values=["plant.x", "plant.signal"])
+    assert len(seen) == 1
+    t, states, values, final, reason = seen[0]
+    assert final
+    assert t == result.summary["t_stop"]
+    assert reason == result.summary.get("stop_reason", "")
+    assert bool(reason) == (fail_at is not None)
+    assert states["plant.x"] == result.final_states()["plant.x"]
+    assert values == {"plant.x": states["plant.x"], "plant.signal": states["plant.x"]}
+
+
+@pytest.mark.parametrize("times", [[], [0.001]])
+def test_early_stop_retains_final_watches_and_its_reason_even_with_pending_windows(times):
+    sim = _linear_sim(initial=1.0, fail_at=0.001)
+    with pytest.warns(UserWarning, match="simulation stopped"):
+        report = small_signal_report(sim, times=times, period=0.0004,
+                                     watch=["plant.x", "plant.signal"], out_dir=None)
+    final = sim.result.final_states()
+    assert _values(report, "plant.x")[-1] == (final["t"], final["plant.x"])
+    assert _values(report, "plant.signal")[-1] == (final["t"], final["plant.x"])
+    assert report.changes[-1]["t"] == final["t"]
+    assert report.changes[-1]["changes"]["analysis.reason"] == sim.result.summary["stop_reason"]
+    assert report.changes[-1]["changes"]["analysis.stability"] == "unavailable"
+
+
+def test_a_final_observation_cannot_request_more_runtime_work():
+    def observe(t, states, values, *, final, stop_reason):
+        return t + 0.0001 if final else None
+
+    with pytest.raises(ValueError, match="final observation"):
+        _linear_sim().run(out_dir=None, times=[], observe=observe)
+
+
+def test_terminal_metadata_is_delivered_even_when_its_physical_snapshot_is_unavailable(monkeypatch):
+    sim = _linear_sim(initial=1.0)
+    read = sim._states.read
+    calls = 0
+
+    def state():
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise FloatingPointError("unavailable terminal state")
+        return read()
+
+    monkeypatch.setattr(sim._states, "read", state)
+    seen = []
+
+    def observe(t, states, values, *, final, stop_reason):
+        seen.append((t, states, values(), final, stop_reason))
+
+    with pytest.warns(UserWarning, match="final physical snapshot unavailable"):
+        result = sim.run(out_dir=None, times=[], observe=observe, observe_values=["plant.x"])
+    assert len(seen) == 1
+    t, states, values, final, reason = seen[0]
+    assert t == sim.p.simulation.t_end and final
+    assert states is None and values == {}
+    assert "unavailable terminal state" in reason
+    assert reason == result.summary["stop_reason"]
+
+
+@pytest.mark.parametrize("error", [ValueError, TypeError, OSError])
+def test_observation_failures_do_not_hide_programming_or_io_errors(error):
+    from peslite.solver.simulation import _optional_output
+
+    def read():
+        raise error("not a numerical observation failure")
+
+    with pytest.raises(error, match="not a numerical"):
+        _optional_output(0.0, "custom output", read)
+
+
 def test_observer_can_request_an_endpoint_without_polling_every_pwm_edge():
     sim = _linear_sim()
     seen = []
 
-    def observe(t, states, values):
+    def observe(t, states, values, **_):
         seen.append(t)
         return 0.000037 if t == 0.0 else None
 
@@ -241,7 +351,7 @@ def test_explicit_observation_schedule_does_not_read_unused_output_snapshots(mon
         return signals(t)
 
     monkeypatch.setattr(sim.system, "signals", read_signals)
-    def observe(t, states, read_values):
+    def observe(t, states, read_values, **_):
         read_values()
         seen.append(t)
 
@@ -325,13 +435,13 @@ def test_window_mean_memory_and_exact_midcycle_observations_are_retained():
     assert any(entry["t"] == 0.001037 for entry in report.changes)
     assert report.checks == 3
     assert report.reused_baselines == 2
-    assert not _values(report, "analysis.reason")[-1][1]
+    assert "not periodic" in _values(report, "analysis.reason")[-1][1]
 
 
 @pytest.mark.parametrize("next_time", [-1.0, 0.0, math.nan, math.inf, 1.0])
 def test_observer_cannot_schedule_an_invalid_or_nonadvancing_time(next_time):
     with pytest.raises(ValueError, match="next time"):
-        _linear_sim().run(out_dir=None, observe=lambda *_: next_time)
+        _linear_sim().run(out_dir=None, observe=lambda *_, **__: next_time)
 
 
 def test_nonzero_start_and_offset_interval_need_no_history_interpolation():
@@ -389,9 +499,9 @@ def test_optional_signal_overflow_preserves_final_time_and_physical_state(tmp_pa
 
     monkeypatch.setattr(sim.system, "signals", overflow)
     seen = []
-    with pytest.warns(RuntimeWarning, match="watch signals unavailable"):
+    with pytest.warns(RuntimeWarning, match="optional output unavailable"):
         result = sim.run(out_dir=tmp_path, times=[], observe_values=["plant.signal", "plant.x"],
-                         observe=lambda t, states, values: seen.append((t, dict(states), values())))
+                         observe=lambda t, states, values, **_: seen.append((t, dict(states), values())))
     assert result.summary["t_stop"] == expected.summary["t_stop"]
     assert result.final_states() == expected.final_states()
     assert seen[-1][0] == sim.p.simulation.t_end
@@ -410,7 +520,7 @@ def test_failed_watch_values_do_not_discard_a_valid_stability_check(monkeypatch)
         return signals(t)
 
     monkeypatch.setattr(sim.system, "signals", overflow)
-    with pytest.warns(RuntimeWarning, match="watch signals unavailable"):
+    with pytest.warns(RuntimeWarning, match="optional output unavailable"):
         report = small_signal_report(sim, times=[0.001], period=0.0001,
                                      watch=["plant.signal", "elements.load.r"], out_dir=None)
     assert _values(report, "analysis.stability") == [(0.0, "stable")]
@@ -432,11 +542,123 @@ def test_optional_continuous_log_overflow_does_not_discard_the_final_state(monke
         return log(t)
 
     monkeypatch.setattr(sim.unit().ctrl, "continuous_log", overflow)
-    with pytest.warns(RuntimeWarning, match="watch signals unavailable"):
+    with pytest.warns(RuntimeWarning, match="optional output unavailable"):
         report = small_signal_report(sim, watch=[name], period=0.0001, out_dir=None)
     assert sim.result.final_states() == expected.final_states()
     assert sim.result.summary["t_stop"] == params.simulation.t_end
     assert _values(report, name)[-1] == (params.simulation.t_end, None)
+
+
+@pytest.mark.parametrize("failed", ["logs", "plant", "energy", "limits"])
+@pytest.mark.parametrize("failure_time", [0.0, 0.001, 0.002])
+def test_independent_snapshot_outputs_survive_a_different_provider_failure(tmp_path, monkeypatch,
+                                                                          failed, failure_time):
+    params = _params(**{"units.converter.bridge.model": "averaging",
+                        "simulation.output.states": True,
+                        "simulation.output.signals": True,
+                        "simulation.output.energy": True,
+                        "simulation.energy_check": "warn", "simulation.solver.phs_check_step": 1})
+    plain = peslite.Simulation(params)
+    expected = plain.run(out_dir=tmp_path / "plain")
+    sim = peslite.Simulation(params)
+    ctrl = sim.unit().ctrl
+    key = ctrl.log_names()[0]
+    name = f"converter.{key}"
+    owner, attribute = {"logs": (ctrl, "continuous_log"), "plant": (sim.system, "signals"),
+                        "energy": (sim.system.model, "energy_balance"),
+                        "limits": (ctrl, "observe_limits")}[failed]
+    original = getattr(owner, attribute, lambda t: None)
+    failures = []
+
+    def read(t, *args):
+        if abs(t - failure_time) < 1e-12:
+            failures.append(t)
+            raise FloatingPointError("deliberate optional output failure")
+        return original(t, *args)
+
+    monkeypatch.setattr(owner, attribute, read, raising=False)
+    observed = []
+
+    def observe(t, states, values, *, final, stop_reason):
+        assert final and not stop_reason
+        observed.append(values())
+        assert values() is observed[-1]
+
+    with pytest.warns(RuntimeWarning, match="optional output unavailable"):
+        result = sim.run(out_dir=tmp_path / "failed", times=[], observe=observe,
+                         observe_values=[name, "output.u"])
+    assert failures == [failure_time]
+    assert result.final_states() == expected.final_states()
+    assert result.summary["t_stop"] == params.simulation.t_end
+    assert result.states["t"][-1] == params.simulation.t_end
+    if failed != "plant":
+        np.testing.assert_array_equal(result.t, expected.t)
+        np.testing.assert_array_equal(result.plant["output.u"], expected.plant["output.u"])
+        assert observed[-1]["output.u"] == expected.plant["output.u"][-1]
+    elif failure_time == params.simulation.t_end:
+        assert math.isnan(observed[-1]["output.u"])
+    else:
+        assert observed[-1]["output.u"] == expected.plant["output.u"][-1]
+    if failed != "energy":
+        np.testing.assert_array_equal(result.energy["t"], expected.energy["t"])
+    if failed == "logs":
+        index = np.flatnonzero(np.isclose(result.ctrl["converter.t"], failure_time,
+                                          atol=1e-12, rtol=0.0))[0]
+        assert math.isnan(result.ctrl[name][index])
+        if failure_time == params.simulation.t_end:
+            assert math.isnan(observed[-1][name])
+        else:
+            assert observed[-1][name] == expected.ctrl[name][-1]
+    else:
+        np.testing.assert_array_equal(result.ctrl[name], expected.ctrl[name])
+
+
+@pytest.mark.parametrize("explicit_names", [False, True])
+def test_controller_only_watch_never_reads_unrelated_plant_signals(monkeypatch, explicit_names):
+    sim = peslite.Simulation(_params())
+    key = sim.unit().ctrl.log_names()[0]
+    name = f"converter.{key}"
+
+    def forbidden(t):
+        raise AssertionError("a controller-only watch must not read plant signals")
+
+    monkeypatch.setattr(sim.system, "signals", forbidden)
+    declared = {"converter": iter((key,))} if explicit_names else None
+    assert sim.watch_values(0.0, {"converter": {key: 0.4}}, names=[name],
+                            ctrl_names=declared) == {name: 0.4}
+
+
+def test_plant_only_watch_never_reads_unrelated_controller_logs():
+    sim = _linear_sim()
+    sim.run(out_dir=None)
+
+    def forbidden():
+        raise AssertionError("a plant-only watch must not read controller logs")
+
+    assert sim.watch_values(0.0, forbidden, names=["plant.signal"]) == {"plant.signal": 0.0}
+
+
+@pytest.mark.parametrize("failed", ["plant", "logs"])
+def test_watch_provider_failure_does_not_erase_valid_values_from_another_provider(failed):
+    sim = peslite.Simulation(_params())
+    key = sim.unit().ctrl.log_names()[0]
+    log_name = f"converter.{key}"
+
+    def plant():
+        if failed == "plant":
+            raise FloatingPointError("unrelated plant output")
+        return {"output.u": 24.0}
+
+    def logs():
+        if failed == "logs":
+            raise FloatingPointError("unrelated controller log")
+        return {"converter": {key: 0.4}}
+
+    with pytest.warns(RuntimeWarning, match="optional output unavailable"):
+        values = sim.watch_values(0.0, logs, plant=plant, names=[log_name, "output.u"])
+    assert math.isnan(values["output.u" if failed == "plant" else log_name])
+    assert values[log_name if failed == "plant" else "output.u"] == (
+        0.4 if failed == "plant" else 24.0)
 
 
 @pytest.mark.parametrize("on", [False, True])
@@ -468,7 +690,7 @@ def test_observer_reads_source_commands_and_effective_parameters_at_runtime(gfl)
     }))
     rows = []
     sim.run(out_dir=None, times=[0.0], observe_values=[connected, resistance],
-            observe=lambda t, states, values: rows.append((t, values())))
+            observe=lambda t, states, values, **_: rows.append((t, values())))
     assert rows[0] == (0.0, {connected: True, resistance: sim.p.sources["grid"].r})
     assert rows[1] == (0.001, {connected: False, resistance: 0.1})
     assert sim.watch_values(0.002, {}, names=[connected, resistance]) == rows[1][1]
@@ -488,7 +710,7 @@ def test_connection_reads_share_the_same_path_for_all_switchable_sections(gfl):
     }))
     rows = []
     sim.run(out_dir=None, times=[0.0], observe_values=paths,
-            observe=lambda t, states, values: rows.append((t, values())))
+            observe=lambda t, states, values, **_: rows.append((t, values())))
     assert rows[0] == (0.0, dict.fromkeys(paths, True))
     assert rows[1] == (0.001, dict.fromkeys(paths, False))
 
@@ -566,4 +788,4 @@ def test_completed_analysis_windows_release_their_restart_rows_during_the_run(mo
 @pytest.mark.parametrize("times", [[-1], [math.inf], [math.nan]])
 def test_generic_observation_time_validation(times):
     with pytest.raises(ValueError, match="observation times"):
-        _linear_sim().run(out_dir=None, observe=lambda *_: None, times=times)
+        _linear_sim().run(out_dir=None, observe=lambda *_, **__: None, times=times)

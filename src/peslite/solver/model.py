@@ -250,10 +250,10 @@ class StateRegistry:
 
     @property
     def linearization_columns(self) -> tuple[str, ...]:
-        """Existing columns retained by an owner's optional feedback-state declaration.
+        """Existing columns retained by an owner's optional smooth-coordinate declaration.
 
-        Observation-only history remains in restart snapshots without becoming an independent
-        feedback coordinate. Owners without a declaration retain their complete state schema.
+        Non-modal history remains in restart and recurrence checks without becoming an
+        independent smooth coordinate. Owners without a declaration retain their complete schema.
         """
         columns = []
         for group in self._groups:
@@ -263,6 +263,31 @@ class StateRegistry:
                 if selected is None or state.local_name in selected:
                     columns.extend(state.columns)
         return tuple(columns)
+
+    def periodic_state(self, row: Mapping[str, float]) -> dict[str, float]:
+        """Compare existing snapshots in an owner's logical, rather than storage, order.
+
+        An optional ``periodic_state(values)`` projects an owner's local named states onto
+        equivalent existing columns, for example a ring buffer in chronological order.
+        The original restart row and registered layout are not changed.
+        """
+        result = dict(row)
+        for group in self._groups:
+            project = getattr(group.part, "periodic_state", None)
+            if project is None:
+                continue
+            local = {state.local_name: (complex(*(row[key] for key in state.columns))
+                                       if state.kind == "complex" else row[state.name])
+                     for state in group.states}
+            projected = flatten(project(local))
+            for state in group.states:
+                for key in state.columns:
+                    local_key = key[len(group.prefix) + 1:] if group.prefix else key
+                    if local_key in projected:
+                        result[key] = projected[local_key]
+                    else:
+                        result.pop(key, None)
+        return result
 
     def read_flat(self, prefixes: Iterable[str] | None = None) -> dict[str, float]:
         """Read the fixed real-valued state-table columns using the registered layout.

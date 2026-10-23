@@ -52,6 +52,38 @@ __all__ = ["Simulation", "SimulationResult", "Recorder", "main", "convert_main",
 
 
 _EPS = 1e-10  # seconds; intervals shorter than this are not integrated separately
+_UNAVAILABLE = object()
+
+
+def _optional_output(t: float, name: str, read: Callable, *args):
+    """Isolate numerical observation failures without hiding programming or I/O errors."""
+    try:
+        with np.errstate(over="raise"):
+            return read(*args)
+    except (OverflowError, FloatingPointError) as exc:
+        warnings.warn(f"optional output unavailable at t = {t:.8g} s ({name}): {exc}",
+                      RuntimeWarning, stacklevel=2)
+        return _UNAVAILABLE
+
+
+class _SnapshotRead:
+    """Read one snapshot value at most once, including an unsuccessful calculation."""
+
+    __slots__ = ("_read", "_value", "_error")
+
+    def __init__(self, read: Callable[[], Any]) -> None:
+        self._read, self._value, self._error = read, None, None
+
+    def __call__(self):
+        if self._read is not None:
+            read, self._read = self._read, None
+            try:
+                self._value = read()
+            except Exception as exc:
+                self._error = exc
+        if self._error is not None:
+            raise self._error
+        return self._value
 
 
 def _finite(y: np.ndarray) -> bool:
@@ -313,17 +345,32 @@ class Recorder:
             self._plant.append(_plant_output_row(
                 self.params, t, signals, self.last_ctrl_log, self.ctrl_names))
 
-    def ctrl_sample(self, unit: str, t: float, log: dict[str, float]) -> None:
-        """Stream one controller's log at one of its sampling instants."""
-        if not self.keep_signals or self.out_dir is None:
-            return
+    def ctrl_sample(self, unit: str, t: float,
+                    log: Mapping[str, float] | Callable[[], Mapping[str, float] | None], *,
+                    record: bool = True) -> None:
+        """Read and publish one controller log independently of every other output."""
         names = self.ctrl_names.get(unit)
-        if not names:
-            names = self.ctrl_names[unit] = tuple(log)
+
+        def read():
+            nonlocal names
+            values = log() if callable(log) else log
+            if values is None:
+                return None
+            if not names:
+                names = self.ctrl_names[unit] = tuple(values)
+            return {name: float(values.get(name, math.nan)) for name in names}
+
+        values = _optional_output(t, f"controller log {unit!r}", read)
+        if values is None:
+            return
+        if values is _UNAVAILABLE:
+            values = dict.fromkeys(names or (), math.nan)
+        self.last_ctrl_log[unit] = values
+        if not record or not self.keep_signals or self.out_dir is None or not names:
+            return
         if unit not in self._ctrl:
             self._ctrl[unit] = _CSVTable(self.out_dir / f"ctrl.{unit}.csv", self._batch_rows)
-        self._ctrl[unit].append(
-            {"t": t, **{name: float(log.get(name, math.nan)) for name in names}})
+        self._ctrl[unit].append({"t": t, **values})
 
     def finish(self) -> _RecordedOutput:
         tables = [table for table in (self._plant, self._states, self._energy) if table is not None]
@@ -609,7 +656,7 @@ class Simulation:
         without their ``.re``/``.im`` suffix, in which case the magnitude is returned.
         Public plant/controller columns take precedence over an alias with the same name.
         Explicit ``names`` can also select effective parameter paths and connection commands.
-        Callable signal/log providers are read only when public signal values are needed.
+        Callable plant/log providers are selected independently from the existing column names.
         """
         selected = None if names is None else tuple(names)
         if selected == ():
@@ -629,23 +676,34 @@ class Simulation:
                 except (KeyError, AttributeError):
                     pass  # A signal/state name is not a parameter path.
         canonical = set(self._states.columns) | set(self._states.names)
-        if selected is None or any(name not in parameters and name not in canonical for name in selected):
-            try:
+        needed = None if selected is None else set(selected) - parameters.keys() - canonical
+        if needed is None or needed:
+            if ctrl_names is None:
+                ctrl_names = {name: getattr(unit.ctrl, "log_names", lambda: ())()
+                              for name, unit in self.units.items()}
+                if not callable(ctrl_logs):
+                    ctrl_names = {**{name: tuple(log) for name, log in ctrl_logs.items()}, **ctrl_names}
+            ctrl_names = {unit: tuple(names) for unit, names in ctrl_names.items()}
+            log_columns = {f"{unit}.{key}" for unit, names in ctrl_names.items() for key in names}
+
+            def read_plant():
                 signals = (getattr(system, "signals", lambda _t: {})(t) if plant is None
                            else plant() if callable(plant) else plant)
-                if ctrl_names is None:
-                    ctrl_names = {name: getattr(unit.ctrl, "log_names", lambda: ())()
-                                  for name, unit in self.units.items()}
+                return _plant_output_row(self.p, t, signals, {})
+
+            def read_logs():
                 logs = ctrl_logs() if callable(ctrl_logs) else ctrl_logs
-                row = _plant_output_row(self.p, t, signals, logs, ctrl_names)
-                values.update({key: value for key, value in row.items() if key != "t"})
-            except (OverflowError, FloatingPointError) as exc:
-                if selected is None:
-                    raise
-                warnings.warn(f"watch signals unavailable at t = {t:.8g} s: {exc}",
-                              RuntimeWarning, stacklevel=2)
-                values.update({name: math.nan for name in selected
-                               if name not in parameters and name not in canonical})
+                return _plant_output_row(self.p, t, {}, logs, ctrl_names)
+
+            for columns, read in ((None if needed is None else needed - log_columns, read_plant),
+                                  (None if needed is None else needed & log_columns, read_logs)):
+                if columns is not None and not columns:
+                    continue
+                row = read() if columns is None else _optional_output(t, "watched signals", read)
+                if row is not _UNAVAILABLE:
+                    values.update({key: value for key, value in row.items() if key != "t"})
+                else:
+                    values.update(dict.fromkeys(columns, math.nan))
         values.update(parameters)
         if selected is None:
             return values
@@ -723,8 +781,7 @@ class Simulation:
 
     def run(self, t_end: float | None = None, *, out_dir: str | Path | None = "output/run",
             info: Mapping[str, Any] | None = None,
-            observe: Callable[[float, Mapping[str, float], Callable[[], Mapping[str, Any]]],
-                              float | None] | None = None,
+            observe: Callable[..., float | None] | None = None,
             times: Iterable[float] | None = None, observe_values: Iterable[str] | None = (),
             name: str = "simulation") -> SimulationResult:
         """Run once, streaming configured histories directly into ``out_dir``.
@@ -733,7 +790,7 @@ class Simulation:
         disable every history. No complete numeric history is retained in memory; result columns
         read the final CSV files on demand.
 
-        ``observe(t, states, read_values)`` consumes read-only observations at exact ``times``, file
+        ``observe(t, states, read_values, *, final, stop_reason)`` consumes read-only observations at exact ``times``, file
         events, protection transitions, and the final state. ``times=None`` also observes every
         output snapshot. Call ``read_values()`` within the callback to read ``observe_values``
         (empty by default; ``None`` selects all watch signals/states), using ``watch_values`` naming.
@@ -741,6 +798,10 @@ class Simulation:
         times do not create output rows or control/protection interrupts. Observers must not
         mutate the simulation or the supplied mappings. No observer history is retained here.
         An observer may return its next required time within the run, using this same event grid.
+        Normal and early termination both deliver ``final=True``; ``stop_reason`` carries any
+        runtime failure. If no valid terminal physical snapshot is available, ``states`` is
+        ``None`` and ``read_values()`` is empty; the reason remains available. A terminal
+        callback must not request another observation time.
         """
         if self.result is not None:
             raise RuntimeError("a Simulation runs once; build a new one for another run")
@@ -816,11 +877,13 @@ class Simulation:
 
         def snapshot(t_now: float, final: bool = False, record: bool = True,
                      notify: bool = True) -> None:
-            nonlocal snapshot_index, continuous_record_index
+            nonlocal snapshot_index, continuous_record_index, stop_reason
             notifying = observe is not None and notify
             audit_due = record and energy_on and (snapshot_index % phs_check_step == 0 or final)
             snapshot_index += int(record)
             # A valid physical snapshot must survive an optional log, signal or audit failure.
+            states = None
+            available = True
             try:
                 with np.errstate(over="raise"):
                     sync_if_needed(t_now)
@@ -829,66 +892,63 @@ class Simulation:
                               if rec.keep_states or final else None)
                     if record:
                         rec.snapshot(t_now, states)
-            except (OverflowError, FloatingPointError):
-                return  # No finite physical observation is available.
+            except (OverflowError, FloatingPointError) as exc:
+                if not final:
+                    return
+                available = False
+                stop_reason = stop_reason or f"final physical snapshot unavailable at t = {t_now:.8g} s: {exc}"
 
-            signals = None
-            values = {} if value_names == () else None
-            logs_read = False
-
+            @_SnapshotRead
             def read_logs():
-                nonlocal logs_read
-                if not logs_read:
-                    for unit in units:
-                        if getattr(unit, "continuous", False):
-                            log = unit.ctrl.continuous_log(t_now)
-                            if log is not None:
-                                rec.last_ctrl_log[unit.name] = log
-                                if record and continuous_record_index % record_every == 0:
-                                    rec.ctrl_sample(unit.name, t_now, log)
-                    logs_read = True
+                for unit in units:
+                    if getattr(unit, "continuous", False):
+                        rec.ctrl_sample(unit.name, t_now,
+                                        lambda unit=unit: unit.ctrl.continuous_log(t_now),
+                                        record=record and continuous_record_index % record_every == 0)
                 return rec.last_ctrl_log
 
+            @_SnapshotRead
             def read_signals():
-                nonlocal signals
-                if signals is None:
-                    signals = getattr(system, "signals", lambda _t: {})(t_now)
-                return signals
+                return getattr(system, "signals", lambda _t: {})(t_now)
 
+            @_SnapshotRead
             def read_values():
-                nonlocal values
-                if values is None:
-                    with np.errstate(over="raise"):
-                        values = self.watch_values(t_now, read_logs, state=state,
-                                                   plant=read_signals, names=value_names,
-                                                   ctrl_names=ctrl_names)
-                return values
-
-            try:
+                if not available:
+                    return {}
                 with np.errstate(over="raise"):
-                    if record:
-                        for unit in units:
-                            if getattr(unit, "continuous", False):
-                                observe_limits = getattr(unit.ctrl, "observe_limits", None)
-                                if observe_limits is not None:
-                                    observe_limits(t_now)
-                        read_logs()
-                        if rec.keep_signals:
-                            rec.plant_snapshot(t_now, read_signals())
-                    if audit_due and _finite(plant.state):
-                        rep = mdl.energy_balance(t_now, plant.state)
-                        if rec.keep_energy:
-                            rec.energy_row(t_now, rep.columns())
-                        scale = rep.scale
-                        worst["tellegen"] = max(worst["tellegen"], abs(rep.tellegen) / scale)
-                        worst["balance"] = max(worst["balance"], rep.max_residual / scale)
-            except (OverflowError, FloatingPointError):
-                pass  # Optional output failed; the physical snapshot is already recorded.
+                    return self.watch_values(t_now, read_logs, state=state,
+                                             plant=read_signals, names=value_names,
+                                             ctrl_names=ctrl_names)
+
+            def record_energy():
+                rep = mdl.energy_balance(t_now, plant.state)
+                if rec.keep_energy:
+                    rec.energy_row(t_now, rep.columns())
+                scale = rep.scale
+                worst["tellegen"] = max(worst["tellegen"], abs(rep.tellegen) / scale)
+                worst["balance"] = max(worst["balance"], rep.max_residual / scale)
+
+            if record and available:
+                for unit in units:
+                    if getattr(unit, "continuous", False):
+                        observe_limits = getattr(unit.ctrl, "observe_limits", None)
+                        if observe_limits is not None:
+                            _optional_output(t_now, f"controller limits {unit.name!r}",
+                                             observe_limits, t_now)
+                read_logs()
+                if rec.keep_signals:
+                    _optional_output(t_now, "plant signals",
+                                     lambda: rec.plant_snapshot(t_now, read_signals()))
+            if available and audit_due and _finite(plant.state):
+                _optional_output(t_now, "energy balance", record_energy)
             continuous_record_index += int(record)
             # Observer failures must not be swallowed as physical-state overflow.
             if notifying:
-                next_observation = observe(t_now, states, read_values)
+                next_observation = observe(t_now, states, read_values,
+                                           final=final, stop_reason=stop_reason if final else "")
                 if next_observation is not None:
+                    if final:
+                        raise ValueError("a final observation cannot request another time")
                     if (not math.isfinite(next_observation) or next_observation <= t_now + _EPS
                             or next_observation > t_final + _EPS):
                         raise ValueError("an observer's next time must be finite, later, and within the run")
@@ -1001,7 +1061,6 @@ class Simulation:
             advancing = t_stop > t_local + _EPS
             if advancing and advance(t_local, t_stop, event_due):
                 stopped = True
-                snapshot(t_local, final=True)
                 break
             if observation_only:
                 snapshot(t_local, record=False)
@@ -1026,26 +1085,21 @@ class Simulation:
                     protection_changed = True
                     stopped = stop_on_trip
             if stopped:
-                snapshot(t_local, final=True)
                 break
             for unit in units:
                 done = unit.sense(t_stop, plant)
                 if done is not None:
                     k, out = done
                     if out.log is not None:
-                        rec.last_ctrl_log[unit.name] = out.log
-                        if k % record_every == 0:
-                            rec.ctrl_sample(unit.name, t_stop, out.log)
+                        rec.ctrl_sample(unit.name, t_stop, out.log, record=k % record_every == 0)
             for unit in units:
                 if unit.actuate(t_stop, plant):
                     protection_changed = True
                     stopped = stop_on_trip
             if stopped:
-                snapshot(t_local, final=True)
                 break
             window_edge(t_local, plant.inputs_changed)
             if t_stop >= t_final - _EPS:
-                snapshot(t_local, final=True)
                 break
             if abs(t_log - t_stop) < _EPS:
                 snapshot(t_local, notify=(observe_output or observation_due
@@ -1059,8 +1113,7 @@ class Simulation:
                       flush=True)
                 next_report += progress_every
 
-        if rec.last_t is None or rec.last_t < t_local - _EPS:
-            snapshot(t_local, final=True)
+        snapshot(t_local, final=True)
         if stop_reason:
             warnings.warn(f"simulation stopped at t = {t_local:.6g} s: {stop_reason}", stacklevel=2)
         records = rec.finish()
@@ -1198,6 +1251,7 @@ class SystemLoop:
         self._flags = {name for name in flags
                        if name.rpartition(".")[2] in ("tripped", "fault")}
         self._modes = set(sim._states.discrete_names) - self._flags
+        self._states = sim._states
         self._map_columns = set(sim._states.linearization_columns)
         self._plant_columns = set(sim._states.read_flat(["", *sim.units])) - control_columns
         rated = getattr(sim.solver, "rated_effort", None)
@@ -1216,13 +1270,19 @@ class SystemLoop:
                                                                       linearisations=0)))
 
     # ------------------------------------------------------------ coordinates
-    def coordinates(self, names: list[str]) -> list[tuple[str, list[str], float]]:
+    def periodic_state(self, row: Mapping[str, float]) -> dict[str, float]:
+        """Logical snapshot for recurrence checks, retaining non-modal protection history."""
+        return self._states.periodic_state(row)
+
+    def coordinates(self, names: list[str], *, linearization: bool = True
+                    ) -> list[tuple[str, list[str], float]]:
         """Group state-table columns into map coordinates ``(kind, names, scale)``."""
         cols: list[tuple[str, list[str], float]] = []
         used: set[str] = set()
+        selected = self._map_columns if linearization else set(self._states.columns)
         for c in names:
-            if c in used or c not in self._map_columns or c.startswith("solver."):
-                continue  # solver bookkeeping and observation-only history are not loop states
+            if c in used or c not in selected or c.startswith("solver."):
+                continue  # Select existing columns; solver bookkeeping is never a loop state.
             if c in self._flags:
                 cols.append(("frozen", [c], 1.0))
                 used.add(c)

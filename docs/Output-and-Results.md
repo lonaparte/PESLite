@@ -51,6 +51,10 @@ simulation:
 
 If `states` is disabled, the terminal state is still retained so `final_states()` works. If
 `energy` is disabled, summary energy checks still run unless `energy_check` disables them.
+Numerical failures in optional observations are reported independently: a failed controller log
+does not discard valid plant, state or energy output. Declared log columns use NaN for an
+unavailable sample. Each CSV retains its own sampling timestamps; different tables are not
+required to have equal row counts.
 
 ## State and signal names
 
