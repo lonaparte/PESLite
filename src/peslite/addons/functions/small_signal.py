@@ -72,8 +72,7 @@ class SmallSignalResult:
     @property
     def mode_table(self) -> str:
         if not self.periodic:
-            return ("Transient finite-time analysis; no periodic stability verdict.\n"
-                    f"Normalized perturbation amplification: {self.amplification:.8g}")
+            return "No stability analysis: a periodic operating state has not been established."
         lines = ["mode  multiplier                  growth (1/s)  frequency (Hz)"]
         for index, (mu, exponent) in enumerate(zip(self.multipliers, self.exponents)):
             lines.append(f"{index:4d}  {mu.real:+.8g}{mu.imag:+.8g}j"
@@ -138,48 +137,60 @@ def _analyze(loop, row, t0, relative_step, periodic_tolerance, multiplier_tolera
         raise ValueError("the loop has no differentiable state coordinates")
     coordinate_names = tuple(name for kind, group, _scale in cols if kind not in ("frozen", "mode")
                              for name in group)
-    initial = loop.to_frame(row, t0, cols)
+    check_row = loop.periodic_state(row)
+    check_cols = loop.coordinates(list(check_row), linearization=False)
+    check_active = active_coordinates(check_cols)
+    check_names = tuple(name for _kind, group, _scale in check_cols for name in group)
+    initial = loop.to_frame(check_row, t0, check_cols)
     baseline_evaluations = int(baseline is None)
     baseline = loop.advance(dict(row), t0) if baseline is None else baseline
-    final = loop.to_frame(baseline, t0 + loop.period, cols)
+    final = loop.to_frame(loop.periodic_state(baseline), t0 + loop.period, check_cols)
     if not np.all(np.isfinite(initial)) or not np.all(np.isfinite(final)):
         raise ValueError("small_signal requires finite initial and final states")
-    floors = np.concatenate([np.full(coordinate_width(kind), scale) for kind, _names, scale in cols])
+    floors = np.concatenate([np.full(coordinate_width(kind), scale)
+                             for kind, _names, scale in check_cols])
     scales = np.maximum(floors, np.maximum(np.abs(initial), np.abs(final)))
     j = 0
     evolved_modes = []
-    for kind, names, scale in cols:
+    for kind, names, scale in check_cols:
         if kind == "angle":
             scales[j] = scale
         elif kind in ("frozen", "mode") and initial[j] != final[j]:
             evolved_modes.append(names[0])
         j += coordinate_width(kind)
-    residual = (np.abs(coordinate_difference(final, initial, cols))[list(active)]
-                / scales[list(active)])
+    residual = (np.abs(coordinate_difference(final, initial, check_cols))[list(check_active)]
+                / scales[list(check_active)])
     worst = int(np.argmax(residual))
     error = float(residual[worst])
     periodic = repeating and not evolved_modes and error <= periodic_tolerance
-    if require_periodic and evolved_modes:
-        raise ValueError(f"the analysis period changes the discrete state {evolved_modes[0]!r}")
-    if require_periodic and not periodic:
-        raise ValueError(f"the final state is not periodic over {loop.period:.8g} s "
-                         f"({coordinate_names[worst]}: scaled residual {error:.3g} "
-                         f"> {periodic_tolerance:.3g}); "
-                         "settle the run or supply the correct period")
+    if not periodic:
+        if not repeating:
+            reason = "the analysis period contains a non-repeating simulation-file event"
+        elif evolved_modes:
+            reason = f"the analysis period changes the discrete state {evolved_modes[0]!r}"
+        else:
+            reason = (f"the final state is not periodic over {loop.period:.8g} s "
+                      f"({check_names[check_active[worst]]}: scaled residual {error:.3g} "
+                      f"> {periodic_tolerance:.3g}); settle the run or supply the correct period")
+        if require_periodic:
+            raise ValueError(reason)
+        return SmallSignalResult(t0, loop.period, np.empty((0, 0)), (),
+                                 np.array([], dtype=complex), error, baseline_evaluations,
+                                 time.perf_counter() - started, multiplier_tolerance,
+                                 (reason,), periodic=False)
 
     linear = linearize_loop(loop, row, t0, cols, relative_step=relative_step, baseline=baseline)
     if linear.changed_modes:
         raise ValueError("a perturbation changes discrete operating modes: "
                          + ", ".join(linear.changed_modes))
     phi = linear.phi[np.ix_(active, active)]
-    multipliers = np.linalg.eigvals(phi).astype(complex) if periodic else np.array([], dtype=complex)
+    multipliers = np.linalg.eigvals(phi).astype(complex)
     order = np.argsort(-np.abs(multipliers), kind="stable")
     diagnostics = ["Frequencies use the principal logarithm and are ambiguous modulo 1 / period."]
     # A single norm convention is used at both window boundaries; it is not an energy norm.
-    scale = scales[list(active)]
+    scales_by_name = dict(zip(check_names, scales))
+    scale = np.array([scales_by_name[name] for name in coordinate_names])
     amplification = float(np.linalg.norm(phi * scale[None, :] / scale[:, None], ord=2))
-    if not periodic:
-        diagnostics = ["Transient finite-time sensitivity, not an asymptotic stability verdict."]
     if getattr(loop, "split_reference", False):
         diagnostics.append("The map uses SystemLoop's unsplit reference integration.")
     return SmallSignalResult(t0, loop.period, phi, coordinate_names, multipliers[order], error,
@@ -248,8 +259,9 @@ def small_signal_report(sim: Simulation, *, times: Iterable[float] = (),
     automatically. Numerical report changes use the requested absolute/relative tolerance.
 
     Reuse unperturbed main-run endpoints when they were observed at exactly ``t + period``.
-    Other endpoints use the existing advance once. Perturbed advances are still necessary;
-    unchanged parameters do not justify reusing an old transition matrix. Multirate reference
+    Other endpoints use the existing advance once. Only periodic operating states start
+    perturbation runs; earlier checks report transient without a matrix or modal values.
+    Unchanged parameters do not justify reusing an old transition matrix. Multirate reference
     maps cannot use endpoints from the split main run.
     """
     _validate_options(relative_step, periodic_tolerance, multiplier_tolerance, period)
@@ -297,10 +309,11 @@ def small_signal_report(sim: Simulation, *, times: Iterable[float] = (),
                 evaluations += analysis.evaluations
             reused += int(baseline is not None)
             exponent = analysis.exponents[0] if analysis.periodic else None
-            entry.update({"analysis.stability": analysis.stability, "analysis.reason": None,
+            entry.update({"analysis.stability": analysis.stability,
+                          "analysis.reason": None if analysis.periodic else analysis.diagnostics[0],
                           "analysis.period": analysis.period,
                           "analysis.periodic_error": analysis.periodic_error,
-                          "analysis.amplification": analysis.amplification,
+                          "analysis.amplification": analysis.amplification if analysis.periodic else None,
                           "analysis.growth_rate": float(exponent.real) if exponent is not None else None,
                           "analysis.frequency": (float(abs(exponent.imag) / math.tau)
                                                  if exponent is not None else None)})
@@ -313,30 +326,33 @@ def small_signal_report(sim: Simulation, *, times: Iterable[float] = (),
     def next_endpoint():
         return waiting[0][0] if waiting else None
 
-    def observe(t, states, read_values):
+    def observe(t, states, read_values, *, final, stop_reason):
         nonlocal was_tripped
-        while waiting and waiting[0][0] <= t + _EPS:
+        while waiting and (final or waiting[0][0] <= t + _EPS):
             endpoint, _index, point = heapq.heappop(waiting)
             analyze(point, states if abs(endpoint - t) <= _EPS else None)
         tripped = any(unit.tripped for unit in sim.units.values())
         due = bool(targets and targets[0] <= t + _EPS)
-        if not due and not (tripped and not was_tripped):
+        if not (due or final or (tripped and not was_tripped)):
             return next_endpoint()
         was_tripped = tripped
         while targets and targets[0] <= t + _EPS:
             targets.popleft()
         entry = dict(read_values())
         records[t] = entry
+        if stop_reason:
+            entry.update({"analysis.stability": "unavailable", "analysis.reason": stop_reason})
+            return None
         if tripped:
             entry.update({"analysis.stability": "unavailable", "analysis.reason": "tripped operating state"})
-            return next_endpoint()
+            return None if final else next_endpoint()
         try:
             loop = SystemLoop(sim, period=period, frame_frequency=0.0, repeat_forcing=True)
             if loop.period is None:
                 raise ValueError("no common analysis period; supply period explicitly")
         except ValueError as exc:
             entry.update({"analysis.stability": "unavailable", "analysis.reason": str(exc)})
-            return next_endpoint()
+            return None if final else next_endpoint()
         point = _ReportPoint(t, dict(states), loop)
         entry["analysis.integration"] = ("unsplit reference" if loop.split_reference
                                          else "configured solver")
@@ -344,17 +360,10 @@ def small_signal_report(sim: Simulation, *, times: Iterable[float] = (),
             heapq.heappush(waiting, (t + loop.period, len(records), point))
         else:
             analyze(point)
-        return next_endpoint()
+        return None if final else next_endpoint()
 
     result = sim.run(out_dir=out_dir, name=name, info=info, observe=observe, times=selected,
                      observe_values=reported)
-    # An early stop may prevent a pending window from reaching its main-run endpoint.
-    while waiting:
-        analyze(heapq.heappop(waiting)[2])
-    if result.summary.get("stop_reason"):
-        records.setdefault(result.summary["t_stop"], {}).update({
-            "analysis.stability": "unavailable", "analysis.reason": result.summary["stop_reason"]})
-
     previous, timeline = {}, []
     metric_names = sorted({name for entry in records.values() for name in entry
                            if name.startswith("analysis.")})

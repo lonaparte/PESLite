@@ -62,6 +62,9 @@ always checked; `times` adds exact observation points. Alternatively, or additio
 `interval=0.005` to check every 5 ms from the simulation start. Detection is not performed at
 every PWM edge. A protection trip is reported at the runtime's detected transition, including
 when the main simulation is configured to continue after a trip.
+Normal and early termination use the same final observation. The report retains any valid watched
+values at the actual stop time, even when that time was not a requested check; a runtime failure
+marks the analysis unavailable with the same stop reason as the simulation summary.
 
 The JSON report, `<name>_report.json`, contains a `small_signal_stability` section with the
 initial row and then only changed items, grouped by time. Event-written parameter paths and command values
@@ -76,11 +79,14 @@ values; the report does not replay events or maintain a separate parameter/comma
 
 Periodic operating states receive the same stability classification as the final-state addon.
 Non-periodic states, changing nominal discrete modes, and windows crossing a one-off file event
-instead receive `transient`: their `analysis.amplification` is the largest singular value of
-the finite-time map after coordinate scaling, not an asymptotic stability verdict. The scale
-for each coordinate is the greater of its existing perturbation floor and its initial/final
-magnitude, used identically at both boundaries; angles use their angular scale. This is not an
-energy norm. Periodic states can also have transient amplification greater than one.
+instead receive `transient`, with a reason and no matrix, modal values, or amplification.
+Only the unperturbed period is checked at those points; perturbation runs begin when a selected
+check establishes a periodic operating state. The report does not extend the main simulation
+or silently settle its operating point. For a periodic state, `analysis.amplification` is the
+largest singular value of the map after coordinate scaling. The scale for each coordinate is
+the greater of its existing perturbation floor and its initial/final magnitude, used identically
+at both boundaries; angles use their angular scale. This is not an energy norm. Periodic states
+can also have transient amplification greater than one.
 Unavailable checks, including perturbation-dependent discrete modes, carry an explicit reason
 and clear preceding modal values. Dominant modal growth and unsigned oscillation frequency are
 reported only for periodic states. `analysis.*` is reserved for report metrics.
@@ -98,9 +104,14 @@ split an integration interval, so normal numerical step/tolerance effects can st
 
 The report consumes the state already read at main-run snapshots. Watched signals are read only
 when requested, and only explicitly watched control-log columns enable controller logging when
-signal histories and progress watches are disabled. Baseline-only endpoints do not read watched
-values. Optional signal overflow produces a warning and an unavailable watched value, without
-discarding a finite physical snapshot or a valid stability calculation.
+signal histories and progress watches are disabled. A controller-only watch does not read plant
+signals, and a plant-only watch does not read controller logs. Baseline-only endpoints do not read watched
+values. Read results, including failed calculations, are cached once per snapshot and shared by
+CSV output and watches. Numerical observation failures produce a warning and unavailable values
+only for that provider. Controller logs, plant signals, limit statistics and energy observations
+are isolated at their shared output boundary: a failed log does not discard a valid plant row,
+physical snapshot, or energy observation. Missing declared controller-log values are NaN in CSV
+and null in JSON rather than reusing stale values.
 
 Only unfinished analysis windows retain complete restart rows. As each endpoint arrives, its
 matrix is calculated through the shared map and its restart row is released; endpoints are not
@@ -108,10 +119,17 @@ stored as a second history. The ordinary waveform history is not loaded.
 The optional observer can request an exact endpoint
 on the existing event grid, without creating CSV rows or extra control/protection interrupts.
 When it coincides with an existing runtime event, no extra integration boundary is needed.
+Python observation callbacks use
+`observe(t, states, read_values, *, final, stop_reason)`. The keyword metadata distinguishes a
+terminal snapshot from a scheduled check or a baseline-only endpoint. A final callback must not
+request another time. If the terminal physical snapshot itself is unavailable, `states` is
+`None`, watched values are empty, and the final reason is still delivered. Callback errors still
+propagate; only numerical output calculations are treated as optional failures.
 
 An endpoint at `t + period` supplies the unperturbed result directly. With `n` active coordinates,
 that check needs `2*n` extra period advances rather than `1 + 2*n`. If the endpoint is beyond the
-main run, the baseline is advanced once through the existing map. Multirate runs use the shared
+main run, the baseline is advanced once through the existing map. Before periodicity is established,
+only that baseline is needed, with no perturbation advances. Multirate runs use the shared
 unsplit reference map and cannot reuse the split run's endpoint; the report identifies the
 reference integration. Perturbed runs are still required, and unchanged parameters alone do
 not justify reusing a matrix computed at a different state.
@@ -150,7 +168,8 @@ explicit-time loop laws may implement `forcing_periods(inputs)`, returning their
 in seconds from the existing wired loop inputs; `ResonantModulation` uses this interface. A caller
 must account for any undeclared time dependence when supplying a period.
 
-The initial and one-period final states must agree within `periodic_tolerance`. Angular differences
+The initial and one-period final logical states must agree within `periodic_tolerance`, including
+protection feedback history even when it is excluded from the smooth modal coordinates. Angular differences
 are taken modulo a full turn, using the control graph's angle-port declarations; unwrapped angle
 magnitude does not relax the periodicity tolerance. Numerical sample/hold and PWM memory remains
 in the map. Boolean/integer modes and owner-declared lifecycle state, such as protection timers
@@ -161,11 +180,14 @@ declare `discrete_state_names` for float-valued lifecycle state; it does not nee
 or a separate snapshot representation. The addon does not remove genuine unit multipliers merely
 because they are near the unit circle.
 
-An owner may also declare `linearization_state_names` to distinguish feedback memory from purely
-observational restart data. For example, ADC window-mean integrals feed the control graph and remain
-coordinates; RMS history and cached statistics do not. Those histories are still restored and
-protection still runs, but they do not introduce cached-sum or ring-buffer modes into the smooth
-closed-loop spectrum. This selection uses the same registered state columns, not another state table.
+An owner may also declare `linearization_state_names` to select independent smooth coordinates
+without dropping other restart or protection history. For example, ADC window-mean integrals remain
+coordinates; RMS history does not introduce cached-sum or ring-buffer modes into the smooth
+closed-loop spectrum. Those histories are still restored and checked for recurrence, and protection
+still runs. The registry's optional owner method `periodic_state(values)` defines logical equivalence
+using existing named columns: ADC compares a full RMS ring in chronological order, not by its
+rotating storage index. A filling or changing history therefore prevents a periodic verdict, while
+an equivalent storage rotation does not. Neither view creates another state table or changes restart data.
 
 ## Options and results
 

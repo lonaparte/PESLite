@@ -180,8 +180,20 @@ class ADC:
 
     @property
     def linearization_state_names(self) -> tuple[str, ...]:
-        """Only window means feed control; RMS history is observation/protection bookkeeping."""
+        """Only window means are smooth controller coordinates; RMS also affects protection."""
         return tuple(f"x_{channel}" for channel in self.accumulated)
+
+    def periodic_state(self, values: Mapping[str, Any]) -> dict[str, Any]:
+        """Compare RMS history in chronological order, without its rotating storage index."""
+        result = dict(values)
+        for channel, window in self.rms.items():
+            prefix = f"rms_{channel}."
+            index = int(result.pop(prefix + "index"))
+            if values[prefix + "count"] == window.window.n:
+                for i in range(window.window.n):
+                    result[f"{prefix}sample_{i}"] = values[
+                        f"{prefix}sample_{(index + i) % window.window.n}"]
+        return result
 
     @property
     def _full(self) -> bool:

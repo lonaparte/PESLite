@@ -6,8 +6,12 @@ documentation are present. Keep this temporary plan until acceptance; maintained
 
 The dynamic addon also provides an opt-in simulation timeline. It consumes existing observations,
 retains only unfinished windows' restart rows, shares the same finite-difference map,
-and reports only changed items. Periodic stability and transient finite-window amplification are
-distinguished explicitly. Static, no-time-integration analysis remains outside this implementation.
+and reports only changed items. It waits for a complete periodic operating state before running
+perturbations; earlier checks are marked transient without modal analysis.
+Static, no-time-integration analysis remains outside this implementation.
+Shared snapshot readers cache values and failures, while independent output providers retain
+their own failure boundaries. Observer lifecycle metadata supplies the same final notification
+for normal completion and early termination; the report does not patch in a second terminal row.
 
 Source: [Issue #23: Idea on small signal stability analysis](https://github.com/lonaparte/PESLite/issues/23),
 proposed by [@NoClassDefError](https://github.com/NoClassDefError).
@@ -106,9 +110,11 @@ Distinguish the complete restart row from the differentiable coordinates used fo
 
 The implementation obtains these views from the existing `StateRegistry`: optional owner
 declarations `discrete_state_names` identify lifecycle state, and `linearization_state_names`
-select actual feedback memory when a snapshot also contains observational history. ADC mean
-integrals remain coordinates; RMS history remains restored for protection without introducing
-observation/cache modes. Neither declaration creates another state store or changes normal runs.
+select smooth modal coordinates without dropping other operating-state history. ADC mean
+integrals remain coordinates; RMS history remains restored and checked for periodicity without
+introducing observation/cache modes. The existing registry applies optional owner-defined
+`periodic_state(values)` projections to compare logical history rather than storage indices.
+No additional state store is created and normal runs are unchanged.
 
 Keep the original output time grid when disabling analysis histories, because sampling or
 protection timing can depend on it. Explicit-time loops declare their forcing periods through
