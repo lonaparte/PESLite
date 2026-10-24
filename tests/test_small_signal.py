@@ -191,7 +191,7 @@ def _params(**overrides):
     })
 
 
-def _linear_sim(matrix, *, feedback=False):
+def _linear_sim(matrix, *, feedback=False, **overrides):
     def factory(params):
         plant = _LinearPlant(matrix)
         subsystems, connections = {"plant": plant}, {}
@@ -205,7 +205,8 @@ def _linear_sim(matrix, *, feedback=False):
         return SimpleNamespace(units={}, model=model, _port_bindings={},
                                state_parts=lambda: [("", model)])
 
-    sim = peslite.Simulation(_params(**{"simulation.solver.dt": 1e-4}), parts={"system": factory})
+    sim = peslite.Simulation(_params(**{"simulation.solver.dt": 1e-4, **overrides}),
+                             parts={"system": factory})
     sim.run(out_dir=None)
     return sim
 
@@ -236,6 +237,41 @@ def test_public_addon_matches_independent_continuous_matrix(growth, frequency, f
     assert not hasattr(sim, "small_signal")
     expected = np.linalg.eigvals(effective)
     np.testing.assert_allclose(np.sort_complex(analysis.exponents), np.sort_complex(expected), atol=1e-6)
+
+
+@pytest.mark.parametrize("solver,settings", [
+    ("fixed", (2e-4, 1e-4, 5e-5)), ("adaptive", (1e-3, 1e-5, 1e-7)),
+])
+def test_integration_refinement_converges_to_the_existing_exact_linear_reference(solver, settings):
+    w = math.tau * 400.0
+    matrix = np.array([[-30.0, -w], [w, -30.0]])
+    period = 0.001
+    reference = expm(matrix * period)
+    errors = []
+    for value in settings:
+        options = ({"simulation.solver.dt": value} if solver == "fixed" else {
+            "simulation.solver.type": "adaptive", "simulation.solver.method": "DP45",
+            "simulation.solver.rtol": value, "simulation.solver.atol": value * 1e-5})
+        sim = _linear_sim(matrix, **{"simulation.output.period": period, **options})
+        analysis = small_signal(sim, period=period)
+        errors.append(np.linalg.norm(analysis.phi - reference))
+    assert errors[1] < errors[0] / 10.0
+    assert errors[2] < errors[1] / 10.0
+    assert errors[-1] < (1e-5 if solver == "fixed" else 1e-7)
+
+
+def test_external_profiler_accounts_for_actual_rebuilds_advances_and_matrix_work():
+    from benchmark_small_signal import profile_analysis
+
+    sim = _linear_sim(-np.eye(2))
+    before = sim.result.final_states()
+    analysis, sample = profile_analysis(sim, period=0.01)
+    assert sample["reconstructions"] == sample["period_advances"] == analysis.evaluations
+    stages = sample["stage_seconds"]
+    assert all(value > 0.0 for value in stages.values())
+    assert sum(stages.values()) == pytest.approx(sample["profiled_wall_seconds"])
+    assert stages["eigenvalues"] > 0.0
+    assert sim.result.final_states() == before
 
 
 def test_neutral_and_zero_multipliers_are_preserved():

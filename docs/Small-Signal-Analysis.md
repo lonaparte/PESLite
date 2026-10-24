@@ -244,6 +244,51 @@ instead. For multirate configurations, the existing `SystemLoop` uses an unsplit
 with the configured base solver and tolerances. It does not identify numerical modes of the
 multirate splitting approximation; the result diagnostics state this distinction.
 
+### Reproducible verification
+
+`tests/test_small_signal_ac.py` exercises the shipped GFL, PSC and VSG converters and a shared-bus
+GFL/PSC pair through the ordinary simulation and online report. The AC cases retain 20 kHz
+`pwm_averaging`, the computation delay, controller sample/hold state and PWM shadow registers.
+They use a 50 ms connection ramp followed by constant commands, with no intervening reference
+or grid-frequency steps. The test operating points are 0.3 pu DC input for GFL, 0.5 pu active
+power for PSC, 0.2 pu for VSG, and 0.3 pu per converter in the pair. Four seconds of time-domain
+settling precede analysis. These are verification conditions, not new defaults or a stability
+guarantee for other operating points. Existing Buck checks separately cover all three bridge modes.
+
+The checks cover exact named-state continuation, independent perturbation directions, cross-unit
+coupling, online/final-state agreement, and matching multiplier sets a quarter-cycle and a full
+cycle later. Matrices at different phases need not be elementwise equal; their spectra are
+matched without assuming an eigenvalue ordering. Fixed-step refinement differentiates the same
+completed physical state rather than conflating integration error with a changed operating point.
+The existing independent linear reference also checks fixed-step and adaptive-tolerance
+convergence; finite-difference refinement is checked on the actual sampled AC map.
+
+Run these checks from a checkout with the test dependencies installed:
+
+```bash
+python -B -m pytest tests/test_small_signal.py tests/test_small_signal_ac.py
+```
+
+`tests/benchmark_small_signal.py` profiles any supplied simulation file through the same addon.
+For the GFL verification operating point:
+
+```bash
+OPENBLAS_NUM_THREADS=1 python -B tests/benchmark_small_signal.py examples/gfl-example.pes \
+  --set simulation.t_end=4.0 \
+  --set events.connect_vsc.t=0.0 \
+  --set events.connect_vsc.ramp=0.05 \
+  --set units.vsc.dclink.source.i_pu=0.3 \
+  --set units.vsc.ctrl.loops.DCVoltageControl.feedforward=0.3
+```
+
+The tool reports model reconstruction, one-period simulation, transition-matrix assembly,
+eigenvalue calculation, and remaining validity/orchestration work as disjoint costs. Period
+advances are subtracted from the matrix helper's inclusive profiler time, so they are not
+counted twice. The measured reconstruction/advance counts must agree with the addon's evaluation
+count. `--repeats` repeats analysis of the same completed state; `--period` and `--relative-step`
+use the ordinary analysis options. These are profiler-instrumented measurements, not portable
+wall-time guarantees. No profiler, extra timers or performance assertions enter normal simulation.
+
 The same solver-side transition-matrix implementation serves split-error analysis. Its held-input
 perturbations and error propagation remain in `splitbound.py`, outside the addon. Split-error
 estimates retain their existing local common-clock period; waveform recurrence is requested only
