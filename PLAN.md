@@ -180,8 +180,8 @@ the entire trajectory merely to support this addon.
   using another addon does not eagerly load this analysis implementation.
 - Record reconstruction, one-period simulation, and matrix/eigenvalue work separately in
   performance experiments. The central difference requires two period evaluations per active
-  coordinate, plus the shared baseline and explicit validation runs. Optimize measured shared
-  costs only; do not add an alternative simulator speculatively.
+  coordinate that is not proven overwritten, plus the shared baseline and explicit validation
+  runs. Optimize measured shared costs only; do not add an alternative simulator speculatively.
 
 Completion requires the shared implementation, verification, and user documentation, not merely
 the presence of this plan or the proposed API example.
@@ -206,3 +206,7 @@ the presence of this plan or the proposed API example.
   analysis path. Maintained instructions and operating-point limits are recorded in
   `docs/Small-Signal-Analysis.md`. Static analysis and historical `at=` selection remain outside
   this plan's scope. Removing this temporary plan remains an acceptance-time cleanup action.
+- Shared linearization skips only structurally proven zero columns, retaining the complete
+  matrix and its zero modes. Owner declarations use the existing state registry and graph
+  schedules; exhaustive comparisons cover clock ratios, phase, bridge models, light loads and
+  custom loops in `tests/test_linearization_pruning.py` and the AC verification module.

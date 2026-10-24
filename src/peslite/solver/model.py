@@ -18,6 +18,7 @@ import linecache
 import math
 import numbers
 import re
+import weakref
 from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, ClassVar, Iterable, Mapping, Protocol, Sequence, runtime_checkable
@@ -288,6 +289,23 @@ class StateRegistry:
                     else:
                         result.pop(key, None)
         return result
+
+    def overwritten_columns(self, period: float) -> frozenset[str]:
+        """Registered columns an owner proves are overwritten before any read in a map.
+
+        Owners without the optional declaration retain exhaustive differentiation. These
+        columns remain in restart, recurrence checks and the resulting transition matrix.
+        """
+        columns = set()
+        for group in self._groups:
+            declare = getattr(group.part, "overwritten_state_names", None)
+            if declare is None:
+                continue
+            overwritten = set(declare(period))
+            for state in group.states:
+                if state.local_name in overwritten:
+                    columns.update(state.columns)
+        return frozenset(columns)
 
     def read_flat(self, prefixes: Iterable[str] | None = None) -> dict[str, float]:
         """Read the fixed real-valued state-table columns using the registered layout.
@@ -1154,6 +1172,8 @@ class Model:
         filename = f"<peslite model {id(self):#x}>"
         exec(compile(source, filename, "exec"), env)
         linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
+        # Rebuilt models own their debugging source; collecting one must release its cache entry.
+        weakref.finalize(self, linecache.cache.pop, filename, None)
         self.compiled_source = source
         self._load, self._outputs, self._zoh_outputs, self.rhs_list = (
             env["_load"], env["_outputs"], env["_zoh_outputs"], env["rhs_list"])

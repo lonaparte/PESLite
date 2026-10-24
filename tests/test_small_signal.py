@@ -300,7 +300,7 @@ def test_buck_modes_reuse_complete_state_without_artificial_unit_multipliers(mod
     analysis = small_signal(sim, period=period)
     assert analysis.stability == "stable"
     assert analysis.phi.shape == (len(analysis.coordinates),) * 2
-    assert analysis.evaluations == 1 + 2 * len(analysis.coordinates)
+    assert analysis.evaluations <= 1 + 2 * len(analysis.coordinates)
     assert not any(".prot." in name or ".startup." in name or name.endswith(".on")
                    for name in analysis.coordinates)
     assert any(".integral" in name for name in analysis.coordinates)

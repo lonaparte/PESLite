@@ -895,6 +895,30 @@ class ControlGraph:
                           for n in self.order}, "connections": dict(self.connections), "outputs": dict(self.outputs)}
 
     # ------------------------------------------------------------ states
+    def overwritten_state_names(self, period, *, reads=()):
+        """Held values overwritten before every possible read during this map.
+
+        Aligned integer-rate consumers run after their producers whenever they are due.
+        Boundary outputs and additional host reads remain conservative. The producer must
+        update within the map, including for an otherwise unused output's own final state.
+        No numerical zero test or operating-point-dependent classification is used.
+        """
+        if self.continuous or self._pending:
+            return frozenset()
+        strides = dict(self._every)
+        retained = set(self.outputs.values()) | set(reads)
+        for target, source in self.connections.items():
+            producer = source.partition(".")[0]
+            consumer = target.partition(".")[0]
+            if producer in strides and strides[consumer] % strides[producer] != 0:
+                retained.add(source)
+        return frozenset(
+            f"held.{self._state_port(source)}"
+            for name in self.order if period >= self.periods[name]
+            for _port, source, _complex in self._out_specs[name]
+            if source not in retained
+        )
+
     def get_state(self):
         state = gather(self.nodes)
         state.update({f"held.{self._state_port(k)}": v for k, v in self.values.items()})
@@ -1012,6 +1036,10 @@ class _GraphRuntime:
     def interface(self) -> ControlInterface:
         """The effective typed boundary of the active control graph."""
         return self.graph.interface
+
+    def overwritten_state_names(self, period):
+        """Expose the graph's proof through the existing state owner."""
+        return self.graph.overwritten_state_names(period)
 
     def _install_flow_state(self, state_type: type, states: list[tuple[str, Mapping]],
                             inp: Any, out: Any) -> None:
@@ -1475,6 +1503,12 @@ class VSCController(_GraphRuntime):
         return log
 
     # ------------------------------------------------------------ states and summary
+    def overwritten_state_names(self, period):
+        # The host also reads the current frame outside graph.sample(). Keep those ports.
+        return self.graph.overwritten_state_names(period, reads=(
+            self._frame_key, self.graph.connections.get(f"{self._frame_cc}.frame"),
+        ))
+
     def get_state(self):
         if self.continuous:
             return gather({"startup": self.startup})

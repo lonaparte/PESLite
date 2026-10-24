@@ -88,6 +88,8 @@ def linearize_loop(loop: LoopMap, row: dict[str, float], t0: float, cols: list,
     state row here to avoid repeating that evaluation; ``evaluations`` counts only actual calls.
     Discrete endpoints are compared with the baseline: nominal clock/lifecycle evolution is not
     a perturbation-dependent mode change. A periodic-state caller checks baseline recurrence.
+    Optional ``loop.overwritten_columns(t0)`` proves zero columns without perturbation runs.
+    Their rows, coordinates and zero multipliers remain present; unknown maps stay exhaustive.
     """
     if not math.isfinite(relative_step) or relative_step <= 0.0:
         raise ValueError("relative_step must be finite and positive")
@@ -112,9 +114,15 @@ def linearize_loop(loop: LoopMap, row: dict[str, float], t0: float, cols: list,
     base = converted(loop.advance(dict(row), t0) if baseline is None else baseline)
     phi = np.eye(len(x0))
     evaluations = int(baseline is None)
+    declare = getattr(loop, "overwritten_columns", None)
+    overwritten = frozenset() if declare is None else declare(t0)
     j = 0
-    for kind, _names, floor in cols:
+    for kind, names, floor in cols:
         if kind not in ("frozen", "mode"):
+            if all(name in overwritten for name in names):
+                phi[:, j:j + coordinate_width(kind)] = 0.0
+                j += coordinate_width(kind)
+                continue
             for w in range(coordinate_width(kind)):
                 value = float(x0[j + w])
                 if kind == "angle":
