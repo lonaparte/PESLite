@@ -19,7 +19,8 @@ from scipy.optimize import linear_sum_assignment
 from conftest import EXAMPLES
 from peslite.addons.functions.small_signal import small_signal, small_signal_report
 from peslite.assembly.params import from_dict, to_dict
-from peslite.solver.linearization import active_coordinates, coordinate_difference, coordinate_width
+from peslite.solver.linearization import (active_coordinates, coordinate_difference, coordinate_width,
+                                         linearize_loop)
 from peslite.solver.simulation import SystemLoop
 
 
@@ -103,7 +104,7 @@ def test_complete_ac_map_retains_control_and_pwm_memory(ac_point, record_propert
     record_property("evaluations", analysis.evaluations)
     assert analysis.period == pytest.approx(1.0 / sim.p.sources["grid"].f)
     assert analysis.periodic_error <= 1e-3
-    assert analysis.evaluations == 1 + 2 * len(analysis.coordinates)
+    assert analysis.evaluations < 1 + 2 * len(analysis.coordinates)
     assert np.all(np.isfinite(analysis.phi))
     for name, unit in sim.units.items():
         assert unit.cfg.ctrl.computation > 0.0
@@ -115,6 +116,47 @@ def test_complete_ac_map_retains_control_and_pwm_memory(ac_point, record_propert
         second = [i for i, name in enumerate(analysis.coordinates) if name.startswith(b + ".")]
         assert np.linalg.norm(analysis.phi[np.ix_(first, second)]) > 1e-3
         assert np.linalg.norm(analysis.phi[np.ix_(second, first)]) > 1e-3
+
+
+def test_ac_pruning_preserves_the_entire_exhaustive_matrix(ac_point, exhaustive_loop, record_property):
+    sim, analysis = ac_point
+    loop = SystemLoop(sim, frame_frequency=0.0, repeat_forcing=True)
+    row = sim.result.final_states()
+    start = row.pop("t")
+    full = linearize_loop(exhaustive_loop(loop), row, start, loop.coordinates(list(row)))
+    expected = full.phi[np.ix_(full.active, full.active)]
+    np.testing.assert_array_equal(analysis.phi, expected)
+    modes = np.linalg.eigvals(expected).astype(complex)
+    modes = modes[np.argsort(-np.abs(modes), kind="stable")]
+    np.testing.assert_array_equal(analysis.multipliers, modes)
+    record_property("exhaustive_evaluations", full.evaluations)
+    record_property("optimized_evaluations", analysis.evaluations)
+    assert analysis.evaluations < full.evaluations
+
+
+@pytest.mark.parametrize("changes,offset", [
+    ({"units.vsc.ctrl.loops.DCVoltageControl.period": 200e-6}, 0.02),
+    ({"units.vsc.ctrl.loops.CurrentLoop.period": 200e-6}, 0.02),
+    ({"units.vsc.pwm.carrier_phase": 0.25}, 12.5e-6),
+    ({"units.vsc.pwm.sync": "synchronous"}, 0.02),
+    ({"units.vsc.ctrl.computation": 0.0}, 0.02),
+], ids=("slow-voltage", "slow-current", "shifted-clock", "synchronous", "zero-delay"))
+def test_ac_clock_variants_match_exhaustive_local_maps(ac_points, changes, offset,
+                                                      exhaustive_loop):
+    # These are local-map comparisons; no settled-stability claim is made after changing clocks.
+    original, _analysis = ac_points("gfl")
+    sim = _restart(original, offset, **changes)
+    sim.run(out_dir=None)
+    assert not sim.result.tripped and not sim.result.summary.get("stop_reason")
+    loop = SystemLoop(sim, frame_frequency=0.0, repeat_forcing=True)
+    row = sim.result.final_states()
+    start = row.pop("t")
+    cols = loop.coordinates(list(row))
+    optimized = linearize_loop(loop, row, start, cols)
+    full = linearize_loop(exhaustive_loop(loop), row, start, cols)
+    np.testing.assert_array_equal(optimized.phi, full.phi)
+    assert optimized.changed_modes == full.changed_modes
+    assert optimized.evaluations < full.evaluations
 
 
 def test_ac_period_restart_matches_the_main_time_domain_simulation(ac_point):

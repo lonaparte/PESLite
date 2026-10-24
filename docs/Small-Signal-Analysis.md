@@ -125,7 +125,8 @@ request another time. If the terminal physical snapshot itself is unavailable, `
 propagate; only numerical output calculations are treated as optional failures.
 
 An endpoint at `t + period` supplies the unperturbed result directly. With `n` active coordinates,
-that check needs `2*n` extra period advances rather than `1 + 2*n`. If the endpoint is beyond the
+that check needs at most `2*n` extra period advances, saving the separate baseline evaluation.
+Proven overwritten coordinates reduce the perturbation count further. If the endpoint is beyond the
 main run, the baseline is advanced once through the existing map. Before periodicity is established,
 only that baseline is needed, with no perturbation advances. Multirate runs use the shared
 unsplit reference map and cannot reuse the split run's endpoint; the report identifies the
@@ -221,7 +222,20 @@ rate `-inf`. Near-unit-circle results require interpretation, not automatic reje
 ## Validation and cost
 
 The baseline is checked before perturbation runs and reused by the shared finite-difference
-implementation. With `n` active coordinates, analysis takes `1 + 2*n` one-period evaluations.
+implementation. With `n` active coordinates, exhaustive analysis takes `1 + 2*n` one-period
+evaluations. An existing named-state owner may provide `overwritten_state_names(period)` to
+prove that some initial values cannot affect any final state: they are overwritten before
+their first possible read and before the map ends. Their matrix columns are exactly zero,
+so the shared linearization skips those perturbations while retaining every row, coordinate,
+zero multiplier and restart value. Each skipped scalar coordinate saves two period advances.
+
+For sampled control graphs this proof uses the existing dependency order and integer clock
+strides. Every consumer of a skipped internal output must update only when its producer also
+updates first. Controller boundary outputs and host frame reads remain conservative; continuous
+graphs, pending retuning and windows crossing file events keep exhaustive evaluation. There is
+no numerical zero threshold, device-name list or cache of previously observed zero columns.
+Unknown owners and maps remain exhaustive without requiring a new declaration.
+
 Each evaluation rebuilds through the existing parameters/factories and named-state restart path;
 it does not mutate the completed run. Ordinary simulations do no extra recording, linearization,
 or eigensystem work, and unrelated optional functions do not import this analysis module.
@@ -260,6 +274,11 @@ matched without assuming an eigenvalue ordering. Fixed-step refinement different
 completed physical state rather than conflating integration error with a changed operating point.
 The existing independent linear reference also checks fixed-step and adaptive-tolerance
 convergence; finite-difference refinement is checked on the actual sampled AC map.
+Optimized AC matrices and multiplier sets are compared directly with exhaustive differences of
+the same loop, including slower outer/inner control, shifted and synchronous carriers, and zero
+computation delay. `tests/test_linearization_pruning.py` adds bridge, clock-ratio, restart-phase,
+CCM/DCM, custom-loop, split-input and small-nonzero-response checks. These comparisons preserve
+the complete matrix rather than accepting only an unchanged stability classification.
 
 Run these checks from a checkout with the test dependencies installed:
 

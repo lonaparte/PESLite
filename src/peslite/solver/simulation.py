@@ -1270,6 +1270,12 @@ class SystemLoop:
                                                                       linearisations=0)))
 
     # ------------------------------------------------------------ coordinates
+    def overwritten_columns(self, t: float) -> frozenset[str]:
+        """Reuse owner proofs only while file events cannot change the execution schedule."""
+        if any(t < change.t <= t + self.period + _EPS for change in self._p.changes):
+            return frozenset()
+        return self._states.overwritten_columns(self.period)
+
     def periodic_state(self, row: Mapping[str, float]) -> dict[str, float]:
         """Logical snapshot for recurrence checks, retaining non-modal protection history."""
         return self._states.periodic_state(row)

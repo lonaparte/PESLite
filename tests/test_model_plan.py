@@ -1,6 +1,9 @@
 """Basic dependency detection and its use by the shared execution planner."""
 
+import gc
+import linecache
 import random
+import weakref
 
 import pytest
 
@@ -90,6 +93,36 @@ class _Feedthrough:
 
     def rhs(self, _t):
         return ()
+
+
+@pytest.mark.parametrize("cyclic", [False, True])
+def test_generated_source_cache_follows_model_lifetime(cyclic):
+    def cached_models():
+        return {name for name in linecache.cache if name.startswith("<peslite model ")}
+
+    gc.collect()
+    before = cached_models()
+    live = Model({"live": _Feedthrough()}, {})
+    filename = live.rhs_list.__code__.co_filename
+    assert linecache.getlines(filename) == live.compiled_source.splitlines(keepends=True)
+    released = []
+    for _ in range(32):
+        part = _Feedthrough()
+        temporary = Model({"temporary": part}, {})
+        if cyclic:
+            part.owner = temporary
+        released.append(weakref.ref(temporary))
+        assert linecache.getlines(temporary.rhs_list.__code__.co_filename)
+        del temporary, part
+    gc.collect()
+    assert all(ref() is None for ref in released)
+    assert cached_models() == before | {filename}
+    live.evaluate_outputs(0.0)
+    assert live.subsystems[0].out.x == pytest.approx(1.0)
+    assert linecache.getlines(filename) == live.compiled_source.splitlines(keepends=True)
+    del live
+    gc.collect()
+    assert cached_models() == before
 
 
 def test_acyclic_model_skips_scc_even_for_a_deep_signal_chain(monkeypatch):
