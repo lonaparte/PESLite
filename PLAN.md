@@ -1,7 +1,8 @@
 # Small-Signal Stability Analysis Addon Plan
 
-Status: implemented, pending user review. The addon, shared calculation, tests, and maintained
-documentation are present. Keep this temporary plan until acceptance; maintained usage is in
+Status: implementation and planned validation completed, pending user acceptance. The addon,
+shared calculation, regression cases, external profiling tool, and maintained documentation are
+present. Keep this temporary plan until acceptance; maintained usage is in
 `docs/Small-Signal-Analysis.md`.
 
 The dynamic addon also provides an opt-in simulation timeline. It consumes existing observations,
@@ -184,3 +185,24 @@ the entire trajectory merely to support this addon.
 
 Completion requires the shared implementation, verification, and user documentation, not merely
 the presence of this plan or the proposed API example.
+
+## Completed verification
+
+- `tests/test_small_signal_ac.py` verifies the existing GFL, PSC and VSG converters and a
+  shared-bus GFL/PSC pair at documented constant-command operating points. It checks complete
+  period-map state, exact continuation, independently directed time-domain perturbations,
+  cross-converter coupling, the online report, and matched spectra at other cycle phases.
+  The native sampled controllers, computation delay and 20 kHz PWM registers remain active.
+- The sampled AC map is checked under fixed-step and finite-difference refinement without
+  changing its completed operating state. `tests/test_small_signal.py` additionally verifies
+  fixed-step and adaptive-tolerance convergence against its existing independent linear
+  reference, as well as the shared discrete map and existing bridge-mode regressions.
+- `tests/benchmark_small_signal.py` measures the actual addon call graph externally. Model
+  reconstruction, period simulation, matrix assembly, eigensystem calculation and other
+  orchestration are disjoint categories. Regression checks verify their accounting and the
+  agreement between actual reconstruction/advance counts and reported map evaluations.
+  Profiling experiments covered all four AC cases; no timing logic was added to the runtime.
+- Verification required no new production model, solver, state store or device-specific
+  analysis path. Maintained instructions and operating-point limits are recorded in
+  `docs/Small-Signal-Analysis.md`. Static analysis and historical `at=` selection remain outside
+  this plan's scope. Removing this temporary plan remains an acceptance-time cleanup action.
