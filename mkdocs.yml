@@ -26,6 +26,7 @@ nav:
       - Events and Restart: Events-and-Restart.md
       - Output and Results: Output-and-Results.md
   - Advanced:
+      - Small-Signal Stability Analysis: Small-Signal-Analysis.md
       - C++ Export: Cpp-Export.md
       - Imperix Export: Imperix-Export.md
       - Extending PESLite: Extending-PESLite.md
