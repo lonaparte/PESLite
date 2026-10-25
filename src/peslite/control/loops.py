@@ -19,7 +19,7 @@ from typing import Any, ClassVar, Mapping, Optional
 import numpy as np
 
 from ..solver.model import ConfigError, _complex, assign, gather, join, scatter
-from .blocks import Filter, Integrator, OutputLimit, PI, complex_power
+from .blocks import Filter, OutputLimit, PI, complex_power
 
 __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER",

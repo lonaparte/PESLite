@@ -15,7 +15,7 @@ from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather
 from .events import SWITCHABLE, SourceScenario, connected_at, switching_schedule
-from .params import Change, Params, _parameterized, _unit_at, _unit_leaves
+from .params import Change, Params, _parameterized, _unit_leaves
 from .types import unit_type
 from .unit import DCConverter, Unit, VSC
 

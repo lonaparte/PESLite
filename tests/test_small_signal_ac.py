@@ -132,20 +132,50 @@ def test_ac_pruning_preserves_the_entire_exhaustive_matrix(ac_point, exhaustive_
     record_property("exhaustive_evaluations", full.evaluations)
     record_property("optimized_evaluations", analysis.evaluations)
     assert analysis.evaluations < full.evaluations
+    skipped = loop.overwritten_columns(start)
+    for name, unit in sim.units.items():
+        graph = unit.ctrl.graph
+        for port in ("theta", "omega"):
+            source = graph.outputs[port]
+            if source in graph.values:
+                assert f"{name}.ctrl.held.{graph._state_port(source)}" not in skipped
 
 
 @pytest.mark.parametrize("changes,offset", [
     ({"units.vsc.ctrl.loops.DCVoltageControl.period": 200e-6}, 0.02),
     ({"units.vsc.ctrl.loops.CurrentLoop.period": 200e-6}, 0.02),
+    ({"units.vsc.ctrl.loops.SRFPLL.period": 200e-6}, 0.02),
     ({"units.vsc.pwm.carrier_phase": 0.25}, 12.5e-6),
     ({"units.vsc.pwm.sync": "synchronous"}, 0.02),
     ({"units.vsc.ctrl.computation": 0.0}, 0.02),
-], ids=("slow-voltage", "slow-current", "shifted-clock", "synchronous", "zero-delay"))
+    ({"units.vsc.pwm.update": "double"}, 0.02),
+], ids=("slow-voltage", "slow-current", "slow-pll", "shifted-clock", "synchronous",
+        "zero-delay", "double-update"))
 def test_ac_clock_variants_match_exhaustive_local_maps(ac_points, changes, offset,
                                                       exhaustive_loop):
     # These are local-map comparisons; no settled-stability claim is made after changing clocks.
     original, _analysis = ac_points("gfl")
     sim = _restart(original, offset, **changes)
+    sim.run(out_dir=None)
+    assert not sim.result.tripped and not sim.result.summary.get("stop_reason")
+    loop = SystemLoop(sim, frame_frequency=0.0, repeat_forcing=True)
+    row = sim.result.final_states()
+    start = row.pop("t")
+    cols = loop.coordinates(list(row))
+    optimized = linearize_loop(loop, row, start, cols)
+    full = linearize_loop(exhaustive_loop(loop), row, start, cols)
+    np.testing.assert_array_equal(optimized.phi, full.phi)
+    assert optimized.changed_modes == full.changed_modes
+    assert optimized.evaluations < full.evaluations
+
+
+def test_coupled_converters_with_different_clock_phases_match_exhaustive_maps(ac_points,
+                                                                            exhaustive_loop):
+    original, _analysis = ac_points("mixed")
+    sim = _restart(original, 0.02, **{
+        "units.gfl.ctrl.loops.DCVoltageControl.period": 200e-6,
+        "units.gfm.pwm.carrier_phase": 0.25,
+    })
     sim.run(out_dir=None)
     assert not sim.result.tripped and not sim.result.summary.get("stop_reason")
     loop = SystemLoop(sim, frame_frequency=0.0, repeat_forcing=True)

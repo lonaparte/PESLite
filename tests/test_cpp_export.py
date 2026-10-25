@@ -336,7 +336,7 @@ def test_fixed_solver_lowering_uses_the_shared_tableau(method, tmp_path):
 
 
 def test_native_continuous_control_feedback_checks_convergence(tmp_path):
-    from test_control import _AffineFeedback  # Register the same pure feedback test loop.
+    from test_control import _AffineFeedback  # noqa: F401 - Register the feedback loop used below.
     from peslite.assembly.params import read_tree
 
     compiler = _compiler()

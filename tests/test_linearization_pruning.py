@@ -1,13 +1,15 @@
 """Proven overwrites versus exhaustive differentiation through the same complete loop."""
 
 import dataclasses
+from types import MappingProxyType
 
 import numpy as np
 import peslite
 import pytest
 
 from conftest import EXAMPLES
-from peslite.control import DUTY_RATIO, Loop, register_loop_type
+from peslite.assembly.params import from_dict, to_dict
+from peslite.control import DUTY_RATIO, ControlGraph, Loop, register_loop_type
 from peslite.solver.linearization import linearize_loop
 from peslite.solver.model import StateRegistry
 from peslite.solver.simulation import SystemLoop
@@ -131,6 +133,19 @@ def test_ordinary_simulation_does_not_run_the_proof_analysis(monkeypatch):
     _simulation()
 
 
+def test_nested_wpt_with_independent_full_bridges_matches_exhaustive_maps(exhaustive_loop):
+    params = peslite.load(EXAMPLES / "wpt-example.pes", **{
+        "simulation.energy_check": "off", "simulation.output.states": False,
+        "simulation.output.signals": False, "simulation.output.energy": False,
+        "simulation.progress.enable": False,
+    })
+    sim = peslite.Simulation(params)
+    sim.run(out_dir=None)
+    assert not sim.result.tripped and not sim.result.summary.get("stop_reason")
+    _loop, optimized, full = _compare(sim, exhaustive_loop)
+    assert optimized.evaluations < full.evaluations
+
+
 @register_loop_type
 class _HeldMemory(Loop):
     """A custom sampled block with genuine internal memory and an unused output."""
@@ -172,9 +187,91 @@ def test_custom_loop_memory_and_boundary_outputs_remain_in_the_matrix(rates, exh
     })
     loop, optimized, full = _compare(sim, exhaustive_loop)
     columns = loop.overwritten_columns(sim.result.final_states()["t"])
-    assert "converter.ctrl.held.consumer.duty" not in columns
+    boundary = "converter.ctrl.held.consumer.duty"
+    assert boundary in sim._states.columns
+    assert (boundary in columns) == (rates[1] == 1)
     assert not any(name.endswith(".memory") for name in columns)
     assert optimized.evaluations < full.evaluations
+
+
+@pytest.mark.parametrize("producer_stride", [1, 2, 3, 4])
+@pytest.mark.parametrize("read_stride", [None, 1, 2, 3, 4])
+def test_boundary_read_timing_uses_the_same_graph_dependency_proof(producer_stride, read_stride):
+    sim = _simulation(**{
+        "units.converter.ctrl.loops.InductorCurrentControl.period": producer_stride * 50e-6,
+    })
+    graph = sim.unit().ctrl.graph
+    source = graph.outputs["duty"]
+    held = "held." + graph._state_port(source)
+    period = max(graph.periods.values())
+    assert held not in graph.overwritten_state_names(period)
+    declared = graph.overwritten_state_names(period, reads=[(source, read_stride)])
+    expected = read_stride is not None and read_stride % producer_stride == 0
+    assert (held in declared) == expected
+    # Any additional startup/unknown-time read defeats a scheduled-read proof.
+    with_startup_read = graph.overwritten_state_names(
+        period, reads=[(source, read_stride), (source, None)],
+    )
+    assert held not in with_startup_read
+
+
+@pytest.mark.parametrize("stride", [None, 0, -1, -4, False, True, 1.0, 0.5,
+                                     float("inf"), float("nan"), "1"])
+def test_unknown_or_invalid_host_timing_retains_the_boundary(stride):
+    sim = _simulation()
+    graph = sim.unit().ctrl.graph
+    source = graph.outputs["duty"]
+    held = "held." + graph._state_port(source)
+    declared = graph.overwritten_state_names(max(graph.periods.values()), reads=[(source, stride)])
+    assert held not in declared
+
+
+@pytest.mark.parametrize("stride", [np.int32(1), np.int64(2)])
+def test_integral_host_timing_uses_the_shared_stride_contract(stride):
+    sim = _simulation()
+    graph = sim.unit().ctrl.graph
+    source = graph.outputs["duty"]
+    declared = graph.overwritten_state_names(max(graph.periods.values()), reads=[(source, stride)])
+    assert "held." + graph._state_port(source) in declared
+
+
+@pytest.mark.parametrize("unit_name,names", [
+    ("stage_alpha", ("outer", "inner")),
+    ("module42", ("voltage_stage_0", "current_stage_1")),
+])
+@pytest.mark.parametrize("rates", [(1, 1), (4, 1), (2, 3)])
+def test_overwrite_proof_uses_wiring_not_unit_or_loop_names(unit_name, names, rates, exhaustive_loop):
+    original = _simulation(**{
+        "units.converter.ctrl.loops.DCVoltageControl.period": rates[0] * 50e-6,
+        "units.converter.ctrl.loops.InductorCurrentControl.period": rates[1] * 50e-6,
+    })
+    tree = to_dict(original.p)
+    unit = tree["units"].pop("converter")
+    loops = unit["ctrl"]["loops"]
+    unit["ctrl"]["loops"] = {
+        name: {**values, "type": cfg.type}
+        for name, values, cfg in zip(names, loops.values(), original.unit().cfg.ctrl.loops.values())
+    }
+    tree["units"][unit_name] = unit
+    renamed = peslite.Simulation(from_dict(tree))
+    renamed.run(out_dir=None)
+    _loop, optimized, full = _compare(renamed, exhaustive_loop)
+    assert optimized.evaluations < full.evaluations
+
+
+@pytest.mark.parametrize("port", ["actuator_request", "custom_output"])
+def test_boundary_proof_does_not_depend_on_standard_port_names(port):
+    sim = _simulation()
+    original = sim.unit().ctrl.graph
+    source = next(iter(original.outputs.values()))
+    interface = dataclasses.replace(original.interface,
+                                    outputs=MappingProxyType({port: DUTY_RATIO}))
+    graph = ControlGraph(original.cfg, original.startup, original.connections,
+                         {port: source}, interface=interface)
+    period = max(graph.periods.values())
+    held = "held." + graph._state_port(source)
+    assert held not in graph.overwritten_state_names(period)
+    assert held in graph.overwritten_state_names(period, reads=[(graph.outputs[port], 1)])
 
 
 def test_registered_overwrites_preserve_complex_columns_and_ignore_unknown_names():

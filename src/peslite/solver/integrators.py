@@ -185,7 +185,7 @@ class AdaptiveSolver:
         max_step: float = math.inf,
         warm_start: bool = True,
     ) -> None:
-        from scipy.integrate import solve_ivp  # local import keeps SciPy optional
+        from scipy.integrate import solve_ivp  # Load SciPy only when this solver is selected.
 
         self._solve_ivp = solve_ivp
         self.method, self.rtol, self.atol, self.max_step = method, rtol, atol, max_step

@@ -12,16 +12,17 @@ from __future__ import annotations
 
 import cmath
 import math
+import numbers
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
-from typing import Any, Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
 
 from ..solver.model import Bag, ConfigError, _complex, _real, gather, scatter
 from ..solver.energy import PowerPort, port_power
-from .blocks import OutputLimit, abc2complex, complex_power, peak_abs, phases, smoothstep
+from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODULATION, POWER,
                     SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ, CurrentLoop,
                     Loop, SignalType, SyncLaw)
@@ -895,23 +896,29 @@ class ControlGraph:
                           for n in self.order}, "connections": dict(self.connections), "outputs": dict(self.outputs)}
 
     # ------------------------------------------------------------ states
-    def overwritten_state_names(self, period, *, reads=()):
+    def overwritten_state_names(self, period, *, reads=None):
         """Held values overwritten before every possible read during this map.
 
         Aligned integer-rate consumers run after their producers whenever they are due.
-        Boundary outputs and additional host reads remain conservative. The producer must
-        update within the map, including for an otherwise unused output's own final state.
+        Host reads are ``(source, positive_integer_stride)`` pairs after graph updates;
+        other strides denote a read before updates or at an unknown rate. Boundary outputs
+        stay conservative without a host declaration. The producer must update within the
+        map, including for an otherwise unused output's own final state.
         No numerical zero test or operating-point-dependent classification is used.
         """
         if self.continuous or self._pending:
             return frozenset()
         strides = dict(self._every)
-        retained = set(self.outputs.values()) | set(reads)
-        for target, source in self.connections.items():
-            producer = source.partition(".")[0]
-            consumer = target.partition(".")[0]
-            if producer in strides and strides[consumer] % strides[producer] != 0:
-                retained.add(source)
+        consumers = [(source, strides[target.partition(".")[0]])
+                     for target, source in self.connections.items()]
+        consumers.extend(((source, None) for source in self.outputs.values())
+                         if reads is None else reads)
+        retained = {
+            source for source, stride in consumers
+            if source in self.values
+            and (not isinstance(stride, numbers.Integral) or isinstance(stride, bool)
+                 or stride <= 0 or stride % strides[source.partition(".")[0]] != 0)
+        }
         return frozenset(
             f"held.{self._state_port(source)}"
             for name in self.order if period >= self.periods[name]
@@ -1504,10 +1511,13 @@ class VSCController(_GraphRuntime):
 
     # ------------------------------------------------------------ states and summary
     def overwritten_state_names(self, period):
-        # The host also reads the current frame outside graph.sample(). Keep those ports.
-        return self.graph.overwritten_state_names(period, reads=(
-            self._frame_key, self.graph.connections.get(f"{self._frame_cc}.frame"),
-        ))
+        graph = self.graph
+        # Frames are read after each sample; the voltage command only after its producer runs.
+        reads = [(self._frame_key, 1), (graph.connections.get(f"{self._frame_cc}.frame"), 1),
+                 (graph.outputs["u_dq"], dict(graph._every).get(self._terminal, 1))]
+        # initial_sync() also supplies the bridge before the first graph update.
+        reads.extend((graph.outputs[port], None) for port in ("theta", "omega"))
+        return graph.overwritten_state_names(period, reads=reads)
 
     def get_state(self):
         if self.continuous:
@@ -1854,6 +1864,12 @@ class GraphController(_GraphRuntime):
     def get_state(self) -> dict[str, Any]:
         startup = {f"startup.{name}": value for name, value in self.startup.get_state().items()}
         return startup if self.continuous else {**self.graph.get_state(), **startup}
+
+    def overwritten_state_names(self, period):
+        # sample() consumes every boundary output after graph.sample() on each interrupt.
+        return self.graph.overwritten_state_names(
+            period, reads=((source, 1) for source in self.graph.outputs.values()),
+        )
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         startup = {name[8:]: value for name, value in values.items() if name.startswith("startup.")}

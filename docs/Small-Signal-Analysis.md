@@ -230,10 +230,15 @@ so the shared linearization skips those perturbations while retaining every row,
 zero multiplier and restart value. Each skipped scalar coordinate saves two period advances.
 
 For sampled control graphs this proof uses the existing dependency order and integer clock
-strides. Every consumer of a skipped internal output must update only when its producer also
-updates first. Controller boundary outputs and host frame reads remain conservative; continuous
-graphs, pending retuning and windows crossing file events keep exhaustive evaluation. There is
-no numerical zero threshold, device-name list or cache of previously observed zero columns.
+strides. Every consumer of a skipped output must read only when its producer updates first.
+Hosts declare their boundary/frame read strides through the same dependency check: the scalar
+controller reads duty after every graph update; VSC reads voltage after its producer runs and
+the frame after each update. VSC's initial angle/frequency reads remain conservative, as do
+boundary ports with unknown read timing. Continuous graphs, pending retuning and windows crossing
+file events keep exhaustive evaluation. There is no numerical zero threshold, device-name list
+or cache of previously observed zero columns.
+Only positive integral interrupt strides can prove a scheduled host read. Other timing values
+remain conservative; they are not coerced or interpreted as valid divisibility evidence.
 Unknown owners and maps remain exhaustive without requiring a new declaration.
 
 Each evaluation rebuilds through the existing parameters/factories and named-state restart path;

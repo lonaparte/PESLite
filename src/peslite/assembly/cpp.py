@@ -31,7 +31,6 @@ from ..solver.integrators import DormandPrince45, FixedStepSolver, TABLEAUS
 from ..solver.model import _strong_components
 from .conduction import DiodeConduction
 from .params import (BaseValues, SourceParams, UnitParams, _PARAMETER_RECORDER, _event_assignments,
-                     _unit_items,
                      _written_out, connection_defaults, dumps, parameter_leaves)
 from .exporter import ExportResult, _exporter, _signal_names
 from .system import _source_scenario
