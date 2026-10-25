@@ -25,6 +25,9 @@ are extension entry points; they do not introduce an add-on wrapper into the sim
 `peslite.addons.functions` has a different role. It contains optional capabilities around a
 simulation, such as plotting completed CSV results. Functions are not controller loops or physical
 components, do not enter the model registries and are imported only when requested.
+The [small-signal stability analysis addon](Small-Signal-Analysis.md) uses this same optional-function
+boundary and reuses the solver's complete loop map for final-state analysis or a sparse simulation
+timeline report.
 
 ## Project-local `PESaddons`
 

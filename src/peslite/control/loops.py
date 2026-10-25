@@ -19,7 +19,7 @@ from typing import Any, ClassVar, Mapping, Optional
 import numpy as np
 
 from ..solver.model import ConfigError, _complex, assign, gather, join, scatter
-from .blocks import Filter, Integrator, OutputLimit, PI, complex_power
+from .blocks import Filter, OutputLimit, PI, complex_power
 
 __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER",
@@ -1309,6 +1309,11 @@ class ResonantModulation(Loop):
 
     def initial_outputs(self):
         return {"duty": 0.5}
+
+    def forcing_periods(self, inputs):
+        """Periods of the explicit-time modulation law, for post-run loop maps."""
+        frequency = abs(inputs["frequency"])
+        return () if frequency == 0.0 else (1.0 / frequency,)
 
     def _duty(self, t, inputs):
         q = self.startup.value * inputs["modulation"] * np.sin(

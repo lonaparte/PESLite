@@ -83,6 +83,25 @@ peslite case.pes --progress 0.1 --watch vsc.i_c,vsc.u_dc
 `--progress SECONDS` uses simulated time. `--watch` may be repeated or contain comma-separated
 names. It does not enable result signal files and does not change simulation results.
 
+## Optional simulation report
+
+```bash
+peslite case.pes --report
+peslite case.pes --report --out output/my-run
+```
+
+With the small-signal analysis addon available, this runs the simulation once and writes
+`case_report.json` in the output directory, with a `small_signal_stability` section. Only JSON
+is generated; the report filename uses the input stem even with a bridge preset or custom output
+directory. Without the addon, a warning is emitted and the ordinary simulation continues.
+
+The default checks cover the initial state, simulation-file events and the final state, with
+only changed items retained. Stability analysis runs only after a check establishes a periodic
+operating state; earlier checks report `transient` without running perturbations.
+Use the [Python addon API](Small-Signal-Analysis.md) for custom
+analysis times, intervals and watched values. `--report` can accompany `--plot`, but not
+inspection or export options.
+
 ## Plot recorded waveforms
 
 Install the optional plotting dependency, then name the recorded columns after `--plot`:

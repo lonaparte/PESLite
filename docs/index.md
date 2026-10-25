@@ -57,6 +57,7 @@ See [Getting Started](Getting-Started.md) to create a case and inspect its resul
 - [Multirate Simulation](Multirate-Simulation.md)
 - [Events and Restart](Events-and-Restart.md)
 - [Output and Results](Output-and-Results.md)
+- [Small-Signal Stability Analysis](Small-Signal-Analysis.md)
 - [C++ Export](Cpp-Export.md)
 - [Imperix ELF Export (Experimental)](Imperix-Export.md)
 - [Extending PESLite](Extending-PESLite.md)

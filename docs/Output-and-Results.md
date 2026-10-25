@@ -24,6 +24,7 @@ history and then export it afterward.
 | `ctrl.<unit>.csv` | `simulation.output.signals: 1` | Controller signals for one unit. |
 | `energy.csv` | `simulation.output.energy: 1` | Stored energy and power-balance history. |
 | `summary.json` | Always | Stop reason, solver counts, protection, peaks and diagnostics. |
+| `<name>_report.json` | Python `--report`, with the analysis addon available | Optional report sections, including `small_signal_stability`. |
 | `simulation.pes` | Always | Complete resolved configuration used for the run. |
 
 `simulation.pes` is not a temporary file. It records defaults and command-line changes and can be
@@ -50,6 +51,10 @@ simulation:
 
 If `states` is disabled, the terminal state is still retained so `final_states()` works. If
 `energy` is disabled, summary energy checks still run unless `energy_check` disables them.
+Numerical failures in optional observations are reported independently: a failed controller log
+does not discard valid plant, state or energy output. Declared log columns use NaN for an
+unavailable sample. Each CSV retains its own sampling timestamps; different tables are not
+required to have equal row counts.
 
 ## State and signal names
 

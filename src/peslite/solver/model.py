@@ -18,6 +18,7 @@ import linecache
 import math
 import numbers
 import re
+import weakref
 from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, ClassVar, Iterable, Mapping, Protocol, Sequence, runtime_checkable
@@ -230,6 +231,81 @@ class StateRegistry:
             for state in group.states:
                 out[state.name] = values[state.local_name]
         return out
+
+    @property
+    def discrete_names(self) -> frozenset[str]:
+        """Discrete coordinates from state values and optional owner lifecycle declarations.
+
+        This view is requested by post-run loop maps, not maintained as another state layout.
+        Float-valued lifecycle state such as a protection timer must be declared by its owner;
+        boolean and integer state is discrete without a declaration.
+        """
+        names = set()
+        for group in self._groups:
+            declared = set(getattr(group.part, "discrete_state_names", ()))
+            values = group.part.get_state()
+            for state in group.states:
+                if state.local_name in declared or isinstance(values[state.local_name], (bool, int)):
+                    names.add(state.name)
+        return frozenset(names)
+
+    @property
+    def linearization_columns(self) -> tuple[str, ...]:
+        """Existing columns retained by an owner's optional smooth-coordinate declaration.
+
+        Non-modal history remains in restart and recurrence checks without becoming an
+        independent smooth coordinate. Owners without a declaration retain their complete schema.
+        """
+        columns = []
+        for group in self._groups:
+            selected = getattr(group.part, "linearization_state_names", None)
+            selected = None if selected is None else set(selected)
+            for state in group.states:
+                if selected is None or state.local_name in selected:
+                    columns.extend(state.columns)
+        return tuple(columns)
+
+    def periodic_state(self, row: Mapping[str, float]) -> dict[str, float]:
+        """Compare existing snapshots in an owner's logical, rather than storage, order.
+
+        An optional ``periodic_state(values)`` projects an owner's local named states onto
+        equivalent existing columns, for example a ring buffer in chronological order.
+        The original restart row and registered layout are not changed.
+        """
+        result = dict(row)
+        for group in self._groups:
+            project = getattr(group.part, "periodic_state", None)
+            if project is None:
+                continue
+            local = {state.local_name: (complex(*(row[key] for key in state.columns))
+                                       if state.kind == "complex" else row[state.name])
+                     for state in group.states}
+            projected = flatten(project(local))
+            for state in group.states:
+                for key in state.columns:
+                    local_key = key[len(group.prefix) + 1:] if group.prefix else key
+                    if local_key in projected:
+                        result[key] = projected[local_key]
+                    else:
+                        result.pop(key, None)
+        return result
+
+    def overwritten_columns(self, period: float) -> frozenset[str]:
+        """Registered columns an owner proves are overwritten before any read in a map.
+
+        Owners without the optional declaration retain exhaustive differentiation. These
+        columns remain in restart, recurrence checks and the resulting transition matrix.
+        """
+        columns = set()
+        for group in self._groups:
+            declare = getattr(group.part, "overwritten_state_names", None)
+            if declare is None:
+                continue
+            overwritten = set(declare(period))
+            for state in group.states:
+                if state.local_name in overwritten:
+                    columns.update(state.columns)
+        return frozenset(columns)
 
     def read_flat(self, prefixes: Iterable[str] | None = None) -> dict[str, float]:
         """Read the fixed real-valued state-table columns using the registered layout.
@@ -1096,6 +1172,8 @@ class Model:
         filename = f"<peslite model {id(self):#x}>"
         exec(compile(source, filename, "exec"), env)
         linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
+        # Rebuilt models own their debugging source; collecting one must release its cache entry.
+        weakref.finalize(self, linecache.cache.pop, filename, None)
         self.compiled_source = source
         self._load, self._outputs, self._zoh_outputs, self.rhs_list = (
             env["_load"], env["_outputs"], env["_zoh_outputs"], env["rhs_list"])
