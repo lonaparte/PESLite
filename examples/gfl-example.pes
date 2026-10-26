@@ -66,6 +66,7 @@ units:                     # converters, one entry each
       # method: spwm       # spwm | svpwm
       # sync: asynchronous # asynchronous | synchronous (carrier locked to the controller angle)
       # carrier_phase: 0.0 # carrier position at t = 0, in periods
+      # pattern_sync: interval # waveform updates: interval | pulse (preserve complete pulses)
 
     # bridge:
     #   model: pwm_averaging       # pwm_averaging (default) | averaging | switching

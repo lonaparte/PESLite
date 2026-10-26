@@ -179,7 +179,7 @@ class Unit(ABC):
             parts.append((f"{self.name}.ctrl", self.ctrl))
         parts.append((f"{self.name}.{self.bridge.state_prefix}", self.bridge.state_owner))
         adc = getattr(self, "adc", None)
-        if adc is not None and adc.accumulating:
+        if adc is not None and (adc.accumulating or adc.clocked):
             parts.append((f"{self.name}.meas", adc))
         return parts
 
@@ -641,7 +641,6 @@ class VSC(Unit):
         )
 
         # ------------------------------------------------------------ bridge actuation and control
-        self.bridge.reset(np.full(3, 0.5), on=False)
         self.zoh = f"{name}.q"                   # model label of the bridge's held switching state
         self.ctrl = ctrl if ctrl is not None else _parameterized(make_controller, cfg)
         if self.ctrl is not None and bool(getattr(self.ctrl, "continuous", False)) != self.continuous:
@@ -837,7 +836,6 @@ class DCConverter(Unit):
             raise TypeError(
                 f"{name}: {type(self.ctrl).__name__} does not satisfy the Controller protocol"
             )
-        self.bridge.reset(np.full(len(topology.duty_names), topology.neutral_duty), on=False)
         self.zoh = f"{name}.q"
         self.ports = MeasurementPorts({
             "current": self._current,

@@ -13,7 +13,7 @@ from __future__ import annotations
 import cmath
 import math
 import numbers
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from types import MappingProxyType
 from typing import Any, Mapping, Protocol, runtime_checkable
 
@@ -23,13 +23,14 @@ from numpy.typing import NDArray
 from ..solver.model import Bag, ConfigError, _complex, _real, gather, scatter
 from ..solver.energy import PowerPort, port_power
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
-from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODULATION, POWER,
+from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,
                     SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ, CurrentLoop,
                     Loop, SignalType, SyncLaw)
 from .modulation import CONFIGURED, OutputStage
-from .profiles import (ReferenceParams, ResonantReferenceParams,
+from .profiles import (PhaseShiftReferenceParams, ReferenceParams, ResonantReferenceParams,
                        ScalarVoltageReferenceParams, control_type,
-                       register_control_type, validate_resonant_references,
+                       register_control_type, validate_phase_shift_references,
+                       validate_resonant_references,
                        validate_scalar_voltage_references)
 
 __all__ = ["Measurement", "ConverterMeasurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
@@ -72,6 +73,13 @@ class ControlMeasurement:
     i_abc: NDArray[np.float64]
 
 
+def _command_value(output, name):
+    commands = output.__dict__.get("commands") or ()
+    if name in commands:
+        return commands[name]
+    raise AttributeError(f"{type(output).__name__!r} has no command {name!r}")
+
+
 @dataclass
 class ControlOutput:
     """Result of one controller call.
@@ -88,18 +96,46 @@ class ControlOutput:
     omega: float | None = None  # synchronization frequency (rad/s)
     gates: bool = True
     startup_complete: bool = True
+    commands: dict[str, float] | None = None
+
+    __getattr__ = _command_value
 
 
-@dataclass
+@dataclass(init=False)
 class BridgeControlOutput:
-    """Result of one single-phase bridge control update."""
+    """One canonical command mapping and the common sampled-control lifecycle outputs.
 
-    duty: float
-    log: dict[str, float] | None = None
-    theta: float | None = None
-    omega: float | None = None
-    gates: bool = True
-    startup_complete: bool = True
+    ``duty`` remains a constructor argument and property for existing scalar controllers; it
+    reads and writes the same mapping used by every other modulation command.
+    """
+
+    commands: dict[str, float]
+    log: dict[str, float] | None
+    theta: float | None
+    omega: float | None
+    gates: bool
+    startup_complete: bool
+
+    def __init__(self, duty: float | None = None, log=None, theta=None, omega=None,
+                 gates: bool = True, startup_complete: bool = True,
+                 commands: Mapping[str, float] | None = None):
+        self.commands = commands if isinstance(commands, dict) else dict(commands or {})
+        if duty is not None:
+            if "duty" in self.commands and self.commands["duty"] != duty:
+                raise ValueError("conflicting duty commands")
+            self.commands["duty"] = duty
+        self.log, self.theta, self.omega = log, theta, omega
+        self.gates, self.startup_complete = gates, startup_complete
+
+    @property
+    def duty(self):
+        return self.commands.get("duty")
+
+    @duty.setter
+    def duty(self, value):
+        self.commands["duty"] = value
+
+    __getattr__ = _command_value
 
 
 @runtime_checkable
@@ -122,11 +158,17 @@ class ControlInterface:
     each driven by one loop output through ``ctrl.outputs``. Direction belongs to the mapping that
     contains a port; its value is the same :class:`SignalType` used by loop port declarations.
     ``optional_inputs`` are schema ports retained at runtime only when an active path uses them.
+    ``optional_outputs`` are controller outputs that exist only when ``ctrl.outputs`` wires them.
     """
 
     inputs: Mapping[str, SignalType]
     outputs: Mapping[str, SignalType]
     optional_inputs: frozenset[str] = frozenset()
+    optional_outputs: frozenset[str] = frozenset()
+
+    def auxiliary_outputs(self, configured):
+        """Configured outputs beyond the required waveform/control boundary."""
+        return tuple(sorted(set(configured) - (self.outputs.keys() - self.optional_outputs)))
 
 
 _OutputLimit = OutputLimit
@@ -342,14 +384,30 @@ class ControlGraph:
                     f"ctrl.connections.{target}: incompatible signal {source!r}: "
                     f"{types[source]} -> {targets[target]}"
                 )
-        unknown_outputs = set(self.outputs) - set(self.interface.outputs)
-        if unknown_outputs:
-            raise ConfigError(f"ctrl.outputs: unknown output ports {sorted(unknown_outputs)}; "
-                              f"known: {sorted(self.interface.outputs)}")
+        additional = set(self.outputs) - set(self.interface.outputs)
+        reserved = set(ControlOutput.__dataclass_fields__) | set(BridgeControlOutput.__dataclass_fields__)
+        if additional & (reserved - {"duty"}):
+            raise ConfigError(f"ctrl.outputs: command names conflict with control lifecycle fields: "
+                              f"{sorted(additional & (reserved - {'duty'}))}")
+        for port in additional:
+            source = self.outputs[port]
+            if source not in types:
+                raise ConfigError(f"ctrl.outputs.{port}: missing or unknown source {source!r}")
+            if types[source].complex_value:
+                raise ConfigError(f"ctrl.outputs.{port}: an auxiliary register needs a scalar signal")
+        if additional:
+            self.interface = interface = replace(
+                interface,
+                outputs=MappingProxyType({**interface.outputs,
+                                          **{port: types[self.outputs[port]] for port in additional}}),
+                optional_outputs=interface.optional_outputs | additional,
+            )
         active = set()
         pending_sources = []
         for port, spec in self.interface.outputs.items():
             source = self.outputs.get(port)
+            if source is None and port in self.interface.optional_outputs:
+                continue
             if source not in types or not types[source].compatible(spec):
                 raise ConfigError(f"ctrl.outputs.{port}: missing or incompatible source {source!r}")
             pending_sources.append(source)
@@ -377,6 +435,7 @@ class ControlGraph:
                                   if name not in interface.optional_inputs or name in used}),
                 interface.outputs,
                 interface.optional_inputs,
+                interface.optional_outputs,
             )
         for name, loop in cfg.ctrl.loops.items():
             if name not in active:
@@ -1173,6 +1232,7 @@ class VSCController(_GraphRuntime):
         self.graph = graph = ControlGraph(
             cfg, self.startup, wires, outputs, interface=profile.interface,
         )
+        self._carried_outputs = profile.interface.auxiliary_outputs(graph.outputs)
         self.periods = graph.periods
         self.v_base, self.i_base, self.w0 = cfg.base.v_phase_peak, cfg.base.i_phase_peak, cfg.base.w0
         self.v_dc_base = cfg.dc_base.v
@@ -1434,8 +1494,10 @@ class VSCController(_GraphRuntime):
                    **self._raw_log(meas, frame)}
             log.update(self._mode_log(t, control_meas))
             self.last_log = log
+        commands = ({port: self.graph.output(port, control_meas) for port in self._carried_outputs}
+                    if self._carried_outputs else None)
         return ControlOutput(duty, log=log, theta=self.theta, omega=self.omega,
-                             gates=gates, startup_complete=startup.complete)
+                             gates=gates, startup_complete=startup.complete, commands=commands)
 
     # ------------------------------------------------------------ continuous ODE
     def begin_algebraic(self):
@@ -1599,14 +1661,30 @@ RESONANT_CONVERTER_INTERFACE = ControlInterface(
 )
 
 
-def _converter_log_sources(**specific: str) -> Mapping[str, str]:
+PHASE_SHIFT_CONVERTER_INTERFACE = ControlInterface(
+    inputs=MappingProxyType({
+        **_CONVERTER_MEASUREMENT_INPUTS,
+        "references.width": MODULATION,
+        "references.frequency": HERTZ,
+        "references.phase": ANGLE,
+        "references.power": SI_POWER,
+        "references.mode": MODE,
+    }),
+    outputs=MappingProxyType({"width": MODULATION, "phase": ANGLE, "frequency": HERTZ,
+                              "mode": MODE}),
+    optional_inputs=frozenset(("meas.power",)),
+)
+
+
+def _converter_log_sources(outputs: tuple[str, ...] = ("duty",),
+                           **specific: str) -> Mapping[str, str]:
     """Build the common scalar-converter log boundary in display order."""
     return MappingProxyType({
         "current": "meas.current",
         "voltage": "meas.voltage",
         "power": "meas.power",
         **specific,
-        "duty": "duty",
+        **{name: name for name in outputs},
         "in_service": "startup.active",
     })
 
@@ -1626,16 +1704,28 @@ _RESONANT_LOG_SOURCES = _converter_log_sources(
 )
 
 
-def _resonant_converter_wiring(cfg):
+_PHASE_SHIFT_LOG_SOURCES = _converter_log_sources(
+    ("width", "phase", "frequency", "mode"),
+    input_voltage="meas.vin",
+    width_reference="references.width",
+    phase_reference="references.phase",
+    power_reference="references.power",
+)
+
+
+def _modulation_wiring(cfg):
+    """Wire the modulation-role loop: each of its inputs named like a reference of the control
+    type reads that reference, and each controller output reads the loop output of its name."""
     find = _role_finder(cfg, cfg.ctrl.type)
     modulation = find("modulation")
     if modulation is None:
         return {}, {}
-    return {
-        f"{modulation}.modulation": "references.modulation",
-        f"{modulation}.frequency": "references.frequency",
-        f"{modulation}.phase": "references.phase",
-    }, {"duty": f"{modulation}.duty"}
+    interface = control_type(cfg.ctrl.type).interface
+    loop = LOOP_TYPES[cfg.ctrl.loops[modulation].type]
+    connections = {f"{modulation}.{port}": f"references.{port}" for port in loop.inputs
+                   if f"references.{port}" in interface.inputs}
+    outputs = {port: f"{modulation}.{port}" for port in interface.outputs if port in loop.outputs}
+    return connections, outputs
 
 
 def _dc_converter_wiring(cfg):
@@ -1739,7 +1829,10 @@ class GraphController(_GraphRuntime):
             source in self.graph.values for source in self._log_sources.values()
         )
         self._last_measurement = ConverterMeasurement(vin=cfg.dclink.vdc_ref)
-        self._last_duty = topology.neutral_duty
+        self._command_ports = tuple(port for port in self.graph.interface.outputs
+                                    if port in self.graph.outputs)
+        self._last_outputs = {port: (topology.neutral_duty if port == "duty" else 0.0)
+                              for port in self._command_ports}
         if self.continuous:
             self._build_flow_state()
 
@@ -1800,15 +1893,16 @@ class GraphController(_GraphRuntime):
         if self.startup.in_progress:
             self.startup.advance()
         self.graph.sample(t, measurement)
-        duty = float(self.graph.output("duty", measurement))
-        self._last_measurement, self._last_duty = measurement, duty
+        outputs = {port: float(self.graph.output(port, measurement))
+                   for port in self._command_ports}
+        self._last_measurement, self._last_outputs = measurement, outputs
         gates = self.startup.active
-        log = self._log(duty, gates) if self.logging else None
+        log = self._log(outputs, gates) if self.logging else None
         return BridgeControlOutput(
-            duty=duty,
             log=log,
             gates=gates,
             startup_complete=self.startup.complete,
+            commands=outputs,
         )
 
     def __call__(self, t: float, meas) -> BridgeControlOutput:
@@ -1821,18 +1915,19 @@ class GraphController(_GraphRuntime):
         self.graph.flow(t, measurement, derivatives=self._derivatives)
         duty = float(self.graph.output("duty", measurement))
         self.out.q = self.topology.state_from_duty(duty) if self.startup.active else self.topology.zero
-        self._last_measurement, self._last_duty = measurement, duty
+        self._last_measurement = measurement
+        self._last_outputs["duty"] = duty
 
     def rhs(self, t: float):
         return self._derivatives
 
-    def _log(self, duty: float, active: bool) -> dict[str, float]:
+    def _log(self, outputs: Mapping[str, float], active: bool) -> dict[str, float]:
         measurement = self._last_measurement
         values = {
             "meas.current": measurement.current,
             "meas.voltage": measurement.voltage,
             "meas.vin": measurement.vin,
-            "duty": duty,
+            **outputs,
             "startup.active": 1.0 if active else 0.0,
         }
         if self._needs_power:
@@ -1849,7 +1944,7 @@ class GraphController(_GraphRuntime):
         # model has synchronized every input by the time it asks for a snapshot observation.
         if self.logging:
             self._flow_measurement()
-        return self._log(self._last_duty, self.startup.active) if self.logging else None
+        return self._log(self._last_outputs, self.startup.active) if self.logging else None
 
     def log_names(self) -> tuple[str, ...]:
         return tuple(self._log_sources)
@@ -1913,11 +2008,23 @@ register_control_type(
     reference_validator=validate_scalar_voltage_references,
 )
 register_control_type(
+    "phase_shift",
+    references=PhaseShiftReferenceParams,
+    unit_types=frozenset(("dc_converter",)),
+    interface=PHASE_SHIFT_CONVERTER_INTERFACE,
+    wiring=_modulation_wiring,
+    log_sources=_PHASE_SHIFT_LOG_SOURCES,
+    default_bridge="full_bridge",
+    controller_factory=GraphController,
+    reference_validator=validate_phase_shift_references,
+    modulator="phase_shift",
+)
+register_control_type(
     "resonant",
     references=ResonantReferenceParams,
     unit_types=frozenset(("dc_converter",)),
     interface=RESONANT_CONVERTER_INTERFACE,
-    wiring=_resonant_converter_wiring,
+    wiring=_modulation_wiring,
     log_sources=_RESONANT_LOG_SOURCES,
     default_bridge="full_bridge",
     controller_factory=GraphController,

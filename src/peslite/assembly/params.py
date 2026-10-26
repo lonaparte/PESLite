@@ -40,6 +40,7 @@ __all__ = [
     "MeasurementParams", "ReferenceParams", "ControlParams", "OvercurrentParams", "VoltageLimitParams",
     "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
     "BridgeParams", "SSLinkParams", "LCCLinkParams", "LCCSLinkParams", "MultiSSLinkParams",
+    "SCCParams",
     "UnitParams",
     "RUNTIME", "Change", "runtime_changeable", "event_changes",
     "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "ProgressParams",
@@ -353,17 +354,21 @@ class PWMParams:
     loads them at valleys and peaks.
     ``sync``: ``"asynchronous"`` (carrier on absolute time) or ``"synchronous"`` (carrier
     locked to the controller angle; requires an integer ``f_sw / base.f0``).
+    ``pattern_sync``: ``"interval"`` applies newly loaded waveform commands
+    at the load; ``"pulse"`` lets a pulse in progress finish and starts the new
+    pattern at its next pulse.
     """
 
     f_sw: float  # carrier frequency, Hz
     modulation_limit: float = 1.0
     update: str = "single"  # "single" | "double"
-    carrier_phase: float = 0.0  # carrier position at t = 0, in carrier periods
+    carrier_phase: float = field(default=0.0, metadata={"modulator": True})
     method: str = "spwm"  # "spwm" | "svpwm"
-    sync: str = "asynchronous"  # "asynchronous" | "synchronous"
+    sync: str = field(default="asynchronous", metadata={"modulator": True})
+    pattern_sync: str = "interval"
 
     _choices = {"update": ("single", "double"), "method": ("spwm", "svpwm"),
-                "sync": ("asynchronous", "synchronous")}
+                "sync": ("asynchronous", "synchronous"), "pattern_sync": ("interval", "pulse")}
 
     @property
     def switching_period(self) -> float:
@@ -683,6 +688,25 @@ class _DCConverterUnitFields:
     filter: Optional[FilterParams] = None
 
 
+@dataclass(frozen=True)
+class SCCParams:
+    """Capacitor shunted by a source-to-source MOSFET pair, with explicit gate drive.
+
+    ``common`` drives both gates together; ``alternating`` uses overlapping pulses displaced
+    by pi. ``angle`` is their nominal conduction/overlap angle. Device channels and body diodes
+    determine the actual branch conduction; zero-voltage turn-on is not imposed artificially.
+    """
+
+    capacitance: float
+    angle: float = 0.0
+    drive: str = "common"
+    sync: str = "current"
+    sync_angle: float = 0.0
+    command: bool = False
+
+    _choices = {"drive": ("common", "alternating"), "sync": ("current", "bridge")}
+
+
 @dataclass(frozen=True, kw_only=True)
 class SSLinkParams:
     """Series-series compensated two-winding inductive link in SI units."""
@@ -695,6 +719,8 @@ class SSLinkParams:
     secondary_capacitance: float
     primary_resistance: float = 0.0
     secondary_resistance: float = 0.0
+    primary_scc: Optional[SCCParams] = None
+    secondary_scc: Optional[SCCParams] = None
 
     _choices = {"type": ("ss",)}
 
@@ -723,6 +749,8 @@ class LCCLinkParams:
     secondary_compensation_resistance: float = 0.0
     primary_parallel_resistance: float = 0.0  # ESR in series with the shunt capacitor
     secondary_parallel_resistance: float = 0.0
+    primary_scc: Optional[SCCParams] = None
+    secondary_scc: Optional[SCCParams] = None
 
     _choices = {"type": ("lcc",)}
 
@@ -747,6 +775,8 @@ class LCCSLinkParams:
     secondary_resistance: float = 0.0
     primary_compensation_resistance: float = 0.0
     primary_parallel_resistance: float = 0.0
+    primary_scc: Optional[SCCParams] = None
+    secondary_scc: Optional[SCCParams] = None
 
     _choices = {"type": ("lcc_s",)}
 

@@ -287,14 +287,14 @@ def test_diode_full_bridge_configuration_is_checked():
             from_dict(leg)
 
 
-def test_diode_full_bridge_is_not_exported(tmp_path):
-    with pytest.raises(ValueError, match="exactly located commutations"):
-        peslite.export(from_dict(_tree(SS, 200.0, 1e-5)), "cpp", tmp_path)
+def test_diode_full_bridge_is_exported_without_a_controller(tmp_path):
+    result = peslite.export(from_dict(_tree(SS, 200.0, 1e-5)), "cpp", tmp_path)
+    assert result.files[0].is_file()
 
 
-def test_capacitive_diode_bridge_reports_the_existing_controllerless_export_limit(tmp_path):
-    with pytest.raises(ValueError, match="without a controller"):
-        peslite.export(from_dict(_tree(LCC, 200.0, 1e-5, capacitance=4.7e-9)), "cpp", tmp_path)
+def test_capacitive_diode_bridge_is_exported_without_a_controller(tmp_path):
+    result = peslite.export(from_dict(_tree(LCC, 200.0, 1e-5, capacitance=4.7e-9)), "cpp", tmp_path)
+    assert result.files[0].is_file()
 
 
 def test_windowed_solver_groups_are_rejected():
@@ -345,6 +345,34 @@ def test_blocked_coupled_ports_project_their_currents_jointly_without_internal_s
     assert not simulation.ph_report.problems
     assert all(status.role == "passive" for status in simulation.ph_report.subsystems
                if status.name.endswith(".bridge"))
+
+
+@pytest.mark.parametrize("link", [SS, LCC, LCC_S, MULTI])
+@pytest.mark.parametrize("active", [("primary",), ("secondary",), ("primary", "secondary")])
+def test_port_current_projection_matches_weighted_constraint_solve(link, active):
+    tree = _tree(link, 200.0, 1e-6)
+    tree["units"]["charger"]["primary"] = _rectifier(400.0)
+    simulation = peslite.Simulation(from_dict(tree))
+    coupled = dict(zip(simulation.system.model.names, simulation.system.model.subsystems))["charger.link"]
+    targets = {side: value for side, value in zip(active, (.3, -.7))}
+    coupled._current_constraints = {side: (lambda value=value: value) for side, value in targets.items()}
+    initial = np.random.default_rng(42).normal(size=len(coupled._mode_names))
+    for name, value in zip(coupled._mode_names, initial):
+        setattr(coupled.state, name, value)
+    modal = [side for side in active if not coupled.sides[side].lcc]
+    expected = initial.copy()
+    if modal:
+        rows = np.array([np.sum([coupled._shapes[k] for k in coupled.sides[side].coils], axis=0)
+                         for side in modal])
+        weighted = rows / np.asarray(coupled._inductance)
+        expected += weighted.T @ np.linalg.solve(
+            weighted @ rows.T, np.array([targets[side] for side in modal]) - rows @ initial)
+    coupled.project_state()
+    np.testing.assert_allclose([getattr(coupled.state, name) for name in coupled._mode_names], expected,
+                               rtol=1e-13, atol=1e-13)
+    for side in active:
+        if coupled.sides[side].lcc:
+            assert getattr(coupled.state, f"i_{side}_comp") == targets[side]
 
 
 def test_nonzero_initial_current_establishes_conduction_before_state_projection():

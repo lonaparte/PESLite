@@ -9,11 +9,12 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .params import ConfigError
+from ..solver.model import commutation_tolerance
 
 __all__ = ["DiodeConduction", "CommutationError"]
 
-_TIME_TOL = 1e-15  # absolute/relative time resolution of a located commutation
 _MAX_COMMUTATIONS = 64  # commutations allowed at one instant before the model is rejected
+_LOCATOR_ITERATIONS = 80
 
 
 class CommutationError(RuntimeError):
@@ -106,7 +107,7 @@ class DiodeConduction:
         if self.commutating:
             state = self._settle(t0, state)
         t = t0
-        end = t1 - _TIME_TOL * max(1.0, abs(t1))
+        end = t1 - commutation_tolerance(t1)
         stalled = 0
         while t < end:
             target = min(t1, t + self._probe) if self._probe is not None else t1
@@ -122,8 +123,8 @@ class DiodeConduction:
                 lower, upper = t, target
                 lower_margin = self._margin(t, state, guarded)
                 bisect_next = False
-                for _ in range(80):
-                    tolerance = _TIME_TOL * max(1.0, abs(upper))
+                for _ in range(_LOCATOR_ITERATIONS):
+                    tolerance = commutation_tolerance(upper)
                     width = upper - lower
                     if width <= tolerance:
                         break
@@ -164,7 +165,7 @@ class DiodeConduction:
                 state = self._settle(target, state)
             if target == t1:
                 return state
-            stalled = stalled + 1 if target - t <= _TIME_TOL * max(1.0, abs(t)) else 0
+            stalled = stalled + 1 if target - t <= commutation_tolerance(t) else 0
             if stalled >= _MAX_COMMUTATIONS:
                 raise CommutationError(f"t = {t:.12g} s: conduction events cannot advance time")
             t = target
@@ -190,7 +191,7 @@ class DiodeConduction:
         """
         if not self.commutating:
             return state
-        tolerance = _TIME_TOL * max(1.0, abs(t))
+        tolerance = commutation_tolerance(t)
         for _ in range(_MAX_COMMUTATIONS):
             self.model.sync(t, state)
             pending = {sub for sub in self.commutating if sub.commutation_margin() < 0.0}

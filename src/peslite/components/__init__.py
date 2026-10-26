@@ -16,8 +16,10 @@ from .converter import (AveragingModel, PWMAveragingModel, SwitchingModel,
                         HalfBridgeDiodeConduction,
                         make_bridge, make_dclink)
 from .adc import ADC, ADCSample, MeasurementPorts
-from .pwm import ZOH, CarrierComparison, PWM, SwitchingSequence, SynchronousCarrier, make_modulator
-from .wpt import CompensatedLink, make_wpt_link
+from .pwm import (ZOH, CarrierComparison, PWM, PhaseShiftModulator, SwitchingSequence,
+                  SynchronousCarrier, make_modulator)
+from .wpt import (CompensatedLink, SwitchControlledCapacitor, SwitchedCompensatedLink,
+                  make_wpt_link)
 
 __all__ = ["Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
            "Bag", "ConfigError", "PowerPort", "StoragePort",
@@ -26,5 +28,5 @@ __all__ = ["Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELE
            "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink", "ADC", "ADCSample",
            "MeasurementPorts", "AveragingModel", "HalfBridge",
            "FullBridge", "HalfBridgeDiodeConduction", "PWM", "SwitchingSequence",
-           "CarrierComparison", "SynchronousCarrier", "ZOH", "make_modulator",
-           "CompensatedLink", "make_wpt_link"]
+           "CarrierComparison", "SynchronousCarrier", "ZOH", "PhaseShiftModulator", "make_modulator",
+           "CompensatedLink", "SwitchedCompensatedLink", "SwitchControlledCapacitor", "make_wpt_link"]

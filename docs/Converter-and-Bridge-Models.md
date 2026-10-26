@@ -152,8 +152,8 @@ also handles rectification. The capacitor charges while the diodes are blocked a
 through their finite resistance when forward biased. DC voltage steps produce finite charging
 currents. This representation uses continuous capacitor state instead of the ideal clamp's
 discrete conduction state and does not require a stiff DC source.
-Standalone C++/Imperix export still requires converter controllers; controllerless rectifiers
-remain a Python simulation capability.
+Standalone C++ supports controllerless rectifiers, including their independent ADCs. Imperix
+hardware export requires a supported sampled controller and hardware peripheral bindings.
 
 Only an explicit `type: full_bridge` can have no controlled device. A diode full-bridge rectifier has no
 gates to block, so it accepts no protection criterion.
@@ -167,6 +167,68 @@ Instantaneous conversions held by an independent ADC use `<unit>.meas.<channel>`
 A controlled bridge without port capacitance keeps its zero state when gates are blocked. On a port without a series
 filter the unit reports once when such a blocked bridge carries current, because its
 anti-parallel diodes would then conduct, which the zero state does not represent.
+
+## Switching waveform updates
+
+The common `pwm.pattern_sync` setting decides how a new switching waveform replaces the old one:
+
+- `interval` (default): at the load. The modulator runs directly, with no pulse-preservation state.
+- `pulse`: a pulse in progress at the load runs to its end under the old registers; the output
+  then stays at zero until the next pulse of the new registers starts. No pulse is cut or
+  shortened; the price is a zero gap of up to one period. The output before the first load is zero,
+  so the first pulse after the gates are enabled is also whole. Clock-rate changes always act at the load.
+  Carrier PWM preserves each pole's gate pulse independently. Phase-shift modulation preserves
+  both poles as one bridge-output pulse. The common sequence processor keeps each accepted
+  pulse's value and remaining phase in cycles; it does not copy controller commands or waveform equations.
+  These are named states under `pwm.pulse.*`, so continuation reproduces an unfinished pulse.
+
+This policy applies to asynchronous and synchronous carrier comparison as well as phase-shift
+modulation, in Python and C++. Constant gate commands require no pulse boundary. Averaged bridge
+models do not resolve switching pulses and do not construct this state. Omitting `pattern_sync`
+and explicitly setting `pattern_sync: interval` select the same execution path.
+
+Synchronous carriers retain the angle and frequency applied at the current load as
+`pwm.angle` and `pwm.frequency`. These restore the waveform during a computation delay;
+the next load takes its reference from the controller through the ordinary PWM timing path.
+
+
+## Phase-shift (square-wave) modulation
+
+`ctrl.type: phase_shift` commands a controlled `full_bridge` with square-wave pulses instead of
+carrier-compared duty ratios. The controller's outputs are four compare registers, which pass the
+same shadow/active path, computation delay and gate enable as duty ratios:
+
+| Register | Meaning |
+|---|---|
+| `width` | pulse width in half periods, clipped to [0, 1] (1 is a full square wave) |
+| `phase` | angle (rad) of the centre of the positive pulse on the bridge's angle axis |
+| `frequency` | angle-axis frequency (Hz) |
+| `mode` | 0 bipolar pulses (`+u_dc` and `-u_dc`), 1 positive pulse only, 3 zero level, 4 negative pulse only (centred half a period after `phase`) |
+
+Extra scalar outputs wired in `ctrl.outputs` are carried as further registers on the same path.
+This applies to every modulation profile: the signal type comes from the wired source, without
+a device-specific output list. These registers do not shape the waveform; a connected component
+reads their active values. For example, an SCC can read a carried `scc_angle` command. Register
+names must be unique path segments and must not collide with modulator state names. Every
+register must be finite; a non-finite controller output stops the run.
+
+With half-width `h = width * pi / 2` the positive pulse covers `theta - phase` in `[-h, h)` and the
+negative pulse `[pi - h, pi + h)`. The angle axis `theta` is continuous: each register load
+continues it with the previously active frequency and then runs the newly loaded one, so the
+frequency may differ from the PWM timer (`pwm.f_sw` sets the load and control instants) and may
+change at every load without a phase jump. A fresh run starts the axis at `2 pi f t`; converters on
+one time base therefore share it, and their `phase` registers set their relative phase directly.
+The axis angle at the current load is a named state (`pwm.angle`) and is restored on continuation.
+
+
+Edges within `1e-9` of a period after a load belong to that load; edges within the same distance
+before the end of an interval belong to the next one, so a load that coincides with an edge neither
+loses nor repeats it. The modulator requires resolved switching edges; the current
+`pwm_averaging` and `averaging` forms accept duty ratios and cannot represent this pattern.
+`pwm.sync` and `pwm.carrier_phase` are also rejected (the phase is a register). Standalone C++
+supports both pattern modes, including register events, parameter overrides and restart state.
+Imperix export currently has only a duty-register hardware adapter; phase-shift hardware
+modulation is not implemented.
 
 ## Exact commutations
 
@@ -189,12 +251,19 @@ The locator uses secant proposals with bisection safeguards and stops on the tim
 A small guard residual alone does not end the search, since a valid mode may have a zero-margin
 plateau. The same search handles bounded currents and general commutation margins.
 
+Switch-controlled capacitors on a compensated link use the same protocol: the link's margin covers
+their body-diode turn-on (capacitor-voltage zero), current reversals and gate edges. Gate state
+and scheduled edges use the same absolute timestamps and time tolerance as the dispatcher,
+including a phase or frequency change at a register load. See
+[Simulation Files](Simulation-Files.md#switch-controlled-capacitors).
+
 Commutating subsystems run with fixed-step and adaptive solvers. An adaptive solver needs a finite
 `max_step`, so that how often the margins are checked does not depend on how far apart the outer
 events (output, control, PWM) are; a windowed multirate group is rejected, because it cannot
 locate the instants. Both are reported when the run starts. A configuration that commutates
-repeatedly without time advancing raises `CommutationError` instead of looping. C++ and Imperix
-export reject commutating subsystems.
+repeatedly without time advancing raises `CommutationError` instead of looping. Standalone C++
+uses the same margin checks, safeguarded secant/bisection locator, scheduled boundaries and state
+resets. Imperix does not provide hardware adapters for these plant commutations.
 
 ## Switching
 

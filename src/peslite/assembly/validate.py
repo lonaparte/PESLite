@@ -14,6 +14,7 @@ from dataclasses import fields, is_dataclass
 from typing import TYPE_CHECKING, Optional
 
 from ..components.converter import make_topology
+from ..components.pwm import validate_modulator
 from ..components.network import element_buses
 from ..control.profiles import control_type
 from ..solver.integrators import ADAPTIVE_METHODS, FIXED_METHODS
@@ -230,6 +231,7 @@ def _converter(u, base, where: str):
     continuous = u.ctrl is None or u.bridge.model == "averaging"
     if u.ctrl is not None:
         _pwm(u.pwm, base, f"{where}.pwm", continuous)
+        validate_modulator(u, topology, where)
         _timing(u.ctrl, u.pwm, f"{where}.ctrl", continuous)
         _control(u.ctrl, u.dclink, u.pwm, f"{where}.ctrl", continuous)
     protection = u.protection
@@ -309,6 +311,7 @@ def _wpt(u, base, where: str, *, nested: bool = False) -> None:
             )
         spec.validator(child, base, child_where, nested=True)
     link = u.link
+    _switch_controlled_capacitors(u, where)
     if link.type == "ss_multi":
         _multi_link(link, f"{where}.link")
         return
@@ -340,6 +343,40 @@ def _wpt(u, base, where: str, *, nested: bool = False) -> None:
             f"{where}.link: the coupled-inductor matrix must be positive definite "
             "(mutual_inductance^2 < primary_inductance * secondary_inductance)"
         )
+
+
+def _switch_controlled_capacitors(u, where: str) -> None:
+    """Check the switch-controlled capacitors of a WPT link and their same-side converters."""
+    for side in unit_type(u.type).children:
+        child = getattr(u, side)
+        ctrl = getattr(child, "ctrl", None)
+        bridge = getattr(child, "bridge", None)
+        clocked = (ctrl is not None and bridge is not None
+                   and bridge.model != "averaging" and getattr(child, "pwm", None) is not None)
+        commanded = ctrl is not None and "scc_angle" in ctrl.outputs
+        scc = getattr(u.link, f"{side}_scc", None)
+        at = f"{where}.link.{side}_scc"
+        if scc is None:
+            if commanded:
+                raise ConfigError(f"{where}.{side}.ctrl.outputs.scc_angle: the link has no "
+                                  f"{side}_scc with command: 1")
+            continue
+        if not math.isfinite(scc.capacitance) or scc.capacitance <= 0.0:
+            raise ConfigError(f"{at}.capacitance must be finite and positive")
+        if not math.isfinite(scc.angle) or not 0.0 <= scc.angle <= math.pi:
+            raise ConfigError(f"{at}.angle must be in [0, pi]")
+        if not math.isfinite(scc.sync_angle):
+            raise ConfigError(f"{at}.sync_angle must be finite")
+        if scc.sync == "bridge" and not clocked:
+            raise ConfigError(f"{at}.sync: 'bridge' needs a clocked bridge on the {side} side")
+        if scc.command and not (clocked and commanded):
+            raise ConfigError(f"{at}.command needs a clocked controller output scc_angle "
+                              f"on the {side} side (ctrl.outputs.scc_angle)")
+        if commanded and not scc.command:
+            raise ConfigError(f"{where}.{side}.ctrl.outputs.scc_angle: {at}.command is off")
+        if scc.command and scc.angle != 0.0:
+            raise ConfigError(f"{at}.angle is not used with command: the angle is the "
+                              "controller output scc_angle (0 before its first write)")
 
 
 def _multi_link(link, where: str) -> None:

@@ -329,9 +329,9 @@ def test_averaging_clips_dc_current_reference_and_tracks_antiwindup(gfl):
     assert ctrl.alarms == ["ID_REF_LIMIT"]
 
 
-def test_unknown_controller_output_boundary_port_is_rejected(gfl):
+def test_unknown_auxiliary_output_source_is_rejected(gfl):
     params = gfl().replace(**{"units.vsc.ctrl.outputs": {"status": "cc.u_dq"}})
-    with pytest.raises(ConfigError, match="unknown output ports.*status"):
+    with pytest.raises(ConfigError, match="ctrl.outputs.status: missing or unknown source"):
         peslite.Simulation(params)
 
 

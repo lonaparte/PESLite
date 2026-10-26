@@ -251,8 +251,8 @@ common trip path, not a WPT phase override.
 
 - Supported solvers are fixed `euler`, `heun` and `rk4`, plus adaptive `DP45`.
 - Multirate subsystem schedules are not currently lowered to C++.
-- Exactly located commutations (diode full-bridge rectifiers and other commutating subsystems) are not
-  lowered; C++ and Imperix export reject such a model.
+- Imperix hardware adapters do not implement plant commutations. Standalone C++ uses the
+  component commutation interfaces described below.
 - Arbitrary Python behavior is not embedded in the standalone executable. File or network I/O,
   reflection, run-time type/layout changes and unsupported library calls in a custom equation are
   rejected during export rather than silently approximated.
@@ -267,5 +267,21 @@ common trip path, not a WPT phase override.
   use numeric sentinels internally and report absent occurrences as JSON `null`.
 - Only parameters reported by `--list-params` can change in the compiled simulator.
 
-The exporter supports the built-in switching, PWM-period-averaged and ideal averaged bridge models.
+The exporter supports the built-in switching, PWM-period-averaged and ideal averaged bridge models,
+including square-wave phase-shift modulation in the switching model.
 For their semantics, see [Converter and Bridge Models](Converter-and-Bridge-Models.md).
+
+Controllerless Units retain their electrical equations and independently clocked ADCs. Ideal
+diode full bridges and switch-controlled capacitors participate through the ordinary
+`commutation_margin()`, `commutate(t)` and optional `next_commutation_time()` component methods.
+The native dispatcher shares scheduled boundaries, margin location, simultaneous transitions,
+state resets and the no-progress guard. Adaptive commutations require a finite `max_step`.
+Component-owned state projections, discharge-energy columns and diagnostics are exported too.
+
+Custom components declare mutable scalar equation memory with `equation_state_bindings()`, a
+mapping from local names to `(owner, attribute)` storage references. These bindings describe the
+existing memory; they do not create another state store or restart schema. `get_state()` and
+`set_state()` retain public restart names. Annotated scalar and void helper methods are traced
+at their existing boundaries to avoid multiplying unrelated branch paths. Component equations and
+state-changing callbacks are traced from their Python implementation; no converter-specific
+commutation equations are maintained in the backend.

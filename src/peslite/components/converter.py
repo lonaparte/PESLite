@@ -16,7 +16,7 @@ from ..control.blocks import A120, phases, smoothstep
 from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, ConfigError, Empty, LocatedZero, OutputMethod, _real
 from .network import RCNode, Terminal
-from .pwm import TIME_EPS, CarrierComparison, Modulator, PWM, ZOH, make_modulator
+from .pwm import TIME_EPS, CarrierComparison, Modulator, PWM, ZOH, make_unit_modulator
 
 __all__ = ["ThreePhaseBridge", "SwitchingModel", "PWMAveragingModel", "AveragingModel",
            "HalfBridge", "FullBridge", "DCLink", "DCCapacitor",
@@ -421,9 +421,12 @@ class _SampledModel(_BridgeModel, PWM):
 
     def __init__(self, period: float, load_period: float, offset: float, computation: float,
                  carrier_period: float, modulator: Modulator, topology=None, *,
+                 pattern_sync: str = "interval",
                  parallel_capacitance: float = 0.0, on_resistance: float = 0.0) -> None:
+        self.pulse_update = None
         _BridgeModel.__init__(self, topology, parallel_capacitance=parallel_capacitance,
                               on_resistance=on_resistance, switching=not isinstance(modulator, ZOH))
+        registers = getattr(modulator, "registers", None)
         PWM.__init__(
             self,
             period,
@@ -432,12 +435,25 @@ class _SampledModel(_BridgeModel, PWM):
             computation,
             carrier_period,
             modulator,
-            duty_names=self.topology.duty_names,
+            pattern_sync=pattern_sync,
+            duty_names=(self.topology.duty_names + tuple(getattr(modulator, "carried", ()))
+                        if registers is None else tuple(registers)),
             switching_state=self.topology.switching_state,
             pwm_state=self.topology.pwm_state,
         )
         self.continuous = False
-        self._command_duties = self.topology.command_duties
+        self.command_registers = (self.topology.command_duties if registers is None
+                                else modulator.command_registers)
+        if registers is None and getattr(modulator, "carried", ()):
+            names = modulator.carried
+            self.command_registers = lambda output: (*self.topology.command_duties(output),
+                                                       *(getattr(output, name) for name in names))
+        self.neutral_registers = (
+            tuple(modulator.neutral_registers()) if registers is not None
+            else (self.topology.neutral_duty,) * len(self.topology.duty_names)
+                 + (0.0,) * len(getattr(modulator, "carried", ()))
+        )
+        self.reset(self.neutral_registers, on=False)
         self.state_owner = self
         self.has_switching_events = not isinstance(modulator, ZOH)
 
@@ -485,13 +501,13 @@ class _SampledModel(_BridgeModel, PWM):
         changes: list[Any] = []
         if command is not None and self.computation == 0.0:
             at, output = command
-            self.write(at, self._command_duties(output), bool(output.gates) and enabled,
+            self.write(at, self.command_registers(output), bool(output.gates) and enabled,
                        output.theta, output.omega)
         if abs(self.t_load - t) < TIME_EPS:
             changes.append(self.load(t))
         if command is not None and self.computation > 0.0:
             at, output = command
-            self.write(at, self._command_duties(output), bool(output.gates) and enabled,
+            self.write(at, self.command_registers(output), bool(output.gates) and enabled,
                        output.theta, output.omega)
         changes.extend(self.switches(t))
         return changes
@@ -548,8 +564,9 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None) -> 
     return model_type(
         cfg.ctrl.period, pwm.load_period, pwm.grid_offset, cfg.ctrl.computation,
         pwm.switching_period,
-        modulator if modulator is not None else make_modulator(pwm, cfg.base.f0, cfg.bridge),
+        modulator if modulator is not None else make_unit_modulator(cfg),
         topology,
+        pattern_sync=getattr(pwm, "pattern_sync", "interval"),
         **impedance,
     )
 
@@ -935,7 +952,7 @@ class FullBridge:
         model._current = LocatedZero()  # sign: the conducting direction, 0 while blocked
         model.commutations = 0
         model.blocked_time = 0.0
-        model._blocked_since: float | None = None
+        model._blocked_since = math.nan
         model.discrete_state_names = ("direction",)
         model.linearization_state_names = ()
         model.dissipated_power = model._zero_power
@@ -949,13 +966,14 @@ class FullBridge:
             ("describe", "_diode_description"),
             ("get_state", "_conduction_state"),
             ("set_state", "_restore_conduction_state"),
+            ("equation_state_bindings", "_conduction_bindings"),
         )
         for name, method in methods:
             setattr(model, name, getattr(type(self), method).__get__(model, type(model)))
 
     @staticmethod
     def _diode_current(model, t: float) -> None:
-        model.out.i_dc = -model._current.sign * float(np.real(model.inp.i_c))
+        model.out.i_dc = -model._current.sign * _real(np.real(model.inp.i_c))
 
     @staticmethod
     def _diode_voltage(model, t: float) -> None:
@@ -971,31 +989,31 @@ class FullBridge:
     @staticmethod
     def _commutation_margin(model) -> float:
         """Nonnegative while the present conduction state is valid."""
-        current = float(np.real(model.inp.i_c))
-        u_dc = float(np.real(model.inp.u_dc))
+        current = _real(np.real(model.inp.i_c))
+        u_dc = _real(np.real(model.inp.u_dc))
         if model._current.sign != 0.0:
             return model._current.margin(current)
         # blocked: valid while |u_hold| < u_dc and the port current keeps its zero value
-        return min(u_dc - abs(float(np.real(model.inp.u_hold))),
+        return min(u_dc - abs(_real(np.real(model.inp.u_hold))),
                    model._current.margin(current, model.topology.zero_current_tolerance))
 
     @staticmethod
     def _commutate(model, t: float) -> None:
         """Switch the conducting pair at a located current zero, or end a blocking interval."""
-        current = float(np.real(model.inp.i_c))
-        u_dc = float(np.real(model.inp.u_dc))
+        current = _real(np.real(model.inp.i_c))
+        u_dc = _real(np.real(model.inp.u_dc))
         if model._current.sign == 0.0:
-            if model._blocked_since is not None:
+            if np.isfinite(model._blocked_since):
                 model.blocked_time += t - model._blocked_since
-                model._blocked_since = None
+                model._blocked_since = math.nan
             if abs(model._current.offset(current)) > model.topology.zero_current_tolerance:
                 # current through blocked diodes (an initial state): conduct in its direction
-                model._current.sign = math.copysign(1.0, model._current.offset(current))
+                model._current.sign = _real(np.copysign(1.0, model._current.offset(current)))
             else:
-                model._current.locate(current, -1.0 if float(np.real(model.inp.u_hold)) > 0.0
+                model._current.locate(current, -1.0 if _real(np.real(model.inp.u_hold)) > 0.0
                                      else 1.0)
         else:
-            reverse = abs(float(np.real(model.inp.u_hold))) > u_dc
+            reverse = abs(_real(np.real(model.inp.u_hold))) > u_dc
             model._current.locate(current, -model._current.sign if reverse else 0.0)
             if not reverse:
                 model._blocked_since = t
@@ -1007,7 +1025,13 @@ class FullBridge:
 
     @staticmethod
     def _conduction_state(model) -> dict[str, Any]:
-        return {"direction": float(model._current.sign), "i_ref": float(model._current.residual)}
+        return {"direction": _real(model._current.sign), "i_ref": _real(model._current.residual)}
+
+    @staticmethod
+    def _conduction_bindings(model):
+        """Mutable equation memory; the ODE and public restart schema stay unchanged."""
+        return {"direction": (model._current, "sign"), "i_ref": (model._current, "residual"),
+                **{name: (model, name) for name in ("commutations", "blocked_time", "_blocked_since")}}
 
     @staticmethod
     def _restore_conduction_state(model, values: Mapping[str, Any]) -> None:

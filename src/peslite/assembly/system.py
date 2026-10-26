@@ -13,7 +13,7 @@ from ..components.network import ELEMENT_TYPES, RCNode, RLBranch, Terminal, Thre
 from ..components.adc import _PortMeasurement
 from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
-from ..solver.model import ConfigError, Model, gather
+from ..solver.model import ConfigError, Model, gather, scatter
 from .events import SWITCHABLE, SourceScenario, connected_at, switching_schedule
 from .params import Change, Params, _parameterized, _unit_leaves
 from .types import unit_type
@@ -292,6 +292,10 @@ def _assemble_wpt(name: str, cfg: Any, system: "System",
             f"units.{name}.{side}",
             "power" if "power" in child.ports else None,
         )
+        for scc in link.switched:
+            if scc.side == side:
+                port = child.port("power" if "power" in child.ports else None)
+                scc.bind_bridge(child.units[port.owner].bridge)
         assembly.ports[side] = child.port()
         assembly.include(child)
     default = assembly.port()
@@ -534,29 +538,22 @@ class System:
         parts: list[tuple[str, Any]] = [("", self.model)]
         for unit in self.units.values():
             parts.extend(unit.state_parts())
+        registered = {id(part) for _name, part in parts}
+        parts.extend((name, sub) for name, sub in zip(self.model.names, self.model.subsystems)
+                     if id(sub) not in registered and callable(getattr(sub, "get_state", None)))
         return parts
 
     def get_state(self) -> dict[str, Any]:
         """Return every plant state (model and units) by name; model outputs must be synced first."""
-        s: dict[str, Any] = self.model.get_state()
-        s.update(gather({name: unit for name, unit in self.units.items()}))
-        return s
+        return gather(dict(self.state_parts()))
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         """Load named states; repack the solver vector with ``model.get_initial_values()``."""
-        mine: dict[str, dict] = {name: {} for name in self.units}
-        rest: dict[str, Any] = {}
-        for key, value in values.items():
-            owner = _owner(self.units, key)
-            tail = key[len(owner) + 1:] if owner is not None else ""
-            if owner is not None and tail in self.units[owner].get_state():
-                mine[owner][tail] = value  # unit-owned state
-            else:
-                rest[key] = value
-        for name, own in mine.items():
-            if own:
-                self.units[name].set_state(own)
-        self.model.set_state(rest)
+        parts = dict(self.state_parts())
+        unknown = set(values) - set(gather(parts))
+        if unknown:
+            raise KeyError(f"unknown system states: {sorted(unknown)}")
+        scatter(parts, values)
 
     def state_presets(self, t: float):
         """Return a resolver for the ``initial.states`` keywords at time ``t`` (s).

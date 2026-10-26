@@ -18,6 +18,15 @@ from peslite.solver.simulation import _plant_output_row
 UNIT_SUFFIX = re.compile(r"_(s|hz|hz_s|J|rad)$")
 
 
+def test_multi_unit_output_columns_follow_configuration_order():
+    from conftest import EXAMPLES
+    params = peslite.load(EXAMPLES / 'wpt-example.pes')
+    signals = {'charger.primary.u_dc': 400., 'charger.primary.i_dc': 2.,
+               'charger.secondary.u_dc': 200., 'charger.secondary.i_dc': 3.}
+    row = _plant_output_row(params, 0., signals, {})
+    assert tuple(row) == ('t', *signals)
+
+
 def _run(params, out):
     return peslite.Simulation(params).run(out_dir=out)
 

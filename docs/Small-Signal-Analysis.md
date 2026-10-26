@@ -169,7 +169,9 @@ must account for any undeclared time dependence when supplying a period.
 
 The initial and one-period final logical states must agree within `periodic_tolerance`, including
 protection feedback history even when it is excluded from the smooth modal coordinates. Angular differences
-are taken modulo a full turn, using the control graph's angle-port declarations; unwrapped angle
+are taken modulo a full turn, using the control graph's angle-port declarations and states an owner
+declares in `angle_state_names` (for example the phase-shift modulator's axis angle and phase
+registers); unwrapped angle
 magnitude does not relax the periodicity tolerance. Numerical sample/hold and PWM memory remains
 in the map. Boolean/integer modes and owner-declared lifecycle state, such as protection timers
 and startup bookkeeping, are restored but excluded from modal coordinates.
@@ -180,7 +182,9 @@ or a separate snapshot representation. The addon does not remove genuine unit mu
 because they are near the unit circle.
 
 An owner may also declare `linearization_state_names` to select independent smooth coordinates
-without dropping other restart or protection history. For example, ADC window-mean integrals remain
+without dropping other restart or protection history. A current-synchronised switch-controlled
+capacitor retains its measured half period and time since the current reference, since both
+affect future gate timing. For example, ADC window-mean integrals remain
 coordinates; RMS history does not introduce cached-sum or ring-buffer modes into the smooth
 closed-loop spectrum. Those histories are still restored and checked for recurrence, and protection
 still runs. The registry's optional owner method `periodic_state(values)` defines logical equivalence

@@ -184,7 +184,9 @@ a resolved `clocks` table containing each used clock's frequency and full-path b
 including defaults. Assignment happens only during export; no runtime clock allocator is added.
 
 `sampling_phase` is in `[0, 1)` relative to CLK0. PWM uses the configured carrier phase,
-frequency and single/double register-update selection. Only asynchronous carriers are supported;
+frequency and single/double register-update selection. The hardware adapter uses
+`pattern_sync: interval`; complete-pulse software updates require a hardware adapter and are
+rejected rather than approximated. Only asynchronous carriers are supported;
 an angle-locked simulation carrier needs a separate hardware timing adapter. Here
 `pwm.sync: asynchronous` refers to the simulated electrical angle, not independently clocked ADC
 channels. Hardware acquisition, execution time and register latency replace numerical timing:

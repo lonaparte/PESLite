@@ -20,16 +20,19 @@ constant (its *hold voltage*). The link evaluates it from its own equations thro
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+import math
+from typing import Any, ClassVar, Mapping
 from functools import lru_cache
 
 import numpy as np
 
 from ..solver.energy import PowerPort, StoragePort
-from ..solver.model import Bag, OutputMethod, _real
+from ..solver.model import Bag, LocatedZero, OutputMethod, _real, commutation_tolerance
 from .network import Terminal
+from .pwm import PhaseClock
 
-__all__ = ["CompensatedLink", "make_wpt_link"]
+__all__ = ["CompensatedLink", "SwitchedCompensatedLink", "SwitchControlledCapacitor",
+           "make_wpt_link"]
 
 SIDES = ("primary", "secondary")
 
@@ -50,7 +53,7 @@ def _two_coil_modes(primary: float, secondary: float, mutual: float):
 
 
 @lru_cache(maxsize=32)
-def _equation_methods(coil_sides, lcc_sides, cap_names, coil_outputs, capacitor_outputs):
+def _equation_methods(coil_sides, lcc_sides, cap_names, coil_outputs, capacitor_outputs, switched):
     """Compile a bounded set of structural layouts, never numerical values or model instances."""
     n = len(coil_sides)
     mode_names = tuple(f"i_mode_{m + 1}" for m in range(n))
@@ -65,6 +68,10 @@ def _equation_methods(coil_sides, lcc_sides, cap_names, coil_outputs, capacitor_
         coil_lines.append(f"i{j} = {expression}")
     sums = {side: " + ".join(f"i{j}" for j in side_coils[side]) for side in SIDES}
     output_lines = [*coil_lines, "out = self.out"]
+    if switched:
+        output_lines.append("self._t = t")
+    output_lines.extend(f"out.{side}_scc_on = _real(self.switched[{k}].on)"
+                        for k, (coil, name, side) in enumerate(switched))
     for side in SIDES:
         output_lines.append(f"out.i_{side}_coil = {sums[side]}")
         current = f"s.i_{side}_comp" if side in lcc_sides else f"out.i_{side}_coil"
@@ -90,12 +97,16 @@ def _equation_methods(coil_sides, lcc_sides, cap_names, coil_outputs, capacitor_
             nodes[side] = f"inp.u_{side}"
     voltages = [f"v{j} = node_{side} - s.{cap_names[j]} - self.resistance[{j}] * i{j}"
                 for j, side in enumerate(coil_sides)]
+    for coil, name, side in switched:
+        voltages[coil] += f" - s.{name}"
     rhs_lines = [*coil_lines, "inp = self.inp", *specs,
                  *(f"node_{side} = {value}" for side, value in nodes.items()), *voltages]
     modes = ["(" + " + ".join(f"a{j}_{m} * v{j}" for j in range(n))
              + f") / self._inductance[{m}]" for m in range(n)]
     derivatives = [*front_currents, *front_voltages, *modes,
-                   *(f"i{j} / self.capacitance[{j}]" for j in range(n))]
+                   *(f"i{j} / self.capacitance[{j}]" for j in range(n)),
+                   *(f"0.0 if self.switched[{k}].on else i{coil} / self.switched[{k}].capacitance"
+                     for k, (coil, name, side) in enumerate(switched))]
     rhs_lines.append("return (" + ", ".join(derivatives) + ",)")
     coil_result = [*coil_lines, "return (" + ", ".join(f"i{j}" for j in range(n)) + ",)"]
     functions = [("rhs", "self, t", rhs_lines),
@@ -115,7 +126,7 @@ def _equation_methods(coil_sides, lcc_sides, cap_names, coil_outputs, capacitor_
             rate = " + ".join(f"self._hold_weights[{side!r}][{j}] * v{j}" for j in range(n))
             lines.append(f"return -({rate}) / self._port_gain[{side!r}]")
         functions.append((f"_hold_{side}", "self", lines))
-    namespace = {}
+    namespace = {"_real": _real}
     methods = []
     for name, signature, lines in functions:
         source = f"def {name}({signature}):\n" + "\n".join("    " + line for line in lines)
@@ -151,8 +162,11 @@ class CompensatedLink:
     )
 
     def __init__(self, *, inductance, coil_sides: tuple[str, ...], capacitance, resistance,
-                 sides: dict[str, _Side]) -> None:
+                 sides: dict[str, _Side],
+                 switched: tuple["SwitchControlledCapacitor", ...] = ()) -> None:
         n = len(coil_sides)
+        self.switched = tuple(switched)
+        self._scc_names = tuple(scc.state_name for scc in switched)
         self.coil_sides = tuple(coil_sides)
         self.sides = sides
         if n == 2:
@@ -175,7 +189,7 @@ class CompensatedLink:
             tuple(f"i_{side}_comp" for side in front)
             + tuple(f"u_{side}_parallel" for side in front)
             + tuple(f"i_mode_{m + 1}" for m in range(n))
-            + self._cap_names
+            + self._cap_names + self._scc_names
         )
         self._mode_names = tuple(f"i_mode_{m + 1}" for m in range(n))
         self.state = type("_LinkState", (Bag,), {"__slots__": self.state_names})()
@@ -188,13 +202,17 @@ class CompensatedLink:
                     for m, name in enumerate(self._mode_names))
             + tuple(StoragePort(name, c, kind="capacitor")
                     for name, c in zip(self._cap_names, self.capacitance))
+            + tuple(StoragePort(scc.state_name, scc.capacitance, kind="capacitor")
+                    for scc in switched)
         )
         self._coil_outputs = (tuple(f"i_{self.coil_sides[j]}_coil_{self._module(j) + 1}"
                                     for j in range(n)) if multi else ())
-        capacitor_outputs = tuple(f"u_{side}_parallel" for side in front) + self._cap_names
+        capacitor_outputs = (tuple(f"u_{side}_parallel" for side in front)
+                             + self._cap_names + self._scc_names)
         self._capacitor_outputs = capacitor_outputs
         outputs = ("i_primary", "i_secondary", "i_primary_coil", "i_secondary_coil",
-                   *self._coil_outputs, *capacitor_outputs)
+                   *self._coil_outputs, *capacitor_outputs,
+                   *(f"{scc.side}_scc_on" for scc in switched))
         self.hold_sides = ()
         self._outputs = outputs
         self.out = type("_LinkOut", (Bag,), {"__slots__": outputs})()
@@ -228,6 +246,16 @@ class CompensatedLink:
                 f"set_hold_{side}", inputs=inputs, outputs=(f"u_hold_{side}",)))
         return self, f"u_hold_{side}"
 
+    def __copy__(self):
+        result = object.__new__(type(self))
+        result.__dict__.update(self.__dict__)
+        if hasattr(result, "_current_projections"):
+            result._current_projections = {}
+        if hasattr(result, "_hold_weights"):
+            del result._hold_weights
+            result._prepare_holds()
+        return result
+
     def _project_currents(self) -> None:
         """Enforce active port constraints jointly in the stored modal coordinates."""
         targets = {}
@@ -243,22 +271,33 @@ class CompensatedLink:
             return
         active = tuple(targets)
         if active not in self._current_projections:
-            rows = np.array([[sum(self._shapes[j][m] for j in self.sides[side].coils)
-                              for m in range(len(self._mode_names))] for side in active])
-            inverse = rows.T / np.asarray(self._inductance)[:, None]
-            correction = np.linalg.solve(rows @ inverse, inverse.T).T
-            self._current_projections[active] = rows, correction
-        rows, correction = self._current_projections[active]
-        currents = np.array([getattr(self.state, name) for name in self._mode_names])
-        values = np.array(tuple(targets.values()))
-        if len(active) == len(currents):
-            # A fully constrained state has no free component to preserve. Direct
-            # reconstruction also preserves an exactly zero current exactly.
-            currents = correction @ values
-        else:
-            currents -= correction @ (rows @ currents - values)
+            # Weighted orthogonal rows implement the same minimum-energy projection without
+            # a numerical matrix solve. Coefficients are cached; scalar parameter expressions
+            # retain their arithmetic through construction and standalone export.
+            basis = []
+            for index, side in enumerate(active):
+                row = [sum(self._shapes[j][m] for j in self.sides[side].coils)
+                       for m in range(len(self._mode_names))]
+                weights = [1.0 if k == index else 0.0 for k in range(len(active))]
+                for orthogonal, direction, previous in basis:
+                    overlap = sum(a * b for a, b in zip(row, direction))
+                    row = [a - overlap * b for a, b in zip(row, orthogonal)]
+                    weights = [a - overlap * b for a, b in zip(weights, previous)]
+                inverse = [a / inductance for a, inductance in zip(row, self._inductance)]
+                norm = sum(a * b for a, b in zip(row, inverse))
+                basis.append((tuple(row), tuple(a / norm for a in inverse), tuple(weights)))
+            self._current_projections[active] = tuple(basis)
+        basis = self._current_projections[active]
+        old = tuple(getattr(self.state, name) for name in self._mode_names)
+        currents = [0.0] * len(old) if len(active) == len(old) else list(old)
+        values = tuple(targets.values())
+        for row, direction, weights in basis:
+            requested = sum(a * b for a, b in zip(weights, values))
+            if len(active) != len(old):
+                requested -= sum(a * b for a, b in zip(row, old))
+            currents = [value + gain * requested for value, gain in zip(currents, direction)]
         for name, value in zip(self._mode_names, currents):
-            setattr(self.state, name, float(value))
+            setattr(self.state, name, _real(value))
 
     def _compile_equations(self) -> None:
         """Bind the shared structural template to this instance's live coefficients.
@@ -268,7 +307,8 @@ class CompensatedLink:
         """
         methods = _equation_methods(
             self.coil_sides, tuple(side for side in SIDES if self.sides[side].lcc),
-            self._cap_names, self._coil_outputs, self._capacitor_outputs)
+            self._cap_names, self._coil_outputs, self._capacitor_outputs,
+            tuple((scc.coil, scc.state_name, scc.side) for scc in self.switched))
         for name, method in methods:
             setattr(self, name, method.__get__(self, type(self)))
 
@@ -353,5 +393,329 @@ def _link_spec(cfg: Any) -> dict[str, Any]:
 
 
 def make_wpt_link(cfg: Any) -> CompensatedLink:
-    """Build the configured compensated magnetic link through its ordinary terminal interface."""
-    return CompensatedLink(**_link_spec(cfg))
+    """Build a compensated link with any configured switch-controlled capacitors."""
+    spec = _link_spec(cfg)
+    switched = []
+    for side in SIDES:
+        scc = getattr(cfg, f"{side}_scc", None)
+        if scc is None:
+            continue
+        coils = spec["sides"][side].coils
+        if len(coils) != 1:
+            raise ValueError(f"a switch-controlled capacitor needs one coil on the {side} side")
+        switched.append(SwitchControlledCapacitor(
+            side, coils[0], scc.capacitance, scc.angle, scc.drive, scc.sync, scc.sync_angle,
+            scc.command))
+    if not switched:
+        return CompensatedLink(**spec)
+    return SwitchedCompensatedLink(**spec, switched=tuple(switched))
+
+
+
+# ------------------------------------------------------------------ switch-controlled capacitors
+
+_CURRENT_TOL = 1e-9
+_VOLTAGE_TOL = 1e-9
+
+
+class SwitchControlledCapacitor:
+    """A capacitor shunted by two source-to-source MOSFETs with their body diodes.
+
+    Positive branch current needs the positive-direction MOSFET channel and the other
+    device's channel or body diode; negative current needs the opposite channel. Gate
+    commands therefore do not directly declare whether the whole branch conducts.
+
+    ``drive='common'`` applies the same pulse to both gates. ``drive='alternating'``
+    uses two pulses of width ``pi + angle``, displaced by pi. Their overlap has the
+    commanded nominal conduction angle; body diodes can conduct outside that overlap.
+    Every actual voltage-clamping transition accounts for its capacitor discharge energy.
+    """
+
+    def __init__(self, side: str, coil: int, capacitance: float, angle: float,
+                 drive: str = "common", sync: str = "current", sync_angle: float = 0.0,
+                 command: bool = False) -> None:
+        if drive not in ("common", "alternating"):
+            raise ValueError(f"unknown SCC gate drive {drive!r}")
+        if sync not in ("current", "bridge"):
+            raise ValueError(f"unknown SCC clock source {sync!r}")
+        self.side, self.coil = side, coil
+        self.capacitance = _real(capacitance)
+        self.angle = self.theta = _real(angle)
+        self.drive, self.sync = drive, sync
+        self.sync_angle = _real(sync_angle)
+        self.command = bool(command)
+        self.state_name = f"u_{side}_scc"
+        self.bridge = None
+        self.started = self.referenced = self.on = False
+        self.gates = (False, False)
+        self._gate_cache = None
+        self.zero = LocatedZero()
+        self.half = 0.0
+        self._reference = 0.0
+        self._since = None
+        self.switchings = self.hard_turn_ons = 0
+        self.max_turn_on_voltage = self.impulsive_energy = 0.0
+
+    def __copy__(self):
+        result = object.__new__(type(self))
+        result.__dict__.update(self.__dict__)
+        result._gate_cache = None
+        return result
+
+    @property
+    def gates(self):
+        return self.positive_gate, self.negative_gate
+
+    @gates.setter
+    def gates(self, values):
+        self.positive_gate, self.negative_gate = values
+
+    def equation_state_bindings(self):
+        return {"sign": (self.zero, "sign"), "i_ref": (self.zero, "residual"),
+                **{name: (self, name) for name in (
+                    "started", "referenced", "on", "positive_gate", "negative_gate", "theta",
+                    "half", "_reference", "switchings", "hard_turn_ons", "max_turn_on_voltage",
+                    "impulsive_energy")}}
+
+    def bind_bridge(self, bridge: Any) -> None:
+        self.bridge = bridge
+
+    def _command(self) -> float:
+        value = self.bridge.register("scc_angle") if self.command else self.angle
+        if not np.isfinite(value):
+            raise ValueError(f"{self.side} SCC angle must be finite")
+        return min(math.pi, max(0.0, _real(value)))
+
+    def _clock(self):
+        if self.sync == "bridge":
+            clock = self.bridge.phase_clock()
+            return PhaseClock(clock.time, clock.angle - self.bridge.phase_reference() - self.sync_angle,
+                              clock.rate)
+        if not self.referenced or self.half <= 0.0:
+            return None
+        return PhaseClock(self._reference, math.pi if self.zero.sign < 0.0 else 0.0,
+                          math.pi / self.half)
+
+    def _pulses(self, theta):
+        if self.drive == "alternating":
+            return (0.0, math.pi), 0.5 * (math.pi + theta), 2.0 * math.pi
+        return (0.5 * math.pi,), 0.5 * theta, math.pi
+
+    def _gate_word(self, now, clock, theta) -> tuple:
+        """Gate word and its validity interval from the existing periodic clock."""
+        centres, width, period = self._pulses(theta)
+        if width == 0.0:
+            return (False, False), -math.inf, math.inf
+        if width >= 0.5 * period:
+            return (True, True), -math.inf, math.inf
+        if clock is None:
+            return (False, False), -math.inf, math.inf
+        angle = clock.at(now)
+        gates, starts, ends = [], [], []
+        for centre in centres:
+            cycle = _real(np.floor((angle - centre + width) / period))
+            middle = clock.time + (centre + period * cycle - clock.angle) / clock.rate
+            start, end = middle - width / clock.rate, middle + width / clock.rate
+            active = now < end
+            gates.append(active)
+            starts.append(_real(np.where(active, start, end)))
+            ends.append(_real(np.where(active, end, start + period / clock.rate)))
+        word = tuple(gates) if len(gates) == 2 else tuple(gates) * 2
+        return word, max(starts), min(ends)
+
+    def _gate_state(self, t):
+        clock = self._clock()
+        theta = self._command() if self.sync == "bridge" else self.theta
+        key, now = (clock, theta), t + commutation_tolerance(t)
+        cached = self._gate_cache
+        if cached is not None and cached[0] == key and cached[1] <= now < cached[2]:
+            return cached[3]
+        word, start, end = self._gate_word(now, clock, theta)
+        # Derived waveform cache only; accepted switch state and restart data stay separate.
+        self._gate_cache = key, start, end, word
+        return word
+
+    def next_time(self, t: float) -> float:
+        """Use the same absolute edge times and due comparison as the dispatcher."""
+        expected = self._gate_state(t)
+        if not self.started or self.gates != expected:
+            return t
+        return self._gate_cache[2]
+
+    def _tracks_current(self) -> bool:
+        return self.sync == "current" or (self.on and self.gates[0] != self.gates[1])
+
+    def _flow(self, current) -> float:
+        return self.zero.sign if abs(current) <= _CURRENT_TOL and self.zero.sign else current
+
+    def margin(self, t: float, current: float, voltage: float) -> float:
+        if not self.started or self.gates != self._gate_state(t):
+            return -1.0
+        margin = self.zero.margin(current, _CURRENT_TOL) if self._tracks_current() else math.inf
+        positive, negative = self.gates
+        if self.on:
+            if not (positive or negative):
+                return -1.0
+            if positive != negative:
+                direction = 1.0 if positive else -1.0
+                if self.zero.sign != direction:
+                    return -1.0
+                margin = min(margin, self.zero.margin(current))
+            return margin
+        if positive and negative:
+            return -1.0
+        if positive or negative:
+            direction = 1.0 if positive else -1.0
+            margin = min(margin, _VOLTAGE_TOL - direction * voltage)
+            # Complementarity at zero voltage selects the path carrying the coil current.
+            if (abs(voltage) <= _VOLTAGE_TOL
+                    and direction * self._flow(current) > 0):
+                return -1.0
+        return margin
+
+    def commutate(self, link: Any, t: float, current: float, voltage: float) -> None:
+        self._synchronize_current(t, current)
+        self.gates = self._gate_state(t)
+        self._set_conduction(link, current, voltage)
+
+    def _synchronize_current(self, t: float, current: float) -> None:
+        if not self.started:
+            self.started = True
+            if self._since is not None:
+                self._reference, self._since = t - self._since, None
+        if self.zero.sign == 0.0:
+            if abs(current) > _CURRENT_TOL:
+                self.zero.sign = _real(np.copysign(1.0, current))
+        elif self._tracks_current() and self.zero.margin(current) < 0.0:
+            self.zero.locate(current, -self.zero.sign)
+            if self.sync == "current":
+                if self.referenced:
+                    self.half = t - self._reference
+                self._reference, self.referenced = t, True
+                self.theta = self._command()
+        elif not self._tracks_current() and abs(current) > _CURRENT_TOL:
+            self.zero.sign = _real(np.copysign(1.0, current))
+    def _set_conduction(self, link: Any, current: float, voltage: float) -> None:
+        positive, negative = self.gates
+        direction = 1.0 if positive else -1.0
+        flow = self._flow(current)
+        conducting = (positive and negative) or ((positive or negative) and (
+            direction * voltage > _VOLTAGE_TOL
+            or (abs(voltage) <= _VOLTAGE_TOL and direction * flow > 0.0)))
+        if conducting:
+            if positive != negative and self.zero.sign == 0.0:
+                self.zero.sign = direction
+            if not self.on:
+                self.switchings += 1
+            if abs(voltage) > _VOLTAGE_TOL:
+                self.hard_turn_ons += 1
+            self.max_turn_on_voltage = max(self.max_turn_on_voltage, abs(voltage))
+            self.impulsive_energy += 0.5 * self.capacitance * voltage * voltage
+            setattr(link.state, self.state_name, 0.0)
+        elif self.on:
+            self.switchings += 1
+        self.on = conducting
+
+    def get_state(self, t: float) -> dict[str, Any]:
+        state = {"on": self.on, "positive_gate": self.gates[0], "negative_gate": self.gates[1],
+                 "sign": _real(self.zero.sign), "i_ref": _real(self.zero.residual)}
+        if self.sync == "current":
+            since = t - self._reference if self.started and self.referenced else self._since or 0.0
+            state.update(referenced=self.referenced, since=_real(since), half=_real(self.half),
+                         theta=_real(self.theta))
+        return state
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        unknown = set(values) - set(self.get_state(0.0))
+        if unknown:
+            raise KeyError(f"{self.side} SCC: no state(s) {sorted(unknown)}")
+        for name in ("on", "referenced"):
+            if name in values:
+                setattr(self, name, bool(values[name]))
+        self.gates = (bool(values.get("positive_gate", self.gates[0])),
+                      bool(values.get("negative_gate", self.gates[1])))
+        for name in ("half", "theta"):
+            if name in values:
+                setattr(self, name, float(values[name]))
+        if "sign" in values:
+            self.zero.sign = float(values["sign"])
+        if "i_ref" in values:
+            self.zero.residual = float(values["i_ref"])
+        if "since" in values:
+            self._since, self.started = float(values["since"]), False
+
+    def diagnostics(self):
+        return {"switchings": self.switchings, "hard_turn_ons": self.hard_turn_ons,
+                "max_turn_on_voltage": self.max_turn_on_voltage,
+                "turn_on_energy": self.impulsive_energy}
+
+
+class SwitchedCompensatedLink(CompensatedLink):
+    """A compensated link with switch-controlled capacitors, a commutating subsystem.
+
+    Its validity margin, commutations and scheduled gate instants come from its capacitors; the
+    commutation framework writes back the capacitor voltage zeroed at a turn-on. The switch
+    states and schedules are named states (``<side>_scc.*``) of the link.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._t = 0.0
+
+    def _scc_values(self):
+        coils = self.coil_currents()
+        for scc in self.switched:
+            yield scc, coils[scc.coil], _real(getattr(self.state, scc.state_name))
+
+    def commutation_margin(self) -> float:
+        return min(scc.margin(self._t, current, voltage)
+                   for scc, current, voltage in self._scc_values())
+
+    def commutate(self, t: float) -> None:
+        for scc, current, voltage in list(self._scc_values()):
+            scc.commutate(self, t, current, voltage)
+
+    def next_commutation_time(self) -> float:
+        return min(scc.next_time(self._t) for scc in self.switched)
+
+    def equation_state_bindings(self):
+        return {"time": (self, "_t"),
+                **{f"{scc.side}_scc.{name}": binding for scc in self.switched
+                   for name, binding in scc.equation_state_bindings().items()}}
+
+    @property
+    def impulsive_dissipated_energy(self) -> float:
+        """Energy (J) dissipated by capacitor discharges at switch closings."""
+        return sum(scc.impulsive_energy for scc in self.switched)
+
+    def diagnostics(self) -> dict[str, float]:
+        return {f"{scc.side}_scc.{key}": value for scc in self.switched
+                for key, value in scc.diagnostics().items()}
+
+    # -- named switch state (a state part of the link) -----------------------------------------
+    def get_state(self) -> dict[str, Any]:
+        return {f"{scc.side}_scc.{key}": value for scc in self.switched
+                for key, value in scc.get_state(self._t).items()}
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        for scc in self.switched:
+            prefix = f"{scc.side}_scc."
+            own = {key[len(prefix):]: value for key, value in values.items()
+                   if key.startswith(prefix)}
+            if own:
+                scc.set_state(own)
+        unknown = [key for key in values
+                   if not any(key.startswith(f"{scc.side}_scc.") for scc in self.switched)]
+        if unknown:
+            raise KeyError(f"switched link: no state(s) {sorted(unknown)}")
+
+    @property
+    def discrete_state_names(self) -> tuple[str, ...]:
+        return tuple(f"{scc.side}_scc.{name}" for scc in self.switched
+                     for name in ("sign",))
+
+    # Current-derived clock memory affects future gates and remains in the smooth map.
+    @property
+    def linearization_state_names(self):
+        return tuple(f"{scc.side}_scc.{name}" for scc in self.switched if scc.sync == "current"
+                     for name in ("since", "half", "theta"))

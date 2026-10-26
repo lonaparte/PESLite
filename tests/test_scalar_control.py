@@ -99,6 +99,39 @@ def test_scalar_control_uses_the_shared_control_package():
     assert LOOP_TYPES["resonant_modulation"] is ResonantModulation
 
 
+def test_scalar_output_alias_and_named_commands_share_one_value():
+    from peslite.control.controller import BridgeControlOutput
+
+    output = BridgeControlOutput(duty=0.25)
+    output.commands["duty"] = 0.4
+    assert output.duty == 0.4
+    output.duty = 0.6
+    assert output.commands == {"duty": 0.6}
+    with pytest.raises(ValueError, match="conflicting duty"):
+        BridgeControlOutput(duty=0.2, commands={"duty": 0.8})
+
+
+def test_registered_carrier_keeps_its_own_topology_capabilities(monkeypatch):
+    from dataclasses import replace
+    import peslite
+    from conftest import EXAMPLES
+    from peslite.components.converter import HalfBridge, make_bridge
+    from peslite.components.pwm import CarrierComparison, MODULATOR_TYPES, validate_modulator
+    from peslite.control.profiles import CONTROL_TYPES
+
+    class CustomCarrier(CarrierComparison):
+        pass
+
+    unit = peslite.load(EXAMPLES / "buck-example.pes",
+                        **{"units.converter.bridge.model": "switching"}).units["converter"]
+    monkeypatch.setitem(MODULATOR_TYPES, "test_carrier", CustomCarrier)
+    monkeypatch.setitem(CONTROL_TYPES, "dc", replace(CONTROL_TYPES["dc"], modulator="test_carrier"))
+    validate_modulator(unit, HalfBridge(), "units.converter")
+    bridge = make_bridge(unit)
+    assert isinstance(bridge.modulator, CustomCarrier)
+    assert len(bridge.register_names) == 1
+
+
 def test_control_profiles_declare_one_static_interface_contract():
     from peslite.control.profiles import control_type
 

@@ -65,6 +65,23 @@
 - Unified the compensated WPT links in one model: `ss`, `lcc`, the new `lcc_s` and `ss_multi`
   (N coupled series-series modules), with negative mutual inductance, every capacitor voltage as
   a link output and the ESR of LCC shunt capacitors.
+- Added square-wave phase-shift modulation (`ctrl.type: phase_shift` on a full bridge, switching
+  model): width, phase, frequency and mode registers on the ordinary register path, a continuous
+  angle axis, in Python and standalone C++. The common `pwm.pattern_sync: interval | pulse`
+  policy preserves complete switching pulses for carrier comparison and phase-shift modulation;
+  its state is constructed only for `pulse` and is restored on continuation.
+  Modulators may define their own registers
+  (and carry optional controller outputs as further registers); owners may declare
+  `angle_state_names` for loop maps.
+- Merged the scalar feedback loops into one law with power, voltage and current measurements and
+  modulation, phase and frequency commands; `PowerControl` and `PhasePowerControl` are unchanged.
+- Added switch-controlled capacitors on `ss`, `lcc` and `lcc_s` links, with common or alternating
+  MOSFET gate pulses and intrinsic body-diode conduction, current or bridge synchronisation,
+  and optional controller commands through the ordinary bridge registers. They reuse the common
+  commutation framework, with summary diagnostics and capacitor discharge loss in the energy table.
+- Completed standalone C++ lowering of generic commutations, component state projections and
+  controllerless Units, including independent ADCs, restart state, diagnostics and discharge loss.
+  Auxiliary scalar control outputs use the ordinary register path across modulation types.
 
 ## 0.3.0
 

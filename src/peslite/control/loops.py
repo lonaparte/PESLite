@@ -7,18 +7,18 @@ How loops are connected is not theirs to know (:mod:`.controller`). Built-in loo
 their continuous-time outputs and state derivatives for the ideal averaged converter model.
 Grid-control signals use pu and scalar converter signals use SI. Unit-system-independent loops
 declare generic scalar voltage/current ports that bind to either control-graph boundary.
-Time is in s, angles in rad and frequencies in rad/s.
+Time is in s, angles in rad, grid angular frequencies in rad/s and modulation frequencies in Hz.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, field, is_dataclass, make_dataclass
 from typing import Any, ClassVar, Mapping, Optional
 
 import numpy as np
 
-from ..solver.model import ConfigError, _complex, assign, gather, join, scatter
+from ..solver.model import ConfigError, _complex, _real, assign, gather, join, scatter
 from .blocks import Filter, OutputLimit, PI, complex_power
 
 __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
@@ -29,7 +29,10 @@ __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "PSC", "Droop", "VSG", "DVOC",
            "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping",
            "SI_CURRENT", "SI_VOLTAGE", "SI_POWER", "DUTY_RATIO", "MODULATION", "HERTZ",
-           "InductorCurrentControl", "PowerControl", "PhasePowerControl", "ResonantModulation"]
+           "InductorCurrentControl", "PowerControl", "PhasePowerControl", "FrequencyPowerControl",
+           "VoltageControl", "PhaseVoltageControl", "FrequencyVoltageControl", "CurrentControl",
+           "PhaseCurrentControl", "FrequencyCurrentControl", "ResonantModulation",
+           "PhaseShiftModulation", "MODE"]
 
 
 # ------------------------------------------------------------------ signals
@@ -1213,80 +1216,122 @@ class InductorCurrentControl(_LimitedScalarPI):
         return self.constrain(requested), requested
 
 
-@dataclass(frozen=True, kw_only=True)
-class _PowerControlParams(_ScalarPIParams):
-    power_filter: PowerFilterParams = field(default_factory=PowerFilterParams)
+class _FeedbackControl(_LimitedScalarPI):
+    """PI feedback of one measured scalar onto one converter command.
 
+    ``command = feedforward + PI(startup * reference - measured)``, limited to
+    ``[minimum, maximum]`` with the shared anti-windup tracking. The measured input and its
+    optional first-order filter (``<measured>_filter``) are named after the measured quantity;
+    the filtered value is echoed as an output for observation. A phase command limits a
+    translated coordinate (``phase - minimum`` in ``[0, maximum - minimum]``), so an
+    all-negative phase range is valid; a crossing of a whole turn remains a saturation.
+    """
 
-class _PowerFeedbackControl(_LimitedScalarPI):
-    """Local signed port power with the existing filter, PI and output constraint."""
-
-    flow_inputs = ("reference", "power", "feedforward")
-    log_outputs = ("power",)
+    measured: ClassVar[str]
+    command: ClassVar[str]
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
-        self.power_filter = None
-        if cfg.power_filter.enable:
-            pole = 2.0 * math.pi * cfg.power_filter.bandwidth
-            self.power_filter = self.state_block(
-                "power", Filter((pole,), (1.0, pole), self.block_period)
+        name = f"{self.measured}_filter"
+        settings = getattr(cfg, name)
+        filtered = None
+        if settings.enable:
+            pole = 2.0 * math.pi * settings.bandwidth
+            filtered = self.state_block(
+                self.measured, Filter((pole,), (1.0, pole), self.block_period)
             )
+        setattr(self, name, filtered)
+        self._filter = filtered
 
-    def initial_outputs(self):
-        command, power = self.outputs
-        return {command: self.cfg.minimum, power: 0.0}
-
-    def equation(self, reference, power, feedforward):
-        if self.power_filter is not None:
-            power = self.power_filter(power)
-        requested = self.pi(self.startup.value * reference, power, feedforward)
-        return self.constrain(requested), power
-
-
-@register_loop_type
-class PowerControl(_PowerFeedbackControl):
-    """Signed power feedback in watts; output is modulation amplitude.
-
-    Positive power leaves the measured port. Under PWM, use the ADC's mean of instantaneous
-    voltage times current, not their separately averaged waveforms or a carrier-boundary product.
-    Gains are modulation/W and modulation/(W*s); feedforward is a modulation amplitude.
-    """
-
-    @dataclass(frozen=True, kw_only=True)
-    class Params(_PowerControlParams):
-        type: str = "power_control"
-
-    type = "power_control"
-    inputs = {"reference": SI_POWER, "power": SI_POWER, "feedforward": MODULATION}
-    outputs = {"modulation": MODULATION, "power": SI_POWER}
-
-
-@register_loop_type
-class PhasePowerControl(_PowerFeedbackControl):
-    """The same local power-feedback law with a phase command in radians.
-
-    Gains are rad/W and rad/(W*s). Choose their sign and phase limits for a monotonic operating
-    branch of the connected circuit; phase-to-power polarity is not a converter-type property.
-    Only the constraint uses a translated coordinate: phase - minimum is bounded in
-    [0, maximum - minimum], then translated back. The shared limiter and PI tracking are unchanged.
-    """
-
-    @dataclass(frozen=True, kw_only=True)
-    class Params(_PowerControlParams):
-        type: str = "phase_power_control"
-
-    type = "phase_power_control"
-    inputs = {"reference": SI_POWER, "power": SI_POWER, "feedforward": ANGLE}
-    outputs = {"phase": ANGLE, "power": SI_POWER}
-
-    @staticmethod
-    def _limit_bounds(cfg):
-        return 0.0, cfg.maximum - cfg.minimum
+    def _limit_bounds(self, cfg):
+        if self.command == "phase":
+            return 0.0, cfg.maximum - cfg.minimum
+        if self.command == "frequency" and not cfg.minimum > 0.0:
+            raise ConfigError(f"{type(self).__name__}.minimum must be > 0: it is the lowest "
+                              "frequency command and the initial output")
+        return cfg.minimum, cfg.maximum
 
     def constrain(self, requested):
+        if self.command != "phase":
+            return _LimitedScalarPI.constrain(self, requested)
         minimum = self.cfg.minimum
         return minimum + _LimitedScalarPI.constrain(self, requested - minimum)
+
+    def initial_outputs(self):
+        return {self.command: self.cfg.minimum, self.measured: 0.0}
+
+    def equation(self, reference, measured, feedforward):
+        if self._filter is not None:
+            measured = self._filter(measured)
+        requested = self.pi(self.startup.value * reference, measured, feedforward)
+        return self.constrain(requested), measured
+
+
+_MEASURED = {"power": ("W", SI_POWER), "voltage": ("V", SI_VOLTAGE),
+             "current": ("A", SI_CURRENT)}
+_COMMANDS = {"modulation": ("1", MODULATION), "phase": ("rad", ANGLE),
+             "frequency": ("Hz", HERTZ)}
+
+
+def _feedback_loop(name: str, measured: str, command: str, summary: str) -> type:
+    """Register one member of the scalar feedback family (one class per measured/command pair,
+    all sharing :class:`_FeedbackControl`)."""
+    type_name = "".join(f"_{c.lower()}" if c.isupper() else c for c in name).lstrip("_")
+    unit, measured_type = _MEASURED[measured]
+    command_unit, command_type = _COMMANDS[command]
+    params = make_dataclass(
+        "Params",
+        [("type", str, field(default=type_name)),
+         (f"{measured}_filter", PowerFilterParams, field(default_factory=PowerFilterParams))],
+        bases=(_ScalarPIParams,), frozen=True, kw_only=True,
+    )
+    params.__qualname__ = f"{name}.Params"
+    params.__module__ = __name__
+    doc = (f"{summary}\n\n    Measured {measured} ({unit}); command and feedforward: {command} "
+           f"({command_unit}). Gains are {command_unit}/{unit} and {command_unit}/({unit}*s).\n"
+           f"    The law is :class:`_FeedbackControl`'s.\n    ")
+    cls = type(name, (_FeedbackControl,), {
+        "__doc__": doc, "__module__": __name__, "__qualname__": name,
+        "Params": params, "type": type_name, "measured": measured, "command": command,
+        "inputs": {"reference": measured_type, measured: measured_type,
+                   "feedforward": command_type},
+        "outputs": {command: command_type, measured: measured_type},
+        "flow_inputs": ("reference", measured, "feedforward"),
+        "log_outputs": (measured,),
+    })
+    return register_loop_type(cls)
+
+
+PowerControl = _feedback_loop(
+    "PowerControl", "power", "modulation",
+    "Signed power feedback; output is modulation amplitude (or a phase-shift width).\n\n"
+    "    Positive power leaves the measured port. Under PWM, use the ADC's mean of instantaneous\n"
+    "    voltage times current, not their separately averaged waveforms or a carrier-boundary\n"
+    "    product.")
+PhasePowerControl = _feedback_loop(
+    "PhasePowerControl", "power", "phase",
+    "The same local power-feedback law with a phase command in radians.\n\n"
+    "    Choose the gain sign and phase limits for a monotonic operating branch of the connected\n"
+    "    circuit; phase-to-power polarity is not a converter-type property.")
+FrequencyPowerControl = _feedback_loop(
+    "FrequencyPowerControl", "power", "frequency",
+    "Power feedback onto a frequency command in Hz.")
+VoltageControl = _feedback_loop(
+    "VoltageControl", "voltage", "modulation",
+    "Output-voltage feedback onto modulation amplitude or phase-shift width.")
+PhaseVoltageControl = _feedback_loop(
+    "PhaseVoltageControl", "voltage", "phase", "Output-voltage feedback onto a phase command.")
+FrequencyVoltageControl = _feedback_loop(
+    "FrequencyVoltageControl", "voltage", "frequency",
+    "Output-voltage feedback onto the switching frequency.")
+CurrentControl = _feedback_loop(
+    "CurrentControl", "current", "modulation",
+    "Port-current feedback onto modulation amplitude or phase-shift width.")
+PhaseCurrentControl = _feedback_loop(
+    "PhaseCurrentControl", "current", "phase", "Port-current feedback onto a phase command.")
+FrequencyCurrentControl = _feedback_loop(
+    "FrequencyCurrentControl", "current", "frequency",
+    "Port-current feedback onto the switching frequency.")
 
 
 @register_loop_type
@@ -1326,3 +1371,45 @@ class ResonantModulation(Loop):
 
     def flow(self, t, inputs):
         return {"duty": self._duty(t, inputs)}, {}
+
+
+MODE = SignalType("1", "mode")
+
+
+@register_loop_type
+class PhaseShiftModulation(Loop):
+    """Square-wave phase-shift commands from width, phase, frequency and mode graph inputs.
+
+    The outputs are the compare registers of the phase-shift modulator
+    (:class:`~peslite.components.pwm.PhaseShiftModulator`): ``width`` (pulse width in half
+    periods, scaled by the start-up ramp and clipped to [0, 1]), ``phase`` (rad, centre of the
+    positive pulse), ``frequency`` (Hz) and ``mode`` (0 full bridge, 1 half bridge, 3 short,
+    4 reverse half bridge). References give open-loop operation; feedback loops (for example
+    :class:`PowerControl` onto ``width`` or :class:`PhasePowerControl` onto ``phase``) drive
+    the same typed inputs.
+    """
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: Optional[float] = None
+        type: str = "phase_shift_modulation"
+
+    type = "phase_shift_modulation"
+    role = "modulation"
+    inputs = {"width": MODULATION, "phase": ANGLE, "frequency": HERTZ, "mode": MODE}
+    outputs = {"width": MODULATION, "phase": ANGLE, "frequency": HERTZ, "mode": MODE}
+    flow_inputs = ("width", "phase", "frequency", "mode")
+
+    def initial_outputs(self):
+        references = self.unit.ctrl.references
+        return {"width": 0.0, "phase": references.phase, "frequency": references.frequency,
+                "mode": _real(references.mode)}
+
+    def forcing_periods(self, inputs):
+        """The square-wave period, for post-run loop maps."""
+        frequency = abs(inputs["frequency"])
+        return () if frequency == 0.0 else (1.0 / frequency,)
+
+    def equation(self, width, phase, frequency, mode):
+        width = min(1.0, max(0.0, self.startup.value * width))
+        return width, phase, frequency, mode

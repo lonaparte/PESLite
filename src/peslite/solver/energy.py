@@ -186,6 +186,8 @@ class SubsystemEnergy:
     energy_rate: float  # dH/dt, W
     residual: float  # power_in + supplied - dissipated - energy_rate, W
     kind: str = "declared"
+    # J, cumulative energy dissipated at state jumps (switch closings); None: none declared
+    impulsive: Optional[float] = None
 
 
 @dataclass
@@ -237,6 +239,8 @@ class EnergyReport:
                 cols[f"{s.name}.power_supplied_W"] = s.supplied  # inferred net injection
             else:
                 cols[f"{s.name}.energy_J"] = s.energy
+            if s.impulsive is not None:
+                cols[f"{s.name}.dissipated_impulsive_J"] = s.impulsive
         return cols
 
 
@@ -339,10 +343,14 @@ class _BalancePlan:
             )
             supplied = float(spec.supplied(check.subsystem))
             dissipated = float(spec.dissipated(check.subsystem))
-            report.subsystems.append(SubsystemEnergy(
+            entry = SubsystemEnergy(
                 check.name, energy, p_in, supplied, dissipated, rate,
                 p_in + supplied - dissipated - rate,
-            ))
+            )
+            impulsive = getattr(check.subsystem, "impulsive_dissipated_energy", None)
+            if impulsive is not None:
+                entry.impulsive = float(impulsive)
+            report.subsystems.append(entry)
         return report
 
 

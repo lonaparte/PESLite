@@ -222,8 +222,7 @@ class ADC:
         ``t`` count the value at ``t`` over that preceding part.
         """
         if self.clocked:
-            self._clock_index = (int(math.ceil((t - TIME_EPS) / self.period)) if held else
-                                 int(math.floor((t + TIME_EPS) / self.period)) + 1)
+            self._clock_index = int(self._start_index(t, held))
             next_ = self._clock_index * self.period
             last = next_ - self.period
         if last is None or next_ is None:
@@ -238,6 +237,11 @@ class ADC:
             values = self.ports.read()
             self.peeks = [ADCSample(last + i * self.sample_period, values)
                           for i in range(1, self.n_samp)]
+
+    def _start_index(self, t, held):
+        """The same owned-clock placement for ordinary startup and standalone lowering."""
+        return (np.ceil((t - TIME_EPS) / self.period) if held else
+                np.floor((t + TIME_EPS) / self.period) + 1)
 
     # ------------------------------------------------------------ the window
     def seed(self) -> None:

@@ -96,7 +96,7 @@ def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
                       ctrl_names: Mapping[str, Iterable[str]] | None = None) -> dict[str, float]:
     """Convert one raw plant snapshot into one public, real-valued output row."""
     row: dict[str, float] = {"t": t}
-    unit_names = {name for name, _unit in _unit_items(params.units)}
+    unit_names = dict.fromkeys(name for name, _unit in _unit_items(params.units))
     for key, value in plant.items():
         head, _, what = key.rpartition(".")
         if np.iscomplexobj(value):
@@ -747,7 +747,10 @@ class Simulation:
         system = self.system
         values = self._initial_values(t0)
         # 1. power stage (unset states stay zero), events up to t0, then the solver vector
-        self._states.load(values, ["", *system.units])
+        timing = {prefix for name, unit in system.units.items()
+                  for prefix in (f"{name}.ctrl", f"{name}.{unit.bridge.state_prefix}", f"{name}.meas")}
+        self._states.load(values, [prefix for prefix, _part in system.state_parts()
+                                  if prefix not in timing])
         for event_t, _, what in self._actions():
             if event_t <= t0 + _EPS:
                 paths = tuple(path for path in what.paths if path not in what.connections)
@@ -763,7 +766,7 @@ class Simulation:
             self._states.load(values, [f"{name}.ctrl", bridge_prefix])
             if any(key.startswith((f"{name}.ctrl.", bridge_prefix + ".")) for key in values):
                 self._continued.add(name)
-            if unit.adc is not None and unit.adc.accumulating:
+            if unit.adc is not None and (unit.adc.accumulating or unit.adc.clocked):
                 self._states.load(values, [f"{name}.meas"])
                 if any(key.startswith(f"{name}.meas.") for key in values):
                     self._windows_given.add(name)
@@ -1123,6 +1126,10 @@ class Simulation:
         summary: dict[str, Any] = {}
         for name, unit in system.units.items():
             summary.update({f"{name}.{k}": v for k, v in unit.summary().items()})
+        for name, sub in zip(system.model.names, system.model.subsystems):
+            report = getattr(sub, "diagnostics", None)
+            if callable(report):
+                summary.update({f"{name}.{k}": v for k, v in report().items()})
         summary["tripped"] = int(any(unit.tripped for unit in units))
         summary["t_start"] = t_start
         summary["t_stop"] = rec.last_t if rec.last_t is not None else t_start
@@ -1235,6 +1242,7 @@ class SystemLoop:
                     periods.update(forcing(graph._gather(graph._wiring[label], measured)))
             self._angles.update(f"{name}.ctrl.command.{port}"
                                 for port, spec in ctrl.interface.outputs.items() if spec.unit == "rad")
+        self._angles.update(sim._states.angle_names)
         if repeat_forcing:
             for source in getattr(sim.system, "sources", {}).values():
                 relative = abs(source.cfg.f - frequency)

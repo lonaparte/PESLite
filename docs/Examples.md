@@ -93,11 +93,10 @@ The feedback loop's optional power filter removes the remaining excitation-frequ
 Ideal `averaging` uses the instantaneous product in the continuous control graph and the same filter,
 without an ADC or artificial sampling delay.
 
-The feedback examples explicitly connect `PowerControl.modulation` or `PhasePowerControl.phase` to
-the corresponding `ResonantModulation` input. Their controller CSV files record the actual amplitude
-and phase commands, the loop's filtered `*.power`, and `power_reference`. The reference changes at
-3 ms; compare settled, time-averaged power, not individual ripple samples or decimated switching
-waveforms. Reduce `simulation.output.period` when inspecting switching-scale voltage/current.
+The controller CSV files record each example's command, filtered power and power reference. The
+reference changes at 3 ms; compare settled, time-averaged power, not individual ripple samples or
+decimated switching waveforms. Reduce `simulation.output.period` when inspecting switching-scale
+voltage/current.
 
 ## Independent loads and measurement selection
 

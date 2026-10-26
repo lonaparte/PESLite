@@ -21,7 +21,7 @@ class Circuit:
     """Coupled coils, coil capacitors, and optional LCC front ends (``lcc[side]``)."""
 
     def __init__(self, inductance, capacitance, resistance, coil_sides, lcc=None,
-                 primary_series_resistance=0.0):
+                 primary_series_resistance=0.0, scc=None):
         self.L = np.asarray(inductance, dtype=float)
         self.C = np.asarray(capacitance, dtype=float)
         self.R = np.asarray(resistance, dtype=float)
@@ -30,15 +30,21 @@ class Circuit:
         self.lcc = dict(lcc or {})  # side -> (Lf, Rf, Cf, Rcf)
         self.front = [side for side in ("primary", "secondary") if side in self.lcc]
         self.r_series = primary_series_resistance
-        self.size = 2 * len(self.front) + 2 * self.n
+        self.scc = dict(scc or {})  # coil index -> switched capacitance (states after the coils)
+        self.scc_coils = tuple(sorted(self.scc))
+        self.size = 2 * len(self.front) + 2 * self.n + len(self.scc_coils)
 
     def _split(self, x):
         k = len(self.front)
         comp = dict(zip(self.front, x[:k]))
         shunt = dict(zip(self.front, x[k:2 * k]))
         i = x[2 * k:2 * k + self.n]
-        uc = x[2 * k + self.n:]
+        uc = x[2 * k + self.n:2 * k + 2 * self.n]
         return comp, shunt, i, uc
+
+    def scc_index(self, coil):
+        """Position of a switched capacitor's voltage in the state vector."""
+        return 2 * len(self.front) + 2 * self.n + self.scc_coils.index(coil)
 
     def side_sum(self, i, side):
         return sum(i[j] for j in range(self.n) if self.sides[j] == side)
@@ -47,7 +53,8 @@ class Circuit:
         comp, _shunt, i, _uc = self._split(x)
         return comp[side] if side in self.lcc else self.side_sum(i, side)
 
-    def derivative(self, x, u_primary, u_secondary):
+    def derivative(self, x, u_primary, u_secondary, closed=()):
+        """State derivative; ``closed``: coils whose switched capacitor is shorted."""
         comp, shunt, i, uc = self._split(x)
         if "primary" not in self.lcc and self.r_series:
             u_primary = u_primary - self.r_series * self.side_sum(i, "primary")
@@ -65,20 +72,26 @@ class Circuit:
             else:
                 node[side] = ports[side]
         v = np.array([node[self.sides[j]] for j in range(self.n)]) - self.R * i - uc
+        d_scc = []
+        for coil in self.scc_coils:
+            if coil in closed:
+                d_scc.append(0.0)
+            else:
+                v[coil] -= x[self.scc_index(coil)]
+                d_scc.append(i[coil] / self.scc[coil])
         di = np.linalg.solve(self.L, v)
-        return np.concatenate([d_comp, d_shunt, di, i / self.C])
+        return np.concatenate([d_comp, d_shunt, di, i / self.C, d_scc])
 
-    def hold_voltage(self, x, u_primary, side="secondary"):
-        """Secondary port voltage with zero rate of change of its port current."""
+    def hold_voltage(self, x, u_primary, side="secondary", closed=()):
+        """Port voltage with zero rate of change of its port current."""
         def rate(u):
-            dx = self.derivative(x, u_primary, u)
-            return self.port_current(dx, side)
+            return self.port_current(self.derivative(x, u_primary, u, closed), side)
         r0 = rate(0.0)
         return -r0 / (rate(1.0) - r0)
 
 
 def rectify(circuit, u_primary, V2, t_end, t_samples, rtol=1e-11, atol=1e-13, max_events=200000,
-            parallel_capacitance=0.0, on_resistance=0.0, breaks=None):
+            parallel_capacitance=0.0, on_resistance=0.0, breaks=None, max_step=np.inf):
     """Integrate from rest; returns sampled circuit states, the DC current samples (into the DC
     side) and the transition log [(t, direction)].
 
@@ -88,6 +101,9 @@ def rectify(circuit, u_primary, V2, t_end, t_samples, rtol=1e-11, atol=1e-13, ma
     Without Cp, ``breaks`` (times of source discontinuities) makes ``u_primary`` piecewise constant between
     them and evaluated inside each segment; a blocked bridge whose hold voltage jumps beyond the
     DC voltage at a break starts conducting there.
+
+    ``max_step`` bounds the integrator step: an event function which leaves and re-enters its
+    valid range within one step (a hold voltage just touching the DC voltage) is otherwise missed.
     """
     cp = float(parallel_capacitance)
     if cp > 0.0:
@@ -150,7 +166,7 @@ def rectify(circuit, u_primary, V2, t_end, t_samples, rtol=1e-11, atol=1e-13, ma
                 return d * circuit.port_current(xx[:n], "secondary")
         event.terminal, event.direction = True, -1
         sol = solve_ivp(f, (t, segment_end), x, method="DOP853", rtol=rtol, atol=atol,
-                        events=event, dense_output=True)
+                        events=event, dense_output=True, max_step=max_step)
         t_stop = sol.t[-1]
         mask = (samples >= t) & (samples <= t_stop)
         if mask.any():
@@ -170,3 +186,76 @@ def rectify(circuit, u_primary, V2, t_end, t_samples, rtol=1e-11, atol=1e-13, ma
     port = np.array([circuit.port_current(sample[:n], "secondary") for sample in out])
     i_dc = -np.abs(port) * (directions != 0.0)
     return out, i_dc, log
+
+
+def switched(circuit, u_primary, t_end, t_samples, *, coil, frequency, conduction, sync_angle=0.0,
+             drive="common", phase=0.0, breaks=(), u_secondary=None, V2=None,
+             rtol=1e-10, atol=1e-12, max_step=1e-7, on_resistance=1e-4, off_resistance=1e8):
+    """Independent finite-resistance circuit, integrated by implicit Radau.
+
+    Each MOSFET's channel conducts either way when gated. An ungated device retains its body
+    diode. Kirchhoff's laws reduce the two source-to-source devices to two series resistances
+    when the corresponding directional channel is gated. Capacitor voltage remains continuous:
+    this reference has neither an ideal-clamp state nor an instantaneous discharge operation.
+    """
+    omega = 2.0 * math.pi * frequency
+    theta = float(conduction)
+    cx = circuit.scc[coil]
+    ix = circuit.scc_index(coil)
+    resistance = 2.0 * on_resistance
+    samples = np.asarray(t_samples)
+    out = np.full((len(samples), circuit.size), np.nan)
+    state = np.zeros(circuit.size + 2)  # total dissipation and finite on-state conduction loss
+    half_width = 0.5 * (math.pi + theta) if drive == "alternating" else 0.5 * theta
+    centres = (0.0, math.pi) if drive == "alternating" else (math.pi / 2, 3 * math.pi / 2)
+    offset = phase + sync_angle
+    boundaries = {0.0, t_end, *(float(t) for t in breaks if 0 < t < t_end)}
+    for cycle in range(-2, math.ceil(t_end * frequency) + 2):
+        for centre in centres:
+            for edge in (centre - half_width, centre + half_width):
+                at = (offset + edge + 2 * math.pi * cycle) / omega
+                if 0 < at < t_end:
+                    boundaries.add(at)
+    boundaries = sorted(boundaries)
+    size = circuit.size
+    t = 0.0
+    for stop in boundaries[1:]:
+        if stop <= t:
+            continue
+        middle = 0.5 * (t + stop)
+        y = omega * middle - offset
+        gates = tuple(abs((y - centre + math.pi) % (2 * math.pi) - math.pi) < half_width
+                      for centre in centres)
+        if drive == "common":
+            gates = (any(gates),) * 2
+        u1 = u_primary(middle)
+        u2 = u_secondary(middle) if u_secondary is not None else None
+
+        def rhs(at, values):
+            x = values[:size]
+            voltage = u2
+            if V2 is not None:
+                # Invert the finite diode-pair I-V law with its off-state leakage resistor.
+                port_current = circuit.port_current(x, "secondary")
+                leakage_limit = V2 / off_resistance
+                voltage = (-off_resistance * port_current if abs(port_current) <= leakage_limit
+                           else -math.copysign((V2 + resistance * abs(port_current))
+                                             / (1.0 + resistance / off_resistance), port_current))
+            derivative = circuit.derivative(x, u1, voltage)
+            v = x[ix]
+            current = (gates[0] * max(v, 0.0) + gates[1] * min(v, 0.0)) / resistance
+            coil_current = cx * derivative[ix]
+            conduction_loss = resistance * coil_current * coil_current if current != 0.0 else 0.0
+            derivative[ix] -= current / cx
+            return [*derivative, resistance * current * current, conduction_loss]
+
+        solution = solve_ivp(rhs, (t, stop), state, method="Radau", rtol=rtol, atol=atol,
+                             max_step=max_step, dense_output=True)
+        if not solution.success:
+            raise RuntimeError(solution.message)
+        keep = (samples >= t) & (samples <= stop)
+        if keep.any():
+            out[keep] = solution.sol(samples[keep]).T[:, :size]
+        state = solution.y[:, -1].copy()
+        t = stop
+    return out, state[size], state[size + 1]

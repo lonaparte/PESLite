@@ -50,20 +50,38 @@ def _table(path):
         return keys, np.array([[float(row[key]) for key in keys] for row in reader])
 
 
-def _compare_run(p, binary, changes, directory, *, rtol=3e-6, atol=3e-5):
+def _compare_run(p, binary, changes, directory, *, rtol=3e-6, atol=3e-5, parts=None):
     native, python = directory / "native", directory / "python"
     args = [str(binary), "--out", str(native)]
     for key, value in changes.items():
         args.extend(["--set", f"{key}={value}"])
     subprocess.run(args, check=True, capture_output=True, text=True)
     expected = p.replace(**changes)
-    peslite.Simulation(expected).run(out_dir=python)
+    simulation = peslite.Simulation(expected, parts=parts)
+    simulation.run(out_dir=python)
     filenames = ("states.csv", "energy.csv") if p.simulation.energy_check != "off" else ("states.csv",)
     for filename in filenames:
         keys, actual = _table(native / filename)
         expected_keys, reference = _table(python / filename)
         assert keys == expected_keys
-        np.testing.assert_allclose(actual, reference, rtol=rtol, atol=atol)
+        if filename == "states.csv":
+            for index, name in enumerate(keys):
+                if name in simulation._states.angle_names:
+                    actual[:, index] = reference[:, index] + (
+                        actual[:, index] - reference[:, index] + np.pi) % (2 * np.pi) - np.pi
+        compared = list(range(len(keys)))
+        if filename == "energy.csv":
+            # Conservation residuals are zero identities. Compare them against the circuit's
+            # power flow: iterative algebraic solves and direct elimination leave different
+            # small residuals even when their physical states agree.
+            residuals = [i for i, key in enumerate(keys)
+                         if key in ("tellegen_W", "balance_residual_W")]
+            watts = [i for i, key in enumerate(keys) if key.endswith("_W")]
+            scale = np.maximum(1.0, np.max(np.abs(reference[:, watts]), axis=1))[:, None]
+            np.testing.assert_allclose(actual[:, residuals] / scale, reference[:, residuals] / scale,
+                                       rtol=rtol, atol=rtol)
+            compared = [i for i in compared if i not in residuals]
+        np.testing.assert_allclose(actual[:, compared], reference[:, compared], rtol=rtol, atol=atol)
     assert _written_out(peslite.load(native / "simulation.pes")) == _written_out(expected)
 
 

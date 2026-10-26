@@ -39,6 +39,11 @@ class ConfigError(ValueError):
     """Invalid model or solver configuration."""
 
 
+def commutation_tolerance(t: float) -> float:
+    """Absolute time resolution shared by commutation owners and their dispatcher."""
+    return 1e-15 * max(1.0, abs(t))
+
+
 class LocatedZero:
     """The sign of a signal (a current) between its exactly located zeros.
 
@@ -64,14 +69,17 @@ class LocatedZero:
 
     def locate(self, value: float, sign: float) -> None:
         """Record a located zero with residual ``value``; the signal continues with ``sign``."""
-        self.residual = float(value)
-        self.sign = float(sign)
+        self.residual = _real(value)
+        self.sign = _real(sign)
 
 
 def _real(value):
     """Normalize scalar numbers while preserving their arithmetic semantics."""
     if hasattr(value, "item"):
-        value = value.item()
+        scalar = value.item()
+        if scalar is value:
+            return scalar
+        value = scalar
     return value if isinstance(value, numbers.Real) else float(value)
 
 
@@ -278,6 +286,16 @@ class StateRegistry:
             for state in group.states:
                 if state.local_name in declared or isinstance(values[state.local_name], (bool, int)):
                     names.add(state.name)
+        return frozenset(names)
+
+    @property
+    def angle_names(self) -> frozenset[str]:
+        """States an owner declares as angles (rad) in ``angle_state_names``: compared and
+        differenced modulo a turn by post-run loop maps."""
+        names = set()
+        for group in self._groups:
+            declared = set(getattr(group.part, "angle_state_names", ()))
+            names.update(state.name for state in group.states if state.local_name in declared)
         return frozenset(names)
 
     @property

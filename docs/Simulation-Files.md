@@ -76,7 +76,8 @@ units:
 ```
 
 `ctrl.type` selects the controller architecture: its reference schema, public ports and default
-wiring. Built-in architectures include `gfl`, `gfm`, scalar `dc` and `resonant`; a custom graph can
+wiring. Built-in architectures include `gfl`, `gfm`, scalar `dc`, `resonant` and
+`phase_shift`; a custom graph can
 override loop connections and controller outputs explicitly. Normally, each key under `ctrl.loops`
 is the registered loop class name and also its graph-node name; no duplicate `type` field is
 needed. PESLite builds only nodes that can reach a controller output through the connection graph.
@@ -139,6 +140,44 @@ units:
       secondary_capacitance: 35.07e-9
 ```
 
+### Phase-shift bridges
+
+`ctrl.type: phase_shift` drives a child's full bridge with square-wave pulses (see
+[Converter and Bridge Models](Converter-and-Bridge-Models.md#phase-shift-square-wave-modulation)).
+Its references are `width` (pulse width in half periods, [0, 1]), `frequency` (Hz), `phase` (rad),
+`mode` (0, 1, 3 or 4; default 0) and the signed `power` reference in watts. The
+`PhaseShiftModulation` loop passes them to the registers, scaling `width` by the start-up ramp;
+feedback loops drive its inputs through `ctrl.connections`. `pwm.f_sw` sets the control and
+register-load clock; `bridge.model` must be `switching`.
+
+```yaml
+    primary:
+      type: dc_converter
+      dclink: {vdc_ref: 400.0, source: {type: voltage}}
+      pwm: {f_sw: 85000.0, pattern_sync: pulse}
+      ctrl:
+        type: phase_shift
+        computation: 0.0
+        loops:
+          PhaseShiftModulation: {}
+        references: {width: 0.8, frequency: 85000.0, phase: 0.0}
+```
+
+The scalar feedback loops share one law, `command = feedforward + PI(reference - measured)` with
+the common limiter and anti-windup. Each class pairs one measured port (`power` in W, `voltage` in
+V, `current` in A, read from `meas.power`, `meas.voltage` or `meas.current`) with one command
+(`modulation`, also used for a phase-shift `width`; `phase` in rad; `frequency` in Hz); an optional
+`<measured>_filter` (`enable`, `bandwidth`) filters the measured value:
+
+| Measured | `modulation` | `phase` | `frequency` |
+|---|---|---|---|
+| power | `PowerControl` | `PhasePowerControl` | `FrequencyPowerControl` |
+| voltage | `VoltageControl` | `PhaseVoltageControl` | `FrequencyVoltageControl` |
+| current | `CurrentControl` | `PhaseCurrentControl` | `FrequencyCurrentControl` |
+
+A phase command limits the translated coordinate `phase - minimum`, so an all-negative phase range
+is valid. A frequency command needs `minimum > 0`: it is also the loop's initial output.
+
 ### Compensated links
 
 All link types are configurations of one compensated-link model: coupled coils, each with a series
@@ -159,6 +198,52 @@ select them (for example `charger.link.u_secondary_cap`). The link signals are t
 currents `i_primary`/`i_secondary`, the summed coil currents `i_primary_coil`/`i_secondary_coil`
 and, for `ss_multi`, each coil current `i_primary_coil_k`/`i_secondary_coil_k`. All declared
 compensation-capacitor voltages are also published with their ordinary link output names.
+
+### Switch-controlled capacitors
+
+`ss`, `lcc` and `lcc_s` links accept `primary_scc` and `secondary_scc`: a capacitor in series with
+that side's coil, shunted by two source-to-source MOSFETs with body diodes. The gate drive and
+the electrical conduction state are separate: a single gated MOSFET allows current in one
+direction through the other device's body diode. Both gates on allow either direction; both
+off block either direction. Actual conduction follows the capacitor voltage and coil current.
+
+| Field | Meaning |
+|---|---|
+| `capacitance` | switched capacitance (F) |
+| `angle` | nominal conduction angle in [0, pi] (not set with `command`) |
+| `drive` | `common` (default): identical gate pulses, centred at pi/2 modulo pi, of width `angle`; `alternating`: two gate pulses centred at 0 and pi, each of width `pi + angle`, whose overlap is `angle` |
+| `sync` | `current` (default): phase from located coil-current zeros and the measured half period; `bridge`: follow the same-side PWM phase clock |
+| `sync_angle` | rad, phase offset from the bridge's pulse centre (`sync: bridge`) |
+| `command` | take the angle from controller output `scc_angle` (`ctrl.outputs.scc_angle`), through the same-side bridge's ordinary registers |
+
+```yaml
+    link:
+      type: ss
+      # ... coil and capacitor fields ...
+      primary_scc: {capacitance: 120.0e-9, angle: 1.5, drive: alternating, sync: bridge,
+                    sync_angle: 1.5708}
+```
+
+`sync: bridge` follows the bridge's existing phase clock and active phase register. A phase or
+frequency change immediately updates the gate schedule. `command` uses the active `scc_angle`
+register, with the ordinary shadow/active path and computation delay; optional carried registers
+do not become extra switching legs. `sync: current` accepts every located current zero, measures
+the interval between successive zeros, and latches the angle there. Phase-dependent pulses wait
+until two crossings establish that interval; constant gate commands need no phase acquisition.
+There is no fixed-period debounce or restriction on diode
+conduction to the overlap of the gates.
+
+With `drive: common`, `angle: 0` keeps the capacitor in circuit and `pi` bypasses it. With
+`drive: alternating`, complementary gates at zero angle still permit body-diode conduction;
+their actual effect depends on the waveform. At pi both gates stay on.
+
+The switch and clock state (`<link>.<side>_scc.*`) is restored on continuation. Current-synchronised
+clock memory remains part of the small-signal coordinates. The capacitor voltage `u_<side>_scc`
+and switch state `<side>_scc_on` are link signals. The summary counts `switchings` and
+`hard_turn_ons` (actual clamping with a residual voltage above the 1 nV zero tolerance) and reports
+`max_turn_on_voltage` and `turn_on_energy`; the energy table adds the cumulative discharge loss
+`<link>.dissipated_impulsive_J`. Python and standalone C++ use the same component equations and
+commutation protocol, including named-state continuation and parameter overrides.
 
 ### Diode full-bridge rectifiers
 

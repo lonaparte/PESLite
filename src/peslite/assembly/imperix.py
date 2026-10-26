@@ -277,6 +277,13 @@ def _bindings(simulation, config, model, *, events=None):
     for name, unit in units.items():
         if unit.continuous:
             raise TypeError(f"{name}: Imperix requires a supported sampled control graph")
+        if unit.cfg.pwm.pattern_sync == "pulse":
+            raise TypeError(f"{name}: the Imperix hardware PWM adapter does not implement "
+                            "complete-pulse updates")
+        names = unit.bridge.register_names[:unit.bridge.modulation_width]
+        if names != unit.bridge.topology.duty_names:
+            raise ValueError(f"Imperix export currently binds duty registers; {name!r} uses "
+                             f"{names}. Its hardware modulation adapter is not implemented")
         _controller_implementation(unit.ctrl, "__call__", "command")
     timing = _timing(units, config)
     period, sampling_period = timing["interrupt_period"], timing["sampling_period"]
@@ -552,6 +559,9 @@ def _export_imperix(simulation, out_dir, name, variables, reusable, *,
     """Generate Imperix ELF sources and optionally build the executable with the configured SDK."""
     if not simulation._rebuildable:
         raise TypeError("Imperix export cannot reconstruct supplied instances; use parts factories")
+    from .conduction import DiodeConduction
+    if DiodeConduction(simulation.system.model).commutating:
+        raise ValueError("Imperix hardware adapters do not implement plant commutations")
     if not name or name in (".", "..") or any(char in name for char in "/\\"):
         raise ValueError("Imperix export name must be a single filename stem")
     if target_config is None:
