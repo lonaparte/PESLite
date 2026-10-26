@@ -28,8 +28,8 @@ from numpy.typing import NDArray
 
 from . import energy as _energy
 
-__all__ = ["ConfigError", "Bag", "Empty", "OutputMethod", "Subsystem", "Model", "GroupPlan",
-           "Stateful", "StateRegistry", "join", "gather", "scatter", "flatten", "resolve",
+__all__ = ["ConfigError", "LocatedZero", "Bag", "Empty", "OutputMethod", "Subsystem", "Model",
+           "GroupPlan", "Stateful", "StateRegistry", "join", "gather", "scatter", "flatten", "resolve",
            "expand_aliases", "assign"]
 
 
@@ -37,6 +37,35 @@ __all__ = ["ConfigError", "Bag", "Empty", "OutputMethod", "Subsystem", "Model", 
 
 class ConfigError(ValueError):
     """Invalid model or solver configuration."""
+
+
+class LocatedZero:
+    """The sign of a signal (a current) between its exactly located zeros.
+
+    Values are compared with the *residual* the signal had at its last located zero, not with
+    zero, so the solver's residual at that instant does not register as another crossing.
+    ``sign`` is +1 or -1 while the signal keeps that sign and 0 while it is held at its zero.
+    """
+
+    __slots__ = ("sign", "residual")
+
+    def __init__(self, sign: float = 0.0, residual: float = 0.0) -> None:
+        self.sign = float(sign)
+        self.residual = float(residual)
+
+    def offset(self, value: float) -> float:
+        return value - self.residual
+
+    def margin(self, value: float, tolerance: float = 0.0) -> float:
+        """Nonnegative while ``value`` keeps ``sign``, or (sign 0) stays within ``tolerance`` of
+        its located zero."""
+        offset = value - self.residual
+        return self.sign * offset if self.sign else tolerance - abs(offset)
+
+    def locate(self, value: float, sign: float) -> None:
+        """Record a located zero with residual ``value``; the signal continues with ``sign``."""
+        self.residual = float(value)
+        self.sign = float(sign)
 
 
 def _real(value):
@@ -101,7 +130,9 @@ class Subsystem(Protocol):
     ``outputs_need_inputs``: whether ``set_outputs`` reads ``inp``; optional ``output_stages``
     (tuple of :class:`OutputMethod`) replaces ``set_outputs``. A subsystem may declare real-state
     unilateral constraints as ``state_bounds = {name: (lower, upper)}``, using ``None`` for an
-    open side.
+    open side. An optional ``project_state()`` enforces coupled constraints on the component's
+    own state. The host applies projections after integration and when preparing audit states;
+    they must be idempotent and must not change other components or discrete modes.
     ``out`` and connected ``inp`` fields are current when ``rhs`` runs.
     """
 
@@ -899,6 +930,8 @@ class Model:
                     )
                 bounds.append((entry[0], lower, upper))
         self._state_bounds = tuple(bounds)
+        self._state_projections = tuple(sub.project_state for sub in self.subsystems
+                                        if callable(getattr(sub, "project_state", None)))
         # stateful subsystems with complex flags, in vector order
         self._rhs_flags = tuple((sub, tuple(is_c for _idx, is_c in entries))
                                 for sub, entries in rhs_layout if entries)
@@ -1283,16 +1316,21 @@ class Model:
 
     @property
     def has_state_bounds(self) -> bool:
-        """Whether any subsystem declares a real-state constraint."""
-        return bool(self._state_bounds)
+        """Whether any subsystem declares bounds or a state projection."""
+        return bool(self._state_bounds or self._state_projections)
 
     def project_states(self, y: NDArray[np.float64]) -> NDArray[np.float64]:
-        """Project declared real-state bounds in place and return ``y``."""
+        """Apply declared bounds and component-owned state constraints in place."""
         for index, lower, upper in self._state_bounds:
             if lower is not None and y[index] < lower:
                 y[index] = lower
             elif upper is not None and y[index] > upper:
                 y[index] = upper
+        if self._state_projections:
+            self.set_states(y)
+            for project in self._state_projections:
+                project()
+            y[:] = self.get_initial_values()
         return y
 
     def state_labels(self) -> list[str]:

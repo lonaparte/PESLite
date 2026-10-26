@@ -10,8 +10,31 @@ import peslite
 from conftest import EXAMPLES
 from peslite.assembly import Event, register_event_type
 from peslite.assembly.params import ConfigError, _unit_leaves, from_dict, read_tree, to_dict
-from peslite.components import LCCLink, SSLink
+from peslite.components import CompensatedLink
 from peslite.control import GraphController, ResonantModulation
+
+
+def test_link_templates_share_only_layout_and_release_their_instances():
+    import dataclasses
+    import gc
+    import weakref
+    from peslite.components.wpt import make_wpt_link
+
+    cfg = _short().unit("charger").link
+    first = make_wpt_link(cfg)
+    second = make_wpt_link(dataclasses.replace(cfg, mutual_inductance=-0.5 * cfg.mutual_inductance))
+    assert first.rhs.__func__ is second.rhs.__func__
+    for link in (first, second):
+        link.state.i_mode_1 = 0.2
+        link.state.i_mode_2 = -0.1
+        link.inp.u_primary = 10.0
+        link.inp.u_secondary = -5.0
+    assert not np.allclose(first.rhs(0.0), second.rhs(0.0))
+    assert not hasattr(first, "_hold_weights")
+    reference = weakref.ref(first)
+    del first
+    gc.collect()
+    assert reference() is None
 
 
 @register_event_type
@@ -93,7 +116,8 @@ def test_wpt_assembly_flattens_only_once_and_shares_one_link():
     subsystems = dict(zip(simulation.system.model.names, simulation.system.model.subsystems))
 
     assert tuple(simulation.units) == ("charger.primary", "charger.secondary")
-    assert isinstance(subsystems["charger.link"], SSLink)
+    assert isinstance(subsystems["charger.link"], CompensatedLink)
+    assert not any(side.lcc for side in subsystems["charger.link"].sides.values())
     assert "charger" not in simulation.units
     link = subsystems["charger.link"]
     for side, unit in (("primary", simulation.units["charger.primary"]),
@@ -247,7 +271,8 @@ def test_lcc_link_uses_the_same_composite_assembly_path():
     simulation = peslite.Simulation(_short(tree))
     subsystems = dict(zip(simulation.system.model.names, simulation.system.model.subsystems))
 
-    assert isinstance(subsystems["charger.link"], LCCLink)
+    assert isinstance(subsystems["charger.link"], CompensatedLink)
+    assert all(side.lcc for side in subsystems["charger.link"].sides.values())
     assert not simulation.energy_problems
     result = simulation.run(out_dir=None)
     assert result.summary["t_stop"] == pytest.approx(20.0e-6)
@@ -261,12 +286,25 @@ def test_wpt_rejects_parameters_in_the_wrong_scope():
         from_dict(tree)
 
 
-def test_directly_connected_dc_converter_requires_a_composite_parent():
+def test_dc_converter_requires_a_connected_power_terminal():
     tree = _tree()
     tree["units"] = {"port": tree["units"]["charger"]["primary"]}
 
-    with pytest.raises(ConfigError, match="unknown bus None|standalone DC converter"):
-        from_dict(tree)
+    params = from_dict(tree)
+    with pytest.raises(ConfigError, match="no attached terminal"):
+        peslite.Simulation(params)
+
+
+def test_scalar_converter_connects_a_registered_load_without_a_composite():
+    tree = _tree()
+    tree["units"] = {"port": tree["units"]["charger"]["primary"]}
+    tree["elements"] = {"load": {"type": "load", "bus": "port.power", "l": 1e-3, "r": 20.0}}
+    tree["simulation"]["t_end"] = 20e-6
+    tree["simulation"]["output"].update(states=False, signals=False, energy=False)
+    sim = peslite.Simulation(from_dict(tree))
+    result = sim.run(out_dir=None)
+    assert result.summary["t_stop"] == pytest.approx(20e-6)
+    assert abs(result.final_states()["load.branch.i"]) > 0.0
 
 
 def test_wpt_tree_round_trips_without_losing_child_unit_types():

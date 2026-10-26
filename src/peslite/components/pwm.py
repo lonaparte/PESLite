@@ -311,6 +311,25 @@ class CarrierComparison:
         self.phase = _real(phase)
         self.min_interval = min_interval
 
+    @staticmethod
+    def state_fractions(duties):
+        """Integrate a complete common-carrier cycle without allocating a timer or events.
+
+        Sorting duty thresholds gives at most n+1 states instead of enumerating 2**n gate
+        combinations. Scalar operations retain parameter expressions for standalone export.
+        """
+        ordered = list(duties)
+        for end in range(len(ordered) - 1, 0, -1):
+            for index in range(end):
+                first, second = ordered[index:index + 2]
+                ordered[index] = np.minimum(first, second).item()
+                ordered[index + 1] = np.maximum(first, second).item()
+        bounds = (0.0, *ordered, 1.0)
+        return tuple((upper - lower,
+                      tuple(np.where(value > 0.5 * (lower + upper), 1.0, 0.0).item()
+                            for value in duties))
+                     for lower, upper in zip(bounds[:-1], bounds[1:]))
+
     def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence:
         m = np.clip(2.0 * np.asarray(d_abc, dtype=float) - 1.0, -1.0, 1.0).tolist()

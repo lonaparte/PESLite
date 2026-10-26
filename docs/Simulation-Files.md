@@ -100,11 +100,10 @@ attach through the child's own assembly boundary. The WPT exposes `primary` and 
 ports and explicitly selects `primary` as its default port. Composite event parameters and shared
 subsystem ratings therefore inherit the primary port unless another port is selected. The bundled
 open-loop example selects a full bridge and `ResonantModulation` for each child; neither choice
-creates a separate converter class. `link.type` selects series-series (`ss`) or LCC-LCC (`lcc`)
-compensation. `wpt-ss-example` and `wpt-lcc-example` connect ordinary power-feedback loops to the
-same modulation inputs. The `resonant` profile's `references.power` is signed watts; `modulation`,
-`frequency` and `phase` remain amplitude, hertz and radians. The complete runnable schemas are
-shown in [Examples](Examples.md#wpt-power-feedback).
+creates a separate converter class. `wpt-ss-example` and `wpt-lcc-example` connect ordinary
+power-feedback loops to the same modulation inputs. The `resonant` profile's `references.power`
+is signed watts; `modulation`, `frequency` and `phase` remain amplitude, hertz and radians. The
+complete runnable schemas are shown in [Examples](Examples.md#wpt-power-feedback).
 
 ```yaml
 units:
@@ -139,6 +138,52 @@ units:
       primary_capacitance: 35.07e-9
       secondary_capacitance: 35.07e-9
 ```
+
+### Compensated links
+
+All link types are configurations of one compensated-link model: coupled coils, each with a series
+capacitor and resistance, and per side either *series* compensation (the coils connect to the port)
+or *LCC* compensation (a series compensation inductor from the port to a shunt-capacitor node).
+
+| `link.type` | Primary | Secondary | Fields |
+|---|---|---|---|
+| `ss` | series | series | `primary_/secondary_inductance`, `mutual_inductance`, `primary_/secondary_capacitance`, optional `primary_/secondary_resistance` |
+| `lcc` | LCC | LCC | coil inductances and `mutual_inductance`; per side `*_series_capacitance`, `*_compensation_inductance`, `*_parallel_capacitance`, optional `*_resistance`, `*_compensation_resistance`, `*_parallel_resistance` (ESR of the shunt capacitor) |
+| `lcc_s` | LCC | series | the `lcc` primary fields and `secondary_capacitance`, `secondary_resistance` |
+| `ss_multi` | N series modules | N series modules | `inductance` (symmetric 2N x 2N matrix in the order Tx1..TxN, Rx1..RxN), lists `primary_/secondary_capacitance` and optional `primary_/secondary_resistance` with one value per module |
+
+`mutual_inductance` may be negative; its sign is that of the coupled flux with both currents
+positive into their dotted terminals. The link records its modal currents (`i_mode_k`) and every
+capacitor voltage as states; the capacitor voltages are also link outputs, so `meas.sources` can
+select them (for example `charger.link.u_secondary_cap`). The link signals are the two port
+currents `i_primary`/`i_secondary`, the summed coil currents `i_primary_coil`/`i_secondary_coil`
+and, for `ss_multi`, each coil current `i_primary_coil_k`/`i_secondary_coil_k`. All declared
+compensation-capacitor voltages are also published with their ordinary link output names.
+
+### Diode full-bridge rectifiers
+
+A `full_bridge` with neither device row gated is a diode rectifier. It has no `ctrl` or `pwm`;
+`bridge.model` must be `switching`. For example, a WPT secondary may be configured as:
+
+```yaml
+    secondary:
+      type: dc_converter
+      dclink: {vdc_ref: 300.0, source: {type: voltage}}
+      bridge: {type: full_bridge, upper_controlled: 0, lower_controlled: 0, model: switching}
+```
+
+The diode commutations are located exactly (see
+[Converter and Bridge Models](Converter-and-Bridge-Models.md#diode-full-bridge-rectifier)). Blocking
+uses the connected terminal's zero-current voltage law, available on ordinary R-L branches and
+compensated links. No unit-type or restriction to one rectifying side is imposed.
+`meas` may configure independent sampling, means, RMS and existing physical sources; its
+`period` defaults to the output period when there is no controller.
+Optional `bridge.parallel_capacitance` (F) models the equivalent port capacitance and requires
+positive `bridge.on_resistance` (ohm per device). These fields apply to all bridge structures;
+the device law, capacitor and ordinary DC-network connections determine the charging current.
+A diode full-bridge rectifier accepts no protection criterion (it has no gates to block).
+Without port capacitance, an adaptive solver requires finite `simulation.solver.max_step`:
+it is the interval at which ideal diode commutations are checked.
 
 ## Simulation settings
 

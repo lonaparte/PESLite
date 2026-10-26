@@ -128,15 +128,11 @@ class _WPTSignals:
     def __init__(self, name: str, link: Any) -> None:
         self.name = name
         self.link = link
+        self._outputs = tuple(type(link.out).__slots__)
 
     def signals(self) -> dict[str, float]:
         out = self.link.out
-        return {
-            f"{self.name}.link.i_primary": out.i_primary,
-            f"{self.name}.link.i_secondary": out.i_secondary,
-            f"{self.name}.link.i_primary_coil": out.i_primary_coil,
-            f"{self.name}.link.i_secondary_coil": out.i_secondary_coil,
-        }
+        return {f"{self.name}.link.{name}": getattr(out, name) for name in self._outputs}
 
 
 def _source_scenario(p: Params, name: str) -> SourceScenario:
@@ -289,13 +285,11 @@ def _assemble_wpt(name: str, cfg: Any, system: "System",
         default_port=unit_type(cfg.type).default_port,
     )
     for side in unit_type(cfg.type).children:
-        child_name = f"{name}.{side}"
-        child_cfg = getattr(cfg, side)
-        child = _assemble_unit(child_name, child_cfg, system, parts)
+        child = _assemble_unit(f"{name}.{side}", getattr(cfg, side), system, parts)
         terminal = getattr(link, f"{side}_terminal")
         child.attach(
             terminal,
-            f"units.{child_name}",
+            f"units.{name}.{side}",
             "power" if "power" in child.ports else None,
         )
         assembly.ports[side] = child.port()
@@ -342,12 +336,6 @@ class System:
                           phases=values[0].phases,
                       ), (cfg, base))
                       for name, cfg in p.buses.items()}
-        self.branches = {name: _parameterized(lambda values: RLBranch(
-                             values[0].l,
-                             values[0].r,
-                             phases=values[1],
-                         ), (cfg, p.buses[cfg.bus1].phases))
-                         for name, cfg in p.branches.items()}
         self.sources = {name: _Source(name, p, p.simulation.initial.t) for name in p.sources}
         assembled = _UnitAssembly()
         for name, cfg in p.units.items():
@@ -364,6 +352,15 @@ class System:
             name: [node.terminal] for name, node in self.buses.items()
         }
         network_buses = {**assembled.endpoints, **self.buses}
+        for name, cfg in p.branches.items():
+            if network_buses[cfg.bus1].phases != network_buses[cfg.bus2].phases:
+                raise ConfigError(f"branches.{name}: both buses must have the same phase count")
+        self.branches = {name: _parameterized(lambda values: RLBranch(
+                             values[0].l,
+                             values[0].r,
+                             phases=values[1],
+                         ), (cfg, network_buses[cfg.bus1].phases))
+                         for name, cfg in p.branches.items()}
         self.named_elements = {name: _parameterized(
                                   lambda values, name=name: ELEMENT_TYPES[values[0].type](
                                       name, values[0], network_buses, values[1]), (cfg, p))
@@ -443,6 +440,14 @@ class System:
             ]
             driver.bind_current_sources(current_sources)
             lowered = lowered_buses.setdefault(bus_name, {})
+            if driver.hold_voltage_input is not None:
+                if len(followers) != 1:
+                    raise ConfigError(
+                        f"bus {bus_name!r}: blocking needs one current-owning terminal "
+                        "with a zero-current voltage law")
+                lowered[(driver.subsystem, driver.hold_voltage_input)] = (
+                    followers[0].hold_voltage_source(
+                        getattr(driver.subsystem, "current_constraint", None)))
             if bus_name not in self.buses:
                 lowered[current_target] = current_sources
                 lowered.update(voltage_connections)
@@ -511,7 +516,7 @@ class System:
                 unit.ports.readers[channel] = (
                     lambda sub=subsystem, field=output: getattr(sub.out, field)
                 )
-                if unit.continuous:
+                if unit.continuous and unit.ctrl is not None:
                     if not hasattr(unit.ctrl.inp, channel):
                         raise ConfigError(f"units.{unit.name}.meas.sources.{channel}: "
                                           "controller has no matching continuous input")
@@ -700,7 +705,7 @@ class System:
                         *self.composite_signal_sources, *self.named_elements.values()):
             add(element, element.signals() if hasattr(element, "signals") else {})
         for unit in self.units.values():
-            if unit.cfg.meas.rms:
+            if unit.adc is not None and (unit.adc.clocked or unit.adc.rms):
                 add(unit, unit.measurement_signals())
         for name, branch in self.branches.items():
             add(branch, {f"{name}.i": branch.out.i})

@@ -43,6 +43,7 @@ __all__ = []
 _ZERO_COEFFICIENTS: ContextVar[dict | None] = ContextVar("peslite_cpp_zero_coefficients", default=None)
 _CONDITIONAL_DEPENDENCIES: ContextVar[tuple | None] = ContextVar(
     "peslite_cpp_conditional_dependencies", default=None)
+_SCALAR_TERMS: ContextVar[tuple | None] = ContextVar("peslite_cpp_scalar_terms", default=None)
 
 _MOVING_WINDOW = r'''template <std::size_t N> struct MovingWindow {
     std::array<double, N> buf{};
@@ -238,7 +239,26 @@ class _Expression:
     __array_priority__ = 1000
 
     def __init__(self, code: str, kind: str) -> None:
+        pool = _SCALAR_TERMS.get()
+        if (pool is not None and kind != "bool" and len(code) > 48 and "/" not in code
+                and any(char in code for char in "(+-*?{")):
+            calls = set(re.findall(r"([A-Za-z_]\w*(?:::\w+)*)\s*\(", code))
+            if calls <= {"std::real", "std::imag", "std::conj", "std::abs", "std::min", "std::max"}:
+                prefix, terms, runtime = pool
+                conditional = _CONDITIONAL_DEPENDENCIES.get()
+                pure_parameter = (conditional is not None
+                                  and runtime.parameter_dependencies((code,))[code] is not None)
+                if not pure_parameter and (conditional is None
+                        or not any(fragment in code for fragment in conditional[1])):
+                    if code not in terms:
+                        name = terms[code] = f"{prefix}{len(terms)}"
+                        runtime._expression_dependencies[name] = code
+                    code = terms[code]
         self.code, self.kind = code, kind
+
+    def item(self):
+        """NumPy scalar extraction preserves the already-scalar symbolic expression."""
+        return self
 
     @staticmethod
     def of(value: Any) -> "_Expression":
@@ -277,8 +297,11 @@ class _Expression:
         code = f"(({self.code}) {op} ({right.code}))"
         trace = _CONDITIONAL_DEPENDENCIES.get() if op == "*" else None
         if trace is not None:
-            trace[1][code] = ((self.code, right.code, "0.0"),
-                             (right.code, self.code, "0.0"))
+            candidates = ((self.code, right.code, "0.0"), (right.code, self.code, "0.0"))
+            parameters = trace[0].parameter_dependencies((self.code, right.code))
+            contributions = tuple(item for item in candidates if parameters[item[0]])
+            if contributions:
+                trace[1][code] = contributions
         return _Expression(code, self._result(self, right))
 
     def _rbinary(self, other: Any, op: str) -> "_Expression":
@@ -594,7 +617,8 @@ class _RuntimeParameters:
         self.by_path = {item.path: item for item in self.selected}
         self.guards = {}
         self.initializers = {}
-        self._initializer_expressions = {}
+        self._expression_dependencies = {}
+        self._equation_counter = 0
         self._parameter_dependencies = {}
         self.copies = {}
         self.object_updates = {}
@@ -671,7 +695,7 @@ class _RuntimeParameters:
             return value
         key = value.code, value.kind
         member = self.initializers.setdefault(key, f"initial_{len(self.initializers)}")
-        self._initializer_expressions.setdefault(member, value.code)
+        self._expression_dependencies.setdefault(member, value.code)
         return value.wrap(_Expression(member, value.kind), value.default)
 
     def initialization_members(self):
@@ -684,32 +708,33 @@ class _RuntimeParameters:
         members.update({"given_" + item.member: item.path for item in self.selected if item.derived})
         return members
 
+    def expression_symbols(self, code):
+        """Yield leaf symbols through shared scalar expressions without expanding strings."""
+        seen, pending = set(), [code]
+        while pending:
+            text = pending.pop()
+            for name in re.findall(r"\b[A-Za-z_]\w*(?:::\w+)*\b", text):
+                if name in self._expression_dependencies:
+                    if name not in seen:
+                        seen.add(name)
+                        pending.append(self._expression_dependencies[name])
+                else:
+                    yield name
+
     def parameter_dependencies(self, expressions):
-        """Resolve pure parameter coefficients through the existing initializer DAG.
+        """Resolve pure parameter coefficients through the scalar dependency DAG.
 
         Unknown run-time symbols are rejected rather than treated as constants. No parameter
         values are tried, and cached initializers are visited at most once per expression.
         """
         members = self._parameter_members
-        initializers = self._initializer_expressions
-
         def resolve(code):
-            paths, seen, pending = set(), set(), [code]
-            while pending:
-                text = pending.pop()
-                for token in re.finditer(r"\b[A-Za-z_]\w*\b", text):
-                    name = token[0]
-                    if name in members:
-                        paths.add(members[name])
-                    elif name in initializers:
-                        if name not in seen:
-                            seen.add(name)
-                            pending.append(initializers[name])
-                    elif (name in {"parameters", "std", "true", "false", "Complex"}
-                          or text[max(0, token.start() - 5):token.start()] == "std::"):
-                        continue
-                    else:
-                        return None
+            paths = set()
+            for name in self.expression_symbols(code):
+                if name in members:
+                    paths.add(members[name])
+                elif name not in {"parameters", "true", "false", "Complex"} and not name.startswith("std::"):
+                    return None
             return tuple(sorted(paths))
 
         for code in expressions:
@@ -1150,8 +1175,8 @@ class _ModelGenerator:
         code = f"(({condition.code}) ? ({right.code}) : ({left.code}))"
         trace = _CONDITIONAL_DEPENDENCIES.get()
         if trace is not None and trace[0].parameter_dependencies((condition.code,))[condition.code]:
-            common = (set(re.findall(r"\b\w+\b", left.code))
-                      & set(re.findall(r"\b\w+\b", right.code)))
+            common = (set(trace[0].expression_symbols(left.code))
+                      & set(trace[0].expression_symbols(right.code)))
             # The condition itself and reads shared by both branches remain unconditional.
             replacement = " ".join(sorted(common)) + " " + condition.code
             trace[1][code] = ((condition.code, right.code, replacement),
@@ -1200,6 +1225,10 @@ class _ModelGenerator:
             if record is not None:
                 part = copy.copy(value)
                 part.state = record
+                for role in ("inp", "out"):
+                    inner = getattr(value, role, None)
+                    if inner is not None:
+                        setattr(part, role, records.get(id(inner), copy.copy(inner)))
                 setattr(clone, name, part)
         for name, value in {**self._parameter_attributes.get(id(owner), {}),
                             **(attributes or {})}.items():
@@ -1223,7 +1252,16 @@ class _ModelGenerator:
             self._rebind(method, clone)(_Expression("t", "real"))
             return tuple(getattr(clone.out, field) for field in fields)
 
-        values = self._trace(run)
+        # Share total scalar operations. The same dependency DAG resolves parameter aliases;
+        # conditional parameter terms, guarded divisions and partial functions retain scope.
+        prefix = f"equation_{self.runtime._equation_counter}_"
+        self.runtime._equation_counter += 1
+        terms = {}
+        token = _SCALAR_TERMS.set((prefix, terms, self.runtime))
+        try:
+            values = self._trace(run)
+        finally:
+            _SCALAR_TERMS.reset(token)
         lines: list[str] = []
         for field, value in zip(fields, values):
             original = self.value(owner.out, field)
@@ -1231,7 +1269,13 @@ class _ModelGenerator:
                 lines.append(f"{original} = {value.code};")
         if not lines and fields:
             raise TypeError("output equation did not assign an output field")
-        return lines
+        needed = set(re.findall(rf"\b{prefix}\d+\b", "\n".join(lines)))
+        declarations = []
+        for code, name in reversed(tuple(terms.items())):
+            if name in needed:
+                needed.update(re.findall(rf"\b{prefix}\d+\b", code))
+                declarations.append(f"const auto {name} = {code};")
+        return [*reversed(declarations), *lines]
 
     def trace_rhs(self, sub: Any, method: Any = None,
                   attributes: dict[str, _Expression] | None = None) -> list[str]:
@@ -1552,6 +1596,13 @@ class _ModelGenerator:
                 coefficients.update(required_zeroes)
             return plan
         self._algebraic_plans[key] = None, {}
+        diagnose = bool(self.runtime.selected) and coefficients is None
+        plan = self._assignment_plan(loop, diagnose)
+        self._algebraic_plans[key] = plan, dict(coefficients or {})
+        return plan
+
+    def _assignment_plan(self, loop: Any, diagnose: bool) -> tuple[str, ...] | None:
+        """Order the same scalar assignments for diagnosis and compact code emission."""
         lines = []
         for kind, item in loop.operations:
             if kind == "algebraic":
@@ -1561,7 +1612,7 @@ class _ModelGenerator:
                 if getattr(owner, "cpp_outputs", None) is not None:
                     return None
             # Observe the existing trace once, only for retained-parameter candidate groups.
-            conditional = {} if self.runtime.selected and coefficients is None else None
+            conditional = {} if diagnose else None
             token = _CONDITIONAL_DEPENDENCIES.set(
                 (self.runtime, conditional) if conditional is not None else None)
             try:
@@ -1592,7 +1643,6 @@ class _ModelGenerator:
             if conditional_by_target:
                 self._parameter_dependencies(loop, assignments, conditional_by_target, sorter)
             return None
-        self._algebraic_plans[key] = plan, dict(coefficients or {})
         return plan
 
     def _parameter_dependencies(self, loop, assignments, conditional_by_target, sorter):
@@ -1633,8 +1683,8 @@ class _ModelGenerator:
                     continue
                 for coefficient, signal, replacement in contributions:
                     paths = parameters[coefficient]
-                    dependencies = ((set(re.findall(r"\b\w+\b", signal)) & residual)
-                                    - set(re.findall(r"\b\w+\b", replacement)))
+                    dependencies = ((set(self.runtime.expression_symbols(signal)) & residual)
+                                    - set(self.runtime.expression_symbols(replacement)))
                     if paths and dependencies:
                         conditional.append((fragment, coefficient, paths, dependencies, replacement))
             unguarded = rhs
@@ -4951,6 +5001,19 @@ def _prepare_export(simulation, variables, reusable, *, params=None):
     """Rebuild privately and record the ordinary factories for either C++ target."""
     from ..solver.simulation import Simulation
 
+    from .conduction import DiodeConduction
+
+    model = simulation.system.model
+    commutating = DiodeConduction(model).commutating
+    if commutating:
+        raise ValueError(
+            "C++/Imperix export does not lower exactly located commutations: "
+            f"{sorted(model.name_of(sub) for sub in commutating)}"
+        )
+    if any(unit.ctrl is None for unit in simulation.system.units.values()):
+        raise ValueError("C++/Imperix export does not lower converter units without a controller")
+    if model._state_projections:
+        raise ValueError("C++/Imperix export does not lower component-owned state projections")
     if not simulation._rebuildable:
         raise TypeError(
             "C++ export cannot safely reconstruct supplied instances; use parts factories instead"

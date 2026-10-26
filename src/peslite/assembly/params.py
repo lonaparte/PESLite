@@ -39,7 +39,8 @@ __all__ = [
     "FilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams",
     "MeasurementParams", "ReferenceParams", "ControlParams", "OvercurrentParams", "VoltageLimitParams",
     "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
-    "BridgeParams", "SSLinkParams", "LCCLinkParams", "UnitParams",
+    "BridgeParams", "SSLinkParams", "LCCLinkParams", "LCCSLinkParams", "MultiSSLinkParams",
+    "UnitParams",
     "RUNTIME", "Change", "runtime_changeable", "event_changes",
     "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "ProgressParams",
     "MetaParams", "Params",
@@ -477,12 +478,15 @@ class ProtectionParams:
 class BridgeParams:
     """Bridge model used by one unit.
 
-    ``"switching"`` follows the exact carrier-comparison edges. ``"pwm_averaging"`` keeps the
+    ``"switching"`` follows exact carrier-comparison edges or, for a diode full-bridge rectifier,
+    exactly located diode commutations. ``"pwm_averaging"`` keeps the
     PWM timer, duty registers and load timing but applies each active duty ratio continuously until
     the next compare-register load. ``"averaging"`` is an ideal controlled voltage source driven
     by continuous measurement and control equations, with no ADC, interrupt, computation or PWM
     events. For a unilateral half bridge, ``pwm.f_sw`` still defines the physical cycle used by
     the averaged DCM conduction law; it does not schedule carrier events.
+    Optional device resistance and port capacitance use the same topology and execution form;
+    nonzero capacitance requires positive device resistance.
     """
 
     model: str = "pwm_averaging"
@@ -491,11 +495,18 @@ class BridgeParams:
     lower_controlled: bool = True
     reverse_port: bool = False
     external_terminal: str = "midpoint"
+    on_resistance: float = 0.0  # ohm, per conducting switch or diode
+    parallel_capacitance: float = 0.0  # F, across the power port (per phase for three phases)
 
     _choices = {
         "model": ("switching", "pwm_averaging", "averaging"),
         "external_terminal": ("midpoint", "lower_rail"),
     }
+
+    @property
+    def controlled(self) -> bool:
+        """Whether any device is gated; otherwise the full bridge is a diode rectifier."""
+        return self.upper_controlled or self.lower_controlled
 
 
 @dataclass(frozen=True, init=False)
@@ -503,7 +514,7 @@ class UnitParams:
     """Common converter-unit parameters plus one ``type``-selected field set."""
 
     type: str
-    pwm: Optional[PWMParams] = field(default=None, metadata={"required": True})
+    pwm: Optional[PWMParams] = None
     ctrl: Optional[ControlParams] = None
     dclink: Optional[DCLinkParams] = field(default=None, metadata={"required": True})
     bus: Optional[str] = None
@@ -567,34 +578,28 @@ class UnitParams:
         return base, base.parameter_scales(float(voltage))
 
     def resolved(self, system_base: BaseValues, events: tuple = ()) -> "UnitParams":
-        if unit_type(self.type).composite:
-            unit = replace(self)
-            base = system_base if self.s_base is None else BaseValues(
-                self.s_base, system_base.v_ll_rms, system_base.f0,
-            )
-            object.__setattr__(unit, "base", base)
-            object.__setattr__(unit, "events", tuple(events))
-            return unit
-        assert self.ctrl is not None and self.pwm is not None and self.bridge is not None
         derived = set()
         ctrl = self.ctrl
-        continuous = self.bridge.model == "averaging"
-        if not continuous and ctrl.period is None:
-            ctrl = replace(ctrl, period=self.pwm.switching_period)
-            derived.add("ctrl.period")
-        if not continuous and ctrl.computation is None:
-            ctrl = replace(ctrl, computation=1.0e-6)
-            derived.add("ctrl.computation")
-        if unit_type(self.type).defaults_grid_frequency and ctrl.references.omega is None:
-            references = replace(ctrl.references, omega=system_base.w0)
-            ctrl = replace(ctrl, references=references)
-            derived.add("ctrl.references.omega")
-        loops = dict(ctrl.loops)
-        for name, loop in loops.items():
-            if not continuous and loop.period is None:
-                loops[name] = replace(loop, period=ctrl.period)
-                derived.add(f"ctrl.loops.{name}.period")
-        unit = replace(self, ctrl=replace(ctrl, loops=loops))
+        if ctrl is not None:
+            assert self.pwm is not None and self.bridge is not None
+            continuous = self.bridge.model == "averaging"
+            if not continuous and ctrl.period is None:
+                ctrl = replace(ctrl, period=self.pwm.switching_period)
+                derived.add("ctrl.period")
+            if not continuous and ctrl.computation is None:
+                ctrl = replace(ctrl, computation=1.0e-6)
+                derived.add("ctrl.computation")
+            if unit_type(self.type).defaults_grid_frequency and ctrl.references.omega is None:
+                references = replace(ctrl.references, omega=system_base.w0)
+                ctrl = replace(ctrl, references=references)
+                derived.add("ctrl.references.omega")
+            loops = dict(ctrl.loops)
+            for name, loop in loops.items():
+                if not continuous and loop.period is None:
+                    loops[name] = replace(loop, period=ctrl.period)
+                    derived.add(f"ctrl.loops.{name}.period")
+            ctrl = replace(ctrl, loops=loops)
+        unit = replace(self, ctrl=ctrl)
         base = system_base if self.s_base is None else BaseValues(
             self.s_base, system_base.v_ll_rms, system_base.f0,
         )
@@ -716,8 +721,60 @@ class LCCLinkParams:
     secondary_resistance: float = 0.0
     primary_compensation_resistance: float = 0.0
     secondary_compensation_resistance: float = 0.0
+    primary_parallel_resistance: float = 0.0  # ESR in series with the shunt capacitor
+    secondary_parallel_resistance: float = 0.0
 
     _choices = {"type": ("lcc",)}
+
+
+@dataclass(frozen=True, kw_only=True)
+class LCCSLinkParams:
+    """LCC-compensated primary and series-compensated secondary of a two-winding link (SI).
+
+    The primary port has a series compensation inductor, a shunt capacitor (optional ESR) and a
+    series coil capacitor; the secondary coil has a series capacitor only.
+    """
+
+    type: str = "lcc_s"
+    primary_inductance: float
+    secondary_inductance: float
+    mutual_inductance: float
+    primary_series_capacitance: float
+    primary_compensation_inductance: float
+    primary_parallel_capacitance: float
+    secondary_capacitance: float
+    primary_resistance: float = 0.0
+    secondary_resistance: float = 0.0
+    primary_compensation_resistance: float = 0.0
+    primary_parallel_resistance: float = 0.0
+
+    _choices = {"type": ("lcc_s",)}
+
+
+@dataclass(frozen=True, kw_only=True)
+class MultiSSLinkParams:
+    """N series-series modules with inter- and cross-coupling, in SI units.
+
+    ``inductance`` is the symmetric 2N x 2N inductance matrix of the coils in the order
+    Tx1..TxN, Rx1..RxN. Every Tx coil (with its series capacitor and resistance) connects in
+    parallel to the primary port, every Rx coil to the secondary port.
+    """
+
+    type: str = "ss_multi"
+    inductance: list
+    primary_capacitance: list
+    secondary_capacitance: list
+    primary_resistance: Optional[list] = None  # default: zero per module
+    secondary_resistance: Optional[list] = None
+
+    _choices = {"type": ("ss_multi",)}
+
+    def __post_init__(self) -> None:
+        modules = len(self.primary_capacitance) if isinstance(
+            self.primary_capacitance, (list, tuple)) else 0
+        for name in ("primary_resistance", "secondary_resistance"):
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, [0.0] * modules)
 
 
 @dataclass(frozen=True)
@@ -726,7 +783,9 @@ class _WPTUnitFields:
 
     primary: Any = field(metadata={"unit": True})
     secondary: Any = field(metadata={"unit": True})
-    link: Any = field(metadata={"types": {"ss": SSLinkParams, "lcc": LCCLinkParams}})
+    link: Any = field(metadata={"types": {"ss": SSLinkParams, "lcc": LCCLinkParams,
+                                          "lcc_s": LCCSLinkParams,
+                                          "ss_multi": MultiSSLinkParams}})
 
 
 # ------------------------------------------------------------------ the run
@@ -1109,6 +1168,22 @@ def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
         unit_scales,
         names=common_names,
     )
+    # Device-only conduction has no controller or PWM peripheral.
+    diode_rectifier = not spec.composite and not common["bridge"].controlled
+    if diode_rectifier:
+        if common["bridge"].type is None:
+            raise ConfigError(
+                f"{path}.bridge.type: required when no devices are controlled"
+            )
+        from ..components.converter import make_topology
+        topology = make_topology(common["bridge"])
+        if not callable(getattr(topology, "initialize_model", None)):
+            raise ConfigError(f"{path}.bridge: the selected topology has no natural-conduction model")
+        for name in ("ctrl", "pwm"):
+            if data.get(name) is not None:
+                raise ConfigError(f"{path}.{name}: a diode full-bridge rectifier has no {name}")
+    elif "pwm" in common_names and common.get("pwm") is None:
+        raise ConfigError(f"{path}.pwm: required value missing")
     unit_fields = _build(
         unit_fields_cls,
         {name: data[name] for name in unit_field_names if name in data},
@@ -1116,7 +1191,7 @@ def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
         unit_base,
         unit_scales,
     )
-    if not spec.composite:
+    if not spec.composite and not diode_rectifier:
         control = _build_control_params(
             data.get("ctrl"), f"{path}.ctrl", unit_base, unit_scales, kind
         )
@@ -1627,7 +1702,7 @@ def _written_out(p: Params) -> dict:
             unit = unit[key]
         if unit["s_base"] is None:
             unit["s_base"] = u.base.s_base
-        if "meas" in unit:
+        if "meas" in unit and u.ctrl is not None:
             meas = unit["meas"]
             if meas["period"] is None:
                 meas["period"] = u.ctrl.period

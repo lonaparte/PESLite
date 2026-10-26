@@ -92,6 +92,15 @@ class EnergySpec:
         return self.kind in ("declared", "default")
 
 
+def _power_law(sub: Any, name: str):
+    """Read the configured method, including equations bound to an individual component."""
+    method = getattr(sub, name)
+    implementation = getattr(method, "__func__", None)
+    if implementation is not None:
+        return implementation
+    return lambda owner: getattr(owner, name)()
+
+
 def spec_of(sub: Any) -> EnergySpec:
     """The effective declaration of a subsystem (explicit, or the default).
 
@@ -103,7 +112,7 @@ def spec_of(sub: Any) -> EnergySpec:
         return EnergySpec("dirac")
     if isinstance(sub, Energetic):
         return EnergySpec("declared", tuple(getattr(sub, "storage", ())), tuple(getattr(sub, "ports", ())),
-                          type(sub).dissipated_power, type(sub).supplied_power,
+                          _power_law(sub, "dissipated_power"), _power_law(sub, "supplied_power"),
                           has_source=bool(getattr(sub, "has_source", False)))
     return EnergySpec("default", (), (), lambda sub: 0.0, lambda sub: 0.0, has_source=True)
 

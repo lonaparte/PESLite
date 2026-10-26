@@ -146,7 +146,7 @@ class ADC:
     def __init__(self, ports: MeasurementPorts, period: float, sample_period: float,
                  length: Optional[float] = None,
                  channels: Mapping[str, complex | float] | None = None,
-                 rms: Mapping[str, float] | None = None) -> None:
+                 rms: Mapping[str, float] | None = None, *, clocked: bool = False) -> None:
         self.ports = ports
         channels = dict(channels or {})
         if channels and (length is None or length <= 0.0):
@@ -160,6 +160,9 @@ class ADC:
         self.samples = max(1, int(round(period / sample_period)))
         self.peeks: list[ADCSample] = []  # instantaneous samples since the last interrupt
         self.n_samp = 1  # sample 0 of a period is its control interrupt
+        self.clocked = clocked
+        self._clock_index = 0
+        self.values = ports.read() if clocked else {}
         # the next interrupt's window is open (a full-period window opens at the interrupt itself)
         self.window_open = self.length is None or self._full
         self.rms = {channel: _RMSWindow(period, window)
@@ -172,6 +175,11 @@ class ADC:
     @property
     def accumulating(self) -> bool:
         return self.averaging or bool(self.rms)
+
+    @property
+    def means(self) -> dict[str, complex | float]:
+        """The mean channels of the same held sample, without a second value store."""
+        return {channel: self.values[channel] for channel in self.channels} if self.clocked else {}
 
     @property
     def periods(self) -> tuple[float, ...]:
@@ -203,7 +211,8 @@ class ADC:
     def averaging(self) -> bool:
         return bool(self.channels)
 
-    def start(self, t: float, last: float, next_: float, held: bool) -> None:
+    def start(self, t: float, last: float | None = None, next_: float | None = None,
+              held: bool = False) -> None:
         """Resume sampling at ``t`` between the interrupts ``last`` and ``next_``.
 
         ADC integrals are named states, while the position of the sampler and whether the next
@@ -212,6 +221,13 @@ class ADC:
         run only at an interrupt.  For a new run, ``held`` makes a window which began before
         ``t`` count the value at ``t`` over that preceding part.
         """
+        if self.clocked:
+            self._clock_index = (int(math.ceil((t - TIME_EPS) / self.period)) if held else
+                                 int(math.floor((t + TIME_EPS) / self.period)) + 1)
+            next_ = self._clock_index * self.period
+            last = next_ - self.period
+        if last is None or next_ is None:
+            raise ValueError("an externally clocked ADC needs its preceding and next interrupt")
         self.n_samp = max(1, int(math.floor((t - last + TIME_EPS) / self.sample_period)) + 1)
         length = self.length
         self.window_open = length is None or self._full or t >= next_ - length - TIME_EPS
@@ -285,7 +301,27 @@ class ADC:
         if self.peeks:
             meas = ADCSample(meas.t, meas.values, tuple(self.peeks) + meas.samples)
         self.peeks, self.n_samp = [], 1
+        if self.clocked:
+            self.values = meas.values
+            self._clock_index += 1
         return meas
+
+    def next_time(self) -> float:
+        """Next owned interrupt/window boundary; external triggers keep their existing clock."""
+        if not self.clocked:
+            return math.inf
+        interrupt = self._clock_index * self.period
+        return min(interrupt, self.t_window(interrupt))
+
+    def sample_clock(self, t: float) -> bool:
+        """Use the ordinary sample/window operations when this ADC owns its trigger clock."""
+        interrupt = self._clock_index * self.period
+        if abs(t - interrupt) < TIME_EPS:
+            self.sample(t)
+            return True
+        if abs(t - self.t_window(interrupt)) < TIME_EPS:
+            self.open()
+        return False
 
     def sample_rms(self, t: float | None = None) -> bool:
         """Finish one statistics period without changing instantaneous control measurements."""
@@ -305,10 +341,13 @@ class ADC:
     # ------------------------------------------------------------ its states
     def get_state(self) -> dict[str, Any]:
         return {**{f"x_{channel}": value for channel, value in self.accumulated.items()},
+                **{f"held_{channel}": value for channel, value in self.values.items()},
                 **{f"rms_{channel}.{key}": value for channel, window in self.rms.items()
                    for key, value in window.get_state().items()}}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
+        self.values = {channel: values.get(f"held_{channel}", value)
+                       for channel, value in self.values.items()}
         for channel, zero in self._zero.items():
             cast = complex if isinstance(zero, complex) else float
             key = f"x_{channel}"

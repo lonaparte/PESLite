@@ -10,7 +10,7 @@ import peslite
 from conftest import EXAMPLES
 from peslite.components import (
     ADC,
-    AveragingBridge,
+    AveragingModel,
     MeasurementPorts,
     PWM,
     RCNode,
@@ -157,7 +157,7 @@ def test_pwm_owns_timer_registers_and_switching_schedule():
 
 
 def test_ideal_averaging_bridge_has_no_timer_register_or_delay_state():
-    bridge = AveragingBridge()
+    bridge = AveragingModel()
     bridge.reset(np.array([0.2, 0.4, 0.6]), on=True)
 
     assert bridge.on

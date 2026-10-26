@@ -50,6 +50,21 @@
 - Power calculation, coordinate transforms and unit delay are shared functions rather than
   registered loop nodes. A synchronization law owns its optional power-filter state, and a loop
   using `unit_delay` explicitly owns and passes the previous sample.
+- Added one commutation protocol to the diode-conduction stage: a subsystem stays in its discrete
+  state while `commutation_margin()` is nonnegative and switches in `commutate(t)` at the instant
+  located by a bracketed search on the solver's step map; scheduled instants end steps exactly and the
+  subsystem's own states are written back. Margins are checked every fixed step or adaptive
+  `max_step` (which must then be finite). A Zeno guard rejects endless commutation at one
+  instant; windowed multirate groups and C++/Imperix export reject commutating models.
+- Added diode full-bridge rectifiers (`upper_controlled: 0`, `lower_controlled: 0`) without
+  controller or PWM. A blocked bridge applies its connected terminal's hold voltage, so discontinuous
+  conduction follows from the circuit; optional `parallel_capacitance` needs a stiff DC side.
+  Diode full-bridge rectifiers accept no protection criterion and must be an explicit `full_bridge`.
+  Independent means/RMS measurements reuse the ADC without constructing a controller.
+  A controlled bridge with blocked gates still applies its zero state and now reports it.
+- Unified the compensated WPT links in one model: `ss`, `lcc`, the new `lcc_s` and `ss_multi`
+  (N coupled series-series modules), with negative mutual inductance, every capacitor voltage as
+  a link output and the ESR of LCC shunt capacitors.
 
 ## 0.3.0
 

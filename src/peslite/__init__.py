@@ -10,7 +10,7 @@ pu bases.
 from . import solver, control, components, assembly
 from .solver import (AdaptiveSolver, DormandPrince45, FixedStepSolver, Model, MultirateSolver, make_solver)
 from .control import OutputStage, VSCController, make_controller, register_loop_type
-from .components import (ADC, ADCSample, PWM, PWMBridge, ZOH, AveragingBridge, SwitchingBridge,
+from .components import (ADC, ADCSample, PWM, PWMAveragingModel, ZOH, AveragingModel, SwitchingModel,
                          ThreePhaseBridge, CarrierComparison, FullBridge, HalfBridge,
                          MeasurementPorts, make_bridge,
                          make_modulator, register_element_type)
@@ -32,7 +32,7 @@ __all__ = [
     "DCConverter", "Protection", "ProtectionSample", "MeasurementPorts", "Model", "SourceScenario",
     "Simulation", "SimulationResult", "ExportResult", "export", "VSCController", "main", "make_controller", "make_modulator", "make_solver",
     "register_loop_type", "register_element_type", "register_event_type",
-    "OutputStage", "ADC", "ADCSample", "PWM", "SwitchingBridge", "PWMBridge", "AveragingBridge",
+    "OutputStage", "ADC", "ADCSample", "PWM", "SwitchingModel", "PWMAveragingModel", "AveragingModel",
     "ThreePhaseBridge", "make_bridge",
     "HalfBridge", "FullBridge",
     "CarrierComparison", "ZOH",

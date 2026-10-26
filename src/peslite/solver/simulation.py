@@ -480,7 +480,7 @@ class Simulation:
             self.solver = make_solver(p.simulation.solver, model=self.system.model,
                                       ratings=self._ratings())
         for unit in self.system.units.values():
-            parts = [(unit.ctrl, Controller)]
+            parts = [(unit.ctrl, Controller)] if unit.ctrl is not None else []
             modulator = getattr(unit.bridge, "modulator", None)
             if modulator is not None:
                 parts.append((modulator, Modulator))
@@ -839,19 +839,26 @@ class Simulation:
         if t_end <= t_start + _EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         t_final = t_end
-        plant = Plant(mdl, self._apply_initial(t_start), project=project)
+        plant = Plant(mdl, self._apply_initial(t_start), project=project,
+                      synchronize=diode_conduction.synchronize if diode_conduction.commutating else None)
         if project is not None:
+            # Establish natural modes before projecting: an initial inductor current may
+            # turn a previously blocked port on and must not be erased by its old mode.
+            plant.outputs(t_start)
             plant.state = project(plant.state)
+            plant.invalidate()
         if parameters_changed is not None:
             parameters_changed()
         windowed = [unit for unit in units if unit.windowed]
-        ctrl_names = {
-            unit.name: getattr(unit.ctrl, "log_names", lambda: ())() for unit in units
-        }
-        for unit in units:
-            set_logging = getattr(unit.ctrl, "set_logging", None)
+        controls = tuple((unit.name, unit.ctrl) for unit in units if unit.ctrl is not None)
+        continuous_controls = tuple((unit_name, ctrl) for unit_name, ctrl in controls
+                                    if getattr(ctrl, "continuous", False))
+        ctrl_names = {unit_name: getattr(ctrl, "log_names", lambda: ())()
+                      for unit_name, ctrl in controls}
+        for unit_name, ctrl in controls:
+            set_logging = getattr(ctrl, "set_logging", None)
             if set_logging is not None:
-                log_names = {f"{unit.name}.{key}" for key in ctrl_names[unit.name]}
+                log_names = {f"{unit_name}.{key}" for key in ctrl_names[unit_name]}
                 set_logging(output.signals or bool(watch)
                             or (observe is not None and (value_names is None
                                 or bool(log_names.intersection(value_names)))))
@@ -900,11 +907,9 @@ class Simulation:
 
             @_SnapshotRead
             def read_logs():
-                for unit in units:
-                    if getattr(unit, "continuous", False):
-                        rec.ctrl_sample(unit.name, t_now,
-                                        lambda unit=unit: unit.ctrl.continuous_log(t_now),
-                                        record=record and continuous_record_index % record_every == 0)
+                for unit_name, ctrl in continuous_controls:
+                    rec.ctrl_sample(unit_name, t_now, lambda ctrl=ctrl: ctrl.continuous_log(t_now),
+                                    record=record and continuous_record_index % record_every == 0)
                 return rec.last_ctrl_log
 
             @_SnapshotRead
@@ -929,12 +934,10 @@ class Simulation:
                 worst["balance"] = max(worst["balance"], rep.max_residual / scale)
 
             if record and available:
-                for unit in units:
-                    if getattr(unit, "continuous", False):
-                        observe_limits = getattr(unit.ctrl, "observe_limits", None)
-                        if observe_limits is not None:
-                            _optional_output(t_now, f"controller limits {unit.name!r}",
-                                             observe_limits, t_now)
+                for unit_name, ctrl in continuous_controls:
+                    observe_limits = getattr(ctrl, "observe_limits", None)
+                    if observe_limits is not None:
+                        _optional_output(t_now, f"controller limits {unit_name!r}", observe_limits, t_now)
                 read_logs()
                 if rec.keep_signals:
                     _optional_output(t_now, "plant signals",
@@ -1621,7 +1624,8 @@ def main(argv=None) -> int:
             print("warning:", diagnostic["message"], file=sys.stderr)
         print("wrote", ", ".join(str(path) for path in result.files))
         return 0
-    units = ", ".join(f"{n} ({u.ctrl.type}, {u.bridge.model.replace('_', ' ')}, "
+    units = ", ".join(f"{n} ({u.ctrl.type if u.ctrl is not None else 'diode full-bridge rectifier'}, "
+                      f"{u.bridge.model.replace('_', ' ')}, "
                       f"{sim.units[n].bridge.describe()})"
                       for n, u in _unit_items(p.units))
     print(f"peslite: {config}  units={units}  "

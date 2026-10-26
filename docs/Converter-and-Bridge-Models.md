@@ -16,11 +16,14 @@ When `bridge.model` is omitted, the file default is `pwm_averaging`.
 
 ## Model comparison
 
-| Model | Electrical bridge | Digital timing | Typical cost |
-|---|---|---|---|
-| `switching` | Ideal switch states at exact carrier-comparison instants. | ADC, controller interrupts, computation completion and PWM register loads. | Highest. |
-| `pwm_averaging` | Active duty ratios applied continuously between register loads; no carrier ripple. | Same sampled controller and PWM-register schedule as switching. | Lower than switching. |
-| `averaging` | Ideal controlled voltage source driven by continuous controller equations. | No ADC, controller-interrupt, computation or PWM-register schedule. | Usually lowest for control-envelope studies. |
+`HalfBridge`, `FullBridge` and `ThreePhaseBridge` describe circuit structure. For controlled
+bridges, the following Python model classes implement the simulation form selected by `bridge.model`.
+
+| Model | Python class | Electrical bridge | Digital timing | Typical cost |
+|---|---|---|---|---|
+| `switching` | `SwitchingModel` | Ideal switch states at exact carrier-comparison instants. | ADC, controller interrupts, computation completion and PWM register loads. | Highest. |
+| `pwm_averaging` | `PWMAveragingModel` | Active duty ratios applied continuously between register loads; no carrier ripple. | Same sampled controller and PWM-register schedule as switching. | Lower than switching. |
+| `averaging` | `AveragingModel` | Ideal controlled voltage source driven by continuous controller equations. | No ADC, controller-interrupt, computation or PWM-register schedule. | Usually lowest for control-envelope studies. |
 
 The models answer different questions. Similar low-frequency trajectories do not make them
 numerically identical.
@@ -93,6 +96,105 @@ limit, so the configured solver step remains in force. This resolution limit cre
 carrier events and applies equally to fixed, adaptive and multirate solvers. A subsystem with a
 state-dependent local limit cannot be placed in a window-averaged group because that group cannot
 resolve its conduction transition.
+
+## Device resistance and port capacitance
+
+Every bridge uses `bridge.on_resistance` (ohm per conducting device) and
+`bridge.parallel_capacitance` (F). Both default to zero. Nonzero capacitance requires an explicit,
+positive resistance; no artificial minimum resistance is inserted. A conducting half-bridge or
+three-phase leg contains one device; a full-bridge current path contains two.
+
+The capacitance connects the half-bridge midpoint to the electrical reference, the full bridge's
+two AC terminals, or each three-phase terminal to a floating star point. It uses the existing
+`RCNode` capacitor model and stores `bridge.u_C`. Its voltage stays continuous when gates or DC
+voltages change. Switches and anti-parallel diodes share a finite-resistance leg law. The topology
+eliminates common voltages using symmetry or the device law's piecewise-linear breakpoints;
+only the ordinary external network feedback remains for the algebraic solver.
+DC sources, capacitors and series impedances retain their ordinary connection interfaces.
+
+Switching evaluates the active switching states. PWM and continuous averaging weight the same
+device equations by the carrier-state durations, including charging currents and losses. They
+require small intra-period capacitor-voltage ripple; use switching to resolve
+individual charging pulses, commutation ringing and their losses. Choose solver tolerances and
+step size to resolve the additional resistance-capacitance time constants. Zero capacitance
+creates no capacitor state or neutral-point equation. Resistance alone adds the conducting-path
+voltage drop and loss to the existing bridge model.
+Three-phase quantities retain the zero-sequence-free space-vector convention; this is equivalent
+port capacitance, not a model of individual device capacitances or common-mode transients.
+
+```yaml
+bridge:
+  type: full_bridge
+  model: switching
+  on_resistance: 0.1
+  parallel_capacitance: 4.7e-9
+```
+
+## Diode full-bridge rectifier
+
+A `full_bridge` with `upper_controlled: 0` and `lower_controlled: 0` keeps only its four
+anti-parallel diodes. The unit then has no controller or PWM timer. `FullBridge` binds its diode
+equations to the common execution model. Its discrete state is a pair conducting the port current
+`i_c` (positive out of the bridge) in either direction, or all diodes blocked. A conducting
+pair opposes the current, `u_c = -sign(i_c) u_dc`, and passes `|i_c|` to the DC side.
+
+A blocked bridge holds its port current at the located zero by applying the port's *hold
+voltage*: the voltage at which the port current has no rate of change. Its connected
+current-owning terminal provides that law. Ordinary scalar R-L branches and compensated links
+support it; no WPT-specific unit placement is required. On a series-compensated link it depends on
+the other port's terminal voltage through the mutual inductance, so a series element between the
+other converter and the link is accounted for. Blocking ends when the hold voltage reaches
+`+-u_dc`; a conducting pair stops at its current zero, after which the opposite pair conducts
+(continuous conduction) or all diodes block (discontinuous conduction).
+
+With `parallel_capacitance`, the same finite-resistance device law used by controlled bridges
+also handles rectification. The capacitor charges while the diodes are blocked and discharges
+through their finite resistance when forward biased. DC voltage steps produce finite charging
+currents. This representation uses continuous capacitor state instead of the ideal clamp's
+discrete conduction state and does not require a stiff DC source.
+Standalone C++/Imperix export still requires converter controllers; controllerless rectifiers
+remain a Python simulation capability.
+
+Only an explicit `type: full_bridge` can have no controlled device. A diode full-bridge rectifier has no
+gates to block, so it accepts no protection criterion.
+
+Measurements use the existing ADC independently of a controller. `meas.period` sets its owned
+sampling clock (the output period is used when absent); window means, RMS windows and
+`meas.sources` use the same channel and state interfaces. Held means are published as
+`<unit>.meas.<channel>_mean`, alongside the existing `<unit>.meas.<channel>_rms` signals.
+Instantaneous conversions held by an independent ADC use `<unit>.meas.<channel>`.
+
+A controlled bridge without port capacitance keeps its zero state when gates are blocked. On a port without a series
+filter the unit reports once when such a blocked bridge carries current, because its
+anti-parallel diodes would then conduct, which the zero state does not represent.
+
+## Exact commutations
+
+The `DiodeConduction` assembly stage also owns every *commutating* subsystem: one with a discrete
+state that is valid while `commutation_margin()` is nonnegative. After each probe interval (the
+fixed step `dt`, or `max_step` for an adaptive solver) the stage checks every margin
+against the new state; a negative margin is located by a bracketed search on the solver's step map and
+`commutate(t)` switches the state at that instant. Because validity rather than a sign change is
+checked, a margin that an outer event makes negative at the start of an interval (for example the
+open-circuit voltage of a series-compensated port at a bridge edge) is handled like one crossing
+zero inside it. A subsystem may also name an exact scheduled instant through
+`next_commutation_time()`; steps then end at that instant. `commutate` may reinitialize the
+subsystem's own continuous states, which are written back into the state vector. The discrete
+state is a named state and is restored on continuation. Bounded diode currents, margin crossings
+and scheduled instants use one locator and boundary dispatcher. Due initial events and coincident
+events are settled before measurement, control and output reads; each transition sees the effects
+of preceding transitions at the same boundary.
+
+The locator uses secant proposals with bisection safeguards and stops on the time bracket's width.
+A small guard residual alone does not end the search, since a valid mode may have a zero-margin
+plateau. The same search handles bounded currents and general commutation margins.
+
+Commutating subsystems run with fixed-step and adaptive solvers. An adaptive solver needs a finite
+`max_step`, so that how often the margins are checked does not depend on how far apart the outer
+events (output, control, PWM) are; a windowed multirate group is rejected, because it cannot
+locate the instants. Both are reported when the run starts. A configuration that commutates
+repeatedly without time advancing raises `CommutationError` instead of looping. C++ and Imperix
+export reject commutating subsystems.
 
 ## Switching
 

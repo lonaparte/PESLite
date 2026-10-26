@@ -97,6 +97,7 @@ def test_compiled_parameters_reinitialize_physics_control_and_energy(name, mode,
             "units.charger.primary.dclink.source.v": 420.0,
         }
         if name == "wpt-lcc":
+            changes["units.charger.link.primary_parallel_resistance"] = 0.05
             changes["units.charger.secondary.ctrl.loops.PhasePowerControl.ki"] = 0.1
             changes["units.charger.secondary.ctrl.loops.PhasePowerControl.power_filter.bandwidth"] = 1500.0
     binary = _compile(p, tmp_path / "model")
@@ -371,6 +372,46 @@ def test_runtime_reuses_parameter_validation_instead_of_a_cpp_device_whitelist(t
                                 capture_output=True, text=True)
         assert result.returncode == 1
         assert not native.exists()
+
+
+
+@pytest.mark.parametrize("selection", ["all", "common"])
+def test_zero_parallel_capacitance_keeps_the_compiled_structure(selection, tmp_path):
+    params = _case("wpt", "averaging")
+    binary = _compile(params, tmp_path / "model", (selection,))
+    path = "units.charger.primary.bridge.parallel_capacitance"
+    baseline = subprocess.run([binary, "--set", f"{path}=0", "--out", tmp_path / "zero"],
+                              capture_output=True, text=True)
+    assert baseline.returncode == 0
+    changed = subprocess.run([binary, "--set", f"{path}=1e-9", "--out", tmp_path / "changed"],
+                             capture_output=True, text=True)
+    assert changed.returncode == 1
+    assert "changed structural specialization" in changed.stderr
+    assert not (tmp_path / "changed").exists()
+
+
+@pytest.mark.parametrize("name,mode,selection", [
+    ("buck", "switching", "all"),
+    ("wpt", "averaging", "all"),
+    ("gfl", "pwm_averaging", "common"),
+])
+def test_finite_bridge_parameters_use_the_shared_native_equations(name, mode, selection, tmp_path):
+    from peslite.assembly.params import _unit_items
+
+    p = _case(name, mode)
+    names = tuple(unit for unit, _ in _unit_items(p.units))
+    changes = {"simulation.t_end": 30e-6, "simulation.solver.dt": 0.25e-6}
+    for unit in names:
+        changes.update({
+            f"units.{unit}.bridge.parallel_capacitance": 1e-5,
+            f"units.{unit}.bridge.on_resistance": 1.0,
+            f"units.{unit}.protection.overcurrent.enable": False,
+        })
+    p = p.replace(**changes)
+    binary = _compile(p, tmp_path / "model", (selection,))
+    unit = names[0]
+    _compare_run(p, binary, {f"units.{unit}.bridge.parallel_capacitance": 1.2e-5,
+                             f"units.{unit}.bridge.on_resistance": 1.1}, tmp_path / "run")
 
 
 def test_parameter_selection_rejects_structural_paths_before_writing(tmp_path):

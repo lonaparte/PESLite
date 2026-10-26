@@ -8,7 +8,7 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, from_dict
-from peslite.components import HalfBridge, HalfBridgeDiodeConduction, PWMBridge
+from peslite.components import HalfBridge, HalfBridgeDiodeConduction, PWMAveragingModel
 from peslite.assembly.conduction import DiodeConduction
 from peslite.control import (BridgeControlOutput, DCVoltageControl, GraphController,
                              InductorCurrentControl, Startup)
@@ -240,7 +240,7 @@ def test_public_factories_follow_the_registered_unit_configuration():
     bridge = peslite.make_bridge(cfg)
     controller = peslite.make_controller(cfg, topology=bridge.topology)
 
-    assert isinstance(bridge, PWMBridge)
+    assert isinstance(bridge, PWMAveragingModel)
     assert isinstance(bridge.topology, HalfBridge)
     assert isinstance(controller, GraphController)
 

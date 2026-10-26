@@ -148,7 +148,7 @@ def test_ideal_averaging_is_a_bridge_implementation_without_a_pwm(tmp_path):
     )
     simulation = peslite.Simulation(params)
     assert not isinstance(simulation.units["vsc_1"].bridge, peslite.PWM)
-    assert isinstance(simulation.units["vsc_1"].bridge, peslite.AveragingBridge)
+    assert isinstance(simulation.units["vsc_1"].bridge, peslite.AveragingModel)
     assert not hasattr(simulation.units["vsc_1"], "pwm")
     assert not hasattr(simulation.units["vsc_1"], "averaging")
     assert type(simulation.units["vsc_2"].bridge.modulator).__name__ == "CarrierComparison"

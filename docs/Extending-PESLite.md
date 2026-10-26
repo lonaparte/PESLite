@@ -152,6 +152,17 @@ roles. A one-terminal element uses `bus` and returns one binding; a multi-termin
 voltage fan-out and signed current sum to direct model connections, so terminal metadata adds no
 work to the integration loop.
 
+Terminals can also declare circuit constraints. A voltage-driving terminal with
+`hold_voltage_input="u_hold"` receives the voltage that keeps its connected current constant
+while it is blocked. Its current-owning peer implements
+`hold_voltage_source(terminal, *, current_constraint=None)` and
+returns the ordinary model output `(subsystem, output_name)` carrying that voltage. Its owner
+may also supply `current_constraint()`, returning its constrained current or `None` when free.
+The current-owning peer receives this callback and installs `project_state()` to enforce active
+constraints on its own states; coupled constraints must be projected together.
+Assembly checks these capabilities after resolving default and named Unit ports; they apply to
+ordinary branches, composite links and add-on elements alike.
+
 Configured element buses may also name an assembled Unit default or named port. An optional
 `series_connections()` mapping `{downstream_bus: inlet_bus}` inserts an element after the original
 voltage driver; its ordinary `terminals()` still declares both electrical boundaries. This is a

@@ -251,6 +251,8 @@ common trip path, not a WPT phase override.
 
 - Supported solvers are fixed `euler`, `heun` and `rk4`, plus adaptive `DP45`.
 - Multirate subsystem schedules are not currently lowered to C++.
+- Exactly located commutations (diode full-bridge rectifiers and other commutating subsystems) are not
+  lowered; C++ and Imperix export reject such a model.
 - Arbitrary Python behavior is not embedded in the standalone executable. File or network I/O,
   reflection, run-time type/layout changes and unsupported library calls in a custom equation are
   rejected during export rather than silently approximated.

@@ -35,6 +35,7 @@ class Terminal:
     current: str
     direction: int
     drives_voltage: bool = False
+    hold_voltage_input: Optional[str] = None
     current_sources: Any = field(init=False, repr=False, compare=False, default=None)
     voltage_source: Any = field(init=False, repr=False, compare=False, default=None)
     power_port: PowerPort = field(init=False, repr=False, compare=False)
@@ -99,6 +100,14 @@ class Terminal:
         if not self.drives_voltage:
             raise ValueError("only a voltage-driving terminal owns the bus current target")
         object.__setattr__(self, "current_sources", sources)
+
+    def hold_voltage_source(self, current_constraint=None) -> tuple:
+        """Ask this current-owning component for its zero-current voltage law."""
+        provider = getattr(self.subsystem, "hold_voltage_source", None)
+        if self.drives_voltage or provider is None:
+            raise ConfigError(
+                f"{type(self.subsystem).__name__}.{self.voltage}: no zero-current voltage law")
+        return provider(self, current_constraint=current_constraint)
 
 
 class _BranchState(Bag):
@@ -202,6 +211,40 @@ class RLBranch:
     def diode_blocks_reverse_current(self) -> bool:
         """Return whether this branch represents a diode-bounded current path."""
         return self.unilateral
+
+    def hold_voltage_source(self, terminal: Terminal, *, current_constraint=None) -> tuple:
+        """Publish the terminal voltage at which this branch's current is constant."""
+        if self.phases != 1 or self.unilateral or self._closed_rhs != self._rhs_ordinary:
+            raise ConfigError("a blocking port needs an ordinary scalar R-L branch")
+        if current_constraint is not None:
+            if not hasattr(self, "_current_constraints"):
+                self._current_constraints = []
+                self.project_state = self._project_current
+            self._current_constraints.append(current_constraint)
+        name = f"hold_{terminal.voltage}"
+        other = "u2" if terminal.voltage == "u1" else "u1"
+        if not hasattr(self.out, name):
+            names = (*type(self.out).__slots__, name)
+            self.out = type("_BranchOut", (Bag,), {"__slots__": names})(
+                **{key: getattr(self.out, key) for key in type(self.out).__slots__})
+            stages = getattr(self, "output_stages", (
+                OutputMethod("set_outputs", inputs=(), outputs=("i",)),))
+            self.output_stages = (*stages, OutputMethod(
+                f"set_{name}", inputs=(other,), outputs=(name,)))
+        return self, name
+
+    def _project_current(self) -> None:
+        targets = {value for read in self._current_constraints if (value := read()) is not None}
+        if len(targets) > 1:
+            raise ConfigError("incompatible current constraints on the same R-L branch")
+        if targets:
+            self.state.i = targets.pop()
+
+    def set_hold_u1(self, t: float) -> None:
+        self.out.hold_u1 = self.inp.u2 + self.R * self.state.i
+
+    def set_hold_u2(self, t: float) -> None:
+        self.out.hold_u2 = self.inp.u1 - self.R * self.state.i
 
     def dissipated_power(self) -> float:
         return self.power_scale * self.R * self.inp.loss_factor * abs(self.state.i) ** 2

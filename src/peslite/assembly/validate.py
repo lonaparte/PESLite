@@ -185,7 +185,8 @@ def _measurement(m, T_c: Optional[float], where: str,
         if value is None:
             continue
         if value > T_c * (1.0 + 1e-9):
-            raise ConfigError(f"{where}.{key} = {value:.6g} s is longer than ctrl.period = {T_c:.6g} s")
+            raise ConfigError(f"{where}.{key} = {value:.6g} s is longer than the sampling period "
+                              f"({T_c:.6g} s)")
     if m.period is not None and not _whole(T_c / m.period):
         raise ConfigError(f"{where}.period = {m.period:.6g} s does not divide ctrl.period = "
                           f"{T_c:.6g} s into whole samples")
@@ -210,27 +211,36 @@ def _converter(u, base, where: str):
     topology_fields = getattr(topology, "config_fields", frozenset())
     unused = [
         item.name for item in fields(u.bridge)
-        if item.name not in {"model", "type", *topology_fields}
+        if item.name not in {"model", "type", "on_resistance", "parallel_capacitance", *topology_fields}
         and getattr(u.bridge, item.name) != item.default
     ]
     if unused:
         raise ConfigError(
             f"{where}.bridge: fields {unused} do not apply to {u.bridge.type!r}"
         )
+    for field in ("on_resistance", "parallel_capacitance"):
+        value = getattr(u.bridge, field)
+        if not math.isfinite(value) or value < 0.0:
+            raise ConfigError(f"{where}.bridge.{field} must be finite and >= 0")
+    if u.bridge.parallel_capacitance > 0.0 and u.bridge.on_resistance == 0.0:
+        raise ConfigError(f"{where}.bridge.parallel_capacitance requires positive on_resistance")
     _dclink(u.dclink, f"{where}.dclink")
-    continuous = u.bridge.model == "averaging"
-    _pwm(u.pwm, base, f"{where}.pwm", continuous)
-    _timing(u.ctrl, u.pwm, f"{where}.ctrl", continuous)
-    _control(u.ctrl, u.dclink, u.pwm, f"{where}.ctrl", continuous)
-    _measurement(
-        u.meas,
-        None if continuous else _period(u.ctrl, u.pwm),
-        f"{where}.meas",
-        spec.measurement_channels,
-    )
+    if not u.bridge.controlled:
+        _natural_conduction(u, where)
+    continuous = u.ctrl is None or u.bridge.model == "averaging"
+    if u.ctrl is not None:
+        _pwm(u.pwm, base, f"{where}.pwm", continuous)
+        _timing(u.ctrl, u.pwm, f"{where}.ctrl", continuous)
+        _control(u.ctrl, u.dclink, u.pwm, f"{where}.ctrl", continuous)
     protection = u.protection
-    for name in ("overcurrent", "rms_current", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof"):
+    for item in fields(protection):
+        name = item.name
         criterion = getattr(protection, name)
+        if not hasattr(criterion, "enable"):
+            continue
+        if criterion.enable and u.ctrl is None:
+            raise ConfigError(f"{where}.protection.{name}: a diode full-bridge rectifier has no gates "
+                              "to block, so a trip could not act on it")
         _switched(criterion, f"{where}.protection.{name}")
         if criterion.enable and name not in spec.protection_criteria:
             raise ConfigError(
@@ -247,6 +257,13 @@ def _converter(u, base, where: str):
         if current not in u.meas.rms:
             raise ConfigError(f"{where}.protection.rms_current requires meas.rms.{current}")
     return topology, continuous
+
+
+def _natural_conduction(u, where: str) -> None:
+    """Check a converter whose bridge has no controlled device (a diode rectifier)."""
+    if u.bridge.model != "switching":
+        raise ConfigError(f"{where}.bridge.model: a diode full-bridge rectifier commutates exactly; "
+                          "use 'switching'")
 
 
 def _unit(u, base, where: str, *, nested: bool = False) -> None:
@@ -272,11 +289,9 @@ def _dc_converter(u, base, where: str, *, nested: bool = False) -> None:
         )
     if nested and u.bus is not None:
         raise ConfigError(f"{where}: a composite child uses its parent's scoped power bus")
-    if not nested and u.bus is None:
-        raise ConfigError(f"{where}.bus: a standalone DC converter needs a scalar bus")
     if u.filter is not None and u.filter.l_f <= 0.0:
         raise ConfigError(f"{where}.filter.l_f must be > 0")
-    if u.pwm.sync != "asynchronous":
+    if u.pwm is not None and u.pwm.sync != "asynchronous":
         raise ConfigError(f"{where}.pwm.sync: scalar converters require asynchronous PWM")
 
 
@@ -294,30 +309,28 @@ def _wpt(u, base, where: str, *, nested: bool = False) -> None:
             )
         spec.validator(child, base, child_where, nested=True)
     link = u.link
-    positive = [
-        "primary_inductance", "secondary_inductance",
-    ]
-    if link.type == "ss":
-        positive += ["primary_capacitance", "secondary_capacitance"]
-    else:
-        positive += [
-            "primary_series_capacitance", "secondary_series_capacitance",
-            "primary_compensation_inductance", "secondary_compensation_inductance",
-            "primary_parallel_capacitance", "secondary_parallel_capacitance",
-        ]
+    if link.type == "ss_multi":
+        _multi_link(link, f"{where}.link")
+        return
+    positive = ["primary_inductance", "secondary_inductance"]
+    nonnegative = ["primary_resistance", "secondary_resistance"]
+    for side in ("primary", "secondary"):
+        if link.type == "lcc" or (link.type == "lcc_s" and side == "primary"):
+            positive += [f"{side}_series_capacitance", f"{side}_compensation_inductance",
+                         f"{side}_parallel_capacitance"]
+            nonnegative += [f"{side}_compensation_resistance", f"{side}_parallel_resistance"]
+        else:
+            positive.append(f"{side}_capacitance")
     for name in positive:
         value = getattr(link, name)
         if not math.isfinite(value) or value <= 0.0:
             raise ConfigError(f"{where}.link.{name} must be finite and positive")
-    for name in ("mutual_inductance", "primary_resistance", "secondary_resistance"):
+    for name in nonnegative:
         value = getattr(link, name)
         if not math.isfinite(value) or value < 0.0:
             raise ConfigError(f"{where}.link.{name} must be finite and nonnegative")
-    if link.type == "lcc":
-        for name in ("primary_compensation_resistance", "secondary_compensation_resistance"):
-            value = getattr(link, name)
-            if not math.isfinite(value) or value < 0.0:
-                raise ConfigError(f"{where}.link.{name} must be finite and nonnegative")
+    if not math.isfinite(link.mutual_inductance):
+        raise ConfigError(f"{where}.link.mutual_inductance must be finite")
     determinant = (
         link.primary_inductance * link.secondary_inductance
         - link.mutual_inductance * link.mutual_inductance
@@ -327,6 +340,34 @@ def _wpt(u, base, where: str, *, nested: bool = False) -> None:
             f"{where}.link: the coupled-inductor matrix must be positive definite "
             "(mutual_inductance^2 < primary_inductance * secondary_inductance)"
         )
+
+
+def _multi_link(link, where: str) -> None:
+    """Check the coil matrix and per-module values of a multi-module series-series link."""
+    names = ("primary_capacitance", "secondary_capacitance",
+             "primary_resistance", "secondary_resistance")
+    try:
+        matrix = np.asarray(link.inductance, dtype=float)
+        vectors = {name: np.asarray(getattr(link, name), dtype=float) for name in names}
+    except (TypeError, ValueError):
+        raise ConfigError(f"{where}: inductance must be a numeric matrix and the per-module "
+                          "values numeric lists") from None
+    modules = vectors["primary_capacitance"].size
+    if modules < 1 or any(vector.shape != (modules,) for vector in vectors.values()):
+        raise ConfigError(f"{where}: {', '.join(names)} must be lists of one value per module")
+    if matrix.shape != (2 * modules, 2 * modules):
+        raise ConfigError(f"{where}.inductance must be a {2 * modules} x {2 * modules} matrix "
+                          f"for {modules} module(s)")
+    if not np.all(np.isfinite(matrix)) or not np.allclose(matrix, matrix.T, rtol=1e-12, atol=0.0):
+        raise ConfigError(f"{where}.inductance must be finite and symmetric")
+    if np.linalg.eigvalsh(matrix).min() <= 0.0:
+        raise ConfigError(f"{where}.inductance must be positive definite")
+    for name in names:
+        vector = vectors[name]
+        positive = name.endswith("capacitance")
+        if not np.all(np.isfinite(vector)) or np.any(vector <= 0.0 if positive else vector < 0.0):
+            raise ConfigError(f"{where}.{name} must be finite and "
+                              f"{'positive' if positive else 'nonnegative'}")
 
 
 def _network(p: Params) -> None:
@@ -339,8 +380,6 @@ def _network(p: Params) -> None:
         name: unit for name, unit in _unit_items(p.units)
         if getattr(unit, "bus", None) is not None
     }
-    if (connected_units or p.branches or p.sources) and not p.buses:
-        raise ConfigError("buses: a connected electrical network needs at least one bus")
     for name, bus in p.buses.items():
         if bus.c <= 0.0:
             raise ConfigError(f"buses.{name}.c must be > 0: the shunt capacitor is what makes the "
@@ -361,12 +400,10 @@ def _network(p: Params) -> None:
                 return
         _bus_of(where, bus)
     for name, br in p.branches.items():
-        _bus_of(f"branches.{name}.bus1", br.bus1)
-        _bus_of(f"branches.{name}.bus2", br.bus2)
+        _element_bus(f"branches.{name}.bus1", br.bus1)
+        _element_bus(f"branches.{name}.bus2", br.bus2)
         if br.bus1 == br.bus2:
             raise ConfigError(f"branches.{name}: both ends are {br.bus1!r}")
-        if p.buses[br.bus1].phases != p.buses[br.bus2].phases:
-            raise ConfigError(f"branches.{name}: both buses must have the same phase count")
         if br.l <= 0.0:
             raise ConfigError(f"branches.{name}.l must be > 0")
     for name, src in p.sources.items():
@@ -465,7 +502,7 @@ def _initial(p: Params) -> None:
         m = getattr(u, "meas", None)
         if m is None:
             continue
-        if u.bridge.model == "averaging":
+        if u.bridge.model == "averaging" or not u.bridge.controlled:
             continue
         T_c = _period(u.ctrl, u.pwm)
         continued = any(key.startswith((f"{name}.ctrl.", f"{name}.pwm.",
@@ -509,7 +546,14 @@ def validate(p: Params) -> Params:
         check(unit, p.base, f"units.{name}")
     from .params import _unit_items
     for name, unit in _unit_items(p.units):
-        if unit.bridge.model == "averaging" and unit.meas.rms:
+        continuous = unit.bridge.model == "averaging" or unit.ctrl is None
+        period = ((unit.meas.period or p.simulation.output.period) if unit.ctrl is None
+                  else None if continuous else _period(unit.ctrl, unit.pwm))
+        if period is not None and (not math.isfinite(period) or period <= 0):
+            raise ConfigError(f"units.{name}.meas: sampling period must be finite and positive")
+        _measurement(unit.meas, period, f"units.{name}.meas",
+                     unit_type(unit.type).measurement_channels)
+        if continuous and unit.ctrl is not None and unit.meas.rms:
             period = p.simulation.output.period
             if not math.isfinite(period) or period <= 0:
                 raise ConfigError("simulation.output.period must be finite and positive")
