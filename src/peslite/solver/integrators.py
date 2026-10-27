@@ -18,7 +18,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 __all__ = ["RHS", "SolverStep", "Solver", "FIXED_METHODS", "ADAPTIVE_METHODS", "TABLEAUS", "combine", "integrator",
-           "FixedStepSolver", "AdaptiveSolver", "DormandPrince45"]
+           "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "subintervals"]
 
 RHS = Callable[[float, NDArray[np.float64]], NDArray[np.float64]]
 
@@ -87,6 +87,11 @@ def integrator(method: str, dt: float, rtol: float = 1e-6, atol: float = 1e-9,
     return AdaptiveSolver(method, rtol, atol, max_step, warm_start)
 
 
+def subintervals(span: float, step: float) -> int:
+    """Return equal pieces that cover ``span`` without exceeding ``step``."""
+    return max(1, int(math.ceil(span / step - 1e-9)))
+
+
 class FixedStepSolver:
     """Explicit RK with a maximum step ``dt`` (s); sub-steps are equal within an interval.
 
@@ -112,7 +117,7 @@ class FixedStepSolver:
         step = min(self.dt, max_step)
         if step <= 0.0:
             raise ValueError("max_step must be positive")
-        n = max(1, int(math.ceil(span / step - 1e-9)))
+        n = subintervals(span, step)
         h = span / n
         c, a, _b = TABLEAUS[self.method]
         self.n_rhs += len(c) * n

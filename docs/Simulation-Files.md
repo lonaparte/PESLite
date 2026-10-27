@@ -76,7 +76,7 @@ units:
 ```
 
 `ctrl.type` selects the controller architecture: its reference schema, public ports and default
-wiring. Built-in architectures include `gfl`, `gfm`, scalar `dc`, `resonant` and
+wiring. Built-in architectures include `gfl`, `gfm`, scalar `dc`, `open_loop`, `resonant` and
 `phase_shift`; a custom graph can
 override loop connections and controller outputs explicitly. Normally, each key under `ctrl.loops`
 is the registered loop class name and also its graph-node name; no duplicate `type` field is
@@ -94,6 +94,18 @@ optional power-filter states. A loop that needs a one-sample delay owns the prev
 passes it explicitly to `unit_delay(value, previous)`. Consequently, unused helper functions create
 no objects or runtime state. `VirtualImpedance`, `ActiveDamping` and `ResonantModulation` remain
 ordinary registered loops because they have configurable behavior and graph ports.
+
+A DC-link source may be `none`, `current` or `voltage`; it is always in the DC electrical domain.
+The top-level `sources` section describes AC voltage sources behind an R-L impedance. A source
+connected to a three-phase bus uses the complex space-vector representation; one connected to a
+single-phase bus or Unit port uses a real sinusoid. For example, `bus: rectifier.power` connects a
+single-phase source directly to the ordinary power port of a `DCConverter`.
+
+Phase count and electrical domain are independent. `phases: 1` is a real scalar network that may
+be AC or DC, while `phases: 3` is a three-phase AC space-vector network. Ports that are inherently
+AC or DC carry an `electrical_domain` assembly constraint; general buses, branches, passive
+components and `DCConverter.power` remain unconstrained. A connected passive network is rejected
+only if it joins explicit AC and DC constraints.
 
 A WPT unit is a configuration-time composite. It owns no bridge or controller itself; each child
 is an ordinary independently clocked `DCConverter`. Each bridge and its matching link terminal
@@ -149,6 +161,10 @@ Its references are `width` (pulse width in half periods, [0, 1]), `frequency` (H
 `PhaseShiftModulation` loop passes them to the registers, scaling `width` by the start-up ramp;
 feedback loops drive its inputs through `ctrl.connections`. `pwm.f_sw` sets the control and
 register-load clock; `bridge.model` must be `switching`.
+
+The optional `ModeSequence` add-on emits one entry of a repeating mode/width/phase pattern on each
+of its sampled updates. Its `period` defaults to `ctrl.period`; the complete graph wiring is shown
+in `wpt-phase-shift-example.pes`.
 
 ```yaml
     primary:

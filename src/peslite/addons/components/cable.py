@@ -158,6 +158,7 @@ class Cable(Element):
                 raise ConfigError("bus1 and bus2 must name different buses")
 
     type = "cable"
+    domain_transparent = True
 
     def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
         self.name, self.cfg = name, cfg

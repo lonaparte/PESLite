@@ -218,8 +218,12 @@ class CompensatedLink:
         self.out = type("_LinkOut", (Bag,), {"__slots__": outputs})()
         self.output_stages = (OutputMethod("set_outputs", inputs=(), outputs=outputs),)
         self.inp = type("_LinkInp", (Bag,), {"__slots__": ("u_primary", "u_secondary")})()
-        self.primary_terminal = Terminal(self, "u_primary", "i_primary", 1)
-        self.secondary_terminal = Terminal(self, "u_secondary", "i_secondary", 1)
+        self.primary_terminal = Terminal(
+            self, "u_primary", "i_primary", 1, electrical_domain="ac"
+        )
+        self.secondary_terminal = Terminal(
+            self, "u_secondary", "i_secondary", 1, electrical_domain="ac"
+        )
         self._compile_equations()
 
     def hold_voltage_source(self, terminal: Terminal, *, current_constraint=None) -> tuple:

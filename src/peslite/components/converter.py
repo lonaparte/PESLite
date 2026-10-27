@@ -20,7 +20,8 @@ from .pwm import TIME_EPS, CarrierComparison, Modulator, PWM, ZOH, make_unit_mod
 
 __all__ = ["ThreePhaseBridge", "SwitchingModel", "PWMAveragingModel", "AveragingModel",
            "HalfBridge", "FullBridge", "DCLink", "DCCapacitor",
-           "DCCurrentSource", "DCVoltageSource", "HalfBridgeDiodeConduction",
+           "DCCurrentSource", "DCVoltageSource",
+           "HalfBridgeDiodeConduction",
            "make_topology", "make_bridge", "make_dclink"]
 
 
@@ -213,7 +214,7 @@ class _BridgeModel:
             PowerPort("inp.u_dc", "out.i_dc"),
             PowerPort("out.u_c", "inp.i_c", self.topology.power_scale, -1.0),
         )
-        self.dc_terminal = Terminal(self, "u_dc", "i_dc", 1)
+        self.dc_terminal = Terminal(self, "u_dc", "i_dc", 1, electrical_domain="dc")
         self.power_terminal = Terminal(self, "u_c", "i_c", -1, drives_voltage=True)
         self.lower_terminal = None
         self.set_dc_current = self.topology.set_dc_current.__get__(self, type(self))
@@ -1112,8 +1113,12 @@ class DCVoltageSource:
     def __init__(self, u_dc: float, R: float = 0.0) -> None:
         self.u_dc, self.R = _real(u_dc), _real(R)
 
-    def terminal_voltage(self, i: float) -> float:
-        return self.u_dc - self.R * i
+    def emf(self, t: float) -> float:
+        """Source voltage behind ``R`` at ``t`` (V)."""
+        return self.u_dc
+
+    def terminal_voltage(self, i: float, t: float = 0.0) -> float:
+        return self.emf(t) - self.R * i
 
     def dissipated_power(self, i: float) -> float:
         return self.R * i ** 2
@@ -1149,10 +1154,12 @@ class DCLink:
         self.storage = ((StoragePort("u_C", capacitor.C, 1.0, (("inp.i_dc", -1.0),)),)
                         if capacitor is not None else ())
         self.has_source = source is not None
-        u0 = capacitor.state.u_C if capacitor is not None else source.u_dc
+        u0 = capacitor.state.u_C if capacitor is not None else source.emf(0.0)
         self.inp = _DCInp(i_dc=0.0)
         self.out = _DCOut(u_dc=u0, u_C=u0, i_src=0.0)
-        self.terminal = Terminal(self, "u_dc", "i_dc", -1, drives_voltage=True)
+        self.terminal = Terminal(
+            self, "u_dc", "i_dc", -1, drives_voltage=True, electrical_domain="dc"
+        )
         self.tripped = False
         # The circuit topology cannot change after assembly. Bind its equations once instead of
         # rediscovering the capacitor/source combination at every Runge--Kutta stage.
@@ -1190,20 +1197,20 @@ class DCLink:
     def set_stored_voltage(self, t: float) -> None:
         """Expose the capacitor voltage (or stiff source emf) without a dc-current dependency."""
         self.out.u_C = (self.capacitor.state.u_C if self.capacitor is not None
-                        else self.source.u_dc)
+                        else self.source.emf(t))
 
     def set_outputs(self, t: float) -> None:
         """Generic topology dispatch retained for subclasses."""
         cap, source, i_dc = self.capacitor, self.source, self.inp.i_dc
         if cap is None:
-            self.out.u_dc = self.out.u_C = source.terminal_voltage(i_dc)
+            self.out.u_dc = self.out.u_C = source.terminal_voltage(i_dc, t)
             self.out.i_src = i_dc
             return
         if self.tripped or source is None:
             i_src = 0.0
         elif isinstance(source, DCVoltageSource):
             # from u_C + R_esr (i_src - i_dc) = u_dc - R i_src
-            i_src = (source.u_dc - cap.state.u_C + cap.R_esr * i_dc) / (source.R + cap.R_esr)
+            i_src = (source.emf(t) - cap.state.u_C + cap.R_esr * i_dc) / (source.R + cap.R_esr)
         else:
             i_src = source(t, cap.state.u_C)
         self.out.i_src = i_src
@@ -1212,7 +1219,7 @@ class DCLink:
 
     def _set_voltage_source_without_capacitor(self, t: float) -> None:
         source, i_dc, out = self.source, self.inp.i_dc, self.out
-        out.u_dc = out.u_C = source.u_dc - source.R * i_dc
+        out.u_dc = out.u_C = source.emf(t) - source.R * i_dc
         out.i_src = i_dc
 
     def _set_capacitor_without_source(self, t: float) -> None:
@@ -1224,7 +1231,7 @@ class DCLink:
     def _set_capacitor_with_voltage_source(self, t: float) -> None:
         cap, source, i_dc, out = self.capacitor, self.source, self.inp.i_dc, self.out
         i_src = (0.0 if self.tripped else
-                 (source.u_dc - cap.state.u_C + cap.R_esr * i_dc) /
+                 (source.emf(t) - cap.state.u_C + cap.R_esr * i_dc) /
                  (source.R + cap.R_esr))
         out.i_src = i_src
         out.u_C = cap.state.u_C
@@ -1259,12 +1266,12 @@ class DCLink:
     def supplied_power(self) -> float:
         if isinstance(self.source, DCVoltageSource):
             i_src = self.inp.i_dc if self.capacitor is None else self.out.i_src
-            return self.source.u_dc * i_src
+            return (self.out.u_dc + self.source.R * i_src) * i_src
         return self.out.u_dc * self.out.i_src
 
 
 def make_dclink(cfg: Any) -> DCLink:
-    """Build a :class:`DCLink` from SI parameters; source type ``"current"``, ``"voltage"`` or ``"none"``."""
+    """Build a DC link from its capacitor and optional DC source."""
     capacitor = None
     if cfg.capacitor is not None:
         capacitor = DCCapacitor(cfg.vdc_ref, cfg.capacitor.c, cfg.capacitor.r_esr)

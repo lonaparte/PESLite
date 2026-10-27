@@ -1,0 +1,86 @@
+# PESLite 0.4.0
+# SS WPT with a square-wave primary and a diode full-bridge rectifier. Power feedback commands
+# pulse width, while pulse synchronisation lets an active pulse finish before a pattern update.
+
+base:
+  s_base: 5000.0
+  v_ll_rms: 400.0
+  f0: 50.0
+
+units:
+  charger:
+    type: wpt
+    primary:
+      type: dc_converter
+      dclink:
+        vdc_ref: 400.0
+        source: {type: voltage}
+      pwm:
+        f_sw: 85000.0
+        pattern_sync: pulse
+      bridge: {model: switching}
+      meas:
+        average: [power]
+      ctrl:
+        type: phase_shift
+        loops:
+          PowerControl:
+            kp: 0.0001
+            ki: 1.5
+            minimum: 0.05
+            maximum: 1.0
+            power_filter: {enable: true, bandwidth: 1000.0}
+          ModeSequence:
+            modes: [1, 0, 4]
+          PhaseShiftModulation: {}
+        references:
+          power: 1500.0
+          width: 0.3
+          frequency: 85000.0
+        connections:
+          PowerControl.reference: references.power
+          PowerControl.power: meas.power
+          PowerControl.feedforward: references.width
+          ModeSequence.width: PowerControl.modulation
+          ModeSequence.phase: references.phase
+          PhaseShiftModulation.mode: ModeSequence.mode
+          PhaseShiftModulation.width: ModeSequence.width
+          PhaseShiftModulation.phase: ModeSequence.phase
+
+    secondary:
+      type: dc_converter
+      dclink:
+        vdc_ref: 300.0
+        source: {type: voltage}
+      bridge: {type: full_bridge, upper_controlled: 0, lower_controlled: 0, model: switching}
+
+    link:
+      type: ss
+      primary_inductance: 100.0e-6
+      secondary_inductance: 100.0e-6
+      mutual_inductance: 20.0e-6
+      primary_capacitance: 35.06e-9
+      secondary_capacitance: 35.06e-9
+      primary_resistance: 0.5
+      secondary_resistance: 0.5
+
+events:
+  power_step:
+    type: set
+    t: 0.002
+    set:
+      units.charger.primary.ctrl.references.power: 2500.0
+
+simulation:
+  t_end: 0.004
+  solver:
+    dt: 25.0e-9
+    linearisations: 0
+  output:
+    period: 1.0e-6
+    record_every: 4
+    signals: 1
+
+meta:
+  title: Phase-shift WPT charger with a diode rectifier
+  description: Width-controlled primary bridge, SS link and diode full-bridge secondary.

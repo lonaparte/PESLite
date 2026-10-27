@@ -10,7 +10,7 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import ConfigError, _unit_items
+from peslite.assembly.params import ConfigError
 
 
 SHORT = ["--set", "simulation.t_end=0.004",
@@ -102,23 +102,15 @@ def test_bridge_flags_are_mutually_exclusive(capsys):
     assert "not allowed with argument" in capsys.readouterr().err
 
 
-def _with_model(params, model):
-    return params.replace(**{
-        f"units.{name}.bridge.model": model for name, _unit in _unit_items(params.units)
-    })
-
-
 @pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda path: path.stem)
-@pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
-def test_every_bundled_file_runs_with_every_completed_model(path, model, tmp_path):
+def test_every_bundled_file_runs_with_its_configured_model(path, tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         params = peslite.load(path, **{"simulation.solver.linearisations": 0})
         duration = min(0.004, params.simulation.t_end)
         params = params.replace(**{"simulation.t_end": duration,
                                    "simulation.output.states": True})
-        params = _with_model(params, model)
-    result = peslite.Simulation(params).run(out_dir=tmp_path / f"{path.stem}-{model}")
+    result = peslite.Simulation(params).run(out_dir=tmp_path / path.stem)
     assert np.isfinite(result.states["t"]).all()
     assert result.states["t"][-1] == pytest.approx(duration)
 

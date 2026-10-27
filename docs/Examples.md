@@ -1,6 +1,6 @@
 # Examples
 
-PESLite ships fifteen simulation files with the Python wheel. They can be run by name from any
+PESLite ships eighteen simulation files with the Python wheel. They can be run by name from any
 directory, so cloning the repository is not required.
 
 ```bash
@@ -20,6 +20,7 @@ peslite case.pes
 | Name | System and control purpose |
 |---|---|
 | `buck-example` | A closed-loop 48 V to 24 V Buck unit using the half bridge's controlled-device/diode placement, an L-C output network, native DCM and the shared scalar control graph. |
+| `buck-open-loop-example` | An open-loop synchronous Buck whose duty-ratio reference changes through an ordinary event. |
 | `boost-example` | A closed-loop 24 V to 48 V Boost application using the same DCConverter with the lower device controlled, the upper diode active and the external scalar bus as its input port. |
 | `buck-boost-example` | A closed-loop single-inductor Buck-Boost built from one DCConverter, with the half bridge's lower rail connected to the negative output bus. |
 | `cable-gfl-example` | A grid-following converter connected to the grid through the distributed R-L/G-C model registered under `addons/components`. |
@@ -34,6 +35,8 @@ peslite case.pes
 | `wpt-ss-example` | SS WPT with local primary-side power feedback controlling modulation amplitude, including a 1200 to 1800 W reference step. |
 | `wpt-lcc-example` | LCC-LCC WPT with local secondary-side power feedback controlling phase, including a -500 to -800 W reference step. |
 | `wpt-load-example` | Independent series load with explicitly routed load-power feedback, a 5 to 8 ohm load step and per-side RMS overcurrent protection. |
+| `wpt-phase-shift-example` | Phase-shift WPT with power-controlled pulse width, a repeating bridge-mode sequence and a diode full-bridge secondary. |
+| `wpt-scc-example` | Square-wave WPT with primary power feedback commanding an SCC conduction angle. |
 
 The files are also available in the repository's
 [`examples/`](https://github.com/lonaparte/PESLite/tree/main/examples) directory. The root
@@ -53,9 +56,6 @@ The default output directories receive a mode suffix, so these runs do not overw
 They represent different model fidelity and timing semantics; compare quantities in their common
 bandwidth rather than expecting identical switching-scale waveforms. See
 [Converter and Bridge Models](Converter-and-Bridge-Models.md).
-
-The scalar Buck, Boost and Buck-Boost cases and both child converters of the WPT cases
-support the same three bridge-model flags.
 
 ## WPT power feedback
 

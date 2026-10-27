@@ -19,6 +19,7 @@ from peslite.control import (
     PowerControl,
     PhasePowerControl,
     ResonantModulation,
+    DutyModulation,
     OutputLimit,
     PI,
 )
@@ -109,6 +110,26 @@ def test_scalar_output_alias_and_named_commands_share_one_value():
     assert output.commands == {"duty": 0.6}
     with pytest.raises(ValueError, match="conflicting duty"):
         BridgeControlOutput(duty=0.2, commands={"duty": 0.8})
+
+
+@pytest.mark.parametrize(("bridge", "neutral"), [
+    ("half_bridge", 0.0),
+    ("full_bridge", 0.5),
+])
+def test_open_loop_startup_ramps_from_the_topology_neutral_duty(bridge, neutral):
+    from peslite.assembly.params import BridgeParams
+
+    startup = SimpleNamespace(value=0.0)
+    unit = SimpleNamespace(
+        bridge=BridgeParams(model="pwm_averaging", type=bridge),
+        ctrl=SimpleNamespace(references=SimpleNamespace(duty=0.8)),
+    )
+    loop = DutyModulation(DutyModulation.Params(period=1.0e-4), unit, startup)
+    assert loop.sample(0.0, {"duty": 0.8})["duty"] == pytest.approx(neutral)
+    startup.value = 0.5
+    assert loop.sample(0.0, {"duty": 0.8})["duty"] == pytest.approx(
+        neutral + 0.5 * (0.8 - neutral)
+    )
 
 
 def test_registered_carrier_keeps_its_own_topology_capabilities(monkeypatch):

@@ -42,7 +42,7 @@ from ..assembly.unit import Plant, Unit
 from ..components.pwm import Modulator
 from ..control.blocks import abc2complex, complex2abc
 from ..control.controller import Controller
-from .integrators import Solver
+from .integrators import Solver, subintervals
 from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
 from .multirate import make_solver
 from .splitbound import split_error_bound
@@ -543,10 +543,12 @@ class Simulation:
 
         def port_rating(port: Any) -> tuple[float, float]:
             cfg = self.p.unit(port.owner)
-            if port.domain == "dc":
+            if port.phases == 1:
                 dc = cfg.dc_base
                 return dc.v, dc.i
-            return cfg.base.v_phase_peak, cfg.base.i_phase_peak
+            if port.phases == 3:
+                return cfg.base.v_phase_peak, cfg.base.i_phase_peak
+            raise ConfigError(f"unit port has unsupported phase count {port.phases!r}")
 
         port_bindings = self.system._port_bindings
         subsystems = dict(zip(self.system.model.names, self.system.model.subsystems))
@@ -992,26 +994,46 @@ class Simulation:
                     y = settle(t_b, y)
                 return project(y)
 
+        measurement_interval = (p.simulation.solver.measurement_interval if windowed else None)
+
         def advance(t_a: float, t_b: float, event: bool = False) -> bool:
             """Integrate over ``[t_a, t_b]``; ``event`` means the model changes at ``t_b``."""
             nonlocal t_local, stop_reason, coarse_reported
             plant.invalidate()
+            t_i = t_a
+            t_j = t_b
             try:
-                plant.state = integrate(t_a, t_b, plant.state, event)
+                if measurement_interval is None:
+                    plant.state = integrate(t_a, t_b, plant.state, event)
+                else:
+                    pieces = subintervals(t_b - t_a, measurement_interval)
+                    for k in range(1, pieces + 1):
+                        t_j = t_b if k == pieces else t_a + k * (t_b - t_a) / pieces
+                        plant.state = integrate(t_i, t_j, plant.state, event and k == pieces)
+                        plant.invalidate()
+                        if not _finite(plant.state):
+                            break
+                        if k < pieces:
+                            sync_if_needed(t_j)
+                            for unit in windowed:
+                                unit.accumulate(t_j - t_i)
+                            t_i = t_j
             except (OverflowError, FloatingPointError):
-                stop_reason = f"diverged: the states overflowed between t = {t_a:.6g} s and {t_b:.6g} s"
-                t_local = t_a
+                stop_reason = (f"diverged: the states overflowed between t = {t_i:.6g} s "
+                               f"and {t_j:.6g} s")
+                t_local = t_i
                 return True
-            t_local = t_b
+            plant.invalidate()
+            t_local = t_j
             finite = _finite(plant.state)
             if windowed and finite:
                 sync_if_needed(t_b)
                 for unit in windowed:
-                    unit.accumulate(t_b - t_a)
+                    unit.accumulate(t_b - t_i)
             elif finite:
                 mdl.set_states(plant.state)
             if not finite:
-                stop_reason = f"diverged: non-finite states at t = {t_b:.6g} s"
+                stop_reason = f"diverged: non-finite states at t = {t_j:.6g} s"
                 return True
             coarse = getattr(solver, "coarse_hold", None)
             if coarse is not None and not coarse_reported:

@@ -138,25 +138,11 @@ def test_wpt_assembly_flattens_only_once_and_shares_one_link():
     assert not simulation.energy_problems
 
 
-def test_nested_wpt_exports_its_declared_default_port():
+def test_nested_wpt_rejects_an_ac_link_connected_to_a_dc_default_port():
     tree = _tree()
     tree["units"]["charger"]["primary"] = copy.deepcopy(tree["units"]["charger"])
-    simulation = peslite.Simulation(_short(tree))
-    subsystems = dict(zip(simulation.system.model.names, simulation.system.model.subsystems))
-    outer_link = subsystems["charger.link"]
-    primary = simulation.units["charger.primary.primary"]
-
-    assert tuple(simulation.units) == (
-        "charger.primary.primary",
-        "charger.primary.secondary",
-        "charger.secondary",
-    )
-    assert simulation.system.model.connections[(outer_link, "u_primary")] == (
-        primary.dclink,
-        "u_dc",
-    )
-    result = simulation.run(out_dir=None)
-    assert result.summary["ph_verdict"] == "port-hamiltonian"
+    with pytest.raises(ConfigError, match="electrical-domain conflict"):
+        peslite.Simulation(_short(tree))
 
 
 @pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])

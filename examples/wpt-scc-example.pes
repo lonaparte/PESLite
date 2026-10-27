@@ -1,0 +1,85 @@
+# PESLite 0.4.0
+# SS WPT with a switch-controlled primary compensation capacitor. Power feedback commands the SCC
+# conduction angle through a normal auxiliary controller output.
+
+base:
+  s_base: 10000.0
+  v_ll_rms: 400.0
+  f0: 50.0
+
+units:
+  charger:
+    type: wpt
+    primary:
+      type: dc_converter
+      dclink:
+        vdc_ref: 400.0
+        source: {type: voltage}
+      pwm:
+        f_sw: 85000.0
+      bridge: {model: switching}
+      meas:
+        average: [power]
+      ctrl:
+        type: phase_shift
+        loops:
+          PhasePowerControl:
+            kp: -4.0e-5
+            ki: -1.0
+            minimum: 0.3
+            maximum: 1.8
+            power_filter: {enable: true, bandwidth: 1000.0}
+          PhaseShiftModulation: {}
+        references:
+          power: 6000.0
+          width: 1.0
+          frequency: 85000.0
+        connections:
+          PhasePowerControl.reference: references.power
+          PhasePowerControl.power: meas.power
+          PhasePowerControl.feedforward: references.phase
+        outputs:
+          scc_angle: PhasePowerControl.phase
+
+    secondary:
+      type: dc_converter
+      dclink:
+        vdc_ref: 150.0
+        source: {type: voltage}
+      bridge: {type: full_bridge, upper_controlled: 0, lower_controlled: 0, model: switching}
+
+    link:
+      type: ss
+      primary_inductance: 100.0e-6
+      secondary_inductance: 100.0e-6
+      mutual_inductance: 30.0e-6
+      primary_capacitance: 70.36e-9
+      secondary_capacitance: 70.36e-9
+      primary_resistance: 0.3
+      secondary_resistance: 0.3
+      primary_scc:
+        capacitance: 120.0e-9
+        sync: bridge
+        sync_angle: 1.5707963267948966
+        command: 1
+
+events:
+  power_step:
+    type: set
+    t: 0.003
+    set:
+      units.charger.primary.ctrl.references.power: 8000.0
+
+simulation:
+  t_end: 0.006
+  solver:
+    dt: 25.0e-9
+    linearisations: 0
+  output:
+    period: 1.0e-6
+    record_every: 4
+    signals: 1
+
+meta:
+  title: SCC-tuned WPT charger
+  description: Power-controlled SCC angle, square-wave primary and diode full-bridge secondary.

@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
-from ..components.network import ELEMENT_TYPES, RCNode, RLBranch, Terminal, ThreePhaseSource
+from ..components.network import ACVoltageSource, ELEMENT_TYPES, RCNode, RLBranch, Terminal
 from ..components.adc import _PortMeasurement
 from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
@@ -69,8 +69,15 @@ class _UnitPort:
 
     bus: str
     owner: str
-    domain: str
     phases: int = 1
+    electrical_domain: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.electrical_domain not in (None, "ac", "dc"):
+            raise ValueError(
+                "unit-port electrical_domain must be 'ac', 'dc' or None, got "
+                f"{self.electrical_domain!r}"
+            )
 
 
 @dataclass
@@ -122,6 +129,64 @@ class _UnitAssembly:
             )
 
 
+def _validate_electrical_domains(
+    endpoints: Mapping[str, _UnitPort],
+    passive_groups: tuple[tuple[tuple[str, Terminal], ...], ...],
+    terminal_bindings: tuple[tuple[str, Terminal], ...],
+    resolve_bus: Callable[[str], str],
+) -> None:
+    """Reject only explicit AC/DC constraints joined by domain-neutral circuitry."""
+    adjacent: dict[str, set[str]] = {}
+
+    def node(name: str) -> str:
+        resolved = resolve_bus(name)
+        adjacent.setdefault(resolved, set())
+        return resolved
+
+    for group in passive_groups:
+        buses = tuple(dict.fromkeys(node(name) for name, _terminal in group))
+        if buses:
+            first = buses[0]
+            for other in buses[1:]:
+                adjacent[first].add(other)
+                adjacent[other].add(first)
+
+    constraints: list[tuple[str, str, str]] = []
+    seen_ports: set[int] = set()
+    for name, port in endpoints.items():
+        if id(port) in seen_ports or port.electrical_domain is None:
+            continue
+        seen_ports.add(id(port))
+        constraints.append((node(port.bus), port.electrical_domain, f"unit port {name}"))
+    for bus, terminal in terminal_bindings:
+        if terminal.electrical_domain is not None:
+            label = f"{type(terminal.subsystem).__name__}.{terminal.voltage}"
+            constraints.append((node(bus), terminal.electrical_domain, label))
+
+    by_bus: dict[str, list[tuple[str, str]]] = {}
+    for bus, domain, label in constraints:
+        by_bus.setdefault(bus, []).append((domain, label))
+    visited: set[str] = set()
+    for start in adjacent:
+        if start in visited:
+            continue
+        pending = [start]
+        domains: dict[str, str] = {}
+        while pending:
+            bus = pending.pop()
+            if bus in visited:
+                continue
+            visited.add(bus)
+            pending.extend(adjacent[bus] - visited)
+            for domain, label in by_bus.get(bus, ()):
+                domains.setdefault(domain, label)
+        if len(domains) > 1:
+            raise ConfigError(
+                "electrical-domain conflict: connected network contains "
+                f"AC constraint {domains['ac']!r} and DC constraint {domains['dc']!r}"
+            )
+
+
 class _WPTSignals:
     """Expose shared link quantities without making the composite a scheduled unit."""
 
@@ -135,24 +200,33 @@ class _WPTSignals:
         return {f"{self.name}.link.{name}": getattr(out, name) for name in self._outputs}
 
 
-def _source_scenario(p: Params, name: str) -> SourceScenario:
-    """Construct a source's complete waveform timeline from the common parameter tree."""
-    paths = {f"sources.{name}.{field}" for field in ("v", "f", "angle")}
-    steps = [(change.t, change.params.sources[name]) for change in p.changes
+def _source_scenario(p: Params, path: str, select: Callable[[Params], Any]) -> SourceScenario:
+    """Construct a source timeline using one parameter path and selector."""
+    paths = {f"{path}.{field}" for field in ("v", "f", "angle")}
+    steps = [(change.t, select(change.params)) for change in p.changes
              if paths.intersection(change.values)]
-    return SourceScenario(p.sources[name], p.base.f0, steps)
+    return SourceScenario(select(p), p.base.f0, steps)
 
 
 class _Source:
     """Voltage source (emf) behind a series R-L branch."""
 
-    def __init__(self, name: str, p: Params, t0: float) -> None:
+    def __init__(self, name: str, p: Params, t0: float, phases: int) -> None:
         cfg, base = p.sources[name], p.base
         self.name, self.cfg = name, cfg
-        self.scenario = _source_scenario(p, name)
+        self.scenario = _source_scenario(p, f"sources.{name}", lambda q: q.sources[name])
         self.emf = _parameterized(
-            lambda b: ThreePhaseSource(b.w0, *self.scenario.law(t0)), base)
-        self.branch = _parameterized(lambda c: RLBranch(c.l, c.r), cfg)
+            lambda values: ACVoltageSource(
+                values[0].w0, *self.scenario.law(t0), phases=values[1]
+            ), (base, phases))
+        self.branch = _parameterized(
+            lambda values: RLBranch(values[0].l, values[0].r, phases=values[1]),
+            (cfg, phases),
+        )
+        self.branch.terminal2 = Terminal(
+            self.branch, "u2", "i", -1, electrical_domain="ac"
+        )
+        self.terminal = self.branch.terminal2
 
     def retune(self, cfg, paths: list[str], t: float) -> None:
         """Apply changed source impedance, magnitude, frequency or angle at ``t``."""
@@ -176,7 +250,7 @@ class _Source:
         }
 
     def terminals(self) -> tuple[tuple[str, Terminal], ...]:
-        return ((self.cfg.bus, self.branch.terminal2),)
+        return ((self.cfg.bus, self.terminal),)
 
     def signals(self) -> dict[str, float | complex]:
         return {f"{self.name}.i": self.branch.out.i, f"{self.name}.angle": self.emf.out.phi}
@@ -184,6 +258,8 @@ class _Source:
 
 class _BranchAssembly:
     """Give a configured bare RLBranch the common network-component assembly interface."""
+
+    domain_transparent = True
 
     def __init__(self, name: str, cfg, branch: RLBranch) -> None:
         self.name, self.cfg, self.branch = name, cfg, branch
@@ -225,8 +301,8 @@ def _assemble_vsc(name: str, cfg: Any, system: "System",
         modulator=_part(parts, name, "modulator"),
     )
     ports = {
-        "dc": _UnitPort(unit.dc_bus, name, "dc"),
-        "power": _UnitPort(cfg.bus, name, "ac", phases=3),
+        "dc": _UnitPort(unit.dc_bus, name, electrical_domain="dc"),
+        "power": _UnitPort(cfg.bus, name, phases=3, electrical_domain="ac"),
     }
     return _UnitAssembly(
         units={name: unit},
@@ -252,8 +328,8 @@ def _assemble_dc_converter(name: str, cfg: Any, system: "System",
         modulator=_part(parts, name, "modulator"),
     )
     ports = {
-        "dc": _UnitPort(unit.dc_bus, name, "dc"),
-        "power": _UnitPort(cfg.bus or unit.power_bus, name, "dc"),
+        "dc": _UnitPort(unit.dc_bus, name, electrical_domain="dc"),
+        "power": _UnitPort(cfg.bus or unit.power_bus, name),
     }
     bindings = {
         unit.dc_bus: (ports["dc"],),
@@ -340,7 +416,6 @@ class System:
                           phases=values[0].phases,
                       ), (cfg, base))
                       for name, cfg in p.buses.items()}
-        self.sources = {name: _Source(name, p, p.simulation.initial.t) for name in p.sources}
         assembled = _UnitAssembly()
         for name, cfg in p.units.items():
             assembled.include(_assemble_unit(name, cfg, self, parts))
@@ -356,6 +431,17 @@ class System:
             name: [node.terminal] for name, node in self.buses.items()
         }
         network_buses = {**assembled.endpoints, **self.buses}
+
+        def resolve_bus(name: str) -> str:
+            port = assembled.endpoints.get(name) if name not in self.buses else None
+            return port.bus if port is not None else name
+
+        self.sources = {
+            name: _Source(
+                name, p, p.simulation.initial.t, network_buses[cfg.bus].phases
+            )
+            for name, cfg in p.sources.items()
+        }
         for name, cfg in p.branches.items():
             if network_buses[cfg.bus1].phases != network_buses[cfg.bus2].phases:
                 raise ConfigError(f"branches.{name}: both buses must have the same phase count")
@@ -370,28 +456,36 @@ class System:
                                       name, values[0], network_buses, values[1]), (cfg, p))
                                for name, cfg in p.elements.items()}
 
-        def resolve_bus(name: str) -> str:
-            port = assembled.endpoints.get(name) if name not in self.buses else None
-            return port.bus if port is not None else name
         branch_assemblies = tuple(_BranchAssembly(name, p.branches[name], branch)
                                   for name, branch in self.branches.items())
         elements = (*branch_assemblies, *self.sources.values(), *self.units.values(),
                     *self.named_elements.values())
+        element_terminals = tuple((element, tuple(element.terminals())) for element in elements)
         for element in elements:
             _merge_unique(subsystems, element.subsystems(), "subsystem name")
+        terminal_bindings = assembled.terminals + tuple(
+            binding for _element, bindings in element_terminals for binding in bindings
+        )
+        passive_groups = tuple(
+            bindings for element, bindings in element_terminals
+            if getattr(element, "domain_transparent", False)
+        )
+        _validate_electrical_domains(
+            assembled.endpoints, passive_groups, terminal_bindings, resolve_bus
+        )
         for bus_name, terminal in assembled.terminals:
             bus_terminals.setdefault(bus_name, []).append(terminal)
         # Every electrical connection uses the same named-terminal contract. Assembly fans one
         # driving voltage out to the followers and sums their signed currents into the driver.
-        for element in elements:
+        for element, element_bindings in element_terminals:
             for bus, inlet in getattr(element, "series_connections", lambda: {})().items():
-                terminals = bus_terminals.setdefault(resolve_bus(bus), [])
-                drivers = [terminal for terminal in terminals if terminal.drives_voltage]
+                attached = bus_terminals.setdefault(resolve_bus(bus), [])
+                drivers = [terminal for terminal in attached if terminal.drives_voltage]
                 if len(drivers) != 1:
                     raise ConfigError(f"series inlet {bus!r} needs one existing voltage driver")
-                terminals.remove(drivers[0])
+                attached.remove(drivers[0])
                 bus_terminals.setdefault(resolve_bus(inlet), []).append(drivers[0])
-            for bus_name, terminal in element.terminals():
+            for bus_name, terminal in element_bindings:
                 if not isinstance(terminal, Terminal):
                     raise TypeError(
                         f"{type(element).__name__}.terminals() returned "
@@ -572,7 +666,7 @@ class System:
                 cfg = self.units[head].cfg
                 return cfg.dclink.vdc_ref
             if word == "source":
-                internal = self.units[head].source_preset() if head in self.units else None
+                internal = self.units[head].source_preset(t) if head in self.units else None
                 if internal is not None:
                     return internal
                 bus = self.units[head].cfg.bus if head in self.units else head

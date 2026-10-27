@@ -267,10 +267,11 @@ class BranchParams:
 
 @dataclass(frozen=True)
 class SourceParams:
-    """Three-phase emf behind a series R-L impedance, connected to ``bus``.
+    """AC emf behind a series R-L impedance, connected to ``bus``.
 
-    ``l`` in H, ``r`` in ohm, ``v`` in phase-peak V (default 1 pu), ``f`` in Hz (default
-    ``base.f0``), and ``angle`` in rad; pu inputs use the system base.
+    The target's phase count selects a real single-phase waveform or the three-phase complex
+    space-vector representation. ``l`` is in H, ``r`` in ohm, ``v`` is peak voltage (default
+    1 pu), ``f`` is in Hz (default ``base.f0``), and ``angle`` is in rad.
     """
 
     bus: str
@@ -318,7 +319,7 @@ class DCCapacitorParams:
 
 @dataclass(frozen=True)
 class DCSourceParams:
-    """DC supply; ``type`` selects which fields apply (pu inputs use the unit DC base)."""
+    """DC-link supply selected by ``type`` (pu inputs use the unit DC base)."""
 
     type: str = "none"  # "none" | "current" | "voltage"
     i: float = 0.0  # current source, A, positive into the DC link
@@ -334,7 +335,8 @@ class DCSourceParams:
     @staticmethod
     def _scaled_defaults(data: dict, scales: dict[str, float]) -> dict:
         """A voltage source's emf defaults to the rated dc voltage."""
-        return {"v": scales["dc_voltage"]} if data.get("type") == "voltage" else {}
+        return ({"v": scales["dc_voltage"]}
+                if data.get("type") == "voltage" else {})
 
 
 @dataclass(frozen=True)
@@ -512,6 +514,12 @@ class BridgeParams:
     def controlled(self) -> bool:
         """Whether any device is gated; otherwise the full bridge is a diode rectifier."""
         return self.upper_controlled or self.lower_controlled
+
+    @property
+    def neutral_duty(self) -> float:
+        """Duty coordinate of zero bridge voltage, from the registered topology."""
+        from ..components.converter import topology_type
+        return topology_type(self.type).neutral_duty
 
 
 @dataclass(frozen=True, init=False)
@@ -840,6 +848,7 @@ class SolverParams:
     linearisations: int = 3  # linearisation points for the split error bound (0: none)
     write_length: int = 1000  # streamed CSV rows per write batch (>= 1)
     phs_check_step: int = 1000  # snapshots between port-Hamiltonian energy audits (>= 1)
+    measurement_interval: Optional[float] = None  # s; maximum extra ADC-integration interval
 
     _choices = {"type": ("fixed", "adaptive")}
 
@@ -1738,9 +1747,6 @@ def _written_out(p: Params) -> dict:
                 meas["period"] = u.ctrl.period
             if meas["window"] is None and meas["average"]:
                 meas["window"] = u.ctrl.period
-    for name, source in d["sources"].items():
-        if source["f"] is None:
-            source["f"] = p.base.f0
     return _switches({key: d[key] for key in _FILE_ORDER})
 
 

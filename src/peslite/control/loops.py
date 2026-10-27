@@ -32,7 +32,7 @@ __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "InductorCurrentControl", "PowerControl", "PhasePowerControl", "FrequencyPowerControl",
            "VoltageControl", "PhaseVoltageControl", "FrequencyVoltageControl", "CurrentControl",
            "PhaseCurrentControl", "FrequencyCurrentControl", "ResonantModulation",
-           "PhaseShiftModulation", "MODE"]
+           "PhaseShiftModulation", "DutyModulation", "MODE"]
 
 
 # ------------------------------------------------------------------ signals
@@ -99,6 +99,8 @@ class Loop:
     ``cfg``: the loop's parameters; ``unit``: the unit's parameters; ``startup``: the controller's
     current run/ramp state.
     ``log_outputs`` optionally names output ports to include in controller observations.
+    ``native_export = False`` declares a Python-only loop whose state transition cannot be traced
+    by generated backends.
     """
 
     type: ClassVar[str]
@@ -107,6 +109,7 @@ class Loop:
     outputs: ClassVar[Mapping[str, SignalType]] = {}
     role: ClassVar[Optional[str]] = None
     outputs_from_state: ClassVar[bool] = False  # held outputs = initial_outputs() after loading states
+    native_export: ClassVar[bool] = True
     flow_inputs: ClassVar[tuple[str, ...] | None] = None
     state_names: tuple[str, ...] | Mapping[str, str] = ()
     carried: ClassVar[tuple[str, ...]] = ()
@@ -1413,3 +1416,31 @@ class PhaseShiftModulation(Loop):
     def equation(self, width, phase, frequency, mode):
         width = min(1.0, max(0.0, self.startup.value * width))
         return width, phase, frequency, mode
+
+
+@register_loop_type
+class DutyModulation(Loop):
+    """Apply the common start-up ramp and [0, 1] limit to an open-loop duty command."""
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: Optional[float] = None
+        type: str = "duty_modulation"
+
+    type = "duty_modulation"
+    role = "modulation"
+    inputs = {"duty": DUTY_RATIO}
+    outputs = {"duty": DUTY_RATIO}
+    flow_inputs = ("duty",)
+
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
+        # Duty is a topology coordinate: zero bridge voltage is not necessarily duty zero.
+        self.neutral_duty = unit.bridge.neutral_duty
+
+    def initial_outputs(self):
+        return {"duty": self.unit.ctrl.references.duty}
+
+    def equation(self, duty):
+        duty = self.neutral_duty + self.startup.value * (duty - self.neutral_duty)
+        return (min(1.0, max(0.0, duty)),)

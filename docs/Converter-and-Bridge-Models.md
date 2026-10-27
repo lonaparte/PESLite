@@ -28,6 +28,20 @@ bridges, the following Python model classes implement the simulation form select
 The models answer different questions. Similar low-frequency trajectories do not make them
 numerically identical.
 
+| Feature | `switching` | `pwm_averaging` | `averaging` | Standalone C++ | Imperix |
+|---|---:|---:|---:|---:|---:|
+| Controlled half, full and three-phase bridges | yes | yes | yes | yes | sampled only |
+| Square-wave phase-shift modulation | yes | no | no | yes | no |
+| Diode full-bridge commutation | yes | no | no | yes | no |
+| Single-phase AC network source | yes | yes | yes | yes | plant not exported |
+| `open_loop` duty control | yes | yes | yes | yes | yes |
+| Additional ADC integration grid | yes | yes | RMS only | no | no |
+| `ModeSequence` add-on | yes | no | no | no | no |
+
+Backend entries describe export support, not whether the hardware executes the simulated plant.
+Imperix exports sampled control and peripheral bindings; continuous `averaging` is not a hardware
+control schedule.
+
 ## Scalar converter ports, device placement and DCM
 
 `DCConverter` is an open Unit, not a packaged Buck/Boost circuit. It owns a DC link, a selected

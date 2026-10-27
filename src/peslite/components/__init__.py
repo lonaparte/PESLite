@@ -7,8 +7,8 @@ models use the ADC (:mod:`.adc`) and own their PWM timing/register implementatio
 """
 
 from ..solver import Bag, ConfigError, PowerPort, StoragePort
-from .network import (ELEMENT_TYPES, Element, Load, Resistor, RCNode, RLBranch, Terminal,
-                      ThreePhaseSource, VoltageSource, register_element_type)
+from .network import (ACVoltageSource, ELEMENT_TYPES, Element, Load, Resistor, RCNode, RLBranch,
+                      Terminal, VoltageSource, register_element_type)
 from .converter import (AveragingModel, PWMAveragingModel, SwitchingModel,
                         ThreePhaseBridge,
                         DCCapacitor, DCCurrentSource, DCLink,
@@ -21,11 +21,12 @@ from .pwm import (ZOH, CarrierComparison, PWM, PhaseShiftModulator, SwitchingSeq
 from .wpt import (CompensatedLink, SwitchControlledCapacitor, SwitchedCompensatedLink,
                   make_wpt_link)
 
-__all__ = ["Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
+__all__ = ["Terminal", "ACVoltageSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
            "Bag", "ConfigError", "PowerPort", "StoragePort",
            "register_element_type", "Load", "Resistor", "VoltageSource", "ThreePhaseBridge", "SwitchingModel",
            "PWMAveragingModel", "make_bridge", "DCLink",
-           "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink", "ADC", "ADCSample",
+           "DCCapacitor", "DCCurrentSource", "DCVoltageSource",
+           "make_dclink", "ADC", "ADCSample",
            "MeasurementPorts", "AveragingModel", "HalfBridge",
            "FullBridge", "HalfBridgeDiodeConduction", "PWM", "SwitchingSequence",
            "CarrierComparison", "SynchronousCarrier", "ZOH", "PhaseShiftModulator", "make_modulator",

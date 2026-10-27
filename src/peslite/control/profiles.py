@@ -50,6 +50,13 @@ class ResonantReferenceParams:
 
 
 @dataclass(frozen=True)
+class DutyReferenceParams:
+    """Open-loop duty-ratio command in [0, 1]."""
+
+    duty: float
+
+
+@dataclass(frozen=True)
 class PhaseShiftReferenceParams:
     """Square-wave commands: pulse ``width`` in half periods, ``frequency`` (Hz), ``phase``
     (rad, centre of the positive pulse), ``mode`` (0 bipolar pulses, 1 positive pulse,
@@ -99,6 +106,11 @@ def _validate_modulation_references(references: Any, where: str, amplitude: str)
 
 def validate_resonant_references(references: Any, where: str) -> None:
     _validate_modulation_references(references, where, "modulation")
+
+
+def validate_duty_references(references: Any, where: str) -> None:
+    if not math.isfinite(references.duty) or not 0.0 <= references.duty <= 1.0:
+        raise ConfigError(f"{where}.duty must be in [0, 1]")
 
 
 # Each mode defines its pulses as (centre offset in rad, signed bridge level).

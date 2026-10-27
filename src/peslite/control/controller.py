@@ -27,9 +27,11 @@ from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MO
                     SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ, CurrentLoop,
                     Loop, SignalType, SyncLaw)
 from .modulation import CONFIGURED, OutputStage
-from .profiles import (PhaseShiftReferenceParams, ReferenceParams, ResonantReferenceParams,
+from .profiles import (DutyReferenceParams, PhaseShiftReferenceParams, ReferenceParams,
+                       ResonantReferenceParams,
                        ScalarVoltageReferenceParams, control_type,
-                       register_control_type, validate_phase_shift_references,
+                       register_control_type, validate_duty_references,
+                       validate_phase_shift_references,
                        validate_resonant_references,
                        validate_scalar_voltage_references)
 
@@ -1661,6 +1663,16 @@ RESONANT_CONVERTER_INTERFACE = ControlInterface(
 )
 
 
+OPEN_LOOP_CONVERTER_INTERFACE = ControlInterface(
+    inputs=MappingProxyType({
+        **_CONVERTER_MEASUREMENT_INPUTS,
+        "references.duty": DUTY_RATIO,
+    }),
+    outputs=MappingProxyType({"duty": DUTY_RATIO}),
+    optional_inputs=frozenset(("meas.power",)),
+)
+
+
 PHASE_SHIFT_CONVERTER_INTERFACE = ControlInterface(
     inputs=MappingProxyType({
         **_CONVERTER_MEASUREMENT_INPUTS,
@@ -2006,6 +2018,18 @@ register_control_type(
     default_bridge="half_bridge",
     controller_factory=GraphController,
     reference_validator=validate_scalar_voltage_references,
+)
+register_control_type(
+    "open_loop",
+    references=DutyReferenceParams,
+    unit_types=frozenset(("dc_converter",)),
+    interface=OPEN_LOOP_CONVERTER_INTERFACE,
+    wiring=_modulation_wiring,
+    log_sources=_converter_log_sources(input_voltage="meas.vin",
+                                       duty_reference="references.duty"),
+    default_bridge="half_bridge",
+    controller_factory=GraphController,
+    reference_validator=validate_duty_references,
 )
 register_control_type(
     "phase_shift",

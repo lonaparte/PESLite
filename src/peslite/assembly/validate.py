@@ -63,13 +63,19 @@ def _dclink(cfg, where):
             raise ConfigError(f"{where}.source.{key} must be finite")
     if source.v < 0 or source.r < 0:
         raise ConfigError(f"{where}.source.v and r must be nonnegative")
-    allowed = {"current": {"i", "k"}, "voltage": {"v", "r"}, "none": set()}[source.type]
-    for key, default in {"i": 0.0, "k": 0.0, "v": 0.0, "r": 0.0}.items():
+    allowed = {
+        "current": {"i", "k"},
+        "voltage": {"v", "r"},
+        "none": set(),
+    }[source.type]
+    defaults = {"i": 0.0, "k": 0.0, "v": 0.0, "r": 0.0}
+    for key, default in defaults.items():
         if key not in allowed and getattr(source, key) != default:
             raise ConfigError(f"{where}.source.{key} is not used by source.type = {source.type!r}")
-    if cap is None and source.type != "voltage":
+    voltage_source = source.type == "voltage"
+    if cap is None and not voltage_source:
         raise ConfigError(f"{where}: without a capacitor, a voltage source is required")
-    if cap is not None and source.type == "voltage" and cap.r_esr + source.r <= 0:
+    if cap is not None and voltage_source and cap.r_esr + source.r <= 0:
         raise ConfigError(f"{where}: a voltage source with a capacitor requires positive source resistance or ESR")
 
 
@@ -444,9 +450,7 @@ def _network(p: Params) -> None:
         if br.l <= 0.0:
             raise ConfigError(f"branches.{name}.l must be > 0")
     for name, src in p.sources.items():
-        _bus_of(f"sources.{name}.bus", src.bus)
-        if p.buses[src.bus].phases != 3:
-            raise ConfigError(f"sources.{name}.bus: a three-phase source needs a three-phase bus")
+        _element_bus(f"sources.{name}.bus", src.bus)
         if src.f is not None and (not math.isfinite(src.f) or src.f <= 0.0):
             raise ConfigError(f"sources.{name}.f must be finite and positive, got {src.f}")
         if not math.isfinite(src.angle):
@@ -488,6 +492,9 @@ def _solver(s) -> None:
         raise ConfigError("simulation.solver.write_length must be >= 1")
     if s.phs_check_step < 1:
         raise ConfigError("simulation.solver.phs_check_step must be >= 1")
+    if (s.measurement_interval is not None
+            and (not math.isfinite(s.measurement_interval) or s.measurement_interval <= 0.0)):
+        raise ConfigError("simulation.solver.measurement_interval must be finite and positive")
     for name, value in s.subsystems.items():
         where = f"simulation.solver.subsystems.{name}"
         if s.type != "fixed":

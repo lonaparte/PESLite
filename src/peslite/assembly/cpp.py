@@ -23,7 +23,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from ..components.converter import DCLink
-from ..components.network import RLBranch, ThreePhaseSource
+from ..components.network import ACVoltageSource, RLBranch
 from ..components.pwm import CarrierComparison, SynchronousCarrier, PhaseClock, PhaseShiftModulator, ZOH
 from ..control.profiles import PHASE_SHIFT_MODES
 from ..control.blocks import OutputLimit
@@ -34,7 +34,8 @@ from ..solver.model import _strong_components, commutation_tolerance
 from .conduction import DiodeConduction, _LOCATOR_ITERATIONS, _MAX_COMMUTATIONS
 from .params import (BaseValues, SourceParams, UnitParams, _PARAMETER_RECORDER, _event_assignments,
                      _written_out, connection_defaults, dumps, parameter_leaves)
-from .exporter import ExportResult, _exporter, _signal_names
+from .exporter import (ExportResult, _exporter, _signal_names,
+                       _validate_dynamic_capabilities)
 from .system import _source_scenario
 from .types import unit_type
 from .unit import Plant
@@ -1786,14 +1787,15 @@ class _ModelGenerator:
         terms = [f"({_number(gain)} * {self.value(out, name)})" for out, name, gain in fanin]
         return " + ".join(terms) if terms else "0.0"
 
-    def _source_values(self, source: ThreePhaseSource) -> tuple[str, str]:
+    def _source_values(self, source: ACVoltageSource) -> tuple[str, str]:
         entry = next(((name, item) for name, item in self.system.sources.items()
                       if item.emf is source), None)
         wrapper = entry[1] if entry is not None else None
         if wrapper is None:
             return _number(source.e_peak), "0.0"
         source_name = entry[0]
-        scenario = _source_scenario(self.p, source_name)
+        scenario = _source_scenario(self.p, f"sources.{source_name}",
+                                    lambda q: q.sources[source_name])
 
         def piecewise(starts, expressions):
             result = expressions[0]
@@ -1831,9 +1833,10 @@ class _ModelGenerator:
         phi = re.sub(r"\bt\b", f"({time})", phi)
         magnitude = re.sub(r"\bt\b", f"({time})", magnitude)
         theta = f"({_number(self.runtime.object(source).w0)} * ({time}) + ({phi}))"
+        voltage = (f"({magnitude}) * std::cos({theta})" if source.phases == 1 else
+                   f"({magnitude}) * Complex{{std::cos({theta}), std::sin({theta})}}")
         return {"phi": _Expression(phi, "real"), "theta": _Expression(theta, "real"),
-                "e_g": _Expression(
-                    f"({magnitude}) * Complex{{std::cos({theta}), std::sin({theta})}}", "complex")}
+                "e_g": _Expression(voltage, "real" if source.phases == 1 else "complex")}
 
     def _output(self, method: Any) -> list[str]:
         owner = method.__self__
@@ -1841,8 +1844,8 @@ class _ModelGenerator:
         hook = getattr(owner, "cpp_outputs", None)
         if hook is not None:
             return list(hook(self))
-        if (isinstance(owner, ThreePhaseSource)
-                and method.__func__ is ThreePhaseSource.set_outputs):
+        if (isinstance(owner, ACVoltageSource)
+                and ACVoltageSource.uses_standard_outputs(method)):
             return [f"{self.value(out, field)} = {value.code};"
                     for field, value in self._source_equations(owner).items()]
         generator = self.continuous_units.get(id(owner))
@@ -2106,7 +2109,8 @@ class _ModelGenerator:
         try:
             method = sub.rhs
             if (type(sub) is RLBranch and getattr(method, "__func__", None) in
-                    (RLBranch._rhs_ordinary, RLBranch._rhs_open, RLBranch._rhs_conduction)):
+                    (RLBranch._rhs_ordinary, RLBranch._rhs_bilateral, RLBranch._rhs_unilateral,
+                     RLBranch._rhs_open, RLBranch._rhs_conduction)):
                 method = RLBranch.rhs.__get__(sub)
             return self.trace_rhs(sub, method, self._equation_attributes(sub))
         except Exception as exc:
@@ -4820,7 +4824,7 @@ class _CppGenerator:
         t0 = self.p.simulation.initial.t
         for name, source in self.system.sources.items():
             view = copy.copy(source)
-            if source.emf.set_outputs.__func__ is ThreePhaseSource.set_outputs:
+            if ACVoltageSource.uses_standard_outputs(source.emf.set_outputs):
                 expression = model._source_equations(source.emf, _number(t0))["e_g"]
             else:
                 def read():
@@ -5952,6 +5956,7 @@ def _parameter_generator(prepared, name, variables, initializations, *, constant
 def _export_cpp(simulation: Any, out_dir: Path, name: str,
                 variables: tuple[str, ...], reusable: bool) -> ExportResult:
     """Write one self-contained, parameter-specialised C++17 translation unit."""
+    _validate_dynamic_capabilities(simulation, "C++")
     prepared, initializations = _prepare_export(simulation, variables, reusable)
     if prepared.p.simulation.solver.subsystems:
         raise TypeError(

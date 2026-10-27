@@ -164,6 +164,7 @@ simulation:                # how the model is simulated
     # linearisations: 3    # points of the split error bound (0: none)
     # write_length: 1000   # streamed CSV rows written per batch
     # phs_check_step: 1000  # snapshots between port-Hamiltonian energy audits
+    # measurement_interval: 1e-6  # optional maximum interval for ADC-window integration, s
   # initial:               # default: buses at their source's emf, dc capacitors at vdc_ref, the rest at zero
   #   t: 0.0               # exact start time; not moved to a control or PWM timer point
   #   states: {vsc.u_dc: 1450.0}  # any states.csv row can continue a run; keywords: source, rated

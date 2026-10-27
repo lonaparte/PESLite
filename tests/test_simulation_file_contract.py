@@ -7,6 +7,7 @@ from peslite.solver import simulation
 from peslite.solver.simulation import _config_path
 
 EXPECTED = {
+    "buck-open-loop-example.pes",
     "buck-example.pes",
     "boost-example.pes",
     "buck-boost-example.pes",
@@ -22,6 +23,8 @@ EXPECTED = {
     "wpt-ss-example.pes",
     "wpt-lcc-example.pes",
     "wpt-load-example.pes",
+    "wpt-phase-shift-example.pes",
+    "wpt-scc-example.pes",
 }
 
 

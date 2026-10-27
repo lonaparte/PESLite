@@ -14,7 +14,7 @@ from ._discovery import discover_modules
 control.discover()
 components.discover()
 
-__all__ = ["control", "components", "functions", "plot_csv", "plot_result"]
+__all__ = ["control", "components", "functions", "energy_closure", "plot_csv", "plot_result"]
 
 
 def _merge_path(package, directory: Path) -> bool:
@@ -67,8 +67,9 @@ def __getattr__(name: str) -> Any:
         module = import_module(f"{__name__}.functions")
         globals()[name] = module
         return module
-    if name in {"plot_csv", "plot_result"}:
+    if name in {"energy_closure", "plot_csv", "plot_result"}:
         module = import_module(f"{__name__}.functions")
-        globals().update({public: getattr(module, public) for public in ("plot_csv", "plot_result")})
+        globals().update({public: getattr(module, public)
+                          for public in ("energy_closure", "plot_csv", "plot_result")})
         return globals()[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

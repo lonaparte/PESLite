@@ -10,7 +10,7 @@ from peslite.assembly.cpp import (_ALGEBRAIC_SOLVER, _ControlGenerator, _ModelGe
                                   _RuntimeParameters, _number, _uses_implementation)
 from peslite.components import Bag
 from peslite.components.converter import DCCapacitor, DCLink, DCVoltageSource
-from peslite.components.network import RLBranch, RCNode, ThreePhaseSource
+from peslite.components.network import ACVoltageSource, RLBranch, RCNode
 from peslite.solver.model import Empty, Model
 from peslite.control import Loop
 from peslite.control.blocks import PI
@@ -239,12 +239,25 @@ def test_native_multivariable_feedback_keeps_the_previous_output_between_calls(t
 
 
 def test_native_inherited_source_keeps_the_existing_adapter():
-    class AnnotatedSource(ThreePhaseSource):
+    class AnnotatedSource(ACVoltageSource):
         pass
 
     source = AnnotatedSource(314.0, 325.0)
     generator = _generator(Model({'source': source}, {}))
     assert any('std::cos' in line for line in generator._output(source.set_outputs))
+
+
+@pytest.mark.parametrize("phases", [1, 3])
+def test_native_ac_source_preserves_the_connected_phase_representation(phases, tmp_path):
+    source = ACVoltageSource(2.0 * np.pi * 50.0, 325.0, phases=phases)
+    model = Model({"source": source}, {})
+    times = (0.0, 1.0e-3, 2.5e-3)
+    actual = _run_model(model, [(source.out, "e_g")], tmp_path, times=times)
+    expected = []
+    for time in times:
+        source.set_outputs(time)
+        expected.append(source.out.e_g)
+    np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
 
 
 class _ModifiedBranch(RLBranch):

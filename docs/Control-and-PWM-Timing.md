@@ -77,6 +77,12 @@ meas:
 the control period and cannot exceed it. Window integrals are named states so a saved run can
 restore an open window; the individual intermediate oversamples are not persisted.
 
+ADC windows use the simulation event grid by default. Setting
+`simulation.solver.measurement_interval` to a positive duration adds integration points so no
+accumulated interval is longer than that value. This makes a window mean independent of the output
+snapshot period without claiming access to an adaptive solver's private accepted steps. The extra
+measurement grid is a Python simulation feature.
+
 For oscillating scalar ports, average `power` itself rather than multiplying separately averaged
 voltage and current. A carrier-boundary voltage sample may be zero even during nonzero power
 transfer. The WPT feedback cases use the ordinary ADC window for that product and an ordinary

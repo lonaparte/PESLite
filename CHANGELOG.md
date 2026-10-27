@@ -2,6 +2,10 @@
 
 ## 0.4.0
 
+- Added single-phase AC network sources through ordinary scalar power ports and assembly-time
+  electrical-domain constraints on inherently AC or DC terminals. Also added bounded-grid ADC
+  window integration, open-loop duty control, the `ModeSequence` add-on and an energy-closure
+  helper, with runnable Buck and WPT examples.
 - Discovered retained C++ parameters from the ordinary schemas and recorded component construction,
   removing the separate small device-parameter whitelist. Numerical physical/control parameters,
   derived defaults, initialization and energy coefficients now share their normal parameter paths;
@@ -55,7 +59,7 @@
   located by a bracketed search on the solver's step map; scheduled instants end steps exactly and the
   subsystem's own states are written back. Margins are checked every fixed step or adaptive
   `max_step` (which must then be finite). A Zeno guard rejects endless commutation at one
-  instant; windowed multirate groups and C++/Imperix export reject commutating models.
+  instant; windowed multirate groups and Imperix hardware export reject commutating models.
 - Added diode full-bridge rectifiers (`upper_controlled: 0`, `lower_controlled: 0`) without
   controller or PWM. A blocked bridge applies its connected terminal's hold voltage, so discontinuous
   conduction follows from the circuit; optional `parallel_capacitance` needs a stiff DC side.
