@@ -50,6 +50,29 @@ def _tree(link, v2, t_end, capacitance=0.0, dt=20e-9):
                                       "signals": True, "energy": False}}}
 
 
+def test_bridge_model_selection_does_not_change_natural_rectifier_commutation(tmp_path):
+    results = {}
+    implementations = []
+    for model in ("switching", "pwm_averaging", "averaging"):
+        tree = _tree(SS, 220.0, 30e-6)
+        tree["units"]["charger"]["secondary"]["bridge"]["model"] = model
+        simulation = peslite.Simulation(from_dict(tree))
+        bridge = simulation.unit("charger.secondary").bridge
+        implementations.append((bridge.set_dc_current.__func__, bridge.set_ac_voltage.__func__))
+        result = simulation.run(out_dir=tmp_path / model)
+        columns = result.columns()
+        results[model] = (
+            np.asarray(result.t),
+            np.asarray(columns["charger.secondary.i_dc"]),
+            np.asarray(columns["charger.link.i_secondary_coil"]),
+        )
+
+    assert implementations[1:] == implementations[:1] * 2
+    for model in ("pwm_averaging", "averaging"):
+        for actual, expected in zip(results[model], results["switching"]):
+            np.testing.assert_array_equal(actual, expected)
+
+
 L1 = L2 = 100e-6
 M = 30e-6
 C_60K = 1.0 / ((2 * math.pi * 60e3) ** 2 * L1)
@@ -249,6 +272,13 @@ def test_continuation_from_saved_states_reproduces_the_run(tmp_path):
 
 def test_diode_full_bridge_configuration_is_checked():
     tree = _tree(SS, 200.0, 1e-5)
+    default_model = copy.deepcopy(tree)
+    default_model["units"]["charger"]["secondary"]["bridge"].pop("model")
+    params = from_dict(default_model)
+    assert params.unit("charger.secondary").bridge.model == "pwm_averaging"
+    assert peslite.Simulation(params).unit("charger.secondary").bridge.describe().startswith(
+        "diode full-bridge rectifier"
+    )
     with_ctrl = copy.deepcopy(tree)
     with_ctrl["units"]["charger"]["secondary"]["ctrl"] = {"type": "resonant", "loops": {}}
     with pytest.raises(ConfigError, match="no ctrl"):

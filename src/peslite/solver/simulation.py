@@ -42,7 +42,7 @@ from ..assembly.unit import Plant, Unit
 from ..components.pwm import Modulator
 from ..control.blocks import abc2complex, complex2abc
 from ..control.controller import Controller
-from .integrators import Solver, subintervals
+from .integrators import Solver
 from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
 from .multirate import make_solver
 from .splitbound import split_error_bound
@@ -858,6 +858,7 @@ class Simulation:
         controls = tuple((unit.name, unit.ctrl) for unit in units if unit.ctrl is not None)
         continuous_controls = tuple((unit_name, ctrl) for unit_name, ctrl in controls
                                     if getattr(ctrl, "continuous", False))
+        output_clocked = any(unit.continuous for unit in units)
         ctrl_names = {unit_name: getattr(ctrl, "log_names", lambda: ())()
                       for unit_name, ctrl in controls}
         for unit_name, ctrl in controls:
@@ -994,46 +995,24 @@ class Simulation:
                     y = settle(t_b, y)
                 return project(y)
 
-        measurement_interval = (p.simulation.solver.measurement_interval if windowed else None)
-
         def advance(t_a: float, t_b: float, event: bool = False) -> bool:
             """Integrate over ``[t_a, t_b]``; ``event`` means the model changes at ``t_b``."""
             nonlocal t_local, stop_reason, coarse_reported
             plant.invalidate()
-            t_i = t_a
-            t_j = t_b
             try:
-                if measurement_interval is None:
-                    plant.state = integrate(t_a, t_b, plant.state, event)
-                else:
-                    pieces = subintervals(t_b - t_a, measurement_interval)
-                    for k in range(1, pieces + 1):
-                        t_j = t_b if k == pieces else t_a + k * (t_b - t_a) / pieces
-                        plant.state = integrate(t_i, t_j, plant.state, event and k == pieces)
-                        plant.invalidate()
-                        if not _finite(plant.state):
-                            break
-                        if k < pieces:
-                            sync_if_needed(t_j)
-                            for unit in windowed:
-                                unit.accumulate(t_j - t_i)
-                            t_i = t_j
+                plant.state = integrate(t_a, t_b, plant.state, event)
             except (OverflowError, FloatingPointError):
-                stop_reason = (f"diverged: the states overflowed between t = {t_i:.6g} s "
-                               f"and {t_j:.6g} s")
-                t_local = t_i
+                stop_reason = (f"diverged: the states overflowed between t = {t_a:.6g} s "
+                               f"and {t_b:.6g} s")
+                t_local = t_a
                 return True
             plant.invalidate()
-            t_local = t_j
+            t_local = t_b
             finite = _finite(plant.state)
-            if windowed and finite:
-                sync_if_needed(t_b)
-                for unit in windowed:
-                    unit.accumulate(t_b - t_i)
-            elif finite:
+            if finite:
                 mdl.set_states(plant.state)
             if not finite:
-                stop_reason = f"diverged: non-finite states at t = {t_j:.6g} s"
+                stop_reason = f"diverged: non-finite states at t = {t_b:.6g} s"
                 return True
             coarse = getattr(solver, "coarse_hold", None)
             if coarse is not None and not coarse_reported:
@@ -1064,20 +1043,19 @@ class Simulation:
             if windowed and (changed or plant.zoh_changed):
                 sync_if_needed(t_now)
                 for unit in windowed:
-                    unit.restart_windows()
+                    unit.restart_windows(t_now)
 
         # ---------------------------------------------------------------- the event grid
         self._begin_units(t_start, plant)
         while True:
             plant.inputs_changed = False
             t_log = n_log * log_period
-            t_stop = t_log
+            physical_stop = min(t_final, t_log) if output_clocked else t_final
             for unit in units:
-                t_stop = min(t_stop, unit.next_time())
+                physical_stop = min(physical_stop, unit.next_time())
             if actions:
-                t_stop = min(t_stop, actions[0][0])
-            if t_stop > t_final - _EPS:
-                t_stop = t_final
+                physical_stop = min(physical_stop, actions[0][0])
+            t_stop = min(t_log, physical_stop)
             native_stop = t_stop
             if observations and observations[0] < t_stop - _EPS:
                 t_stop = observations[0]
@@ -1093,6 +1071,20 @@ class Simulation:
             if observation_only:
                 snapshot(t_local, record=False)
                 continue
+            physical_due = physical_stop <= t_stop + _EPS
+            if not physical_due:
+                snapshot(t_local, notify=(observe_output or observation_due))
+                n_log += 1
+                if t_local >= next_report:
+                    suffix = watched(t_local) if watch else ""
+                    print(f"  t = {t_local:8.4f} s   wall {time.time() - wall0:8.1f} s{suffix}",
+                          flush=True)
+                    next_report += progress_every
+                continue
+            if windowed:
+                sync_if_needed(t_stop)
+                for unit in windowed:
+                    unit.accumulate(t_stop)
             # File events run before the coincident protection/control/PWM events.
             if event_due:
                 if advancing:  # advance() already settled at t_stop

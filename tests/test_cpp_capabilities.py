@@ -26,7 +26,21 @@ def test_generated_cpp_matches_the_open_loop_buck(tmp_path):
     assert max(abs(actual[key] - expected[key]) for key in expected) <= 1.0e-8 * scale
 
 
-def test_cpp_rejects_the_python_only_mode_sequence(tmp_path):
-    params = peslite.load(EXAMPLES / "wpt-phase-shift-example.pes")
-    with pytest.raises(ValueError, match="ModeSequence"):
-        peslite.Simulation(params).export("cpp", tmp_path)
+def test_cpp_traces_mode_sequence_through_the_common_loop_path(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "wpt-phase-shift-example.pes").replace(**{
+        "simulation.t_end": 50.0e-6,
+        "simulation.output.states": True,
+        "simulation.output.signals": False,
+        "simulation.energy_check": "off",
+    })
+    source, cpp_out, python_out = _run_generated(params, tmp_path, compiler)
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
+    scale = max(1.0, *(abs(value) for value in expected.values()))
+
+    assert "ModeSequence_position_0" in source.read_text(encoding="utf-8")
+    assert actual.keys() == expected.keys()
+    assert max(abs(actual[key] - expected[key]) for key in expected) <= 1.0e-8 * scale

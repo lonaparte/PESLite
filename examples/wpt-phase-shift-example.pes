@@ -41,11 +41,9 @@ units:
           PowerControl.reference: references.power
           PowerControl.power: meas.power
           PowerControl.feedforward: references.width
-          ModeSequence.width: PowerControl.modulation
-          ModeSequence.phase: references.phase
           PhaseShiftModulation.mode: ModeSequence.mode
-          PhaseShiftModulation.width: ModeSequence.width
-          PhaseShiftModulation.phase: ModeSequence.phase
+          PhaseShiftModulation.width: PowerControl.modulation
+          PhaseShiftModulation.phase: references.phase
 
     secondary:
       type: dc_converter

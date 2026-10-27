@@ -162,9 +162,9 @@ Its references are `width` (pulse width in half periods, [0, 1]), `frequency` (H
 feedback loops drive its inputs through `ctrl.connections`. `pwm.f_sw` sets the control and
 register-load clock; `bridge.model` must be `switching`.
 
-The optional `ModeSequence` add-on emits one entry of a repeating mode/width/phase pattern on each
-of its sampled updates. Its `period` defaults to `ctrl.period`; the complete graph wiring is shown
-in `wpt-phase-shift-example.pes`.
+The optional `ModeSequence` add-on emits one entry of a repeating integer-mode pattern on each of
+its sampled updates. Its `period` defaults to `ctrl.period`; the complete graph wiring is shown in
+`wpt-phase-shift-example.pes`. The receiving modulation loop defines the meaning of each mode.
 
 ```yaml
     primary:
@@ -264,19 +264,22 @@ commutation protocol, including named-state continuation and parameter overrides
 ### Diode full-bridge rectifiers
 
 A `full_bridge` with neither device row gated is a diode rectifier. It has no `ctrl` or `pwm`;
-`bridge.model` must be `switching`. For example, a WPT secondary may be configured as:
+its natural-commutation law is unchanged by the controlled-bridge model preset. For example, a WPT
+secondary may be configured as:
 
 ```yaml
     secondary:
       type: dc_converter
       dclink: {vdc_ref: 300.0, source: {type: voltage}}
-      bridge: {type: full_bridge, upper_controlled: 0, lower_controlled: 0, model: switching}
+      bridge: {type: full_bridge, upper_controlled: 0, lower_controlled: 0}
 ```
 
 The diode commutations are located exactly (see
 [Converter and Bridge Models](Converter-and-Bridge-Models.md#diode-full-bridge-rectifier)). Blocking
 uses the connected terminal's zero-current voltage law, available on ordinary R-L branches and
 compensated links. No unit-type or restriction to one rectifying side is imposed.
+Selecting `switching`, `pwm_averaging` or `averaging` changes controlled bridges and the associated
+solver preset, but it does not replace this controllerless bridge's natural-conduction equations.
 `meas` may configure independent sampling, means, RMS and existing physical sources; its
 `period` defaults to the output period when there is no controller.
 Optional `bridge.parallel_capacitance` (F) models the equivalent port capacitance and requires

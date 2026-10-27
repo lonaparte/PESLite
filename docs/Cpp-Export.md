@@ -251,9 +251,6 @@ common trip path, not a WPT phase override.
 
 - Supported solvers are fixed `euler`, `heun` and `rk4`, plus adaptive `DP45`.
 - Multirate subsystem schedules are not currently lowered to C++.
-- An additional ADC integration grid is currently Python-only; generated backends require
-  `simulation.solver.measurement_interval` to be omitted.
-- `ModeSequence` is currently Python-only. Open-loop duty control is supported by standalone C++.
 - Imperix hardware adapters do not implement plant commutations. Standalone C++ uses the
   component commutation interfaces described below.
 - Arbitrary Python behavior is not embedded in the standalone executable. File or network I/O,

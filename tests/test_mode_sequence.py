@@ -1,4 +1,4 @@
-"""ModeSequence emits a reusable phase-shift bridge pattern."""
+"""ModeSequence emits a reusable sampled integer-mode pattern."""
 
 import math
 
@@ -17,11 +17,9 @@ def _sequence(modes, **extra):
         "PhaseShiftModulation": {},
     }
     primary["ctrl"]["connections"] = {
-        "ModeSequence.width": "references.width",
-        "ModeSequence.phase": "references.phase",
         "PhaseShiftModulation.mode": "ModeSequence.mode",
-        "PhaseShiftModulation.width": "ModeSequence.width",
-        "PhaseShiftModulation.phase": "ModeSequence.phase",
+        "PhaseShiftModulation.width": "references.width",
+        "PhaseShiftModulation.phase": "references.phase",
     }
     return _ps_tree(primary, _rectifier(150.0), 4.0 / F)
 
@@ -29,18 +27,16 @@ def _sequence(modes, **extra):
 def test_sequence_advances_and_restores_its_named_state():
     simulation = peslite.Simulation(from_dict(_sequence([1, 0, 4])))
     node = simulation.system.units["charger.primary"].ctrl.graph.nodes["ModeSequence"]
-    inputs = {"width": 0.7, "phase": 0.2}
+    inputs = {}
 
     assert [node.sample(k / F, inputs)["mode"] for k in range(4)] == [1.0, 0.0, 4.0, 1.0]
-    node.set_state({"index": 2})
+    node.set_state({"position_0": 0.0, "position_1": 0.0, "position_2": 1.0})
     assert node.sample(0.0, inputs)["mode"] == 4.0
 
 
 def test_sequence_parameters_and_period_are_checked():
-    with pytest.raises(ConfigError, match="unknown mode"):
-        from_dict(_sequence([1, 2]))
-    with pytest.raises(ConfigError, match="one entry per mode"):
-        from_dict(_sequence([1, 0], widths=[0.5]))
+    with pytest.raises(ConfigError, match="entries must be integers"):
+        from_dict(_sequence([1, "off"]))
     slow = _sequence([1, 0, 4])
     slow["units"]["charger"]["primary"]["ctrl"]["loops"]["ModeSequence"][
         "period"

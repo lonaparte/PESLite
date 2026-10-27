@@ -17,8 +17,8 @@ from typing import Any, Callable, Iterator, Mapping, Optional
 import numpy as np
 
 from ..components.adc import ADC, ADCSample, MeasurementPorts
-from ..components.converter import (DCVoltageSource, HalfBridgeDiodeConduction, make_bridge,
-                                    make_dclink, make_topology)
+from ..components.converter import (HalfBridgeDiodeConduction, make_bridge, make_dclink,
+                                    make_topology)
 from ..components.network import RLBranch, Terminal
 from ..components.pwm import TIME_EPS, Modulator
 from ..control.blocks import phases
@@ -136,7 +136,7 @@ class Unit(ABC):
 
         self.adc = _parameterized(make_adc, (self.cfg, sim))
         self.windowed = self.adc.accumulating
-        self.accumulate, self.restart_windows = self.adc.accumulate, self.adc.seed
+        self.accumulate, self.restart_windows = self.adc.accumulate_to, self.adc.seed
         self._oversamples = self.adc.samples > 1
 
     @abstractmethod
@@ -308,7 +308,8 @@ class Unit(ABC):
             self._start_continuous_bridge(t)
             if self.adc is not None:
                 plant.outputs(t)
-                self.adc.seed()
+                if not self.adc.integration_anchor_restored:
+                    self.adc.seed(t)
                 if self.adc.clocked:
                     self.adc.start(t, held=not window_given)
             return
@@ -389,8 +390,8 @@ class Unit(ABC):
         trip = self.protection.trip
         return trip.cause if trip is not None else None
 
-    def source_preset(self, t: float) -> float | None:
-        """Return an internal source voltage at ``t`` for initial-state presets."""
+    def source_preset(self) -> float | None:
+        """Return an internal source voltage for initial-state presets."""
         return None
 
     def _controller_command(self, run: bool, ramp: float = 0.0,
@@ -562,7 +563,8 @@ class Unit(ABC):
         )
         if self.windowed:
             plant.outputs(t)
-            self.adc.seed()
+            if not self.adc.integration_anchor_restored:
+                self.adc.seed(t)
         bridge = self.bridge
         self.adc.start(
             t,
@@ -990,9 +992,9 @@ class DCConverter(Unit):
             values.get("power"),
         )
 
-    def source_preset(self, t: float) -> float:
-        source = self.dclink.source
-        return source.emf(t) if isinstance(source, DCVoltageSource) else self.cfg.dclink.vdc_ref
+    def source_preset(self) -> float:
+        source = self.cfg.dclink.source
+        return source.v if source.type == "voltage" else self.cfg.dclink.vdc_ref
 
     def _current(self) -> float:
         if self.branch_f is not None:

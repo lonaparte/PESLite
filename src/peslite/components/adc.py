@@ -156,6 +156,8 @@ class ADC:
         self._zero = channels
         self.accumulated = dict(channels)
         self._last = dict(channels)  # previous sample
+        self.integration_time = 0.0
+        self._anchor_restored = False
         self.period, self.sample_period = period, sample_period
         self.samples = max(1, int(round(period / sample_period)))
         self.peeks: list[ADCSample] = []  # instantaneous samples since the last interrupt
@@ -177,6 +179,11 @@ class ADC:
         return self.averaging or bool(self.rms)
 
     @property
+    def integration_anchor_restored(self) -> bool:
+        """Whether restart data supplied the complete quadrature anchor."""
+        return self._anchor_restored
+
+    @property
     def means(self) -> dict[str, complex | float]:
         """The mean channels of the same held sample, without a second value store."""
         return {channel: self.values[channel] for channel in self.channels} if self.clocked else {}
@@ -194,6 +201,7 @@ class ADC:
     def periodic_state(self, values: Mapping[str, Any]) -> dict[str, Any]:
         """Compare RMS history in chronological order, without its rotating storage index."""
         result = dict(values)
+        result.pop("integration_time", None)
         for channel, window in self.rms.items():
             prefix = f"rms_{channel}."
             index = int(result.pop(prefix + "index"))
@@ -244,7 +252,7 @@ class ADC:
                 np.floor((t + TIME_EPS) / self.period) + 1)
 
     # ------------------------------------------------------------ the window
-    def seed(self) -> None:
+    def seed(self, t: float | None = None) -> None:
         """Start the next integration interval from the values after changes at this instant."""
         for channel, averaged, window in self._integrated:
             value = self.ports.readers[channel]()
@@ -252,6 +260,9 @@ class ADC:
                 self._last[channel] = value
             if window is not None:
                 window.last = re_product(value, value)
+        if t is not None:
+            self.integration_time = float(t)
+        self._anchor_restored = True
 
     def held_before(self, duration: float) -> None:
         """Count the current values as held for ``duration`` seconds before the run starts."""
@@ -271,6 +282,14 @@ class ADC:
                 self._last[channel] = value
             if window is not None:
                 window.accumulate(dt, value)
+
+    def accumulate_to(self, t: float) -> None:
+        """Advance every open integral to absolute time ``t`` on the physical event grid."""
+        dt = float(t) - self.integration_time
+        if dt < -TIME_EPS:
+            raise ValueError("ADC integration time cannot move backwards")
+        self.accumulate(max(0.0, dt))
+        self.integration_time = float(t)
 
     def open(self) -> None:
         """Start the window ending at the next control interrupt."""
@@ -344,12 +363,20 @@ class ADC:
 
     # ------------------------------------------------------------ its states
     def get_state(self) -> dict[str, Any]:
+        anchor = ({"integration_time": self.integration_time,
+                   **{f"last_{channel}": value for channel, value in self._last.items()}}
+                  if self.accumulating else {})
         return {**{f"x_{channel}": value for channel, value in self.accumulated.items()},
+                **anchor,
                 **{f"held_{channel}": value for channel, value in self.values.items()},
                 **{f"rms_{channel}.{key}": value for channel, window in self.rms.items()
                    for key, value in window.get_state().items()}}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
+        anchor_names = {"integration_time", *(f"last_{channel}" for channel in self._last)}
+        self._anchor_restored = bool(anchor_names) and anchor_names <= set(values)
+        if "integration_time" in values:
+            self.integration_time = float(values["integration_time"])
         self.values = {channel: values.get(f"held_{channel}", value)
                        for channel, value in self.values.items()}
         for channel, zero in self._zero.items():
@@ -357,6 +384,9 @@ class ADC:
             key = f"x_{channel}"
             if key in values:
                 self.accumulated[channel] = cast(values[key])
+            key = f"last_{channel}"
+            if key in values:
+                self._last[channel] = cast(values[key])
         for channel, window in self.rms.items():
             prefix = f"rms_{channel}."
             window.set_state({key[len(prefix):]: value for key, value in values.items()

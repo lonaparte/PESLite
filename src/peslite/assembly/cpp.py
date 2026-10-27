@@ -34,8 +34,7 @@ from ..solver.model import _strong_components, commutation_tolerance
 from .conduction import DiodeConduction, _LOCATOR_ITERATIONS, _MAX_COMMUTATIONS
 from .params import (BaseValues, SourceParams, UnitParams, _PARAMETER_RECORDER, _event_assignments,
                      _written_out, connection_defaults, dumps, parameter_leaves)
-from .exporter import (ExportResult, _exporter, _signal_names,
-                       _validate_dynamic_capabilities)
+from .exporter import ExportResult, _exporter, _signal_names
 from .system import _source_scenario
 from .types import unit_type
 from .unit import Plant
@@ -2108,8 +2107,8 @@ class _ModelGenerator:
         label = self.subsystem_name.get(id(sub), type(sub).__name__)
         try:
             method = sub.rhs
-            if (type(sub) is RLBranch and getattr(method, "__func__", None) in
-                    (RLBranch._rhs_ordinary, RLBranch._rhs_bilateral, RLBranch._rhs_unilateral,
+            if (isinstance(sub, RLBranch) and getattr(method, "__func__", None) in
+                    (RLBranch._rhs_bilateral, RLBranch._rhs_unilateral,
                      RLBranch._rhs_open, RLBranch._rhs_conduction)):
                 method = RLBranch.rhs.__get__(sub)
             return self.trace_rhs(sub, method, self._equation_attributes(sub))
@@ -2826,6 +2825,18 @@ class _ControlGenerator:
     def adc(self):
         return self.model.runtime.object(self.unit.adc)
 
+    def _adc_state_expression(self, local: str) -> str | None:
+        """Map the common ADC state contract to this unit's generated members."""
+        if local == "integration_time":
+            return self.m("adc_integration_time")
+        if local.startswith("x_"):
+            return self.m("adc_acc_" + local[2:])
+        if local.startswith("last_"):
+            return self.m("adc_last_" + local[5:])
+        if local.startswith("held_"):
+            return self.m("adc_held_" + local[5:])
+        return None
+
     @property
     def protection(self):
         return self.model.runtime.object(self.unit.protection)
@@ -3298,6 +3309,11 @@ class _ControlGenerator:
             round(adc.period / adc.sample_period)
         if adc is None or (not adc.accumulating and adc.samples == 1):
             return lines
+        if adc.accumulating:
+            lines.append(
+                f"double {self.m('adc_integration_time')} = "
+                f"{_number(adc.integration_time)};"
+            )
         lines += [f"long long {self.m('adc_n_samp')} = {int(adc.n_samp)};",
                  f"bool {self.m('adc_window_open')} = "
                  f"{'true' if adc.window_open else 'false'};"]
@@ -3397,7 +3413,8 @@ class _ControlGenerator:
         adc = self.adc
         if adc is None or not adc.accumulating:
             return ""
-        lines = [f"void adc_accumulate_{self.tag}(double dt) {{",
+        lines = [f"void adc_accumulate_{self.tag}(double t) {{",
+                 f"    const double dt = t - {self.m('adc_integration_time')};",
                  "    if (dt <= 0.0) return;"]
         for channel in adc.channels:
             reading = self._adc_reading(channel)
@@ -3411,11 +3428,12 @@ class _ControlGenerator:
         for channel in adc.rms:
             member = self.m("adc_rms_" + channel)
             lines.append(f"    {member}.accumulate(dt, {self._rms_square(channel)});")
+        lines.append(f"    {self.m('adc_integration_time')} = t;")
         return "\n".join([*lines, "}"])
 
-    def adc_accumulate_call(self, duration: str) -> str:
+    def adc_accumulate_call(self, t: str) -> str:
         adc = self.adc
-        return (f"adc_accumulate_{self.tag}({duration});"
+        return (f"adc_accumulate_{self.tag}({t});"
                 if adc is not None and adc.accumulating else "")
 
     def _adc_next_values(self) -> list[str]:
@@ -4213,8 +4231,10 @@ class _UnitGenerator(_ACControlGenerator):
             word = self.m("shadow" if bank == "shadow" else "active")
             index = (*self.bridge.register_names, "on").index(field)
             return f"{word}[{index}]"
-        if part is self.unit.adc and local.startswith("x_"):
-            return self.m("adc_acc_" + local[2:])
+        if part is self.unit.adc:
+            expression = self._adc_state_expression(local)
+            if expression is not None:
+                return expression
         if part is self.ctrl or part is self.unit.ctrl:
             if local.startswith("held."):
                 public = local[5:]
@@ -4374,10 +4394,9 @@ class _ElectricalUnitGenerator(_ProtectionGenerator, _ControlGenerator):
         protected = self.protection_state(local)
         if protected is not None:
             return protected
-        if local.startswith("x_"):
-            return self.m("adc_acc_" + local[2:])
-        if local.startswith("held_"):
-            return self.m("adc_held_" + local[5:])
+        expression = self._adc_state_expression(local)
+        if expression is not None:
+            return expression
         raise KeyError(local)
 
     def sense_method(self):
@@ -4707,8 +4726,10 @@ class _GraphUnitGenerator(_ElectricalUnitGenerator):
             node = self.graph.nodes.get(loop_name)
             if node is not None and public in node.get_state():
                 return self.node(loop_name, public)
-        if part is self.unit.adc and local.startswith("x_"):
-            return self.m("adc_acc_" + local[2:])
+        if part is self.unit.adc:
+            expression = self._adc_state_expression(local)
+            if expression is not None:
+                return expression
         raise KeyError(local)
 
     def command_lines(self, on: bool, ramp: float, t: str = "t") -> list[str]:
@@ -5224,7 +5245,7 @@ class _CppGenerator:
                    for name in unit_names]
         protect = [f"trip_now = protect_{(sampled.get(name) or continuous[name]).tag}(t) || trip_now;"
                    for name in unit_names]
-        adc_accumulate = [generator.adc_accumulate_call("t - interval_start")
+        adc_accumulate = [generator.adc_accumulate_call("t")
                           for generator in (*sampled.values(), *continuous.values())]
         adc_accumulate = [line for line in adc_accumulate if line]
         adc_seed = [line for generator in (*sampled.values(), *continuous.values())
@@ -5786,41 +5807,46 @@ public:
             ++snapshot_index;
         }};
         while (true) {{
-            double boundary = std::min(end, next_output);
-            {'boundary = std::min(boundary, std::min({' + next_units + '}));' if next_units else ''}
-            if (action_index < action_times.size()) boundary = std::min(boundary, action_times[action_index]);
-            const double interval_start = t;
+            double physical_boundary = end;
+            {'physical_boundary = std::min(physical_boundary, next_output);' if continuous else ''}
+            {'physical_boundary = std::min(physical_boundary, std::min({' + next_units + '}));' if next_units else ''}
+            if (action_index < action_times.size())
+                physical_boundary = std::min(physical_boundary, action_times[action_index]);
+            const double boundary = std::min(physical_boundary, next_output);
             if (boundary > t + time_eps) {{
                 {advance_method}(t, boundary);
             }} else {{
                 t = boundary;
             }}
             sync(t);
-            {' '.join(adc_accumulate)}
-            bool actions_applied = false;
-            while (action_index < action_times.size() && action_times[action_index] <= t + time_eps) {{
-                apply_action(action_index, t);
-                actions_applied = true;
-                ++action_index;
+            const bool physical_due = physical_boundary <= t + time_eps;
+            if (physical_due) {{
+                {' '.join(adc_accumulate)}
+                bool actions_applied = false;
+                while (action_index < action_times.size() && action_times[action_index] <= t + time_eps) {{
+                    apply_action(action_index, t);
+                    actions_applied = true;
+                    ++action_index;
+                }}
+                if (actions_applied) sync(t);
+                {conduction_sync}
+                bool trip_now = false;
+                {' '.join(protect)}
+                if constexpr ({'true' if self.p.simulation.stop_on_trip else 'false'}) {{
+                    if (trip_now) {{ snapshot(true); break; }}
+                }}
+                if (trip_now) sync(t);
+                {' '.join(sense)}
+                if constexpr ({'true' if output.signals else 'false'}) {{
+                    {sampled_ctrl_text}
+                }}
+                {' '.join(actuate)}
+                {conduction_sync}
+                if constexpr ({'true' if self.p.simulation.stop_on_trip else 'false'}) {{
+                    if (trip_now) {{ snapshot(true); break; }}
+                }}
+                {'sync<true>(t);' if adc_seed else ''}
             }}
-            if (actions_applied) sync(t);
-            {conduction_sync}
-            bool trip_now = false;
-            {' '.join(protect)}
-            if constexpr ({'true' if self.p.simulation.stop_on_trip else 'false'}) {{
-                if (trip_now) {{ snapshot(true); break; }}
-            }}
-            if (trip_now) sync(t);
-            {' '.join(sense)}
-            if constexpr ({'true' if output.signals else 'false'}) {{
-                {sampled_ctrl_text}
-            }}
-            {' '.join(actuate)}
-            {conduction_sync}
-            if constexpr ({'true' if self.p.simulation.stop_on_trip else 'false'}) {{
-                if (trip_now) {{ snapshot(true); break; }}
-            }}
-            {'sync<true>(t);' if adc_seed else ''}
             if (t >= end - time_eps) {{ snapshot(true); break; }}
             if (std::abs(next_output - t) < time_eps) {{
                 snapshot();
@@ -5956,7 +5982,6 @@ def _parameter_generator(prepared, name, variables, initializations, *, constant
 def _export_cpp(simulation: Any, out_dir: Path, name: str,
                 variables: tuple[str, ...], reusable: bool) -> ExportResult:
     """Write one self-contained, parameter-specialised C++17 translation unit."""
-    _validate_dynamic_capabilities(simulation, "C++")
     prepared, initializations = _prepare_export(simulation, variables, reusable)
     if prepared.p.simulation.solver.subsystems:
         raise TypeError(

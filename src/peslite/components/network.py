@@ -161,25 +161,25 @@ class RLBranch:
         self.breaker_open = False
         if self.unilateral:
             self.state_bounds = {"i": (0.0, None)}
-        if type(self) is RLBranch:
-            if self.unilateral:
-                self.set_outputs = self._set_outputs_unilateral
-                self._closed_rhs = self._rhs_unilateral
-            else:
-                self.set_outputs = self._set_outputs_ordinary
-                self._closed_rhs = self._rhs_bilateral
+        self._output_equation = (self._set_outputs_unilateral if self.unilateral
+                                 else self._set_outputs_bilateral)
+        self._closed_rhs = self._rhs_unilateral if self.unilateral else self._rhs_bilateral
+        self._uses_default_rhs = type(self).rhs is RLBranch.rhs
+        if type(self).set_outputs is RLBranch.set_outputs:
+            self.set_outputs = self._output_equation
+        if self._uses_default_rhs:
             self.rhs = self._closed_rhs
 
     def open_breaker(self) -> None:
         self.breaker_open = True
         self.state.i = self.zero
-        if type(self) is RLBranch:
+        if self._uses_default_rhs:
             self.rhs = self._rhs_open
 
     def close_breaker(self) -> None:
         """Close the breaker; current resumes from zero after an opening."""
         self.breaker_open = False
-        if type(self) is RLBranch:
+        if self._uses_default_rhs:
             self.rhs = self._closed_rhs
 
     def retune(self, L: float, R: float) -> None:
@@ -188,17 +188,17 @@ class RLBranch:
         self.storage = (replace(self.storage[0], value=L),)
 
     def set_outputs(self, t: float) -> None:
-        """Generic structural dispatch retained for subclasses."""
-        current = self.state.i
-        self.out.i = max(0.0, current) if self.unilateral else current
+        """Evaluate the output equation selected when the branch was constructed."""
+        self._output_equation(t)
 
-    def _set_outputs_ordinary(self, t: float) -> None:
+    def _set_outputs_bilateral(self, t: float) -> None:
         self.out.i = self.state.i
 
     def _set_outputs_unilateral(self, t: float) -> None:
         self.out.i = max(0.0, self.state.i)
 
     def rhs(self, t: float):
+        """Evaluate the active state equation without duplicating its electrical law."""
         if self.breaker_open:
             return (self.zero,)
         return self._closed_rhs(t)
@@ -206,21 +206,12 @@ class RLBranch:
     def _rhs_open(self, t: float):
         return (self.zero,)
 
-    def _rhs_ordinary(self, t: float):
-        """Generic structural dispatch retained for subclasses."""
-        derivative = (self.inp.u1 - self.inp.u2 - self.R * self.state.i) / self.L
-        if self.unilateral and self.state.i <= 0.0 and derivative < 0.0:
-            derivative = 0.0
-        return (derivative,)
-
     def _rhs_bilateral(self, t: float):
         return ((self.inp.u1 - self.inp.u2 - self.R * self.state.i) / self.L,)
 
     def _rhs_unilateral(self, t: float):
         derivative = (self.inp.u1 - self.inp.u2 - self.R * self.state.i) / self.L
         return (0.0 if self.state.i <= 0.0 and derivative < 0.0 else derivative,)
-
-    _closed_rhs = _rhs_ordinary
 
     def _rhs_conduction(self, _t: float):
         return (self.inp.di_dt,)
@@ -232,7 +223,7 @@ class RLBranch:
             "cycle-averaged DCM current does not have the branch's linear instantaneous "
             "storage function"
         )
-        if not self.breaker_open and type(self) is RLBranch:
+        if not self.breaker_open and self._uses_default_rhs:
             self.rhs = self._closed_rhs
 
     def diode_blocks_reverse_current(self) -> bool:
@@ -243,7 +234,7 @@ class RLBranch:
         """Publish the terminal voltage at which this branch's current is constant."""
         closed = getattr(self._closed_rhs, "__func__", self._closed_rhs)
         if (self.phases != 1 or self.unilateral
-                or closed not in (RLBranch._rhs_ordinary, RLBranch._rhs_bilateral)):
+                or closed is not RLBranch._rhs_bilateral):
             raise ConfigError("a blocking port needs an ordinary scalar R-L branch")
         if current_constraint is not None:
             if not hasattr(self, "_current_constraints"):
@@ -366,20 +357,14 @@ class ACVoltageSource:
         self.terminal = Terminal(
             self, "e_g", "i", -1, drives_voltage=True, electrical_domain="ac"
         )
-        if type(self) is ACVoltageSource:
-            self.set_outputs = (self._set_three_phase_outputs if phases == 3
-                                else self._set_single_phase_outputs)
+        self._output_equation = (self._set_three_phase_outputs if phases == 3
+                                 else self._set_single_phase_outputs)
+        if type(self).set_outputs is ACVoltageSource.set_outputs:
+            self.set_outputs = self._output_equation
 
     def set_outputs(self, t: float) -> None:
-        """Generic phase dispatch retained for subclasses."""
-        phi = self.phi(t) if self.phi is not None else 0.0
-        theta = self.w0 * t + phi
-        out = self.out
-        out.phi = phi
-        out.theta = theta
-        cosine = self.e_peak * math.cos(theta)
-        out.e_g = (complex(cosine, self.e_peak * math.sin(theta))
-                   if self.phases == 3 else cosine)
+        """Evaluate the phase representation selected when the source was constructed."""
+        self._output_equation(t)
 
     def _set_single_phase_outputs(self, t: float) -> None:
         phi = self.phi(t) if self.phi is not None else 0.0
@@ -540,15 +525,20 @@ class _ResistorModel:
             OutputMethod("set_voltage", ("u", "i") if series else (), ("u",), rhs=series),
             OutputMethod("set_power", ("i",) if series else ("u",), ("power",), rhs=False),
         )
-        if type(self) is _ResistorModel:
-            if series:
-                self.set_current = self._set_series_current
-                self.set_voltage = self._set_series_voltage
-                self.dissipated_power = self._series_loss
-            else:
-                self.set_current = self._set_shunt_current
-                self.set_voltage = self._set_shunt_voltage
-                self.dissipated_power = self._shunt_loss
+        if series:
+            self._current_equation = self._set_series_current
+            self._voltage_equation = self._set_series_voltage
+            self._loss_equation = self._series_loss
+        else:
+            self._current_equation = self._set_shunt_current
+            self._voltage_equation = self._set_shunt_voltage
+            self._loss_equation = self._shunt_loss
+        if type(self).set_current is _ResistorModel.set_current:
+            self.set_current = self._current_equation
+        if type(self).set_voltage is _ResistorModel.set_voltage:
+            self.set_voltage = self._voltage_equation
+        if type(self).dissipated_power is _ResistorModel.dissipated_power:
+            self.dissipated_power = self._loss_equation
 
     def set_outputs(self, t: float) -> None:
         self.set_current(t)
@@ -556,12 +546,12 @@ class _ResistorModel:
         self.set_power(t)
 
     def set_current(self, t: float) -> None:
-        """Generic structural dispatch retained for subclasses."""
-        self.out.i = self.inp.i if self.series else self.inp.u / self.resistance
+        """Evaluate the current equation selected when the resistor was constructed."""
+        self._current_equation(t)
 
     def set_voltage(self, t: float) -> None:
-        """Generic structural dispatch retained for subclasses."""
-        self.out.u = self.inp.u - self.resistance * self.inp.i if self.series else 0.0
+        """Evaluate the voltage equation selected when the resistor was constructed."""
+        self._voltage_equation(t)
 
     def _set_series_current(self, t: float) -> None:
         self.out.i = self.inp.i
@@ -582,10 +572,8 @@ class _ResistorModel:
         return ()
 
     def dissipated_power(self) -> float:
-        """Generic structural dispatch retained for subclasses."""
-        if self.series:
-            return self.power_scale * self.resistance * abs(self.inp.i) ** 2
-        return self.power_scale * abs(self.inp.u) ** 2 / self.resistance
+        """Evaluate the loss equation selected when the resistor was constructed."""
+        return self._loss_equation()
 
     def _series_loss(self) -> float:
         return self.power_scale * self.resistance * abs(self.inp.i) ** 2

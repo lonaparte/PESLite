@@ -197,9 +197,6 @@ def _measurement(m, T_c: Optional[float], where: str,
     if m.period is not None and not _whole(T_c / m.period):
         raise ConfigError(f"{where}.period = {m.period:.6g} s does not divide ctrl.period = "
                           f"{T_c:.6g} s into whole samples")
-    if m.average and m.period is not None and m.period < T_c * (1.0 - 1e-9):
-        raise ConfigError(f"{where}: window averaging cannot be combined "
-                          f"with oversampling (period shorter than ctrl.period)")
     if not m.average and m.window is not None:
         warnings.warn(f"{where}.window has no effect: no quantity is window-averaged", stacklevel=4)
 
@@ -232,8 +229,6 @@ def _converter(u, base, where: str):
     if u.bridge.parallel_capacitance > 0.0 and u.bridge.on_resistance == 0.0:
         raise ConfigError(f"{where}.bridge.parallel_capacitance requires positive on_resistance")
     _dclink(u.dclink, f"{where}.dclink")
-    if not u.bridge.controlled:
-        _natural_conduction(u, where)
     continuous = u.ctrl is None or u.bridge.model == "averaging"
     if u.ctrl is not None:
         _pwm(u.pwm, base, f"{where}.pwm", continuous)
@@ -265,13 +260,6 @@ def _converter(u, base, where: str):
         if current not in u.meas.rms:
             raise ConfigError(f"{where}.protection.rms_current requires meas.rms.{current}")
     return topology, continuous
-
-
-def _natural_conduction(u, where: str) -> None:
-    """Check a converter whose bridge has no controlled device (a diode rectifier)."""
-    if u.bridge.model != "switching":
-        raise ConfigError(f"{where}.bridge.model: a diode full-bridge rectifier commutates exactly; "
-                          "use 'switching'")
 
 
 def _unit(u, base, where: str, *, nested: bool = False) -> None:
@@ -492,9 +480,6 @@ def _solver(s) -> None:
         raise ConfigError("simulation.solver.write_length must be >= 1")
     if s.phs_check_step < 1:
         raise ConfigError("simulation.solver.phs_check_step must be >= 1")
-    if (s.measurement_interval is not None
-            and (not math.isfinite(s.measurement_interval) or s.measurement_interval <= 0.0)):
-        raise ConfigError("simulation.solver.measurement_interval must be finite and positive")
     for name, value in s.subsystems.items():
         where = f"simulation.solver.subsystems.{name}"
         if s.type != "fixed":

@@ -105,8 +105,6 @@ def test_timing_defaults_follow_the_carrier(gfl):
     ({"units.vsc.meas.average": ["u_g", "u_g"]}, "must not be repeated"),
     ({"units.vsc.meas.average": ["u_g", "i_c"], "units.vsc.meas.window": 1e-4},
      "longer than the sampling period"),
-    ({"units.vsc.meas.average": ["u_g", "i_c"], "units.vsc.meas.period": 2.5e-5},
-     "cannot be combined"),
     ({"units.vsc.pwm.update": "triple"}, "update"),
     ({"units.vsc.delay.steps": 1}, "unknown key"),
     ({"units.vsc.pwm.computation_delay.steps": 1}, "unknown key"),

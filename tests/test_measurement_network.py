@@ -209,9 +209,9 @@ def test_continuous_rms_seeds_actual_initial_outputs_not_structure_probe_values(
     initial = {}
     original = ADC.seed
 
-    def seed(adc):
+    def seed(adc, t=None):
         initial.setdefault(id(adc), adc.ports.read())
-        original(adc)
+        original(adc, t)
 
     monkeypatch.setattr(ADC, "seed", seed)
     sim = peslite.Simulation(from_dict(load_case("averaging", link=link)))

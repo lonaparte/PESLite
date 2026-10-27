@@ -666,7 +666,7 @@ class System:
                 cfg = self.units[head].cfg
                 return cfg.dclink.vdc_ref
             if word == "source":
-                internal = self.units[head].source_preset(t) if head in self.units else None
+                internal = self.units[head].source_preset() if head in self.units else None
                 if internal is not None:
                     return internal
                 bus = self.units[head].cfg.bus if head in self.units else head

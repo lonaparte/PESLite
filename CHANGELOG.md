@@ -3,8 +3,9 @@
 ## 0.4.0
 
 - Added single-phase AC network sources through ordinary scalar power ports and assembly-time
-  electrical-domain constraints on inherently AC or DC terminals. Also added bounded-grid ADC
-  window integration, open-loop duty control, the `ModeSequence` add-on and an energy-closure
+  electrical-domain constraints on inherently AC or DC terminals. Also made ADC window integration
+  follow the configured physical sampling grid, and added open-loop duty control, the traceable
+  `ModeSequence` add-on and an energy-closure
   helper, with runnable Buck and WPT examples.
 - Discovered retained C++ parameters from the ordinary schemas and recorded component construction,
   removing the separate small device-parameter whitelist. Numerical physical/control parameters,

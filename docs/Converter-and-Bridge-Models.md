@@ -32,11 +32,10 @@ numerically identical.
 |---|---:|---:|---:|---:|---:|
 | Controlled half, full and three-phase bridges | yes | yes | yes | yes | sampled only |
 | Square-wave phase-shift modulation | yes | no | no | yes | no |
-| Diode full-bridge commutation | yes | no | no | yes | no |
+| Diode full-bridge commutation | yes | yes, same natural-conduction law | yes, same natural-conduction law | yes | no |
 | Single-phase AC network source | yes | yes | yes | yes | plant not exported |
 | `open_loop` duty control | yes | yes | yes | yes | yes |
-| Additional ADC integration grid | yes | yes | RMS only | no | no |
-| `ModeSequence` add-on | yes | no | no | no | no |
+| `ModeSequence` add-on | yes | no | no | yes | no |
 
 Backend entries describe export support, not whether the hardware executes the simulated plant.
 Imperix exports sampled control and peripheral bindings; continuous `averaging` is not a hardware
@@ -151,6 +150,11 @@ anti-parallel diodes. The unit then has no controller or PWM timer. `FullBridge`
 equations to the common execution model. Its discrete state is a pair conducting the port current
 `i_c` (positive out of the bridge) in either direction, or all diodes blocked. A conducting
 pair opposes the current, `u_c = -sign(i_c) u_dc`, and passes `|i_c|` to the DC side.
+
+Because this bridge has no commanded PWM waveform, `bridge.model` does not replace its conduction
+law with a duty-ratio model. The `switching`, `pwm_averaging` and `averaging` run selections all
+retain the same exactly located natural commutations; the selection still controls the solver
+preset and any controlled bridges elsewhere in the system.
 
 A blocked bridge holds its port current at the located zero by applying the port's *hold
 voltage*: the voltage at which the port current has no rate of change. Its connected
@@ -314,6 +318,10 @@ This model therefore retains:
 Use it when digital timing matters but switching ripple does not. It is generally the best default
 for controller and system-level studies with sampled control.
 
+Ordinary PWM-period averaging is not a reliable approximation of square-wave phase-shift power
+transfer: the period mean can be zero while the switching-frequency fundamental carries power.
+Use the switching model unless a separately validated harmonic approximation is available.
+
 ## Ideal averaging
 
 `averaging` represents the bridge as an ideal controlled voltage source. Measurements and
@@ -334,6 +342,10 @@ Use ideal averaging for:
 Do not use it as a substitute for switching when conclusions depend on ripple, carrier timing or
 sampled-data delay. Continuous feedback can also create algebraic loops; PESLite detects connected
 feedback variables and solves them internally at each derivative evaluation.
+
+The same limitation applies to square-wave phase-shift bridges: an ordinary ideal average can
+discard the fundamental responsible for resonant power transfer and therefore give an incorrect
+result. Use the switching model unless a separately validated harmonic approximation is available.
 
 ## Command presets
 

@@ -485,13 +485,14 @@ class ProtectionParams:
 class BridgeParams:
     """Bridge model used by one unit.
 
-    ``"switching"`` follows exact carrier-comparison edges or, for a diode full-bridge rectifier,
-    exactly located diode commutations. ``"pwm_averaging"`` keeps the
+    ``"switching"`` follows exact carrier-comparison edges. ``"pwm_averaging"`` keeps the
     PWM timer, duty registers and load timing but applies each active duty ratio continuously until
     the next compare-register load. ``"averaging"`` is an ideal controlled voltage source driven
     by continuous measurement and control equations, with no ADC, interrupt, computation or PWM
     events. For a unilateral half bridge, ``pwm.f_sw`` still defines the physical cycle used by
     the averaged DCM conduction law; it does not schedule carrier events.
+    A controllerless diode full bridge has no PWM waveform to average, so all three selections
+    retain its exactly located natural commutations while selecting the surrounding run preset.
     Optional device resistance and port capacitance use the same topology and execution form;
     nonzero capacitance requires positive device resistance.
     """
@@ -848,8 +849,6 @@ class SolverParams:
     linearisations: int = 3  # linearisation points for the split error bound (0: none)
     write_length: int = 1000  # streamed CSV rows per write batch (>= 1)
     phs_check_step: int = 1000  # snapshots between port-Hamiltonian energy audits (>= 1)
-    measurement_interval: Optional[float] = None  # s; maximum extra ADC-integration interval
-
     _choices = {"type": ("fixed", "adaptive")}
 
 

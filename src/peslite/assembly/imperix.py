@@ -18,8 +18,7 @@ from .cpp import (_CONTROL_MATH, _MOVING_WINDOW, _ControlGenerator, _Expression,
                   _ModelGenerator, _ProtectionGenerator,
                   _controller_implementation, _identifier, _number,
                   _parameter_generator, _prepare_export)
-from .exporter import (ExportResult, _exporter, _signal_names,
-                       _validate_dynamic_capabilities)
+from .exporter import ExportResult, _exporter, _signal_names
 from .validate import _whole
 
 
@@ -558,7 +557,6 @@ def _source(generators, adc, clocks, period, phase, runtime, *, sampling_period=
 def _export_imperix(simulation, out_dir, name, variables, reusable, *,
                     target_config=None, sdk=None, build=True):
     """Generate Imperix ELF sources and optionally build the executable with the configured SDK."""
-    _validate_dynamic_capabilities(simulation, "Imperix")
     if not simulation._rebuildable:
         raise TypeError("Imperix export cannot reconstruct supplied instances; use parts factories")
     from .conduction import DiodeConduction

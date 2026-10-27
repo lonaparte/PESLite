@@ -21,34 +21,6 @@ if TYPE_CHECKING:  # pragma: no cover - imports used only by type checkers
 __all__ = ["ExportResult", "EXPORTERS", "export"]
 
 
-def _validate_dynamic_capabilities(simulation: "Simulation", backend: str) -> None:
-    """Reject runtime semantics that a generated backend cannot reproduce."""
-    if simulation.p.simulation.solver.measurement_interval is not None:
-        raise ValueError(
-            f"{backend} export does not implement an additional ADC integration grid; "
-            "omit simulation.solver.measurement_interval"
-        )
-    unsupported = [
-        name for name, unit in simulation.system.units.items()
-        if not getattr(getattr(unit.dclink, "source", None), "native_export", True)
-    ]
-    if unsupported:
-        raise ValueError(
-            f"{backend} export does not implement the time-varying input source of "
-            f"unit(s) {unsupported}"
-        )
-    unsupported_loops = [
-        f"{unit_name}.{loop_name}"
-        for unit_name, unit in simulation.system.units.items()
-        for loop_name, loop in getattr(getattr(unit.ctrl, "graph", None), "nodes", {}).items()
-        if not getattr(loop, "native_export", True)
-    ]
-    if unsupported_loops:
-        raise ValueError(
-            f"{backend} export does not implement control loop(s) {unsupported_loops}"
-        )
-
-
 def _signal_names(path: str, phases: int = 1) -> tuple[str, ...]:
     """Keep the canonical signal path; three-phase columns only append phase suffixes."""
     if phases == 1:

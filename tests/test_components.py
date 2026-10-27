@@ -53,7 +53,7 @@ def test_electrical_terminals_use_the_energy_direction_and_numbered_voltage_port
         Terminal(branch, "u1", "i", -1)
 
 
-def test_branch_subclasses_retain_the_generic_unilateral_equations():
+def test_inherited_branch_behavior_uses_the_preselected_equations():
     class DerivedBranch(RLBranch):
         pass
 
@@ -61,8 +61,14 @@ def test_branch_subclasses_retain_the_generic_unilateral_equations():
     branch.inp.u1, branch.inp.u2 = 0.0, 1.0
     branch.set_outputs(0.0)
 
+    assert branch.set_outputs.__func__ is RLBranch._set_outputs_unilateral
+    assert branch.rhs.__func__ is RLBranch._rhs_unilateral
     assert branch.out.i == 0.0
     assert branch.rhs(0.0) == (0.0,)
+    branch.open_breaker()
+    assert branch.rhs.__func__ is RLBranch._rhs_open
+    branch.close_breaker()
+    assert branch.rhs.__func__ is RLBranch._rhs_unilateral
 
 
 def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():
@@ -128,7 +134,9 @@ def test_adc_owns_oversampling_and_averaging_window_state():
         "u_dc": 10.0,
     }
     assert not hasattr(sample, "raw")
-    assert set(adc.get_state()) == {"x_u_g", "x_i_c"}
+    assert set(adc.get_state()) == {
+        "x_u_g", "x_i_c", "integration_time", "last_u_g", "last_i_c",
+    }
 
 
 def test_adc_reconstructs_its_sampling_position_from_the_start_time():

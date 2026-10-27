@@ -99,8 +99,6 @@ class Loop:
     ``cfg``: the loop's parameters; ``unit``: the unit's parameters; ``startup``: the controller's
     current run/ramp state.
     ``log_outputs`` optionally names output ports to include in controller observations.
-    ``native_export = False`` declares a Python-only loop whose state transition cannot be traced
-    by generated backends.
     """
 
     type: ClassVar[str]
@@ -109,7 +107,6 @@ class Loop:
     outputs: ClassVar[Mapping[str, SignalType]] = {}
     role: ClassVar[Optional[str]] = None
     outputs_from_state: ClassVar[bool] = False  # held outputs = initial_outputs() after loading states
-    native_export: ClassVar[bool] = True
     flow_inputs: ClassVar[tuple[str, ...] | None] = None
     state_names: tuple[str, ...] | Mapping[str, str] = ()
     carried: ClassVar[tuple[str, ...]] = ()
