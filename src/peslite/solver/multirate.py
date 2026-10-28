@@ -15,7 +15,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .energy import re_product, signal
-from .integrators import RHS, TABLEAUS, FixedStepSolver, SolverStep, combine, integrator, stage_state
+from .integrators import RHS, TABLEAUS, FixedStepSolver, SolverStep, combine, integrator, stage_state, subintervals
 from .model import ConfigError
 
 __all__ = ["MultirateSolver", "HeldStorage", "make_solver", "parse_step"]
@@ -35,17 +35,12 @@ def make_solver(cfg: Any, model: Optional[Any] = None, ratings: Any = None):
             raise ConfigError("simulation.solver.subsystems needs the model whose subsystems it names")
         try:
             parsed = {name: parse_step(value)[0] for name, value in cfg.subsystems.items()}
-            if all(ratio == 1.0 for ratio in parsed.values()):
-                unknown = [name for name in parsed if not model.select(name)]
-                if unknown:
-                    raise KeyError(
-                        f"unknown subsystem(s) or namespace(s) {unknown}; this model has {model.names}"
-                    )
-                return integrator(
-                    cfg.method, cfg.dt, cfg.rtol, cfg.atol, cfg.max_step, cfg.warm_start,
-                )
-            return MultirateSolver(model, cfg.subsystems, cfg.dt, cfg.method, cfg.sweeps, cfg.rtol, cfg.atol,
-                                   ratings)
+            if any(ratio != 1.0 for ratio in parsed.values()):
+                return MultirateSolver(model, cfg.subsystems, cfg.dt, cfg.method, cfg.sweeps, cfg.rtol, cfg.atol,
+                                       ratings)
+            unknown = [name for name in parsed if not model.select(name)]  # every step is dt: single-rate
+            if unknown:
+                raise KeyError(f"unknown subsystem(s) or namespace(s) {unknown}; this model has {model.names}")
         except (KeyError, ValueError) as exc:
             raise ConfigError(f"simulation.solver.subsystems: {exc.args[0]}") from None
     return integrator(cfg.method, cfg.dt, cfg.rtol, cfg.atol, cfg.max_step, cfg.warm_start)
@@ -135,7 +130,6 @@ class MultirateSolver:
         self.n_system = 0
         self.n_inner = 0
         self.n_outer = 0
-        self.force_general = False  # testing: run the general code even when it would delegate
 
         inner: dict[str, float] = {}
         outer: dict[str, float] = {}
@@ -167,6 +161,7 @@ class MultirateSolver:
         self._mask_inner = self.inner.mask if self.inner is not None else np.zeros(model.n_states, dtype=bool)
         self._mask_outer = self.outer.mask if self.outer is not None else np.zeros(model.n_states, dtype=bool)
         self._mask_moving = ~self._mask_outer  # what the system step advances (system and inner states)
+        self._outer_labels = [lab for lab, m in zip(model.state_labels(), self._mask_outer) if m]
         self.window = self.window_steps * self.dt
         self.outer_method = outer_method or method
         self._outer_solver = (integrator(self.outer_method, self.window, rtol, atol)
@@ -198,12 +193,9 @@ class MultirateSolver:
         self._exc_abs: dict[int, float] = {}  # storage index -> worst sub-window change of the effort
         self._windows = 0
         self._steps = 0
-        self._storage_of: dict[int, tuple[Any, Any]] = {}  # state index -> (subsystem, StoragePort)
+        self.parameters_changed()  # _storage_of: state index -> (subsystem, StoragePort)
         self._coupling = np.ones(model.n_states, dtype=bool)  # states that feed back (observers do not)
         for sub in model.subsystems:
-            for st in getattr(sub, "storage", ()):
-                sl = model.state_slice(sub, st.state)
-                self._storage_of[sl.start] = (sub, st)
             if getattr(sub, "observer", False):
                 for name in sub.state_names:
                     self._coupling[model.state_slice(sub, name)] = False
@@ -219,7 +211,7 @@ class MultirateSolver:
         """Advance with a local limit applied coherently to every system and inner step."""
         if max_step <= 0.0:
             raise ValueError("max_step must be positive")
-        if self.inner is None and self.outer is None and not self.force_general:
+        if self.inner is None and self.outer is None:
             step = self._single.advance(f, t0, t1, y0, max_step=max_step)
             self.n_system = self._single.n_rhs
             self.n_rhs = self.n_system + self.n_inner + self.n_outer
@@ -235,14 +227,8 @@ class MultirateSolver:
                                     and not np.array_equal(y0[self._mask_outer], self._last_returned[self._mask_outer])):
             if self._anchor is None or not self._window_end > t0 + _EPS:
                 self._window_end = t0 + self.window
-            self._anchor = y0[self._mask_outer].copy()
-            self._slope = np.zeros_like(self._anchor)
-            self._t_anchor = t0
-            self._acc = {}
-            self._acc_energy = {}
-            self._acc_flow = {}
-            self._excursion = {}
-            self._flow_track = {}
+            anchor = y0[self._mask_outer].copy()
+            self._open_window(t0, anchor, np.zeros_like(anchor))
         t = t0
         while t < t1 - _EPS:
             self._sample_outer_rate(t, y)
@@ -402,15 +388,14 @@ class MultirateSolver:
         """Window bookkeeping (``nan`` before the first window) for exact continuation from a window boundary."""
         if self.outer is None:
             return {}
-        labels = [lab for lab, m in zip(self.model.state_labels(), self._mask_outer) if m]
         if self._anchor is None:
             s: dict[str, Any] = {"t_anchor": math.nan, "window_end": math.nan}
-            for lab in labels:
+            for lab in self._outer_labels:
                 s[f"anchor.{lab}"] = math.nan
                 s[f"slope.{lab}"] = math.nan
             return s
         s = {"t_anchor": self._t_anchor, "window_end": self._window_end}
-        for lab, a, sl in zip(labels, self._anchor, self._slope):
+        for lab, a, sl in zip(self._outer_labels, self._anchor, self._slope):
             s[f"anchor.{lab}"] = float(a)
             s[f"slope.{lab}"] = float(sl)
         return s
@@ -418,10 +403,7 @@ class MultirateSolver:
     def set_state(self, values: Mapping[str, Any]) -> None:
         if self.outer is None:
             return
-        labels = [lab for lab, m in zip(self.model.state_labels(), self._mask_outer) if m]
-        names = (("t_anchor", "window_end") + tuple(f"anchor.{lab}" for lab in labels)
-                 + tuple(f"slope.{lab}" for lab in labels))
-        unknown = set(values) - set(names)
+        unknown = set(values) - set(self.get_state())
         if unknown:
             raise KeyError(f"MultirateSolver has no state(s) {sorted(unknown)}")
         t_anchor = values.get("t_anchor", math.nan)
@@ -429,18 +411,17 @@ class MultirateSolver:
         if t_anchor != t_anchor:  # nan: no window in progress
             self._anchor = self._slope = None
             return
-        anchor = np.zeros(len(labels))
-        slope = np.zeros(len(labels))
-        for i, lab in enumerate(labels):
+        anchor = np.zeros(len(self._outer_labels))
+        slope = np.zeros(len(self._outer_labels))
+        for i, lab in enumerate(self._outer_labels):
             anchor[i] = float(values.get(f"anchor.{lab}", math.nan))
             slope[i] = float(values.get(f"slope.{lab}", 0.0))
         if np.any(np.isnan(anchor)):
             self._anchor = self._slope = None
             return
-        self._t_anchor, self._anchor, self._slope = float(t_anchor), anchor, slope
+        self._open_window(float(t_anchor), anchor, slope)
         end = float(values.get("window_end", math.nan))
         self._window_end = end if end > t_anchor else t_anchor + self.window
-        self._acc, self._acc_energy, self._acc_flow, self._excursion, self._flow_track = {}, {}, {}, {}, {}
         self._last_returned = None  # a loaded anchor is trusted on the next call
 
     # ------------------------------------------------------ the system step
@@ -448,8 +429,7 @@ class MultirateSolver:
                  max_step: float = math.inf) -> NDArray[np.float64]:
         """System (and inner) steps over ``[t0, t1]``; outer states extrapolated."""
         span = t1 - t0
-        step = min(self.dt, max_step)
-        n = max(1, int(math.ceil(span / step - 1e-9)))
+        n = subintervals(span, min(self.dt, max_step))
         H = span / n
         y, t = y0, t0
         for _ in range(n):
@@ -682,11 +662,9 @@ class MultirateSolver:
                 for j in range(sl.start, sl.stop):
                     ripple[outer_index[j]] = stray
         self.window_log.append((t1, np.abs(new - self._anchor), np.abs(predicted - new), ripple))
-        self._acc_energy = {}
-        self._acc_flow = {}
-        self._excursion = {}
-        self._flow_track = {}
-        self._slope = (new - self._anchor) / duration
-        self._anchor = new.copy()
-        self._t_anchor = t1
-        self._acc = {}
+        self._open_window(t1, new.copy(), (new - self._anchor) / duration)
+
+    def _open_window(self, t: float, anchor: NDArray[np.float64], slope: NDArray[np.float64]) -> None:
+        """Anchor the outer states at ``t`` with ``slope`` and start the window's sums empty."""
+        self._t_anchor, self._anchor, self._slope = t, anchor, slope
+        self._acc, self._acc_energy, self._acc_flow, self._excursion, self._flow_track = {}, {}, {}, {}, {}

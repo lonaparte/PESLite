@@ -27,11 +27,9 @@ def energy_closure(result: Any) -> dict[str, float]:
     step = np.diff(t)
     if np.any(step <= 0.0):
         raise ValueError("energy rows must be strictly increasing in time")
-    impulsive = sum(
-        float(np.asarray(table[name], dtype=float)[-1]
-              - np.asarray(table[name], dtype=float)[0])
-        for name in table if str(name).endswith(".dissipated_impulsive_J")
-    )
+    impulsive = sum(float(column[-1] - column[0])
+                    for name in table if str(name).endswith(".dissipated_impulsive_J")
+                    for column in [np.asarray(table[name], dtype=float)])
     stored = float(energy[-1] - energy[0])
     supplied = float(np.sum(0.5 * step * (supplied_power[1:] + supplied_power[:-1])))
     dissipated = float(np.sum(0.5 * step * (dissipated_power[1:] + dissipated_power[:-1])))

@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from peslite import Simulation, load  # noqa: E402
 from peslite.assembly.params import _unit_items  # noqa: E402
 from peslite.solver.simulation import read_csv  # noqa: E402
+from benchmark_averaging_solvers import _errors  # noqa: E402
 
 
 CASES = {
@@ -45,31 +46,9 @@ CASES = {
 }
 
 
-def _scale(reference: np.ndarray, name: str) -> float:
+def _scale(name: str, reference: np.ndarray) -> float:
     """Representative magnitude used only to make cross-state errors readable."""
-    if ".ctrl." in name or ".bridge." in name or ".pwm." in name or name.endswith(".tripped"):
-        return max(1.0, float(np.max(np.abs(reference[name]))))
-    return max(1.0, float(np.max(np.abs(reference[name]))))
-
-
-def _errors(reference: np.ndarray, candidate: np.ndarray) -> dict[str, float | str]:
-    """Error on state columns shared with the fixed ideal-averaging reference."""
-    if reference.shape != candidate.shape or not np.allclose(
-            reference["t"], candidate["t"], rtol=0.0, atol=1e-12):
-        return {"max_scaled": float("inf"), "rms_scaled": float("inf"),
-                "worst_state": "incompatible output grid"}
-    shared = tuple(name for name in reference.dtype.names or ()
-                   if name != "t" and name in (candidate.dtype.names or ()))
-    worst_name, worst = "", 0.0
-    squared = []
-    for name in shared:
-        scaled = (candidate[name] - reference[name]) / _scale(reference, name)
-        value = float(np.max(np.abs(scaled)))
-        if value > worst:
-            worst_name, worst = name, value
-        squared.append(scaled * scaled)
-    rms = float(np.sqrt(np.mean(np.concatenate(squared)))) if squared else 0.0
-    return {"max_scaled": worst, "rms_scaled": rms, "worst_state": worst_name}
+    return max(1.0, float(np.max(np.abs(reference))))
 
 
 def main() -> int:
@@ -100,7 +79,7 @@ def main() -> int:
                     reference = states
                     error = {"max_scaled": 0.0, "rms_scaled": 0.0, "worst_state": ""}
                 else:
-                    error = _errors(reference, states)
+                    error = _errors(reference, states, _scale)
                 row = {
                     "example": path.stem,
                     "case": case,

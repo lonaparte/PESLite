@@ -14,9 +14,9 @@ from types import SimpleNamespace
 
 from ..control.controller import VSCController
 from . import imperix_build
-from .cpp import (_CONTROL_MATH, _MOVING_WINDOW, _ControlGenerator, _Expression,
+from .cpp import (_CONTROL_MATH, _CPP_TYPES, _MOVING_WINDOW, _ControlGenerator, _Expression,
                   _ModelGenerator, _ProtectionGenerator,
-                  _controller_implementation, _identifier, _number,
+                  _controller_implementation, _identifier, _literal, _number,
                   _parameter_generator, _prepare_export)
 from .exporter import ExportResult, _exporter, _signal_names
 from .validate import _whole
@@ -70,17 +70,6 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
     def _adc_value(self, channel):
         return "measured." + _identifier(channel)
 
-    def source(self, path):
-        if path.startswith("meas."):
-            return "meas_" + _identifier(path[5:])
-        if path.startswith("references."):
-            return self._reference(path[11:])
-        if path == "startup.active":
-            return self.m("startup_run")
-        if path in self.graph.interface.outputs:
-            return self.source(self.graph.outputs[path])
-        return self.g(path)
-
     def state_expression(self, _part, local):
         return self.node(*local.split(".", 1))
 
@@ -107,8 +96,8 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
     def header(self):
         startup = self.ctrl.startup
         channels = self.model.unit_measurements(self.unit)
-        measured = [f"{'Complex' if value.kind == 'complex' else 'double'} "
-                    f"{_identifier(name)}{{}};" for name, value in channels.items()]
+        measured = [f"{_CPP_TYPES[value.kind]} {_identifier(name)}{{}};"
+                    for name, value in channels.items()]
         members = [
             f"bool {self.m('tripped')} = false, {self.m('fault')} = false;",
             f"double {self.m('trip_time')} = std::numeric_limits<double>::quiet_NaN();",
@@ -120,8 +109,8 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
             *[f"double {self.m('prot_' + key)} = 0.0;"
               for key in self.protection.get_state()],
             *self.protection_members(), *self._loop_members(),
-            *[f"{'Complex' if isinstance(value, complex) else 'double'} "
-              f"{self.g(key)} = {self._literal(value)};" for key, value in self.graph.values.items()],
+            *[f"{_CPP_TYPES[_Expression.of(value).kind]} {self.g(key)} = {_literal(value)};"
+              for key, value in self.graph.values.items()],
             f"std::array<double, {len(self.topology.duty_names)}> duty{{}};",
         ]
         on = self._controller_command_lines(True, self.binding.get("startup_ramp", startup.ramp))
@@ -129,7 +118,7 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
         lines = self._sampled_measurement_lines()
         lines += self._sampled_loop_lines()
         if isinstance(self.ctrl, VSCController):
-            members += [f"Complex {self.m('u_cmd')} = {self._literal(self.ctrl.u_cmd)};",
+            members += [f"Complex {self.m('u_cmd')} = {_literal(self.ctrl.u_cmd)};",
                         f"double {self.m('theta')} = {_number(self.ctrl.theta)};",
                         f"double {self.m('omega')} = {_number(self.ctrl.omega)};",
                         f"double {self.m('command_theta')} = {_number(self.ctrl.command_theta)};"]
@@ -557,8 +546,6 @@ def _source(generators, adc, clocks, period, phase, runtime, *, sampling_period=
 def _export_imperix(simulation, out_dir, name, variables, reusable, *,
                     target_config=None, sdk=None, build=True):
     """Generate Imperix ELF sources and optionally build the executable with the configured SDK."""
-    if not simulation._rebuildable:
-        raise TypeError("Imperix export cannot reconstruct supplied instances; use parts factories")
     from .conduction import DiodeConduction
     if DiodeConduction(simulation.system.model).commutating:
         raise ValueError("Imperix hardware adapters do not implement plant commutations")

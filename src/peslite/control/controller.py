@@ -173,8 +173,6 @@ class ControlInterface:
         return tuple(sorted(set(configured) - (self.outputs.keys() - self.optional_outputs)))
 
 
-_OutputLimit = OutputLimit
-
 # ------------------------------------------------------------------ the start-up sequence
 
 class Startup:
@@ -198,9 +196,7 @@ class Startup:
         self.run = bool(run)
         if self.run:
             self.ramp = float(ramp)
-            self.steps, self.value, self.complete = 0, 0.0, False
-        else:
-            self.steps, self.value, self.complete = 0, 0.0, False
+        self.steps, self.value, self.complete = 0, 0.0, False
 
     @property
     def active(self) -> bool:
@@ -348,7 +344,7 @@ class ControlGraph:
         self._t0 = cfg.pwm.grid_offset
         self.values: dict[str, Any] = {}
         self._out_specs: dict[str, tuple] = {}
-        self._limits: dict[str, tuple[str, _OutputLimit]] = {}
+        self._limits: dict[str, tuple[str, OutputLimit]] = {}
         self.updated = set()
         refs = cfg.ctrl.references
         self.references = {f.name: getattr(refs, f.name) for f in fields(refs)}
@@ -655,8 +651,7 @@ class ControlGraph:
             for name, node in self.nodes.items()
         }
         self._flow_plan = tuple(
-            (group, group in self._continuous_cycles,
-             self._flow_cycle_keys.get(group, ()), tuple(steps[name] for name in group))
+            (group, self._flow_cycle_keys.get(group, ()), tuple(steps[name] for name in group))
             for group in self._continuous_plan
         )
         if self._continuous_cycles:
@@ -673,7 +668,7 @@ class ControlGraph:
         environment = {"_values": self.values}
         body = []
         index = 0
-        for group, _cyclic, _keys, steps in self._flow_plan:
+        for group, _keys, steps in self._flow_plan:
             name, evaluate, wiring, inputs, outputs, flow, out_specs, flow_specs = steps[0]
             if selected is not None and name not in selected:
                 continue
@@ -901,24 +896,10 @@ class ControlGraph:
                 return (dict(zip(self.flow_state_names, derivatives))
                         if named else derivatives)
         values = self.values
-        for group, cyclic, keys, steps in self._flow_plan:
+        for group, keys, steps in self._flow_plan:
             if only is not None and not any(name in only for name in group):
                 continue
-            if not cyclic:
-                _name, evaluate, wiring, inputs, outputs, flow, out_specs, flow_specs = steps[0]
-                for port, kind, key in wiring:
-                    if kind == _HELD:
-                        inputs[port] = values[key]
-                    elif kind == _MEASURED:
-                        inputs[port] = getattr(meas, key)
-                    else:
-                        inputs[port] = key
-                evaluate(t, inputs, outputs, flow)
-                for port, key, _complex_value in out_specs:
-                    values[key] = outputs[port]
-                for local, key in flow_specs:
-                    derivatives[self._flow_derivative_index[key]] = flow[local]
-                continue
+            # An acyclic component has no feedback keys, so its first pass has converged.
             previous = tuple(values[key] for key in keys)
             for _iteration in range(self._cycle_iterations):
                 for (_name, evaluate, wiring, inputs, outputs, flow,
@@ -1095,6 +1076,9 @@ class _ContinuousControlOut(Bag):
 class _GraphRuntime:
     """Lifecycle and continuous-state mechanics shared by control-graph hosts."""
 
+    outputs_need_inputs = True
+    observer = True
+
     @property
     def discrete_state_names(self) -> tuple[str, ...]:
         """Run/ramp bookkeeping is restored, not differentiated as controller memory."""
@@ -1105,17 +1089,12 @@ class _GraphRuntime:
         """The effective typed boundary of the active control graph."""
         return self.graph.interface
 
-    def overwritten_state_names(self, period):
-        """Expose the graph's proof through the existing state owner."""
-        return self.graph.overwritten_state_names(period)
-
-    def _install_flow_state(self, state_type: type, states: list[tuple[str, Mapping]],
-                            inp: Any, out: Any) -> None:
+    def _install_flow_state(self, inp: Any, out: Any) -> None:
         """Create one fixed ODE layout from the graph's declared loop states."""
-        state = state_type()
+        state = _ContinuousControlState()
         names = []
-        for name, values in states:
-            for local, value in values.items():
+        for name in self.graph.order:
+            for local, value in self.graph.nodes[name].flow_state().items():
                 if isinstance(value, bool):
                     raise ConfigError(
                         f"ctrl.loops.{name}: boolean state {local!r} "
@@ -1172,7 +1151,8 @@ class _GraphRuntime:
                 if key in known:
                     setattr(self.state, key, value)
 
-    def _graph_retuned(self) -> None:
+    def _loop_retuned(self, name=None) -> None:
+        """Rebind continuous state after a set event rebuilt loop ``name``."""
         if not self.continuous:
             return
         if self.graph.flow_state_names != self.state_names:
@@ -1189,27 +1169,29 @@ class _GraphRuntime:
         """Apply initial parameter events before startup and named-state restoration."""
         self.graph._apply_pending()
 
-    def command(self, run: bool, ramp: float = 0.0) -> None:
-        """Take the host's run or stop command."""
-        if self.continuous:
-            self.command_at(run, ramp, 0.0)
-            return
+    def command(self, run: bool, ramp: float = 0.0, t: float = 0.0, *, reset: bool = True) -> None:
+        """Take the host's run or stop command; a continuous controller takes it at absolute
+        time ``t`` and clears its integrators on a new run only with ``reset``."""
         starting = bool(run) and not self.startup.active
-        if starting:
-            self.graph.reset_integrators()
-        self.startup.command(run, ramp)
-
-    def command_at(self, run: bool, ramp: float, t: float, *, reset: bool = True) -> None:
-        """Take a continuous run or stop command at absolute time ``t``."""
         if not self.continuous:
-            self.command(run, ramp)
+            if starting:
+                self.graph.reset_integrators()
+            self.startup.command(run, ramp)
             return
-        starting = bool(run) and not self.startup.active
         if starting and reset:
             self._sync_continuous_nodes()
             self.graph.reset_integrators()
             self._store_continuous_nodes()
         self.startup.command(run, ramp, t)
+
+    command_at = command
+
+    def rhs(self, t):
+        return self._derivatives
+
+    def set_logging(self, enabled: bool) -> None:
+        """Enable per-interrupt log dictionaries when a run records or watches them."""
+        self.logging = bool(enabled)
 
 
 class VSCController(_GraphRuntime):
@@ -1219,9 +1201,6 @@ class VSCController(_GraphRuntime):
     averaging it is called at each interrupt.  With ideal averaging it is a continuous subsystem:
     its loop states join the plant ODE and its output is the bridge's modulation space vector.
     """
-
-    outputs_need_inputs = True
-    observer = True
 
     def __init__(self, cfg, pwm_method=None, *, limiter=CONFIGURED):
         self.p = cfg
@@ -1316,7 +1295,7 @@ class VSCController(_GraphRuntime):
                 and isinstance(node, CurrentLoop) and self.stage is not None):
             limit = self.stage.command_limit(1.0)
             if limit is not None:
-                output_limit = _OutputLimit(
+                output_limit = OutputLimit(
                     limit, pi=node.pi,
                     active=lambda: self.startup.active,
                 )
@@ -1336,42 +1315,29 @@ class VSCController(_GraphRuntime):
                 self.alarms.append(alarm)
 
     def _build_flow_state(self):
-        """Create the fixed ODE state layout from each loop's flow-state declaration."""
-        states = []
+        """Check each loop's continuous implementation, then create the fixed ODE state layout."""
         for name in self.graph.order:
             node = self.graph.nodes[name]
-            try:
-                if (type(node).flow is Loop.flow
-                        and (node.flow_inputs is None
-                             or (type(node).flow_path is Loop.flow_path
-                                 and type(node).equation is Loop.equation))):
-                    raise NotImplementedError(
-                        f"loop type {node.type!r} has no continuous-time implementation"
-                    )
-                if isinstance(node, SyncLaw) and type(node)._flow is SyncLaw._flow:
-                    raise NotImplementedError(
-                        f"loop type {node.type!r} has no continuous-time flow implementation"
-                    )
-                values = node.flow_state()
-            except NotImplementedError as exc:
-                raise ConfigError(f"ctrl.loops.{name}: {exc}") from None
-            states.append((name, values))
+            if (type(node).flow is Loop.flow
+                    and (node.flow_inputs is None
+                         or (type(node).flow_path is Loop.flow_path
+                             and type(node).equation is Loop.equation))):
+                raise ConfigError(f"ctrl.loops.{name}: loop type {node.type!r} "
+                                  "has no continuous-time implementation")
+            if isinstance(node, SyncLaw) and type(node)._flow is SyncLaw._flow:
+                raise ConfigError(f"ctrl.loops.{name}: loop type {node.type!r} "
+                                  "has no continuous-time flow implementation")
         self._install_flow_state(
-            _ContinuousControlState,
-            states,
             _ContinuousControlInp(u_g=0j, i_c=0j, u_dc=self.p.dclink.vdc_ref),
             _ContinuousControlOut(q=0j),
         )
-        self._flow_derivative_index = {
-            name: index for index, name in enumerate(self.state_names)
-        }
         self._continuous_meas = ControlMeasurement(0.0, 0j, 0j, 1.0, np.zeros(3))
         self._last_control_meas = self._continuous_meas
 
     def _loop_retuned(self, name=None):
         """Rebuild the loop's limit and continuous state bindings after a set event."""
         self._configure_limit(name)
-        self._graph_retuned()
+        super()._loop_retuned(name)
 
     def describe(self):
         return self.graph.describe()
@@ -1428,10 +1394,6 @@ class VSCController(_GraphRuntime):
         names += (["id_ref_pu", "freq_dev", "angle_rel"] if self._is_gfl else
                   ["p_pu", "q_pu", "p_ref_pu", "v_ref_pu", "freq_dev", "angle_rel"])
         return tuple(names)
-
-    def set_logging(self, enabled: bool) -> None:
-        """Enable per-interrupt log dictionaries when a run records or watches them."""
-        self.logging = bool(enabled)
 
     def mode_log_sources(self) -> Mapping[str, str]:
         """Return graph sources for control-family-specific log fields."""
@@ -1554,9 +1516,6 @@ class VSCController(_GraphRuntime):
         else:
             self.out.q = 0j
         self._last_control_meas = meas
-
-    def rhs(self, t):
-        return self._derivatives
 
     def continuous_log(self, t):
         """Controller observation at an output snapshot of the continuous model."""
@@ -1771,16 +1730,8 @@ class ConverterMeasurement:
     samples: tuple["ConverterMeasurement", ...] = ()
 
 
-class _ConverterControlState:
-    """Dynamic attributes containing a converter graph's continuous states."""
-
-
 class _ConverterControlInp(Bag):
     __slots__ = ("current", "voltage", "vin", "power_voltage", "power_current", "power")
-
-
-class _ConverterControlOut(Bag):
-    __slots__ = ("q",)
 
 
 class GraphController(_GraphRuntime):
@@ -1789,9 +1740,6 @@ class GraphController(_GraphRuntime):
     This class supplies only the plant boundary and lifecycle. Feedback and open-loop laws are both
     ordinary graph loops; no application-specific controller bypasses the graph.
     """
-
-    outputs_need_inputs = True
-    observer = True
 
     def __init__(self, cfg, topology) -> None:
         self.p = cfg
@@ -1844,7 +1792,11 @@ class GraphController(_GraphRuntime):
         self._last_outputs = {port: (topology.neutral_duty if port == "duty" else 0.0)
                               for port in self._command_ports}
         if self.continuous:
-            self._build_flow_state()
+            self._install_flow_state(
+                _ConverterControlInp(current=0.0, voltage=0.0, vin=cfg.dclink.vdc_ref,
+                                     power_voltage=0.0, power_current=0.0, power=0.0),
+                _ContinuousControlOut(q=topology.zero),
+            )
 
     def control_inputs(self, current, voltage, vin, power=None) -> dict[str, Any]:
         """Return canonical measurements and converter feedforward at the control boundary."""
@@ -1882,18 +1834,6 @@ class GraphController(_GraphRuntime):
             power=power,
         )
 
-    def _build_flow_state(self) -> None:
-        self._install_flow_state(
-            _ConverterControlState,
-            [(name, self.graph.nodes[name].flow_state()) for name in self.graph.order],
-            _ConverterControlInp(current=0.0, voltage=0.0, vin=self.p.dclink.vdc_ref,
-                                 power_voltage=0.0, power_current=0.0, power=0.0),
-            _ConverterControlOut(q=self.topology.zero),
-        )
-
-    def _loop_retuned(self, _name=None) -> None:
-        self._graph_retuned()
-
     def sample(self, t: float, current: float, voltage: float, vin: float,
                power: float | None = None) -> BridgeControlOutput:
         """Evaluate one sampled control interrupt from physical plant values."""
@@ -1928,9 +1868,6 @@ class GraphController(_GraphRuntime):
         self._last_measurement = measurement
         self._last_outputs["duty"] = duty
 
-    def rhs(self, t: float):
-        return self._derivatives
-
     def _log(self, outputs: Mapping[str, float], active: bool) -> dict[str, float]:
         measurement = self._last_measurement
         values = {
@@ -1962,9 +1899,6 @@ class GraphController(_GraphRuntime):
     def log_sources(self) -> Mapping[str, str]:
         """Map log columns to public control ports or controller lifecycle values."""
         return self._log_sources
-
-    def set_logging(self, enabled: bool) -> None:
-        self.logging = bool(enabled)
 
     def get_state(self) -> dict[str, Any]:
         startup = {f"startup.{name}": value for name, value in self.startup.get_state().items()}

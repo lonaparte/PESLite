@@ -15,7 +15,7 @@ from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather, scatter
 from .events import SWITCHABLE, SourceScenario, connected_at, switching_schedule
-from .params import Change, Params, _parameterized, _unit_leaves
+from .params import Change, Params, _parameterized, _split_path, _unit_leaves, _unit_path
 from .types import unit_type
 from .unit import DCConverter, Unit, VSC
 
@@ -281,15 +281,6 @@ def _part(parts: Mapping[str, Any], name: str, suffix: str = "") -> Any:
     return parts.get(key)
 
 
-def _owner(names: Mapping[str, Any], value: str, default: Optional[str] = None) -> Optional[str]:
-    """Return the longest runtime name that is equal to or prefixes ``value``."""
-    return next(
-        (name for name in sorted(names, key=len, reverse=True)
-         if value == name or value.startswith(name + ".")),
-        default,
-    )
-
-
 def _assemble_vsc(name: str, cfg: Any, system: "System",
                   parts: Mapping[str, Any]) -> _UnitAssembly:
     unit = _part(parts, name) or VSC(
@@ -381,10 +372,7 @@ def _assemble_wpt(name: str, cfg: Any, system: "System",
 
 def _assemble_unit(name: str, cfg: Any, system: "System",
                    parts: Mapping[str, Any]) -> _UnitAssembly:
-    assembler = unit_type(cfg.type, f"units.{name}.type").assembler
-    if assembler is None:
-        raise ConfigError(f"units.{name}.type: {cfg.type!r} has no runtime assembler")
-    assembly = assembler(name, cfg, system, parts)
+    assembly = unit_type(cfg.type, f"units.{name}.type").assembler(name, cfg, system, parts)
     try:
         assembly.port()
     except ConfigError as exc:
@@ -658,7 +646,7 @@ class System:
             src.emf.set_outputs(t)
 
         def preset(key: str, word: str):
-            head = _owner(self.units, key, key.partition(".")[0])
+            head = _unit_path(self.p.units, key) or key.partition(".")[0]
             if word == "rated":
                 if head not in self.units:
                     raise ValueError(f"{key}: 'rated' is a converter's rated dc voltage, and "
@@ -720,11 +708,7 @@ class System:
             if path in change.connections:
                 self.switch(path.removesuffix(".connected"), change.values[path], change.t, change.ramp)
                 continue
-            section, _, remainder = path.partition(".")
-            if section == "units":
-                name = _owner(self.units, remainder, remainder.partition(".")[0])
-            else:
-                name = remainder.partition(".")[0]
+            section, name, _ = _split_path(self.p, path)
             if (section, name) in done:
                 continue
             done.add((section, name))
@@ -755,12 +739,7 @@ class System:
                         if not (hasattr(element, "breakers") or hasattr(element, "connect")):
                             raise ConfigError(f"{path}: its type has no breakers and no connect()")
                     continue
-                section, _, remainder = path.partition(".")
-                if section == "units":
-                    name = _owner(self.units, remainder, remainder.partition(".")[0])
-                    rest = remainder[len(name) + 1:]
-                else:
-                    name, _, rest = remainder.partition(".")
+                section, name, rest = _split_path(p, path)
                 if section == "elements" and not hasattr(self.named_elements[name], "retune"):
                     raise ConfigError(
                         f"events.{change.event}: elements.{name} has no retune(parameters), so a "

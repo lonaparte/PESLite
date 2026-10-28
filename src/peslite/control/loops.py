@@ -391,15 +391,17 @@ class SRFPLL(Loop):
     def initial_outputs(self):
         return {"theta": self.theta, "frame": self.theta, "omega": self.omega}
 
-    def sample(self, t, inputs):
-        frame = self.theta
-        v = inputs["v"] * _into(frame)
-        u_g = self.u_g
-        if u_g is None:                                    # rated
-            eps = v.imag
-        else:                                              # amplitude
-            eps = v.imag / u_g if u_g > 0.0 else 0.0
+    def _frequency(self, voltage):
+        """Set ``omega`` from the error in the present frame; return the rotated voltage."""
+        v = voltage * _into(self.theta)
+        u_g = self.u_g                                     # None: rated normalisation
+        eps = v.imag if u_g is None else v.imag / u_g if u_g > 0.0 else 0.0
         self.omega = self.pi(eps, 0.0, self.w0)
+        return v
+
+    def sample(self, t, inputs):
+        frame, u_g = self.theta, self.u_g
+        v = self._frequency(inputs["v"])
         self.theta += self.T * self.omega
         if u_g is not None:
             self.u_g = u_g + self.T * self.kp * (v.real - u_g)
@@ -407,12 +409,7 @@ class SRFPLL(Loop):
 
     def flow_path(self, voltage):
         """Positional form used by the construction-time compiled continuous graph."""
-        v = voltage * _into(self.theta)
-        if self.u_g is None:
-            eps = v.imag
-        else:
-            eps = v.imag / self.u_g if self.u_g > 0.0 else 0.0
-        self.omega = self.pi(eps, 0.0, self.w0)
+        v = self._frequency(voltage)
         d_integral = self.pi.derivative
         if self.u_g is not None:
             return (self.theta, self.theta, self.omega, self.omega, d_integral,
@@ -601,9 +598,7 @@ class DCVoltageControl(Loop):
 
     def equation(self, reference, voltage):
         self.raw = self._requested(reference, voltage)
-        current = (self.limit.flow(self.raw) if self.block_period is None
-                   else self.limit.sample(0.0, self.raw))
-        return (current,)
+        return (self.limit.sample(0.0, self.raw),)
 
     def sample(self, t, inputs):
         current, = self.equation(inputs["reference"], inputs["voltage"])
@@ -640,9 +635,11 @@ class SyncLaw(Loop):
     """Base of the grid-forming synchronization laws: angle (rad), frequency (rad/s) and voltage
     magnitude reference (pu) from the power feedback, the setpoints and the measured voltage.
 
-    A law implements ``step(T, p, q, v_mag, v_dc, p_ref, q_ref, v_ref, i_dq)``, which advances
-    ``theta``, ``omega`` and ``v_mag`` by one period ``T``; its inputs are in pu (the voltage
-    magnitude on the ac base, ``v_dc`` on the dc base) and ``i_dq`` is the current in the law's frame.
+    A law implements ``_flow(p, q, v_mag, v_dc, p_ref, q_ref, v_ref, i_dq)``, which sets ``omega``
+    and ``v_mag`` and returns the derivatives of its named states (``theta`` first); its sampled
+    form is one forward-Euler step of that law unless it overrides ``_sample(T, ...)``. The inputs
+    are in pu (the voltage magnitude on the ac base, ``v_dc`` on the dc base) and ``i_dq`` is the
+    current in the law's frame.
     The active-power setpoint follows the controller's start-up ramp. Before it runs, a grid-forming
     law follows the measured terminal voltage so that it starts in phase with the grid.
     """
@@ -709,9 +706,12 @@ class SyncLaw(Loop):
         return {"theta": self.theta, "frame": frame, "omega": self.omega,
                 "v_ref": self.v_mag, "p": p, "q": q}
 
-    def _sample(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
-                p_ref_pu, q_ref_pu, v_ref_pu, i_dq) -> None:
-        raise NotImplementedError
+    def _sample(self, T, *inputs) -> None:
+        """Advance the named states by one forward-Euler step of :meth:`_flow`."""
+        state = self.get_state()
+        assign(self, {name: state[name] + T * derivative
+                      for name, derivative in zip(self.state_names, self._flow(*inputs))},
+               self.state_names)
 
     def flow_path(self, voltage, current, u_dc, p_ref, q_ref, v_ref):
         """Shared continuous evaluation for all synchronization laws."""
@@ -836,12 +836,6 @@ class Droop(SyncLaw):
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
         self.m_p, self.n_q = cfg.m_p_pu, cfg.n_q_pu
-
-    def _sample(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
-                p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
-        self.omega = self.w0 + self.m_p * (p_ref_pu - p_pu)
-        self.theta += T * self.omega
-        self.v_mag = v_ref_pu + self.n_q * (q_ref_pu - q_pu)
 
     def _flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
               q_ref_pu, v_ref_pu, i_dq):
@@ -969,12 +963,6 @@ class Matching(SyncLaw):
         self.k_theta = cfg.k_theta_pu if cfg.k_theta_pu is not None else self.w0 / vdc_ref_pu
         self.k_q = cfg.k_q_pu
 
-    def _sample(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
-                p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
-        self.omega = self.k_theta * v_dc_pu
-        self.theta += T * self.omega
-        self.v_mag = v_ref_pu + self.k_q * (q_ref_pu - q_pu)
-
     def _flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
               q_ref_pu, v_ref_pu, i_dq):
         self.omega = self.k_theta * v_dc_pu
@@ -1013,11 +1001,6 @@ class VirtualImpedance(Loop):
 
     def initial_outputs(self):
         return {"u_dq": 0j}
-
-    def sample(self, t, inputs):
-        output, = self.equation(inputs["v_ref"], inputs["i"], inputs["frame"],
-                                inputs["omega"], inputs["extra"])
-        return {"u_dq": output}
 
     def equation(self, v_ref, current, frame, omega, extra):
         i = current * _into(frame)
@@ -1127,29 +1110,15 @@ class ActiveDamping(Loop):
         super().__init__(cfg, unit, startup)
         self.r_a = cfg.r_a_pu
         self.alpha_d = cfg.alpha_d
-        self.lpf = Filter((cfg.alpha_d,), (1.0, cfg.alpha_d),
-                          self.block_period, initial=0j)
+        self.lpf = self.state_block("hpf_pu", Filter((cfg.alpha_d,), (1.0, cfg.alpha_d),
+                                                     self.block_period, initial=0j))
 
     def initial_outputs(self):
         return {"extra": 0j}
 
-    def sample(self, t, inputs):
-        current = inputs["i"] * _into(inputs["frame"])
-        return {"extra": -self.r_a * (current - self.lpf(current))}
-
-    def flow_path(self, current, frame):
-        current_dq = current * _into(frame)
-        delta = current_dq - self.lpf(current_dq)
-        return -self.r_a * delta, self.lpf.derivative[0]
-
-    def get_state(self):
-        return gather({"hpf_pu": self.lpf})
-
-    def flow_state_bindings(self):
-        return {"hpf_pu": (self.lpf, "x0")}
-
-    def set_state(self, values):
-        scatter({"hpf_pu": self.lpf}, values)
+    def equation(self, current, frame):
+        current = current * _into(frame)
+        return (-self.r_a * (current - self.lpf(current)),)
 
 
 # ------------------------------------------------------------------ scalar SI converter loops
@@ -1185,8 +1154,6 @@ class _LimitedScalarPI(Loop):
         return cfg.minimum, cfg.maximum
 
     def constrain(self, requested):
-        if self.block_period is None:
-            return self.limit.flow(requested)
         return self.limit.sample(0.0, requested)
 
     def initial_outputs(self):
@@ -1405,10 +1372,7 @@ class PhaseShiftModulation(Loop):
         return {"width": 0.0, "phase": references.phase, "frequency": references.frequency,
                 "mode": _real(references.mode)}
 
-    def forcing_periods(self, inputs):
-        """The square-wave period, for post-run loop maps."""
-        frequency = abs(inputs["frequency"])
-        return () if frequency == 0.0 else (1.0 / frequency,)
+    forcing_periods = ResonantModulation.forcing_periods
 
     def equation(self, width, phase, frequency, mode):
         width = min(1.0, max(0.0, self.startup.value * width))

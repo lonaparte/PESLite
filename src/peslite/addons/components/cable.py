@@ -74,9 +74,7 @@ class CableModel:
         self.series_l = tuple(l_per_km * span for span in lengths)
         self.shunt_g = g_per_km * cell
         self.shunt_c = c_per_km * cell
-        self.state_names = tuple(f"iL{k}" for k in range(1, sections + 2)) + tuple(
-            f"uC{k}" for k in range(1, sections + 1)
-        )
+        self.state_names = _state_record(sections).__slots__
         initial = {name: 0j for name in self.state_names}
         initial.update({f"uC{k}": complex(voltage0) for k in range(1, sections + 1)})
         self.state = _state_record(sections)(**initial)

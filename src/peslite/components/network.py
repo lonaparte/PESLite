@@ -116,6 +116,22 @@ class Terminal:
         return provider(self, current_constraint=current_constraint)
 
 
+def _phase_convention(phases: int, initial: complex | float = 0.0):
+    """Power scale, zero and ``initial`` of peak complex space vectors (3) or real scalars (1)."""
+    if phases not in (1, 3):
+        raise ValueError(f"phases must be 1 or 3, got {phases!r}")
+    if phases == 3:
+        return 1.5, 0j, _complex(initial)
+    return 1.0, 0.0, _real(initial.real if isinstance(initial, complex) else initial)
+
+
+def _extend_record(record: Bag, *names: str) -> Bag:
+    """Copy ``record`` into a record type with the additional fields ``names``."""
+    fields = type(record).__slots__
+    return type(type(record).__name__, (Bag,), {"__slots__": (*fields, *names)})(
+        **{name: getattr(record, name) for name in fields})
+
+
 class _BranchState(Bag):
     __slots__ = ("i",)
 
@@ -136,16 +152,12 @@ class RLBranch:
     outputs_need_inputs: ClassVar[bool] = False
     def __init__(self, L: float, R: float, i0: complex | float = 0j, *, phases: int = 3,
                  unilateral: bool = False) -> None:
-        if phases not in (1, 3):
-            raise ValueError(f"phases must be 1 or 3, got {phases!r}")
+        self.power_scale, self.zero, initial = _phase_convention(phases, i0)
         if unilateral and phases != 1:
             raise ValueError("unilateral current is only available for scalar branches")
         self.L, self.R = L, R
         self.phases = phases
-        self.power_scale = 1.5 if phases == 3 else 1.0
-        self.zero = 0j if phases == 3 else 0.0
         self.unilateral = bool(unilateral)
-        initial = _complex(i0) if phases == 3 else _real(i0.real if isinstance(i0, complex) else i0)
         self.ports = (PowerPort("inp.u1", "out.i", self.power_scale, 1.0),
                       PowerPort("inp.u2", "out.i", self.power_scale, -1.0))
         self.storage = (StoragePort(
@@ -244,9 +256,7 @@ class RLBranch:
         name = f"hold_{terminal.voltage}"
         other = "u2" if terminal.voltage == "u1" else "u1"
         if not hasattr(self.out, name):
-            names = (*type(self.out).__slots__, name)
-            self.out = type("_BranchOut", (Bag,), {"__slots__": names})(
-                **{key: getattr(self.out, key) for key in type(self.out).__slots__})
+            self.out = _extend_record(self.out, name)
             stages = getattr(self, "output_stages", (
                 OutputMethod("set_outputs", inputs=(), outputs=("i",)),))
             self.output_stages = (*stages, OutputMethod(
@@ -290,13 +300,9 @@ class RCNode:
     state_names: ClassVar[tuple[str, ...]] = ("u_C",)
     outputs_need_inputs: ClassVar[bool] = True
     def __init__(self, C: float, R_d: float, u0: complex | float = 0j, *, phases: int = 3) -> None:
-        if phases not in (1, 3):
-            raise ValueError(f"phases must be 1 or 3, got {phases!r}")
+        self.power_scale, zero, initial = _phase_convention(phases, u0)
         self.C, self.R_d = C, R_d
         self.phases = phases
-        self.power_scale = 1.5 if phases == 3 else 1.0
-        initial = _complex(u0) if phases == 3 else _real(u0.real if isinstance(u0, complex) else u0)
-        zero = 0j if phases == 3 else 0.0
         self.ports = (PowerPort("out.u", "inp.i", self.power_scale),)
         self.storage = (StoragePort("u_C", C, self.power_scale, (("inp.i", 1.0),)),)
         self.state = _NodeState(u_C=initial)
@@ -344,15 +350,13 @@ class ACVoltageSource:
 
     def __init__(self, w0: float, e_peak: float,
                  phi: Optional[Callable[[float], float]] = None, *, phases: int = 3) -> None:
-        if phases not in (1, 3):
-            raise ValueError(f"phases must be 1 or 3, got {phases!r}")
+        self.power_scale, zero, _ = _phase_convention(phases)
         self.w0, self.e_peak, self.phases = w0, e_peak, phases
-        self.power_scale = 1.5 if phases == 3 else 1.0
         self.phi = phi
         self.state = Empty()
-        self.inp = _SourceInp(i=0j if phases == 3 else 0.0)
+        self.inp = _SourceInp(i=zero)
         self.out = _SourceOut()
-        self.out.e_g = 0j if phases == 3 else 0.0
+        self.out.e_g = zero
         self.ports = (PowerPort("out.e_g", "inp.i", self.power_scale, -1.0),)
         self.terminal = Terminal(
             self, "e_g", "i", -1, drives_voltage=True, electrical_domain="ac"
@@ -510,8 +514,7 @@ class _ResistorModel:
     def __init__(self, resistance: float, phases: int, series: bool = False) -> None:
         self.resistance = resistance
         self.series = series
-        self.power_scale = 1.5 if phases == 3 else 1.0
-        zero = 0j if phases == 3 else 0.0
+        self.power_scale, zero, _ = _phase_convention(phases)
         self.state = Empty()
         self.inp = _ResistorInp(u=zero, i=zero)
         self.out = _ResistorOut(i=zero, u=zero, power=0.0)

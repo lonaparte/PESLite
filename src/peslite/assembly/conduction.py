@@ -191,20 +191,19 @@ class DiodeConduction:
         """
         if not self.commutating:
             return state
-        tolerance = commutation_tolerance(t)
+        due = t + commutation_tolerance(t)
         for _ in range(_MAX_COMMUTATIONS):
             self.model.sync(t, state)
             pending = {sub for sub in self.commutating if sub.commutation_margin() < 0.0}
             pending.update(sub for sub in self._scheduled
-                           if float(sub.next_commutation_time()) <= t + tolerance)
+                           if float(sub.next_commutation_time()) <= due)
             if not pending:
                 return state
             for sub in self.commutating:
                 if sub not in pending:
                     continue
                 self.model.sync(t, state)
-                scheduled = (callable(getattr(sub, "next_commutation_time", None))
-                             and float(sub.next_commutation_time()) <= t + tolerance)
+                scheduled = sub in self._scheduled and float(sub.next_commutation_time()) <= due
                 if not scheduled and sub.commutation_margin() >= 0.0:
                     continue
                 sub.commutate(t)

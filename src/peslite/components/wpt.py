@@ -28,7 +28,7 @@ import numpy as np
 
 from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, LocatedZero, OutputMethod, _real, commutation_tolerance
-from .network import Terminal
+from .network import Terminal, _extend_record
 from .pwm import PhaseClock
 
 __all__ = ["CompensatedLink", "SwitchedCompensatedLink", "SwitchControlledCapacitor",
@@ -214,7 +214,6 @@ class CompensatedLink:
                    *self._coil_outputs, *capacitor_outputs,
                    *(f"{scc.side}_scc_on" for scc in switched))
         self.hold_sides = ()
-        self._outputs = outputs
         self.out = type("_LinkOut", (Bag,), {"__slots__": outputs})()
         self.output_stages = (OutputMethod("set_outputs", inputs=(), outputs=outputs),)
         self.inp = type("_LinkInp", (Bag,), {"__slots__": ("u_primary", "u_secondary")})()
@@ -240,10 +239,7 @@ class CompensatedLink:
         self._prepare_holds()
         if side not in self.hold_sides:
             self.hold_sides = (*self.hold_sides, side)
-            names = (*self._outputs, *(f"u_hold_{key}" for key in self.hold_sides))
-            previous = self.out
-            self.out = type("_LinkOut", (Bag,), {"__slots__": names})(
-                **{key: getattr(previous, key) for key in type(previous).__slots__})
+            self.out = _extend_record(self.out, f"u_hold_{side}")
             other = SIDES[1 - SIDES.index(side)]
             inputs = () if self.sides[side].lcc or self.sides[other].lcc else (f"u_{other}",)
             self.output_stages = (*self.output_stages, OutputMethod(
@@ -353,9 +349,8 @@ class CompensatedLink:
 
 
 def _link_spec(cfg: Any) -> dict[str, Any]:
-    """Normalize one configured link type into the general coil/side description."""
-    kind = cfg.type
-    if kind == "ss_multi":
+    """Normalize one link type into coil/side form; a compensation inductor marks an LCC side."""
+    if cfg.type == "ss_multi":
         n = len(cfg.primary_capacitance)
         return {
             "inductance": cfg.inductance,
@@ -367,10 +362,9 @@ def _link_spec(cfg: Any) -> dict[str, Any]:
         }
     matrix = ((cfg.primary_inductance, cfg.mutual_inductance),
               (cfg.mutual_inductance, cfg.secondary_inductance))
-    lcc = {"ss": (False, False), "lcc": (True, True), "lcc_s": (True, False)}[kind]
     sides, capacitance = {}, []
     for index, side in enumerate(SIDES):
-        if lcc[index]:
+        if hasattr(cfg, f"{side}_compensation_inductance"):
             sides[side] = _Side(
                 side, (index,), True,
                 getattr(cfg, f"{side}_compensation_inductance"),
@@ -582,18 +576,16 @@ class SwitchControlledCapacitor:
             self.started = True
             if self._since is not None:
                 self._reference, self._since = t - self._since, None
-        if self.zero.sign == 0.0:
+        if self.zero.sign == 0.0 or not self._tracks_current():
             if abs(current) > _CURRENT_TOL:
                 self.zero.sign = _real(np.copysign(1.0, current))
-        elif self._tracks_current() and self.zero.margin(current) < 0.0:
+        elif self.zero.margin(current) < 0.0:
             self.zero.locate(current, -self.zero.sign)
             if self.sync == "current":
                 if self.referenced:
                     self.half = t - self._reference
                 self._reference, self.referenced = t, True
                 self.theta = self._command()
-        elif not self._tracks_current() and abs(current) > _CURRENT_TOL:
-            self.zero.sign = _real(np.copysign(1.0, current))
     def _set_conduction(self, link: Any, current: float, voltage: float) -> None:
         positive, negative = self.gates
         direction = 1.0 if positive else -1.0

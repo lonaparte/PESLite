@@ -264,8 +264,6 @@ def _converter(u, base, where: str):
 
 def _unit(u, base, where: str, *, nested: bool = False) -> None:
     """Check one converter unit."""
-    if nested:
-        raise ConfigError(f"{where}: a three-phase VSC cannot be used as a scalar composite port")
     _topology, _continuous = _converter(u, base, where)
     if u.bus is None:
         raise ConfigError(f"{where}.bus: a VSC needs a three-phase bus")
@@ -299,7 +297,7 @@ def _wpt(u, base, where: str, *, nested: bool = False) -> None:
         child = getattr(u, side)
         child_where = f"{where}.{side}"
         spec = unit_type(child.type, f"{child_where}.type")
-        if spec.phases != 1 or spec.validator is None:
+        if spec.phases != 1:
             raise ConfigError(
                 f"{child_where}: a WPT child needs a scalar unit"
             )
@@ -311,8 +309,8 @@ def _wpt(u, base, where: str, *, nested: bool = False) -> None:
         return
     positive = ["primary_inductance", "secondary_inductance"]
     nonnegative = ["primary_resistance", "secondary_resistance"]
-    for side in ("primary", "secondary"):
-        if link.type == "lcc" or (link.type == "lcc_s" and side == "primary"):
+    for side in unit_type(u.type).children:
+        if hasattr(link, f"{side}_compensation_inductance"):
             positive += [f"{side}_series_capacitance", f"{side}_compensation_inductance",
                          f"{side}_parallel_capacitance"]
             nonnegative += [f"{side}_compensation_resistance", f"{side}_parallel_resistance"]
@@ -403,7 +401,7 @@ def _multi_link(link, where: str) -> None:
 
 def _network(p: Params) -> None:
     """Check element identities, network values and bus references."""
-    from .params import _unit_items
+    from .params import _unit_items, _unit_path
 
     if not p.units:
         raise ConfigError("units: a system needs at least one converter")
@@ -422,12 +420,10 @@ def _network(p: Params) -> None:
             raise ConfigError(f"{where}: unknown bus {bus!r}; known: {sorted(p.buses)}")
 
     def _element_bus(where: str, bus: str) -> None:
-        if bus in p.buses:
-            return
-        for name, unit in _unit_items(p.units, leaves_only=False):
-            spec = unit_type(unit.type)
-            if bus == name or (bus.startswith(name + ".")
-                               and bus[len(name) + 1:] in (spec.children or spec.ports)):
+        name = _unit_path(p.units, bus)
+        if name is not None:
+            spec = unit_type(p.unit(name).type)
+            if bus == name or bus[len(name) + 1:] in (spec.children or spec.ports):
                 return
         _bus_of(where, bus)
     for name, br in p.branches.items():
@@ -448,7 +444,7 @@ def _network(p: Params) -> None:
     for name, u in connected_units.items():
         _bus_of(f"units.{name}.bus", u.bus)
         expected = unit_type(u.type).phases
-        if expected is not None and p.buses[u.bus].phases != expected:
+        if p.buses[u.bus].phases != expected:
             phase_name = "single" if expected == 1 else str(expected)
             raise ConfigError(
                 f"units.{name}.bus: unit type {u.type!r} needs a {phase_name}-phase bus"
@@ -528,9 +524,7 @@ def _initial(p: Params) -> None:
     if t0 < 0.0:
         raise ConfigError("simulation.initial.t must be >= 0")
     for name, u in _unit_items(p.units):
-        m = getattr(u, "meas", None)
-        if m is None:
-            continue
+        m = u.meas
         if u.bridge.model == "averaging" or not u.bridge.controlled:
             continue
         T_c = _period(u.ctrl, u.pwm)
@@ -569,10 +563,7 @@ def validate(p: Params) -> Params:
     """Check a :class:`Params` tree and return it unchanged; raise ConfigError if invalid."""
     _network(p)
     for name, unit in p.units.items():
-        check = unit_type(unit.type, f"units.{name}.type").validator
-        if check is None:
-            raise ConfigError(f"units.{name}.type: {unit.type!r} has no validator")
-        check(unit, p.base, f"units.{name}")
+        unit_type(unit.type, f"units.{name}.type").validator(unit, p.base, f"units.{name}")
     from .params import _unit_items
     for name, unit in _unit_items(p.units):
         continuous = unit.bridge.model == "averaging" or unit.ctrl is None

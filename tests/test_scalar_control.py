@@ -246,7 +246,7 @@ def test_output_limit_tracks_sampled_and_continuous_pi_states():
     continuous = PI(2.0, 4.0, None)
     requested = continuous(2.0, 0.0)
     limiter = OutputLimit(1.0, lower=0.0, pi=continuous)
-    assert limiter.flow(requested) == 1.0
+    assert limiter.sample(0.0, requested) == 1.0
     assert continuous.derivative == pytest.approx(0.5)
 
 
@@ -328,7 +328,6 @@ def test_scalar_output_limits_keep_the_original_positive_upper_contract(lower, u
     for value in (lower - 1.0, lower, (lower + upper) / 2.0, upper, upper + 1.0):
         expected = min(upper, max(lower, value))
         assert limiter.sample(0.0, value) == expected
-        assert limiter.flow(value) == expected
 
 
 @pytest.mark.parametrize("lower,upper", [(-1.0, float("inf")), (float("nan"), 1.0),

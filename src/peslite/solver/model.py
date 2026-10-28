@@ -555,13 +555,47 @@ def _copy_value(operation: tuple) -> Any:
 
 
 def _run_output_operation(operation: tuple, t: float) -> None:
-    """Execute one uncompiled output/copy operation."""
+    """Execute one uncompiled output, algebraic-loop or copy operation."""
     kind, item = operation
-    if kind == "out":
-        item(t)
+    if kind == "copy":
+        setattr(item[0], item[1], _copy_value(item))
     else:
-        dst, field, _src, _src_field, _fanin = item
-        setattr(dst, field, _copy_value(item))
+        item(t)
+
+
+def _source_writers(env: dict[str, Any]):
+    """``ref``, ``put`` and ``value`` writers of generated source executed in ``env``.
+
+    ``ref(obj)`` names ``obj`` in ``env``; ``put`` assigns a field; ``value`` is a copy operation's value.
+    """
+    refs: dict[int, str] = {}
+
+    def ref(obj: Any) -> str:
+        key = refs.get(id(obj))
+        if key is None:
+            key = refs[id(obj)] = f"_{len(refs)}"
+            env[key] = obj
+        return key
+
+    def plain(field: str) -> bool:
+        return field.isidentifier() and not keyword.iskeyword(field)
+
+    def get(obj: Any, field: str) -> str:
+        return f"{ref(obj)}.{field}" if plain(field) else f"getattr({ref(obj)}, {field!r})"
+
+    def put(obj: Any, field: str, value: str) -> str:
+        return f"{ref(obj)}.{field} = {value}" if plain(field) else f"setattr({ref(obj)}, {field!r}, {value})"
+
+    def value(item: tuple) -> str:
+        _dst, _field, src, src_field, fanin = item
+        if fanin is None:
+            return get(src, src_field)
+        expression = "0"
+        for out, name, gain in fanin:
+            expression = f"({expression} + {ref(gain)} * {get(out, name)})"
+        return expression
+
+    return ref, put, value
 
 
 def _signal_error(a: Any, b: Any) -> tuple[float, float]:
@@ -606,33 +640,7 @@ class _AlgebraicLoop:
     def _compile_scalar_sweep(self):
         """Compile the torn scalar assignment and its acyclic operations into one Python call."""
         env: dict[str, Any] = {}
-        refs: dict[int, str] = {}
-
-        def ref(obj: Any) -> str:
-            key = refs.get(id(obj))
-            if key is None:
-                key = refs[id(obj)] = f"_{len(refs)}"
-                env[key] = obj
-            return key
-
-        def get(obj: Any, field: str) -> str:
-            return (f"{ref(obj)}.{field}" if field.isidentifier() and not keyword.iskeyword(field)
-                    else f"getattr({ref(obj)}, {field!r})")
-
-        def put(obj: Any, field: str, value: str) -> str:
-            return (f"{ref(obj)}.{field} = {value}"
-                    if field.isidentifier() and not keyword.iskeyword(field)
-                    else f"setattr({ref(obj)}, {field!r}, {value})")
-
-        def value(item: tuple) -> str:
-            _dst, _field, src, src_field, fanin = item
-            if fanin is None:
-                return get(src, src_field)
-            expression = "0"
-            for out, name, gain in fanin:
-                expression = f"({expression} + {ref(gain)} * {get(out, name)})"
-            return expression
-
+        ref, put, value = _source_writers(env)
         tear = self.tears[0]
         body = [put(tear[0], tear[1], "x")]
         for kind, item in self.operations:
@@ -1155,24 +1163,7 @@ class Model:
         """Generate and compile ``_load``, ``_outputs``, ``rhs_list`` (source in ``compiled_source``)."""
         owners = {id(s): n for n, s in zip(self.names, self.subsystems)}
         env: dict[str, Any] = {}
-        refs: dict[int, str] = {}
-
-        def ref(obj: Any) -> str:
-            key = refs.get(id(obj))
-            if key is None:
-                key = refs[id(obj)] = f"_{len(refs)}"
-                env[key] = obj
-            return key
-
-        def plain(field: str) -> bool:
-            return field.isidentifier() and not keyword.iskeyword(field)
-
-        def get(obj: Any, field: str) -> str:
-            return f"{ref(obj)}.{field}" if plain(field) else f"getattr({ref(obj)}, {field!r})"
-
-        def put(obj: Any, field: str, value: str) -> str:
-            return f"{ref(obj)}.{field} = {value}" if plain(field) else f"setattr({ref(obj)}, {field!r}, {value})"
-
+        ref, put, value = _source_writers(env)
         load = [put(st, name, f"complex(v[{idx}], v[{idx + 1}])" if is_c else f"v[{idx}]")
                 for st, name, idx, is_c in self._state_ops]
 
@@ -1182,14 +1173,7 @@ class Model:
             if kind in ("out", "algebraic"):
                 line = f"{ref(item)}(t)"
             else:
-                dst, field, src, src_field, fanin = item
-                if fanin is None:
-                    value = get(src, src_field)
-                else:
-                    value = "0"
-                    for out, name, gain in fanin:
-                        value = f"({value} + {ref(gain)} * {get(out, name)})"
-                line = put(dst, field, value)
+                line = put(item[0], item[1], value(item))
             comment = ", ".join(owners[id(owner)] for owner in op_owners)
             line = f"{line}  # {comment}"
             plan.append(line)
@@ -1277,18 +1261,8 @@ class Model:
 
     def run_plan(self, t: float, plan: tuple) -> None:
         """Run a plan (subset of the output plan) on the current subsystem records."""
-        for kind, item in plan:
-            if kind in ("out", "algebraic"):
-                item(t)
-            else:
-                dst_inp, dst_name, src_out, src_name, fanin = item
-                if fanin is None:
-                    setattr(dst_inp, dst_name, getattr(src_out, src_name))
-                else:
-                    total = 0
-                    for out, name, gain in fanin:
-                        total += gain * getattr(out, name)
-                    setattr(dst_inp, dst_name, total)
+        for operation in plan:
+            _run_output_operation(operation, t)
 
     def rhs_group(self, t: float, y: NDArray[np.float64], group: GroupPlan, own: bool = False) -> NDArray[np.float64]:
         """Return the derivatives of one group's states (zeros elsewhere) for the full state ``y``.

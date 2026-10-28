@@ -520,10 +520,10 @@ class BridgeParams:
 class UnitParams:
     """Common converter-unit parameters plus one ``type``-selected field set."""
 
-    type: str
+    type: str = "vsc"
     pwm: Optional[PWMParams] = None
     ctrl: Optional[ControlParams] = None
-    dclink: Optional[DCLinkParams] = field(default=None, metadata={"required": True})
+    dclink: Optional[DCLinkParams] = None
     bus: Optional[str] = None
     connected: Optional[bool] = None  # initial command; None preserves event-derived startup
     bridge: BridgeParams = field(default_factory=BridgeParams)
@@ -563,8 +563,9 @@ class UnitParams:
         return getattr(object.__getattribute__(self, "_unit_fields"), name)
 
     @staticmethod
-    def _bases(data: dict, base: BaseValues, where: str) -> tuple[BaseValues, dict[str, float]]:
-        """Resolve the common rating and the selected unit's electrical scaling base."""
+    def _bases(data: dict, base: BaseValues, where: str,
+               spec: Any) -> tuple[BaseValues, dict[str, float]]:
+        """Resolve the common rating and the electrical scaling base of a unit of type ``spec``."""
         if data.get("s_base") is not None:
             base = _build(
                 BaseValues,
@@ -573,8 +574,7 @@ class UnitParams:
                 None,
                 None,
             )
-        kind = data.get("type", "vsc")
-        if unit_type(kind, f"{where}.type").composite:
+        if spec.composite:
             return base, base.parameter_scales()
         dclink = data.get("dclink")
         voltage = _numeric_string(dclink.get("vdc_ref")) if isinstance(dclink, dict) else None
@@ -654,6 +654,13 @@ def _unit_path(units: Mapping[str, UnitParams], value: str) -> Optional[str]:
         ) if value == name or value.startswith(name + ".")),
         None,
     )
+
+
+def _split_path(p: Params, path: str) -> tuple[str, str, str]:
+    """Split ``section.name.rest``; a unit name is the longest configured unit path."""
+    section, _, rest = path.partition(".")
+    name = (_unit_path(p.units, rest) if section == "units" else None) or rest.partition(".")[0]
+    return section, name, rest[len(name) + 1:]
 
 
 def _unit_leaves(units: Mapping[str, UnitParams], path: str) -> tuple[str, ...]:
@@ -1043,34 +1050,25 @@ def to_dict(p: Any, derived: bool = False) -> dict:
             **{item.name: to_dict(getattr(p, item.name), derived) for item in fields(p)
                if item.name in common or (item.name == "ctrl" and p.ctrl is not None)},
         }
-        if not derived:
-            for path in p.derived_defaults:
-                *head, last = path.split(".")
-                node = d
-                for key in head:
-                    node = node[key]
-                node[last] = None
-        return d
-    if isinstance(p, ControlParams):
+    elif is_dataclass(p) and not isinstance(p, type):
         d = {f.name: to_dict(getattr(p, f.name), derived) for f in fields(p) if f.init}
-        for name, loop in p.loops.items():
-            direct = loop_key_type(name)
-            if direct is not None and direct.type == loop.type:
-                d["loops"][name].pop("type", None)
-        return d
-    if is_dataclass(p) and not isinstance(p, type):
-        d = {f.name: to_dict(getattr(p, f.name), derived) for f in fields(p) if f.init}
-        if not derived:
-            for path in getattr(p, "derived_defaults", ()):
-                *head, last = path.split(".")
-                node = d
-                for key in head:
-                    node = node[key]
-                node[last] = None
-        return d
-    if isinstance(p, dict):
+        if isinstance(p, ControlParams):
+            for name, loop in p.loops.items():
+                direct = loop_key_type(name)
+                if direct is not None and direct.type == loop.type:
+                    d["loops"][name].pop("type", None)
+    elif isinstance(p, dict):
         return {k: to_dict(v, derived) for k, v in p.items()}
-    return p
+    else:
+        return p
+    if not derived:
+        for path in getattr(p, "derived_defaults", ()):
+            *head, last = path.split(".")
+            node = d
+            for key in head:
+                node = node[key]
+            node[last] = None
+    return d
 
 
 def _numeric_string(value: Any) -> Any:
@@ -1140,14 +1138,6 @@ _TYPED = {
 }
 
 
-def _unit_params_class(data: Any, path: str) -> type:
-    """Select only the unit-type-specific field schema."""
-    if not isinstance(data, dict):
-        raise ConfigError(f"{path}: expected a mapping, got {type(data).__name__}")
-    kind = data.get("type", "vsc")
-    return unit_type(kind, f"{path}.type").params
-
-
 def _build_control_params(data: Any, path: str, base: BaseValues,
                           scales: dict[str, float], unit_type: str) -> ControlParams:
     """Build the single controller parameter type using its selected reference schema."""
@@ -1172,11 +1162,12 @@ def _build_control_params(data: Any, path: str, base: BaseValues,
 
 def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
     """Build common unit fields and one explicitly scoped set of unique fields."""
-    unit_fields_cls = _unit_params_class(data, path)
-    kind = data.get("type", "vsc")
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path}: expected a mapping, got {type(data).__name__}")
+    kind = data.get("type", UnitParams.type)
     spec = unit_type(kind, f"{path}.type")
     common_names = UnitParams._common_fields(composite=spec.composite)
-    unit_field_names = {item.name for item in fields(unit_fields_cls) if item.init}
+    unit_field_names = {item.name for item in fields(spec.params) if item.init}
     known = {"type", *common_names, *unit_field_names}
     if not spec.composite:
         known.add("ctrl")
@@ -1184,7 +1175,7 @@ def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
     if unknown:
         raise ConfigError(f"{path}: unknown key(s) {sorted(unknown)}; known: {sorted(known)}")
 
-    unit_base, unit_scales = UnitParams._bases(data, base, path)
+    unit_base, unit_scales = UnitParams._bases(data, base, path, spec)
     common = _build_fields(
         UnitParams,
         {name: data[name] for name in common_names if name in data},
@@ -1210,7 +1201,7 @@ def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
     elif "pwm" in common_names and common.get("pwm") is None:
         raise ConfigError(f"{path}.pwm: required value missing")
     unit_fields = _build(
-        unit_fields_cls,
+        spec.params,
         {name: data[name] for name in unit_field_names if name in data},
         path,
         unit_base,
@@ -1282,8 +1273,8 @@ def _target_scales(event: Any, parent: dict, base: Any) -> Optional[dict]:
     current_base = base
     index = 1
     while True:
-        current_base, scales = UnitParams._bases(unit, current_base, f"units.{path}")
-        spec = unit_type(unit.get("type", "vsc"), f"units.{path}.type")
+        spec = unit_type(unit.get("type", UnitParams.type), f"units.{path}.type")
+        current_base, scales = UnitParams._bases(unit, current_base, f"units.{path}", spec)
         if index < len(parts) and parts[index] in spec.children:
             child = parts[index]
             value = unit.get(child)
@@ -1387,8 +1378,6 @@ def _build_fields(cls, data: dict, path: str, base: Any, scales: Optional[dict],
     kwargs = {}
     for f in selected:
         key = f"{path}.{f.name}" if path else f.name
-        if f.metadata.get("required") and data.get(f.name) is None:
-            raise ConfigError(f"{key}: required value missing")
         tp = hints[f.name]
         optional, inner = _is_optional(tp)
         if f.name in data:
@@ -1481,12 +1470,7 @@ def runtime_changeable(path: str, p: Params) -> bool:
     """Whether a stored parameter or connection command may be written during a run."""
     if _connection_variable(p, path) is not None:
         return True
-    section, _, rest = path.partition(".")
-    if section == "units":
-        name = _unit_path(p.units, rest) or rest.partition(".")[0]
-        rest = rest[len(name) + 1:]
-    else:
-        name, _, rest = rest.partition(".")
+    section, name, rest = _split_path(p, path)
     keys = rest.split(".")
     if section == "buses":
         return keys in (["c"], ["r_d"])
@@ -1716,11 +1700,7 @@ _FILE_ORDER = ("base", "buses", "branches", "sources", "units", "elements", "eve
 def _written_out(p: Params) -> dict:
     """Return ``p`` in file order, including defaults derived from other values."""
     d = to_dict(p, derived=True)
-    for name, u in p.units.items():
-        unit = d["units"][name]
-        if unit["s_base"] is None:
-            unit["s_base"] = u.base.s_base
-    for name, u in _unit_items(p.units):
+    for name, u in _unit_items(p.units, leaves_only=False):
         keys = name.split(".")
         unit = d["units"][keys[0]]
         for key in keys[1:]:

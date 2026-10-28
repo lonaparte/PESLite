@@ -44,6 +44,28 @@ class SwitchingSequence:
     q_abc: NDArray[np.float64]
 
 
+def _switching_sequence(span, min_interval, word, changes) -> SwitchingSequence:
+    """Apply time-ordered ``(time, positions, values)`` changes to ``word`` over ``span``.
+
+    An interval not longer than ``min_interval`` is absorbed into the next one; a vanishing last
+    interval into the previous one.
+    """
+    durations, states, previous = [], [], 0.0
+    for at, positions, values in changes:
+        if at - previous > min_interval:
+            durations.append(at - previous)
+            states.append(word.copy())
+            previous = at
+        for k, value in zip(positions, values):
+            word[k] = value
+    if span - previous > min_interval or not durations:
+        durations.append(span - previous)
+        states.append(word.copy())
+    else:
+        durations[-1] += span - previous
+    return SwitchingSequence(np.asarray(durations), np.asarray(states))
+
+
 @runtime_checkable
 class Modulator(Protocol):
     """Convert loaded commands into a SwitchingSequence spanning ``T`` seconds.
@@ -53,6 +75,9 @@ class Modulator(Protocol):
     Complete-pulse updates also require a periodic ``phase_clock`` view accepting prospective
     ``registers``; the ordinary interval path needs no additional interface.
     """
+
+    carried: tuple[str, ...] = ()  # controller outputs passed after the modulated registers
+    config_fields = frozenset(("carrier_phase", "sync"))  # the pwm options the modulator reads
 
     def __call__(self, t: float, T: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence: ...
@@ -179,21 +204,8 @@ class PulseSequence:
                 next_word[k] = value
             remaining.append(left)
         self.next, self.next_remaining = tuple(next_word), tuple(remaining)
-        durations, states, previous = [], [], 0.0
-        word = initial
-        for at, index, value in sorted(changes):
-            if at - previous > self.modulator.min_interval:
-                durations.append(at - previous)
-                states.append(word.copy())
-                previous = at
-            for k, value_k in zip(self.groups[index], value):
-                word[k] = value_k
-        if span - previous > self.modulator.min_interval or not durations:
-            durations.append(span - previous)
-            states.append(word.copy())
-        else:
-            durations[-1] += span - previous
-        return SwitchingSequence(np.asarray(durations), np.asarray(states))
+        return _switching_sequence(span, self.modulator.min_interval, initial, (
+            (at, self.groups[index], value) for at, index, value in sorted(changes)))
 
 
 class PWM:
@@ -223,7 +235,7 @@ class PWM:
         if len(set(self._names)) != len(self._names):
             raise ValueError("PWM register names must be unique")
         self._width = len(self._names) - 1
-        self.modulation_width = self._width - len(getattr(modulator, "carried", ()))
+        self.modulation_width = self._width - len(modulator.carried)
         self._switching_state = switching_state or abc2complex
         self._pwm_state = pwm_state or ZOH.value
         if pattern_sync not in ("interval", "pulse"):
@@ -507,13 +519,12 @@ def _pieces(t0: float, span: float, f_sw: float, phase: float, tol: float,
 _EPS = 1e-13
 
 
-class CarrierComparison:
+class CarrierComparison(Modulator):
     """Triangular-carrier comparison with exact switching instants.
 
     ``f_sw`` in Hz, ``phase`` in carrier periods, ``min_interval`` in s.
     """
 
-    config_fields = frozenset(("carrier_phase", "sync"))
     supported_models = frozenset(("switching",))
 
     @classmethod
@@ -561,39 +572,24 @@ class CarrierComparison:
             q = [1.0 if m[k] > c_t else 0.0 for k in range(width)]
         else:
             q = [1.0 if m[k] >= c_t else 0.0 for k in range(width)]
-        events: list[tuple[float, int, float]] = []
+        events: list[tuple[float, tuple[int], tuple[float]]] = []
         for start, seg, rising, c0, slope in _pieces(t, T_s, self.f_sw, self.phase, _EPS, 64):
             for k in range(width):
                 x = (m[k] - c0) / slope
                 if 0.0 < x < seg:
                     # rising carrier crosses m from below -> switch off; falling -> on
-                    events.append((start + x, k, 0.0 if rising else 1.0))
+                    events.append((start + x, (k,), (0.0 if rising else 1.0,)))
         events.sort(key=lambda e: e[0])
-        dts: list[float] = []
-        states: list[list[float]] = []
-        t_prev = 0.0
-        for time, k, new_state in events:
-            if time - t_prev > self.min_interval:
-                dts.append(time - t_prev)
-                states.append(list(q))
-                t_prev = time
-            q[k] = new_state
-        if T_s - t_prev > self.min_interval or not dts:
-            dts.append(T_s - t_prev)
-            states.append(list(q))
-        else:  # absorb a vanishing last interval into the previous one
-            dts[-1] += T_s - t_prev
-        return SwitchingSequence(np.asarray(dts), np.asarray(states))
+        return _switching_sequence(T_s, self.min_interval, q, events)
 
 
-class SynchronousCarrier:
+class SynchronousCarrier(Modulator):
     """Carrier comparison with the carrier locked to the controller angle.
 
     Carrier position is ``pulse_ratio * theta / (2 pi) + phase`` (periods);
     requires ``theta`` (rad) and ``omega`` (rad/s).
     """
 
-    config_fields = frozenset(("carrier_phase", "sync"))
     supported_models = frozenset(("switching",))
 
     @classmethod
@@ -651,10 +647,9 @@ class SynchronousCarrier:
         self._time = None
 
 
-class ZOH:
+class ZOH(Modulator):
     """PWM-period averaging: hold the duty ratios as the switching state for the period."""
 
-    config_fields = frozenset(("carrier_phase", "sync"))
     supported_models = frozenset(("pwm_averaging", "averaging"))
 
     @classmethod
@@ -757,9 +752,12 @@ class PhaseShiftModulator:
         if registers is None:
             return PhaseClock(self._t or 0.0, self._theta, 2.0 * math.pi * self.frequency)
         frequency = self._registers(registers)[2]
-        angle = (self._theta if self._restored else 2.0 * math.pi * frequency * t
-                 if self._t is None else self.angle(t))
-        return PhaseClock(t, angle, 2.0 * math.pi * frequency)
+        return PhaseClock(t, self._start_angle(t, frequency), 2.0 * math.pi * frequency)
+
+    def _start_angle(self, t: float, frequency: float) -> float:
+        """Angle of an interval starting at ``t``: restored, first-anchored or continued."""
+        return (self._theta if self._restored else 2.0 * math.pi * frequency * t
+                if self._t is None else self.angle(t))
 
     def __init__(self, frequency: float, min_interval: float = 1e-12,
                  carried: tuple[str, ...] = ()) -> None:
@@ -808,18 +806,6 @@ class PhaseShiftModulator:
         """Active angle-axis frequency (Hz)."""
         return self._f
 
-    def _advance(self, t: float, frequency: float) -> float:
-        if self._restored:
-            theta = self._theta
-            self._restored = False
-        elif self._t is None:
-            theta = 2.0 * math.pi * frequency * t
-        else:
-            theta = self._theta + 2.0 * math.pi * self._f * (t - self._t)
-        theta %= 2.0 * math.pi
-        self._t, self._theta, self._f = t, theta, frequency
-        return theta
-
     # -- edges -----------------------------------------------------------------------------------
     @staticmethod
     def _edges(pattern, theta0: float, omega: float, x0: float, x1: float, snap: float):
@@ -857,28 +843,12 @@ class PhaseShiftModulator:
     def __call__(self, t: float, T_s: float, values: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence:
         width, phase, frequency, mode = self._registers(values)
-        theta0 = self._advance(t, frequency)
-        return self._sequence(T_s, *self._edges(
-            (width, phase, mode), theta0, 2.0 * math.pi * frequency, 0.0, T_s, _SNAP / frequency))
-
-    def _sequence(self, T_s: float, level: int, changes) -> SwitchingSequence:
-        dts: list[float] = []
-        states: list[tuple[float, float]] = []
-        t_prev = 0.0
-        for time, after in changes:
-            if after == level:
-                continue
-            if time - t_prev > self.min_interval:
-                dts.append(time - t_prev)
-                states.append(_LEGS[level])
-                t_prev = time
-            level = after
-        if T_s - t_prev > self.min_interval or not dts:
-            dts.append(T_s - t_prev)
-            states.append(_LEGS[level])
-        else:
-            dts[-1] += T_s - t_prev
-        return SwitchingSequence(np.asarray(dts), np.asarray(states))
+        theta0 = self._start_angle(t, frequency) % (2.0 * math.pi)
+        self._t, self._theta, self._f, self._restored = t, theta0, frequency, False
+        level, changes = self._edges(
+            (width, phase, mode), theta0, 2.0 * math.pi * frequency, 0.0, T_s, _SNAP / frequency)
+        return _switching_sequence(T_s, self.min_interval, list(_LEGS[level]),
+                                   ((x, self.pulse_groups[0], _LEGS[after]) for x, after in changes))
 
     # -- named state -----------------------------------------------------------------------------
     angle_state_names = ("angle",)

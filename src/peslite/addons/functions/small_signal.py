@@ -16,7 +16,7 @@ import numpy as np
 
 from ...solver.linearization import (DEFAULT_STEP, active_coordinates, coordinate_difference,
                                      coordinate_width, linearize_loop)
-from ...solver.simulation import SystemLoop, _EPS
+from ...solver.simulation import TIME_EPS, SystemLoop
 
 if TYPE_CHECKING:
     from ...solver.simulation import Simulation
@@ -104,7 +104,7 @@ def small_signal(sim: Simulation, *, period: float | None = None,
     loop = SystemLoop(sim, period=period, frame_frequency=0.0, repeat_forcing=True)
     if loop.period is None:
         raise ValueError("no common loop period was found; supply a valid period explicitly")
-    if any(t0 < change.t <= t0 + loop.period + _EPS for change in sim.p.changes):
+    if any(t0 < change.t <= t0 + loop.period + TIME_EPS for change in sim.p.changes):
         raise ValueError("the analysis period contains a non-repeating simulation-file event")
     if any(getattr(unit.ctrl, "startup", None) is not None and unit.ctrl.startup.in_progress
            for unit in sim.units.values()):
@@ -119,7 +119,7 @@ def _validate_options(relative_step, periodic_tolerance, multiplier_tolerance, p
                         ("multiplier_tolerance", multiplier_tolerance), ("period", period)):
         if value is not None and (not math.isfinite(value) or value <= 0.0):
             raise ValueError(f"{name} must be finite and positive")
-    if period is not None and period <= _EPS:
+    if period is not None and period <= TIME_EPS:
         raise ValueError("period must exceed the simulation's time resolution")
 
 
@@ -296,7 +296,7 @@ def small_signal_report(sim: Simulation, *, times: Iterable[float] = (),
         entry = records[point.at]
         tick = time.perf_counter()
         try:
-            repeating = not any(point.at < change.t <= point.at + point.loop.period + _EPS
+            repeating = not any(point.at < change.t <= point.at + point.loop.period + TIME_EPS
                                 for change in changes)
             analysis = _analyze(point.loop, point.row, point.at, relative_step, periodic_tolerance,
                                 multiplier_tolerance, baseline=baseline,
@@ -324,15 +324,15 @@ def small_signal_report(sim: Simulation, *, times: Iterable[float] = (),
 
     def observe(t, states, read_values, *, final, stop_reason):
         nonlocal was_tripped
-        while waiting and (final or waiting[0][0] <= t + _EPS):
+        while waiting and (final or waiting[0][0] <= t + TIME_EPS):
             endpoint, _index, point = heapq.heappop(waiting)
-            analyze(point, states if abs(endpoint - t) <= _EPS else None)
+            analyze(point, states if abs(endpoint - t) <= TIME_EPS else None)
         tripped = any(unit.tripped for unit in sim.units.values())
-        due = bool(targets and targets[0] <= t + _EPS)
+        due = bool(targets and targets[0] <= t + TIME_EPS)
         if not (due or final or (tripped and not was_tripped)):
             return next_endpoint()
         was_tripped = tripped
-        while targets and targets[0] <= t + _EPS:
+        while targets and targets[0] <= t + TIME_EPS:
             targets.popleft()
         entry = dict(read_values())
         records[t] = entry

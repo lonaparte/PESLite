@@ -15,7 +15,7 @@ from numpy.typing import NDArray
 from ..control.blocks import A120, phases, smoothstep
 from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, ConfigError, Empty, LocatedZero, OutputMethod, _real
-from .network import RCNode, Terminal
+from .network import RCNode, Terminal, _extend_record
 from .pwm import TIME_EPS, CarrierComparison, Modulator, PWM, ZOH, make_unit_modulator
 
 __all__ = ["ThreePhaseBridge", "SwitchingModel", "PWMAveragingModel", "AveragingModel",
@@ -270,10 +270,7 @@ class _BridgeModel:
         self.capacitor = RCNode(capacitance, 0.0, phases=3 if isinstance(self.topology.zero, complex) else 1)
         self.state, self.state_names = self.capacitor.state, self.capacitor.state_names
         self.storage = tuple(replace(port, flows=()) for port in self.capacitor.storage)
-        old = self.out
-        names = (*type(old).__slots__, "i_device", "power_loss")
-        self.out = type("_CapacitiveOut", (Bag,), {"__slots__": names})(
-            **{name: getattr(old, name) for name in type(old).__slots__})
+        self.out = _extend_record(self.out, "i_device", "power_loss")
         self.out.i_device = self.topology.zero
         inputs = ("q", "u_dc") + (("u_lower",) if self.lower_terminal else ())
         currents = ("i_dc", "i_device", "power_loss")
@@ -425,9 +422,11 @@ class _SampledModel(_BridgeModel, PWM):
                  pattern_sync: str = "interval",
                  parallel_capacitance: float = 0.0, on_resistance: float = 0.0) -> None:
         self.pulse_update = None
+        self.has_switching_events = not isinstance(modulator, ZOH)
         _BridgeModel.__init__(self, topology, parallel_capacitance=parallel_capacitance,
-                              on_resistance=on_resistance, switching=not isinstance(modulator, ZOH))
+                              on_resistance=on_resistance, switching=self.has_switching_events)
         registers = getattr(modulator, "registers", None)
+        carried = tuple(modulator.carried)
         PWM.__init__(
             self,
             period,
@@ -437,26 +436,22 @@ class _SampledModel(_BridgeModel, PWM):
             carrier_period,
             modulator,
             pattern_sync=pattern_sync,
-            duty_names=(self.topology.duty_names + tuple(getattr(modulator, "carried", ()))
-                        if registers is None else tuple(registers)),
+            duty_names=(self.topology.duty_names + carried if registers is None else tuple(registers)),
             switching_state=self.topology.switching_state,
             pwm_state=self.topology.pwm_state,
         )
         self.continuous = False
         self.command_registers = (self.topology.command_duties if registers is None
                                 else modulator.command_registers)
-        if registers is None and getattr(modulator, "carried", ()):
-            names = modulator.carried
+        if registers is None and carried:
             self.command_registers = lambda output: (*self.topology.command_duties(output),
-                                                       *(getattr(output, name) for name in names))
+                                                       *(getattr(output, name) for name in carried))
         self.neutral_registers = (
             tuple(modulator.neutral_registers()) if registers is not None
-            else (self.topology.neutral_duty,) * len(self.topology.duty_names)
-                 + (0.0,) * len(getattr(modulator, "carried", ()))
+            else (self.topology.neutral_duty,) * len(self.topology.duty_names) + (0.0,) * len(carried)
         )
         self.reset(self.neutral_registers, on=False)
         self.state_owner = self
-        self.has_switching_events = not isinstance(modulator, ZOH)
 
     @property
     def event_periods(self) -> list[float]:
@@ -578,7 +573,7 @@ class HalfBridge:
 
     Device placement is fixed once at construction.  Setting ``upper_controlled``
     or ``lower_controlled`` to false leaves only that device's diode available.
-    The simulation hot path therefore uses the same two-bit gate word for
+    The simulation hot path therefore uses the same two gate flags for
     diode-assisted and fully controlled legs.
     """
 
@@ -629,7 +624,7 @@ class HalfBridge:
     @staticmethod
     def pole_gates(q, switching):
         return (q,)
-    __slots__ = ("_gate_mask", "_reverse_port", "_external_terminal")
+    __slots__ = ("upper_controlled", "lower_controlled", "_reverse_port", "_external_terminal")
 
     def switching_state(self, states) -> float:
         state = states[0]
@@ -664,7 +659,7 @@ class HalfBridge:
             raise ConfigError(
                 "a lower-rail external terminal uses the forward half-bridge orientation"
             )
-        self._gate_mask = int(upper_controlled) | (int(lower_controlled) << 1)
+        self.upper_controlled, self.lower_controlled = upper_controlled, lower_controlled
         self._reverse_port = reverse_port
         self._external_terminal = external_terminal
 
@@ -709,16 +704,6 @@ class HalfBridge:
             feedforward = voltage / supply if supply > 0.0 else 0.0
         return current, voltage, supply, feedforward
 
-    @property
-    def upper_controlled(self) -> bool:
-        """Whether the upper position contains a controlled device."""
-        return bool(self._gate_mask & 1)
-
-    @property
-    def lower_controlled(self) -> bool:
-        """Whether the lower position contains a controlled device."""
-        return bool(self._gate_mask & 2)
-
 class _DiodeConductionResult(NamedTuple):
     controlled: Any
     diode: Any
@@ -735,10 +720,7 @@ class _ConductionInp(Bag):
 
 
 class _ConductionOut(Bag):
-    __slots__ = (
-        "controlled", "diode", "total", "resistance_factor", "derivative",
-        "in_dcm", "upper_current_ratio", "lower_current_ratio", "maximum_step",
-    )
+    __slots__ = (*_DiodeConductionResult._fields, "maximum_step")
 
 
 class HalfBridgeDiodeConduction:
@@ -753,14 +735,8 @@ class HalfBridgeDiodeConduction:
     outputs_need_inputs: ClassVar[bool] = True
     observer: ClassVar[bool] = True
     output_stages: ClassVar[tuple[OutputMethod, ...]] = (
-        OutputMethod(
-            "set_outputs",
-            inputs=("current", "q", "upper", "lower", "reference"),
-            outputs=(
-                "controlled", "diode", "total", "resistance_factor", "derivative",
-                "in_dcm", "upper_current_ratio", "lower_current_ratio", "maximum_step",
-            ),
-        ),
+        OutputMethod("set_outputs", inputs=_ConductionInp.__slots__,
+                     outputs=_ConductionOut.__slots__),
     )
 
     def __init__(self, switching_period: float, inductance: float, resistance: float,
@@ -772,20 +748,9 @@ class HalfBridgeDiodeConduction:
         if not isinstance(self.topology, HalfBridge) or not self.topology.unilateral:
             raise TypeError("diode conduction requires a unilateral half-bridge topology")
         self.state = Empty()
-        self.inp = _ConductionInp(
-            current=0.0, q=0.0, upper=0.0, lower=0.0, reference=0.0,
-        )
-        self.out = _ConductionOut(
-            controlled=0.0,
-            diode=0.0,
-            total=1.0,
-            resistance_factor=1.0,
-            derivative=0.0,
-            in_dcm=False,
-            upper_current_ratio=0.0,
-            lower_current_ratio=0.0,
-            maximum_step=math.inf,
-        )
+        self.inp = _ConductionInp()
+        self.out = _ConductionOut(total=1.0, resistance_factor=1.0, in_dcm=False,
+                                  maximum_step=math.inf)
 
     def equations(self, current: Any, q: Any, upper: Any, lower: Any,
                   reference: Any) -> _DiodeConductionResult:
@@ -833,7 +798,7 @@ class HalfBridgeDiodeConduction:
         out = self.out
         (out.controlled, out.diode, out.total, out.resistance_factor,
          out.derivative, out.in_dcm, out.upper_current_ratio,
-         out.lower_current_ratio) = result
+         out.lower_current_ratio) = result  # unpacked directly: this runs at every RHS evaluation
         out.maximum_step = self.period / 10.0 if result.in_dcm else math.inf
 
     def rhs(self, _t: float):
