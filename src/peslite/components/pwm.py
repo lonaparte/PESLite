@@ -321,10 +321,6 @@ class PWM:
         self.k += 1
         self.t_interrupt = self.interrupt(self.k)
 
-    def write_shadow(self, d_abc: NDArray[np.float64], on: bool = True) -> None:
-        """Write commands and enable directly to an immediately eligible shadow register."""
-        self.shadow = self._word(d_abc, on)
-
     def write(self, t: float, d_abc: NDArray[np.float64], on: bool = True,
               theta: float | None = None,
               omega: float | None = None) -> None:
@@ -397,11 +393,6 @@ class PWM:
 
     def _pulse_sequence(self, t, span, values, theta, omega):
         return self.pulse_update(t, span, values, theta, omega, enabled=self.on)
-
-    @property
-    def next_edge(self) -> float:
-        """Next switching or held-input edge relevant to fast protection."""
-        return min(self.next_switch, self.load_end)
 
     def edge(self, t: float) -> bool:
         """Whether the old switching or held-input interval ends at ``t``."""

@@ -1265,8 +1265,12 @@ class VSCController(_GraphRuntime):
         self._theta_source = graph._output_source["theta"]
         self._omega_source = graph._output_source["omega"]
         self._command_source = graph._output_source["u_dq"]
-        self._frame_source = (graph._port_source[self._frame_cc]["frame"]
-                              if self._frame_cc is not None else None)
+        # dq frame of the logged signals, as a graph path that C++ export lowers unchanged: the
+        # current loop's frame input, else the angle the theta loop used for its latest update
+        self._frame_path = (graph.connections[f"{self._frame_cc}.frame"] if self._frame_cc is not None
+                            else self._frame_key if self._frame_key in graph.values
+                            else graph.outputs["theta"])
+        self._frame_source = graph._resolve(self._frame_path)
         self._is_gfl = profile.grid_following
         if self._is_gfl:
             mode_log_sources = (
@@ -1463,7 +1467,6 @@ class VSCController(_GraphRuntime):
             self.command_theta = self.theta
             if self._terminal_limit is not None:
                 self.stage._command_saturated = self._terminal_limit.saturated
-            self.stage.modulate(t, self.u_cmd, self.command_theta, meas.u_dc, count=False)
 
     def __call__(self, t, meas):
         if self.continuous:
@@ -1472,20 +1475,17 @@ class VSCController(_GraphRuntime):
         startup = self.startup
         if startup.in_progress:
             startup.advance()
-        self.stage.new_instant()
         if self._terminal_limit is not None:
             self._terminal_limit.limit = (
                 self._terminal_limit_scale * max(0.0, control_meas.u_dc)
             )
         self.graph.sample(t, control_meas, finalize=self._accept_command)
-        frame = self.graph.values.get(self._frame_key, self.theta)
-        if self._frame_cc is not None:
-            frame = self.graph.input(self._frame_cc, "frame", control_meas)
+        frame = self.graph._read(*self._frame_source, control_meas)
         rot = cmath.exp(-1j * frame)
         self.v_dq, self.i_dq = control_meas.u_g * rot, control_meas.i_c * rot
         gates = startup.active
-        duty = self.stage.finish(t, self.u_cmd, self.command_theta, control_meas.u_dc,
-                                 count=gates)
+        duty = self.stage.modulate(t, self.u_cmd, self.command_theta, control_meas.u_dc,
+                                   count=gates)
         log = None
         if self.logging:
             log = {"id_pu": self.i_dq.real, "iq_pu": self.i_dq.imag,
@@ -1535,9 +1535,7 @@ class VSCController(_GraphRuntime):
         self.omega = float(graph._read(*self._omega_source, meas))
         self.u_cmd = complex(graph._read(*self._command_source, meas))
         self.command_theta = self.theta
-        frame = graph.values.get(self._frame_key, self.theta)
-        if self._frame_source is not None:
-            frame = graph._read(*self._frame_source, meas)
+        frame = graph._read(*self._frame_source, meas)
         command_rot = complex(math.cos(self.command_theta), math.sin(self.command_theta))
         into_frame = (command_rot.conjugate() if frame == self.command_theta
                       else cmath.exp(-1j * frame))

@@ -44,11 +44,10 @@ from ..control.blocks import abc2complex, complex2abc
 from ..control.controller import Controller
 from .integrators import Solver
 from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
-from .multirate import make_solver
+from .multirate import make_solver, rated_effort
 from .splitbound import split_error_bound
 
-__all__ = ["Simulation", "SimulationResult", "Recorder", "main", "convert_main", "read_csv", "align", "window_ptp",
-           "pointwise_errors"]
+__all__ = ["Simulation", "SimulationResult", "Recorder", "main", "convert_main", "read_csv"]
 
 
 _EPS = 1e-10  # seconds; intervals shorter than this are not integrated separately
@@ -394,36 +393,6 @@ def read_csv(path: str | Path, skip_header: int = 0) -> np.ndarray:
     return np.genfromtxt(path, delimiter=",", names=True, skip_header=skip_header, deletechars="")
 
 
-def align(a: np.ndarray, b: np.ndarray, period: float) -> tuple[np.ndarray, np.ndarray]:
-    """Rows of ``a`` and ``b`` whose times fall on the same multiple of ``period``."""
-    ia = np.round(a["t"] / period).astype(int)
-    ib = np.round(b["t"] / period).astype(int)
-    _common, ka, kb = np.intersect1d(ia, ib, return_indices=True)
-    return a[ka], b[kb]
-
-
-def window_ptp(d: np.ndarray, t0: float, t1: float, key: str) -> float:
-    """Peak-to-peak of ``d[key]`` on ``[t0, t1)`` (NaN with fewer than 11 samples)."""
-    m = (d["t"] >= t0) & (d["t"] < t1)
-    return float(np.ptp(d[key][m])) if m.sum() > 10 else float("nan")
-
-
-def pointwise_errors(a: np.ndarray, b: np.ndarray, keys: Iterable[str],
-                     scale: Optional[Mapping[str, float]] = None) -> dict[str, dict[str, float]]:
-    """Max and RMS of ``|a[k] - b[k]| / scale[k]`` for aligned arrays, per key present in both."""
-    scale = scale or {}
-    out = {}
-    for key in keys:
-        if key not in a.dtype.names or key not in b.dtype.names:
-            continue
-        s = scale.get(key, 1.0)
-        x, y = a[key] / s, b[key] / s
-        e = np.abs(x - y)
-        out[key] = {"max": float(e.max()), "rms": float(np.sqrt(np.mean(e * e))),
-                    "t_max": float(a["t"][int(e.argmax())]), "rms_ref": float(np.sqrt(np.mean(y * y)))}
-    return out
-
-
 # ------------------------------------------------------------------ the run
 
 class Simulation:
@@ -616,17 +585,7 @@ class Simulation:
     # ------------------------------------------------------------ states
     def _state_parts(self) -> list[tuple[str, Any]]:
         """State owners by fixed state-table prefix, in state-table order."""
-        provide = getattr(self.system, "state_parts", None)
-        if provide is not None:
-            parts = list(provide())
-        else:  # custom systems written for the original aggregate Stateful interface
-            parts = [("", self.system)]
-            for name, unit in self.system.units.items():
-                bridge = unit.bridge
-                parts.extend([(f"{name}.ctrl", unit.ctrl),
-                              (f"{name}.{bridge.state_prefix}", bridge.state_owner)])
-                if unit.adc is not None and unit.adc.averaging:
-                    parts.append((f"{name}.meas", unit.adc))
+        parts = list(self.system.state_parts())
         parts.append(("solver", self.solver))
         return parts
 
@@ -1279,7 +1238,7 @@ class SystemLoop:
         self._states = sim._states
         self._map_columns = set(sim._states.linearization_columns)
         self._plant_columns = set(sim._states.read_flat(["", *sim.units])) - control_columns
-        rated = getattr(sim.solver, "rated_effort", None)
+        rated = rated_effort(sim.system.model, sim._ratings())  # the same scales for every solver
         self._rated = ({lab: float(r) for lab, r in zip(sim.system.model.state_labels(), rated)}
                        if rated is not None else {})
         p = sim.p

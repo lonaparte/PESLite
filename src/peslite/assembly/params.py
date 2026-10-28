@@ -176,17 +176,10 @@ def quantity_metadata(cls, name: str) -> dict:
     return result
 
 
-def quantity_fields(cls, values: dict | None = None) -> dict:
-    quantities = quantity_metadata(cls, "_quantities")
-    if hasattr(cls, "_signal_quantities"):
-        quantities.update(cls._signal_quantities(values or {}))
-    return quantities
-
-
-def quantity_name(cls, name: str, values: dict | None = None) -> str:
+def quantity_name(cls, name: str) -> str:
     """Return the stored field name for the SI or ``_pu`` spelling of a parameter."""
     name = quantity_metadata(cls, "_input_aliases").get(name, name)
-    for target in quantity_fields(cls, values):
+    for target in quantity_metadata(cls, "_quantities"):
         si = target.removesuffix("_pu")
         if name in (si, si + "_pu"):
             return target
@@ -199,11 +192,11 @@ def convert_quantities(data: dict, cls, scales: dict[str, float], where: str) ->
     Raises ConfigError if both the SI and the pu spelling of a parameter are given.
     """
     aliases = quantity_metadata(cls, "_input_aliases")
-    quantities = quantity_fields(cls, data)
+    quantities = quantity_metadata(cls, "_quantities")
     out, seen = {}, {}
     for name, value in data.items():
         spelling = aliases.get(name, name)
-        target = quantity_name(cls, name, data)
+        target = quantity_name(cls, name)
         if target in seen:
             raise ConfigError(f"{where}.{target}: both {seen[target]!r} and {name!r} specify the same parameter")
         seen[target] = name
@@ -957,11 +950,6 @@ class Params:
             sections.append("units")
         return tuple(sections)
 
-    def section_of(self, name: str) -> Optional[str]:
-        """Return the sole section containing ``name``, or ``None`` if absent or ambiguous."""
-        sections = self.sections_of(name)
-        return sections[0] if len(sections) == 1 else None
-
     @functools.cached_property
     def changes(self) -> tuple["Change", ...]:
         """Checked variable writes for every event, in time/file order."""
@@ -996,8 +984,7 @@ class Params:
             for k in keys[:-1]:
                 node = node.setdefault(k, {})
                 obj = obj.get(k) if isinstance(obj, dict) else getattr(obj, k, None)
-            values = vars(obj) if hasattr(obj, "__dict__") else {}
-            canonical = quantity_name(type(obj), keys[-1], values) if obj is not None else keys[-1]
+            canonical = quantity_name(type(obj), keys[-1]) if obj is not None else keys[-1]
             identity = (*keys[:-1], canonical)
             if identity in assigned:
                 raise ConfigError(f"{path}: both actual and pu values specify the same parameter")
@@ -1553,7 +1540,7 @@ def _event_assignments(p: Params, event: Any):
             unit = p.unit(_unit_path(p.units, ".".join(head[1:])))
             scales = unit.base.parameter_scales(
                 unit.dclink.vdc_ref if unit.dclink is not None else 1.0)
-        target = quantity_name(type(owner), name, getattr(owner, "__dict__", None))
+        target = quantity_name(type(owner), name)
         converted = convert_quantities({name: value}, type(owner), scales, path)
         yield ".".join((*head, target)), converted[target]
 

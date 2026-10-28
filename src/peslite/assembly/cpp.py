@@ -2090,18 +2090,8 @@ class _ModelGenerator:
         generator = self.continuous_units.get(id(sub))
         if generator is not None:
             return generator.derivatives()
-        enabled = self.enabled_by.get(id(sub))
-        if (enabled is not None and hasattr(sub, "_active_rhs")
-                and hasattr(sub, "_inactive_rhs")):
-            active = self.trace_rhs(sub, sub._active_rhs)
-            disabled = self.trace_rhs(sub, sub._inactive_rhs)
-            return [f"({enabled} ? ({on}) : ({off}))"
-                    for on, off in zip(active, disabled)]
         if (getattr(sub, "continuous", False) and hasattr(sub, "graph")
                 and hasattr(sub, "state_names")):
-            hook = getattr(sub, "cpp_continuous_rhs", None)
-            if hook is not None:
-                return list(hook(self))
             label = self.subsystem_name.get(id(sub), "controller")
             raise TypeError(f"C++ export: continuous controller {label!r} is not yet lowered")
         label = self.subsystem_name.get(id(sub), type(sub).__name__)
@@ -2996,10 +2986,6 @@ class _ControlGenerator:
         if self.continuous:
             return self.model.value(self.ctrl.state, f"{loop}.{local}")
         return self.state_expression(self.ctrl, f"{loop}.{local}")
-
-    @staticmethod
-    def _local(block_name: str, local: str) -> str:
-        return block_name if not local else f"{block_name}.{local}"
 
     @staticmethod
     def _copy_block(block: Any) -> Any:
@@ -3998,9 +3984,6 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         super().__init__(name, unit, model, "c")
         self.continuous = True
 
-    def state(self, loop: str, local: str) -> str:
-        return self.model.value(self.ctrl.state, f"{loop}.{local}")
-
     def source(self, path: str) -> str:
         if path == "meas.u_g":
             return self.m("meas_u_g")
@@ -4063,7 +4046,11 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
             ]
         return lines
 
-    def state_expression(self, local: str) -> str:
+    def state_expression(self, part: Any, local: str) -> str:
+        if part is self.unit.adc:
+            expression = self._adc_state_expression(local)
+            if expression is not None:
+                return expression
         protected = self.protection_state(local)
         if protected is not None:
             return protected
@@ -4074,10 +4061,6 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         if local == "startup.start":
             return self.m("startup_start")
         raise KeyError(local)
-
-    @staticmethod
-    def _rotate(value: str, frame: str) -> str:
-        return f"({value} * Complex{{std::cos({frame}), -std::sin({frame})}})"
 
     def output_lines(self) -> list[str]:
         lines: list[str] = [
@@ -4106,9 +4089,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         return lines
 
     def _log_lines(self) -> list[str]:
-        current_name = self.ctrl._frame_cc
-        frame = (self.input(current_name, "frame") if current_name is not None
-                 else self.m("theta"))
+        frame = self.source(self.ctrl._frame_path)
         current = f"({self.m('meas_i_c')} * Complex{{std::cos({frame}), -std::sin({frame})}})"
         voltage = f"({self.m('meas_u_g')} * Complex{{std::cos({frame}), -std::sin({frame})}})"
         log_i, log_v = self.m("log_i_value"), self.m("log_v_value")
@@ -4277,9 +4258,7 @@ class _UnitGenerator(_ACControlGenerator):
         return "\n".join(lines)
 
     def _log_lines(self, indent: str) -> list[str]:
-        current_name = self.ctrl._frame_cc
-        frame = (self.input(current_name, "frame") if current_name is not None
-                 else self.m("theta"))
+        frame = self.source(self.ctrl._frame_path)
         current = f"(meas_i_c * Complex{{std::cos({frame}), -std::sin({frame})}})"
         voltage = f"(meas_u_g * Complex{{std::cos({frame}), -std::sin({frame})}})"
         lines = [f"{indent}const Complex log_i = {current};",
@@ -4684,9 +4663,12 @@ class _GraphUnitGenerator(_ElectricalUnitGenerator):
                   "    return tripped_now;", "}"]
         return "\n".join(lines)
 
-    def state_expression(self, *args: Any) -> str:
+    def state_expression(self, part: Any, local: str) -> str:
         if self.continuous:
-            local = args[0]
+            if part is self.unit.adc:
+                expression = self._adc_state_expression(local)
+                if expression is not None:
+                    return expression
             protected = self.protection_state(local)
             if protected is not None:
                 return protected
@@ -4697,7 +4679,6 @@ class _GraphUnitGenerator(_ElectricalUnitGenerator):
             if local == "startup.start":
                 return self.m("startup_start")
             raise KeyError(local)
-        part, local = args
         if part is self.unit:
             protected = self.protection_state(local)
             if protected is not None:
@@ -4894,7 +4875,7 @@ class _CppGenerator:
                                             if part in (item.unit, item.unit.ctrl, item.unit.bridge,
                                                         item.unit.adc)), None)
                         if generator_c is not None:
-                            value = generator_c.state_expression(state.local_name)
+                            value = generator_c.state_expression(part, state.local_name)
                         elif not group.states:
                             continue
                         else:
@@ -5037,7 +5018,6 @@ class _CppGenerator:
                      model.record_types[id(record_b), field_b])
             return f"std::real(({a}) * std::conj({b}))" if "Complex" in kinds else f"(({a}) * ({b}))"
 
-        into_default = ["0.0" for _ in range(plan.n_defaults)]
         default_terms: list[list[str]] = [[] for _ in range(plan.n_defaults)]
         for transfer in plan.transfers:
             term = product(transfer.other_record, transfer.other_field,
@@ -5049,10 +5029,6 @@ class _CppGenerator:
 
         def powers(check: Any) -> tuple[str, str]:
             sub = check.subsystem
-            hook = getattr(sub, "cpp_energy", None)
-            if hook is not None:
-                supplied, dissipated = hook(model)
-                return str(supplied), str(dissipated)
             try:
                 attributes = model._equation_attributes(sub)
                 return (model.trace_scalar_method(sub, "supplied_power", attributes),
@@ -5934,9 +5910,6 @@ def _prepare_export(simulation, variables, reusable, *, params=None):
     """Rebuild privately and record the ordinary factories for either C++ target."""
     from ..solver.simulation import Simulation
 
-    from .conduction import DiodeConduction
-
-    model = simulation.system.model
     if not simulation._rebuildable:
         raise TypeError(
             "C++ export cannot safely reconstruct supplied instances; use parts factories instead"

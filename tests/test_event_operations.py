@@ -232,6 +232,7 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     old_dvc = unit.ctrl.graph.nodes["DCVoltageControl"]
     old_dvc.integral, old_dvc.n_updates, old_dvc.n_limit_exceeded = 0.2, 5, 2
     old_dvc.n_reverse, old_dvc.first_limit_t = 1, 4e-4
+    system.model.energy_balance(change.t, system.model.get_initial_values())  # compiles the audit
     system.apply(change)
     current = change.params
     assert bus.state.u_C == 3 + 4j
@@ -268,6 +269,9 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     assert specs["grid.branch"].storage[0].value == current.sources["grid"].l
     assert specs["line"].storage[0].value == current.branches["line"].l
     assert specs["load.branch"].storage[0].value == current.elements["load"].l
+    audit = system.model.energy_balance(change.t, system.model.get_initial_values())
+    stored = next(entry.energy for entry in audit.subsystems if entry.name == "pcc")
+    assert stored == pytest.approx(0.5 * bus.power_scale * current.buses["pcc"].c * 25.0)
 
 
 def test_continuous_controller_retune_rebinds_its_ode_states(tmp_path):

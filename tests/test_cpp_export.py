@@ -510,6 +510,7 @@ def _quick_gfm(mode: str):
         "simulation.solver.subsystems": {},
         "simulation.t_end": 0.004,
         "simulation.output.period": 1e-3,
+        "simulation.output.signals": True,
         "simulation.energy_check": "off",
     })
 
@@ -592,6 +593,9 @@ def test_generated_cpp_runs_gfm_function_owned_power_filter(mode, tmp_path):
     scale = max(1.0, max(abs(value) for value in expected.values()))
     tolerance = 2e-5 if mode == "averaging" else 2e-8
     assert max(abs(actual[key] - expected[key]) for key in expected) <= tolerance * scale
+    expected = _final_csv(python_out / "ctrl.vsc.csv")
+    actual = _final_csv(cpp_out / "ctrl.vsc.csv")
+    assert max(abs(actual[key] - expected[key]) for key in ("id_pu", "iq_pu", "vd_pu", "vq_pu")) <= tolerance
 
 
 @pytest.mark.parametrize("bridge_type,source,reference,load", (

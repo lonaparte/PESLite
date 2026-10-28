@@ -351,11 +351,6 @@ class CompensatedLink:
     def set_hold_secondary(self, t: float) -> None:
         self.out.u_hold_secondary = self._hold_secondary()
 
-    def port_hold_voltage(self, side: str) -> float:
-        """Port voltage at which the port current of ``side`` has zero rate of change."""
-        self._prepare_holds()
-        return getattr(self, f"_hold_{side}")()
-
 
 def _link_spec(cfg: Any) -> dict[str, Any]:
     """Normalize one configured link type into the general coil/side description."""

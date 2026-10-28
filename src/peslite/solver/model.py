@@ -1150,16 +1150,6 @@ class Model:
                     or any(dependency in affected for dependency in self._plan_dependencies[i])):
                 affected.add(i)
         self._zoh_plan = tuple(sorted(affected))
-        # staged subsystems appear once per output call
-        aliases = [s for s in self.subsystems if id(s) in legacy and legacy[id(s)] is None]
-        output_order = list(aliases)
-        for (kind, _), (op_owners, _) in zip(self._plan, self._plan_owners):
-            if kind not in ("out", "algebraic"):
-                continue
-            for owner in op_owners:
-                if owner not in output_order:
-                    output_order.append(owner)
-        self.output_order = output_order
 
     def _compile(self) -> None:
         """Generate and compile ``_load``, ``_outputs``, ``rhs_list`` (source in ``compiled_source``)."""

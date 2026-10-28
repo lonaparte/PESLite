@@ -73,6 +73,23 @@ def parse_step(value: Any) -> tuple[float, Optional[str]]:
     return 1.0 / round(inv), method
 
 
+def rated_effort(model: Any, ratings: Any) -> Optional[NDArray[np.float64]]:
+    """Rated effort per state entry of ``model``'s declared storages (``0.0`` where unrated).
+
+    ``ratings``: mapping storage scale -> (rated effort, rated flow), or a callable
+    ``(subsystem_name, storage) -> (effort, flow)``; ``None`` without ratings.
+    """
+    if not ratings:
+        return None
+    rated = np.zeros(model.n_states)
+    for sub in model.subsystems:
+        for st in getattr(sub, "storage", ()):
+            rating = ratings(model.name_of(sub), st) if callable(ratings) else ratings.get(st.scale)
+            if rating:
+                rated[model.state_slice(sub, st.state)] = rating[0] if st.kind == "capacitor" else rating[1]
+    return rated
+
+
 @dataclass(frozen=True)
 class HeldStorage:
     """A declared storage held over a window by :class:`MultirateSolver`.
@@ -191,19 +208,7 @@ class MultirateSolver:
                 for name in sub.state_names:
                     self._coupling[model.state_slice(sub, name)] = False
         # rated effort per declared storage entry (0 elsewhere); None without ratings
-        self._rated_ref: Optional[NDArray[np.float64]] = None
-        if self.ratings:
-            self._rated_ref = np.zeros(model.n_states)
-            for sub, st in self._storage_of.values():
-                rating = self._rating_of(sub, st)
-                if rating:
-                    self._rated_ref[model.state_slice(sub, st.state)] = rating[0] if st.kind == "capacitor" else rating[1]
-
-    def _rating_of(self, sub: Any, st: Any) -> Optional[tuple[float, float]]:
-        """The (rated effort, rated flow) of this storage, if any."""
-        if callable(self.ratings):
-            return self.ratings(self.model.name_of(sub), st)
-        return self.ratings.get(st.scale)
+        self._rated_ref: Optional[NDArray[np.float64]] = rated_effort(model, self.ratings)
 
     # ------------------------------------------------------------- interface
     def __call__(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64]) -> SolverStep:
@@ -354,7 +359,7 @@ class MultirateSolver:
             if reached > 0.0:
                 win_rel = max(win_rel, self._win_abs.get(idx, 0.0) / (0.5 * st.scale * st.value * reached ** 2))
                 exc_rel = max(exc_rel, float(self._exc_abs.get(idx, 0.0) / reached))
-            if self._rating_of(sub, st):
+            if self._rated_ref is not None and self._rated_ref[sl.start] > 0.0:
                 err_rated = max(err_rated, float(np.sqrt(np.sum(self._abs_err[sl] ** 2)) / ref[sl.start]))
                 exc_rated = max(exc_rated, float(self._exc_abs.get(idx, 0.0) / ref[sl.start]))
         out = {"max_rel_error": float(np.max(rel)) if rel.size else 0.0,

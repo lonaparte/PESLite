@@ -952,8 +952,6 @@ class FullBridge:
         model.dirac = False
         model._current = LocatedZero()  # sign: the conducting direction, 0 while blocked
         model.commutations = 0
-        model.blocked_time = 0.0
-        model._blocked_since = math.nan
         model.discrete_state_names = ("direction",)
         model.linearization_state_names = ()
         model.dissipated_power = model._zero_power
@@ -1004,9 +1002,6 @@ class FullBridge:
         current = _real(np.real(model.inp.i_c))
         u_dc = _real(np.real(model.inp.u_dc))
         if model._current.sign == 0.0:
-            if np.isfinite(model._blocked_since):
-                model.blocked_time += t - model._blocked_since
-                model._blocked_since = math.nan
             if abs(model._current.offset(current)) > model.topology.zero_current_tolerance:
                 # current through blocked diodes (an initial state): conduct in its direction
                 model._current.sign = _real(np.copysign(1.0, model._current.offset(current)))
@@ -1016,8 +1011,6 @@ class FullBridge:
         else:
             reverse = abs(_real(np.real(model.inp.u_hold))) > u_dc
             model._current.locate(current, -model._current.sign if reverse else 0.0)
-            if not reverse:
-                model._blocked_since = t
         model.commutations += 1
 
     @staticmethod
@@ -1032,7 +1025,7 @@ class FullBridge:
     def _conduction_bindings(model):
         """Mutable equation memory; the ODE and public restart schema stay unchanged."""
         return {"direction": (model._current, "sign"), "i_ref": (model._current, "residual"),
-                **{name: (model, name) for name in ("commutations", "blocked_time", "_blocked_since")}}
+                "commutations": (model, "commutations")}
 
     @staticmethod
     def _restore_conduction_state(model, values: Mapping[str, Any]) -> None:
@@ -1065,12 +1058,6 @@ class DCCapacitor:
     def __init__(self, u0: float, C: float, R_esr: float = 0.0) -> None:
         self.C, self.R_esr = _real(C), _real(R_esr)
         self.state = _DCState(u_C=_real(u0))
-
-    def terminal_voltage(self, i: float) -> float:
-        return self.state.u_C + self.R_esr * i
-
-    def derivative(self, i: float) -> float:
-        return i / self.C
 
     def dissipated_power(self, i: float) -> float:
         return self.R_esr * i ** 2
@@ -1112,9 +1099,6 @@ class DCVoltageSource:
 
     def __init__(self, u_dc: float, R: float = 0.0) -> None:
         self.u_dc, self.R = _real(u_dc), _real(R)
-
-    def terminal_voltage(self, i: float) -> float:
-        return self.u_dc - self.R * i
 
     def dissipated_power(self, i: float) -> float:
         return self.R * i ** 2
@@ -1159,19 +1143,18 @@ class DCLink:
         self.tripped = False
         # The circuit topology cannot change after assembly. Bind its equations once instead of
         # rediscovering the capacitor/source combination at every Runge--Kutta stage.
-        if type(self) is DCLink:
-            if capacitor is None:
-                self.set_outputs = self._set_voltage_source_without_capacitor
-                self.rhs = self._rhs_without_capacitor
-            elif source is None:
-                self.set_outputs = self._set_capacitor_without_source
-                self.rhs = self._rhs_with_capacitor
-            elif isinstance(source, DCVoltageSource):
-                self.set_outputs = self._set_capacitor_with_voltage_source
-                self.rhs = self._rhs_with_capacitor
-            else:
-                self.set_outputs = self._set_capacitor_with_current_source
-                self.rhs = self._rhs_with_capacitor
+        if capacitor is None:
+            self.set_outputs = self._set_voltage_source_without_capacitor
+            self.rhs = self._rhs_without_capacitor
+        elif source is None:
+            self.set_outputs = self._set_capacitor_without_source
+            self.rhs = self._rhs_with_capacitor
+        elif isinstance(source, DCVoltageSource):
+            self.set_outputs = self._set_capacitor_with_voltage_source
+            self.rhs = self._rhs_with_capacitor
+        else:
+            self.set_outputs = self._set_capacitor_with_current_source
+            self.rhs = self._rhs_with_capacitor
 
     def open_breaker(self) -> None:
         """Disconnect the source from the capacitor; a link without capacitor is unchanged."""
@@ -1194,24 +1177,6 @@ class DCLink:
         """Expose the capacitor voltage (or stiff source emf) without a dc-current dependency."""
         self.out.u_C = (self.capacitor.state.u_C if self.capacitor is not None
                         else self.source.u_dc)
-
-    def set_outputs(self, t: float) -> None:
-        """Generic topology dispatch retained for subclasses."""
-        cap, source, i_dc = self.capacitor, self.source, self.inp.i_dc
-        if cap is None:
-            self.out.u_dc = self.out.u_C = source.terminal_voltage(i_dc)
-            self.out.i_src = i_dc
-            return
-        if self.tripped or source is None:
-            i_src = 0.0
-        elif isinstance(source, DCVoltageSource):
-            # from u_C + R_esr (i_src - i_dc) = u_dc - R i_src
-            i_src = (source.u_dc - cap.state.u_C + cap.R_esr * i_dc) / (source.R + cap.R_esr)
-        else:
-            i_src = source(t, cap.state.u_C)
-        self.out.i_src = i_src
-        self.out.u_C = cap.state.u_C
-        self.out.u_dc = cap.terminal_voltage(i_src - i_dc)
 
     def _set_voltage_source_without_capacitor(self, t: float) -> None:
         source, i_dc, out = self.source, self.inp.i_dc, self.out
@@ -1239,11 +1204,6 @@ class DCLink:
         out.i_src = i_src
         out.u_C = cap.state.u_C
         out.u_dc = cap.state.u_C + cap.R_esr * (i_src - i_dc)
-
-    def rhs(self, t: float):
-        if self.capacitor is None:
-            return ()
-        return (self.capacitor.derivative(self.out.i_src - self.inp.i_dc),)
 
     def _rhs_without_capacitor(self, t: float):
         return ()
