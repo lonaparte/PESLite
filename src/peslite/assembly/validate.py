@@ -86,6 +86,7 @@ def _pwm(w, base, where: str, continuous: bool = False) -> None:
     if not math.isfinite(w.carrier_phase):
         raise ConfigError(f"{where}.carrier_phase must be finite, got {w.carrier_phase}")
     if not continuous and w.sync == "synchronous":
+        base.require("f0", where=f"{where}.sync = 'synchronous'")
         ratio = w.f_sw / base.f0
         if abs(ratio - round(ratio)) > 1e-9 * np.maximum(1.0, ratio):
             raise ConfigError(f"{where}.sync = 'synchronous' needs an integer pulse ratio "
@@ -264,6 +265,7 @@ def _converter(u, base, where: str):
 
 def _unit(u, base, where: str, *, nested: bool = False) -> None:
     """Check one converter unit."""
+    base.require("v_ll_rms", "f0", where=f"{where}: a VSC")
     _topology, _continuous = _converter(u, base, where)
     if u.bus is None:
         raise ConfigError(f"{where}.bus: a VSC needs a three-phase bus")
@@ -403,8 +405,6 @@ def _network(p: Params) -> None:
     """Check element identities, network values and bus references."""
     from .params import _unit_items, _unit_path
 
-    if not p.units:
-        raise ConfigError("units: a system needs at least one converter")
     connected_units = {
         name: unit for name, unit in _unit_items(p.units)
         if getattr(unit, "bus", None) is not None
@@ -415,6 +415,8 @@ def _network(p: Params) -> None:
                               f"bus voltage a state (a bus without one would need a node-voltage solver)")
         if bus.phases not in (1, 3):
             raise ConfigError(f"buses.{name}.phases must be 1 or 3")
+        if bus.phases == 3:
+            p.base.require("v_ll_rms", where=f"buses.{name}: a three-phase bus")
     def _bus_of(where: str, bus: str) -> None:
         if bus not in p.buses:
             raise ConfigError(f"{where}: unknown bus {bus!r}; known: {sorted(p.buses)}")
@@ -437,6 +439,7 @@ def _network(p: Params) -> None:
         _element_bus(f"sources.{name}.bus", src.bus)
         if src.f is not None and (not math.isfinite(src.f) or src.f <= 0.0):
             raise ConfigError(f"sources.{name}.f must be finite and positive, got {src.f}")
+        p.base.require("f0", where=f"sources.{name}: an AC source")
         if not math.isfinite(src.angle):
             raise ConfigError(f"sources.{name}.angle must be finite")
         if src.l <= 0.0:

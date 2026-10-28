@@ -9,6 +9,8 @@ fields, types and choices, and builds registered loop, element and event paramet
 
 pu bases, AC: Vb = sqrt(2/3)*v_ll_rms (phase peak), Ib = S/(1.5*Vb), Zb = Vb/Ib, w0 = 2*pi*f0;
 DC: Vdc = vdc_ref, Idc = S/Vdc, Zdc = Vdc**2/S. L base = Z/w0, C base = 1/(w0*Z).
+``v_ll_rms`` and ``f0`` are optional until an AC quantity or frequency-based pu quantity needs
+them; scalar SI models use the same base schema with only ``s_base``.
 """
 
 from __future__ import annotations
@@ -112,45 +114,66 @@ class DCBase:
     v: float  # rated dc voltage (V)
     i: float  # s_base / v (A)
     z: float  # v / i (ohm)
-    w0: float
+    w0: Optional[float]
 
     def C(self, c_pu: float) -> float:
         """pu -> F."""
+        if self.w0 is None:
+            raise ConfigError("a per-unit DC capacitance requires base.f0")
         return c_pu / (self.w0 * self.z)
 
 
 @dataclass(frozen=True)
 class BaseValues:
-    """System base (``s_base`` VA, ``v_ll_rms`` V, ``f0`` Hz) and derived phase-peak SI bases."""
+    """Shared rating and optional AC base used by system and unit parameter scopes.
+
+    ``s_base`` is always available. ``v_ll_rms`` and ``f0`` are required only by quantities whose
+    SI/pu conversion or physical model uses them; scalar models written in SI therefore do not
+    need placeholder AC values.
+    """
 
     s_base: float
-    v_ll_rms: float
-    f0: float
-    v_phase_peak: float = field(init=False)
-    i_phase_peak: float = field(init=False)
-    z_base: float = field(init=False)
-    w0: float = field(init=False)
+    v_ll_rms: Optional[float] = None
+    f0: Optional[float] = None
+    v_phase_peak: Optional[float] = field(init=False)
+    i_phase_peak: Optional[float] = field(init=False)
+    z_base: Optional[float] = field(init=False)
+    w0: Optional[float] = field(init=False)
 
     def __post_init__(self) -> None:
         for name in ("s_base", "v_ll_rms", "f0"):
             value = getattr(self, name)
-            if not math.isfinite(value) or value <= 0:
+            if value is not None and (not math.isfinite(value) or value <= 0):
                 raise ConfigError(f"{name} must be finite and positive")
-        v = math.sqrt(2.0 / 3.0) * self.v_ll_rms
-        i = self.s_base / (1.5 * v)
+        v = (None if self.v_ll_rms is None
+             else math.sqrt(2.0 / 3.0) * self.v_ll_rms)
+        i = None if v is None else self.s_base / (1.5 * v)
         object.__setattr__(self, "v_phase_peak", v)
         object.__setattr__(self, "i_phase_peak", i)
-        object.__setattr__(self, "z_base", v / i)
-        object.__setattr__(self, "w0", 2.0 * math.pi * self.f0)
+        object.__setattr__(self, "z_base", None if v is None else v / i)
+        object.__setattr__(self, "w0", None if self.f0 is None else 2.0 * math.pi * self.f0)
+
+    def require(self, *names: str, where: str) -> "BaseValues":
+        """Return this base after checking fields required by the requesting model."""
+        missing = [f"base.{name}" for name in names if getattr(self, name) is None]
+        if missing:
+            raise ConfigError(f"{where} requires {', '.join(missing)}")
+        return self
 
     # pu -> SI
     def L(self, x_pu: float) -> float:
+        self.require("v_ll_rms", "f0", where="an AC per-unit inductance")
+        assert self.z_base is not None and self.w0 is not None
         return x_pu * self.z_base / self.w0
 
     def R(self, r_pu: float) -> float:
+        self.require("v_ll_rms", where="an AC per-unit resistance")
+        assert self.z_base is not None
         return r_pu * self.z_base
 
     def C(self, c_pu: float) -> float:
+        self.require("v_ll_rms", "f0", where="an AC per-unit capacitance")
+        assert self.w0 is not None and self.z_base is not None
         return c_pu / (self.w0 * self.z_base)
 
     def dc(self, vdc_ref: float) -> DCBase:
@@ -159,13 +182,23 @@ class BaseValues:
         return DCBase(v=vdc_ref, i=i, z=vdc_ref / i if i > 0.0 else 0.0, w0=self.w0)
 
     def parameter_scales(self, vdc_ref: float = 1.0) -> dict[str, float]:
-        """Return the SI value of one pu for each quantity name."""
+        """Return the SI value of one pu for every quantity defined by this base."""
         dc = self.dc(vdc_ref)
-        return {"1": 1.0, "voltage": self.v_phase_peak, "current": self.i_phase_peak,
-                "power": self.s_base, "frequency": self.w0,
-                "resistance": self.z_base, "inductance": self.L(1.0), "capacitance": self.C(1.0),
-                "dc_voltage": dc.v, "dc_current": dc.i, "dc_resistance": dc.z,
-                "dc_capacitance": dc.C(1.0)}
+        scales = {"1": 1.0}
+        if self.v_phase_peak is not None:
+            scales.update(voltage=self.v_phase_peak, current=self.i_phase_peak)
+        scales["power"] = self.s_base
+        if self.w0 is not None:
+            scales["frequency"] = self.w0
+        if self.z_base is not None:
+            scales["resistance"] = self.z_base
+        if self.z_base is not None and self.w0 is not None:
+            scales.update(inductance=self.z_base / self.w0,
+                          capacitance=1.0 / (self.w0 * self.z_base))
+        scales.update(dc_voltage=dc.v, dc_current=dc.i, dc_resistance=dc.z)
+        if dc.w0 is not None:
+            scales["dc_capacitance"] = dc.C(1.0)
+        return scales
 
 
 def quantity_metadata(cls, name: str) -> dict:
@@ -209,7 +242,10 @@ def convert_quantities(data: dict, cls, scales: dict[str, float], where: str) ->
             except (TypeError, ValueError):
                 raise ConfigError(f"{where}.{name}: expected a number, got {value!r}") from None
             if spelling.endswith("_pu") != target.endswith("_pu"):
-                scale = _scale(quantities[target], scales)
+                try:
+                    scale = _scale(quantities[target], scales)
+                except ConfigError as exc:
+                    raise ConfigError(f"{where}.{name}: {exc}") from None
                 value = value * scale if spelling.endswith("_pu") else value / scale
         out[target] = value
     for name, value in quantity_metadata(cls, "_defaults_pu").items():
@@ -220,9 +256,14 @@ def convert_quantities(data: dict, cls, scales: dict[str, float], where: str) ->
 
 def _scale(expression: str, scales: dict[str, float]) -> float:
     numerator, *denominators = expression.split("/")
-    value = math.prod(scales[name] for name in numerator.split("*"))
-    for denominator in denominators:
-        value /= math.prod(scales[name] for name in denominator.split("*"))
+    try:
+        value = math.prod(scales[name] for name in numerator.split("*"))
+        for denominator in denominators:
+            value /= math.prod(scales[name] for name in denominator.split("*"))
+    except KeyError as exc:
+        raise ConfigError(
+            f"a per-unit {exc.args[0].replace('_', ' ')} value needs the corresponding base"
+        ) from None
     return value
 
 
@@ -607,9 +648,7 @@ class UnitParams:
                     derived.add(f"ctrl.loops.{name}.period")
             ctrl = replace(ctrl, loops=loops)
         unit = replace(self, ctrl=ctrl)
-        base = system_base if self.s_base is None else BaseValues(
-            self.s_base, system_base.v_ll_rms, system_base.f0,
-        )
+        base = system_base if self.s_base is None else replace(system_base, s_base=self.s_base)
         object.__setattr__(unit, "base", base)
         object.__setattr__(unit, "derived_defaults", frozenset(derived))
         object.__setattr__(unit, "events", tuple(events))
@@ -925,7 +964,9 @@ class Params:
     """
 
     base: BaseValues  # system base, used for network pu inputs
-    units: dict[str, UnitParams] = field(metadata={"entries": "unit"})
+    units: dict[str, UnitParams] = field(
+        default_factory=dict, metadata={"entries": "unit"}, kw_only=True,
+    )
     simulation: SimulationParams
     buses: dict[str, BusParams] = field(default_factory=dict)
     sources: dict[str, SourceParams] = field(default_factory=dict)

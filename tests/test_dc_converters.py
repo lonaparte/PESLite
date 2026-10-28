@@ -15,9 +15,12 @@ from peslite.control import (BridgeControlOutput, DCVoltageControl, GraphControl
 
 
 def _case(*, model="pwm_averaging", bridge_type="half_bridge",
-          lower_controlled=False, load=6.0, t_end=0.01):
+          lower_controlled=False, load=6.0, t_end=0.01, ac_base=True):
+    base = {"s_base": 500.0}
+    if ac_base:
+        base.update(v_ll_rms=230.0, f0=50.0)
     return from_dict({
-        "base": {"s_base": 500.0, "v_ll_rms": 230.0, "f0": 50.0},
+        "base": base,
         "buses": {"output": {"phases": 1, "c": 470.0e-6}},
         "elements": {
             "load": {"type": "resistor", "bus": "output", "r": load},
@@ -199,6 +202,18 @@ def test_dc_converter_is_an_open_unit_connected_through_the_common_terminal_api(
     assert not hasattr(unit, "plant")
     assert isinstance(unit.ctrl.graph.nodes["DCVoltageControl"], DCVoltageControl)
     assert isinstance(unit.ctrl.graph.nodes["InductorCurrentControl"], InductorCurrentControl)
+
+
+def test_dc_converter_si_model_is_independent_of_the_optional_ac_base(tmp_path):
+    configured = _case(t_end=0.0002)
+    dc_only = _case(t_end=0.0002, ac_base=False)
+    assert dc_only.base.v_ll_rms is None and dc_only.base.f0 is None
+
+    expected = peslite.Simulation(configured).run(out_dir=tmp_path / "configured")
+    actual = peslite.Simulation(dc_only).run(out_dir=tmp_path / "dc-only")
+    assert actual.states.keys() == expected.states.keys()
+    for name, values in expected.states.items():
+        np.testing.assert_array_equal(actual.states[name], values)
 
 
 def test_dc_converter_rejects_a_three_phase_point_network():

@@ -4210,7 +4210,7 @@ class _UnitGenerator(_ACControlGenerator):
         return lines
 
     def event_methods(self) -> str:
-        bridge = self.unit.bridge
+        bridge = self.bridge
         hold = self.model.zoh_fields[id(bridge.inp), "q"]
         switching = not isinstance(bridge.modulator, ZOH)
         next_values = [

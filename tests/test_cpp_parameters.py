@@ -408,6 +408,28 @@ def test_zero_parallel_capacitance_keeps_the_compiled_structure(selection, tmp_p
     assert not (tmp_path / "changed").exists()
 
 
+@pytest.mark.parametrize("initial, changed", [(0.0, 1.0e-6), (1.0e-6, 0.0)])
+def test_vsc_computation_delay_uses_the_shared_structural_guard(
+        initial, changed, tmp_path):
+    params = _case("gfl", "pwm_averaging").replace(**{
+        "units.vsc.ctrl.computation": initial,
+    })
+    binary = _compile(
+        params,
+        tmp_path / "model",
+        ("units.vsc.ctrl.computation",),
+    )
+    output = tmp_path / "changed"
+    result = subprocess.run(
+        [binary, "--set", f"units.vsc.ctrl.computation={changed}", "--out", output],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "changed structural specialization" in result.stderr
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("name,mode,selection", [
     ("buck", "switching", "all"),
     ("wpt", "averaging", "all"),

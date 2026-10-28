@@ -35,6 +35,44 @@ def test_buses_section_may_be_omitted_when_no_public_bus_is_used(filename):
     assert result.summary["t_stop"] == pytest.approx(2e-6)
 
 
+def test_scalar_si_network_needs_neither_converters_nor_ac_base_values(tmp_path):
+    params = from_dict({
+        "base": {"s_base": 500.0},
+        "buses": {"node": {"c": 1.0e-3, "phases": 1}},
+        "elements": {"load": {"type": "resistor", "bus": "node", "r": 10.0}},
+        "simulation": {
+            "t_end": 0.01,
+            "solver": {"dt": 1.0e-5},
+            "initial": {"states": {"node.u_C": 10.0}},
+            "output": {"period": 1.0e-3},
+            "energy_check": "strict",
+        },
+    })
+    assert params.units == {}
+    assert params.base.v_ll_rms is None and params.base.f0 is None
+    assert from_dict(to_dict(params)) == params
+
+    result = peslite.Simulation(params).run(out_dir=tmp_path)
+    assert result.states["node.u_C"][-1] == pytest.approx(10.0 / math.e, rel=2e-8)
+
+
+def test_missing_optional_base_values_are_reported_only_when_used():
+    tree = {
+        "base": {"s_base": 500.0},
+        "buses": {"node": {"c": 1.0e-3, "phases": 1}},
+        "simulation": {"t_end": 0.01},
+    }
+    with pytest.raises(ConfigError, match=r"per-unit capacitance.*corresponding base"):
+        from_dict({**tree, "buses": {"node": {"c_pu": 0.1, "phases": 1}}})
+    with pytest.raises(ConfigError, match=r"three-phase bus requires base\.v_ll_rms"):
+        from_dict({**tree, "buses": {"node": {"c": 1.0e-3, "phases": 3}}})
+
+    vsc = read_tree(EXAMPLES / "gfl-example.pes")
+    vsc["base"] = {"s_base": vsc["base"]["s_base"]}
+    with pytest.raises(ConfigError, match=r"per-unit .*capacitance.*corresponding base|a VSC requires"):
+        from_dict(vsc)
+
+
 @pytest.mark.parametrize("filename", ["gfl-example.pes", "buck-example.pes", "wpt-load-example.pes"])
 def test_shared_unit_schema_round_trips_without_persisting_cached_derived_fields(filename):
     params = peslite.load(EXAMPLES / filename)

@@ -8,11 +8,11 @@ cross-references are reported before the run starts.
 
 | Section | Purpose |
 |---|---|
-| `base` | System power, line-line RMS voltage and nominal frequency. |
+| `base` | System power rating and, when needed, AC voltage and nominal frequency bases. |
 | `buses` | Electrical nodes, including optional shunt capacitance and damping. |
 | `branches` | R-L connections between buses. |
 | `sources` | Grid voltage sources and their connection impedance. |
-| `units` | Converter power stage, sensing, controller, bridge and protection. |
+| `units` | Converter power stage, sensing, controller, bridge and protection, when present. |
 | `elements` | Built-in or registered circuit elements such as R-L loads. |
 | `events` | Timed connect, disconnect and parameter-change operations. |
 | `simulation` | End time, solver, initial state, output and progress settings. |
@@ -39,6 +39,12 @@ branches:
 Each converter may define its own `s_base`; otherwise it uses the system base. Controller
 references and loop parameters use that converter's base. Time is in seconds, angles are radians,
 frequencies are hertz unless named `omega`, and switches are written as `0` or `1`.
+
+`s_base` is the only unconditional base field. `v_ll_rms` is required by three-phase buses, VSCs
+and AC per-unit voltage or impedance values; `f0` is required by VSCs, AC sources, synchronous PWM
+and frequency-based per-unit values. A scalar circuit written in SI therefore uses, for example,
+`base: {s_base: 500.0}` without placeholder AC values. A model with no converters simply has no
+`units` section; buses, branches, sources and elements use the same assembly and solver path.
 
 `bus`, `dclink`, `pwm`, `ctrl`, `bridge`, `meas`, `protection` and `s_base` are common to every
 non-composite converter unit. The selected `unit.type` contributes its own electrical fields:

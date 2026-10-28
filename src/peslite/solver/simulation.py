@@ -1153,7 +1153,7 @@ class SystemLoop:
         self._cls = Simulation
         self._factories = dict(sim._factories)
         self.split_reference = bool(getattr(sim.solver, "groups", ()))
-        frequency = sim.p.base.f0 if frame_frequency is None else frame_frequency
+        frequency = (sim.p.base.f0 or 0.0) if frame_frequency is None else frame_frequency
         self.w0 = 2.0 * math.pi * frequency
         periods = {value for unit in sim.units.values() for value in unit.periods}
         self._angles: set[str] = set()
