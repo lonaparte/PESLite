@@ -65,6 +65,7 @@ def main() -> int:
                        for name, _unit in _unit_items(base.units)},
                     "simulation.solver.type": settings["type"],
                     "simulation.solver.method": settings["method"],
+                    "simulation.output.states": True,
                 }
                 if "rtol" in settings:
                     changes["simulation.solver.rtol"] = settings["rtol"]

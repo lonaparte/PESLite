@@ -12,7 +12,6 @@ import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import replace
-from functools import cached_property
 from typing import Any, Callable, Iterator, Mapping, Optional
 
 import numpy as np
@@ -91,11 +90,6 @@ class Unit(ABC):
         self.scenario = Scenario(cfg.events, f"units.{name}", initial=cfg.connected)
         self.dclink = _parameterized(make_dclink, cfg.dclink)
         self.zoh = f"{name}.q"  # model label of the bridge's held switching state
-
-    @cached_property
-    def continuous(self) -> bool:
-        """Whether the bridge, and so the controller, is continuous rather than sampled."""
-        return bool(getattr(self.bridge, "continuous", False))
 
     @property
     def dc_bus(self) -> str:
@@ -653,6 +647,7 @@ class VSC(Unit):
             self.bridge = _parameterized(lambda c: make_bridge(c, modulator), cfg)
         except ValueError as exc:
             raise ValueError(f"{name}: {exc}") from None
+        self.continuous = bool(getattr(self.bridge, "continuous", False))
         self.branch_f = _parameterized(lambda c: RLBranch(c.l_f, c.r_f), cfg.ac_filter)
         self._diodes_warned = False
 
@@ -795,6 +790,7 @@ class DCConverter(Unit):
         super().__init__(name, cfg, bus)
         topology = make_topology(cfg.bridge)
         self.bridge = _parameterized(lambda c: make_bridge(c, modulator, topology=topology), cfg)
+        self.continuous = bool(getattr(self.bridge, "continuous", False))
         self.branch_f = None if cfg.filter is None else _parameterized(lambda c: RLBranch(
             c.l_f,
             c.r_f,

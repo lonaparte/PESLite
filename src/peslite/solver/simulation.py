@@ -89,6 +89,33 @@ def _finite(y: np.ndarray) -> bool:
     return all(map(math.isfinite, y.tolist()))
 
 
+def _compile_interval_integrator(solver, rhs, conduction, settle, project):
+    """Compile the assembled interval stages so structural choices leave the run loop.
+
+    Conduction participation, solver settlement and state bounds cannot change during a run.
+    Only whether the current boundary is an event remains dynamic.
+    """
+    env = {"solver": solver, "rhs": rhs}
+    if conduction:
+        env["conduction"] = conduction
+        advance = "conduction.advance(t_a, t_b, y)"
+    else:
+        advance = "solver(rhs, t_a, t_b, y).y"
+    body = [f"y = {advance}"]
+    if settle is not None:
+        env["settle"] = settle
+        body += ["if event:", "    y = settle(t_b, y)"]
+    if project is not None:
+        env["project"] = project
+        body.append("y = project(y)")
+    body.append("return y")
+    source = "def integrate(t_a, t_b, y, event):\n" + "\n".join(
+        "    " + line for line in body
+    )
+    exec(compile(source, "<peslite interval integrator>", "exec"), env)
+    return np.errstate(over="raise")(env["integrate"])
+
+
 def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
                       ctrl_logs: Mapping[str, Mapping[str, float]],
                       ctrl_names: Mapping[str, Iterable[str]] | None = None) -> dict[str, float]:
@@ -924,12 +951,9 @@ class Simulation:
                                   f"known: {sorted(values)}")
             return "".join(f"   {name} = {values[name]:.6g}" for name in watch)
 
-        @np.errstate(over="raise")  # overflow counts as divergence
-        def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
-            y = diode_conduction.advance(t_a, t_b, y) if diode_conduction else solver(mdl.rhs, t_a, t_b, y).y
-            if event and settle is not None:
-                y = settle(t_b, y)
-            return project(y) if project is not None else y
+        integrate = _compile_interval_integrator(
+            solver, mdl.rhs, diode_conduction, settle, project,
+        )
 
         def advance(t_a: float, t_b: float, event: bool = False) -> bool:
             """Integrate over ``[t_a, t_b]``; ``event`` means the model changes at ``t_b``."""
