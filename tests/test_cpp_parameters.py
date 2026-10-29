@@ -430,6 +430,22 @@ def test_vsc_computation_delay_uses_the_shared_structural_guard(
     assert not output.exists()
 
 
+@pytest.mark.parametrize("initial, changed", [(0.0, 5.0e-6), (5.0e-6, 0.0)])
+def test_adc_offset_uses_the_shared_structural_guard(initial, changed, tmp_path):
+    path = "units.vsc.meas.offset"
+    params = _case("gfl", "pwm_averaging").replace(**{path: initial})
+    binary = _compile(params, tmp_path / "model", (path,))
+    output = tmp_path / "changed"
+    result = subprocess.run(
+        [binary, "--set", f"{path}={changed}", "--out", output],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "changed structural specialization" in result.stderr
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("name,mode,selection", [
     ("buck", "switching", "all"),
     ("wpt", "averaging", "all"),

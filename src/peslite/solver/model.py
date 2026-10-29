@@ -1347,6 +1347,16 @@ class Model:
                 out[f"{sname}.{name}"] = getattr(st, name)
         return out
 
+    @property
+    def angle_state_names(self) -> tuple[str, ...]:
+        """Qualified continuous states declared as angles by their owning subsystems."""
+        return tuple(
+            f"{prefix}.{name}"
+            for prefix, subsystem in zip(self.names, self.subsystems)
+            for name in getattr(subsystem, "angle_state_names", ())
+            if name in subsystem.state_names
+        )
+
     def set_state(self, values: Mapping[str, Any]) -> None:
         """Write named states into the subsystem records (repack with :meth:`get_initial_values`)."""
         index = {f"{sname}.{name}": (sub.state, name)

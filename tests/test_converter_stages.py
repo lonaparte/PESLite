@@ -47,7 +47,7 @@ def test_bridge_topologies_share_the_existing_converter_module():
 def _bridge_configuration(model):
     return SimpleNamespace(
         bridge=SimpleNamespace(model=model),
-        ctrl=SimpleNamespace(period=1e-4, computation=0.0),
+        ctrl=SimpleNamespace(period=1e-4, offset=None, computation=0.0),
         pwm=SimpleNamespace(
             load_period=1e-4,
             grid_offset=0.0,

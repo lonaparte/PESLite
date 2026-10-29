@@ -142,13 +142,22 @@ class Unit(ABC):
                 period = cfg.meas.period
             sample_period = cfg.meas.period if cfg.meas.period is not None else period
             window = cfg.meas.window if cfg.meas.window is not None else period
+            if clocked:
+                sample_offset = 0.0 if cfg.meas.offset is None else cfg.meas.offset
+                control_offset = sample_offset
+            elif self.continuous:
+                control_offset = sample_offset = 0.0
+            else:
+                control_offset = cfg.ctrl.clock_offset(cfg.pwm)
+                sample_offset = cfg.meas.clock_offset(control_offset, sample_period)
             return ADC(self.ports, period, sample_period, window, channels,
-                       rms=cfg.meas.rms, clocked=clocked)
+                       rms=cfg.meas.rms, clocked=clocked,
+                       control_offset=control_offset, sample_offset=sample_offset)
 
         self.adc = _parameterized(make_adc, (self.cfg, sim))
         self.windowed = self.adc.accumulating
         self.accumulate, self.restart_windows = self.adc.accumulate_to, self.adc.seed
-        self._oversamples = self.adc.samples > 1
+        self._oversamples = self.adc.samples > 1 and not self.adc.independent
 
     def _check_parts(self) -> None:
         """Reject a controller timed unlike the bridge, or a part outside its protocol."""
@@ -208,7 +217,7 @@ class Unit(ABC):
             parts.append((f"{self.name}.ctrl", self.ctrl))
         parts.append((f"{self.name}.{self.bridge.state_prefix}", self.bridge.state_owner))
         adc = getattr(self, "adc", None)
-        if adc is not None and (adc.accumulating or adc.clocked):
+        if adc is not None and (adc.accumulating or adc.independent):
             parts.append((f"{self.name}.meas", adc))
         return parts
 
@@ -235,6 +244,8 @@ class Unit(ABC):
             return self.adc.next_time() if self.adc is not None else math.inf
         bridge = self.bridge
         next_ = bridge.next_time()
+        if self.adc.independent:
+            next_ = min(next_, self.adc.next_time())
         if self.windowed:
             next_ = min(next_, self.adc.t_window(bridge.next_control_time))
         if self._oversamples:
@@ -596,6 +607,9 @@ class Unit(ABC):
     def _sample_control(self, t: float, plant: Plant) -> Any | None:
         """Run common oversampling and return one controller sample when its interrupt is due."""
         bridge = self.bridge
+        if self.adc.conversion_due(t):
+            plant.outputs(t)
+            self.adc.convert(t)
         if not bridge.control_due(t):
             if (self._oversamples
                     and abs(self.adc.t_sample(bridge.previous_control_time()) - t) < TIME_EPS):
@@ -603,7 +617,7 @@ class Unit(ABC):
                 self.adc.peek(t)
             return None
         plant.outputs(t)
-        return self._control_measurement(self.adc.sample(t))
+        return self._control_measurement(self.adc.sample(t, held=self.adc.independent))
 
     def _actuate_sampled(self, t: float, plant: Plant, enabled: bool) -> bool:
         """Apply a pending trip, bridge events and the next ADC window."""

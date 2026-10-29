@@ -676,6 +676,38 @@ def test_generated_cpp_reuses_common_adc_and_protection_for_dc_converter(tmp_pat
     assert _summary(cpp_out)["converter.trip_cause"] == "overcurrent"
 
 
+def test_generated_cpp_matches_independent_control_adc_and_pwm_offsets(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "gfl-example.pes").replace(**{
+        "units.vsc.ctrl.offset": 10.0e-6,
+        "units.vsc.meas.period": 25.0e-6,
+        "units.vsc.meas.offset": 5.0e-6,
+        "units.vsc.meas.average": ["u_g", "i_c"],
+        "units.vsc.meas.window": 25.0e-6,
+        "simulation.t_end": 0.001,
+        "simulation.output.period": 50.0e-6,
+        "simulation.output.states": True,
+        "simulation.output.signals": False,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+    })
+    _source, cpp_out, python_out = _run_generated(
+        params, tmp_path / "independent-clock-offsets", compiler
+    )
+
+    actual = _final_csv(cpp_out / "states.csv")
+    expected = _final_csv(python_out / "states.csv")
+    assert actual.keys() == expected.keys()
+    np.testing.assert_allclose(
+        [actual[name] for name in actual],
+        [expected[name] for name in expected],
+        rtol=2e-8,
+        atol=2e-9,
+    )
+
+
 @pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
 def test_generated_cpp_matches_python_for_adaptive_dcm(mode, tmp_path):
     compiler = _compiler()

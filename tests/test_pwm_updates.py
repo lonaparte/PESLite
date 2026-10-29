@@ -56,7 +56,7 @@ def test_bridge_phase_clock_describes_the_applied_reference():
     from peslite.components.pwm import PWM
 
     omega = 2 * math.pi * 100e3
-    pwm = PWM(1e-5, 1e-5, 0.0, 0.0, 1e-5, SynchronousCarrier(1))
+    pwm = PWM(1e-5, 1e-5, 0.0, 0.0, 0.0, 1e-5, SynchronousCarrier(1))
     pwm.reset(np.full(3, .5), on=True)
     pwm.start(0.0, (0.0, omega), False)
     pwm.tick(1e-5, .4, omega)
@@ -75,7 +75,7 @@ def test_pwm_register_layout_rejects_state_collisions(registers, modulator, matc
     from peslite.components.pwm import PWM
 
     with pytest.raises(ValueError, match=match):
-        PWM(1e-5, 1e-5, 0.0, 0.0, 1e-5, modulator, duty_names=registers)
+        PWM(1e-5, 1e-5, 0.0, 0.0, 0.0, 1e-5, modulator, duty_names=registers)
 
 
 @pytest.mark.parametrize("example", ["gfl", "buck", "wpt"])

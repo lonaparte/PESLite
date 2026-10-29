@@ -58,6 +58,7 @@ units:                     # converters, one entry each
     #   rms: {}            # channel -> RMS window in seconds; whole sampling periods
     #   window: 50.0e-6    # averaging window, s (default: ctrl.period)
     #   period: 25.0e-6    # oversampling period, s; divides ctrl.period (default: one sample)
+    #   offset: 0.0         # ADC clock position, s (default: aligned with the control clock)
 
     pwm:
       f_sw: 20000.0        # carrier frequency, Hz
@@ -82,6 +83,7 @@ units:                     # converters, one entry each
     ctrl:
       type: gfl            # default wiring: gfl | gfm | custom (explicit connections and outputs)
       # period: 50.0e-6    # sampled modes: control interrupt (ignored by averaging)
+      # offset: 0.0        # sampled modes: control-clock position, s (default: PWM load clock)
       # computation: 1.0e-6  # sampled modes: sample-to-PWM-load eligibility (ignored by averaging)
       loops:               # sampled by interrupts, or integrated continuously by averaging
         SRFPLL:

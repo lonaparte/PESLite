@@ -96,10 +96,14 @@ def test_timing_defaults_follow_the_carrier(gfl):
     ({"units.vsc.ctrl.computation": 5e-5}, "shorter than the control period"),
     ({"units.vsc.ctrl.computation": -1e-6}, "must be at least 0"),
     ({"units.vsc.ctrl.computation": math.nan}, "computation"),
+    ({"units.vsc.ctrl.offset": -1e-6}, "offset"),
+    ({"units.vsc.ctrl.offset": T}, "offset"),
     ({"units.vsc.ctrl.loops.DCVoltageControl.period": 7.5e-5},
      "not a multiple of ctrl.period"),
     ({"units.vsc.meas.period": 2e-5}, "does not divide ctrl.period"),
     ({"units.vsc.meas.period": 1e-4}, "longer than the sampling period"),
+    ({"units.vsc.meas.offset": -1e-6}, "offset"),
+    ({"units.vsc.meas.period": T / 2, "units.vsc.meas.offset": T / 2}, "offset"),
     ({"units.vsc.meas.average": "window"}, "expected a list of channels"),
     ({"units.vsc.meas.average": ["u_g", "unknown"]}, "unknown channel"),
     ({"units.vsc.meas.average": ["u_g", "u_g"]}, "must not be repeated"),
@@ -159,6 +163,34 @@ def test_timing_follows_an_asynchronous_carrier_phase(gfl, tmp_path):
     assert np.allclose(_lags(interrupts, loads), T)
 
 
+def test_control_adc_and_pwm_use_independent_offsets_on_the_shared_clock_grid(gfl, tmp_path):
+    params = gfl(**{
+        "units.vsc.ctrl.offset": 10e-6,
+        "units.vsc.meas.period": T / 2,
+        "units.vsc.meas.offset": 5e-6,
+        "simulation.t_end": 3 * T,
+    })
+    simulation = peslite.Simulation(params)
+    unit = simulation.unit("vsc")
+    conversions = []
+    convert = unit.adc.convert
+
+    def record_conversion(t):
+        conversions.append(t)
+        convert(t)
+
+    unit.adc.convert = record_conversion
+    controller = []
+    unit.ctrl = _Recorder(unit.ctrl, controller, "ctrl")
+    simulation.run(out_dir=tmp_path)
+
+    assert unit.bridge.control_clock.offset == pytest.approx(10e-6)
+    assert unit.bridge.load_clock.offset == pytest.approx(0.0)
+    assert unit.adc.independent
+    np.testing.assert_allclose([t for t, _output in controller], [10e-6, 60e-6, 110e-6])
+    np.testing.assert_allclose(conversions, np.arange(5e-6, 3 * T, T / 2))
+
+
 def test_a_slow_loop_runs_at_every_nth_interrupt(gfl):
     sim = peslite.Simulation(gfl(**{
         "units.vsc.ctrl.loops.DCVoltageControl.period": 4 * T,
@@ -170,7 +202,7 @@ def test_a_slow_loop_runs_at_every_nth_interrupt(gfl):
 
 
 def _pwm(computation):
-    return PWM(T, T, 0.0, computation, T, ZOH())
+    return PWM(T, T, 0.0, 0.0, computation, T, ZOH())
 
 
 def test_shadow_duty_loads_only_after_computation():
@@ -201,7 +233,9 @@ def test_timer_starts_at_the_first_carrier_valley(gfl):
         "units.vsc.pwm.carrier_phase": 0.25,
         "units.vsc.pwm.update": "double",
     })).unit().bridge
-    assert (pwm.offset, pwm.period, pwm.load_period) == (pytest.approx(0.75 * T), T, T / 2)
+    assert (pwm.control_clock.offset, pwm.load_clock.offset, pwm.period, pwm.load_period) == (
+        pytest.approx(0.75 * T), pytest.approx(0.75 * T), T, T / 2,
+    )
     assert pwm.after(0.0) == 0
     assert pwm.after(pwm.interrupt(3)) == 4
     assert pwm.after(pwm.interrupt(3) + 1e-7) == 4
@@ -213,7 +247,7 @@ def test_timer_starts_at_the_first_carrier_valley(gfl):
         "units.vsc.pwm.carrier_phase": 0.25,
         "units.vsc.pwm.sync": "synchronous",
     })).unit().bridge
-    assert synchronous.offset == 0.0
+    assert synchronous.control_clock.offset == synchronous.load_clock.offset == 0.0
 
 
 def test_duty_registers_are_states_and_loop_clocks_are_not(gfl):

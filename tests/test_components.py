@@ -154,7 +154,8 @@ def test_adc_reconstructs_its_sampling_position_from_the_start_time():
 
 def test_pwm_owns_timer_registers_and_switching_schedule():
     initial = np.array([0.2, 0.4, 0.6])
-    pwm = PWM(period=1e-3, load_period=1e-3, offset=0.0, computation=2e-4,
+    pwm = PWM(period=1e-3, load_period=1e-3, control_offset=0.0, load_offset=0.0,
+              computation=2e-4,
               carrier_period=1e-3, modulator=ZOH())
     pwm.reset(initial)
     assert pwm.get_state() == {

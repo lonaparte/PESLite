@@ -22,6 +22,7 @@ from numpy.typing import NDArray
 
 from ..solver.model import Bag, ConfigError, _complex, _real, gather, scatter
 from ..solver.energy import PowerPort, port_power
+from ..solver.timing import control_clock_offset
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,
                     SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ, CurrentLoop,
@@ -341,7 +342,7 @@ class ControlGraph:
         self.periods = {}
         self.continuous = cfg.bridge.model == "averaging"
         self._T = None if self.continuous else _real(cfg.ctrl.period)
-        self._t0 = cfg.pwm.grid_offset
+        self._t0 = control_clock_offset(cfg.ctrl, cfg.pwm)
         self.values: dict[str, Any] = {}
         self._out_specs: dict[str, tuple] = {}
         self._limits: dict[str, tuple[str, OutputLimit]] = {}
@@ -502,6 +503,16 @@ class ControlGraph:
         self._every_interrupt = (None if self.continuous else
                                  frozenset(name for name, every in self._every)
                                  if all(every == 1 for _name, every in self._every) else None)
+        angles = []
+        for name, node in self.nodes.items():
+            node_states = node.get_state()
+            for port, spec in node.outputs.items():
+                if spec.unit != "rad":
+                    continue
+                if port in node_states:
+                    angles.append(f"{name}.{port}")
+                angles.append(f"held.{self._state_port(f'{name}.{port}')}")
+        self.angle_state_names = tuple(angles)
 
     @staticmethod
     def period_stride(period, interrupt_period):
@@ -1083,6 +1094,18 @@ class _GraphRuntime:
     def discrete_state_names(self) -> tuple[str, ...]:
         """Run/ramp bookkeeping is restored, not differentiated as controller memory."""
         return tuple(f"startup.{name}" for name in self.startup.get_state())
+
+    @property
+    def angle_state_names(self) -> tuple[str, ...]:
+        """Controller-owned state coordinates whose values are angles in radians."""
+        known = set(self.state_names) if self.continuous else set(self.get_state())
+        names = [name for name in self.graph.angle_state_names if name in known]
+        names.extend(
+            f"command.{port}"
+            for port, spec in self.interface.outputs.items()
+            if spec.unit == "rad" and f"command.{port}" in known
+        )
+        return tuple(names)
 
     @property
     def interface(self) -> ControlInterface:

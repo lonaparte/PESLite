@@ -717,7 +717,7 @@ class Simulation:
             self._states.load(values, [f"{name}.ctrl", bridge_prefix])
             if any(key.startswith((f"{name}.ctrl.", bridge_prefix + ".")) for key in values):
                 self._continued.add(name)
-            if unit.adc is not None and (unit.adc.accumulating or unit.adc.clocked):
+            if unit.adc is not None and (unit.adc.accumulating or unit.adc.independent):
                 self._states.load(values, [f"{name}.meas"])
                 if any(key.startswith(f"{name}.meas.") for key in values):
                     self._windows_given.add(name)
@@ -1156,7 +1156,6 @@ class SystemLoop:
         frequency = (sim.p.base.f0 or 0.0) if frame_frequency is None else frame_frequency
         self.w0 = 2.0 * math.pi * frequency
         periods = {value for unit in sim.units.values() for value in unit.periods}
-        self._angles: set[str] = set()
         control_columns: set[str] = set()
         for name, unit in sim.units.items():
             ctrl = unit.ctrl
@@ -1167,10 +1166,6 @@ class SystemLoop:
                 control_columns.update((f"{name}.ctrl.{local}.re", f"{name}.ctrl.{local}.im"))
             measured = None
             for label, node in graph.nodes.items():
-                for port, spec in node.outputs.items():
-                    if spec.unit == "rad":
-                        self._angles.update((f"{name}.ctrl.{label}.{port}",
-                                             f"{name}.ctrl.held.{graph._state_port(label + '.' + port)}"))
                 forcing = getattr(node, "forcing_periods", None)
                 if repeat_forcing and forcing is not None:
                     if measured is None:
@@ -1179,9 +1174,7 @@ class SystemLoop:
                             for key, value in unit.control_inputs().items()
                         })
                     periods.update(forcing(graph._gather(graph._wiring[label], measured)))
-            self._angles.update(f"{name}.ctrl.command.{port}"
-                                for port, spec in ctrl.interface.outputs.items() if spec.unit == "rad")
-        self._angles.update(sim._states.angle_names)
+        self._angles = set(sim._states.angle_names)
         if repeat_forcing:
             for source in getattr(sim.system, "sources", {}).values():
                 relative = abs(source.cfg.f - frequency)

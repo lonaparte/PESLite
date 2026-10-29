@@ -3276,20 +3276,33 @@ class _ControlGenerator:
     def limit_observation(self) -> list[str]:
         return []
 
-    def _adc_reading(self, channel: str) -> str:
+    def _adc_source(self, channel: str) -> str:
         return f"obs_{_identifier(self.name + '.adc.' + channel)}"
 
-    def _adc_value(self, channel: str) -> str:
+    def _adc_reading(self, channel: str) -> str:
+        adc = self.adc
+        return (self.m("adc_held_" + channel)
+                if adc is not None and adc.independent else self._adc_source(channel))
+
+    def _adc_mean(self, channel: str) -> str | None:
         adc = self.adc
         assert adc is not None
         if channel in adc.channels:
             return f"({self.m('adc_acc_' + channel)} / {_number(adc.length)})"
-        return self._adc_reading(channel)
+        return None
+
+    def _adc_value(self, channel: str) -> str:
+        """Value presented to a controller at its interrupt."""
+        return self._adc_mean(channel) or self._adc_reading(channel)
+
+    def _adc_conversion(self, channel: str) -> str:
+        """Value produced by a conversion which itself closes the averaging window."""
+        return self._adc_mean(channel) or self._adc_source(channel)
 
     def _adc_members(self) -> list[str]:
         adc = self.adc
         lines = []
-        if adc is not None and adc.clocked:
+        if adc is not None and adc.independent:
             held = self.name not in self.model.simulation._windows_given
             index = adc._start_index(self.p.simulation.initial.t, held)
             lines.append(f"long long {self.m('adc_clock_index')} = static_cast<long long>({_number(index)});")
@@ -3300,15 +3313,16 @@ class _ControlGenerator:
             # Oversample scheduling and history layout are specialized; numerical periods may
             # change together, but not the number of samples represented by this executable.
             round(adc.period / adc.sample_period)
-        if adc is None or (not adc.accumulating and adc.samples == 1):
+        if adc is None or (not adc.accumulating and (adc.independent or adc.samples == 1)):
             return lines
         if adc.accumulating:
             lines.append(
                 f"double {self.m('adc_integration_time')} = "
                 f"{_number(adc.integration_time)};"
             )
-        lines += [f"long long {self.m('adc_n_samp')} = {int(adc.n_samp)};",
-                 f"bool {self.m('adc_window_open')} = "
+        if not adc.independent:
+            lines.append(f"long long {self.m('adc_n_samp')} = {int(adc.n_samp)};")
+        lines += [f"bool {self.m('adc_window_open')} = "
                  f"{'true' if adc.window_open else 'false'};"]
         for channel in adc.channels:
             value = adc.accumulated[channel]
@@ -3340,9 +3354,9 @@ class _ControlGenerator:
     def adc_initialization_lines(self) -> list[str]:
         """Reuse ADC startup with the retained timer and freshly seeded physical readings."""
         adc = self.adc
-        if (adc is None or (not self.model.runtime.selected and not adc.clocked)
+        if (adc is None or (not self.model.runtime.selected and not adc.independent)
                 or self.continuous and not adc.clocked
-                or not adc.accumulating and adc.samples == 1):
+                or not adc.accumulating and (adc.independent or adc.samples == 1)):
             return []
         clone = copy.copy(adc)
         restored = self.name in self.model.simulation._windows_given
@@ -3357,9 +3371,9 @@ class _ControlGenerator:
         if adc.clocked:
             clone.start(t0, held=not restored)
         else:
-            index = bridge.index_after(t0)
+            index = bridge.control_clock.index_after(t0)
             clone.start(t0, bridge.interrupt(index - 1), bridge.interrupt(index), held=not restored)
-        return [f"{self.m('adc_n_samp')} = {clone.n_samp};",
+        return [*([f"{self.m('adc_n_samp')} = {clone.n_samp};"] if not adc.independent else []),
                 f"{self.m('adc_window_open')} = {_literal(clone.window_open)};",
                 *(f"{self.m('adc_acc_' + channel)} = {_literal(value)};"
                   for channel, value in clone.accumulated.items())]
@@ -3369,7 +3383,7 @@ class _ControlGenerator:
 
     def _rms_square(self, channel: str, *, direct: bool = False) -> str:
         reading = self.model.unit_measurements(self.unit)[channel]
-        value = reading if direct else _Expression(self._adc_reading(channel), reading.kind)
+        value = reading if direct else _Expression(self._adc_source(channel), reading.kind)
         return self.model._trace(lambda: re_product(value, value)).code
 
     def adc_seed_lines(self) -> list[str]:
@@ -3410,7 +3424,7 @@ class _ControlGenerator:
                  f"    const double dt = t - {self.m('adc_integration_time')};",
                  "    if (dt <= 0.0) return;"]
         for channel in adc.channels:
-            reading = self._adc_reading(channel)
+            reading = self._adc_source(channel)
             lines += [
                 f"    const auto now_{channel} = {reading};",
                 f"    if ({self.m('adc_window_open')}) "
@@ -3434,18 +3448,24 @@ class _ControlGenerator:
         if adc is None:
             return []
         if adc.clocked:
-            interrupt = f"({self.m('adc_clock_index')} * {_number(adc.period)})"
+            interrupt = (f"({_number(adc.sampling_clock.offset)} + "
+                         f"{self.m('adc_clock_index')} * {_number(adc.sample_period)})")
             return [interrupt, *([
                 f"({self.m('adc_window_open')} ? std::numeric_limits<double>::infinity() : "
                 f"{interrupt} - {_number(adc.length)})"
             ] if adc.averaging and not adc._full else [])]
         values: list[str] = []
+        if adc.independent:
+            values.append(
+                f"({_number(adc.sampling_clock.offset)} + {self.m('adc_clock_index')} * "
+                f"{_number(adc.sample_period)})"
+            )
         if adc.averaging and not adc._full:
             values.append(
                 f"({self.m('adc_window_open')} ? std::numeric_limits<double>::infinity() : "
                 f"{self.m('t_interrupt')} - {_number(adc.length)})"
             )
-        if adc.samples > 1:
+        if adc.samples > 1 and not adc.independent:
             values.append(
                 f"({self.m('adc_n_samp')} < {adc.samples} ? "
                 f"{self.m('t_interrupt')} - {_number(self.bridge.period)} + "
@@ -3456,8 +3476,19 @@ class _ControlGenerator:
 
     def _adc_sense_lines(self) -> list[str]:
         adc = self.adc
-        if adc is None or adc.samples == 1:
+        if adc is None or (adc.samples == 1 and not adc.independent):
             return []
+        if adc.independent:
+            interrupt = (f"({_number(adc.sampling_clock.offset)} + "
+                         f"{self.m('adc_clock_index')} * {_number(adc.sample_period)})")
+            return [
+                f"const bool adc_due = std::abs(t - {interrupt}) < time_eps;",
+                "if (adc_due) {",
+                *[f"    {self.m('adc_held_' + channel)} = {self._adc_source(channel)};"
+                  for channel in adc.values],
+                f"    ++{self.m('adc_clock_index')};",
+                "}",
+            ]
         return [
             f"if (!control_due && {self.m('adc_n_samp')} < {adc.samples}) {{",
             f"    const double sample_at = {self.m('t_interrupt')} "
@@ -3479,7 +3510,7 @@ class _ControlGenerator:
                 *[f"    {self.m('adc_acc_' + channel)} = {_literal(adc._zero[channel])};"
                   for channel in adc.channels],
                 f"    {self.m('adc_window_open')} = {'true' if adc._full else 'false'};",
-                f"    {self.m('adc_n_samp')} = 1;",
+                *([f"    {self.m('adc_n_samp')} = 1;"] if not adc.independent else []),
                 "}",
             ]
             if not adc._full:
@@ -3493,7 +3524,7 @@ class _ControlGenerator:
                     f"    {self.m('adc_window_open')} = true;",
                     "}",
                 ]
-        elif adc.samples > 1:
+        elif adc.samples > 1 and not adc.independent:
             lines.append(f"if ({due}) {self.m('adc_n_samp')} = 1;")
         return lines
 
@@ -3554,8 +3585,8 @@ class _ControlGenerator:
                 if isinstance(value, _InitializationExpression):
                     bool(value == value.default)
         t0 = self.p.simulation.initial.t
-        control_index = bridge.index_after(t0)
-        load_index = bridge.index_after(t0, bridge.load_period)
+        control_index = bridge.control_clock.index_after(t0)
+        load_index = bridge.load_clock.index_after(t0)
         q_kind = _CPP_TYPES[_Expression.of(self.topology.zero).kind]
         schedule = ", ".join(
             "{" + _number(at) + ", " + _literal(q) + "}" for at, q in bridge.schedule
@@ -3586,7 +3617,8 @@ class _ControlGenerator:
             f"        {self.m('shadow')}[{self.width}] = {on};",
             *self.modulation.write_sync(self),
             f"        ++{self.m('pwm_k')}; {self.m('t_interrupt')} = "
-            f"{_number(bridge.offset)} + {self.m('pwm_k')} * {_number(bridge.period)};",
+            f"{_number(bridge.control_clock.offset)} + {self.m('pwm_k')} * "
+            f"{_number(bridge.period)};",
         ]
 
     def _pwm_load_lines(self, hold: str, switching: bool, gates: str,
@@ -3594,12 +3626,13 @@ class _ControlGenerator:
         bridge = self.bridge
         return [
             "    if (load_due) {",
-            f"        const double completed = {_number(bridge.offset)} + "
+            f"        const double completed = {_number(bridge.control_clock.offset)} + "
             f"({self.m('pwm_k')} - 1) * {_number(bridge.period)} + "
             f"{_number(bridge.computation)};",
             f"        if (completed <= t + time_eps) {self.m('active')} = {self.m('shadow')};",
             *self._load_modulation(hold, switching),
-            f"        ++{self.m('pwm_j')}; {self.m('t_load')} = {_number(bridge.offset)} + "
+            f"        ++{self.m('pwm_j')}; {self.m('t_load')} = "
+            f"{_number(bridge.load_clock.offset)} + "
             f"{self.m('pwm_j')} * {_number(bridge.load_period)};",
             f"        {self.m('gates')} = {gates};",
             *tail,
@@ -4288,10 +4321,11 @@ class _ElectricalUnitGenerator(_ProtectionGenerator, _ControlGenerator):
         lines = [f"bool sense_{self.tag}(double t) {{"]
         adc = self.adc
         if adc is not None and adc.clocked:
-            interrupt = f"({self.m('adc_clock_index')} * {_number(adc.period)})"
+            interrupt = (f"({_number(adc.sampling_clock.offset)} + "
+                         f"{self.m('adc_clock_index')} * {_number(adc.sample_period)})")
             lines += [f"    const bool adc_due = std::abs(t - {interrupt}) < time_eps;",
                       "    if (adc_due) {",
-                      *[f"        {self.m('adc_held_' + channel)} = {self._adc_value(channel)};"
+                      *[f"        {self.m('adc_held_' + channel)} = {self._adc_conversion(channel)};"
                         for channel in adc.values],
                       f"        ++{self.m('adc_clock_index')};", "    }"]
         lines += self._rms_sample_lines(due="adc_due" if adc is not None and adc.clocked else None)
@@ -4306,8 +4340,9 @@ class _ElectricalUnitGenerator(_ProtectionGenerator, _ControlGenerator):
         lines = [f"bool actuate_{self.tag}(double t) {{", *self._pending_trip_lines()]
         adc = self.adc
         if adc is not None and adc.clocked:
-            interrupt = f"({self.m('adc_clock_index')} * {_number(adc.period)})"
-            lines += [f"const bool adc_due = std::abs(t - ({interrupt} - {_number(adc.period)})) < time_eps;",
+            interrupt = (f"({_number(adc.sampling_clock.offset)} + "
+                         f"{self.m('adc_clock_index')} * {_number(adc.sample_period)})")
+            lines += [f"const bool adc_due = std::abs(t - ({interrupt} - {_number(adc.sample_period)})) < time_eps;",
                       *self._adc_actuate_lines("adc_due", interrupt)]
         return "\n".join([*lines, "return tripped_now;", "}"])
 

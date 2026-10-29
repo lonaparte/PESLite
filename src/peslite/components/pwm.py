@@ -15,8 +15,11 @@ from numpy.typing import NDArray
 from ..control.blocks import abc2complex
 from ..control.profiles import PHASE_SHIFT_MODES, control_type
 from ..solver.model import ConfigError, _integer, _real
+from ..solver.timing import TIME_EPS, PeriodicClock, control_clock_offset, resolve_clock_offset
 
-__all__ = ["PWM", "TIME_EPS", "PhaseClock", "PulseSequence", "SwitchingSequence", "Modulator", "CarrierComparison",
+__all__ = ["PWM", "TIME_EPS", "PeriodicClock", "resolve_clock_offset",
+           "control_clock_offset", "PhaseClock", "PulseSequence", "SwitchingSequence",
+           "Modulator", "CarrierComparison",
            "SynchronousCarrier", "ZOH", "PhaseShiftModulator",
            "phase_shift_level", "carrier", "carrier_position", "MODULATOR_TYPES",
            "make_modulator"]
@@ -81,9 +84,6 @@ class Modulator(Protocol):
 
     def __call__(self, t: float, T: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence: ...
-
-
-TIME_EPS = 1e-10
 
 
 class PulseSequence:
@@ -219,7 +219,8 @@ class PWM:
 
     _NAMES = ("d_a", "d_b", "d_c", "on")
 
-    def __init__(self, period: float, load_period: float, offset: float, computation: float,
+    def __init__(self, period: float, load_period: float, control_offset: float,
+                 load_offset: float, computation: float,
                  carrier_period: float, modulator: Modulator, *,
                  pattern_sync: str = "interval",
                  duty_names: tuple[str, ...] | None = None,
@@ -227,7 +228,9 @@ class PWM:
                  pwm_state: Callable[[Any], Any] | None = None) -> None:
         if not math.isfinite(computation) or computation < 0.0:
             raise ValueError(f"the computation time must be finite and >= 0, got {computation}")
-        self.period, self.load_period, self.offset = _real(period), _real(load_period), _real(offset)
+        self.control_clock = PeriodicClock(_real(period), _real(control_offset))
+        self.load_clock = PeriodicClock(_real(load_period), _real(load_offset))
+        self.period, self.load_period = self.control_clock.period, self.load_clock.period
         self.computation, self.carrier_period = _real(computation), _real(carrier_period)
         self._names = (*duty_names, "on") if duty_names is not None else self._NAMES
         if any(not name or "." in name for name in self._names):
@@ -259,6 +262,14 @@ class PWM:
     def register_names(self) -> tuple[str, ...]:
         return self._names[:-1]
 
+    @property
+    def control_offset(self) -> float:
+        return self.control_clock.offset
+
+    @property
+    def load_offset(self) -> float:
+        return self.load_clock.offset
+
     def phase_clock(self) -> PhaseClock:
         read = getattr(self.modulator, "phase_clock", None)
         if read is not None:
@@ -284,28 +295,23 @@ class PWM:
         )
 
     def interrupt(self, k: int) -> float:
-        return self.offset + k * self.period
+        return self.control_clock.at(k)
 
     def load_time(self, j: int) -> float:
-        return self.offset + j * self.load_period
+        return self.load_clock.at(j)
 
     @property
     def t_next(self) -> float:
         """Next control interrupt (temporary name retained while the run loop is migrated)."""
         return self.t_interrupt
 
-    def after(self, t: float, period: Optional[float] = None) -> int:
-        """Index of the first timer point after ``t``; a point at ``t`` is not after it."""
-        return int(self.index_after(t, period))
-
-    def index_after(self, t: float, period: Optional[float] = None):
-        """Scalar timer-index equation shared by initialization and standalone execution."""
-        T = self.period if period is None else period
-        return np.floor((t - self.offset + TIME_EPS) / T) + 1
+    def after(self, t: float) -> int:
+        """Index of the first control interrupt after ``t``."""
+        return int(self.control_clock.index_after(t))
 
     def count(self, t_a: float, t_b: float) -> int:
         """Number of control interrupts in ``[t_a, t_b]``, including both ends."""
-        first = math.ceil((t_a - self.offset - TIME_EPS) / self.period)
+        first = math.ceil((t_a - self.control_clock.offset - TIME_EPS) / self.period)
         return max(0, self.after(t_b) - first)
 
     def describe(self) -> str:
@@ -352,7 +358,8 @@ class PWM:
 
     def start(self, t: float, sync: tuple[float | None, float | None], continued: bool):
         """Resume the timer and switching sequence at ``t`` after named states were loaded."""
-        self.k, self.j = self.after(t), self.after(t, self.load_period)
+        self.k = int(self.control_clock.index_after(t))
+        self.j = int(self.load_clock.index_after(t))
         self.t_interrupt, self.t_load = self.interrupt(self.k), self.load_time(self.j)
         last = self.interrupt(self.k - 1)
         self.sync, self.t_sync = sync, min(last, t)

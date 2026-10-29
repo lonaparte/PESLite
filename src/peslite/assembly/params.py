@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
 
 from ..components.network import ELEMENT_TYPES, element_buses
+from ..solver.timing import control_clock_offset, resolve_clock_offset
 from ..control.loops import LOOP_TYPES, loop_key_type, loop_type
 from ..control.profiles import ReferenceParams, control_type
 from ..solver.model import ConfigError
@@ -437,8 +438,13 @@ class MeasurementParams:
     average: list[str] = field(default_factory=list)
     window: Optional[float] = None  # s; default: the control period
     period: Optional[float] = None  # s; default: the control period
+    offset: Optional[float] = None  # s; default: the controller clock offset
     sources: dict[str, str] = field(default_factory=dict)  # channel -> physical output name
     rms: dict[str, float] = field(default_factory=dict)  # channel -> window duration (s)
+
+    def clock_offset(self, control_offset: float, period: float) -> float:
+        """Return the ADC clock offset, inheriting the controller grid when omitted."""
+        return resolve_clock_offset(period, self.offset, control_offset)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -457,11 +463,16 @@ class ControlParams:
 
     type: str
     period: Optional[float] = None  # s; default: one carrier period
+    offset: Optional[float] = None  # s; default: the PWM load-clock offset
     computation: Optional[float] = None  # s; sampled default 1 us; ignored by continuous averaging
     loops: dict[str, Any] = field(metadata={"entries": "loop"})
     connections: dict = field(default_factory=dict)
     outputs: dict = field(default_factory=dict)
     references: Any = None  # built from the schema selected by type
+
+    def clock_offset(self, pwm: PWMParams) -> float:
+        """Return the control-clock offset, inheriting the PWM load grid when omitted."""
+        return control_clock_offset(self, pwm)
 
 
 @dataclass(frozen=True)

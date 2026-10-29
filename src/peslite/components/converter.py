@@ -15,6 +15,7 @@ from numpy.typing import NDArray
 from ..control.blocks import A120, phases, smoothstep
 from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, ConfigError, Empty, LocatedZero, OutputMethod, _real
+from ..solver.timing import control_clock_offset
 from .network import RCNode, Terminal, _extend_record
 from .pwm import TIME_EPS, CarrierComparison, Modulator, PWM, ZOH, make_unit_modulator
 
@@ -417,7 +418,8 @@ class _SampledModel(_BridgeModel, PWM):
     def zoh_connections(self, label: str) -> dict:
         return {(self, "q"): label}
 
-    def __init__(self, period: float, load_period: float, offset: float, computation: float,
+    def __init__(self, period: float, load_period: float, control_offset: float,
+                 load_offset: float, computation: float,
                  carrier_period: float, modulator: Modulator, topology=None, *,
                  pattern_sync: str = "interval",
                  parallel_capacitance: float = 0.0, on_resistance: float = 0.0) -> None:
@@ -431,7 +433,8 @@ class _SampledModel(_BridgeModel, PWM):
             self,
             period,
             load_period,
-            offset,
+            control_offset,
+            load_offset,
             computation,
             carrier_period,
             modulator,
@@ -557,8 +560,9 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None) -> 
             raise ValueError("an averaging bridge does not use a PWM modulator")
         return AveragingModel(topology, **impedance)
     model_type = SwitchingModel if cfg.bridge.model == "switching" else PWMAveragingModel
+    control_offset = control_clock_offset(cfg.ctrl, pwm)
     return model_type(
-        cfg.ctrl.period, pwm.load_period, pwm.grid_offset, cfg.ctrl.computation,
+        cfg.ctrl.period, pwm.load_period, control_offset, pwm.grid_offset, cfg.ctrl.computation,
         pwm.switching_period,
         modulator if modulator is not None else make_unit_modulator(cfg),
         topology,

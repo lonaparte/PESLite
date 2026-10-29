@@ -52,6 +52,7 @@ def _graph(*, continuous=False):
         loops=loops,
         references=_References(),
         period=period,
+        offset=None,
         connections={},
         outputs={},
     )

@@ -107,10 +107,15 @@ def _timing(c, pwm, where: str, continuous: bool = False) -> None:
             raise ConfigError(
                 f"{where}.computation must be finite and nonnegative, got {c.computation}"
             )
+        if c.offset is not None and (not math.isfinite(c.offset) or c.offset < 0.0):
+            raise ConfigError(f"{where}.offset must be finite and nonnegative, got {c.offset}")
         return
     T_c = _period(c, pwm)
     if not math.isfinite(T_c) or T_c <= 0.0:
         raise ConfigError(f"{where}.period must be finite and positive, got {T_c}")
+    offset = c.clock_offset(pwm)
+    if not math.isfinite(offset) or not 0.0 <= offset < T_c:
+        raise ConfigError(f"{where}.offset must be in [0, ctrl.period), got {offset}")
     half = pwm.switching_period / 2.0
     if not _whole(T_c / half):
         raise ConfigError(f"{where}.period = {T_c:.6g} s is not a multiple of half the carrier period "
@@ -186,8 +191,15 @@ def _measurement(m, T_c: Optional[float], where: str,
         value = getattr(m, key)
         if value is not None and (not math.isfinite(value) or value <= 0.0):
             raise ConfigError(f"{where}.{key} must be finite and positive, got {value}")
+    if m.offset is not None and (not math.isfinite(m.offset) or m.offset < 0.0):
+        raise ConfigError(f"{where}.offset must be finite and nonnegative, got {m.offset}")
     if T_c is None:
         return
+    sample_period = T_c if m.period is None else m.period
+    if m.offset is not None and m.offset >= sample_period:
+        raise ConfigError(
+            f"{where}.offset must be below the ADC period {sample_period:.6g} s, got {m.offset}"
+        )
     for key in ("period", "window"):
         value = getattr(m, key)
         if value is None:
@@ -536,8 +548,9 @@ def _initial(p: Params) -> None:
                         for key in p.simulation.initial.states)
         if not continued or m.period is None or m.period >= T_c * (1.0 - 1e-9):
             continue
-        k = round((t0 - u.pwm.grid_offset) / T_c)
-        if abs(u.pwm.grid_offset + k * T_c - t0) > 1e-10:
+        offset = u.ctrl.clock_offset(u.pwm)
+        k = round((t0 - offset) / T_c)
+        if abs(offset + k * T_c - t0) > 1e-10:
             raise ConfigError(f"simulation.initial.t = {t0} is between two control interrupts of {name!r}, "
                               f"whose oversampled ADC (units.{name}.meas.period) took samples before it "
                               f"that are not states: continue from an interrupt")
