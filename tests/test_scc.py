@@ -243,8 +243,10 @@ def _commanded(t_end):
     return tree
 
 
-def test_commanded_angle_takes_the_register_path_and_continues(tmp_path):
+@pytest.mark.parametrize("drive", ["common", "alternating"])
+def test_commanded_angle_takes_the_register_path_and_continues(drive, tmp_path):
     whole = _commanded(0.3e-3)
+    whole["units"]["charger"]["link"]["primary_scc"]["drive"] = drive
     simulation = peslite.Simulation(from_dict(copy.deepcopy(whole)))
     names = set(simulation._states.read())
     assert {"charger.primary.pwm.scc_angle", "charger.primary.pwm.shadow.scc_angle"} <= names

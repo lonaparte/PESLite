@@ -457,7 +457,7 @@ class MultirateSolver:
         k = self.model.rhs_group(t, y, self.system)
         self._note_rate(k)
         if self.outer is not None and weight != 0.0:
-            self.model.run_plan(t, self.outer.feed)
+            self.outer.run_feed(t)
             for _kind, (dst_inp, dst_name, _s, _n, _f) in self.outer.inputs:
                 key = (id(dst_inp), dst_name)
                 value = getattr(dst_inp, dst_name)

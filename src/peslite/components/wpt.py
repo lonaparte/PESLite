@@ -539,7 +539,9 @@ class SwitchControlledCapacitor:
         return self.sync == "current" or (self.on and self.gates[0] != self.gates[1])
 
     def _flow(self, current) -> float:
-        return self.zero.sign if abs(current) <= _CURRENT_TOL and self.zero.sign else current
+        return (self.zero.sign
+                if self.zero.sign and abs(self.zero.offset(current)) <= _CURRENT_TOL
+                else current)
 
     def margin(self, t: float, current: float, voltage: float) -> float:
         if not self.started or self.gates != self._gate_state(t):

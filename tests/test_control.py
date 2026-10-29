@@ -238,6 +238,39 @@ def test_control_graph_has_one_typed_boundary_for_inputs_and_outputs(gfl):
         assert graph.nodes[owner].outputs[source_port] == CONTROL_INTERFACE.outputs[port]
 
 
+@pytest.mark.parametrize("model", ["pwm_averaging", "averaging"])
+def test_reference_changes_rewire_graph_outputs_and_frame(gfl, model):
+    params = gfl(**{"units.vsc.bridge.model": model})
+    loops = {
+        name: loop
+        for name, loop in params.unit("vsc").ctrl.loops.items()
+        if name != "SRFPLL"
+    }
+    params = params.replace(**{"units.vsc.ctrl.loops": loops})
+    cfg = params.unit("vsc")
+    controller = peslite.VSCController(cfg)
+    moved = params.replace(**{
+        "units.vsc.ctrl.references.theta": 0.5,
+        "units.vsc.ctrl.references.omega": 300.0,
+    })
+
+    controller.retune(
+        moved.unit("vsc"),
+        ["ctrl.references.theta", "ctrl.references.omega"],
+        0.0,
+    )
+    if controller.continuous:
+        controller.inp.u_g = cfg.base.v_phase_peak + 0j
+        controller.set_outputs(0.0)
+    else:
+        controller(0.0, Measurement(
+            0.0, cfg.base.v_phase_peak + 0j, 0j, cfg.dclink.vdc_ref, np.zeros(3),
+        ))
+
+    assert (controller.theta, controller.command_theta, controller.omega) == (0.5, 0.5, 300.0)
+    assert controller.v_dq == pytest.approx(np.exp(-0.5j))
+
+
 def test_control_ports_have_the_canonical_signal_types():
     signals = (I_AB, V_AB, I_DQ, V_DQ, I, V, ANGLE, FREQUENCY, POWER)
 

@@ -618,11 +618,9 @@ class ControlGraph:
             else:  # ControlInterface is a package-owned declaration, not user input.
                 raise RuntimeError(f"unknown controller input owner {owner!r}")
         self._wiring = {}
-        self._port_source = {}
         for name, node in self.nodes.items():
             wiring = tuple((port,) + self._resolve(self.connections[f"{name}.{port}"]) for port in node.inputs)
             self._wiring[name] = wiring
-            self._port_source[name] = {w[0]: w[1:] for w in wiring}
         self._output_source = {port: self._resolve(source) for port, source in self.outputs.items()}
 
     def _prepare_flow(self):
@@ -857,10 +855,6 @@ class ControlGraph:
         """Clear every loop's explicitly declared error integrator."""
         for node in self.nodes.values():
             node.reset_integrator()
-
-    def input(self, name, port, meas):
-        """Return the input ``port`` of the loop ``name`` for the pu measurement ``meas``."""
-        return self._read(*self._port_source[name][port], meas)
 
     def sample(self, t, meas, finalize=None):
         """Run the loops due at ``t`` on the pu measurement ``meas``; return their names.
@@ -1264,15 +1258,12 @@ class VSCController(_GraphRuntime):
         self._frame_key = f"{graph.outputs['theta'].partition('.')[0]}.frame"
         self._dc, self._sync = first("dc_voltage"), first("sync")
         self._frame_cc, self._log_cc = first("current", "frame"), first("current", "id_ref")
-        self._theta_source = graph._output_source["theta"]
-        self._omega_source = graph._output_source["omega"]
-        self._command_source = graph._output_source["u_dq"]
         # dq frame of the logged signals, as a graph path that C++ export lowers unchanged: the
-        # current loop's frame input, else the angle the theta loop used for its latest update
+        # current loop's frame input, else the angle the theta loop used for its latest update.
+        # Resolve it when read so reference changes use the same wiring as graph inputs and outputs.
         self._frame_path = (graph.connections[f"{self._frame_cc}.frame"] if self._frame_cc is not None
                             else self._frame_key if self._frame_key in graph.values
                             else graph.outputs["theta"])
-        self._frame_source = graph._resolve(self._frame_path)
         self._is_gfl = profile.grid_following
         if self._is_gfl:
             mode_log_sources = (
@@ -1366,8 +1357,8 @@ class VSCController(_GraphRuntime):
         return self.graph.describe()
 
     def initial_sync(self):
-        values = {**self.graph.values, **{f"references.{k}": v for k, v in self.graph.references.items()}}
-        return _real(values[self.graph.outputs["theta"]]), _real(values[self.graph.outputs["omega"]])
+        graph = self.graph
+        return _real(graph.output("theta", None)), _real(graph.output("omega", None))
 
     def track(self, meas):
         """Pre-synchronise grid-forming laws to an SI terminal sample."""
@@ -1464,8 +1455,9 @@ class VSCController(_GraphRuntime):
             self._terminal_limit.limit = (
                 self._terminal_limit_scale * max(0.0, control_meas.u_dc)
             )
-        self.graph.sample(t, control_meas, finalize=self._accept_command)
-        frame = self.graph._read(*self._frame_source, control_meas)
+        graph = self.graph
+        graph.sample(t, control_meas, finalize=self._accept_command)
+        frame = graph._read(*graph._resolve(self._frame_path), control_meas)
         rot = cmath.exp(-1j * frame)
         self.v_dq, self.i_dq = control_meas.u_g * rot, control_meas.i_c * rot
         gates = startup.active
@@ -1516,11 +1508,12 @@ class VSCController(_GraphRuntime):
         self.graph.flow(t, meas, only=only, derivatives=derivatives)
         self._algebraic_first = False
         graph = self.graph
-        self.theta = float(graph._read(*self._theta_source, meas))
-        self.omega = float(graph._read(*self._omega_source, meas))
-        self.u_cmd = complex(graph._read(*self._command_source, meas))
+        read, source = graph._read, graph._output_source
+        self.theta = float(read(*source["theta"], meas))
+        self.omega = float(read(*source["omega"], meas))
+        self.u_cmd = complex(read(*source["u_dq"], meas))
         self.command_theta = self.theta
-        frame = graph._read(*self._frame_source, meas)
+        frame = read(*graph._resolve(self._frame_path), meas)
         command_rot = complex(math.cos(self.command_theta), math.sin(self.command_theta))
         into_frame = (command_rot.conjugate() if frame == self.command_theta
                       else cmath.exp(-1j * frame))

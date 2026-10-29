@@ -1416,10 +1416,13 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
     return obj
 
 
+_type_hints = functools.cache(get_type_hints)
+
+
 def _build_fields(cls, data: dict, path: str, base: Any, scales: Optional[dict],
                   *, names: Optional[frozenset[str]] = None) -> dict:
     """Parse selected dataclass fields through the same rules as an ordinary section."""
-    hints = get_type_hints(cls)
+    hints = _type_hints(cls)
     selected = tuple(f for f in fields(cls) if f.init and (names is None or f.name in names))
     known = {f.name for f in selected}
     unknown = set(data) - known
