@@ -140,6 +140,9 @@ ADC oversample count or RMS/ROCOF history size requires a new export. Parameter 
 checked initialization branches come from the ordinary schemas and constructors. Invalid values
 and changes outside the compiled specialization fail before simulation output is created.
 Clock changes that would alter an already initialized switching-edge sequence also require a new export.
+The generated schedule uses the same PWM-load, controller and ADC period-and-offset clocks as
+Python. Changing an exported offset across the aligned/independent ADC boundary changes held-state
+layout and is therefore rejected by the same structural-specialization guard.
 
 Runtime values are stored as direct typed fields. Component construction is recorded during export
 and replayed with parameter expressions, reusing the normal numerical initialization rather than

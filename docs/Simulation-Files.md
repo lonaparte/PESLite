@@ -288,6 +288,11 @@ Selecting `switching`, `pwm_averaging` or `averaging` changes controlled bridges
 solver preset, but it does not replace this controllerless bridge's natural-conduction equations.
 `meas` may configure independent sampling, means, RMS and existing physical sources; its
 `period` defaults to the output period when there is no controller.
+For a sampled controlled Unit, `meas.offset` selects the ADC clock position in seconds and defaults
+to the controller clock position. `ctrl.offset` selects the controller clock position and defaults
+to the PWM load-clock position. Both offsets must lie within their respective periods. An explicit
+ADC offset that is not aligned with the controller creates an independent conversion grid; control
+uses the latest held conversion. See [Control and PWM Timing](Control-and-PWM-Timing.md).
 Optional `bridge.parallel_capacitance` (F) models the equivalent port capacitance and requires
 positive `bridge.on_resistance` (ohm per device). These fields apply to all bridge structures;
 the device law, capacitor and ordinary DC-network connections determine the charging current.

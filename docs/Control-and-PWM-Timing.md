@@ -9,7 +9,8 @@ that schedule with continuous controller equations; see
 At one controller interrupt, PESLite performs these operations in order:
 
 1. finish the integration interval exactly at the interrupt;
-2. read instantaneous ADC channels and close any configured averaging windows;
+2. read instantaneous ADC channels, or consume the latest held conversion from an independent
+   ADC clock, and close any configured averaging windows;
 3. update the control loops due at this interrupt;
 4. evaluate sampled protection from the same measurement;
 5. make the controller command eligible after `ctrl.computation`;
@@ -23,6 +24,10 @@ converter access to another converter's newly updated output.
 
 For sampled bridges, `units.<u>.ctrl.period` defaults to one switching period. It must be a whole
 multiple of half a carrier period because interrupts are tied to carrier valleys or peaks.
+`ctrl.offset` is the first clock position in seconds within one control period. It defaults to the
+PWM load-clock position, so existing files retain the carrier-aligned schedule. Setting it
+explicitly moves controller interrupts without moving PWM register loads; both schedules use the
+same period-and-offset clock representation.
 
 Individual loops may run more slowly:
 
@@ -77,6 +82,14 @@ meas:
 the control period and cannot exceed it. Window integrals and their latest quadrature anchors are
 named states so a saved run can restore an open window; the individual intermediate conversions
 are not persisted.
+
+`meas.offset` is the ADC conversion-clock position in seconds within one `meas.period`. When it is
+omitted, the ADC grid contains every controller interrupt and preserves the existing direct-sample
+path. An explicit offset may place conversions between controller interrupts. In that case the ADC
+runs on its own periodic grid and the controller consumes the most recent held conversion. If a
+conversion and controller interrupt coincide, conversion occurs first. This held value is a named
+restart state. Ideal continuous averaging has no sampled controller/ADC schedule, so these offsets
+do not affect it.
 
 Sampled-converter ADC windows integrate on physical event boundaries, including configured ADC
 conversions, control interrupts, PWM edges and file events; output snapshots do not add ADC
