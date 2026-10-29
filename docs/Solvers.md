@@ -80,14 +80,15 @@ Before a run, `simulation.energy_check` controls validation of component energy 
 
 - `warn`: report structural or balance problems and continue;
 - `strict`: reject a problematic model;
-- `off`: skip the check.
+- `off`: skip the check and its structure report (no `ph_*` entries in `summary.json`).
 
 During a run, `simulation.solver.phs_check_step` sets the number of output snapshots between energy
 audits. It defaults to 1000 and is intended as an internal performance/diagnostic control rather
 than a primary model setting.
 
-`--ph-report` prints the assembled port-Hamiltonian structure without running. Solver counts,
-rejected adaptive steps and multirate interface indicators are written to `summary.json`.
+`--ph-report` prints the assembled port-Hamiltonian structure without running, including when the
+configuration sets `energy_check: off`. Solver counts, rejected adaptive steps and multirate
+interface indicators are written to `summary.json`.
 
 ## Selection guidance
 

@@ -388,7 +388,8 @@ class _Expression:
         if (pool is not None and kind != "bool" and len(code) > 48 and "/" not in code
                 and any(char in code for char in "(+-*?{")):
             calls = set(re.findall(r"([A-Za-z_]\w*(?:::\w+)*)\s*\(", code))
-            if calls <= {"std::real", "std::imag", "std::conj", "std::abs", "std::min", "std::max"}:
+            if calls <= {"std::real", "std::imag", "std::conj", "std::abs", "std::min", "std::max",
+                         "std::exp", "std::sin", "std::cos"}:
                 prefix, terms, runtime = pool
                 conditional = _CONDITIONAL_DEPENDENCIES.get()
                 pure_parameter = (conditional is not None
@@ -2191,16 +2192,8 @@ class _ModelGenerator:
             add(f"{name}.i", self.value(source.branch.out, "i"), "complex")
             add(f"{name}.angle", self.value(source.emf.out, "phi"), "real")
         for name, unit in self.system.units.items():
-            if getattr(unit, "branch_f", None) is not None and hasattr(unit, "dclink"):
-                add(f"{name}.i_c", self.value(unit.branch_f.out, "i"),
-                    self.record_types[id(unit.branch_f.out), "i"])
-                add(f"{name}.u_g", self.value(unit.bus.out, "u"),
-                    self.record_types[id(unit.bus.out), "u"])
-                add(f"{name}.u_dc", self.value(unit.dclink.out, "u_dc"), "real")
-                add(f"{name}.i_dc", self.value(unit.dclink.inp, "i_dc"), "real")
-            else:
-                for signal, value in self.trace_element_signals(unit).items():
-                    add(signal, value.code, value.kind)
+            for signal, value in self.trace_element_signals(unit).items():
+                add(signal, value.code, value.kind)
             if hasattr(unit.ctrl, "log_sources"):
                 for port, value in self.unit_control_inputs(unit).items():
                     add(f"{name}.ctrl.{port}", value.code, value.kind)
@@ -3098,7 +3091,8 @@ class _ControlGenerator:
         return tuple(self.model._trace(run)), carried, internal_limit, external_limit
 
     def _loop_lines(self, loop_name: str, node: Any) -> list[str]:
-        values, carried, internal_limit, external_limit = self._trace_loop(loop_name, node)
+        with self.model._shared_terms() as (prefix, terms):
+            values, carried, internal_limit, external_limit = self._trace_loop(loop_name, node)
         targets = [self.g(loop_name + '.' + port) for port in node.outputs]
         state_names = tuple(node.flow_state() if self.continuous else node.get_state())
         targets += [self.d(loop_name, local) if self.continuous else self._state(loop_name, local)
@@ -3108,7 +3102,8 @@ class _ControlGenerator:
             targets.append(self.node(loop_name, "limit_exceeded"))
         if external_limit:
             targets.append(self.m('command_saturated'))
-        lines = self._assign_values(f"value_{loop_name}", zip(targets, values, strict=True))
+        lines = self.model._term_declarations(prefix, terms, self._assign_values(
+            f"value_{loop_name}", zip(targets, values, strict=True)))
         if self.continuous:
             return lines
         guard = self._sampled_due(loop_name)
@@ -3617,8 +3612,7 @@ class _ControlGenerator:
             f"        {self.m('shadow')}[{self.width}] = {on};",
             *self.modulation.write_sync(self),
             f"        ++{self.m('pwm_k')}; {self.m('t_interrupt')} = "
-            f"{_number(bridge.control_clock.offset)} + {self.m('pwm_k')} * "
-            f"{_number(bridge.period)};",
+            f"{_number(bridge.interrupt(_Expression(self.m('pwm_k'), 'real')))};",
         ]
 
     def _pwm_load_lines(self, hold: str, switching: bool, gates: str,
@@ -3626,14 +3620,12 @@ class _ControlGenerator:
         bridge = self.bridge
         return [
             "    if (load_due) {",
-            f"        const double completed = {_number(bridge.control_clock.offset)} + "
-            f"({self.m('pwm_k')} - 1) * {_number(bridge.period)} + "
-            f"{_number(bridge.computation)};",
+            f"        const double completed = "
+            f"{_number(bridge.interrupt(_Expression(self.m('pwm_k'), 'real') - 1) + bridge.computation)};",
             f"        if (completed <= t + time_eps) {self.m('active')} = {self.m('shadow')};",
             *self._load_modulation(hold, switching),
             f"        ++{self.m('pwm_j')}; {self.m('t_load')} = "
-            f"{_number(bridge.load_clock.offset)} + "
-            f"{self.m('pwm_j')} * {_number(bridge.load_period)};",
+            f"{_number(bridge.load_time(_Expression(self.m('pwm_j'), 'real')))};",
             f"        {self.m('gates')} = {gates};",
             *tail,
             "    }",

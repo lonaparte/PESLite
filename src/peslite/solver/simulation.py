@@ -559,10 +559,10 @@ class Simulation:
         return rating
 
     def _check_energy(self) -> None:
-        """Build the structure report and apply ``simulation.energy_check`` (warn, strict or off)."""
+        """Build and check the energy structure unless ``simulation.energy_check`` is off."""
         mode = self.p.simulation.energy_check
         model = getattr(self.system, "model", None)
-        if model is None or not hasattr(model, "ph_report"):
+        if mode == "off" or model is None or not hasattr(model, "ph_report"):
             return
         solver = self.solver
         groups = getattr(solver, "groups", None)
@@ -592,8 +592,6 @@ class Simulation:
                             + "; ".join(f"{c.group} {c.members} holds {c.unaccounted}" for c in bad_cuts))
         problems += report.warnings
         self.energy_problems = problems
-        if mode == "off":
-            return
         if problems and mode == "strict":
             raise ConfigError("energy check: " + "; ".join(problems))
         for msg in problems:
@@ -1121,8 +1119,17 @@ class Simulation:
                                               f"64 of the longest, so the loop has no period to linearise: "
                                               f"no bound")
                 else:
+                    table = records.states_table
+                    state_rows = (
+                        np.atleast_1d(read_csv(table.path))
+                        if table is not None and table.n_rows else None
+                    )
+                    state_columns = (
+                        {name: state_rows[name] for name in state_rows.dtype.names}
+                        if state_rows is not None else {}
+                    )
                     summary.update(split_error_bound(
-                        solver, loop, records.t, records.states, p.simulation.solver.linearisations,
+                        solver, loop, records.t, state_columns, p.simulation.solver.linearisations,
                         labels=mdl.state_labels(), prefix=""))
             else:  # parts given as instances
                 summary["split_bound"] = ("the loop has custom parts given as instances, so it cannot be "
@@ -1468,7 +1475,8 @@ def main(argv=None) -> int:
     ap.add_argument("--list-states", action="store_true",
                     help="print the state names generated for this configuration and exit")
     ap.add_argument("--ph-report", action="store_true",
-                    help="print the port-Hamiltonian structure report of the system (always built) and exit")
+                    help="print the port-Hamiltonian structure report of the system and exit "
+                         "(built also with simulation.energy_check: off)")
     ap.add_argument("--report", action="store_true",
                     help="generate <simulation name>_report.json using the optional analysis addon")
     ap.add_argument("--resolved", action="store_true",
@@ -1556,6 +1564,8 @@ def main(argv=None) -> int:
     if args.resolved:
         print(dumps(p), end="")
         return 0
+    if args.ph_report and p.simulation.energy_check == "off":
+        p = p.replace(**{"simulation.energy_check": "warn"})
     sim = Simulation(p)
     if args.list_states:
         print("\n".join(sim.state_names()))
