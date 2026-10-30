@@ -5,8 +5,7 @@
 - Added single-phase AC network sources through ordinary scalar power ports and assembly-time
   electrical-domain constraints on inherently AC or DC terminals. Also made ADC window integration
   follow the configured physical sampling grid, and added open-loop duty control, the traceable
-  `ModeSequence` add-on and an energy-closure
-  helper, with runnable Buck and WPT examples.
+  `ModeSequence` add-on and an energy-closure helper, with runnable Buck and WPT examples.
 - Discovered retained C++ parameters from the ordinary schemas and recorded component construction,
   removing the separate small device-parameter whitelist. Numerical physical/control parameters,
   derived defaults, initialization and energy coefficients now share their normal parameter paths;
@@ -40,6 +39,7 @@
   preserving the shared limiter and PI anti-windup without angle wrapping.
 - Aligned C++ reference changes with actual event actions and refreshed continuous measurement logs
   after model synchronization, including open-loop controllers with non-loading measurement inputs.
+- `peslite --help` names the bundled `gfl-example` as the case run without an argument.
 - Added an open `DCConverter` unit using the shared `UnitParams`, control graph, bridge simulation
   forms and solver infrastructure, with Buck, Boost and single-inductor Buck-Boost examples.
 - Added `HalfBridge` and `FullBridge` topologies and composed them with switching, PWM-period
@@ -61,9 +61,13 @@
   subsystem's own states are written back. Margins are checked every fixed step or adaptive
   `max_step` (which must then be finite). A Zeno guard rejects endless commutation at one
   instant; windowed multirate groups and Imperix hardware export reject commutating models.
+- A multirate group rejects different ratios: all fast subsystems share one substep ratio and all
+  windowed subsystems one window ratio, instead of silently using the finest substep and the
+  shortest window.
 - Added diode full-bridge rectifiers (`upper_controlled: 0`, `lower_controlled: 0`) without
   controller or PWM. A blocked bridge applies its connected terminal's hold voltage, so discontinuous
-  conduction follows from the circuit; optional `parallel_capacitance` needs a stiff DC side.
+  conduction follows from the circuit; optional `parallel_capacitance` requires positive
+  `on_resistance`.
   Diode full-bridge rectifiers accept no protection criterion and must be an explicit `full_bridge`.
   Independent means/RMS measurements reuse the ADC without constructing a controller.
   A controlled bridge with blocked gates still applies its zero state and now reports it.
@@ -87,6 +91,17 @@
 - Completed standalone C++ lowering of generic commutations, component state projections and
   controllerless Units, including independent ADCs, restart state, diagnostics and discharge loss.
   Auxiliary scalar control outputs use the ordinary register path across modulation types.
+- Added the experimental Imperix ELF exporter with explicit ADC/PWM bindings and optional builds
+  through the configured official SDK.
+- Added the optional small-signal stability addon and `--report`, which writes a
+  `small_signal_stability` section to `<name>_report.json`.
+- Added `ctrl.offset` and `meas.offset`; an independently clocked ADC holds a restartable sample.
+- Bound events to explicit writable variables, including `<section>.<object>.connected`; `connect`
+  and `disconnect` are shorthand for those commands.
+- Custom events declare writes through `variables(event, params)`; `apply()` is rejected.
+- Names need only be unique within their top-level section, while event targets remain unambiguous.
+- Imperix export rejects an explicit `ctrl.offset` or `meas.offset`: hardware timing comes from
+  the binding file's `sampling_phase` on the CLK0 grid.
 
 ## 0.3.0
 

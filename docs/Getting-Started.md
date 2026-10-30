@@ -21,8 +21,7 @@ Check the command-line interface:
 peslite --help
 ```
 
-PESLite requires Python 3.10 or newer. Simulation files are YAML text; `.pes` is the conventional
-extension, but the parser does not require it.
+PESLite requires Python 3.10 or newer.
 
 ## Run the first case
 
@@ -40,8 +39,7 @@ output/gfl-example/
 └── simulation.pes
 ```
 
-Additional signal or energy CSV files appear only when enabled by the configuration. PESLite
-streams enabled histories directly to these files instead of retaining the complete run in RAM.
+Signal and energy files appear only when enabled ([Output and Results](Output-and-Results.md#files)).
 
 `simulation.pes` is the complete configuration actually used after defaults, derived values,
 presets and command-line overrides. It can be run again directly:
@@ -67,12 +65,8 @@ peslite gfl-example \
   --out output/short-run
 ```
 
-The priority is:
-
-1. explicit `--set` values;
-2. a command preset such as `--averaging`;
-3. values in the simulation file;
-4. PESLite defaults.
+`--set` values take priority over presets and file values
+([CLI Reference](CLI-Reference.md#override-parameters)).
 
 Use `--progress SECONDS` to print progress and `--watch NAME` to include a state or output value:
 
@@ -88,18 +82,8 @@ The quickest starting point is a resolved bundled example:
 peslite gfl-example --resolved > my-case.pes
 ```
 
-Edit `my-case.pes`, then run it with `peslite my-case.pes`. A file is organized into these
-top-level sections:
-
-| Section | Purpose |
-|---|---|
-| `base` | System power, voltage and frequency base. |
-| `buses`, `branches`, `sources` | Network and grid source. |
-| `units` | Converter hardware, controller and protection. |
-| `elements` | Optional registered loads or custom circuit elements. |
-| `events` | Timed connect, disconnect and parameter-change operations. |
-| `simulation` | End time, solver, initial values, output and progress. |
-| `meta` | Optional title and description; does not affect the run. |
+Edit `my-case.pes`, then run it with `peslite my-case.pes`; its sections are listed in
+[Simulation Files](Simulation-Files.md#top-level-structure).
 
 A `.pes` file may optionally use a sibling `PESaddons/` directory for project-local extensions.
 The simulation file, extension paths and local output layout are described together in
@@ -141,8 +125,8 @@ simulation:
   output: {record_every: 10}
 ```
 
-Names without a suffix are SI quantities. Names ending in `_pu` are per-unit quantities, times are
-seconds, angles are radians and switches are written as `0` or `1`.
+Names without a suffix are SI quantities and names ending in `_pu` are per-unit quantities; see
+[Units and per-unit values](Simulation-Files.md#units-and-per-unit-values).
 
 ## Choose a bridge model
 
@@ -171,8 +155,7 @@ print(result.final_states())
 u_dc = result.states["vsc.dclink.u_C"]
 ```
 
-`Simulation.run()` uses `output/run` by default. `result.states`, `result.plant` and `result.ctrl`
-load their final CSV data when accessed.
+See [Output and Results](Output-and-Results.md#python-result-api) for the result object.
 
 ## Next steps
 

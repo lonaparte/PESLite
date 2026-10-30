@@ -31,13 +31,15 @@ Register a control-loop class with `register_loop_type`:
 
 ```python
 from dataclasses import dataclass
+from typing import Optional
+
 from peslite.addons.control import SyncLaw, register_loop_type
 
 @register_loop_type
 class LaggedSync(SyncLaw):
     @dataclass(frozen=True, kw_only=True)
     class Params:
-        period: float
+        period: Optional[float] = None
         k_p_pu: float
         tau: float
         type: str = "lagged_sync"
@@ -72,11 +74,11 @@ under `units.<u>.ctrl.loops` exactly like a built-in loop:
 
 ```yaml
 loops:
-  LaggedPSC: {k_p_pu: 6.2832, tau: 0.02}
+  LaggedSync: {k_p_pu: 6.2832, tau: 0.02}
 ```
 
-When one graph needs the same class more than once, append a graph-local label without adding a
-second type selector, for example `Observer[voltage]` and `Observer[current]`.
+Repeated uses of one class follow the loop naming rules in
+[Simulation Files](Simulation-Files.md#converter-section).
 
 A specialized loop may expose separate sampled and continuous-flow laws. When its dynamics can be
 built from the standard blocks, define one `equation()` instead: the graph supplies its inputs,
@@ -125,7 +127,8 @@ An element class registered by `register_element_type` owns:
 - `connections()` for its internal and auxiliary signal wiring;
 - `terminals()` binding each configured bus to an electrical `Terminal`;
 - optional `signals()` returning namespaced scalar or complex values for `plant.csv`;
-- optional `connect()`, `disconnect()` or `retune()` behavior.
+- optional `breakers` or `connect(on, t, ramp)` for connection events, plus `retune(cfg)` for
+  `set` events.
 
 ```python
 from peslite.addons.components import Element, Terminal, register_element_type
@@ -268,14 +271,6 @@ startup status; it should not directly open breakers or mutate the system.
 
 ## C++ export
 
-Pure numerical custom subsystems with a fixed `state`/`inp`/`out` layout have an automatic C++
-fallback. During export, PESLite symbolically traces their scalar `set_outputs()` and `rhs()`
-equations, specialises configuration branches and fixed loops, and emits static C++. The cable
-add-on is exported through this fallback; it does not carry a second handwritten C++ equation.
-Built-in modules still use dedicated lowering, which covers their complete event and timing
-semantics and gives the generator more opportunities for deliberate optimisation.
-
-The fallback does not embed Python in the binary. Dynamic Python behavior outside a pure numerical
-equation—such as I/O, reflection, changing the state layout or an unsupported library call—is
-rejected. Custom loops, events and modulators that alter discrete scheduling still need explicit
-backend support rather than being approximated.
+Custom and built-in components use the same equation tracing; see
+[What is specialized](Cpp-Export.md#what-is-specialized) and
+[Current limitations](Cpp-Export.md#current-limitations).

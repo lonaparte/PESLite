@@ -13,9 +13,8 @@ simulation:
     dt: 25e-6
 ```
 
-Available fixed methods are `euler`, `heun` and `rk4`. `dt` is the maximum step, not a demand that
-every interval have exactly that length. When an exact boundary falls inside a step, PESLite divides
-the interval into equal shorter steps ending precisely at the boundary.
+Available fixed methods are `euler`, `heun` and `rk4`. `dt` (default `1e-6` s) is the maximum step;
+PESLite divides intervals as needed to end exactly at scheduled boundaries.
 
 RK4 is the normal starting point for `switching` and `pwm_averaging`. Reduce `dt` until important
 outputs and event responses are insensitive to further reduction.
@@ -37,7 +36,8 @@ simulation:
 
 `rtol` controls error relative to the current state scale, while `atol` supplies an absolute floor
 near zero. Smaller tolerances generally increase accepted steps and RHS evaluations. `max_step`
-limits how far the solver may advance even when the error estimate would permit more.
+limits how far the solver may advance even when the error estimate would permit more. Defaults are
+`rtol: 1e-6`, `atol: 1e-9`, `max_step: .inf` and `warm_start: 1` (reuse the last step size).
 
 Adaptive DP45 is the normal starting point for ideal `averaging`, where no PWM time grid forces
 small intervals. Sampled modes are supported with adaptive integration, but the solver still stops
@@ -46,14 +46,9 @@ benefit.
 
 ## Command presets
 
-| Command | Bridge | Solver |
-|---|---|---|
-| `--switching` | exact switching | fixed RK4 |
-| `--pwm-averaging` | PWM-period averaging | fixed RK4 |
-| `--averaging` | ideal averaging | adaptive DP45 |
-
-These flags are configuration presets. Explicit `--set` values for solver type or method take
-priority, so one file can be reused while deliberately testing another combination.
+The bridge/solver presets are listed in
+[Converter and Bridge Models](Converter-and-Bridge-Models.md#command-presets). Explicit `--set`
+values for solver type or method take priority over them.
 
 ## Multirate integration
 
@@ -63,16 +58,12 @@ slow windows while keeping event boundaries exact. Multirate schedules require
 
 ## Event-aware solver contract
 
-A solver is called only for the interval presented by `Simulation`. Before a model-changing event,
-an optional `settle(t, y)` hook can finish deferred work such as a multirate window. After a `set`
-event, an optional `parameters_changed()` hook can refresh cached parameter-dependent data.
+A solver is called only for the interval presented by `Simulation`; shared `settle()` and
+`parameters_changed()` hooks are described under [Custom solvers](Extending-PESLite.md#custom-solvers).
 Built-in solvers also provide `advance(f, t0, t1, y0, max_step=...)`, which lets a physical
 subsystem request a local resolution limit without changing the configured solver step. When a
 user solver provides only the callable interface, the diode-conduction stage enforces such a limit
 by dividing the requested interval before calling it.
-
-This contract also applies to user solvers. A simple user solver only needs the normal callable
-interface; the hooks are required only when it defers state or caches mutable parameters.
 
 ## Energy checks and diagnostics
 
@@ -87,8 +78,8 @@ audits. It defaults to 1000 and is intended as an internal performance/diagnosti
 than a primary model setting.
 
 `--ph-report` prints the assembled port-Hamiltonian structure without running, including when the
-configuration sets `energy_check: off`. Solver counts, rejected adaptive steps and multirate
-interface indicators are written to `summary.json`.
+configuration sets `energy_check: off`. `summary.json` records `n_rhs` and any multirate interface
+indicators.
 
 ## Selection guidance
 

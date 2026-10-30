@@ -39,7 +39,8 @@ numerically identical.
 
 Backend entries describe export support, not whether the hardware executes the simulated plant.
 Imperix exports sampled control and peripheral bindings; continuous `averaging` is not a hardware
-control schedule.
+control schedule. [Imperix ELF Export](Imperix-Export.md#timing-and-run-commands) lists what it
+rejects.
 
 ## Scalar converter ports, device placement and DCM
 
@@ -106,9 +107,8 @@ auditing when this averaged conduction relation is present instead of reporting 
 For either averaged form, the diode-conduction stage requests a local step of at most one tenth of
 the physical switching period while the operating point is in DCM. In CCM it imposes no extra
 limit, so the configured solver step remains in force. This resolution limit creates no PWM or
-carrier events and applies equally to fixed, adaptive and multirate solvers. A subsystem with a
-state-dependent local limit cannot be placed in a window-averaged group because that group cannot
-resolve its conduction transition.
+carrier events and applies equally to fixed, adaptive and multirate solvers; see the windowed-group
+restriction in [Multirate Simulation](Multirate-Simulation.md#limitations).
 
 ## Device resistance and port capacitance
 
@@ -125,7 +125,7 @@ eliminates common voltages using symmetry or the device law's piecewise-linear b
 only the ordinary external network feedback remains for the algebraic solver.
 DC sources, capacitors and series impedances retain their ordinary connection interfaces.
 
-Switching evaluates the active switching states. PWM and continuous averaging weight the same
+Switching evaluates the active switching states. PWM-period and ideal averaging weight the same
 device equations by the carrier-state durations, including charging currents and losses. They
 require small intra-period capacitor-voltage ripple; use switching to resolve
 individual charging pulses, commutation ringing and their losses. Choose solver tolerances and
@@ -170,14 +170,13 @@ also handles rectification. The capacitor charges while the diodes are blocked a
 through their finite resistance when forward biased. DC voltage steps produce finite charging
 currents. This representation uses continuous capacitor state instead of the ideal clamp's
 discrete conduction state and does not require a stiff DC source.
-Standalone C++ supports controllerless rectifiers, including their independent ADCs. Imperix
-hardware export requires a supported sampled controller and hardware peripheral bindings.
+Standalone C++ supports controllerless rectifiers, including their independent ADCs.
 
 Only an explicit `type: full_bridge` can have no controlled device. A diode full-bridge rectifier has no
 gates to block, so it accepts no protection criterion.
 
-Measurements use the existing ADC independently of a controller. `meas.period` sets its owned
-sampling and protection clock (the output period is used when absent); window means, RMS windows and
+Measurements use the existing ADC independently of a controller, on the unit's own measurement
+clock ([ADC sampling](Control-and-PWM-Timing.md#adc-sampling)); window means, RMS windows and
 `meas.sources` use the same channel and state interfaces. Held means are published as
 `<unit>.meas.<channel>_mean`, alongside the existing `<unit>.meas.<channel>_rms` signals.
 Instantaneous conversions held by an independent ADC use `<unit>.meas.<channel>`.
@@ -242,11 +241,11 @@ The axis angle at the current load is a named state (`pwm.angle`) and is restore
 Edges within `1e-9` of a period after a load belong to that load; edges within the same distance
 before the end of an interval belong to the next one, so a load that coincides with an edge neither
 loses nor repeats it. The modulator requires resolved switching edges; the current
-`pwm_averaging` and `averaging` forms accept duty ratios and cannot represent this pattern.
+`pwm_averaging` and `averaging` forms accept duty ratios and cannot represent this pattern. Their
+period mean can be zero while the switching-frequency fundamental carries the resonant power, so
+use the switching model unless a separately validated harmonic approximation is available.
 `pwm.sync` and `pwm.carrier_phase` are also rejected (the phase is a register). Standalone C++
 supports both pattern modes, including register events, parameter overrides and restart state.
-Imperix export currently has only a duty-register hardware adapter; phase-shift hardware
-modulation is not implemented.
 
 ## Exact commutations
 
@@ -277,11 +276,11 @@ including a phase or frequency change at a register load. See
 
 Commutating subsystems run with fixed-step and adaptive solvers. An adaptive solver needs a finite
 `max_step`, so that how often the margins are checked does not depend on how far apart the outer
-events (output, control, PWM) are; a windowed multirate group is rejected, because it cannot
-locate the instants. Both are reported when the run starts. A configuration that commutates
-repeatedly without time advancing raises `CommutationError` instead of looping. Standalone C++
-uses the same margin checks, safeguarded secant/bisection locator, scheduled boundaries and state
-resets. Imperix does not provide hardware adapters for these plant commutations.
+events (output, control, PWM) are; windowed multirate restrictions are listed in
+[Multirate Simulation](Multirate-Simulation.md#limitations). Both are reported when the run starts.
+A configuration that commutates repeatedly without time advancing raises `CommutationError`
+instead of looping. Standalone C++ uses the same margin checks, safeguarded secant/bisection
+locator, scheduled boundaries and state resets.
 
 ## Switching
 
@@ -316,11 +315,8 @@ This model therefore retains:
 - startup, protection and event timing.
 
 Use it when digital timing matters but switching ripple does not. It is generally the best default
-for controller and system-level studies with sampled control.
-
-Ordinary PWM-period averaging is not a reliable approximation of square-wave phase-shift power
-transfer: the period mean can be zero while the switching-frequency fundamental carries power.
-Use the switching model unless a separately validated harmonic approximation is available.
+for controller and system-level studies with sampled control. It cannot represent square-wave
+phase-shift modulation ([Phase-shift](#phase-shift-square-wave-modulation)).
 
 ## Ideal averaging
 
@@ -329,8 +325,9 @@ controller outputs are evaluated at solver stages, and controller states join th
 state vector.
 
 There is no ADC window, controller-interrupt grid, computation wait, carrier, or active/shadow PWM
-register in this mode. Sampled-only settings may remain in a shared file and are silently ignored,
-which allows the same case to be run under any of the three presets.
+register in this mode. Which sampled settings it ignores is described in
+[Control and PWM Timing](Control-and-PWM-Timing.md#ideal-averaging); the same case can therefore be
+run under any of the three presets.
 
 Use ideal averaging for:
 
@@ -341,11 +338,8 @@ Use ideal averaging for:
 
 Do not use it as a substitute for switching when conclusions depend on ripple, carrier timing or
 sampled-data delay. Continuous feedback can also create algebraic loops; PESLite detects connected
-feedback variables and solves them internally at each derivative evaluation.
-
-The same limitation applies to square-wave phase-shift bridges: an ordinary ideal average can
-discard the fundamental responsible for resonant power transfer and therefore give an incorrect
-result. Use the switching model unless a separately validated harmonic approximation is available.
+feedback variables and solves them internally at each derivative evaluation. Like PWM-period
+averaging, it cannot represent square-wave phase-shift modulation.
 
 ## Command presets
 
@@ -379,8 +373,8 @@ initial values and output times. A useful workflow is:
 3. use switching for the intervals where ripple and edge behavior must be verified;
 4. reduce solver step or tolerances until the conclusion is insensitive to further refinement.
 
-The output interval controls saved snapshots, not the integrator step. A visually smooth CSV does
-not by itself demonstrate numerical convergence.
+Judge convergence by solver refinement, not CSV smoothness: the output interval does not set the
+integration step.
 
 ## Selection summary
 

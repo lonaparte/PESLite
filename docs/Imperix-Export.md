@@ -204,6 +204,13 @@ RMS windows are still rejected: averaged samples cannot reconstruct a mean-squar
 Continuous `averaging` controllers and saved simulation initial states are also rejected.
 Use a sampled bridge configuration and a cold start.
 
+The hardware adapters bind duty registers only, so phase-shift (non-duty) modulator registers are
+rejected. Plants with commutating subsystems, such as diode rectifiers and switch-controlled
+capacitors, are rejected because no hardware adapter implements their commutations. An explicit
+`ctrl.offset` or `meas.offset` is rejected before files are written: hardware timing comes from
+`sampling_phase` on the CLK0 grid, and no adapter places a controller or ADC clock at a
+configured position.
+
 Period mapping uses rational common divisors, not a per-tick search or an expanded schedule.
 It rejects a common period below the SDK's 4 ns clock resolution. Periods still need to be
 representable on the target, and the resulting CPU rate and execution deadline must be checked
@@ -265,8 +272,7 @@ and `common` also keeps automatically detected structure-sensitive parameters co
 and controller gains use the same interface, without a separate reference whitelist or naming rule.
 
 Imperix additionally keeps hardware timing fixed at export: PWM frequency/carrier phase, control
-and loop periods, control and ADC clock offsets, ADC periods/windows, and the configured
-computation delay are not tunable.
+and loop periods, ADC periods/windows, and the configured computation delay are not tunable.
 Explicitly selecting a timing parameter, including through a section, fails with its full path.
 `all` and `common` omit timing parameters and report the omitted paths. Dependencies introduced by
 custom construction factories are traced through the shared parameter expressions, not a separate
@@ -339,7 +345,7 @@ The optional top-level `build` mapping contains `sdk`, `command`, `elf_machine` 
 against the binding file. `command` is an explicit argument list, executed without a shell,
 using `{sdk}`, `{source}` and `{elf}` placeholders. It must write its fresh target executable to
 `{elf}`. `{source}` is the generated package, containing the user source/header files for the
-official SDK project. `timeout` defaults to 300 seconds.
+official SDK project. `timeout` is in (0, 3600] seconds and defaults to 300.
 
 Use the actual compiler, C++17 flags, include paths, target ABI, linker script/specs, startup and
 BBOS libraries from the installed official SDK project. The exporter deliberately does not guess

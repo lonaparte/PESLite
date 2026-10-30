@@ -69,15 +69,9 @@ peslite wpt-ss-example --pwm-averaging
 peslite wpt-lcc-example --averaging
 ```
 
-`PowerControl` produces a dimensionless modulation amplitude; `PhasePowerControl` produces radians.
-They share one signed-power feedback law built from the existing `Filter`, `PI` and `OutputLimit`.
-Both use `reference - measured_power`. The feedforward port has the same units as the command, and
-the gains have units command/W and command/(W*s). Set phase limits and gain polarity for a monotonic
-operating branch of the configured circuit; the controller does not infer them from SS or LCC.
-Phase stays in signed radians. Before saturation, `PhasePowerControl` translates the command by
-its configured minimum, so the unchanged shared limiter operates on `[0, maximum - minimum]`.
-It then restores the phase coordinate. This preserves the configured operating branch and PI
-anti-windup; it neither wraps the angle nor removes the constraint.
+`PowerControl` produces a modulation amplitude and `PhasePowerControl` a phase in radians through
+the scalar feedback law in [Simulation Files](Simulation-Files.md#phase-shift-bridges). Set phase
+limits and gain polarity for a monotonic circuit branch; the controller does not infer them.
 
 The power channel uses the paired voltage and current of the converter's external `power` terminal,
 including its direction and power convention, independently of control feedback coordinates. In
@@ -86,12 +80,9 @@ converter, so negative
 secondary power means power is delivered to its ideal DC voltage source. These examples demonstrate
 power-transfer regulation between stiff DC rails, not battery dynamics or output-voltage regulation.
 
-Use `meas.average: [power]` for sampled power feedback. The existing ADC window then integrates
-instantaneous `voltage * current` over the control interval. Multiplying separately averaged voltage
-and current is not equivalent; sampling only at a carrier boundary may also return zero voltage.
-The feedback loop's optional power filter removes the remaining excitation-frequency ripple.
-Ideal `averaging` uses the instantaneous product in the continuous control graph and the same filter,
-without an ADC or artificial sampling delay.
+Sampled power feedback averages `power` itself with `meas.average: [power]`
+([ADC sampling](Control-and-PWM-Timing.md#adc-sampling)); its optional filter removes the remaining
+excitation ripple. Ideal `averaging` uses the instantaneous product and the same filter.
 
 The controller CSV files record each example's command, filtered power and power reference. The
 reference changes at 3 ms; compare settled, time-averaged power, not individual ripple samples or
@@ -125,26 +116,11 @@ protection:
   hold: 50.0e-6
 ```
 
-`meas.sources` overrides existing channel readers with named physical outputs. For a configured
-bus or Unit port, append `.voltage`, `.current` or `.power`, such as `charger.secondary.dc.power`.
-Port power is positive outward from the bus's voltage-driving terminal; a resistor's `load.power`
-is its nonnegative dissipation. Port observations are non-loading and use the existing energy-port
-power convention. All bindings are resolved at assembly, including dependency ordering for
-continuous control and C++ export. Selecting another Unit's measurement is explicit signal routing,
-not an implicit communication model or a claim that hardware makes that measurement locally.
+Source names and RMS windows are described in
+[Measurement sources and RMS](Control-and-PWM-Timing.md#measurement-sources-and-rms).
 
-RMS is `sqrt(mean(abs(signal)**2))`, integrated before sampling over a sliding window of whole
-control periods. Ideal averaging uses whole periods of its protection clock instead (`meas.period`,
-default `simulation.output.period`); it does not discretize the continuous controller. This is
-total waveform RMS, not a fundamental/envelope estimator; for a complex space vector it is the RMS
-of its magnitude, not a per-phase RMS conversion.
-An averaged model's RMS does not reconstruct the switching harmonics omitted by that model.
-The statistic is unavailable until a complete window has elapsed. Signals are named
-`<unit>.meas.<channel>_rms`. Only configured windows are allocated.
-
-RMS protection uses the same current base and trip latch as existing protection. Either side may
-enable it independently. It is a held overcurrent trip, not soft current regulation: it does not
-force phase to zero or change the common command limiter. Changing `elements.load.r` uses the
+Either side may enable RMS protection independently ([Protection](Simulation-Files.md#protection)).
+It is a held trip, not current regulation. Changing `elements.load.r` uses the
 ordinary `set` event and preserves electrical and controller state in Python and C++.
 
 ## Short exploratory runs

@@ -103,26 +103,23 @@ split an integration interval, so normal numerical step/tolerance effects can st
 The report consumes the state already read at main-run snapshots. Watched signals are read only
 when requested, and only explicitly watched control-log columns enable controller logging when
 signal histories and progress watches are disabled. A controller-only watch does not read plant
-signals, and a plant-only watch does not read controller logs. Baseline-only endpoints do not read watched
-values. Read results, including failed calculations, are cached once per snapshot and shared by
-CSV output and watches. Numerical observation failures produce a warning and unavailable values
-only for that provider. Controller logs, plant signals, limit statistics and energy observations
-are isolated at their shared output boundary: a failed log does not discard a valid plant row,
-physical snapshot, or energy observation. Missing declared controller-log values are NaN in CSV
-and null in JSON rather than reusing stale values.
+signals, and a plant-only watch does not read controller logs. Baseline-only endpoints do not read
+watched values. Read results, including failed calculations, are cached once per snapshot and
+shared by CSV output and watches. Numerical observation failures produce a warning and unavailable
+values only for that provider; output isolation is described in
+[Output settings](Output-and-Results.md#output-settings), and unavailable report values are `null`.
 
 Only unfinished analysis windows retain complete restart rows. As each endpoint arrives, its
 matrix is calculated through the shared map and its restart row is released; endpoints are not
-stored as a second history. The ordinary waveform history is not loaded.
-The optional observer can request an exact endpoint
-on the existing event grid, without creating CSV rows or extra control/protection interrupts.
-When it coincides with an existing runtime event, no extra integration boundary is needed.
-Python observation callbacks use
+stored as a second history. The ordinary waveform history is not loaded. The optional observer can
+request an exact endpoint on the existing event grid without creating CSV rows or extra
+control/protection interrupts. When it coincides with an existing runtime event, no extra
+integration boundary is needed. Python observation callbacks use
 `observe(t, states, read_values, *, final, stop_reason)`. The keyword metadata distinguishes a
 terminal snapshot from a scheduled check or a baseline-only endpoint. A final callback must not
-request another time. If the terminal physical snapshot itself is unavailable, `states` is
-`None`, watched values are empty, and the final reason is still delivered. Callback errors still
-propagate; only numerical output calculations are treated as optional failures.
+request another time. If the terminal physical snapshot itself is unavailable, `states` is `None`,
+watched values are empty, and the final reason is still delivered. Callback errors still propagate;
+only numerical output calculations are treated as optional failures.
 
 An endpoint at `t + period` supplies the unperturbed result directly. With `n` active coordinates,
 that check needs at most `2*n` extra period advances, saving the separate baseline evaluation.

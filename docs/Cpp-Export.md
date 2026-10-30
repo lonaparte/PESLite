@@ -71,6 +71,7 @@ export/case/peslite \
   --out output/cpp-run
 ```
 
+The output directory may also be given as a positional argument instead of `--out`.
 `--list-params` shows the paths compiled as variables and their current defaults. Only these paths
 can be changed. Setting any other path fails with:
 
@@ -105,8 +106,8 @@ peslite-convert buck-example common
 
 Leaf converters also expose `units.<name>.connected`, the initial connection command. Select it
 individually or through a unit section, `all`, or `common`, and set it to `0` or `1` with `--set`.
-Scheduled connection events retain their normal precedence and timing. The command uses the same
-startup, PWM and protection lifecycle as a local simulation; it is not a writable gate-status flag.
+Scheduled connection events retain their normal precedence and timing; see
+[Built-in events](Events-and-Restart.md#built-in-events).
 
 `common` means `all` minus the parameters identified by the existing structural sensitivity
 check. It keeps those detected parameters constant at their configured values; every other
@@ -159,10 +160,8 @@ fully constant build; select only the fields you need when maximum specializatio
 
 Export also reports retained parameters that control conditional dependencies inside algebraic
 loops. The command prints these diagnostics; the Python API exposes the same records through
-`project.diagnostics`, including `parameters`, `condition`, `dependencies` and `loop`. For example,
-the Buck model reports `buses.output.r_d` and `units.converter.dclink.source.r`, with their public
-input-to-output dependency paths. These names are discovered from the traced equations, not a
-device or parameter list. They remain adjustable with `--set`.
+`project.diagnostics`, including `parameters`, `condition`, `dependencies` and `loop`. These names
+come from traced equations, not a device or parameter list, and remain adjustable with `--set`.
 
 The check reuses the existing equation trace and topological sort. Only cyclic residual graphs
 need SCC analysis. Products with parameter-only coefficients and parameter-controlled scalar
@@ -178,18 +177,8 @@ validation constraints is not proved by this basic check.
 
 ## Results
 
-The compiled simulator uses the same result structure as the Python runner:
-
-```text
-output/cpp-run/
-├── states.csv
-├── summary.json
-└── simulation.pes
-```
-
-Optional plant, controller and energy files follow the same configuration. The output
-`simulation.pes` records the actual values after `--config` and `--set`, so the C++ run remains
-auditable.
+The compiled simulator writes the same [result files](Output-and-Results.md#files) as Python; its
+`simulation.pes` records values after `--config` and `--set`.
 
 ## What is specialized
 
@@ -256,8 +245,6 @@ common trip path, not a WPT phase override.
 
 - Supported solvers are fixed `euler`, `heun` and `rk4`, plus adaptive `DP45`.
 - Multirate subsystem schedules are not currently lowered to C++.
-- Imperix hardware adapters do not implement plant commutations. Standalone C++ uses the
-  component commutation interfaces described below.
 - Arbitrary Python behavior is not embedded in the standalone executable. File or network I/O,
   reflection, run-time type/layout changes and unsupported library calls in a custom equation are
   rejected during export rather than silently approximated.

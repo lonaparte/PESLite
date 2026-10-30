@@ -9,7 +9,7 @@ Use `peslite --help` and `peslite-convert --help` for the interface of the insta
 
 ## Select a simulation
 
-With no argument, `peslite` runs the first bundled case by filename:
+With no argument, `peslite` runs the bundled `gfl-example`:
 
 ```bash
 peslite
@@ -23,7 +23,8 @@ peslite case.pes
 peslite ./cases/my-converter.pes
 ```
 
-For a local file, the suffix may be omitted when the path resolves unambiguously:
+The suffix may be omitted. PESLite tries the path, then `.pes`, `.yaml`, `.yml` and `.json`
+variants, then bundled examples, and uses the first match:
 
 ```bash
 peslite case
@@ -50,7 +51,7 @@ peslite case.pes \
   --set simulation.solver.rtol=1e-3
 ```
 
-`--set` has priority over a command preset, file value and default.
+The priority, from highest, is: `--set`, a command preset, the simulation file, package defaults.
 
 ## Select a bridge/solver preset
 
@@ -60,9 +61,8 @@ peslite case.pes --pwm-averaging
 peslite case.pes --averaging
 ```
 
-The flags select, respectively, switching + fixed RK4, PWM-period averaging + fixed RK4, and ideal
-averaging + adaptive DP45 for the run. They change every unit unless a unit path is explicitly
-overridden with `--set`.
+What each preset selects is listed in
+[Command presets](Converter-and-Bridge-Models.md#command-presets).
 
 ## Choose the output directory
 
@@ -81,26 +81,17 @@ peslite case.pes --progress 0.1 --watch vsc.i_c,vsc.u_dc
 ```
 
 `--progress SECONDS` uses simulated time. `--watch` may be repeated or contain comma-separated
-names. It does not enable result signal files and does not change simulation results.
+names; see [Progress and watch](Output-and-Results.md#progress-and-watch).
 
 ## Optional simulation report
 
 ```bash
 peslite case.pes --report
-peslite case.pes --report --out output/my-run
 ```
 
-With the small-signal analysis addon available, this runs the simulation once and writes
-`case_report.json` in the output directory, with a `small_signal_stability` section. Only JSON
-is generated; the report filename uses the input stem even with a bridge preset or custom output
-directory. Without the addon, a warning is emitted and the ordinary simulation continues.
-
-The default checks cover the initial state, simulation-file events and the final state, with
-only changed items retained. Stability analysis runs only after a check establishes a periodic
-operating state; earlier checks report `transient` without running perturbations.
-Use the [Python addon API](Small-Signal-Analysis.md) for custom
-analysis times, intervals and watched values. `--report` can accompany `--plot`, but not
-inspection or export options.
+With the small-signal analysis addon available, this also writes `case_report.json`; see
+[Small-Signal Stability Analysis](Small-Signal-Analysis.md#time-based-simulation-report) for its
+contents and compatible options.
 
 ## Plot recorded waveforms
 
@@ -133,29 +124,19 @@ peslite case.pes --plot vsc.dclink.u_C \
   --plot-output dc-link.pdf
 ```
 
+Further options are `--plot-x` (another horizontal column) and `--plot-xlabel`, per-waveform
+`--plot-color` and `--plot-style` in `--plot` order, `--plot-height` (inches), `--plot-linewidth`
+(points), `--plot-ylim`, `--plot-no-grid` and `--plot-no-legend`.
+
 `--plot-xlim` remains in the CSV time unit (seconds); only its presentation is scaled. The default
 style uses IEEE dimensions, serif/Computer Modern text, inward ticks, restrained colors and vector
 PDF output. External LaTeX is used when available, with a bundled Computer Modern-style fallback.
 
 ## Continue from saved state
 
-```bash
-peslite case.pes --out output/part-a
-peslite output/part-a/simulation.pes \
-  --initial output/part-a/states.csv \
-  --out output/part-b
-```
-
-By default, `--initial` selects the last CSV row. Select another saved time with:
-
-```bash
-peslite output/part-a/simulation.pes \
-  --initial output/part-a/states.csv \
-  --initial-time 0.75 \
-  --out output/part-b
-```
-
-See [Events and Restart](Events-and-Restart.md) for what is restored.
+`--initial FILE` starts from the last row of a saved `states.csv`; `--initial-time T` selects the
+row saved at another time. See [Events and Restart](Events-and-Restart.md#continue-from-a-saved-csv)
+for the commands and what is restored.
 
 ## Inspect without running
 
@@ -195,8 +176,8 @@ peslite-convert case.pes simulation.t_end units.vsc.ctrl.references.p_ref_pu
 peslite-convert case.pes all --out export/my-simulator
 ```
 
-It emits `peslite.cpp` in `export/<name>/` or the explicit `--out` directory. Compilation and
-backend limitations are documented in [C++ Export](Cpp-Export.md).
+It emits `peslite.cpp` in `export/<name>/` or the explicit `--out` directory. Compilation, runtime
+options and backend limits are documented in [C++ Export](Cpp-Export.md).
 
 Use `--imperix` for [Imperix ELF export (Experimental)](Imperix-Export.md):
 
@@ -206,20 +187,6 @@ peslite-convert case.pes --imperix
 
 This builds an ELF using the configured official SDK. Add `--imperix-source-only` to generate
 sources without building the ELF.
-
-## Generated C++ executable
-
-After compilation, inspect and run it with familiar override/output options:
-
-```bash
-export/case/peslite --list-params
-export/case/peslite --config another.pes \
-  --set simulation.t_end=5.0 \
-  --out output/cpp-run
-```
-
-Only paths shown by `--list-params` are mutable. The generated executable applies compiled defaults,
-then `--config`, then repeatable `--set` values.
 
 ## Common command patterns
 
