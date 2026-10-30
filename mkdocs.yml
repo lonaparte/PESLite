@@ -26,8 +26,8 @@ nav:
   - Components:
       - Passive Network Components: Passive-Network-Components.md
       - Electrical Sources: Electrical-Sources.md
-      - Voltage-Source Converters: Voltage-Source-Converters.md
       - Bridge and PWM: Bridge-and-PWM.md
+      - Voltage-Source Converters: Voltage-Source-Converters.md
       - DC converters and WPT: DC-Converters-and-WPT.md
   - Advanced:
       - Architecture: Architecture.md
