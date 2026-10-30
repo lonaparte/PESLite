@@ -138,7 +138,7 @@ the explicit `dc_converter` type.
 Parameter ownership is explicit: all converter units share common fields; `unit.type` adds
 electrical fields, `bridge.type` topology fields, `ctrl.type` reference/default-wiring fields, and
 each `ctrl.loops` key its class parameters. See
-[Simulation Files](Simulation-Files.md#units-and-per-unit-values).
+[Simulation Files](Simulation-Files.md#si-and-per-unit-values).
 
 Every `ctrl` section is represented by the same `ControlParams` type. Its discriminator narrows the
 valid fields inside that object; it never switches to another public parameter container. The unit

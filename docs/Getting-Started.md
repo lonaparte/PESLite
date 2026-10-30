@@ -141,7 +141,7 @@ simulation:
 ```
 
 Names without a suffix are SI quantities and names ending in `_pu` are per-unit quantities; see
-[Units and per-unit values](Simulation-Files.md#units-and-per-unit-values).
+[SI and per-unit values](Simulation-Files.md#si-and-per-unit-values).
 
 ## Choose a bridge model
 

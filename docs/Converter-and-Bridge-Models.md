@@ -272,7 +272,7 @@ Switch-controlled capacitors on a compensated link use the same protocol: the li
 their body-diode turn-on (capacitor-voltage zero), current reversals and gate edges. Gate state
 and scheduled edges use the same absolute timestamps and time tolerance as the dispatcher,
 including a phase or frequency change at a register load. See
-[Simulation Files](Simulation-Files.md#switch-controlled-capacitors).
+[Simulation Files](Simulation-Files.md#link-fields).
 
 Commutating subsystems run with fixed-step and adaptive solvers. An adaptive solver needs a finite
 `max_step`, so that how often the margins are checked does not depend on how far apart the outer
