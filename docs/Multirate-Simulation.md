@@ -147,7 +147,7 @@ diagnostics, not as a replacement for convergence against a tighter reference ru
 - A system with commutating subsystems, such as diode rectifiers or switch-controlled capacitors,
   cannot use a windowed group because it cannot locate their commutation instants.
 - The filter of an averaged unilateral half bridge requests a state-dependent local step in DCM
-  ([DC Converters and Wireless Power Transfer](DC-Converters-and-WPT.md#ccm-and-dcm))
+  ([DC converters and WPT](DC-Converters-and-WPT.md#ccm-and-dcm))
   and therefore cannot be windowed.
 - C++ export does not support multirate subsystem schedules
   ([C++ Export](Cpp-Export.md#current-limitations)).

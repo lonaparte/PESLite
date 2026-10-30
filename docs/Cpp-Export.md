@@ -270,7 +270,7 @@ common trip path, not a WPT phase override.
 The exporter supports the built-in switching, PWM-period-averaged and ideal averaged bridge models,
 including square-wave phase-shift modulation in the switching model.
 For their semantics, see [Bridge and PWM](Bridge-and-PWM.md) and
-[DC Converters and Wireless Power Transfer](DC-Converters-and-WPT.md).
+[DC converters and WPT](DC-Converters-and-WPT.md).
 
 Controllerless Units retain their electrical equations and independently clocked ADCs. Ideal
 diode full bridges and switch-controlled capacitors participate through the ordinary

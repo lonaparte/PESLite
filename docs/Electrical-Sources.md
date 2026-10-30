@@ -3,7 +3,7 @@
 Independent network sources are configured under `sources` or as a `voltage_source` element.
 Converter DC supplies are configured inside the Unit `dclink`; see
 [Voltage-Source Converters](Voltage-Source-Converters.md) and
-[DC Converters and Wireless Power Transfer](DC-Converters-and-WPT.md).
+[DC converters and WPT](DC-Converters-and-WPT.md).
 
 ## AC voltage source
 
@@ -29,12 +29,12 @@ sources:
 | `f` | no | `base.f0` | frequency in Hz |
 | `angle` | no | 0 | initial angle in rad |
 
-A three-phase target uses the complex space-vector representation. A scalar target uses a real
-single-phase sinusoid. The source and target phase counts are resolved from the connection.
+A three-phase target uses the complex space-vector representation. A single-phase target uses a
+real sinusoid. The source and target phase counts are resolved from the connection.
 
-## Constant scalar voltage source
+## Constant voltage source
 
-Use `elements.type: voltage_source` for a constant scalar voltage behind resistance:
+Use `elements.type: voltage_source` for a constant single-phase voltage behind resistance:
 
 ```yaml
 elements:
@@ -43,7 +43,7 @@ elements:
 
 | Field | Required | Constraint |
 |---|---:|---|
-| `bus` | yes | scalar bus or Unit port |
+| `bus` | yes | single-phase bus or Unit port |
 | `v` | yes | finite V |
 | `r` | yes | positive ohm |
 

@@ -16,7 +16,7 @@ buses:
 |---|---:|---|---|
 | `c` or `c_pu` | yes | — | shunt capacitance |
 | `r_d` or `r_d_pu` | no | 0 | series damping resistance |
-| `phases` | no | 3 | `1` for a real scalar node or `3` for a three-phase space-vector node |
+| `phases` | no | 3 | `1` for a real single-phase node or `3` for a three-phase space-vector node |
 
 A circuit that does not need a capacitor node does not need a `buses` section.
 

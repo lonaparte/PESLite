@@ -62,7 +62,7 @@ See [Getting Started](Getting-Started.md) to create a case and inspect its resul
 - [Electrical Sources](Electrical-Sources.md)
 - [Voltage-Source Converters](Voltage-Source-Converters.md)
 - [Bridge and PWM](Bridge-and-PWM.md)
-- [DC Converters and Wireless Power Transfer](DC-Converters-and-WPT.md)
+- [DC converters and WPT](DC-Converters-and-WPT.md)
 - [Architecture](Architecture.md)
 - [Plotting](Plotting.md)
 - [Online Stability Analysis](Online-Stability-Analysis.md)

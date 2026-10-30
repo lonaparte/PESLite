@@ -1,7 +1,7 @@
-# DC Converters and Wireless Power Transfer
+# DC converters and WPT
 
-`dc_converter` is a scalar converter Unit. `wpt` combines two scalar child Units with one coupled
-link.
+`dc_converter` configures a half-bridge or full-bridge converter Unit. `wpt` combines two child
+converter Units with one coupled link.
 
 ## DC converter
 
@@ -27,7 +27,7 @@ units:
 | Field | Required | Default | Meaning |
 |---|---:|---|---|
 | `type` | yes | — | `dc_converter` |
-| `bus`, `filter` | together for an external connection | omitted | scalar terminal and series R-L filter |
+| `bus`, `filter` | together for an external connection | omitted | external terminal and series R-L filter |
 | `s_base` | no | `base.s_base` | Unit rating in VA |
 | `dclink` | yes | — | rated DC voltage and source |
 | `bridge.type` | no | selected by `ctrl.type` | `half_bridge` or `full_bridge` |
@@ -139,8 +139,8 @@ units:
 
 | Field | Required | Meaning |
 |---|---:|---|
-| `primary` | yes | scalar non-composite child Unit |
-| `secondary` | yes | scalar non-composite child Unit |
+| `primary` | yes | non-composite converter Unit |
+| `secondary` | yes | non-composite converter Unit |
 | `link` | yes | coupled electrical link |
 | `s_base` | no | shared rating; defaults to `base.s_base` |
 

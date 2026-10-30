@@ -16,8 +16,8 @@ bridge:
 |---|---|---|---|
 | `type` | `half_bridge`, `full_bridge`, `three_phase_bridge` | selected by Unit type | electrical topology |
 | `model` | `switching`, `pwm_averaging`, `averaging` | `pwm_averaging` | simulation form |
-| `upper_controlled`, `lower_controlled` | switches | 1 | controlled rows of a scalar bridge |
-| `reverse_port` | switch | 0 | scalar half-bridge power-port direction |
+| `upper_controlled`, `lower_controlled` | switches | 1 | controlled rows of a half bridge or full bridge |
+| `reverse_port` | switch | 0 | half-bridge power-port direction |
 | `external_terminal` | `midpoint`, `lower_rail` | `midpoint` | exposed half-bridge terminal |
 | `on_resistance` | ohm per conducting device | 0 | device voltage drop and loss |
 | `parallel_capacitance` | F | 0 | capacitance across the bridge power port |

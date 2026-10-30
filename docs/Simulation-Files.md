@@ -30,7 +30,7 @@ meta: {}
 | `sources` | independent network sources | [Electrical Sources](Electrical-Sources.md) |
 | `units` with `type: vsc` | voltage-source converters | [Voltage-Source Converters](Voltage-Source-Converters.md) |
 | converter `bridge`, `pwm`, `ctrl`, `meas`, `protection` | bridge model and sampled control | [Bridge and PWM](Bridge-and-PWM.md) |
-| `units` with `type: dc_converter` or `wpt` | scalar conversion and coupled links | [DC Converters and Wireless Power Transfer](DC-Converters-and-WPT.md) |
+| `units` with `type: dc_converter` or `wpt` | DC converters and coupled links | [DC converters and WPT](DC-Converters-and-WPT.md) |
 | `events` and `simulation.initial` | event timeline and continuation | [Events Timeline](Events-Timeline.md) |
 | `simulation.output` and `simulation.progress` | files, signals and progress | [Output and Results](Output-and-Results.md) |
 | `simulation.solver` | integration settings | [Solvers](Solvers.md) |

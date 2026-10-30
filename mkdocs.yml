@@ -27,7 +27,7 @@ nav:
       - Electrical Sources: Electrical-Sources.md
       - Voltage-Source Converters: Voltage-Source-Converters.md
       - Bridge and PWM: Bridge-and-PWM.md
-      - DC Converters and Wireless Power Transfer: DC-Converters-and-WPT.md
+      - DC converters and WPT: DC-Converters-and-WPT.md
   - Advanced:
       - Architecture: Architecture.md
       - Plotting: Plotting.md

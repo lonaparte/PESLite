@@ -105,7 +105,7 @@ for compilation, runtime configuration and current backend limits.
 - [Electrical Sources](https://github.com/lonaparte/PESLite/wiki/Electrical-Sources)
 - [Voltage-Source Converters](https://github.com/lonaparte/PESLite/wiki/Voltage-Source-Converters)
 - [Bridge and PWM](https://github.com/lonaparte/PESLite/wiki/Bridge-and-PWM)
-- [DC Converters and Wireless Power Transfer](https://github.com/lonaparte/PESLite/wiki/DC-Converters-and-WPT)
+- [DC converters and WPT](https://github.com/lonaparte/PESLite/wiki/DC-Converters-and-WPT)
 - [Architecture](https://github.com/lonaparte/PESLite/wiki/Architecture)
 - [Extending PESLite](https://github.com/lonaparte/PESLite/wiki/Extending-PESLite)
 - [CLI Reference](https://github.com/lonaparte/PESLite/wiki/CLI-Reference)

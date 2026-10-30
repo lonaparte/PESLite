@@ -69,7 +69,7 @@ groups iteratively.
 
 The graph has one typed, directed boundary. Its input ports are measured feedback signals
 (`meas.*`) and controller references (`references.*`). Its output schema belongs to that boundary:
-AC control exposes `u_dq`, `theta` and `omega`, while scalar bridge control exposes its modulator
+AC control exposes `u_dq`, `theta` and `omega`, while DC bridge control exposes its modulator
 registers, such as `duty` (see [Bridge and PWM](Bridge-and-PWM.md)). A
 connection always binds a loop input to a boundary or loop output. Default wiring and explicit
 custom wiring are both lowered to this same graph before the run.
