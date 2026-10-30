@@ -50,12 +50,6 @@ The bridge/solver presets are listed in
 [Bridge and PWM](Bridge-and-PWM.md#command-presets). Explicit `--set`
 values for solver type or method take priority over them.
 
-## Multirate integration
-
-Named subsystems can use a step relative to the fixed system step. This supports fast substeps and
-slow windows while keeping event boundaries exact. Multirate schedules require
-`simulation.solver.type: fixed`; see [Multirate Simulation](Multirate-Simulation.md).
-
 ## Event-aware solver contract
 
 A solver is called only for the interval presented by `Simulation`; shared `settle()` and
@@ -89,7 +83,7 @@ indicators.
 | Sampled control without carrier ripple | fixed RK4, PWM-period averaging |
 | Continuous averaged dynamics | adaptive DP45 |
 | Stiff continuous dynamics | a suitable SciPy implicit method, verified against a reference |
-| Strongly separated subsystem time scales | fixed multirate, after a single-rate baseline |
+| Strongly separated subsystem time scales | [fixed multirate](Multirate-Simulation.md), after a single-rate baseline |
 
 Always establish convergence for the quantities used in the conclusion. Output density is not an
 integration-accuracy setting.

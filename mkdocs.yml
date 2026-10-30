@@ -20,9 +20,10 @@ nav:
   - Simulation Files: Simulation-Files.md
   - Simulation:
       - Events Timeline: Events-Timeline.md
-      - Output and Results: Output-and-Results.md
       - Solvers: Solvers.md
       - Multirate Simulation: Multirate-Simulation.md
+      - Output and Results: Output-and-Results.md
+  - Components:
       - Passive Network Components: Passive-Network-Components.md
       - Electrical Sources: Electrical-Sources.md
       - Voltage-Source Converters: Voltage-Source-Converters.md
