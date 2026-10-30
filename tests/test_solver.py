@@ -152,9 +152,11 @@ def test_observational_output_stage_is_pruned_or_promoted_by_rhs_dependencies():
     assert producer.observations == 1
 
 
-def test_a_run_continues_exactly_from_a_saved_state(tmp_path):
+@pytest.mark.parametrize("split", [{}, {"simulation.solver.subsystems": {"pcc": 3}}],
+                         ids=["single-rate", "mid-window"])  # 2 ms lies inside a 3 dt window
+def test_a_run_continues_exactly_from_a_saved_state(tmp_path, split):
     def run(t_end, out, **changes):
-        params = peslite.load(EXAMPLES / "gfl-example.pes", **QUIET, **FAST,
+        params = peslite.load(EXAMPLES / "gfl-example.pes", **QUIET, **FAST, **split,
                               **{"simulation.t_end": t_end}, **changes)
         return peslite.Simulation(params).run(out_dir=out)
 

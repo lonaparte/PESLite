@@ -138,11 +138,12 @@ def test_wpt_assembly_flattens_only_once_and_shares_one_link():
     assert not simulation.energy_problems
 
 
-def test_nested_wpt_rejects_an_ac_link_connected_to_a_dc_default_port():
+def test_a_wpt_child_cannot_itself_be_a_composite_wpt():
     tree = _tree()
     tree["units"]["charger"]["primary"] = copy.deepcopy(tree["units"]["charger"])
-    with pytest.raises(ConfigError, match="electrical-domain conflict"):
-        peslite.Simulation(_short(tree))
+    with pytest.raises(ConfigError, match=r"charger\.primary: a WPT child needs a scalar, "
+                                          "non-composite unit"):
+        _short(tree)
 
 
 @pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])

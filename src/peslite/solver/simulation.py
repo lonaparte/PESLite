@@ -39,7 +39,7 @@ from ..assembly.params import (Params, _connection_variable, _parameterized, _un
 from ..assembly.system import System, _start_connections
 from ..assembly.types import unit_type
 from ..assembly.unit import Plant, Unit
-from ..components.pwm import TIME_EPS
+from .timing import TIME_EPS
 from ..control.blocks import abc2complex, complex2abc
 from .integrators import Solver
 from .linearization import coordinate_width
@@ -121,24 +121,22 @@ def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
                       ctrl_names: Mapping[str, Iterable[str]] | None = None) -> dict[str, float]:
     """Convert one raw plant snapshot into one public, real-valued output row."""
     row: dict[str, float] = {"t": t}
-    unit_names = dict.fromkeys(name for name, _unit in _unit_items(params.units))
     for key, value in plant.items():
-        head, _, what = key.rpartition(".")
-        if np.iscomplexobj(value):
+        if isinstance(value, complex):  # signals are scalars; np.complex128 is a complex
             for name, phase_value in zip(_signal_names(key, 3), complex2abc(complex(value))):
                 row[name] = float(phase_value)
-        elif not ((head in unit_names and what in ("u_dc", "i_dc"))
-                  or (head in params.sources and what == "angle")):
+        else:
             row[key] = float(value)
-    for name in unit_names:
+    # the units' DC quantities, then the source angles, follow in configuration order
+    for name, _unit in _unit_items(params.units):
         for what in ("u_dc", "i_dc"):
             key = f"{name}.{what}"
             if key in plant:
-                row[key] = float(plant[key])
+                row[key] = row.pop(key)
     for name in params.sources:
         key = f"{name}.angle"
         if key in plant:
-            row[key] = float(plant[key])
+            row[key] = row.pop(key)
     names_by_unit = ctrl_names or {unit: log for unit, log in ctrl_logs.items()}
     for unit, names in names_by_unit.items():
         log = ctrl_logs.get(unit, {})
@@ -374,7 +372,10 @@ class Recorder:
                     log: Mapping[str, float] | Callable[[], Mapping[str, float] | None], *,
                     record: bool = True) -> None:
         """Read and publish one controller log independently of every other output."""
-        names = self.ctrl_names.get(unit)
+        # Names a controller does not declare are discovered for ctrl.<unit>.csv only, whose first
+        # row fixes them; plant.csv, whose columns are fixed at its own first row, keeps the declared.
+        table = self._ctrl.get(unit)
+        names = self.ctrl_names.get(unit) or (tuple(table.keys[1:]) if table is not None else ())
 
         def read():
             nonlocal names
@@ -382,7 +383,7 @@ class Recorder:
             if values is None:
                 return None
             if not names:
-                names = self.ctrl_names[unit] = tuple(values)
+                names = tuple(values)
             return {name: float(values.get(name, math.nan)) for name in names}
 
         values = _optional_output(t, f"controller log {unit!r}", read)
@@ -559,7 +560,7 @@ class Simulation:
         return rating
 
     def _check_energy(self) -> None:
-        """Build and check the energy structure unless ``simulation.energy_check`` is off."""
+        """Build the structure report and apply ``simulation.energy_check`` (warn or strict; off: neither)."""
         mode = self.p.simulation.energy_check
         model = getattr(self.system, "model", None)
         if mode == "off" or model is None or not hasattr(model, "ph_report"):
@@ -568,9 +569,7 @@ class Simulation:
         groups = getattr(solver, "groups", None)
         if groups is not None and len(groups) < 2:  # not split
             groups = None
-        hold = None
-        if hasattr(solver, "window") and hasattr(solver, "dt"):
-            hold = {"step": solver.dt, "window": solver.window}
+        hold = {"step": solver.dt, "window": solver.window} if groups else None  # the split's hold times
         zoh = {
             unit.zoh: (0.7 + 0.2j if isinstance(unit.bridge.topology.zero, complex) else 0.7)
             for unit in self.system.units.values()
@@ -740,7 +739,12 @@ class Simulation:
         for name, unit in system.units.items():
             bridge_prefix = f"{name}.{unit.bridge.state_prefix}"
             self._states.load(values, [f"{name}.ctrl", bridge_prefix])
-            if any(key.startswith((f"{name}.ctrl.", bridge_prefix + ".")) for key in values):
+            runtime_states = {
+                f"{prefix}.{local}" if prefix else local
+                for prefix, part in unit.state_parts()
+                for local in getattr(part, "get_state", lambda: {})()
+            }
+            if runtime_states.intersection(values):
                 self._continued.add(name)
             if unit.adc is not None and (unit.adc.accumulating or unit.adc.independent):
                 self._states.load(values, [f"{name}.meas"])
@@ -832,7 +836,10 @@ class Simulation:
         controls = tuple((unit.name, unit.ctrl) for unit in units if unit.ctrl is not None)
         continuous_controls = tuple((unit_name, ctrl) for unit_name, ctrl in controls
                                     if getattr(ctrl, "continuous", False))
-        output_clocked = any(unit.continuous for unit in units)
+        # Sampled units' bridge/ADC events and file events change the circuit for every window;
+        # a continuous unit's own clock samples only that unit.
+        sampled_units = tuple(unit for unit in units if not unit.continuous)
+        clocked_units = tuple(unit for unit in units if unit.continuous)
         ctrl_names = {unit_name: getattr(ctrl, "log_names", lambda: ())()
                       for unit_name, ctrl in controls}
         for unit_name, ctrl in controls:
@@ -984,34 +991,39 @@ class Simulation:
             return False
 
         def settle_now() -> None:
-            """Finish deferred integration with the plant as it is, before it changes now."""
+            """Finish deferred integration and open ADC windows with the plant as it is,
+            before it changes now."""
             if settle is not None:
                 plant.state = settle(t_local, plant.state)
                 if project is not None:
                     plant.state = project(plant.state)
                 mdl.set_states(plant.state)
                 plant.invalidate()
-
-        plant.settle = settle_now
+            if windowed:
+                sync_if_needed(t_local)
+                for unit in windowed:
+                    unit.accumulate(t_local)
 
         def window_edge(t_now: float, changed: bool) -> None:
             """Restart ADC integrals from the values on the new side of a plant/input jump."""
-            if windowed and (changed or plant.zoh_changed):
+            if windowed and changed:
                 sync_if_needed(t_now)
                 for unit in windowed:
                     unit.restart_windows(t_now)
 
         # ---------------------------------------------------------------- the event grid
         self._begin_units(t_start, plant)
+        plant.settle = settle_now
         while True:
             plant.inputs_changed = False
             t_log = n_log * log_period
-            physical_stop = min(t_final, t_log) if output_clocked else t_final
-            for unit in units:
+            circuit_stop = actions[0][0] if actions else math.inf
+            for unit in sampled_units:
+                circuit_stop = min(circuit_stop, unit.next_time())
+            physical_stop = circuit_stop
+            for unit in clocked_units:
                 physical_stop = min(physical_stop, unit.next_time())
-            if actions:
-                physical_stop = min(physical_stop, actions[0][0])
-            t_stop = min(t_log, physical_stop)
+            t_stop = min(t_final, t_log, physical_stop)
             native_stop = t_stop
             if observations and observations[0] < t_stop - TIME_EPS:
                 t_stop = observations[0]
@@ -1029,9 +1041,12 @@ class Simulation:
                 continue
             protection_changed = False
             if physical_stop <= t_stop + TIME_EPS:  # otherwise only the output snapshot is due
-                if windowed:
-                    sync_if_needed(t_stop)
-                    for unit in windowed:
+                # A window integrates where the circuit changes or where its own unit samples;
+                # trips and other plant changes integrate through settle_now.
+                circuit = circuit_stop <= t_stop + TIME_EPS
+                for unit in windowed:
+                    if circuit or unit.next_time() <= t_stop + TIME_EPS:
+                        sync_if_needed(t_stop)
                         unit.accumulate(t_stop)
                 # File events run before the coincident protection/control/PWM events.
                 if event_due:
@@ -1065,7 +1080,8 @@ class Simulation:
                         stopped = stop_on_trip
                 if stopped:
                     break
-                window_edge(t_local, plant.inputs_changed)
+                # Held inputs change only at circuit events; elsewhere they are only re-asserted.
+                window_edge(t_local, plant.inputs_changed or circuit and plant.zoh_changed)
             if t_stop >= t_final - TIME_EPS:
                 break
             if abs(t_log - t_stop) < TIME_EPS:
@@ -1096,9 +1112,6 @@ class Simulation:
         summary["t_stop"] = rec.last_t if rec.last_t is not None else t_start
         if stop_reason:
             summary["stop_reason"] = stop_reason
-        coarse = getattr(solver, "coarse_hold", None)
-        if coarse is not None:
-            summary["interface_coarse_hold"] = f"{coarse[1]} at t = {coarse[0]:.6g} s: {coarse[2]:.3g} of rating"
         if self.ph_report is not None:
             summary["ph_verdict"] = self.ph_report.verdict
             summary["ph_defaulted"] = list(self.ph_report.defaulted)
@@ -1118,19 +1131,12 @@ class Simulation:
                                               f"loads, carriers and loops) have no common multiple within "
                                               f"64 of the longest, so the loop has no period to linearise: "
                                               f"no bound")
-                else:
+                else:  # the bound reads whole rows: parse states.csv once, not once per column
                     table = records.states_table
-                    state_rows = (
-                        np.atleast_1d(read_csv(table.path))
-                        if table is not None and table.n_rows else None
-                    )
-                    state_columns = (
-                        {name: state_rows[name] for name in state_rows.dtype.names}
-                        if state_rows is not None else {}
-                    )
+                    rows = np.atleast_1d(read_csv(table.path)) if table is not None and table.n_rows else None
                     summary.update(split_error_bound(
-                        solver, loop, records.t, state_columns, p.simulation.solver.linearisations,
-                        labels=mdl.state_labels(), prefix=""))
+                        solver, loop, records.t, {key: rows[key] for key in rows.dtype.names} if rows is not None
+                        else {}, p.simulation.solver.linearisations, labels=mdl.state_labels(), prefix=""))
             else:  # parts given as instances
                 summary["split_bound"] = ("the loop has custom parts given as instances, so it cannot be "
                                           "rebuilt for the linearisation: pass them as factories of the "
@@ -1147,7 +1153,7 @@ class Simulation:
             summary_path = output_dir / "summary.json"
             params_path = output_dir / "simulation.pes"
             summary_path.write_text(json.dumps(payload, indent=2, default=float), encoding="utf-8")
-            dump(p, params_path)
+            dump(p if t_end == p.simulation.t_end else p.replace(**{"simulation.t_end": t_end}), params_path)
             files += [summary_path, params_path]
         self.result = SimulationResult(
             params=p, _records=records, out_dir=output_dir, files=files, summary=summary,
@@ -1561,10 +1567,12 @@ def main(argv=None) -> int:
             p = p.replace(**changes)
     if args.watch and not p.simulation.progress.enable:
         ap.error("--watch prints on the progress lines: add --progress SECONDS")
+    if args.initial_time is not None and args.initial is None:
+        ap.error("--initial-time selects a row of a states.csv: add --initial FILE")
     if args.resolved:
         print(dumps(p), end="")
         return 0
-    if args.ph_report and p.simulation.energy_check == "off":
+    if args.ph_report and p.simulation.energy_check == "off":  # the check builds the report
         p = p.replace(**{"simulation.energy_check": "warn"})
     sim = Simulation(p)
     if args.list_states:

@@ -46,8 +46,9 @@ def test_bridge_topologies_share_the_existing_converter_module():
 
 def _bridge_configuration(model):
     return SimpleNamespace(
-        bridge=SimpleNamespace(model=model),
-        ctrl=SimpleNamespace(period=1e-4, offset=None, computation=0.0),
+        bridge=SimpleNamespace(model=model, parallel_capacitance=0.0, on_resistance=0.0),
+        ctrl=SimpleNamespace(type="custom", period=1e-4, offset=None, computation=0.0, outputs={},
+                             references=None),
         pwm=SimpleNamespace(
             load_period=1e-4,
             grid_offset=0.0,
@@ -55,6 +56,7 @@ def _bridge_configuration(model):
             f_sw=10_000.0,
             sync="asynchronous",
             carrier_phase=0.0,
+            pattern_sync="interval",
         ),
         base=SimpleNamespace(f0=50.0),
     )

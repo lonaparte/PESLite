@@ -111,7 +111,6 @@ class OutputStage:
         self.n_updates = 0
         self.n_saturated = 0
         self.first_saturation_t: float | None = None
-        self.saturated = False
         self.m_abc = np.zeros(3)
         self._command_saturated = False
 
@@ -159,7 +158,7 @@ class OutputStage:
         u_dc = u_dc * self.v_dc_base  # PWM receives DC volts; loop feedback stays pu
         values, saturated = self.equation(u_cmd_dq, rot, u_dc)
         saturated = saturated or self._command_saturated
-        self.m_abc, self.saturated = np.asarray(values, dtype=float), saturated
+        self.m_abc = np.asarray(values, dtype=float)
         duty = 0.5 * (1.0 + self.m_abc)
         if count:
             self.n_updates += 1

@@ -83,9 +83,7 @@ class Protection:
             self._requested_rocof_window = cfg.rocof.window
         self.fast_enabled = bool(cfg.overcurrent.enable)
         self.needs_frequency = bool(cfg.frequency.enable or cfg.rocof.enable)
-        self.rms_enabled = bool(getattr(getattr(cfg, "rms_current", None), "enable", False))
-        if self.rms_enabled and "hold_rms" not in self._timers:
-            self._timers["hold_rms"] = HoldTimer(self.T)
+        self.rms_enabled = bool(cfg.rms_current.enable)
 
     def retune(self, cfg: Any) -> None:
         """Apply new settings without changing latches, timers or observations."""

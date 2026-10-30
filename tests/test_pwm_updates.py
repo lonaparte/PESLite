@@ -53,10 +53,10 @@ def test_constant_gate_commands_do_not_wait_for_nonexistent_edges():
 
 
 def test_bridge_phase_clock_describes_the_applied_reference():
-    from peslite.components.pwm import PWM
+    from peslite.components.converter import SwitchingModel, ThreePhaseBridge
 
     omega = 2 * math.pi * 100e3
-    pwm = PWM(1e-5, 1e-5, 0.0, 0.0, 0.0, 1e-5, SynchronousCarrier(1))
+    pwm = SwitchingModel(1e-5, 1e-5, 0.0, 0.0, 0.0, 1e-5, SynchronousCarrier(1), ThreePhaseBridge())
     pwm.reset(np.full(3, .5), on=True)
     pwm.start(0.0, (0.0, omega), False)
     pwm.tick(1e-5, .4, omega)
@@ -72,10 +72,13 @@ def test_bridge_phase_clock_describes_the_applied_reference():
     (("angle",), SynchronousCarrier(1), "conflict with modulator states"),
 ])
 def test_pwm_register_layout_rejects_state_collisions(registers, modulator, match):
+    from peslite.components.converter import HalfBridge
     from peslite.components.pwm import PWM
 
+    topology = HalfBridge()
     with pytest.raises(ValueError, match=match):
-        PWM(1e-5, 1e-5, 0.0, 0.0, 0.0, 1e-5, modulator, duty_names=registers)
+        PWM(1e-5, 1e-5, 0.0, 0.0, 0.0, 1e-5, modulator, duty_names=registers,
+            switching_state=topology.switching_state, pwm_state=topology.pwm_state)
 
 
 @pytest.mark.parametrize("example", ["gfl", "buck", "wpt"])
@@ -136,20 +139,23 @@ def test_synchronous_continuation_restores_the_applied_waveform(update, tmp_path
     assert np.max(np.abs(error) / scale) < 1e-9
 
 
-@pytest.mark.parametrize("example, synchronous, update", [
-    ("gfl", False, "pulse"), ("gfl", True, "pulse"),
-    ("buck", False, "pulse"), ("wpt", False, "pulse"),
-    ("gfl", True, "interval"),
+@pytest.mark.parametrize("example, synchronous, update, control_offset", [
+    ("gfl", False, "pulse", None), ("gfl", True, "pulse", None),
+    ("buck", False, "pulse", None), ("wpt", False, "pulse", None),
+    ("gfl", True, "interval", None), ("gfl", True, "interval", 10e-6),
 ])
 @pytest.mark.parametrize("restart", [False, True])
 @pytest.mark.parametrize("variables", [("common",), ("all",)])
-def test_native_carrier_pulse_updates_match_python(example, synchronous, update, restart, variables, tmp_path):
+def test_native_carrier_pulse_updates_match_python(example, synchronous, update, control_offset, restart,
+                                                   variables, tmp_path):
     params = _case(example, "switching")
     from peslite.assembly.params import _unit_items
     changes = {f"units.{name}.pwm.pattern_sync": update for name, _ in _unit_items(params.units)}
     changes["simulation.t_end"] = 80e-6 if example == "wpt" else .001
     if synchronous:
         changes["units.vsc.pwm.sync"] = "synchronous"
+    if control_offset is not None:  # the control clock differs from the PWM load clock
+        changes["units.vsc.ctrl.offset"] = control_offset
     params = params.replace(**changes)
     if restart:
         first = params.replace(**{"simulation.t_end": params.simulation.t_end * .43})

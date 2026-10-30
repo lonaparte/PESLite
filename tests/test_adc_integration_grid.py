@@ -3,6 +3,7 @@
 import warnings
 
 import numpy as np
+import pytest
 
 import peslite
 from conftest import EXAMPLES
@@ -27,9 +28,15 @@ def _power(output_period, tmp_path, **changes):
     return dict(zip(times, np.asarray(result.columns()["charger.primary.power"])))
 
 
-def test_adc_sampling_grid_is_independent_of_the_output_grid(tmp_path):
-    coarse = _power(2.0e-6, tmp_path)
-    fine = _power(1.0e-7, tmp_path)
+@pytest.mark.parametrize("changes", [
+    {},
+    # Neither the output grid nor a continuous unit's own clock adds window nodes.
+    {"units.charger.primary.meas.period": None,
+     "units.charger.secondary.bridge.model": "averaging"},
+])
+def test_adc_sampling_grid_is_independent_of_the_output_grid(tmp_path, changes):
+    coarse = _power(2.0e-6, tmp_path, **changes)
+    fine = _power(1.0e-7, tmp_path, **changes)
     common = [time for time in coarse.keys() & fine.keys()
               if np.isfinite(coarse[time]) and np.isfinite(fine[time])]
     scale = max(1.0, *(abs(fine[time]) for time in common))

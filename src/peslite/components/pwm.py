@@ -12,13 +12,11 @@ from typing import Any, Callable, Iterator, Mapping, Optional, Protocol, NamedTu
 import numpy as np
 from numpy.typing import NDArray
 
-from ..control.blocks import abc2complex
 from ..control.profiles import PHASE_SHIFT_MODES, control_type
 from ..solver.model import ConfigError, _integer, _real
-from ..solver.timing import TIME_EPS, PeriodicClock, control_clock_offset, resolve_clock_offset
+from ..solver.timing import TIME_EPS, PeriodicClock
 
-__all__ = ["PWM", "TIME_EPS", "PeriodicClock", "resolve_clock_offset",
-           "control_clock_offset", "PhaseClock", "PulseSequence", "SwitchingSequence",
+__all__ = ["PWM", "PhaseClock", "PulseSequence", "SwitchingSequence",
            "Modulator", "CarrierComparison",
            "SynchronousCarrier", "ZOH", "PhaseShiftModulator",
            "phase_shift_level", "carrier", "carrier_position", "MODULATOR_TYPES",
@@ -213,34 +211,32 @@ class PWM:
 
     Interrupts occur every ``period`` from ``offset``. Compare registers load every
     ``load_period``. An interrupt writes commands and the PWM enable to the shadow registers;
-    a load copies them to the active registers only after ``computation`` seconds. The enable is
+    a load copies them to the active registers only after ``computation`` seconds. Until then
+    the shadow still holds the replaced word, which a load takes instead. The enable is
     carried through exactly the same register path as the commands.
     """
-
-    _NAMES = ("d_a", "d_b", "d_c", "on")
 
     def __init__(self, period: float, load_period: float, control_offset: float,
                  load_offset: float, computation: float,
                  carrier_period: float, modulator: Modulator, *,
                  pattern_sync: str = "interval",
-                 duty_names: tuple[str, ...] | None = None,
-                 switching_state: Callable[[Any], Any] | None = None,
-                 pwm_state: Callable[[Any], Any] | None = None) -> None:
+                 duty_names: tuple[str, ...],
+                 switching_state: Callable[[Any], Any],
+                 pwm_state: Callable[[Any], Any]) -> None:
         if not math.isfinite(computation) or computation < 0.0:
             raise ValueError(f"the computation time must be finite and >= 0, got {computation}")
         self.control_clock = PeriodicClock(_real(period), _real(control_offset))
         self.load_clock = PeriodicClock(_real(load_period), _real(load_offset))
         self.period, self.load_period = self.control_clock.period, self.load_clock.period
         self.computation, self.carrier_period = _real(computation), _real(carrier_period)
-        self._names = (*duty_names, "on") if duty_names is not None else self._NAMES
+        self._names = (*duty_names, "on")
         if any(not name or "." in name for name in self._names):
             raise ValueError("PWM register names must be nonempty path segments")
         if len(set(self._names)) != len(self._names):
             raise ValueError("PWM register names must be unique")
         self._width = len(self._names) - 1
         self.modulation_width = self._width - len(modulator.carried)
-        self._switching_state = switching_state or abc2complex
-        self._pwm_state = pwm_state or ZOH.value
+        self._switching_state, self._pwm_state = switching_state, pwm_state
         if pattern_sync not in ("interval", "pulse"):
             raise ValueError(f"pattern_sync must be 'interval' or 'pulse', got {pattern_sync!r}")
         self.pulse_update = (PulseSequence(modulator, getattr(modulator, "switching_legs", self.modulation_width))
@@ -251,7 +247,8 @@ class PWM:
             raise ValueError(f"PWM registers conflict with modulator states: {sorted(overlap)}")
         self.k = self.j = 0
         self.t_interrupt, self.t_load = self.interrupt(0), self.load_time(0)
-        self.active, self.shadow = [0.0] * (self._width + 1), [0.0] * (self._width + 1)
+        self.active = self.shadow = (0.0,) * (self._width + 1)
+        self.completed = self.shadow
         self.sync: tuple[float | None, float | None] = (None, None)
         self.t_sync = 0.0
         self.schedule: list[tuple[float, Any]] = []
@@ -261,14 +258,6 @@ class PWM:
     @property
     def register_names(self) -> tuple[str, ...]:
         return self._names[:-1]
-
-    @property
-    def control_offset(self) -> float:
-        return self.control_clock.offset
-
-    @property
-    def load_offset(self) -> float:
-        return self.load_clock.offset
 
     def phase_clock(self) -> PhaseClock:
         read = getattr(self.modulator, "phase_clock", None)
@@ -291,7 +280,7 @@ class PWM:
             self.pulse_update.modulator = value
         self._sequence = self._pulse_sequence if self.pulse_update is not None else value
         self._switching = (
-            self._pwm_interval if type(value) is ZOH else self._switching_interval
+            self._pwm_interval if isinstance(value, ZOH) else self._switching_interval
         )
 
     def interrupt(self, k: int) -> float:
@@ -300,38 +289,32 @@ class PWM:
     def load_time(self, j: int) -> float:
         return self.load_clock.at(j)
 
-    @property
-    def t_next(self) -> float:
-        """Next control interrupt (temporary name retained while the run loop is migrated)."""
-        return self.t_interrupt
-
     def after(self, t: float) -> int:
         """Index of the first control interrupt after ``t``."""
         return int(self.control_clock.index_after(t))
 
-    def count(self, t_a: float, t_b: float) -> int:
+    def control_count(self, t_a: float, t_b: float) -> int:
         """Number of control interrupts in ``[t_a, t_b]``, including both ends."""
-        first = math.ceil((t_a - self.control_clock.offset - TIME_EPS) / self.period)
-        return max(0, self.after(t_b) - first)
+        return max(0, self.after(t_b) - int(self.control_clock.index_at_or_after(t_a)))
 
     def describe(self) -> str:
         double = self.load_period < 0.75 * self.carrier_period
         return (f"control {1e-3 / self.period:g} kHz, computation {self.computation * 1e6:g} us, "
                 f"{'double' if double else 'single'} update")
 
-    def _word(self, registers, on: bool) -> list[float]:
+    def _word(self, registers, on: bool) -> tuple[float, ...]:
         # Registers are scalar values, not a numerical vector operation. Preserve each
         # scalar's arithmetic semantics so ordinary construction also binds export parameters.
-        values = list(registers)
+        values = registers.tolist() if isinstance(registers, np.ndarray) else list(registers)
         if len(values) != self._width:
             raise ValueError(f"expected {self._width} command registers, got {len(values)}")
         values.append(1.0 if on else 0.0)
-        return values
+        return tuple(values)
 
     def reset(self, d_abc: NDArray[np.float64], on: bool = False) -> None:
         """Put commands and enable in both register banks; the default is blocked."""
         word = self._word(d_abc, on)
-        self.active, self.shadow = word.copy(), word.copy()
+        self.active = self.shadow = self.completed = word
 
     def tick(self, t: float, theta: float | None = None, omega: float | None = None) -> None:
         """Advance the control-interrupt timer and its synchronous-carrier reference."""
@@ -344,7 +327,8 @@ class PWM:
               omega: float | None = None) -> None:
         """Advance an interrupt and write its computed commands and enable to shadow."""
         self.tick(t, theta, omega)
-        self.shadow = self._word(d_abc, on)
+        # computation < period: the replaced word's computation has completed.
+        self.completed, self.shadow = self.shadow, self._word(d_abc, on)
 
     @property
     def duty(self) -> NDArray[np.float64]:
@@ -361,6 +345,8 @@ class PWM:
         self.k = int(self.control_clock.index_after(t))
         self.j = int(self.load_clock.index_after(t))
         self.t_interrupt, self.t_load = self.interrupt(self.k), self.load_time(self.j)
+        # The word the latest interrupt replaced, once a load has followed its completion.
+        self.completed = self.active
         last = self.interrupt(self.k - 1)
         self.sync, self.t_sync = sync, min(last, t)
         q = self._switching(self.load_time(self.j - 1), self.active[:-1], t)
@@ -371,10 +357,8 @@ class PWM:
     def load(self, t: float):
         """Load shadow into active registers and schedule switching until the next load."""
         completed = self.interrupt(self.k - 1) + self.computation
-        if completed <= t + TIME_EPS:
-            # Writes replace the shadow word, so the active bank can take ownership without a
-            # copy. Named-state writes detach the banks before mutating either one in place.
-            self.active = self.shadow
+        # A load within the latest computation takes the completed word it replaces.
+        self.active = self.shadow if completed <= t + TIME_EPS else self.completed
         q = self._switching(t, self.active[:-1], t)
         self.j += 1
         self.t_load = self.load_time(self.j)
@@ -413,7 +397,7 @@ class PWM:
     def _pulse_sequence(self, t, span, values, theta, omega):
         return self.pulse_update(t, span, values, theta, omega, enabled=self.on)
 
-    def edge(self, t: float) -> bool:
+    def fast_edge(self, t: float) -> bool:
         """Whether the old switching or held-input interval ends at ``t``."""
         return abs(self.next_switch - t) < TIME_EPS or abs(self.load_end - t) < TIME_EPS
 
@@ -463,17 +447,15 @@ class PWM:
         if own & set(values):
             (self.pulse_update or self._modulator).set_state(
                 {key: value for key, value in values.items() if key in own})
-        if self.active is self.shadow:
-            # load() may transfer ownership without copying.  Named-state writes address the two
-            # register banks independently, so detach them before changing either bank in place.
-            self.active = self.active.copy()
+        active, shadow = list(self.active), list(self.shadow)
         for key, value in values.items():
             if key in own:
                 continue
             head, _, name = key.rpartition(".")
             k = self._names.index(name)
-            target = {"": self.active, "shadow": self.shadow}[head]
+            target = {"": active, "shadow": shadow}[head]
             target[k] = (1.0 if value else 0.0) if name == "on" else float(value)
+        self.active, self.shadow = tuple(active), tuple(shadow)
 
 
 # ------------------------------------------------------------------ the triangular carrier
@@ -665,20 +647,10 @@ class ZOH(Modulator):
         result.carried = carried
         return result
 
-
-
-    @staticmethod
-    def value(d_abc: NDArray[np.float64]) -> complex:
-        """Return the held space vector without constructing a one-segment schedule."""
-        d_a = min(1.0, max(0.0, float(d_abc[0])))
-        d_b = min(1.0, max(0.0, float(d_abc[1])))
-        d_c = min(1.0, max(0.0, float(d_abc[2])))
-        return abc2complex((d_a, d_b, d_c))
-
     def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence:
         d = np.clip(np.asarray(d_abc, dtype=float), 0.0, 1.0)
-        return SwitchingSequence(np.array([T_s]), d.reshape(1, 3))
+        return SwitchingSequence(np.array([T_s]), d[None, :])
 
 
 
@@ -905,9 +877,6 @@ def make_modulator(pwm: Any, f0: float, bridge: Any, kind: str | None = None,
 
 
 def make_unit_modulator(cfg):
-    control = getattr(cfg, "ctrl", None)
-    spec = control_type(control.type) if control is not None and hasattr(control, "type") else None
-    carried = spec.interface.auxiliary_outputs(control.outputs) if spec is not None else ()
-    return make_modulator(cfg.pwm, cfg.base.f0, cfg.bridge,
-                          spec.modulator if spec is not None else None,
-                          control.references if spec is not None else None, carried)
+    spec = control_type(cfg.ctrl.type)
+    return make_modulator(cfg.pwm, cfg.base.f0, cfg.bridge, spec.modulator, cfg.ctrl.references,
+                          spec.interface.auxiliary_outputs(cfg.ctrl.outputs))

@@ -14,7 +14,7 @@ from typing import Any, Callable, ClassVar, Iterable, Mapping, Optional
 
 __all__ = [
     "NAMED", "SWITCHABLE", "SWITCHING", "Event", "EVENT_TYPES", "register_event_type",
-    "Connect", "Disconnect", "Set", "events_for", "switching_schedule", "connected_at",
+    "Connect", "Disconnect", "Set", "events_for", "switching_schedule",
     "Scenario", "SourceScenario",
 ]
 
@@ -134,16 +134,6 @@ def switching_schedule(events: Iterable[Any]) -> dict[str, list[tuple[float, boo
 
 def _initial_connection(steps, initial=None):
     return initial if initial is not None else not steps[0][1] if steps else True
-
-
-def connected_at(steps: list[tuple[float, bool]], t: float) -> bool:
-    """Return a target's state at ``t``; before its first step it is in the opposite state."""
-    state = _initial_connection(steps)
-    for event_t, connected in steps:
-        if event_t > t + 1e-10:
-            break
-        state = connected
-    return state
 
 
 class Scenario:

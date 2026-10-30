@@ -177,7 +177,7 @@ Only an explicit `type: full_bridge` can have no controlled device. A diode full
 gates to block, so it accepts no protection criterion.
 
 Measurements use the existing ADC independently of a controller. `meas.period` sets its owned
-sampling clock (the output period is used when absent); window means, RMS windows and
+sampling and protection clock (the output period is used when absent); window means, RMS windows and
 `meas.sources` use the same channel and state interfaces. Held means are published as
 `<unit>.meas.<channel>_mean`, alongside the existing `<unit>.meas.<channel>_rms` signals.
 Instantaneous conversions held by an independent ADC use `<unit>.meas.<channel>`.

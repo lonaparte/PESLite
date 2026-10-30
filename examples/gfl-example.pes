@@ -146,8 +146,8 @@ events:                    # what happens during the run, by name; written only 
   # load_on: {type: connect, target: load1, t: 1.0}                # load1 starts disconnected
   # p_step: {type: set, t: 2.0, set: {units.vsc.ctrl.references.p_ref_pu: 0.8}}
   #                        # set: new values from t on, paths as for --set: references, loop parameters
-  #                        # (not type, period), protection, dc source; a source's v, f, angle, l, r;
-  #                        # l, r of lines and elements; c, r_d of buses
+  #                        # (not type, period or state switches), protection, dc source; a source's
+  #                        # v, f, angle, l, r; l, r of lines and elements; c, r_d of buses
   # weak_grid: {type: set, t: 4.0, set: {sources.grid.x_pu: 0.6, sources.grid.f: 49.8}}
   # A custom event type, registered with peslite.register_event_type, is written here too.
 

@@ -14,7 +14,7 @@ from ..components.adc import _PortMeasurement
 from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather, scatter
-from .events import SWITCHABLE, SourceScenario, connected_at, switching_schedule
+from .events import SWITCHABLE, Scenario, SourceScenario
 from .params import Change, Params, _parameterized, _split_path, _unit_leaves, _unit_path
 from .types import unit_type
 from .unit import DCConverter, Unit, VSC
@@ -24,7 +24,6 @@ __all__ = ["System"]
 
 def _start_connections(system, p: Params, t: float) -> None:
     """Initialize each connection through its owner, once, before restoring control state."""
-    schedule = switching_schedule(p.changes)
     for section in SWITCHABLE:
         owners = getattr(system, "named_elements" if section == "elements" else section, {})
         for name, owner in owners.items():
@@ -33,7 +32,7 @@ def _start_connections(system, p: Params, t: float) -> None:
                 start(t)
             else:
                 target = f"{section}.{name}"
-                if not connected_at(schedule.get(target, ()), t):
+                if not Scenario(p.changes, target).connected(t):
                     system.switch(target, False, t)
 
 
@@ -354,15 +353,10 @@ def _assemble_wpt(name: str, cfg: Any, system: "System",
     for side in unit_type(cfg.type).children:
         child = _assemble_unit(f"{name}.{side}", getattr(cfg, side), system, parts)
         terminal = getattr(link, f"{side}_terminal")
-        child.attach(
-            terminal,
-            f"units.{name}.{side}",
-            "power" if "power" in child.ports else None,
-        )
+        child.attach(terminal, f"units.{name}.{side}", "power")
         for scc in link.switched:
             if scc.side == side:
-                port = child.port("power" if "power" in child.ports else None)
-                scc.bind_bridge(child.units[port.owner].bridge)
+                scc.bind_bridge(child.units[child.port("power").owner].bridge)
         assembly.ports[side] = child.port()
         assembly.include(child)
     default = assembly.port()

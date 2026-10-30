@@ -15,9 +15,9 @@ from numpy.typing import NDArray
 from ..control.blocks import A120, phases, smoothstep
 from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, ConfigError, Empty, LocatedZero, OutputMethod, _real
-from ..solver.timing import control_clock_offset
+from ..solver.timing import TIME_EPS, control_clock_offset
 from .network import RCNode, Terminal, _extend_record
-from .pwm import TIME_EPS, CarrierComparison, Modulator, PWM, ZOH, make_unit_modulator
+from .pwm import CarrierComparison, Modulator, PWM, ZOH, make_unit_modulator
 
 __all__ = ["ThreePhaseBridge", "SwitchingModel", "PWMAveragingModel", "AveragingModel",
            "HalfBridge", "FullBridge", "DCLink", "DCCapacitor",
@@ -411,6 +411,8 @@ class _SampledModel(_BridgeModel, PWM):
     on = PWM.on
     reset = PWM.reset
     start = PWM.start
+    control_count = PWM.control_count
+    fast_edge = PWM.fast_edge
     get_state = PWM.get_state
     set_state = PWM.set_state
     describe = PWM.describe
@@ -479,15 +481,8 @@ class _SampledModel(_BridgeModel, PWM):
     def previous_control_time(self) -> float:
         return self.interrupt(self.k - 1)
 
-    def control_count(self, t_a: float, t_b: float) -> int:
-        return self.count(t_a, t_b)
-
     def control_due(self, t: float) -> bool:
         return abs(self.t_interrupt - t) < TIME_EPS
-
-    def fast_edge(self, t: float) -> bool:
-        """Whether the old bridge output interval ends at ``t``."""
-        return self.edge(t)
 
     def actuate(self, t: float, command: tuple[float, Any] | None,
                 enabled: bool) -> list[Any]:
@@ -548,8 +543,8 @@ def topology_type(name: str, where: str = "bridge.type") -> type:
 def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None) -> _BridgeModel:
     """Compose a bridge topology with switching, PWM or averaging behavior."""
     topology = topology if topology is not None else make_topology(cfg.bridge)
-    impedance = {name: getattr(cfg.bridge, name, 0.0)
-                 for name in ("parallel_capacitance", "on_resistance")}
+    impedance = {"parallel_capacitance": cfg.bridge.parallel_capacitance,
+                 "on_resistance": cfg.bridge.on_resistance}
     if not getattr(topology, "controlled", True):
         if modulator is not None:
             raise ValueError("a diode full-bridge rectifier does not use a PWM modulator")
@@ -566,7 +561,7 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None) -> 
         pwm.switching_period,
         modulator if modulator is not None else make_unit_modulator(cfg),
         topology,
-        pattern_sync=getattr(pwm, "pattern_sync", "interval"),
+        pattern_sync=pwm.pattern_sync,
         **impedance,
     )
 
@@ -886,9 +881,7 @@ class FullBridge:
 
     @classmethod
     def from_config(cls, cfg: Any) -> "FullBridge":
-        upper = getattr(cfg, "upper_controlled", True)
-        lower = getattr(cfg, "lower_controlled", True)
-        return cls(upper_controlled=upper, lower_controlled=lower)
+        return cls(upper_controlled=cfg.upper_controlled, lower_controlled=cfg.lower_controlled)
 
     def state_from_duty(self, duty: float) -> float:
         """Return the differential bridge ratio produced by a bipolar duty command."""
@@ -941,7 +934,7 @@ class FullBridge:
 
     @staticmethod
     def _diode_current(model, t: float) -> None:
-        model.out.i_dc = -model._current.sign * _real(np.real(model.inp.i_c))
+        model.out.i_dc = -model._current.sign * model.inp.i_c.real
 
     @staticmethod
     def _diode_voltage(model, t: float) -> None:
@@ -957,28 +950,28 @@ class FullBridge:
     @staticmethod
     def _commutation_margin(model) -> float:
         """Nonnegative while the present conduction state is valid."""
-        current = _real(np.real(model.inp.i_c))
-        u_dc = _real(np.real(model.inp.u_dc))
+        current = model.inp.i_c.real
+        u_dc = model.inp.u_dc.real
         if model._current.sign != 0.0:
             return model._current.margin(current)
         # blocked: valid while |u_hold| < u_dc and the port current keeps its zero value
-        return min(u_dc - abs(_real(np.real(model.inp.u_hold))),
+        return min(u_dc - abs(model.inp.u_hold.real),
                    model._current.margin(current, model.topology.zero_current_tolerance))
 
     @staticmethod
     def _commutate(model, t: float) -> None:
         """Switch the conducting pair at a located current zero, or end a blocking interval."""
-        current = _real(np.real(model.inp.i_c))
-        u_dc = _real(np.real(model.inp.u_dc))
+        current = model.inp.i_c.real
+        u_dc = model.inp.u_dc.real
         if model._current.sign == 0.0:
             if abs(model._current.offset(current)) > model.topology.zero_current_tolerance:
                 # current through blocked diodes (an initial state): conduct in its direction
                 model._current.sign = _real(np.copysign(1.0, model._current.offset(current)))
             else:
-                model._current.locate(current, -1.0 if _real(np.real(model.inp.u_hold)) > 0.0
+                model._current.locate(current, -1.0 if model.inp.u_hold.real > 0.0
                                      else 1.0)
         else:
-            reverse = abs(_real(np.real(model.inp.u_hold))) > u_dc
+            reverse = abs(model.inp.u_hold.real) > u_dc
             model._current.locate(current, -model._current.sign if reverse else 0.0)
         model.commutations += 1
 

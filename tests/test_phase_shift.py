@@ -342,7 +342,8 @@ def test_power_feedback_drives_the_width(tmp_path):
                    "PhaseShiftModulation.width": "PowerControl.modulation"}
     primary = _phase_shift(0.3, loops=loops, connections=connections, power=800.0)
     primary["ctrl"]["computation"] = 1e-6
-    primary["meas"] = {"average": ["power"]}
+    # The window integrates on its ADC grid, not on output rows: oversample the resonant power.
+    primary["meas"] = {"average": ["power"], "period": 1.0 / (8 * F)}
     tree = _ps_tree(primary, _rectifier(200.0), 3e-3)
     tree["simulation"]["output"]["period"] = 1e-6
     result = peslite.Simulation(from_dict(tree)).run(out_dir=tmp_path)

@@ -265,7 +265,8 @@ and `common` also keeps automatically detected structure-sensitive parameters co
 and controller gains use the same interface, without a separate reference whitelist or naming rule.
 
 Imperix additionally keeps hardware timing fixed at export: PWM frequency/carrier phase, control
-and loop periods, ADC periods/windows, and the configured computation delay are not tunable.
+and loop periods, control and ADC clock offsets, ADC periods/windows, and the configured
+computation delay are not tunable.
 Explicitly selecting a timing parameter, including through a section, fails with its full path.
 `all` and `common` omit timing parameters and report the omitted paths. Dependencies introduced by
 custom construction factories are traced through the shared parameter expressions, not a separate

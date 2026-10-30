@@ -63,7 +63,8 @@ opens its series branch when present, and blocks an unfiltered bridge on its nam
 Changes runtime-safe parameter paths and validates the complete parameter tree before use. Supported
 families include source values, line/bus electrical parameters, controller references and loop
 gains, protection settings, DC-source values and retunable element parameters. Structural fields
-such as component type, bus assignment, loop type and loop period cannot change at run time.
+such as component type, bus assignment, loop type and loop period cannot change at run time, nor can
+loop switches that add or remove states, such as `SRFPLL.normalisation` or a filter `enable`.
 
 Changed control loops retain their named state. Source frequency/angle changes preserve phase
 continuity, and solver caches are notified after the parameter update.
@@ -138,7 +139,8 @@ Depending on the selected model, named state includes:
 - controller integrators, filters, startup progress and protection timers;
 - PWM active and shadow registers and enable bits;
 - ADC averaging-window accumulators;
-- multirate window anchors and slopes;
+- multirate window anchors, slopes and input integrals, so a row inside a window also continues
+  exactly;
 - unit trip/fault latches.
 
 Timer indices and the next ADC/PWM instants are reconstructed from the saved time. Intermediate ADC

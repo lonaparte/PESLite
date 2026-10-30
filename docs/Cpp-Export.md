@@ -140,6 +140,8 @@ ADC oversample count or RMS/ROCOF history size requires a new export. Parameter 
 checked initialization branches come from the ordinary schemas and constructors. Invalid values
 and changes outside the compiled specialization fail before simulation output is created.
 Clock changes that would alter an already initialized switching-edge sequence also require a new export.
+So do clock changes that would alter the start-up interrupt count of a unit connected at or before
+the initial time.
 The generated schedule uses the same PWM-load, controller and ADC period-and-offset clocks as
 Python. Changing an exported offset across the aligned/independent ADC boundary changes held-state
 layout and is therefore rejected by the same structural-specialization guard.
@@ -269,6 +271,14 @@ common trip path, not a WPT phase override.
   infer an optional-value protocol from a field's initial value. Built-in first-occurrence times
   use numeric sentinels internally and report absent occurrences as JSON `null`.
 - Only parameters reported by `--list-params` can change in the compiled simulator.
+- Scheduled `set` events are lowered for controller references
+  (`units.<unit>.ctrl.references.<name>`), source `v`, `f` and `angle`, connection commands and
+  element scalars declared by `parameter_bindings()`. Export refuses the other `set` targets that
+  a Python run accepts, with `event '<name>' writes unsupported variable '<path>'`: bus `c` and
+  `r_d`, branch and source `l` and `r`, controller loop parameters
+  (`units.<unit>.ctrl.loops.<loop>.<field>`), protection settings (`units.<unit>.protection.*`),
+  DC-link source values (`units.<unit>.dclink.source.*`) and element fields without a binding.
+  A retained parameter can still start a run with another value through `--set`.
 
 The exporter supports the built-in switching, PWM-period-averaged and ideal averaged bridge models,
 including square-wave phase-shift modulation in the switching model.

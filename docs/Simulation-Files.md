@@ -49,7 +49,9 @@ and frequency-based per-unit values. A scalar circuit written in SI therefore us
 `bus`, `dclink`, `pwm`, `ctrl`, `bridge`, `meas`, `protection` and `s_base` are common to every
 non-composite converter unit. The selected `unit.type` contributes its own electrical fields:
 `vsc` adds `ac_filter`, while `dc_converter` adds `filter`. The common ADC and protection lifecycle
-are shared by both converter families.
+are shared by both converter families. A scalar unit's protection voltage and current limits are
+per unit of its DC base (`dclink.vdc_ref` and `s_base / dclink.vdc_ref`), the base its protection
+compares against, so SI limits need no AC base.
 
 `meas.sources` optionally maps existing channel names to physical subsystem outputs or named
 port quantities. `meas.rms` maps channels to sliding RMS windows in seconds. Both use the same
@@ -287,7 +289,7 @@ compensated links. No unit-type or restriction to one rectifying side is imposed
 Selecting `switching`, `pwm_averaging` or `averaging` changes controlled bridges and the associated
 solver preset, but it does not replace this controllerless bridge's natural-conduction equations.
 `meas` may configure independent sampling, means, RMS and existing physical sources; its
-`period` defaults to the output period when there is no controller.
+`period` is the unit's own measurement and protection clock and defaults to the output period.
 For a sampled controlled Unit, `meas.offset` selects the ADC clock position in seconds and defaults
 to the controller clock position. `ctrl.offset` selects the controller clock position and defaults
 to the PWM load-clock position. Both offsets must lie within their respective periods. An explicit
@@ -326,8 +328,9 @@ from the connected source or converter rating.
 ## Defaults and resolved files
 
 Some defaults are derived from other values. For example, sampled control defaults to one carrier
-period and ADC timing defaults to the control period. Derived defaults are recomputed after
-`--set` or `Params.replace()` changes their source parameter.
+period, ADC timing defaults to the control period, an AC source's `v` defaults to 1 pu of the
+system base and a DC voltage source's `v` to `dclink.vdc_ref`. Derived defaults are recomputed
+after `--set` or `Params.replace()` changes their source parameter.
 
 Print the complete resolved tree with:
 

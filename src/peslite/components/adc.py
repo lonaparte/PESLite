@@ -166,9 +166,9 @@ class ADC:
         self.peeks: list[ADCSample] = []  # instantaneous samples since the last interrupt
         self.n_samp = 1  # sample 0 of a period is its control interrupt
         self.clocked = clocked
-        self.independent = bool(
-            clocked or sample_offset != control_offset % sample_period
-        )
+        # Aligned when the control interrupts are conversion instants within the clock tolerance.
+        self.independent = bool(clocked or not self.sampling_clock.due(
+            control_offset, self.sampling_clock.index_at_or_after(control_offset)))
         self._clock_index = 0
         self.values = ports.read() if self.independent else {}
         # the next interrupt's window is open (a full-period window opens at the interrupt itself)
@@ -243,8 +243,6 @@ class ADC:
             self._clock_index = int(self._start_index(t, held))
         if last is None or next_ is None:
             raise ValueError("an externally clocked ADC needs its preceding and next interrupt")
-        if self.independent and held:
-            self.values = self.ports.read()
         self.n_samp = (1 if self.independent else
                        max(1, int(math.floor((t - last + TIME_EPS) / self.sample_period)) + 1))
         length = self.length
@@ -253,7 +251,7 @@ class ADC:
             self.held_before(_real(np.maximum(0.0, t - (next_ - length))))
         self.peeks = []
         if self.independent and held:
-            values = self.ports.read()
+            self.values = values = self.ports.read()
             index = int(self.sampling_clock.index_after(last))
             while self.sampling_clock.at(index) < t - TIME_EPS:
                 self.peeks.append(ADCSample(self.sampling_clock.at(index), values))
@@ -319,9 +317,7 @@ class ADC:
 
     # ------------------------------------------------------------ the samples
     def t_sample(self, start: float) -> float:
-        """The next sample between two interrupts in the period starting at ``start``; ``inf`` if none."""
-        if self.independent:
-            return self.sampling_clock.at(self._clock_index)
+        """The next aligned oversample in the period starting at ``start``; ``inf`` if none."""
         return (start + self.n_samp * self.sample_period) if self.n_samp < self.samples else math.inf
 
     def peek(self, t: float) -> None:
@@ -365,25 +361,18 @@ class ADC:
         conversion = self.sampling_clock.at(self._clock_index)
         return (min(conversion, self.t_window(conversion)) if self.clocked else conversion)
 
-    def sample_clock(self, t: float) -> bool:
+    def sample_clock(self, t: float) -> None:
         """Use the ordinary sample/window operations when this ADC owns its trigger clock."""
         interrupt = self.sampling_clock.at(self._clock_index)
         if abs(t - interrupt) < TIME_EPS:
             self.sample(t)
-            return True
-        if abs(t - self.t_window(interrupt)) < TIME_EPS:
+        elif abs(t - self.t_window(interrupt)) < TIME_EPS:
             self.open()
-        return False
 
-    def sample_rms(self, t: float | None = None) -> bool:
+    def sample_rms(self) -> None:
         """Finish one statistics period without changing instantaneous control measurements."""
-        if t is not None:
-            index = round((t - self.control_clock.offset) / self.period)
-            if abs(t - self.control_clock.at(index)) >= TIME_EPS:
-                return False
         for window in self.rms.values():
             window.sample()
-        return True
 
     def measure(self, t: float, reading: Mapping[str, complex | float] | None = None, *,
                 include_sample: bool = True) -> ADCSample:

@@ -321,7 +321,7 @@ def _into(frame: float):
 class PowerFilterParams:
     """Optional first-order low-pass filter on measured active and reactive power."""
 
-    enable: bool = False
+    enable: bool = field(default=False, metadata={"runtime": False})  # switches filter states
     bandwidth: Optional[float] = None  # Hz
 
     def __post_init__(self) -> None:
@@ -357,7 +357,7 @@ class SRFPLL(Loop):
     class Params:
         kp_pu: float
         ki_pu: float
-        normalisation: str = "rated"
+        normalisation: str = field(default="rated", metadata={"runtime": False})
         period: Optional[float] = None
         type: str = "srf_pll"
 
@@ -708,10 +708,11 @@ class SyncLaw(Loop):
 
     def _sample(self, T, *inputs) -> None:
         """Advance the named states by one forward-Euler step of :meth:`_flow`."""
-        state = self.get_state()
-        assign(self, {name: state[name] + T * derivative
-                      for name, derivative in zip(self.state_names, self._flow(*inputs))},
-               self.state_names)
+        names = self.state_names
+        attributes = names if isinstance(names, tuple) else names.values()
+        values = [getattr(self, name) for name in attributes]  # before _flow sets omega, v_mag
+        for name, value, derivative in zip(attributes, values, self._flow(*inputs)):
+            setattr(self, name, value + T * derivative)
 
     def flow_path(self, voltage, current, u_dc, p_ref, q_ref, v_ref):
         """Shared continuous evaluation for all synchronization laws."""
@@ -921,15 +922,6 @@ class DVOC(SyncLaw):
         self.eta, self.alpha = cfg.eta_pu, cfg.alpha_pu
         self.rot = _complex(np.exp(1j * cfg.kappa))
 
-    def _sample(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
-                p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
-        V = self.v_mag
-        i_star = (p_ref_pu - 1j * q_ref_pu) * V / (v_ref_pu * v_ref_pu)
-        w = self.eta * self.rot * (i_star - i_dq) + self.eta * self.alpha * (1.0 - V * V / (v_ref_pu * v_ref_pu)) * V
-        self.omega = self.w0 + w.imag / V
-        self.v_mag = V + T * w.real
-        self.theta += T * self.omega
-
     def _flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
               q_ref_pu, v_ref_pu, i_dq):
         V = max(self.v_mag, 1e-12)
@@ -983,7 +975,8 @@ class VirtualImpedance(Loop):
     class Params:
         r_v_pu: float = 0.0
         x_v_pu: float = 0.0
-        period: Optional[float] = None  # None: runs on upstream updates
+        # period None: runs on upstream updates
+        period: Optional[float] = None
         type: str = "virtual_impedance"
 
         _quantities = {"r_v_pu": "resistance", "x_v_pu": "resistance"}

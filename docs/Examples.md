@@ -134,9 +134,10 @@ continuous control and C++ export. Selecting another Unit's measurement is expli
 not an implicit communication model or a claim that hardware makes that measurement locally.
 
 RMS is `sqrt(mean(abs(signal)**2))`, integrated before sampling over a sliding window of whole
-control periods. Ideal averaging uses whole existing protection/output periods instead; it does
-not discretize the continuous controller. This is total waveform RMS, not a fundamental/envelope
-estimator; for a complex space vector it is the RMS of its magnitude, not a per-phase RMS conversion.
+control periods. Ideal averaging uses whole periods of its protection clock instead (`meas.period`,
+default `simulation.output.period`); it does not discretize the continuous controller. This is
+total waveform RMS, not a fundamental/envelope estimator; for a complex space vector it is the RMS
+of its magnitude, not a per-phase RMS conversion.
 An averaged model's RMS does not reconstruct the switching harmonics omitted by that model.
 The statistic is unavailable until a complete window has elapsed. Signals are named
 `<unit>.meas.<channel>_rms`. Only configured windows are allocated.

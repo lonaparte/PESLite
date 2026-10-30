@@ -1268,12 +1268,14 @@ def test_ac_and_nested_wpt_gains_retune_through_the_same_parameter_store(name, k
 
 @pytest.mark.parametrize("prefix", [(), ("all",), ("common",)])
 @pytest.mark.parametrize("field", ["pwm.f_sw", "pwm.carrier_phase", "ctrl.period", "ctrl.computation",
+                                   "ctrl.offset", "meas.offset",
                                    "meas.period", "meas.window", "ctrl.loops.DCVoltageControl.period",
                                    "pwm", "ctrl.loops"])
 def test_explicit_timing_selection_is_rejected_before_writing_files(prefix, field, tmp_path):
     sim = peslite.Simulation(_simulation().p.replace(**{
         "units.converter.meas.period": 50e-6, "units.converter.meas.window": 25e-6,
         "units.converter.meas.average": ["voltage"],
+        "units.converter.ctrl.offset": 0.0, "units.converter.meas.offset": 0.0,
     }))
     path = "units.converter." + field
     with pytest.raises(ValueError, match="timing parameters must remain constant") as error:

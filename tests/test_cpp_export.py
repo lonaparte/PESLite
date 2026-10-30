@@ -378,6 +378,8 @@ def test_native_named_load_step_and_rms_match_python(mode, link, tmp_path):
         tree["units"]["charger"]["secondary"]["meas"].update(
             sources={"power": "load.power"}, average=["power"],
         )
+        # An independent ADC clock publishes its held conversions next to the RMS signals.
+        tree["units"]["charger"]["primary"]["meas"]["offset"] = 0.25e-6
     tree["events"] = {"step": {"type": "set", "t": 15e-6, "set": {"elements.load.r": 3.0}}}
     source, native, python = _run_generated(from_dict(tree), tmp_path / "loaded", compiler)
     assert "_rocof_window;" not in source.read_text()
@@ -469,13 +471,15 @@ def test_native_power_measurement_can_select_another_named_port(tmp_path):
     np.testing.assert_allclose(list(a.values()), list(b.values()), rtol=2e-6, atol=2e-6)
 
 
-@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
-def test_native_vsc_uses_the_same_measurement_binding_and_rms(mode, tmp_path):
+@pytest.mark.parametrize("mode, method", [("switching", "spwm"), ("pwm_averaging", "spwm"),
+                                          ("averaging", "spwm"), ("switching", "svpwm")])
+def test_native_vsc_uses_the_same_measurement_binding_and_rms(mode, method, tmp_path):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
     params = peslite.load(EXAMPLES / "gfl-example.pes").replace(**{
         "units.vsc.bridge.model": mode,
+        "units.vsc.pwm.method": method,
         "units.vsc.meas.sources": {"u_g": "grid.emf.e_g", "i_c": "vsc.branch_f.i"},
         "units.vsc.meas.rms": {"i_c": 1e-3},
         "units.vsc.protection.overcurrent.enable": False,
@@ -686,10 +690,12 @@ def test_generated_cpp_matches_independent_control_adc_and_pwm_offsets(tmp_path)
         "units.vsc.meas.offset": 5.0e-6,
         "units.vsc.meas.average": ["u_g", "i_c"],
         "units.vsc.meas.window": 25.0e-6,
+        "events.connect_vsc.t": 0.0,
+        "events.connect_vsc.ramp": 0.5e-3,
         "simulation.t_end": 0.001,
         "simulation.output.period": 50.0e-6,
         "simulation.output.states": True,
-        "simulation.output.signals": False,
+        "simulation.output.signals": True,
         "simulation.output.energy": False,
         "simulation.energy_check": "off",
     })
@@ -697,15 +703,16 @@ def test_generated_cpp_matches_independent_control_adc_and_pwm_offsets(tmp_path)
         params, tmp_path / "independent-clock-offsets", compiler
     )
 
-    actual = _final_csv(cpp_out / "states.csv")
-    expected = _final_csv(python_out / "states.csv")
-    assert actual.keys() == expected.keys()
-    np.testing.assert_allclose(
-        [actual[name] for name in actual],
-        [expected[name] for name in expected],
-        rtol=2e-8,
-        atol=2e-9,
-    )
+    for filename in ("states.csv", "plant.csv"):  # plant.csv includes the *_raw_pu logs
+        actual = _final_csv(cpp_out / filename)
+        expected = _final_csv(python_out / filename)
+        assert actual.keys() == expected.keys()
+        np.testing.assert_allclose(
+            [actual[name] for name in actual],
+            [expected[name] for name in expected],
+            rtol=2e-8,
+            atol=2e-9,
+        )
 
 
 @pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))

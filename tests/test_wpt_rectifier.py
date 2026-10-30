@@ -543,6 +543,43 @@ def test_diode_full_bridge_converter_reuses_adc_sources_means_rms_and_restart(tm
         assert continued.final_states()[name] == pytest.approx(value, rel=1e-8, abs=1e-8)
 
 
+def test_controllerless_adc_consumes_a_short_averaging_window_boundary():
+    tree = _tree(SS, 200.0, 1.9e-6)
+    tree["units"]["charger"]["secondary"]["meas"] = {
+        "period": 0.5e-6, "window": 0.25e-6, "average": ["current"],
+    }
+    tree["simulation"]["output"].update(states=False, signals=False, energy=False)
+    simulation = peslite.Simulation(from_dict(tree))
+    result = simulation.run(out_dir=None)
+    adc = simulation.unit("charger.secondary").adc
+    assert result.summary["t_stop"] == pytest.approx(1.9e-6)
+    assert adc.window_open
+    assert adc.next_time() == pytest.approx(2.0e-6)
+
+
+def test_controllerless_continuation_does_not_repeat_the_saved_clock_edge(tmp_path):
+    tree = _tree(SS, 200.0, 1.0e-6)
+    tree["simulation"]["output"].update(
+        period=0.5e-6, states=True, signals=False, energy=False,
+    )
+    peslite.Simulation(from_dict(tree)).run(out_dir=tmp_path / "first")
+
+    tree["simulation"]["t_end"] = 1.2e-6
+    tree["simulation"]["initial"] = read_initial(tmp_path / "first" / "states.csv")
+    simulation = peslite.Simulation(from_dict(tree))
+    protection = simulation.unit("charger.secondary").protection
+    calls = []
+    check_sampled = protection.check_sampled
+
+    def record(t, sample):
+        calls.append(t)
+        return check_sampled(t, sample)
+
+    protection.check_sampled = record
+    simulation.run(out_dir=tmp_path / "continued")
+    assert calls == []
+
+
 @pytest.mark.parametrize("period", [None, 0.5e-6])
 def test_diode_full_bridge_adc_window_cannot_exceed_its_actual_sampling_period(period):
     tree = _tree(SS, 200.0, 12e-6)

@@ -184,6 +184,7 @@ def test_averaging_silently_ignores_all_sampled_timing_semantics(tmp_path):
         "events.connect_vsc.ramp": 0.0,
         "simulation.t_end": 0.001,
         "simulation.solver.linearisations": 0,
+        "units.vsc.meas.period": 7e-6,  # not ignored: the unit's protection clock
     }
     baseline = peslite.load(EXAMPLES / "gfl-example.pes", **common)
     configured = peslite.load(EXAMPLES / "gfl-example.pes", **common, **{
@@ -192,7 +193,6 @@ def test_averaging_silently_ignores_all_sampled_timing_semantics(tmp_path):
         "units.vsc.ctrl.loops.SRFPLL.period": 31e-6,
         "units.vsc.ctrl.loops.CurrentLoop.period": 43e-6,
         "units.vsc.ctrl.loops.DCVoltageControl.period": 59e-6,
-        "units.vsc.meas.period": 7e-6,
         "units.vsc.meas.window": 0.2,
         "units.vsc.meas.average": ["u_g", "i_c", "u_dc"],
         "units.vsc.pwm.f_sw": 19_999.0,
@@ -206,6 +206,7 @@ def test_averaging_silently_ignores_all_sampled_timing_semantics(tmp_path):
     first = peslite.Simulation(baseline).run(out_dir=tmp_path / "baseline")
     second_sim = peslite.Simulation(configured)
     assert second_sim.unit().adc is None
+    assert second_sim.unit().clock.period == 7e-6
     assert second_sim.unit().periods == []
     assert second_sim.unit().ctrl.periods == {
         "SRFPLL": 31e-6,

@@ -1107,11 +1107,22 @@ class _GraphRuntime:
         return self.graph.interface
 
     def _install_flow_state(self, inp: Any, out: Any) -> None:
-        """Create one fixed ODE layout from the graph's declared loop states."""
+        """Check each loop's continuous implementation, then create one fixed ODE layout from
+        the graph's declared loop states."""
         state = _ContinuousControlState()
         names = []
         for name in self.graph.order:
-            for local, value in self.graph.nodes[name].flow_state().items():
+            node = self.graph.nodes[name]
+            if (type(node).flow is Loop.flow
+                    and (node.flow_inputs is None
+                         or (type(node).flow_path is Loop.flow_path
+                             and type(node).equation is Loop.equation))):
+                raise ConfigError(f"ctrl.loops.{name}: loop type {node.type!r} "
+                                  "has no continuous-time implementation")
+            if isinstance(node, SyncLaw) and type(node)._flow is SyncLaw._flow:
+                raise ConfigError(f"ctrl.loops.{name}: loop type {node.type!r} "
+                                  "has no continuous-time flow implementation")
+            for local, value in node.flow_state().items():
                 if isinstance(value, bool):
                     raise ConfigError(
                         f"ctrl.loops.{name}: boolean state {local!r} "
@@ -1161,12 +1172,9 @@ class _GraphRuntime:
             node.set_state({local: getattr(state, key) for local, key in bindings})
 
     def _store_continuous_nodes(self) -> None:
-        known = set(self.state_names)
         for name in self.graph.order:
             for local, value in self.graph.nodes[name].flow_state().items():
-                key = f"{name}.{local}"
-                if key in known:
-                    setattr(self.state, key, value)
+                setattr(self.state, f"{name}.{local}", value)
 
     def _loop_retuned(self, name=None) -> None:
         """Rebind continuous state after a set event rebuilt loop ``name``."""
@@ -1175,6 +1183,18 @@ class _GraphRuntime:
         if self.graph.flow_state_names != self.state_names:
             raise ConfigError("a set event cannot reorder continuous controller states")
         self._bind_flow_state()
+
+    def get_state(self) -> dict[str, Any]:
+        startup = {f"startup.{name}": value for name, value in self.startup.get_state().items()}
+        return startup if self.continuous else {**self.graph.get_state(), **startup}
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        """Restore the start-up and, when sampled, the graph states; unknown names raise."""
+        startup = {name[8:]: value for name, value in values.items() if name.startswith("startup.")}
+        self.startup.set_state(startup)
+        if not self.continuous:
+            self.graph.set_state({name: value for name, value in values.items()
+                                  if not name.startswith("startup.")})
 
     def retune(self, cfg, paths, t: float) -> None:
         """Queue new controller parameters for the next graph update."""
@@ -1200,8 +1220,6 @@ class _GraphRuntime:
             self.graph.reset_integrators()
             self._store_continuous_nodes()
         self.startup.command(run, ramp, t)
-
-    command_at = command
 
     def rhs(self, t):
         return self._derivatives
@@ -1256,11 +1274,14 @@ class VSCController(_GraphRuntime):
         self._terminal_in_graph = self._terminal in graph.nodes
         graph.on_retune = self._loop_retuned
         self._frame_key = f"{graph.outputs['theta'].partition('.')[0]}.frame"
-        self._dc, self._sync = first("dc_voltage"), first("sync")
+        # The DC-voltage loop is observed (ID_REF_LIMIT, summary) only through its limit observer.
+        dc = first("dc_voltage")
+        self._dc = dc if hasattr(graph.nodes.get(dc), "observe_limit") else None
+        self._sync = first("sync")
         self._frame_cc, self._log_cc = first("current", "frame"), first("current", "id_ref")
         # dq frame of the logged signals, as a graph path that C++ export lowers unchanged: the
         # current loop's frame input, else the angle the theta loop used for its latest update.
-        # Resolve it when read so reference changes use the same wiring as graph inputs and outputs.
+        # It is resolved at each read, so a references set event moves it like the loops' inputs.
         self._frame_path = (graph.connections[f"{self._frame_cc}.frame"] if self._frame_cc is not None
                             else self._frame_key if self._frame_key in graph.values
                             else graph.outputs["theta"])
@@ -1297,13 +1318,9 @@ class VSCController(_GraphRuntime):
         graph.clear_limit(name)
         self._flow_limits.pop(name, None)
         node = graph.nodes.get(name)
-        if name == self._terminal:
-            self._terminal_limit = None
-            self._terminal_limit_scale = None
-            if self.stage is not None:
-                self.stage._command_saturated = False
-        if (self.continuous and name == self._dc
-                and callable(getattr(node, "observe_limit", None))):
+        if name == self._terminal and self.stage is not None:
+            self.stage._command_saturated = False
+        if self.continuous and name == self._dc:
             self._flow_limits[name] = (f"{name}.current_reference", "ID_REF_LIMIT", node)
         if (not self.continuous and name == self._terminal
                 and isinstance(node, CurrentLoop) and self.stage is not None):
@@ -1313,6 +1330,9 @@ class VSCController(_GraphRuntime):
                     limit, pi=node.pi,
                     active=lambda: self.startup.active,
                 )
+                if self._terminal_limit is not None:
+                    # A loop rebuilt by a set event keeps the limit __call__ scaled to u_dc.
+                    output_limit.limit = self._terminal_limit.limit
                 graph.limit_output(name, "u_dq", output_limit)
                 self._terminal_limit = output_limit
                 self._terminal_limit_scale = limit
@@ -1329,18 +1349,7 @@ class VSCController(_GraphRuntime):
                 self.alarms.append(alarm)
 
     def _build_flow_state(self):
-        """Check each loop's continuous implementation, then create the fixed ODE state layout."""
-        for name in self.graph.order:
-            node = self.graph.nodes[name]
-            if (type(node).flow is Loop.flow
-                    and (node.flow_inputs is None
-                         or (type(node).flow_path is Loop.flow_path
-                             and type(node).equation is Loop.equation))):
-                raise ConfigError(f"ctrl.loops.{name}: loop type {node.type!r} "
-                                  "has no continuous-time implementation")
-            if isinstance(node, SyncLaw) and type(node)._flow is SyncLaw._flow:
-                raise ConfigError(f"ctrl.loops.{name}: loop type {node.type!r} "
-                                  "has no continuous-time flow implementation")
+        """Create the fixed ODE state layout and the reused continuous measurement."""
         self._install_flow_state(
             _ContinuousControlInp(u_g=0j, i_c=0j, u_dc=self.p.dclink.vdc_ref),
             _ContinuousControlOut(q=0j),
@@ -1508,7 +1517,7 @@ class VSCController(_GraphRuntime):
         self.graph.flow(t, meas, only=only, derivatives=derivatives)
         self._algebraic_first = False
         graph = self.graph
-        read, source = graph._read, graph._output_source
+        read, source = graph._read, graph._output_source  # graph.output, inlined: every ODE stage
         self.theta = float(read(*source["theta"], meas))
         self.omega = float(read(*source["omega"], meas))
         self.u_cmd = complex(read(*source["u_dq"], meas))
@@ -1549,39 +1558,39 @@ class VSCController(_GraphRuntime):
     # ------------------------------------------------------------ states and summary
     def overwritten_state_names(self, period):
         graph = self.graph
-        # Frames are read after each sample; the voltage command only after its producer runs.
-        reads = [(self._frame_key, 1), (graph.connections.get(f"{self._frame_cc}.frame"), 1),
+        # The frame is read after each sample; the voltage command only after its producer runs.
+        reads = [(self._frame_path, 1),
                  (graph.outputs["u_dq"], dict(graph._every).get(self._terminal, 1))]
         # initial_sync() also supplies the bridge before the first graph update.
         reads.extend((graph.outputs[port], None) for port in ("theta", "omega"))
         return graph.overwritten_state_names(period, reads=reads)
 
     def get_state(self):
-        if self.continuous:
-            return gather({"startup": self.startup})
-        return {**self.graph.get_state(), "command.u_dq_pu": self.u_cmd,
-                "command.theta": self.command_theta, "command.omega": self.omega,
-                **gather({"startup": self.startup})}
+        state = super().get_state()
+        if not self.continuous:
+            # The held command precedes the start-up entries in the restart schema.
+            startup = {name: state.pop(name) for name in self.discrete_state_names}
+            state.update({"command.u_dq_pu": self.u_cmd, "command.theta": self.command_theta,
+                          "command.omega": self.omega})
+            state.update(startup)
+        return state
 
     def set_state(self, values):
-        if self.continuous:
-            scatter({"startup": self.startup}, values)
-            return
-        rest, startup = {}, {}
-        for name, value in values.items():
-            if name.startswith("startup."):
-                startup[name] = value
-            elif name == "command.u_dq_pu":
-                self.u_cmd = complex(value)
-            elif name == "command.theta":
-                self.command_theta = float(value)
-            elif name == "command.omega":
-                self.omega = float(value)
-            else:
-                rest[name] = value
-        self.graph.set_state(rest)
-        scatter({"startup": self.startup}, startup)
-        self.theta, self.omega = self.initial_sync()
+        if not self.continuous:
+            rest = {}
+            for name, value in values.items():
+                if name == "command.u_dq_pu":
+                    self.u_cmd = complex(value)
+                elif name == "command.theta":
+                    self.command_theta = float(value)
+                elif name == "command.omega":
+                    self.omega = float(value)
+                else:
+                    rest[name] = value
+            values = rest
+        super().set_state(values)
+        if not self.continuous:
+            self.theta, self.omega = self.initial_sync()
 
     def summary(self):
         """Return controller and modulation observations."""
@@ -1916,22 +1925,11 @@ class GraphController(_GraphRuntime):
         """Map log columns to public control ports or controller lifecycle values."""
         return self._log_sources
 
-    def get_state(self) -> dict[str, Any]:
-        startup = {f"startup.{name}": value for name, value in self.startup.get_state().items()}
-        return startup if self.continuous else {**self.graph.get_state(), **startup}
-
     def overwritten_state_names(self, period):
         # sample() consumes every boundary output after graph.sample() on each interrupt.
         return self.graph.overwritten_state_names(
             period, reads=((source, 1) for source in self.graph.outputs.values()),
         )
-
-    def set_state(self, values: Mapping[str, Any]) -> None:
-        startup = {name[8:]: value for name, value in values.items() if name.startswith("startup.")}
-        self.startup.set_state(startup)
-        if not self.continuous:
-            self.graph.set_state({name: value for name, value in values.items()
-                                  if not name.startswith("startup.")})
 
     def summary(self) -> dict[str, Any]:
         return {"alarms": []}

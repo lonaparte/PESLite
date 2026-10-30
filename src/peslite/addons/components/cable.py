@@ -9,7 +9,7 @@ physical length.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from types import FunctionType
 from typing import Any, ClassVar
@@ -134,7 +134,7 @@ class Cable(Element):
         l_per_km: float
         c_per_km: float
         g_per_km: float = 0.0
-        sections: int = 4
+        sections: int = field(default=4, metadata={"structural": True})
         type: str = "cable"
 
         def __post_init__(self) -> None:

@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
 
 from ..components.network import ELEMENT_TYPES, element_buses
-from ..solver.timing import control_clock_offset, resolve_clock_offset
 from ..control.loops import LOOP_TYPES, loop_key_type, loop_type
 from ..control.profiles import ReferenceParams, control_type
 from ..solver.model import ConfigError
@@ -115,13 +114,6 @@ class DCBase:
     v: float  # rated dc voltage (V)
     i: float  # s_base / v (A)
     z: float  # v / i (ohm)
-    w0: Optional[float]
-
-    def C(self, c_pu: float) -> float:
-        """pu -> F."""
-        if self.w0 is None:
-            raise ConfigError("a per-unit DC capacitance requires base.f0")
-        return c_pu / (self.w0 * self.z)
 
 
 @dataclass(frozen=True)
@@ -161,26 +153,10 @@ class BaseValues:
             raise ConfigError(f"{where} requires {', '.join(missing)}")
         return self
 
-    # pu -> SI
-    def L(self, x_pu: float) -> float:
-        self.require("v_ll_rms", "f0", where="an AC per-unit inductance")
-        assert self.z_base is not None and self.w0 is not None
-        return x_pu * self.z_base / self.w0
-
-    def R(self, r_pu: float) -> float:
-        self.require("v_ll_rms", where="an AC per-unit resistance")
-        assert self.z_base is not None
-        return r_pu * self.z_base
-
-    def C(self, c_pu: float) -> float:
-        self.require("v_ll_rms", "f0", where="an AC per-unit capacitance")
-        assert self.w0 is not None and self.z_base is not None
-        return c_pu / (self.w0 * self.z_base)
-
     def dc(self, vdc_ref: float) -> DCBase:
         """Return the DC base for the rated DC voltage ``vdc_ref`` (V)."""
         i = self.s_base / vdc_ref if vdc_ref > 0.0 else 0.0
-        return DCBase(v=vdc_ref, i=i, z=vdc_ref / i if i > 0.0 else 0.0, w0=self.w0)
+        return DCBase(v=vdc_ref, i=i, z=vdc_ref / i if i > 0.0 else 0.0)
 
     def parameter_scales(self, vdc_ref: float = 1.0) -> dict[str, float]:
         """Return the SI value of one pu for every quantity defined by this base."""
@@ -197,8 +173,8 @@ class BaseValues:
             scales.update(inductance=self.z_base / self.w0,
                           capacitance=1.0 / (self.w0 * self.z_base))
         scales.update(dc_voltage=dc.v, dc_current=dc.i, dc_resistance=dc.z)
-        if dc.w0 is not None:
-            scales["dc_capacitance"] = dc.C(1.0)
+        if self.w0 is not None:
+            scales["dc_capacitance"] = 1.0 / (self.w0 * dc.z)
         return scales
 
 
@@ -221,7 +197,7 @@ def quantity_name(cls, name: str) -> str:
 
 
 def convert_quantities(data: dict, cls, scales: dict[str, float], where: str) -> dict:
-    """Convert SI/pu inputs of one section to its storage units and fill pu defaults.
+    """Convert SI/pu inputs of one section to its storage units.
 
     Raises ConfigError if both the SI and the pu spelling of a parameter are given.
     """
@@ -249,9 +225,6 @@ def convert_quantities(data: dict, cls, scales: dict[str, float], where: str) ->
                     raise ConfigError(f"{where}.{name}: {exc}") from None
                 value = value * scale if spelling.endswith("_pu") else value / scale
         out[target] = value
-    for name, value in quantity_metadata(cls, "_defaults_pu").items():
-        if name not in out:
-            out[name] = value if name.endswith("_pu") else value * _scale(quantities[name], scales)
     return out
 
 
@@ -312,18 +285,19 @@ class SourceParams:
     bus: str
     l: float
     r: float = 0.0
-    v: float = 0.0  # emf magnitude, phase-peak V
+    v: Optional[float] = None  # emf magnitude, phase-peak V
     f: Optional[float] = None
     angle: float = 0.0
     derived_defaults: frozenset = field(init=False, default=frozenset(), compare=False)
 
     _quantities = {"l": "inductance", "r": "resistance", "v": "voltage"}
     _input_aliases = {"x_pu": "l_pu"}
-    _defaults_pu = {"v": 1.0}
 
     def resolved(self, base: BaseValues) -> "SourceParams":
-        source = replace(self, f=base.f0 if self.f is None else self.f)
-        object.__setattr__(source, "derived_defaults", frozenset(("f",)) if self.f is None else frozenset())
+        source = replace(self, v=base.v_phase_peak if self.v is None else self.v,
+                         f=base.f0 if self.f is None else self.f)
+        object.__setattr__(source, "derived_defaults",
+                           frozenset(name for name in ("v", "f") if getattr(self, name) is None))
         return source
 
 # ------------------------------------------------------------------ a converter unit
@@ -359,19 +333,13 @@ class DCSourceParams:
     type: str = "none"  # "none" | "current" | "voltage"
     i: float = 0.0  # current source, A, positive into the DC link
     k: float = 0.0  # current-source voltage droop, A/V
-    v: float = 0.0  # voltage-source emf, V
+    v: Optional[float] = None  # voltage-source emf, V; default: dclink.vdc_ref (0 unused)
     r: float = 0.0  # voltage-source series resistance, ohm
 
     _choices = {"type": ("none", "current", "voltage")}
 
     _quantities = {"i": "dc_current", "k": "dc_current/dc_voltage",
                    "v": "dc_voltage", "r": "dc_resistance"}
-
-    @staticmethod
-    def _scaled_defaults(data: dict, scales: dict[str, float]) -> dict:
-        """A voltage source's emf defaults to the rated dc voltage."""
-        return ({"v": scales["dc_voltage"]}
-                if data.get("type") == "voltage" else {})
 
 
 @dataclass(frozen=True)
@@ -442,10 +410,6 @@ class MeasurementParams:
     sources: dict[str, str] = field(default_factory=dict)  # channel -> physical output name
     rms: dict[str, float] = field(default_factory=dict)  # channel -> window duration (s)
 
-    def clock_offset(self, control_offset: float, period: float) -> float:
-        """Return the ADC clock offset, inheriting the controller grid when omitted."""
-        return resolve_clock_offset(period, self.offset, control_offset)
-
 
 @dataclass(frozen=True, kw_only=True)
 class ControlParams:
@@ -469,10 +433,6 @@ class ControlParams:
     connections: dict = field(default_factory=dict)
     outputs: dict = field(default_factory=dict)
     references: Any = None  # built from the schema selected by type
-
-    def clock_offset(self, pwm: PWMParams) -> float:
-        """Return the control-clock offset, inheriting the PWM load grid when omitted."""
-        return control_clock_offset(self, pwm)
 
 
 @dataclass(frozen=True)
@@ -617,7 +577,10 @@ class UnitParams:
     @staticmethod
     def _bases(data: dict, base: BaseValues, where: str,
                spec: Any) -> tuple[BaseValues, dict[str, float]]:
-        """Resolve the common rating and the electrical scaling base of a unit of type ``spec``."""
+        """Resolve the common rating and the electrical scaling base of a unit of type ``spec``.
+
+        A scalar unit's voltage and current are its DC quantities, the bases of its protection.
+        """
         if data.get("s_base") is not None:
             base = _build(
                 BaseValues,
@@ -634,7 +597,10 @@ class UnitParams:
         if (isinstance(voltage, bool) or not isinstance(voltage, (int, float))
                 or not math.isfinite(voltage) or voltage <= 0.0):
             raise ConfigError(f"{where}.{label} must be finite and positive")
-        return base, base.parameter_scales(float(voltage))
+        scales = base.parameter_scales(voltage)
+        if spec.phases == 1:
+            scales.update(voltage=scales["dc_voltage"], current=scales["dc_current"])
+        return base, scales
 
     def resolved(self, system_base: BaseValues, events: tuple = ()) -> "UnitParams":
         derived = set()
@@ -658,7 +624,12 @@ class UnitParams:
                     loops[name] = replace(loop, period=ctrl.period)
                     derived.add(f"ctrl.loops.{name}.period")
             ctrl = replace(ctrl, loops=loops)
-        unit = replace(self, ctrl=ctrl)
+        dclink = self.dclink
+        if dclink is not None and dclink.source.v is None:
+            voltage = dclink.vdc_ref if dclink.source.type == "voltage" else 0.0
+            dclink = replace(dclink, source=replace(dclink.source, v=voltage))
+            derived.add("dclink.source.v")
+        unit = replace(self, ctrl=ctrl, dclink=dclink)
         base = system_base if self.s_base is None else replace(system_base, s_base=self.s_base)
         object.__setattr__(unit, "base", base)
         object.__setattr__(unit, "derived_defaults", frozenset(derived))
@@ -1073,18 +1044,13 @@ def from_dict(data: dict) -> Params:
 
 def _resolve_unit(unit: UnitParams, system_base: BaseValues) -> UnitParams:
     """Resolve ratings and defaults once through the configured unit tree."""
-    spec = unit_type(unit.type)
-    if not spec.composite:
-        return unit.resolved(system_base)
     resolved = unit.resolved(system_base)
-    child_base = resolved.base
-    selected = replace(resolved._unit_fields, **{
-        child: _resolve_unit(
-            getattr(unit, child), child_base,
-        )
-        for child in spec.children
-    })
-    object.__setattr__(resolved, "_unit_fields", selected)
+    spec = unit_type(unit.type)
+    if spec.composite:
+        selected = replace(resolved._unit_fields, **{
+            child: _resolve_unit(getattr(unit, child), resolved.base) for child in spec.children
+        })
+        object.__setattr__(resolved, "_unit_fields", selected)
     return resolved
 
 
@@ -1403,8 +1369,6 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
         base, scales = cls._bases(data, base, path)
     if scales is not None:
         data = convert_quantities(data, cls, scales, path)
-        if hasattr(cls, "_scaled_defaults"):
-            data = {**cls._scaled_defaults(data, scales), **data}
     kwargs = _build_fields(cls, data, path, base, scales)
     try:
         obj = cls(**kwargs)
@@ -1416,6 +1380,7 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
     return obj
 
 
+# A class's annotations do not change once it is defined; evaluating their strings dominated loading.
 _type_hints = functools.cache(get_type_hints)
 
 
@@ -1482,9 +1447,7 @@ def _build_fields(cls, data: dict, path: str, base: Any, scales: Optional[dict],
         elif f.default is not dataclasses.MISSING:
             kwargs[f.name] = f.default
         elif f.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
-            # an omitted section: built from nothing, so that its pu defaults are converted too
-            kwargs[f.name] = (_build(inner, {}, key, base, scales) if is_dataclass(inner) and not optional
-                              else f.default_factory())  # type: ignore[misc]
+            kwargs[f.name] = f.default_factory()  # type: ignore[misc]
         else:
             raise ConfigError(f"{key}: required value missing")
     return kwargs
@@ -1498,7 +1461,7 @@ RUNTIME = (
     "branches.*.l", "branches.*.r",
     "sources.*.v", "sources.*.f", "sources.*.angle", "sources.*.l", "sources.*.r",
     "units.*.ctrl.references.*",
-    "units.*.ctrl.loops.*.** (not period)",
+    "units.*.ctrl.loops.*.** (not type, period or declared structural fields)",
     "units.*.protection.**",
     "units.*.dclink.source.* (not type)",
     "elements.*.* (not type, bus or declared structural fields)",
@@ -1518,7 +1481,9 @@ class Change:
     ramp: float = 0.0
 
     def touches(self, prefix: str) -> list[str]:
-        return [path[len(prefix):] for path in self.paths if path.startswith(prefix)]
+        """Return the parameter paths below ``prefix``; connection commands are switched instead."""
+        return [path[len(prefix):] for path in self.paths
+                if path.startswith(prefix) and path not in self.connections]
 
 
 def runtime_changeable(path: str, p: Params) -> bool:
@@ -1536,18 +1501,26 @@ def runtime_changeable(path: str, p: Params) -> bool:
     if section == "units":
         if keys[:2] == ["ctrl", "references"]:
             return len(keys) == 3
-        if keys[:2] == ["ctrl", "loops"]:
-            return len(keys) >= 4 and keys[3] not in ("type", "period")
         if keys[0] == "protection":
             return True
-        return keys[:2] == ["dclink", "source"] and len(keys) == 3 and keys[2] != "type"
-    if section == "elements":
-        element = p.elements.get(name)
-        field = element.__dataclass_fields__.get(rest) if element is not None else None
-        return (field is not None and len(keys) == 1 and keys[0] != "type"
-                and field.metadata.get("runtime", True)
-                and keys[0] not in element_buses(element))
-    return False
+        if keys[:2] == ["dclink", "source"]:
+            return len(keys) == 3 and keys[2] != "type"
+        if keys[:2] != ["ctrl", "loops"] or len(keys) < 4:
+            return False
+        owner, keys = p.unit(name).ctrl.loops[keys[2]], keys[3:]
+        if len(keys) == 1 and keys[0] in ("type", "period"):
+            return False
+    elif section == "elements":
+        owner = p.elements.get(name)
+        if owner is None or len(keys) != 1 or keys[0] == "type" or keys[0] in element_buses(owner):
+            return False
+    else:
+        return False
+    # Type-specific loop and element fields are writable unless declared structural.
+    for key in keys[:-1]:
+        owner = getattr(owner, key) if is_dataclass(owner) else None
+    field = owner.__dataclass_fields__.get(keys[-1]) if is_dataclass(owner) else None
+    return field is not None and field.metadata.get("runtime", True)
 
 
 def _event_assignments(p: Params, event: Any):
@@ -1576,9 +1549,10 @@ def _event_assignments(p: Params, event: Any):
             raise ConfigError(f"{path}: unknown writable variable") from None
         scales = p.base.parameter_scales()
         if head[0] == "units":
-            unit = p.unit(_unit_path(p.units, ".".join(head[1:])))
-            scales = unit.base.parameter_scales(
-                unit.dclink.vdc_ref if unit.dclink is not None else 1.0)
+            unit_path = _unit_path(p.units, ".".join(head[1:]))
+            unit = p.unit(unit_path)
+            _base, scales = UnitParams._bases(to_dict(unit), unit.base, f"units.{unit_path}",
+                                              unit_type(unit.type))
         target = quantity_name(type(owner), name)
         converted = convert_quantities({name: value}, type(owner), scales, path)
         yield ".".join((*head, target)), converted[target]

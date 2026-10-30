@@ -1,6 +1,7 @@
 """One compiled model uses the ordinary parameter tree for physical and control changes."""
 
 import csv
+import json
 import subprocess
 
 import numpy as np
@@ -86,7 +87,7 @@ def _compare_run(p, binary, changes, directory, *, rtol=3e-6, atol=3e-5, parts=N
 
 
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
-@pytest.mark.parametrize("name", ["buck", "gfl", "wpt", "wpt-lcc"])
+@pytest.mark.parametrize("name", ["buck", "gfl", "cable-gfl", "wpt", "wpt-lcc"])
 def test_compiled_parameters_reinitialize_physics_control_and_energy(name, mode, tmp_path):
     p = _case(name, mode)
     if name == "buck":
@@ -105,6 +106,12 @@ def test_compiled_parameters_reinitialize_physics_control_and_energy(name, mode,
             "sources.grid.r": p.sources["grid"].r * 1.3,
             "units.vsc.ac_filter.l_f": p.unit().ac_filter.l_f * 1.1,
             "units.vsc.dclink.capacitor.c": p.unit().dclink.capacitor.c * 1.2,
+            "units.vsc.ctrl.loops.CurrentLoop.bandwidth": 250.0,
+        }
+    elif name == "cable-gfl":
+        changes = {
+            "elements.cable1.r_per_km": 0.07,
+            "elements.cable1.c_per_km": 0.25e-6,
             "units.vsc.ctrl.loops.CurrentLoop.bandwidth": 250.0,
         }
     else:
@@ -198,6 +205,11 @@ def test_explicit_connection_variable_events_match_python(name, target, mode, tm
     }})
     binary = _compile(p, tmp_path / "model")
     _compare_run(p, binary, {}, tmp_path / "run")
+    # Interrupts while stopped are not modulation updates in either target.
+    native, python = (json.loads((tmp_path / "run" / side / "summary.json").read_text())
+                      for side in ("native", "python"))
+    key = f"{target}.modulation_saturation_fraction"
+    assert native.get(key) == pytest.approx(python.get(key))
 
 
 @pytest.mark.parametrize("name, target", [("buck", "converter"), ("gfl", "vsc"), ("gfm-dvoc", "vsc"),
@@ -539,10 +551,23 @@ def test_retained_carrier_phase_uses_normal_startup_clock(mode, tmp_path):
     p = _case("buck", mode)
     binary = _compile(p, tmp_path / "model")
     _compare_run(p, binary, {"units.converter.pwm.carrier_phase": 0.25}, tmp_path / "run")
+    # A unit connected at t0 has already counted the interrupt at t0 for its start-up ramp.
+    p = _case("gfl", mode).replace(**{"events.connect_vsc.ramp": 1e-3})
+    binary = _compile(p, tmp_path / "connected")
+    _compare_run(p, binary, {"units.vsc.ctrl.period": 1e-4,
+                             "units.vsc.protection.rocof.window": 0.2}, tmp_path / "same_count")
+    output = tmp_path / "changed_count"
+    result = subprocess.run([binary, "--set", "units.vsc.pwm.carrier_phase=0.25", "--out", output],
+                            capture_output=True, text=True)
+    assert result.returncode == 1
+    assert "changed structural specialization" in result.stderr
+    assert not output.exists()
 
 
-def test_retained_clock_and_supply_reinitialize_the_adc_window_before_first_sample(tmp_path):
-    p = _case("buck", "pwm_averaging").replace(**{"units.converter.meas.average": ["vin"]})
+@pytest.mark.parametrize("offset", [None, 1e-5])  # an independent ADC also seeds its held values
+def test_retained_clock_and_supply_reinitialize_the_adc_window_before_first_sample(offset, tmp_path):
+    p = _case("buck", "pwm_averaging").replace(**{"units.converter.meas.average": ["vin"],
+                                                  "units.converter.meas.offset": offset})
     binary = _compile(p, tmp_path / "model")
     _compare_run(p, binary, {"units.converter.pwm.carrier_phase": 0.25,
                              "units.converter.dclink.source.v": 52.0}, tmp_path / "run")

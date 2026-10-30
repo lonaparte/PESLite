@@ -13,12 +13,13 @@ from peslite.components import (
     AveragingModel,
     MeasurementPorts,
     PWM,
+    PWMAveragingModel,
     RCNode,
     RLBranch,
     Terminal,
+    ThreePhaseBridge,
     ZOH,
 )
-from peslite.control.blocks import abc2complex
 
 COMPONENTS = Path(peslite.components.__file__).parent
 PACKAGE = COMPONENTS.parent
@@ -150,13 +151,18 @@ def test_adc_reconstructs_its_sampling_position_from_the_start_time():
     assert adc.n_samp == 3
     assert [sample.t for sample in adc.peeks] == [0.25, 0.5]
     assert adc.t_sample(0.0) == 0.75
+    # An explicit offset on the control grid is aligned within the clock tolerance
+    # (3e-5 % 1e-5 is 9.999999999999999e-06, not 0.0).
+    assert not ADC(ports, period=4e-5, sample_period=1e-5, control_offset=3e-5).independent
+    assert ADC(ports, period=4e-5, sample_period=1e-5, control_offset=3e-5,
+               sample_offset=5e-6).independent
 
 
 def test_pwm_owns_timer_registers_and_switching_schedule():
     initial = np.array([0.2, 0.4, 0.6])
-    pwm = PWM(period=1e-3, load_period=1e-3, control_offset=0.0, load_offset=0.0,
-              computation=2e-4,
-              carrier_period=1e-3, modulator=ZOH())
+    pwm = PWMAveragingModel(period=1e-3, load_period=1e-3, control_offset=0.0, load_offset=0.0,
+                            computation=2e-4, carrier_period=1e-3, modulator=ZOH(),
+                            topology=ThreePhaseBridge())
     pwm.reset(initial)
     assert pwm.get_state() == {
         "d_a": 0.2, "d_b": 0.4, "d_c": 0.6, "on": False,
@@ -166,15 +172,19 @@ def test_pwm_owns_timer_registers_and_switching_schedule():
 
     pwm.write(0.0, np.array([0.8, 0.7, 0.6]))
     q = pwm.load(0.0)
-    assert q == abc2complex(initial)
+    assert q == ThreePhaseBridge.pwm_state(initial)
     assert pwm.k == 1
-    assert pwm.t_next == 1e-3
+    assert pwm.t_interrupt == 1e-3
     assert pwm.next_switch == float("inf")
     pwm.load(1e-3)
     assert pwm.active[0] == 0.8
+    pwm.start(1e-3, (None, None), True)
+    completed = pwm.completed
     pwm.set_state({"shadow.d_a": 0.1})
     assert pwm.get_state()["d_a"] == 0.8
     assert pwm.get_state()["shadow.d_a"] == 0.1
+    assert pwm.completed is completed
+    assert pwm.completed[0] == 0.8
 
 
 def test_ideal_averaging_bridge_has_no_timer_register_or_delay_state():

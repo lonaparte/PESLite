@@ -203,7 +203,7 @@ def _timing_parameters(units, runtime):
     for unit in units.values():
         cfg = runtime.copy(unit.cfg)
         values = (*_unit_periods(cfg).values(), cfg.pwm.carrier_phase, cfg.ctrl.computation,
-                  cfg.meas.window, *cfg.meas.rms.values(),
+                  cfg.ctrl.offset, cfg.meas.offset, cfg.meas.window, *cfg.meas.rms.values(),
                   *runtime.object(unit.ctrl).graph.periods.values())
         expressions.extend(_number(value) for value in values if value is not None)
     dependencies = runtime.parameter_dependencies(expressions)

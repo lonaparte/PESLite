@@ -16,7 +16,8 @@ import numpy as np
 
 from ...solver.linearization import (DEFAULT_STEP, active_coordinates, coordinate_difference,
                                      coordinate_width, linearize_loop)
-from ...solver.simulation import TIME_EPS, SystemLoop
+from ...solver.simulation import SystemLoop
+from ...solver.timing import TIME_EPS
 
 if TYPE_CHECKING:
     from ...solver.simulation import Simulation

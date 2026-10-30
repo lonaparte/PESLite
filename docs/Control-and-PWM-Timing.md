@@ -92,9 +92,12 @@ restart state. Ideal continuous averaging has no sampled controller/ADC schedule
 do not affect it.
 
 Sampled-converter ADC windows integrate on physical event boundaries, including configured ADC
-conversions, control interrupts, PWM edges and file events; output snapshots do not add ADC
-integration points. Use `meas.period` when a window needs a finer conversion grid than the
-controller period. Python and generated C++ use the same ADC schedule.
+conversions, control interrupts, PWM edges and file events, and immediately before a trip changes
+the plant. Output snapshots and the end time do not add ADC integration points, and neither does a
+continuous unit's protection/measurement clock, which is an integration point only for that unit's
+own windows. A window open at the end of a run continues from its saved quadrature anchor. Use
+`meas.period` when a window needs a finer conversion grid than the controller period. Python and
+generated C++ use the same ADC schedule.
 
 For oscillating scalar ports, average `power` itself rather than multiplying separately averaged
 voltage and current. A carrier-boundary voltage sample may be zero even during nonzero power
@@ -107,9 +110,13 @@ power-loop low-pass filter for the remaining excitation ripple; see [Examples](E
 PWM register load. It defaults to 1 microsecond in sampled modes and must be nonnegative and shorter
 than the controller period.
 
-There is one shadow register, not a queue of delayed duty words. A new controller result replaces
-the shadow word. At a load instant, the active register copies the shadow word only when the
-corresponding computation has completed; otherwise the previous active word remains in force.
+There is one shadow register, not a queue of delayed duty words. As on a DSP, an interrupt's result
+replaces the shadow word when its computation completes, and a register load copies whatever the
+shadow holds: a load during an interrupt's computation, including one at the interrupt instant,
+takes the previous completed result. An explicit `ctrl.offset` that places interrupts less than
+`ctrl.computation` before loads therefore adds one control period of delay. The replaced word is
+not a saved state. A continuation (`simulation.initial`) restores it from the active word, and is
+refused where a load inside the computation window needs a word that no load has applied yet.
 
 ## Shadow and active registers
 
@@ -167,6 +174,10 @@ signal adapter:
 
 - instantaneous overcurrent protection runs at switching or held-bridge edges;
 - voltage, frequency, DC-voltage and ROCOF criteria run from controller-rate measurements;
+- a continuous unit (ideal averaging, or a controllerless natural-conduction bridge) runs both on
+  its own clock with period `meas.period`, which defaults to `simulation.output.period`; other
+  units' events, file events and output snapshots do not advance its hold timers, ROCOF window
+  or RMS periods;
 - sampled criteria are armed after startup reports completion;
 - a trip blocks the gates, opens an external terminal when present and disconnects the DC source.
 
@@ -180,4 +191,6 @@ The controller reports measurements and startup status but does not own the phys
 
 With `bridge.model: averaging`, controller states and plant states are integrated together. There
 is no ADC sampler, interrupt grid, computation wait, carrier, shadow register or active register.
-The sampled timing settings may remain in a shared file but are silently ignored for that unit.
+The sampled timing settings may remain in a shared file but are silently ignored for that unit,
+except `meas.period`, which sets the unit's protection and RMS clock (see
+[Protection clocks](#protection-clocks)).

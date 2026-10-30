@@ -2,7 +2,7 @@
 
 Named subsystems step at ``dt/N`` or advance over windows of ``M*dt``. Windowed subsystems advance on
 window-averaged inputs while the rest sees their extrapolated states; with every step equal to
-``dt`` the result equals :class:`~peslite.solver.integrators.FixedStepSolver`.
+``dt``, :func:`make_solver` returns the single-rate integrator itself.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .energy import re_product, signal
-from .integrators import RHS, TABLEAUS, FixedStepSolver, SolverStep, combine, integrator, stage_state, subintervals
+from .integrators import RHS, TABLEAUS, SolverStep, combine, integrator, stage_state, subintervals
 from .model import ConfigError
 
 __all__ = ["MultirateSolver", "HeldStorage", "make_solver", "parse_step"]
@@ -162,11 +162,14 @@ class MultirateSolver:
         self._mask_outer = self.outer.mask if self.outer is not None else np.zeros(model.n_states, dtype=bool)
         self._mask_moving = ~self._mask_outer  # what the system step advances (system and inner states)
         self._outer_labels = [lab for lab, m in zip(model.state_labels(), self._mask_outer) if m]
+        # windowed-group inputs whose window sums are restart state: (label, input record, field), plan order
+        owner = {id(sub.inp): model.name_of(sub) for sub in self.outer.members} if self.outer is not None else {}
+        self._input_labels = [(f"{owner[id(inp)]}.{field}", inp, field)
+                              for _kind, (inp, field, *_rest) in (self.outer.inputs if self.outer is not None else ())]
         self.window = self.window_steps * self.dt
         self.outer_method = outer_method or method
         self._outer_solver = (integrator(self.outer_method, self.window, rtol, atol)
                               if self.outer is not None else None)
-        self._single = FixedStepSolver(dt, method)  # single-rate path
         # window bookkeeping (outer group)
         self._anchor: Optional[NDArray[np.float64]] = None  # outer states at the last window close
         self._slope: Optional[NDArray[np.float64]] = None
@@ -211,11 +214,6 @@ class MultirateSolver:
         """Advance with a local limit applied coherently to every system and inner step."""
         if max_step <= 0.0:
             raise ValueError("max_step must be positive")
-        if self.inner is None and self.outer is None:
-            step = self._single.advance(f, t0, t1, y0, max_step=max_step)
-            self.n_system = self._single.n_rhs
-            self.n_rhs = self.n_system + self.n_inner + self.n_outer
-            return step
         if t1 - t0 <= 0.0:
             return SolverStep(t1, y0, self.n_rhs)
         if self.outer is None:
@@ -331,8 +329,9 @@ class MultirateSolver:
         """Coupling indicators of the run, relative to rated effort where given, else to the state's peak.
 
         Keys: ``max_rel_error``, ``excursion_rel_max``, ``energy_residual`` (J), ``energy_window_rel_max``,
-        ``windows``, ``steps``; with ratings ``max_error_rated`` and ``excursion_rated``; with a split
-        ``kappa`` (hold bound) and ``within_bound`` (1.0 if no hold exceeded its bound).
+        ``windows``, ``steps``, ``kappa`` (hold bound) and ``within_bound`` (1 if no hold exceeded its
+        bound); with ratings ``max_error_rated``, ``excursion_rated`` and, once a window hold's bound
+        exceeds 0.1 of the rated effort, ``coarse_hold`` (the first such hold, see :attr:`coarse_hold`).
         """
         ref = self._reference()
         seen = ref > 0.0
@@ -355,11 +354,12 @@ class MultirateSolver:
         if self.ratings:
             out["max_error_rated"] = err_rated  # worst held-effort error / rated effort
             out["excursion_rated"] = exc_rated  # worst sub-window change / rated effort
-        if self.inner is not None or self.outer is not None:
-            # hold bound relative to the reference
-            bound_rel = (self._bound_abs / ref)[seen]
-            out["kappa"] = float(np.max(bound_rel)) if bound_rel.size else 0.0
-            out["within_bound"] = int(self.bound_violations == 0)
+        bound_rel = (self._bound_abs / ref)[seen]  # hold bound relative to the reference
+        out["kappa"] = float(np.max(bound_rel)) if bound_rel.size else 0.0
+        out["within_bound"] = int(self.bound_violations == 0)
+        if self.coarse_hold is not None:
+            t_c, label, rel = self.coarse_hold
+            out["coarse_hold"] = f"{label} at t = {t_c:.6g} s: {rel:.3g} of rating"
         return out
 
     @property
@@ -378,14 +378,12 @@ class MultirateSolver:
                                    kind=st.kind, scale=st.scale, value=st.value))
         return tuple(out)
 
-    @property
-    def rated_effort(self) -> Optional[NDArray[np.float64]]:
-        """Rated effort per state entry (``0.0`` where unrated), or ``None`` without ratings."""
-        return None if self._rated_ref is None else self._rated_ref.copy()
-
     # ------------------------------------------------------ Stateful (windows)
     def get_state(self) -> dict[str, Any]:
-        """Window bookkeeping (``nan`` before the first window) for exact continuation from a window boundary."""
+        """Window bookkeeping (``nan`` before the first window) for exact continuation from any instant.
+
+        ``acc.<input>``: the open window's input integral, complex for a complex input.
+        """
         if self.outer is None:
             return {}
         if self._anchor is None:
@@ -393,11 +391,13 @@ class MultirateSolver:
             for lab in self._outer_labels:
                 s[f"anchor.{lab}"] = math.nan
                 s[f"slope.{lab}"] = math.nan
-            return s
-        s = {"t_anchor": self._t_anchor, "window_end": self._window_end}
-        for lab, a, sl in zip(self._outer_labels, self._anchor, self._slope):
-            s[f"anchor.{lab}"] = float(a)
-            s[f"slope.{lab}"] = float(sl)
+        else:
+            s = {"t_anchor": self._t_anchor, "window_end": self._window_end}
+            for lab, a, sl in zip(self._outer_labels, self._anchor, self._slope):
+                s[f"anchor.{lab}"] = float(a)
+                s[f"slope.{lab}"] = float(sl)
+        for lab, inp, field in self._input_labels:
+            s[f"acc.{lab}"] = self._acc.get((id(inp), field), 0.0 * getattr(inp, field))
         return s
 
     def set_state(self, values: Mapping[str, Any]) -> None:
@@ -420,6 +420,8 @@ class MultirateSolver:
             self._anchor = self._slope = None
             return
         self._open_window(float(t_anchor), anchor, slope)
+        self._acc = {(id(inp), field): values[f"acc.{lab}"]
+                     for lab, inp, field in self._input_labels if f"acc.{lab}" in values}
         end = float(values.get("window_end", math.nan))
         self._window_end = end if end > t_anchor else t_anchor + self.window
         self._last_returned = None  # a loaded anchor is trusted on the next call
@@ -489,7 +491,7 @@ class MultirateSolver:
         m = self.ratio
         h = H / m
         moving = self._mask_moving
-        last_sweep = self.sweeps == 1 or self.inner is None or m == 1
+        last_sweep = self.sweeps == 1 or self.inner is None
         # -- compound step: shared stages, inner group with step h, the rest with H
         ks: list[NDArray[np.float64]] = []
         k_sys: list[NDArray[np.float64]] = []
@@ -506,8 +508,8 @@ class MultirateSolver:
                 ks.append(k_i + k_s)
             else:
                 ks.append(k_s)
-        y1 = combine(self.method, y0, H, ks)  # system states at t0 + H (inner entries: discarded unless m == 1)
-        if self.inner is None or m == 1:
+        y1 = combine(self.method, y0, H, ks)  # system states at t0 + H (inner entries: discarded)
+        if self.inner is None:
             self._track_flow(t0 + H)
             return np.where(moving, y1, y0) if self._anchor is not None else y1
         mask_i = self._mask_inner

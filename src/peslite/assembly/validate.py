@@ -20,6 +20,7 @@ from ..control.profiles import control_type
 from ..solver.integrators import ADAPTIVE_METHODS, FIXED_METHODS
 from ..solver.model import ConfigError
 from ..solver.multirate import parse_step
+from ..solver.timing import TIME_EPS, PeriodicClock, control_clock_offset
 from .events import NAMED, SWITCHABLE, SWITCHING
 from .types import unit_type
 
@@ -58,19 +59,21 @@ def _dclink(cfg, where):
             raise ConfigError(f"{where}.capacitor.c must be finite and positive")
         if not math.isfinite(cap.r_esr) or cap.r_esr < 0:
             raise ConfigError(f"{where}.capacitor.r_esr must be finite and nonnegative")
-    for key in ("i", "k", "v", "r"):
-        if not math.isfinite(getattr(source, key)):
+    # An omitted voltage-source emf is resolved from vdc_ref, checked above.
+    values = {"i": source.i, "k": source.k, "v": 0.0 if source.v is None else source.v,
+              "r": source.r}
+    for key, value in values.items():
+        if not math.isfinite(value):
             raise ConfigError(f"{where}.source.{key} must be finite")
-    if source.v < 0 or source.r < 0:
+    if values["v"] < 0 or source.r < 0:
         raise ConfigError(f"{where}.source.v and r must be nonnegative")
     allowed = {
         "current": {"i", "k"},
         "voltage": {"v", "r"},
         "none": set(),
     }[source.type]
-    defaults = {"i": 0.0, "k": 0.0, "v": 0.0, "r": 0.0}
-    for key, default in defaults.items():
-        if key not in allowed and getattr(source, key) != default:
+    for key, value in values.items():
+        if key not in allowed and value != 0.0:
             raise ConfigError(f"{where}.source.{key} is not used by source.type = {source.type!r}")
     voltage_source = source.type == "voltage"
     if cap is None and not voltage_source:
@@ -98,6 +101,11 @@ def _period(c, pwm) -> float:
     return c.period if c.period is not None else pwm.switching_period
 
 
+def _computation(c) -> float:
+    """The controller computation time (s), defaulting to 1 us."""
+    return 1.0e-6 if c.computation is None else c.computation
+
+
 def _timing(c, pwm, where: str, continuous: bool = False) -> None:
     """Check the carrier-triggered control interrupt and computation time."""
     if continuous:
@@ -113,7 +121,7 @@ def _timing(c, pwm, where: str, continuous: bool = False) -> None:
     T_c = _period(c, pwm)
     if not math.isfinite(T_c) or T_c <= 0.0:
         raise ConfigError(f"{where}.period must be finite and positive, got {T_c}")
-    offset = c.clock_offset(pwm)
+    offset = control_clock_offset(c, pwm)
     if not math.isfinite(offset) or not 0.0 <= offset < T_c:
         raise ConfigError(f"{where}.offset must be in [0, ctrl.period), got {offset}")
     half = pwm.switching_period / 2.0
@@ -121,7 +129,7 @@ def _timing(c, pwm, where: str, continuous: bool = False) -> None:
         raise ConfigError(f"{where}.period = {T_c:.6g} s is not a multiple of half the carrier period "
                           f"({half:.6g} s at pwm.f_sw = {pwm.f_sw:g} Hz): the carrier triggers the "
                           f"interrupt at its valleys and peaks")
-    tau = 1.0e-6 if c.computation is None else c.computation
+    tau = _computation(c)
     if not math.isfinite(tau) or tau < 0.0 or tau >= T_c:
         raise ConfigError(f"{where}.computation = {tau} s must be at least 0 and shorter than the "
                           f"control period {T_c:.6g} s")
@@ -133,7 +141,7 @@ def _control(c, dclink, pwm, where: str, continuous: bool = False) -> None:
         raise ConfigError(f"{where}.loops must contain at least one loop")
     T_c = None if continuous else _period(c, pwm)
     for name, cfg in c.loops.items():
-        if name in {"meas", "references", "held", "command", "prot"}:
+        if name in {"meas", "references", "held", "command", "prot", "startup"}:
             raise ConfigError(f"{where}.loops.{name}: reserved loop name")
         T = cfg.period
         if T is not None and (not math.isfinite(T) or T <= 0):
@@ -216,8 +224,6 @@ def _measurement(m, T_c: Optional[float], where: str,
 
 def _converter(u, base, where: str):
     """Validate fields shared by every non-composite converter unit."""
-    if u.s_base is not None and (not math.isfinite(u.s_base) or u.s_base <= 0.0):
-        raise ConfigError(f"{where}.s_base must be finite and positive, got {u.s_base}")
     spec = unit_type(u.type, f"{where}.type")
     if u.bridge.type not in spec.bridge_types:
         raise ConfigError(
@@ -305,15 +311,13 @@ def _dc_converter(u, base, where: str, *, nested: bool = False) -> None:
 
 def _wpt(u, base, where: str, *, nested: bool = False) -> None:
     """Check a WPT composite and its shared compensated magnetic link."""
-    if u.s_base is not None and (not math.isfinite(u.s_base) or u.s_base <= 0.0):
-        raise ConfigError(f"{where}.s_base must be finite and positive, got {u.s_base}")
     for side in unit_type(u.type).children:
         child = getattr(u, side)
         child_where = f"{where}.{side}"
         spec = unit_type(child.type, f"{child_where}.type")
-        if spec.phases != 1:
+        if spec.phases != 1 or spec.composite:
             raise ConfigError(
-                f"{child_where}: a WPT child needs a scalar unit"
+                f"{child_where}: a WPT child needs a scalar, non-composite unit"
             )
         spec.validator(child, base, child_where, nested=True)
     link = u.link
@@ -355,10 +359,8 @@ def _switch_controlled_capacitors(u, where: str) -> None:
     """Check the switch-controlled capacitors of a WPT link and their same-side converters."""
     for side in unit_type(u.type).children:
         child = getattr(u, side)
-        ctrl = getattr(child, "ctrl", None)
-        bridge = getattr(child, "bridge", None)
-        clocked = (ctrl is not None and bridge is not None
-                   and bridge.model != "averaging" and getattr(child, "pwm", None) is not None)
+        ctrl = child.ctrl
+        clocked = ctrl is not None and child.bridge.model != "averaging" and child.pwm is not None
         commanded = ctrl is not None and "scc_angle" in ctrl.outputs
         scc = getattr(u.link, f"{side}_scc", None)
         at = f"{where}.link.{side}_scc"
@@ -419,7 +421,7 @@ def _network(p: Params) -> None:
 
     connected_units = {
         name: unit for name, unit in _unit_items(p.units)
-        if getattr(unit, "bus", None) is not None
+        if unit.bus is not None
     }
     for name, bus in p.buses.items():
         if bus.c <= 0.0:
@@ -452,6 +454,8 @@ def _network(p: Params) -> None:
         if src.f is not None and (not math.isfinite(src.f) or src.f <= 0.0):
             raise ConfigError(f"sources.{name}.f must be finite and positive, got {src.f}")
         p.base.require("f0", where=f"sources.{name}: an AC source")
+        if src.v is None:
+            p.base.require("v_ll_rms", where=f"sources.{name}.v: the default 1 pu emf")
         if not math.isfinite(src.angle):
             raise ConfigError(f"sources.{name}.angle must be finite")
         if src.l <= 0.0:
@@ -546,9 +550,21 @@ def _initial(p: Params) -> None:
         continued = any(key.startswith((f"{name}.ctrl.", f"{name}.pwm.",
                                          f"{name}.bridge.", f"{name}.meas."))
                         for key in p.simulation.initial.states)
-        if not continued or m.period is None or m.period >= T_c * (1.0 - 1e-9):
+        if not continued:
             continue
-        offset = u.ctrl.clock_offset(u.pwm)
+        offset = control_clock_offset(u.ctrl, u.pwm)
+        interrupts, loads = PeriodicClock(T_c, offset), PeriodicClock(u.pwm.load_period, u.pwm.grid_offset)
+        k, j, tau = interrupts.index_after(t0), loads.index_after(t0), _computation(u.ctrl)
+        # The next load takes the word the latest interrupt replaced; the active word restores it
+        # only if a load followed that word's completion.
+        if (interrupts.at(k - 1) + tau > loads.at(j) + TIME_EPS
+                and interrupts.at(k - 2) + tau > loads.at(j - 1) + TIME_EPS):
+            raise ConfigError(f"simulation.initial.t = {t0} is inside the computation of a control interrupt "
+                              f"of {name!r}, before a PWM register load that takes the shadow word the "
+                              f"interrupt replaced, which is not a state: continue from outside a controller "
+                              f"computation window")
+        if m.period is None or m.period >= T_c * (1.0 - 1e-9):
+            continue
         k = round((t0 - offset) / T_c)
         if abs(offset + k * T_c - t0) > 1e-10:
             raise ConfigError(f"simulation.initial.t = {t0} is between two control interrupts of {name!r}, "
@@ -590,13 +606,14 @@ def validate(p: Params) -> Params:
         _measurement(unit.meas, period, f"units.{name}.meas",
                      unit_type(unit.type).measurement_channels)
         if continuous and unit.ctrl is not None and unit.meas.rms:
-            period = p.simulation.output.period
+            period = unit.meas.period or p.simulation.output.period
             if not math.isfinite(period) or period <= 0:
                 raise ConfigError("simulation.output.period must be finite and positive")
             for channel, window in unit.meas.rms.items():
                 if not _whole(window / period):
                     raise ConfigError(f"units.{name}.meas.rms.{channel}: window must contain "
-                                      "whole protection/output periods in continuous mode")
+                                      "whole protection periods (meas.period, default "
+                                      "simulation.output.period) in continuous mode")
     _solver(p.simulation.solver)
     _events(p)
     _progress(p.simulation.progress)

@@ -193,31 +193,51 @@ def test_mean_and_rms_share_one_bound_read_per_interval_and_reseed_discontinuiti
 
 
 def test_off_grid_rms_sampling_keeps_the_pending_integral_and_window():
-    adc = ADC(MeasurementPorts({"current": lambda: 3.0}), 0.1, 0.1,
-              rms={"current": 0.1})
-    adc.seed()
-    adc.accumulate(0.1)
-    before = adc.get_state()
-    assert not adc.sample_rms(0.05)
-    assert adc.get_state() == before
-    assert adc.sample_rms(0.1)
-    assert adc.rms["current"].value == pytest.approx(3.0)
+    def run(events):
+        tree = load_case("averaging")
+        tree["units"]["charger"]["primary"]["protection"] = {
+            "overvoltage": {"enable": True, "limit_pu": 1e-6}, "hold": 1.0,
+        }
+        tree["events"] = events
+        sim = peslite.Simulation(from_dict(tree))
+        sim.run(out_dir=None)
+        unit = sim.units["charger.primary"]
+        window = unit.adc.rms["current"].get_state()
+        return unit.protection.get_state(), (window["count"], window["index"])
+
+    plain = run({})
+    # An off-clock file event and the other unit's samples neither advance the hold timers
+    # nor close an RMS period of this continuous unit.
+    off_grid = run({"off": {"type": "set", "t": 10.5e-6,
+                            "set": {"units.charger.primary.protection.hold": 1.0}}})
+    assert plain[0]["hold_ov"] == pytest.approx(30e-6)  # the 1 us clock from 1 us to 30 us
+    assert off_grid == plain
 
 
+@pytest.mark.parametrize("rms", [True, False])
 @pytest.mark.parametrize("link", ["ss", "lcc"])
-def test_continuous_rms_seeds_actual_initial_outputs_not_structure_probe_values(link, monkeypatch):
-    initial = {}
-    original = ADC.seed
+def test_continuous_rms_seeds_actual_initial_outputs_not_structure_probe_values(link, rms,
+                                                                                monkeypatch):
+    initial, protected = {}, {}
+    original, check_fast = ADC.seed, peslite.Protection.check_fast
 
     def seed(adc, t=None):
         initial.setdefault(id(adc), adc.ports.read())
         original(adc, t)
 
+    def first_check(protection, t, currents):
+        protected.setdefault(id(protection), tuple(currents))
+        return check_fast(protection, t, currents)
+
     monkeypatch.setattr(ADC, "seed", seed)
-    sim = peslite.Simulation(from_dict(load_case("averaging", link=link)))
+    monkeypatch.setattr(peslite.Protection, "check_fast", first_check)
+    sim = peslite.Simulation(from_dict(load_case("averaging", link=link, rms=rms)))
     sim.run(out_dir=None)
     for unit in sim.units.values():
-        assert initial[id(unit.adc)]["current"] == 0.0
+        if rms:
+            assert initial[id(unit.adc)]["current"] == 0.0
+        # The first protection check at t0 reads the same refreshed outputs, with or without an ADC.
+        assert protected[id(unit.protection)] == (0.0,)
 
 
 @pytest.mark.parametrize("side", ["primary", "secondary"])

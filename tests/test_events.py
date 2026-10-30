@@ -1,6 +1,7 @@
 """Unified simulation-file events: registration, scenarios and set validation."""
 
 import math
+import re
 from dataclasses import dataclass
 
 import pytest
@@ -9,7 +10,7 @@ import yaml
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly import Event, Scenario, register_event_type
-from peslite.assembly.events import EVENT_TYPES, SourceScenario, connected_at, events_for, switching_schedule
+from peslite.assembly.events import EVENT_TYPES, SourceScenario, events_for, switching_schedule
 from peslite.assembly.params import ConfigError, dumps, from_dict, read_tree
 from peslite.control import Startup
 
@@ -123,7 +124,8 @@ def test_switching_schedule_and_scenario_connection_ramps():
     )
     schedule = switching_schedule(p.changes)["units.vsc"]
     assert schedule == [(0.2, True), (2.0, False), (3.0, True)]
-    assert not connected_at(schedule, 0.1) and connected_at(schedule, 1.0)
+    assert not Scenario(p.changes, "units.vsc").connected(0.1)
+    assert Scenario(p.changes, "units.vsc").connected(1.0)
     scenario = Scenario(events_for(p.changes, "units.vsc"))
     assert not scenario.connected(0.1) and scenario.connected(0.7)
     assert not scenario.connected(2.5) and scenario.connected(4.0)
@@ -153,6 +155,12 @@ def test_set_events_are_applied_and_validated_in_order():
     assert [change.params.unit("vsc").protection.frequency.limit for change in changes] == [0.5, 0.8]
     assert changes[0].touches("units.vsc.") == [
         "protection.frequency.enable", "protection.frequency.limit"]
+    # A connection command in the same event is switched, not retuned.
+    mixed = p.replace(**_set("mixed", 2.5, **{"units.vsc.protection.frequency.limit": 0.9,
+                                              "units.vsc.connected": 0}))
+    change, = (change for change in mixed.changes if change.event == "mixed")
+    assert change.connections == ("units.vsc.connected",)
+    assert change.touches("units.vsc.") == ["protection.frequency.limit"]
 
     with pytest.raises(ConfigError, match="required when enable is 1"):
         _gfl().replace(**_set("bad", 1.0, **{"units.vsc.protection.frequency.enable": 1}))
@@ -174,6 +182,22 @@ def test_set_paths_use_si_pu_rules_and_detect_same_time_conflicts():
         )
     with pytest.raises(ConfigError, match="pwm.f_sw cannot change during a run"):
         _gfl().replace(**_set("bad", 1.0, **{"units.vsc.pwm.f_sw": 10_000.0}))
+    # Loop fields declared structural (type, period, state-defining switches) are rejected.
+    psc = peslite.load(EXAMPLES / "gfm-psc-example.pes").replace(
+        **{"units.vsc.ctrl.loops.PSC.power_filter.bandwidth": 5.0})
+    wpt = peslite.load(EXAMPLES / "wpt-load-example.pes")
+    for params, path, value in (
+            (_gfl(), "units.vsc.ctrl.loops.SRFPLL.normalisation", "amplitude"),
+            (_gfl(), "units.vsc.ctrl.loops.SRFPLL.period", 1e-4),
+            (_gfl(), "units.vsc.ctrl.loops.SRFPLL.type", "srf_pll"),
+            (psc, "units.vsc.ctrl.loops.PSC.power_filter.enable", 1),
+            (wpt, "units.charger.primary.ctrl.loops.PowerControl.power_filter.enable", 0)):
+        with pytest.raises(ConfigError, match=f"{re.escape(path)} cannot change during a run"):
+            params.replace(**_set("bad", 1e-3, **{path: value}))
+    retuned = psc.replace(**_set("ok", 1e-3, **{
+        "units.vsc.ctrl.loops.PSC.power_filter.bandwidth": 8.0}))
+    assert [change.paths for change in retuned.changes if change.event == "ok"] == [
+        ("units.vsc.ctrl.loops.PSC.power_filter.bandwidth",)]
 
 
 def test_source_scenario_preserves_frequency_phase_and_voltage_changes():

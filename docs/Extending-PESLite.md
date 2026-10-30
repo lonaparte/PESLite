@@ -63,7 +63,10 @@ class LaggedSync(SyncLaw):
         return self.omega, (p_pu - self.p_f) / self.cfg.tau
 ```
 
-The nested frozen `Params` dataclass defines the file schema and defaults. A module stored under
+The nested frozen `Params` dataclass defines the file schema and defaults. Loop `type` and `period`
+are structural; `set` events may write other fields except those declared with dataclass metadata
+`{"runtime": False}`. Use that metadata for additional fields that add or remove states, as the
+built-in loops do for `SRFPLL.normalisation` and the power-filter `enable`. A module stored under
 `peslite/addons/control/` is discovered automatically; the class name is then available directly
 under `units.<u>.ctrl.loops` exactly like a built-in loop:
 
