@@ -1617,7 +1617,7 @@ def main(argv=None) -> int:
         else:
             reporter = getattr(addon, "small_signal_report", None)
         if not callable(reporter):
-            warnings.warn("--report: the small-signal analysis addon is unavailable; "
+            warnings.warn("--report: the online stability analysis addon is unavailable; "
                           "continuing the simulation without a report", RuntimeWarning, stacklevel=2)
             reporter = None
     if reporter is not None:

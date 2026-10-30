@@ -107,7 +107,7 @@ peslite-convert buck-example common
 Leaf converters also expose `units.<name>.connected`, the initial connection command. Select it
 individually or through a unit section, `all`, or `common`, and set it to `0` or `1` with `--set`.
 Scheduled connection events retain their normal precedence and timing; see
-[Built-in events](Events-and-Restart.md#built-in-events).
+[Built-in events](Events-Timeline.md#built-in-events).
 
 `common` means `all` minus the parameters identified by the existing structural sensitivity
 check. It keeps those detected parameters constant at their configured values; every other
@@ -269,7 +269,8 @@ common trip path, not a WPT phase override.
 
 The exporter supports the built-in switching, PWM-period-averaged and ideal averaged bridge models,
 including square-wave phase-shift modulation in the switching model.
-For their semantics, see [Converter and Bridge Models](Converter-and-Bridge-Models.md).
+For their semantics, see [Bridge and PWM](Bridge-and-PWM.md) and
+[DC Converters and Wireless Power Transfer](DC-Converters-and-WPT.md).
 
 Controllerless Units retain their electrical equations and independently clocked ADCs. Ideal
 diode full bridges and switch-controlled capacitors participate through the ordinary

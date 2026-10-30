@@ -62,7 +62,7 @@ peslite case.pes --averaging
 ```
 
 What each preset selects is listed in
-[Command presets](Converter-and-Bridge-Models.md#command-presets).
+[Command presets](Bridge-and-PWM.md#command-presets).
 
 ## Choose the output directory
 
@@ -89,53 +89,20 @@ names; see [Progress and watch](Output-and-Results.md#progress-and-watch).
 peslite case.pes --report
 ```
 
-With the small-signal analysis addon available, this also writes `case_report.json`; see
-[Small-Signal Stability Analysis](Small-Signal-Analysis.md#time-based-simulation-report) for its
+With the online stability analysis addon available, this also writes `case_report.json`; see
+[Online Stability Analysis](Online-Stability-Analysis.md#online-simulation-report) for its
 contents and compatible options.
 
 ## Plot recorded waveforms
 
-Install the optional plotting dependency, then name the recorded columns after `--plot`:
-
-```bash
-pip install "peslite[plot]"
-peslite case.pes --plot vsc.dclink.u_C vsc.ctrl.SRFPLL.theta \
-  --plot-ylabel '$x$ (pu)'
-```
-
-`pip install "peslite[all]"` installs every optional runtime add-on in one step.
-
-PESLite always runs the simulation first. It finds the actual generated CSV that contains all the
-requested columns and writes `fig_<table>.pdf` beside it. The columns must belong to one CSV; no
-implicit resampling is performed between output grids. Plant and controller waveforms require
-`simulation.output.signals: 1`, as they do for CSV output generally.
-
-The horizontal column defaults to `t`. Its labels automatically use seconds, milliseconds or
-microseconds instead of a scientific multiplier. Use `--plot-time-unit s|ms|us` to override that
-choice. Common presentation options include:
-
-```bash
-peslite case.pes --plot vsc.dclink.u_C \
-  --plot-title 'DC-link voltage' \
-  --plot-label '$u_{dc}$' \
-  --plot-ylabel '$u_{dc}$ (V)' \
-  --plot-xlim 0.1 0.2 \
-  --plot-width double \
-  --plot-output dc-link.pdf
-```
-
-Further options are `--plot-x` (another horizontal column) and `--plot-xlabel`, per-waveform
-`--plot-color` and `--plot-style` in `--plot` order, `--plot-height` (inches), `--plot-linewidth`
-(points), `--plot-ylim`, `--plot-no-grid` and `--plot-no-legend`.
-
-`--plot-xlim` remains in the CSV time unit (seconds); only its presentation is scaled. The default
-style uses IEEE dimensions, serif/Computer Modern text, inward ticks, restrained colors and vector
-PDF output. External LaTeX is used when available, with a bundled Computer Modern-style fallback.
+`--plot NAME [NAME ...]` invokes the optional plotting add-on after the simulation. See
+[Plotting](Plotting.md) for installation, output requirements and presentation options.
 
 ## Continue from saved state
 
 `--initial FILE` starts from the last row of a saved `states.csv`; `--initial-time T` selects the
-row saved at another time. See [Events and Restart](Events-and-Restart.md#continue-from-a-saved-csv)
+row saved at another time. See
+[Events Timeline](Events-Timeline.md#continue-from-a-saved-csv)
 for the commands and what is restored.
 
 ## Inspect without running

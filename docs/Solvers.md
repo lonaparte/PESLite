@@ -47,7 +47,7 @@ benefit.
 ## Command presets
 
 The bridge/solver presets are listed in
-[Converter and Bridge Models](Converter-and-Bridge-Models.md#command-presets). Explicit `--set`
+[Bridge and PWM](Bridge-and-PWM.md#command-presets). Explicit `--set`
 values for solver type or method take priority over them.
 
 ## Multirate integration

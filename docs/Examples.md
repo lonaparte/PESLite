@@ -55,7 +55,7 @@ peslite gfl-example --averaging
 The default output directories receive a mode suffix, so these runs do not overwrite one another.
 They represent different model fidelity and timing semantics; compare quantities in their common
 bandwidth rather than expecting identical switching-scale waveforms. See
-[Converter and Bridge Models](Converter-and-Bridge-Models.md).
+[Bridge and PWM](Bridge-and-PWM.md).
 
 ## WPT power feedback
 
@@ -70,7 +70,7 @@ peslite wpt-lcc-example --averaging
 ```
 
 `PowerControl` produces a modulation amplitude and `PhasePowerControl` a phase in radians through
-the [scalar feedback loops](Control-and-PWM-Timing.md#scalar-feedback-loops). Set phase
+the [scalar feedback loops](Bridge-and-PWM.md#scalar-feedback-loops). Set phase
 limits and gain polarity for a monotonic circuit branch; the controller does not infer them.
 
 The power channel uses the paired voltage and current of the converter's external `power` terminal,
@@ -81,7 +81,7 @@ secondary power means power is delivered to its ideal DC voltage source. These e
 power-transfer regulation between stiff DC rails, not battery dynamics or output-voltage regulation.
 
 Sampled power feedback averages `power` itself with `meas.average: [power]`
-([ADC sampling](Control-and-PWM-Timing.md#adc-sampling)); its optional filter removes the remaining
+([ADC sampling](Bridge-and-PWM.md#adc-sampling)); its optional filter removes the remaining
 excitation ripple. Ideal `averaging` uses the instantaneous product and the same filter.
 
 The controller CSV files record each example's command, filtered power and power reference. The
@@ -117,9 +117,10 @@ protection:
 ```
 
 Source names and RMS windows are described in
-[Measurement sources and RMS](Control-and-PWM-Timing.md#measurement-sources-and-rms).
+[Measurement sources and RMS](Bridge-and-PWM.md#measurement-sources-and-rms).
 
-Either side may enable RMS protection independently ([Protection](Simulation-Files.md#protection)).
+Either side may enable RMS protection independently
+([Protection periods](Bridge-and-PWM.md#protection-periods)).
 It is a held trip, not current regulation. Changing `elements.load.r` uses the
 ordinary `set` event and preserves electrical and controller state in Python and C++.
 

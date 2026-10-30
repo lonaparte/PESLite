@@ -6,7 +6,7 @@
 
 PESLite is an open-source, lightweight, multirate, and extensible power electronics simulator in
 Python. It provides time-domain simulation for power-electronic converters and converter-based 
-systems—combining switching and averaged models, digital control timing, event-driven operation, 
+systems—combining switching and averaged models, sampled control, event-driven operation,
 and flexible multi-time-scale numerical integration via readable YAML files and a Python 
 API—designed as a deterministic simulation backend for LLM reasoning and verification.
 
@@ -15,7 +15,7 @@ API—designed as a deterministic simulation backend for LLM reasoning and verif
 - AC and DC converter networks, including grid-connected and wireless-power-transfer systems.
 - Configurable grid-following, grid-forming and DC converter control.
 - Switching, PWM-period-averaged and continuously averaged models.
-- Digital control timing, sensing and converter protection.
+- Sampled control, sensing and converter protection.
 - Fixed-step, adaptive and multirate integration with exact event boundaries.
 - Simulation events and continuation from saved states.
 - Streamed waveform output, optional plotting and energy accounting.
@@ -62,8 +62,8 @@ peslite case.pes --pwm-averaging
 peslite case.pes --averaging
 ```
 
-See [Converter and Bridge Models](https://github.com/lonaparte/PESLite/wiki/Converter-and-Bridge-Models)
-for model fidelity, control timing and solver presets.
+See [Bridge and PWM](https://github.com/lonaparte/PESLite/wiki/Bridge-and-PWM)
+for bridge models, control periods and solver presets.
 
 Use `peslite --help` for the full interface.
 
@@ -95,18 +95,21 @@ for compilation, runtime configuration and current backend limits.
 ## Documentation
 
 - [Getting Started](https://github.com/lonaparte/PESLite/wiki/Getting-Started)
-- [Examples](https://github.com/lonaparte/PESLite/wiki/Examples)
+- [Project Workspace](https://github.com/lonaparte/PESLite/wiki/Project-Workspace)
 - [Simulation Files](https://github.com/lonaparte/PESLite/wiki/Simulation-Files)
-- [Converter and Bridge Models](https://github.com/lonaparte/PESLite/wiki/Converter-and-Bridge-Models)
-- [Control and PWM Timing](https://github.com/lonaparte/PESLite/wiki/Control-and-PWM-Timing)
+- [Events Timeline](https://github.com/lonaparte/PESLite/wiki/Events-Timeline)
+- [Output and Results](https://github.com/lonaparte/PESLite/wiki/Output-and-Results)
 - [Solvers](https://github.com/lonaparte/PESLite/wiki/Solvers)
 - [Multirate Simulation](https://github.com/lonaparte/PESLite/wiki/Multirate-Simulation)
-- [Events and Restart](https://github.com/lonaparte/PESLite/wiki/Events-and-Restart)
-- [Output and Results](https://github.com/lonaparte/PESLite/wiki/Output-and-Results)
-- [Project Workspace](https://github.com/lonaparte/PESLite/wiki/Project-Workspace)
-- [Extending PESLite](https://github.com/lonaparte/PESLite/wiki/Extending-PESLite)
+- [Passive Network Components](https://github.com/lonaparte/PESLite/wiki/Passive-Network-Components)
+- [Electrical Sources](https://github.com/lonaparte/PESLite/wiki/Electrical-Sources)
+- [Voltage-Source Converters](https://github.com/lonaparte/PESLite/wiki/Voltage-Source-Converters)
+- [Bridge and PWM](https://github.com/lonaparte/PESLite/wiki/Bridge-and-PWM)
+- [DC Converters and Wireless Power Transfer](https://github.com/lonaparte/PESLite/wiki/DC-Converters-and-WPT)
 - [Architecture](https://github.com/lonaparte/PESLite/wiki/Architecture)
+- [Extending PESLite](https://github.com/lonaparte/PESLite/wiki/Extending-PESLite)
 - [CLI Reference](https://github.com/lonaparte/PESLite/wiki/CLI-Reference)
+- [Examples](https://github.com/lonaparte/PESLite/wiki/Examples)
 
 The Wiki documents the current `main` branch. Releases and the changelog record versioned changes.
 

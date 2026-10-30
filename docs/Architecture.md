@@ -32,19 +32,16 @@ assembled system.
 Controller and component modules in their respective add-on packages are imported once at package
 initialisation. Their decorators populate the same registries used by built-in types, so there is
 no add-on lookup or dispatch in the simulation hot path. Optional dependencies stay behind the
-`addons/functions` boundary. IEEE-style plotting reads closed result CSV files after a run and is
-absent from the solver path and generated C++ source.
-The optional small-signal analysis functions also live in `addons/functions`. They consume a
-completed simulation or selected observations from a run, and share the solver-side loop-map
-linearization. The runner exposes an optional observation callback on its existing event grid;
-core time stepping never imports the analysis implementation; the CLI loads it only with
-`--report`. Split-error diagnostics use that same
-finite-difference calculation without depending on the stability addon.
-See [Small-Signal Stability Analysis](Small-Signal-Analysis.md).
+`addons/functions` boundary; [plotting](Plotting.md) is loaded only when requested.
+The optional online stability analysis functions also live in `addons/functions`. They consume
+selected observations during a run and share the solver-side loop-map linearization. The runner
+exposes an optional observation callback on its existing event grid; core time stepping never
+imports the analysis implementation, and the CLI loads it only with `--report`. Split-error
+diagnostics use the same finite-difference calculation without depending on the addon. See
+[Online Stability Analysis](Online-Stability-Analysis.md).
 
 Loading a simulation file also merges a sibling `PESaddons/` tree into these three package paths
-without adding run-loop work; see
-[Project Workspace](Project-Workspace.md#project-local-pesaddons).
+without adding run-loop work; see [Project Workspace](Project-Workspace.md).
 
 ## Components
 
@@ -73,7 +70,7 @@ groups iteratively.
 The graph has one typed, directed boundary. Its input ports are measured feedback signals
 (`meas.*`) and controller references (`references.*`). Its output schema belongs to that boundary:
 AC control exposes `u_dq`, `theta` and `omega`, while scalar bridge control exposes its modulator
-registers, such as `duty` (see [Converter and Bridge Models](Converter-and-Bridge-Models.md)). A
+registers, such as `duty` (see [Bridge and PWM](Bridge-and-PWM.md)). A
 connection always binds a loop input to a boundary or loop output. Default wiring and explicit
 custom wiring are both lowered to this same graph before the run.
 
@@ -102,8 +99,8 @@ owns its power stage, controller, sensing, startup interface, breakers and gates
 
 Construction assembles these objects without issuing connection commands. Before loading named
 control state, the connection owner initializes its source and controller command once from the
-event timeline. After state loading, cold starts track the physical inputs and restore
-bridge/ADC timing; restarts preserve the supplied control state. Cold-start and reconnect tracking
+event timeline. After state loading, cold starts track the physical inputs and restore bridge and
+ADC clock state; restarts preserve the supplied control state. Cold-start and reconnect tracking
 use the same loop `track()` callbacks in Python and generated C++, including custom loops.
 Parameter selection does not change this initialization sequence.
 
@@ -175,7 +172,7 @@ use one integration method.
 - file events;
 - converter ADC, control, PWM load and switching instants;
 - continuous-unit measurement/protection clocks;
-- observation times requested by analyses such as the small-signal report.
+- observation times requested by analyses such as the online stability report.
 
 Multirate windows advance inside the solver and settle before model-changing events.
 

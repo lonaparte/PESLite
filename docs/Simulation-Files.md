@@ -1,414 +1,69 @@
 # Simulation Files
 
-PESLite simulations are YAML mappings. `.pes` is the conventional extension, but any text-file
-extension is accepted. Files are parsed strictly: unknown keys, invalid types and inconsistent
-cross-references are reported before the run starts.
+A `.pes` file is a YAML description of one simulation. PESLite validates the complete file before
+assembly and reports unknown fields, invalid values and unresolved connections.
 
-## Top-level structure
-
-| Section | Purpose |
-|---|---|
-| `base` | System power rating and, when needed, AC voltage and nominal frequency bases. |
-| `buses` | Electrical nodes with a shunt capacitance and optional damping. |
-| `branches` | R-L connections between named buses or Unit ports. |
-| `sources` | AC voltage sources behind R-L impedance, connected to a bus or Unit port. |
-| `units` | Converter power stage, sensing, controller, bridge and protection, when present. |
-| `elements` | Built-in or registered circuit elements such as R-L loads. |
-| `events` | Timed connect, disconnect and parameter-change operations. |
-| `simulation` | End time, solver, initial state, output and progress settings. |
-| `meta` | Optional title and description; never affects the model. |
-
-Names are unique within each of `buses`, `branches`, `sources`, `units` and `elements`. The same
-spelling may be used in different sections when their assembled subsystem and signal names remain
-distinct. An event target must still identify exactly one switchable object. Names must be
-non-empty and cannot contain a dot, because dots separate public parameter and state paths.
-
-## SI and per-unit values
-
-Power-circuit values are stored internally in SI. A parameter without the `_pu` suffix is an SI
-value; a parameter ending in `_pu` is converted using the applicable system or converter base.
-Do not provide both forms of the same parameter.
+## Structure
 
 ```yaml
 base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
 
-branches:
-  line: {bus1: grid_bus, bus2: pcc, l_pu: 0.2, r_pu: 0.02}
-```
+buses: {}
+branches: {}
+sources: {}
+elements: {}
+units: {}
+events: {}
 
-Each converter may define its own `s_base`; otherwise it uses the system base. Controller
-references and loop parameters use that converter's base. Time is in seconds, angles are radians,
-frequencies are hertz unless named `omega`, and switches are `0` or `1`. YAML `true` and `false` are
-also accepted; resolved files write `0` and `1`.
-
-`s_base` is the only unconditional base field. `v_ll_rms` is required by three-phase buses, VSCs
-and AC per-unit voltage or impedance values; `f0` is required by VSCs, AC sources, synchronous PWM
-and frequency-based per-unit values. A scalar circuit written in SI therefore uses, for example,
-`base: {s_base: 500.0}` without placeholder AC values. A model with no converters simply has no
-`units` section; buses, branches, sources and elements use the same assembly and solver path.
-
-| Field | Required | Value | Default | Meaning |
-|---|---:|---|---|---|
-| `s_base` | yes | VA | — | system power rating |
-| `v_ll_rms` | when an AC voltage base is needed | V RMS | — | three-phase line-to-line voltage base |
-| `f0` | when a frequency base is needed | Hz | — | nominal frequency |
-
-## Network components
-
-The network sections are optional mappings of user-defined names to electrical components. A bus
-is a named capacitor node; a circuit that does not need such a node does not need a `buses` entry.
-
-### Buses
-
-```yaml
-buses:
-  pcc: {c_pu: 0.02, r_d_pu: 0.5, phases: 3}
-```
-
-| Field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `c` or `c_pu` | yes | F or pu | — | shunt capacitance |
-| `r_d` or `r_d_pu` | no | ohm or pu | 0 | series damping resistance |
-| `phases` | no | `1` or `3` | `3` | scalar or three-phase space-vector node |
-
-### Branches
-
-A branch is an R-L connection between two buses or Unit ports:
-
-```yaml
-branches:
-  line: {bus1: grid_bus, bus2: pcc, l_pu: 0.2, r_pu: 0.02}
-```
-
-| Field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `bus1`, `bus2` | yes | bus or Unit-port name | — | branch terminals |
-| `l` or `x_pu` | yes | H or pu | — | series inductance |
-| `r` or `r_pu` | no | ohm or pu | 0 | series resistance |
-
-### Sources
-
-```yaml
-sources:
-  grid: {bus: pcc, x_pu: 0.4, r_pu: 0.04}
-```
-
-| Field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `bus` | yes | bus or Unit-port name | — | source terminal |
-| `l` or `x_pu` | yes | H or pu | — | series inductance |
-| `r` or `r_pu` | no | ohm or pu | 0 | series resistance |
-| `v` or `v_pu` | no | phase-peak V or pu | system base | voltage magnitude |
-| `f` | no | Hz | `base.f0` | frequency |
-| `angle` | no | rad | 0 | initial angle |
-
-Source voltage is phase-peak volts, frequency is hertz and angle is radians. Omitted `v` and `f`
-use the applicable system-base values.
-
-### Elements
-
-```yaml
-elements:
-  load: {type: resistor, bus: pcc, r: 10.0}
-```
-
-| `type` | Required fields | Optional fields | Meaning |
-|---|---|---|---|
-| `load` | `bus`, `l` or `x_pu` | `r` or `r_pu` | series R-L load |
-| `resistor` | `bus`, `r` | `series` (default 0) | shunt resistor or series resistor after the bus voltage driver |
-| `voltage_source` | scalar `bus`, `v`, `r` | — | constant voltage behind series resistance |
-
-Per-unit element inputs use the system base. Registered element types define their own fields
-([Extending PESLite](Extending-PESLite.md#custom-circuit-elements)).
-
-## Units and controllers
-
-A `Unit` groups one converter or a composite of converters.
-
-### Unit configuration
-
-Every entry under `units` selects a registered Unit type. These fields are available to every
-Unit:
-
-| Field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `type` | no | `vsc`, `dc_converter` or `wpt` | `vsc` | Unit type |
-| `s_base` | no | VA | `base.s_base` | Unit power rating |
-
-Non-composite converter Units share the following fields:
-
-| Field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `bus` | by Unit type | bus name | — | external network connection |
-| `connected` | no | switch | event-derived | initial connection command |
-| `dclink` | yes | mapping | — | DC rating, source and optional capacitor |
-| `bridge` | no | mapping | type default | bridge topology and simulation model |
-| `pwm` | sampled controlled bridge | mapping | — | switching and register-update settings |
-| `ctrl` | controlled bridge | mapping | — | controller definition |
-| `meas` | no | mapping | `{}` | measurements and sampling |
-| `protection` | no | mapping | disabled | converter protection |
-
-The selected type contributes only its own fields and constraints:
-
-| `type` | Required type-specific fields | Optional type-specific fields | Constraint |
-|---|---|---|---|
-| `vsc` | `ac_filter` | — | common `bus` is required and three-phase |
-| `dc_converter` | — | `filter` | common `bus` and `filter` are provided together |
-| `wpt` | `primary`, `secondary`, `link` | — | `primary` and `secondary` are child Units |
-
-For a converter Unit, `dclink.vdc_ref` is its rated DC voltage, `dclink.capacitor` accepts `c` and
-`r_esr`, and `dclink.source.type` is `voltage`, `current` or `none`. See
-[Converter and Bridge Models](Converter-and-Bridge-Models.md) for bridge topology, DCM and device
-behavior.
-
-### Controllers
-
-`ctrl.type` selects the controller interface and default wiring: `gfl`, `gfm`, `dc`, `open_loop`,
-`resonant`, `phase_shift` or `custom`.
-
-| Field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `type` | yes | registered controller profile | — | controller interface and default wiring |
-| `period` | sampled control only | s | PWM period | controller interrupt period |
-| `offset` | no | s | PWM load-clock offset | controller clock position |
-| `computation` | no | s | 1 us | command-computation delay |
-| `loops` | yes | mapping | — | control-loop nodes and parameters |
-| `connections` | no | mapping | profile wiring | explicit graph connections |
-| `outputs` | no | mapping | profile outputs | outputs supplied to the Unit |
-| `references` | by profile | mapping | profile defaults | controller reference values |
-
-Each `ctrl.loops` key is both the registered class and the graph-node name; no nested `type` field
-is needed. `{}`, a bare key and YAML `null` all mean an empty parameter mapping. Repeated uses of
-one class use names such as `Observer[voltage]` and `Observer[current]`. See
-[Control and PWM Timing](Control-and-PWM-Timing.md) for loop periods, ADC timing and register
-updates.
-
-### Bridge and PWM settings
-
-| `bridge` field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `type` | no | `half_bridge`, `full_bridge` or `three_phase_bridge` | Unit-specific | topology |
-| `model` | no | `switching`, `pwm_averaging` or `averaging` | `pwm_averaging` | simulation form |
-| `upper_controlled`, `lower_controlled` | no | switches | 1 | controlled device rows |
-| `reverse_port` | no | switch | 0 | reverse the scalar power-port direction |
-| `external_terminal` | no | `midpoint` or `lower_rail` | `midpoint` | exposed half-bridge terminal |
-| `on_resistance` | no | ohm per conducting device | 0 | device conduction resistance |
-| `parallel_capacitance` | no | F | 0 | capacitance across the bridge power port |
-
-| `pwm` field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `f_sw` | sampled controlled bridges | Hz | — | carrier and default control frequency |
-| `modulation_limit` | no | ratio | 1 | modulation magnitude limit |
-| `update` | no | `single` or `double` | `single` | PWM register-load rate |
-| `carrier_phase` | no | carrier periods | 0 | carrier position |
-| `method` | no | `spwm` or `svpwm` | `spwm` | modulation method |
-| `sync` | no | `asynchronous` or `synchronous` | `asynchronous` | carrier synchronization |
-| `pattern_sync` | no | `interval` or `pulse` | `interval` | command-update boundary |
-
-See [Converter and Bridge Models](Converter-and-Bridge-Models.md) for model selection and
-[Control and PWM Timing](Control-and-PWM-Timing.md) for register timing.
-
-### Link fields
-
-| `link.type` | Required fields | Optional fields | Meaning |
-|---|---|---|---|
-| `ss` | primary/secondary inductance and capacitance, mutual inductance | primary/secondary resistance and SCC | series-series link |
-| `lcc` | coil and compensation inductances, series and parallel capacitances, mutual inductance | corresponding resistances and SCC | LCC-LCC link |
-| `lcc_s` | LCC primary fields, secondary inductance and capacitance, mutual inductance | corresponding resistances and SCC | LCC-series link |
-| `ss_multi` | inductance matrix and primary/secondary capacitance lists | primary/secondary resistance lists | multi-module series-series link |
-
-`mutual_inductance` may be negative according to the selected winding polarity.
-
-`ss`, `lcc` and `lcc_s` links accept `primary_scc` and `secondary_scc`:
-
-| Field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `capacitance` | yes | F | — | switched capacitance |
-| `angle` | no | rad in [0, pi] | 0 | conduction angle |
-| `drive` | no | `common` or `alternating` | `common` | gate pattern |
-| `sync` | no | `current` or `bridge` | `current` | phase reference |
-| `sync_angle` | no | rad | 0 | bridge-synchronised phase offset |
-| `command` | no | switch | 0 | use controller output `scc_angle` |
-
-See [Exact commutations](Converter-and-Bridge-Models.md#exact-commutations) for switch-controlled
-capacitor behavior.
-
-### Measurements
-
-| Field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `average` | no | list of channels | `[]` | channels sampled as window means |
-| `window` | no | s | controller period | measurement window |
-| `period` | no | s | controller period | measurement period |
-| `offset` | no | s | controller offset | measurement-clock position |
-| `sources` | no | mapping | `{}` | channels mapped to physical outputs or Unit-port quantities |
-| `rms` | no | channel-to-seconds mapping | `{}` | sliding RMS windows |
-
-See [ADC sampling](Control-and-PWM-Timing.md#adc-sampling) for timing and source selection.
-
-### Protection
-
-Each `protection` criterion is switched by `enable`; an enabled limit must be positive. Current and
-voltage limits are per unit of the electrical base selected by the Unit type.
-
-| Criterion | Required fields | Default | Effect |
-|---|---|---|---|
-| `overcurrent` | `enable`, `limit_pu` | disabled | trip on instantaneous current |
-| `rms_current` | `enable`, `limit_pu` and a current `meas.rms` window | disabled | trip after the RMS limit persists for `hold` |
-| `undervoltage`, `overvoltage` | `enable`, `limit_pu` | disabled | trip after the terminal-voltage limit persists for `hold` |
-| `dc_voltage` | `enable`, `limit_pu` | disabled | trip after the DC-link deviation persists for `hold` |
-| `frequency` | `enable`, `limit` in Hz | disabled | trip after the frequency deviation persists for `hold`; VSC only |
-| `rocof` | `enable`, `limit` in Hz/s; optional `window` | disabled; window 0.1 s | raise the `ROCOF` alarm; VSC only |
-
-`hold` (s, default 0.02) is the time a held criterion must persist.
-[Protection clocks](Control-and-PWM-Timing.md#protection-clocks) describes when each criterion is
-evaluated and armed, and what a trip does.
-
-## Events
-
-```yaml
-events:
-  connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 0.2}
-  power_step: {type: set, t: 0.5, set: {units.vsc.ctrl.references.p_ref_pu: 0.8}}
-```
-
-| `type` | Required fields | Optional fields | Meaning |
-|---|---|---|---|
-| `connect` | `target`, `t` | `ramp` | connect a Unit, source, branch or element |
-| `disconnect` | `target`, `t` | — | disconnect a Unit, source, branch or element |
-| `set` | `t`, `set` | `ramp` for connection commands | change one or more writable variables |
-
-Event times are exact simulation boundaries. See [Events and Restart](Events-and-Restart.md) for
-ordering, writable paths, initial states and continuation.
-
-## Simulation settings
-
-```yaml
 simulation:
-  t_end: 3.0
-  solver: {type: fixed, method: rk4, dt: 25e-6}
-  initial:
-    t: 0.0
-    states: {}
-  output:
-    period: 0.5e-3
-    record_every: 10
-    states: 1
-    signals: 0
-    energy: 0
-  stop_on_trip: 1
-  energy_check: warn
+  t_end: 1.0
+  solver: {type: fixed, method: rk4, dt: 1e-6}
+  output: {}
+
+meta: {}
 ```
 
-| Field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `t_end` | yes | s | — | simulation end time |
-| `solver` | no | mapping | fixed-step RK4 | numerical solver settings |
-| `initial` | no | mapping | `t: 0`, no explicit states | start time and state values |
-| `output` | no | mapping | standard state output | output periods and files |
-| `stop_on_trip` | no | switch | 1 | stop at the first converter trip |
-| `progress` | no | mapping | disabled | console progress and watched values |
-| `energy_check` | no | `warn`, `strict` or `off` | `warn` | construction-time energy audit |
+| Section | Contents | Reference |
+|---|---|---|
+| `base` | system power, voltage and frequency bases | [SI and per-unit values](#si-and-per-unit-values) |
+| `buses`, `branches`, `elements` | passive electrical network | [Passive Network Components](Passive-Network-Components.md) |
+| `sources` | independent network sources | [Electrical Sources](Electrical-Sources.md) |
+| `units` with `type: vsc` | voltage-source converters | [Voltage-Source Converters](Voltage-Source-Converters.md) |
+| converter `bridge`, `pwm`, `ctrl`, `meas`, `protection` | bridge model and sampled control | [Bridge and PWM](Bridge-and-PWM.md) |
+| `units` with `type: dc_converter` or `wpt` | scalar conversion and coupled links | [DC Converters and Wireless Power Transfer](DC-Converters-and-WPT.md) |
+| `events` and `simulation.initial` | event timeline and continuation | [Events Timeline](Events-Timeline.md) |
+| `simulation.output` and `simulation.progress` | files, signals and progress | [Output and Results](Output-and-Results.md) |
+| `simulation.solver` | integration settings | [Solvers](Solvers.md) |
+| `simulation.solver.subsystems` | subsystem step ratios | [Multirate Simulation](Multirate-Simulation.md) |
+| `meta` | optional title and description | — |
 
-### Solver
+All top-level sections except `base` and `simulation` are optional. A model without a component
+section simply omits it.
 
-| Field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `type` | no | `fixed` or `adaptive` | `fixed` | solver family |
-| `method` | no | method name | `rk4` | integration method |
-| `dt` | fixed solver | s | 1 us | maximum fixed system step |
-| `rtol` | adaptive solver | ratio | 1e-6 | relative error tolerance |
-| `atol` | adaptive solver | state scale | 1e-9 | absolute error tolerance |
-| `max_step` | adaptive solver | s | unlimited | maximum adaptive step |
-| `warm_start` | no | switch | 1 | reuse the previous adaptive step size |
-| `subsystems` | no | mapping | `{}` | multirate subsystem schedule |
-| `sweeps` | no | positive integer | 2 | coupling sweeps for sub-stepped subsystems |
-| `linearisations` | no | non-negative integer | 3 | split-error linearisation points |
-| `write_length` | no | positive integer | 1000 | rows per streamed CSV write |
-| `phs_check_step` | no | positive integer | 1000 | snapshots between energy audits |
+## Names and paths
 
-See [Solvers](Solvers.md) and [Multirate Simulation](Multirate-Simulation.md) for the available
-methods and multirate fields.
+Names are unique within each of `buses`, `branches`, `sources`, `elements` and `units`. They must
+be non-empty and cannot contain a dot. Dots separate public configuration, state and signal paths:
 
-### Initial state
-
-| Field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `t` | no | s | 0 | simulation start time |
-| `states` | no | mapping | `{}` | initial values keyed by public state path |
-
-The start and end times are exact and are not rounded to an ADC, PWM or solver grid. State names,
-values and keywords are described in [Events and Restart](Events-and-Restart.md#initial-state).
-
-### Output and progress
-
-| `output` field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `period` | no | s | 0.5 ms | plant snapshot period |
-| `record_every` | no | positive integer | 1 | keep every nth controller sample |
-| `states` | no | switch | 1 | write `states.csv` |
-| `signals` | no | switch | 0 | write plant and controller signal files |
-| `energy` | no | switch | 0 | write `energy.csv` |
-
-| `progress` field | Required | Value/format | Default | Meaning |
-|---|---:|---|---|---|
-| `enable` | no | switch | 0 | print simulation progress |
-| `period` | when enabled | s | — | simulated time between progress lines |
-| `watch` | no | list of public output paths | `[]` | values appended to each progress line |
-
-See [Output and Results](Output-and-Results.md) for result files and public output names.
-
-## Metadata
-
-```yaml
-meta:
-  title: Example study
-  description: Optional descriptive text
+```text
+units.vsc.ctrl.references.p_ref_pu
+units.converter.bridge.model
+simulation.solver.dt
 ```
 
-`meta` never changes the model or simulation.
+A network connection uses a bus name or a named Unit port. Event targets must identify one
+switchable object.
 
-## Resolved configuration
+## SI and per-unit values
 
-Some defaults are derived from other values. For example, sampled control defaults to one carrier
-period, ADC timing defaults to the control period, an AC source's `v` defaults to 1 pu of the
-system base and a DC voltage source's `v` to `dclink.vdc_ref`. Derived defaults are recomputed
-after `--set` or `Params.replace()` changes their source parameter.
+Power-circuit values are stored internally in SI. A field ending in `_pu` is converted using the
+applicable system or Unit base; do not provide both SI and per-unit forms of one field.
 
-Print the complete resolved tree with:
+| `base` field | Required | Meaning |
+|---|---:|---|
+| `s_base` | yes | system power rating in VA |
+| `v_ll_rms` | when an AC voltage base is needed | three-phase line-to-line RMS voltage in V |
+| `f0` | when a frequency base is needed | nominal frequency in Hz |
 
-```bash
-peslite case.pes --resolved
-```
-
-Every completed run writes the same complete tree to `simulation.pes`. Loading that file reproduces
-the configuration; fields written as `null` are derived again in the same way.
-
-## Command-line overrides
-
-Use repeatable dotted paths:
-
-```bash
-peslite case.pes \
-  --set simulation.t_end=1.0 \
-  --set units.vsc.ctrl.references.p_ref_pu=0.4
-```
-
-Their priority is given in [CLI Reference](CLI-Reference.md#override-parameters). Invalid
-combinations are checked after all overrides are applied.
-
-## Python API
-
-```python
-import peslite
-
-params = peslite.load("case.pes")
-changed = params.replace(**{
-    "simulation.t_end": 1.0,
-    "units.vsc.ctrl.references.p_ref_pu": 0.4,
-})
-peslite.dump(changed, "changed.pes")
-```
-
-`Params` objects are immutable; `replace()` returns a new validated tree. For event-time changes,
-see [Events and Restart](Events-and-Restart.md).
+Each Unit may override `s_base`. Time is in seconds, angles are in radians and ordinary frequency
+fields are in hertz. Switch values accept `0`/`1` or YAML `false`/`true`.

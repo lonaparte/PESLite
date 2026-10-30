@@ -46,7 +46,7 @@ simulation:
 
 - `period` is the plant/state snapshot interval. It does not set the integration step, but it is
   the default measurement and protection clock of a continuous unit
-  ([ADC sampling](Control-and-PWM-Timing.md#adc-sampling)).
+  ([ADC sampling](Bridge-and-PWM.md#adc-sampling)).
 - `record_every` keeps every N-th controller log sample.
 - `states`, `signals` and `energy` enable their corresponding histories.
 - `write_length` is the number of rows buffered per streamed CSV write batch.
@@ -121,27 +121,7 @@ files = result.files
 end time recorded in `simulation.pes`. CSV-backed properties load lazily and are not on the write
 hot path.
 
-The optional plotting add-on operates only after the CSV streams have closed:
-
-```python
-pdf = result.plot(
-    ["vsc.dclink.u_C", "vsc.ctrl.SRFPLL.theta"],
-    labels=[r"$u_{dc}$", r"$\theta$"],
-    ylabel=r"$x$ (pu)",
-)
-
-# The same function can process Python or standalone C++ output directly.
-from peslite.addons import plot_csv
-
-pdf = plot_csv(
-    "output/run/states.csv",
-    "vsc.dclink.u_C",
-)
-```
-
-Both calls return the written PDF path. Plotting lives under `peslite.addons`, imports Matplotlib
-only when called and is not included in the generated C++ simulator. Install it with
-`pip install "peslite[plot]"`.
+The optional [plotting](Plotting.md) add-on reads completed Python or standalone C++ CSV output.
 
 `result.ctrl` uses `<unit>.<column>` keys. The final-state mapping can be reused through a saved CSV
 or programmatically.
@@ -168,5 +148,6 @@ Watching does not enable CSV histories or alter solver state or results.
 
 A `states.csv` row can initialize another run. Use the matching resolved `simulation.pes` to
 preserve every parameter and derived default. See
-[Events and Restart](Events-and-Restart.md#continue-from-a-saved-csv) for the continuation commands
+[Events Timeline](Events-Timeline.md#continue-from-a-saved-csv)
+for the continuation commands
 and the rows that cannot be used.

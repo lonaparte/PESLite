@@ -2,7 +2,7 @@
 
 PESLite is an open-source, lightweight, multirate, and extensible power electronics simulator in
 Python. It is designed for time-domain studies of power-electronic converters and converter-based
-systems, combining switching and averaged models, digital control timing, event-driven operation
+systems, combining switching and averaged models, sampled control, event-driven operation
 and flexible numerical integration across multiple time scales.
 
 > This documentation describes the current development version on the `main` branch. For released
@@ -15,7 +15,7 @@ PESLite supports:
 - switching, PWM-period-averaged and ideal averaged bridge models;
 - grid-following and grid-forming control;
 - fixed-step, adaptive and multirate integration;
-- ADC/PWM timing, digital control, protection and energy accounting;
+- ADC and PWM periods, sampled control, protection and energy accounting;
 - events and continuation from saved states;
 - export as a standalone C++17 simulator.
 
@@ -54,17 +54,21 @@ See [Getting Started](Getting-Started.md) to create a case and inspect its resul
 - [Getting Started](Getting-Started.md)
 - [Project Workspace](Project-Workspace.md)
 - [Simulation Files](Simulation-Files.md)
-- [Converter and Bridge Models](Converter-and-Bridge-Models.md)
-- [Control and PWM Timing](Control-and-PWM-Timing.md)
+- [Events Timeline](Events-Timeline.md)
+- [Output and Results](Output-and-Results.md)
 - [Solvers](Solvers.md)
 - [Multirate Simulation](Multirate-Simulation.md)
-- [Events and Restart](Events-and-Restart.md)
-- [Output and Results](Output-and-Results.md)
-- [Small-Signal Stability Analysis](Small-Signal-Analysis.md)
+- [Passive Network Components](Passive-Network-Components.md)
+- [Electrical Sources](Electrical-Sources.md)
+- [Voltage-Source Converters](Voltage-Source-Converters.md)
+- [Bridge and PWM](Bridge-and-PWM.md)
+- [DC Converters and Wireless Power Transfer](DC-Converters-and-WPT.md)
+- [Architecture](Architecture.md)
+- [Plotting](Plotting.md)
+- [Online Stability Analysis](Online-Stability-Analysis.md)
+- [Extending PESLite](Extending-PESLite.md)
 - [C++ Export](Cpp-Export.md)
 - [Imperix ELF Export (Experimental)](Imperix-Export.md)
-- [Extending PESLite](Extending-PESLite.md)
-- [Architecture](Architecture.md)
 - [CLI Reference](CLI-Reference.md)
 - [Examples](Examples.md)
 - [FAQ](FAQ.md)

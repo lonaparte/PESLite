@@ -7,13 +7,13 @@ No. `.pes` is the project convention; see [Simulation Files](Simulation-Files.md
 ## Which bridge model is used by default?
 
 When neither the file nor the command line selects another model, each unit uses
-`pwm_averaging`. This retains sampled control and PWM-register timing while omitting carrier
-ripple. See [Converter and Bridge Models](Converter-and-Bridge-Models.md).
+`pwm_averaging`. This retains sampled control periods and PWM-register updates while omitting carrier
+ripple. See [Bridge and PWM](Bridge-and-PWM.md#model-comparison).
 
 ## What do the three bridge flags select?
 
 They are complete run presets that select the bridge model of every unit and the solver; see
-[Command presets](Converter-and-Bridge-Models.md#command-presets).
+[Command presets](Bridge-and-PWM.md#command-presets).
 
 ## Can one system mix bridge models?
 
@@ -25,7 +25,7 @@ override a unit with `--set` ([CLI Reference](CLI-Reference.md#override-paramete
 No. Ideal `averaging` uses a controlled voltage-source bridge and continuous controller states.
 ADC windows, controller interrupts, computation completion, carrier comparison and PWM
 shadow/active registers belong to the sampled `switching` and `pwm_averaging` models. See
-[Ideal averaging](Control-and-PWM-Timing.md#ideal-averaging) for which sampled settings it ignores.
+[Ideal averaging](Bridge-and-PWM.md#ideal-averaging) for which sampled settings it ignores.
 
 ## How should solver accuracy be checked?
 
@@ -36,12 +36,14 @@ conclusion no longer changes materially under further refinement. See [Solvers](
 ## Can state initial values be specified?
 
 Yes. Use `simulation.initial.states` for explicit state values, or continue from a saved
-`states.csv` with `--initial`. See [Events and Restart](Events-and-Restart.md#initial-state).
+`states.csv` with `--initial`. See
+[Events Timeline](Events-Timeline.md#initial-state).
 
 ## Can a run continue from an intermediate output row?
 
 Usually. Supply the saved `states.csv` with `--initial` and select the row using `--initial-time`.
-[Events and Restart](Events-and-Restart.md#what-is-restored) lists what is restored and the rows
+[Events Timeline](Events-Timeline.md#what-is-restored)
+lists what is restored and the rows
 that are rejected.
 
 ## Why is a watched name prefixed by the unit name?

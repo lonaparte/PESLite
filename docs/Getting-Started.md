@@ -9,7 +9,7 @@ resolved example into a new simulation file.
 python -m pip install peslite
 ```
 
-To include every optional runtime add-on, including PDF plotting:
+To include every optional runtime add-on, including [PDF plotting](Plotting.md):
 
 ```bash
 python -m pip install "peslite[all]"
@@ -98,7 +98,7 @@ peslite gfl-example --resolved > my-case.pes
 ```
 
 Edit `my-case.pes`, then run it with `peslite my-case.pes`; its sections are listed in
-[Simulation Files](Simulation-Files.md#top-level-structure).
+[Simulation Files](Simulation-Files.md#structure).
 
 A `.pes` file may optionally use a sibling `PESaddons/` directory for project-local extensions.
 The simulation file, extension paths and local output layout are described together in
@@ -155,7 +155,8 @@ peslite my-case.pes --averaging
 ```
 
 The presets also select an appropriate default solver. See
-[Converter and Bridge Models](Converter-and-Bridge-Models.md) before comparing their results.
+[Bridge and PWM](Bridge-and-PWM.md#model-comparison) before comparing
+their results.
 
 ## Use the Python API
 
@@ -174,7 +175,7 @@ See [Output and Results](Output-and-Results.md#python-result-api) for the result
 
 ## Next steps
 
-- Compare model fidelity and timing in [Converter and Bridge Models](Converter-and-Bridge-Models.md).
+- Configure bridge fidelity and periods in [Bridge and PWM](Bridge-and-PWM.md).
 - Split fast and slow states with [Multirate Simulation](Multirate-Simulation.md).
 - Generate a standalone simulator with [C++ Export](Cpp-Export.md).
 - Choose and adapt a bundled case from [Examples](Examples.md).

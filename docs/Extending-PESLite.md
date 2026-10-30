@@ -78,7 +78,7 @@ loops:
 ```
 
 Repeated uses of one class follow the loop naming rules in
-[Simulation Files](Simulation-Files.md#units-and-controllers).
+[Bridge and PWM](Bridge-and-PWM.md#controller-and-loop-periods).
 
 A specialized loop may expose separate sampled and continuous-flow laws. When its dynamics can be
 built from the standard blocks, define one `equation()` instead: the graph supplies its inputs,

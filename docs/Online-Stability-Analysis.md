@@ -1,32 +1,11 @@
-# Small-Signal Stability Analysis
+# Online Stability Analysis
 
-Small-signal analysis is an optional Python addon under `peslite.addons.functions`.
-It uses the existing complete simulation loop, including control state, sample/hold memory,
-computation delay, PWM registers, electrical integration, and algebraic-loop solves. It does not
-add a method to `Simulation`, run automatically, or replace a switching model with an averaged one.
+Online stability analysis performs small-signal stability analysis alongside the time-domain
+simulation and records results at selected simulation times. It is an optional Python addon under
+`peslite.addons.functions` and uses the complete simulation loop, including sampled control, PWM,
+electrical integration and algebraic-loop solves.
 
-## Use
-
-From a source checkout:
-
-```python
-import peslite
-from peslite.addons.functions.small_signal import small_signal
-
-params = peslite.load("examples/buck-example.pes", **{"simulation.t_end": 0.05})
-sim = peslite.Simulation(params)
-result = sim.run(out_dir="output/buck")
-
-analysis = small_signal(sim)
-print(analysis.mode_table)
-print(analysis.stability)
-```
-
-Only the final complete named state is required. The addon also works when state-history output
-is disabled; it does not add snapshots or retain an in-memory trajectory. Historical `at=`
-selection and automatic operating-point trimming are not part of this interface.
-
-## Time-based simulation report
+## Online simulation report
 
 From the command line:
 
@@ -75,7 +54,7 @@ Parameter values come from the snapshot retained when the runtime applies a chec
 Connection commands use the existing `Scenario` interpretation, including inferred initial
 values; the report does not replay events or maintain a separate parameter/command state.
 
-Periodic operating states receive the same stability classification as the final-state addon.
+Periodic operating states receive the same stability classification as the final-state API.
 Non-periodic states, changing nominal discrete modes, and windows crossing a one-off file event
 instead receive `transient`, with a reason and no matrix, modal values, or amplification.
 Only the unperturbed period is checked at those points; perturbation runs begin when a selected
@@ -143,6 +122,25 @@ A new run clears its previous `<name>_report.json` along with its other managed 
 when no new report is requested or the addon is unavailable. Python callers reusing a directory
 should pass the same `name` to `Simulation.run()` and `small_signal_report()`; unrelated report
 files are preserved.
+
+## Final-state Python API
+
+```python
+import peslite
+from peslite.addons.functions.small_signal import small_signal
+
+params = peslite.load("examples/buck-example.pes", **{"simulation.t_end": 0.05})
+sim = peslite.Simulation(params)
+result = sim.run(out_dir="output/buck")
+
+analysis = small_signal(sim)
+print(analysis.mode_table)
+print(analysis.stability)
+```
+
+This entry point analyzes the final complete named state. It works with state-history output
+disabled and does not retain an in-memory trajectory. Historical `at=` selection and automatic
+operating-point trimming are not supported.
 
 ## Period and state coordinates
 

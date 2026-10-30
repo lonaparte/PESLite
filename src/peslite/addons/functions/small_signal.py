@@ -1,4 +1,4 @@
-"""Opt-in small-signal analysis of the existing complete simulation loop map."""
+"""Opt-in online stability analysis using the complete simulation loop map."""
 
 from __future__ import annotations
 

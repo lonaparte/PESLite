@@ -62,7 +62,7 @@ windows across strong coupling can reduce accuracy or erase dynamics that matter
 
 Event, output and end times remain exact integration boundaries; they are not rounded to a
 multirate, controller or PWM grid. An event inside a slow window is handled as described in
-[Exact event semantics](Events-and-Restart.md#exact-event-semantics).
+[Exact event semantics](Events-Timeline.md#exact-event-semantics).
 
 ## Complete example
 
@@ -147,9 +147,10 @@ diagnostics, not as a replacement for convergence against a tighter reference ru
 - A system with commutating subsystems, such as diode rectifiers or switch-controlled capacitors,
   cannot use a windowed group because it cannot locate their commutation instants.
 - The filter of an averaged unilateral half bridge requests a state-dependent local step in DCM
-  ([Converter and Bridge Models](Converter-and-Bridge-Models.md#scalar-converter-ports-device-placement-and-dcm))
+  ([DC Converters and Wireless Power Transfer](DC-Converters-and-WPT.md#ccm-and-dcm))
   and therefore cannot be windowed.
 - C++ export does not support multirate subsystem schedules
   ([C++ Export](Cpp-Export.md#current-limitations)).
 
-For bridge-dependent time grids, see [Converter and Bridge Models](Converter-and-Bridge-Models.md).
+For bridge-dependent periods and event boundaries, see
+[Bridge and PWM](Bridge-and-PWM.md).

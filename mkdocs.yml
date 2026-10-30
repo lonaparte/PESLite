@@ -19,18 +19,22 @@ nav:
   - Project Workspace: Project-Workspace.md
   - Simulation Files: Simulation-Files.md
   - Simulation:
-      - Converter and Bridge Models: Converter-and-Bridge-Models.md
-      - Control and PWM Timing: Control-and-PWM-Timing.md
+      - Events Timeline: Events-Timeline.md
+      - Output and Results: Output-and-Results.md
       - Solvers: Solvers.md
       - Multirate Simulation: Multirate-Simulation.md
-      - Events and Restart: Events-and-Restart.md
-      - Output and Results: Output-and-Results.md
+      - Passive Network Components: Passive-Network-Components.md
+      - Electrical Sources: Electrical-Sources.md
+      - Voltage-Source Converters: Voltage-Source-Converters.md
+      - Bridge and PWM: Bridge-and-PWM.md
+      - DC Converters and Wireless Power Transfer: DC-Converters-and-WPT.md
   - Advanced:
-      - Small-Signal Stability Analysis: Small-Signal-Analysis.md
+      - Architecture: Architecture.md
+      - Plotting: Plotting.md
+      - Online Stability Analysis: Online-Stability-Analysis.md
+      - Extending PESLite: Extending-PESLite.md
       - C++ Export: Cpp-Export.md
       - Imperix Export: Imperix-Export.md
-      - Extending PESLite: Extending-PESLite.md
-      - Architecture: Architecture.md
   - Reference:
       - CLI Reference: CLI-Reference.md
       - Examples: Examples.md

@@ -1,4 +1,4 @@
-# Events and Restart
+# Events Timeline
 
 Events describe model changes at absolute simulation times. Restart loads named state from a saved
 row and reconstructs the discrete timing needed to continue from that exact time.
@@ -156,7 +156,8 @@ rejected:
 - between two control interrupts of a unit whose ADC oversamples (`meas.period` shorter than
   `ctrl.period`);
 - inside a controller computation window when the next PWM register load would take a word that
-  no load has applied yet (see [Computation time](Control-and-PWM-Timing.md#computation-time)).
+  no load has applied yet (see
+  [Computation time](Bridge-and-PWM.md#computation-time)).
 
 Ideal averaging has no PWM register state or ADC samples; its continuous controller state, and the
 history of any `meas.rms` window, are restored with the plant state instead.
