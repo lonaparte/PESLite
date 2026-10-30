@@ -440,6 +440,11 @@ def test_dc_voltage_control_owns_its_limit_in_both_execution_modes(gfl):
         assert ctrl.graph.connections["CurrentLoop.id_ref"] == "_UnobservedDCVoltage.current_reference"
         assert ctrl._flow_limits == {}
         assert "id_ref_limit_fraction" not in ctrl.summary()
+    # Its period, annotated ``float | None``, accepts null (the controller period) like
+    # ``Optional[float]``.
+    every_interrupt = gfl().replace(**{"units.vsc.ctrl.loops": loops}).replace(
+        **{"units.vsc.ctrl.loops._UnobservedDCVoltage.period": None}).unit("vsc").ctrl
+    assert every_interrupt.loops["_UnobservedDCVoltage"].period == every_interrupt.period
 
 
 def test_averaging_clips_dc_current_reference_and_tracks_antiwindup(gfl):

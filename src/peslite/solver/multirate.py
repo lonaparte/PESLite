@@ -150,6 +150,12 @@ class MultirateSolver:
                     if outer_method is not None and meth != outer_method:
                         raise ValueError("subsystems on windows share one method")
                     outer_method = meth
+        # Like their method, each group's step count is shared by all its subsystems.
+        for where, group, count in (("inside the system step", inner, lambda r: round(1.0 / r)),
+                                    ("on windows", outer, round)):
+            if len({count(r) for r in group.values()}) > 1:
+                raise ValueError(f"subsystems {where} share one ratio, got "
+                                 + ", ".join(f"{name}: {steps[name]}" for name in group))
         self.ratio = int(round(1.0 / min(inner.values()))) if inner else 1  # steps per system step
         self.window_steps = int(round(min(outer.values()))) if outer else 1  # system steps per window
         assignment = {n: "inner" for n in inner}

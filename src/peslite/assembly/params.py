@@ -25,6 +25,7 @@ from copy import deepcopy
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
+from types import UnionType
 from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
 
 from ..components.network import ELEMENT_TYPES, element_buses
@@ -1141,7 +1142,7 @@ def _normalize(data: dict) -> dict:
 
 
 def _is_optional(tp) -> tuple[bool, Any]:
-    if get_origin(tp) is Union:
+    if get_origin(tp) in (Union, UnionType):  # Optional[X] or X | None
         args = [a for a in get_args(tp) if a is not type(None)]
         if len(args) == 1 and len(get_args(tp)) == 2:
             return True, args[0]

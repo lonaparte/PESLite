@@ -45,6 +45,11 @@ def test_make_solver_builds_the_configured_integrator():
     for expected, changes in cases.items():
         configured = settings.__class__(**{**vars(settings), **changes})
         assert type(make_solver(configured, model)) is expected
+    # A group's subsystems share one step count, as they share one method.
+    for subsystems in ({"vsc.dclink": 4, "pcc": 2}, {"vsc.dclink": 0.5, "pcc": 0.25}):
+        configured = settings.__class__(**{**vars(settings), "subsystems": subsystems})
+        with pytest.raises(ValueError, match="share one ratio"):
+            make_solver(configured, model)
 
 
 def test_dp45_float_model_path_matches_the_array_path():

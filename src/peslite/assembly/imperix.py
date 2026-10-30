@@ -203,7 +203,7 @@ def _timing_parameters(units, runtime):
     for unit in units.values():
         cfg = runtime.copy(unit.cfg)
         values = (*_unit_periods(cfg).values(), cfg.pwm.carrier_phase, cfg.ctrl.computation,
-                  cfg.ctrl.offset, cfg.meas.offset, cfg.meas.window, *cfg.meas.rms.values(),
+                  cfg.meas.window, *cfg.meas.rms.values(),
                   *runtime.object(unit.ctrl).graph.periods.values())
         expressions.extend(_number(value) for value in values if value is not None)
     dependencies = runtime.parameter_dependencies(expressions)
@@ -269,6 +269,10 @@ def _bindings(simulation, config, model, *, events=None):
         if unit.cfg.pwm.pattern_sync == "pulse":
             raise TypeError(f"{name}: the Imperix hardware PWM adapter does not implement "
                             "complete-pulse updates")
+        if unit.cfg.ctrl.offset is not None or unit.cfg.meas.offset is not None:
+            raise ValueError(f"{name}: hardware timing comes from imperix.sampling_phase on the CLK0 "
+                             "grid; configured clock offsets (ctrl.offset, meas.offset) have no "
+                             "hardware adapter")
         names = unit.bridge.register_names[:unit.bridge.modulation_width]
         if names != unit.bridge.topology.duty_names:
             raise ValueError(f"Imperix export currently binds duty registers; {name!r} uses "
@@ -298,11 +302,11 @@ def _bindings(simulation, config, model, *, events=None):
         sample_stride = unit.ctrl.graph.period_stride(sample_period, sampling_period)
         if (sample_period < sampling_period * (1.0 - 1e-6)
                 or abs(sample_stride * sampling_period - sample_period) > 1e-6 * sample_period):
-            raise ValueError(f"{name}: ADC sample period is not on the mapped CLOCK_0 grid")
+            raise ValueError(f"{name}: ADC sample period is not on the mapped CLK0 grid")
         window = configured.meas.window or configured.ctrl.period
         history = int(round(window / sampling_period)) if cfg.meas.average else 1
         if cfg.meas.average and abs(window - history * sampling_period) > 1e-6 * window:
-            raise ValueError(f"{name}: averaging window is not on the mapped CLOCK_0 grid")
+            raise ValueError(f"{name}: averaging window is not on the mapped CLK0 grid")
         if history > 64:
             raise ValueError(f"{name}: the averaging window requires {history} ADC history samples; "
                              "the SDK supports at most 64")

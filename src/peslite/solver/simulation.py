@@ -739,12 +739,8 @@ class Simulation:
         for name, unit in system.units.items():
             bridge_prefix = f"{name}.{unit.bridge.state_prefix}"
             self._states.load(values, [f"{name}.ctrl", bridge_prefix])
-            runtime_states = {
-                f"{prefix}.{local}" if prefix else local
-                for prefix, part in unit.state_parts()
-                for local in getattr(part, "get_state", lambda: {})()
-            }
-            if runtime_states.intersection(values):
+            # Continued: any of the unit's registered states is given.
+            if not values.keys().isdisjoint(self._states.read(prefix for prefix, _ in unit.state_parts())):
                 self._continued.add(name)
             if unit.adc is not None and (unit.adc.accumulating or unit.adc.independent):
                 self._states.load(values, [f"{name}.meas"])
@@ -1450,7 +1446,7 @@ def main(argv=None) -> int:
     """Run a simulation file and save its states, summary and configured signals."""
     ap = argparse.ArgumentParser(description=main.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("config", nargs="?",
-                    help="simulation file path or bundled example name; default: first example by filename")
+                    help="simulation file path or bundled example name; default: gfl-example")
     ap.add_argument("--set", action="append", default=[], type=parse_override, metavar="PATH=VALUE",
                     help="override a dotted parameter path (repeatable)")
     ap.add_argument("--initial", default=None, metavar="FILE",
