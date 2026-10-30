@@ -113,6 +113,17 @@ The Wiki documents the current `main` branch. Releases and the changelog record 
 
 ## Development
 
+[Fork PESLite](https://github.com/lonaparte/PESLite/fork) on GitHub, then clone your fork and install
+it with the development dependencies:
+
+```bash
+git clone https://github.com/<your-username>/PESLite.git
+cd PESLite
+python -m pip install -e ".[test]"
+```
+
+Run the test suite from the repository root:
+
 ```bash
 python -m pytest
 ```

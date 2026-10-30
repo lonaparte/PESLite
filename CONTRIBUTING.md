@@ -1,7 +1,7 @@
 # Contributing to PESLite
 
-Contributions are welcome. Please keep changes focused, follow the existing project style, and run
-the relevant tests before opening a pull request.
+You are welcome to contribute to PESLite. Please keep changes focused, follow the existing project
+style, and run the relevant tests before opening a pull request.
 
 ## Contributor License Agreement
 
