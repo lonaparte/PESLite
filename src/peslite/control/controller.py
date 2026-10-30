@@ -13,7 +13,7 @@ from __future__ import annotations
 import cmath
 import math
 import numbers
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from types import MappingProxyType
 from typing import Any, Mapping, Protocol, runtime_checkable
 
@@ -22,14 +22,18 @@ from numpy.typing import NDArray
 
 from ..solver.model import Bag, ConfigError, _complex, _real, gather, scatter
 from ..solver.energy import PowerPort, port_power
+from ..solver.timing import control_clock_offset
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
-from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODULATION, POWER,
+from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,
                     SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ, CurrentLoop,
                     Loop, SignalType, SyncLaw)
 from .modulation import CONFIGURED, OutputStage
-from .profiles import (ReferenceParams, ResonantReferenceParams,
+from .profiles import (DutyReferenceParams, PhaseShiftReferenceParams, ReferenceParams,
+                       ResonantReferenceParams,
                        ScalarVoltageReferenceParams, control_type,
-                       register_control_type, validate_resonant_references,
+                       register_control_type, validate_duty_references,
+                       validate_phase_shift_references,
+                       validate_resonant_references,
                        validate_scalar_voltage_references)
 
 __all__ = ["Measurement", "ConverterMeasurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
@@ -72,6 +76,13 @@ class ControlMeasurement:
     i_abc: NDArray[np.float64]
 
 
+def _command_value(output, name):
+    commands = output.__dict__.get("commands") or ()
+    if name in commands:
+        return commands[name]
+    raise AttributeError(f"{type(output).__name__!r} has no command {name!r}")
+
+
 @dataclass
 class ControlOutput:
     """Result of one controller call.
@@ -88,18 +99,46 @@ class ControlOutput:
     omega: float | None = None  # synchronization frequency (rad/s)
     gates: bool = True
     startup_complete: bool = True
+    commands: dict[str, float] | None = None
+
+    __getattr__ = _command_value
 
 
-@dataclass
+@dataclass(init=False)
 class BridgeControlOutput:
-    """Result of one single-phase bridge control update."""
+    """One canonical command mapping and the common sampled-control lifecycle outputs.
 
-    duty: float
-    log: dict[str, float] | None = None
-    theta: float | None = None
-    omega: float | None = None
-    gates: bool = True
-    startup_complete: bool = True
+    ``duty`` remains a constructor argument and property for existing scalar controllers; it
+    reads and writes the same mapping used by every other modulation command.
+    """
+
+    commands: dict[str, float]
+    log: dict[str, float] | None
+    theta: float | None
+    omega: float | None
+    gates: bool
+    startup_complete: bool
+
+    def __init__(self, duty: float | None = None, log=None, theta=None, omega=None,
+                 gates: bool = True, startup_complete: bool = True,
+                 commands: Mapping[str, float] | None = None):
+        self.commands = commands if isinstance(commands, dict) else dict(commands or {})
+        if duty is not None:
+            if "duty" in self.commands and self.commands["duty"] != duty:
+                raise ValueError("conflicting duty commands")
+            self.commands["duty"] = duty
+        self.log, self.theta, self.omega = log, theta, omega
+        self.gates, self.startup_complete = gates, startup_complete
+
+    @property
+    def duty(self):
+        return self.commands.get("duty")
+
+    @duty.setter
+    def duty(self, value):
+        self.commands["duty"] = value
+
+    __getattr__ = _command_value
 
 
 @runtime_checkable
@@ -122,14 +161,18 @@ class ControlInterface:
     each driven by one loop output through ``ctrl.outputs``. Direction belongs to the mapping that
     contains a port; its value is the same :class:`SignalType` used by loop port declarations.
     ``optional_inputs`` are schema ports retained at runtime only when an active path uses them.
+    ``optional_outputs`` are controller outputs that exist only when ``ctrl.outputs`` wires them.
     """
 
     inputs: Mapping[str, SignalType]
     outputs: Mapping[str, SignalType]
     optional_inputs: frozenset[str] = frozenset()
+    optional_outputs: frozenset[str] = frozenset()
 
+    def auxiliary_outputs(self, configured):
+        """Configured outputs beyond the required waveform/control boundary."""
+        return tuple(sorted(set(configured) - (self.outputs.keys() - self.optional_outputs)))
 
-_OutputLimit = OutputLimit
 
 # ------------------------------------------------------------------ the start-up sequence
 
@@ -154,9 +197,7 @@ class Startup:
         self.run = bool(run)
         if self.run:
             self.ramp = float(ramp)
-            self.steps, self.value, self.complete = 0, 0.0, False
-        else:
-            self.steps, self.value, self.complete = 0, 0.0, False
+        self.steps, self.value, self.complete = 0, 0.0, False
 
     @property
     def active(self) -> bool:
@@ -301,10 +342,10 @@ class ControlGraph:
         self.periods = {}
         self.continuous = cfg.bridge.model == "averaging"
         self._T = None if self.continuous else _real(cfg.ctrl.period)
-        self._t0 = cfg.pwm.grid_offset
+        self._t0 = control_clock_offset(cfg.ctrl, cfg.pwm)
         self.values: dict[str, Any] = {}
         self._out_specs: dict[str, tuple] = {}
-        self._limits: dict[str, tuple[str, _OutputLimit]] = {}
+        self._limits: dict[str, tuple[str, OutputLimit]] = {}
         self.updated = set()
         refs = cfg.ctrl.references
         self.references = {f.name: getattr(refs, f.name) for f in fields(refs)}
@@ -342,14 +383,30 @@ class ControlGraph:
                     f"ctrl.connections.{target}: incompatible signal {source!r}: "
                     f"{types[source]} -> {targets[target]}"
                 )
-        unknown_outputs = set(self.outputs) - set(self.interface.outputs)
-        if unknown_outputs:
-            raise ConfigError(f"ctrl.outputs: unknown output ports {sorted(unknown_outputs)}; "
-                              f"known: {sorted(self.interface.outputs)}")
+        additional = set(self.outputs) - set(self.interface.outputs)
+        reserved = set(ControlOutput.__dataclass_fields__) | set(BridgeControlOutput.__dataclass_fields__)
+        if additional & (reserved - {"duty"}):
+            raise ConfigError(f"ctrl.outputs: command names conflict with control lifecycle fields: "
+                              f"{sorted(additional & (reserved - {'duty'}))}")
+        for port in additional:
+            source = self.outputs[port]
+            if source not in types:
+                raise ConfigError(f"ctrl.outputs.{port}: missing or unknown source {source!r}")
+            if types[source].complex_value:
+                raise ConfigError(f"ctrl.outputs.{port}: an auxiliary register needs a scalar signal")
+        if additional:
+            self.interface = interface = replace(
+                interface,
+                outputs=MappingProxyType({**interface.outputs,
+                                          **{port: types[self.outputs[port]] for port in additional}}),
+                optional_outputs=interface.optional_outputs | additional,
+            )
         active = set()
         pending_sources = []
         for port, spec in self.interface.outputs.items():
             source = self.outputs.get(port)
+            if source is None and port in self.interface.optional_outputs:
+                continue
             if source not in types or not types[source].compatible(spec):
                 raise ConfigError(f"ctrl.outputs.{port}: missing or incompatible source {source!r}")
             pending_sources.append(source)
@@ -377,6 +434,7 @@ class ControlGraph:
                                   if name not in interface.optional_inputs or name in used}),
                 interface.outputs,
                 interface.optional_inputs,
+                interface.optional_outputs,
             )
         for name, loop in cfg.ctrl.loops.items():
             if name not in active:
@@ -445,6 +503,16 @@ class ControlGraph:
         self._every_interrupt = (None if self.continuous else
                                  frozenset(name for name, every in self._every)
                                  if all(every == 1 for _name, every in self._every) else None)
+        angles = []
+        for name, node in self.nodes.items():
+            node_states = node.get_state()
+            for port, spec in node.outputs.items():
+                if spec.unit != "rad":
+                    continue
+                if port in node_states:
+                    angles.append(f"{name}.{port}")
+                angles.append(f"held.{self._state_port(f'{name}.{port}')}")
+        self.angle_state_names = tuple(angles)
 
     @staticmethod
     def period_stride(period, interrupt_period):
@@ -550,11 +618,9 @@ class ControlGraph:
             else:  # ControlInterface is a package-owned declaration, not user input.
                 raise RuntimeError(f"unknown controller input owner {owner!r}")
         self._wiring = {}
-        self._port_source = {}
         for name, node in self.nodes.items():
             wiring = tuple((port,) + self._resolve(self.connections[f"{name}.{port}"]) for port in node.inputs)
             self._wiring[name] = wiring
-            self._port_source[name] = {w[0]: w[1:] for w in wiring}
         self._output_source = {port: self._resolve(source) for port, source in self.outputs.items()}
 
     def _prepare_flow(self):
@@ -594,8 +660,7 @@ class ControlGraph:
             for name, node in self.nodes.items()
         }
         self._flow_plan = tuple(
-            (group, group in self._continuous_cycles,
-             self._flow_cycle_keys.get(group, ()), tuple(steps[name] for name in group))
+            (group, self._flow_cycle_keys.get(group, ()), tuple(steps[name] for name in group))
             for group in self._continuous_plan
         )
         if self._continuous_cycles:
@@ -612,7 +677,7 @@ class ControlGraph:
         environment = {"_values": self.values}
         body = []
         index = 0
-        for group, _cyclic, _keys, steps in self._flow_plan:
+        for group, _keys, steps in self._flow_plan:
             name, evaluate, wiring, inputs, outputs, flow, out_specs, flow_specs = steps[0]
             if selected is not None and name not in selected:
                 continue
@@ -791,10 +856,6 @@ class ControlGraph:
         for node in self.nodes.values():
             node.reset_integrator()
 
-    def input(self, name, port, meas):
-        """Return the input ``port`` of the loop ``name`` for the pu measurement ``meas``."""
-        return self._read(*self._port_source[name][port], meas)
-
     def sample(self, t, meas, finalize=None):
         """Run the loops due at ``t`` on the pu measurement ``meas``; return their names.
 
@@ -840,24 +901,10 @@ class ControlGraph:
                 return (dict(zip(self.flow_state_names, derivatives))
                         if named else derivatives)
         values = self.values
-        for group, cyclic, keys, steps in self._flow_plan:
+        for group, keys, steps in self._flow_plan:
             if only is not None and not any(name in only for name in group):
                 continue
-            if not cyclic:
-                _name, evaluate, wiring, inputs, outputs, flow, out_specs, flow_specs = steps[0]
-                for port, kind, key in wiring:
-                    if kind == _HELD:
-                        inputs[port] = values[key]
-                    elif kind == _MEASURED:
-                        inputs[port] = getattr(meas, key)
-                    else:
-                        inputs[port] = key
-                evaluate(t, inputs, outputs, flow)
-                for port, key, _complex_value in out_specs:
-                    values[key] = outputs[port]
-                for local, key in flow_specs:
-                    derivatives[self._flow_derivative_index[key]] = flow[local]
-                continue
+            # An acyclic component has no feedback keys, so its first pass has converged.
             previous = tuple(values[key] for key in keys)
             for _iteration in range(self._cycle_iterations):
                 for (_name, evaluate, wiring, inputs, outputs, flow,
@@ -1034,27 +1081,48 @@ class _ContinuousControlOut(Bag):
 class _GraphRuntime:
     """Lifecycle and continuous-state mechanics shared by control-graph hosts."""
 
+    outputs_need_inputs = True
+    observer = True
+
     @property
     def discrete_state_names(self) -> tuple[str, ...]:
         """Run/ramp bookkeeping is restored, not differentiated as controller memory."""
         return tuple(f"startup.{name}" for name in self.startup.get_state())
 
     @property
+    def angle_state_names(self) -> tuple[str, ...]:
+        """Controller-owned state coordinates whose values are angles in radians."""
+        known = set(self.state_names) if self.continuous else set(self.get_state())
+        names = [name for name in self.graph.angle_state_names if name in known]
+        names.extend(
+            f"command.{port}"
+            for port, spec in self.interface.outputs.items()
+            if spec.unit == "rad" and f"command.{port}" in known
+        )
+        return tuple(names)
+
+    @property
     def interface(self) -> ControlInterface:
         """The effective typed boundary of the active control graph."""
         return self.graph.interface
 
-    def overwritten_state_names(self, period):
-        """Expose the graph's proof through the existing state owner."""
-        return self.graph.overwritten_state_names(period)
-
-    def _install_flow_state(self, state_type: type, states: list[tuple[str, Mapping]],
-                            inp: Any, out: Any) -> None:
-        """Create one fixed ODE layout from the graph's declared loop states."""
-        state = state_type()
+    def _install_flow_state(self, inp: Any, out: Any) -> None:
+        """Check each loop's continuous implementation, then create one fixed ODE layout from
+        the graph's declared loop states."""
+        state = _ContinuousControlState()
         names = []
-        for name, values in states:
-            for local, value in values.items():
+        for name in self.graph.order:
+            node = self.graph.nodes[name]
+            if (type(node).flow is Loop.flow
+                    and (node.flow_inputs is None
+                         or (type(node).flow_path is Loop.flow_path
+                             and type(node).equation is Loop.equation))):
+                raise ConfigError(f"ctrl.loops.{name}: loop type {node.type!r} "
+                                  "has no continuous-time implementation")
+            if isinstance(node, SyncLaw) and type(node)._flow is SyncLaw._flow:
+                raise ConfigError(f"ctrl.loops.{name}: loop type {node.type!r} "
+                                  "has no continuous-time flow implementation")
+            for local, value in node.flow_state().items():
                 if isinstance(value, bool):
                     raise ConfigError(
                         f"ctrl.loops.{name}: boolean state {local!r} "
@@ -1104,19 +1172,29 @@ class _GraphRuntime:
             node.set_state({local: getattr(state, key) for local, key in bindings})
 
     def _store_continuous_nodes(self) -> None:
-        known = set(self.state_names)
         for name in self.graph.order:
             for local, value in self.graph.nodes[name].flow_state().items():
-                key = f"{name}.{local}"
-                if key in known:
-                    setattr(self.state, key, value)
+                setattr(self.state, f"{name}.{local}", value)
 
-    def _graph_retuned(self) -> None:
+    def _loop_retuned(self, name=None) -> None:
+        """Rebind continuous state after a set event rebuilt loop ``name``."""
         if not self.continuous:
             return
         if self.graph.flow_state_names != self.state_names:
             raise ConfigError("a set event cannot reorder continuous controller states")
         self._bind_flow_state()
+
+    def get_state(self) -> dict[str, Any]:
+        startup = {f"startup.{name}": value for name, value in self.startup.get_state().items()}
+        return startup if self.continuous else {**self.graph.get_state(), **startup}
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        """Restore the start-up and, when sampled, the graph states; unknown names raise."""
+        startup = {name[8:]: value for name, value in values.items() if name.startswith("startup.")}
+        self.startup.set_state(startup)
+        if not self.continuous:
+            self.graph.set_state({name: value for name, value in values.items()
+                                  if not name.startswith("startup.")})
 
     def retune(self, cfg, paths, t: float) -> None:
         """Queue new controller parameters for the next graph update."""
@@ -1128,27 +1206,27 @@ class _GraphRuntime:
         """Apply initial parameter events before startup and named-state restoration."""
         self.graph._apply_pending()
 
-    def command(self, run: bool, ramp: float = 0.0) -> None:
-        """Take the host's run or stop command."""
-        if self.continuous:
-            self.command_at(run, ramp, 0.0)
-            return
+    def command(self, run: bool, ramp: float = 0.0, t: float = 0.0, *, reset: bool = True) -> None:
+        """Take the host's run or stop command; a continuous controller takes it at absolute
+        time ``t`` and clears its integrators on a new run only with ``reset``."""
         starting = bool(run) and not self.startup.active
-        if starting:
-            self.graph.reset_integrators()
-        self.startup.command(run, ramp)
-
-    def command_at(self, run: bool, ramp: float, t: float, *, reset: bool = True) -> None:
-        """Take a continuous run or stop command at absolute time ``t``."""
         if not self.continuous:
-            self.command(run, ramp)
+            if starting:
+                self.graph.reset_integrators()
+            self.startup.command(run, ramp)
             return
-        starting = bool(run) and not self.startup.active
         if starting and reset:
             self._sync_continuous_nodes()
             self.graph.reset_integrators()
             self._store_continuous_nodes()
         self.startup.command(run, ramp, t)
+
+    def rhs(self, t):
+        return self._derivatives
+
+    def set_logging(self, enabled: bool) -> None:
+        """Enable per-interrupt log dictionaries when a run records or watches them."""
+        self.logging = bool(enabled)
 
 
 class VSCController(_GraphRuntime):
@@ -1158,9 +1236,6 @@ class VSCController(_GraphRuntime):
     averaging it is called at each interrupt.  With ideal averaging it is a continuous subsystem:
     its loop states join the plant ODE and its output is the bridge's modulation space vector.
     """
-
-    outputs_need_inputs = True
-    observer = True
 
     def __init__(self, cfg, pwm_method=None, *, limiter=CONFIGURED):
         self.p = cfg
@@ -1173,6 +1248,7 @@ class VSCController(_GraphRuntime):
         self.graph = graph = ControlGraph(
             cfg, self.startup, wires, outputs, interface=profile.interface,
         )
+        self._carried_outputs = profile.interface.auxiliary_outputs(graph.outputs)
         self.periods = graph.periods
         self.v_base, self.i_base, self.w0 = cfg.base.v_phase_peak, cfg.base.i_phase_peak, cfg.base.w0
         self.v_dc_base = cfg.dc_base.v
@@ -1198,13 +1274,17 @@ class VSCController(_GraphRuntime):
         self._terminal_in_graph = self._terminal in graph.nodes
         graph.on_retune = self._loop_retuned
         self._frame_key = f"{graph.outputs['theta'].partition('.')[0]}.frame"
-        self._dc, self._sync = first("dc_voltage"), first("sync")
+        # The DC-voltage loop is observed (ID_REF_LIMIT, summary) only through its limit observer.
+        dc = first("dc_voltage")
+        self._dc = dc if hasattr(graph.nodes.get(dc), "observe_limit") else None
+        self._sync = first("sync")
         self._frame_cc, self._log_cc = first("current", "frame"), first("current", "id_ref")
-        self._theta_source = graph._output_source["theta"]
-        self._omega_source = graph._output_source["omega"]
-        self._command_source = graph._output_source["u_dq"]
-        self._frame_source = (graph._port_source[self._frame_cc]["frame"]
-                              if self._frame_cc is not None else None)
+        # dq frame of the logged signals, as a graph path that C++ export lowers unchanged: the
+        # current loop's frame input, else the angle the theta loop used for its latest update.
+        # It is resolved at each read, so a references set event moves it like the loops' inputs.
+        self._frame_path = (graph.connections[f"{self._frame_cc}.frame"] if self._frame_cc is not None
+                            else self._frame_key if self._frame_key in graph.values
+                            else graph.outputs["theta"])
         self._is_gfl = profile.grid_following
         if self._is_gfl:
             mode_log_sources = (
@@ -1238,22 +1318,21 @@ class VSCController(_GraphRuntime):
         graph.clear_limit(name)
         self._flow_limits.pop(name, None)
         node = graph.nodes.get(name)
-        if name == self._terminal:
-            self._terminal_limit = None
-            self._terminal_limit_scale = None
-            if self.stage is not None:
-                self.stage._command_saturated = False
-        if (self.continuous and name == self._dc
-                and callable(getattr(node, "observe_limit", None))):
+        if name == self._terminal and self.stage is not None:
+            self.stage._command_saturated = False
+        if self.continuous and name == self._dc:
             self._flow_limits[name] = (f"{name}.current_reference", "ID_REF_LIMIT", node)
         if (not self.continuous and name == self._terminal
                 and isinstance(node, CurrentLoop) and self.stage is not None):
             limit = self.stage.command_limit(1.0)
             if limit is not None:
-                output_limit = _OutputLimit(
+                output_limit = OutputLimit(
                     limit, pi=node.pi,
                     active=lambda: self.startup.active,
                 )
+                if self._terminal_limit is not None:
+                    # A loop rebuilt by a set event keeps the limit __call__ scaled to u_dc.
+                    output_limit.limit = self._terminal_limit.limit
                 graph.limit_output(name, "u_dq", output_limit)
                 self._terminal_limit = output_limit
                 self._terminal_limit_scale = limit
@@ -1270,49 +1349,25 @@ class VSCController(_GraphRuntime):
                 self.alarms.append(alarm)
 
     def _build_flow_state(self):
-        """Create the fixed ODE state layout from each loop's flow-state declaration."""
-        states = []
-        for name in self.graph.order:
-            node = self.graph.nodes[name]
-            try:
-                if (type(node).flow is Loop.flow
-                        and (node.flow_inputs is None
-                             or (type(node).flow_path is Loop.flow_path
-                                 and type(node).equation is Loop.equation))):
-                    raise NotImplementedError(
-                        f"loop type {node.type!r} has no continuous-time implementation"
-                    )
-                if isinstance(node, SyncLaw) and type(node)._flow is SyncLaw._flow:
-                    raise NotImplementedError(
-                        f"loop type {node.type!r} has no continuous-time flow implementation"
-                    )
-                values = node.flow_state()
-            except NotImplementedError as exc:
-                raise ConfigError(f"ctrl.loops.{name}: {exc}") from None
-            states.append((name, values))
+        """Create the fixed ODE state layout and the reused continuous measurement."""
         self._install_flow_state(
-            _ContinuousControlState,
-            states,
             _ContinuousControlInp(u_g=0j, i_c=0j, u_dc=self.p.dclink.vdc_ref),
             _ContinuousControlOut(q=0j),
         )
-        self._flow_derivative_index = {
-            name: index for index, name in enumerate(self.state_names)
-        }
         self._continuous_meas = ControlMeasurement(0.0, 0j, 0j, 1.0, np.zeros(3))
         self._last_control_meas = self._continuous_meas
 
     def _loop_retuned(self, name=None):
         """Rebuild the loop's limit and continuous state bindings after a set event."""
         self._configure_limit(name)
-        self._graph_retuned()
+        super()._loop_retuned(name)
 
     def describe(self):
         return self.graph.describe()
 
     def initial_sync(self):
-        values = {**self.graph.values, **{f"references.{k}": v for k, v in self.graph.references.items()}}
-        return _real(values[self.graph.outputs["theta"]]), _real(values[self.graph.outputs["omega"]])
+        graph = self.graph
+        return _real(graph.output("theta", None)), _real(graph.output("omega", None))
 
     def track(self, meas):
         """Pre-synchronise grid-forming laws to an SI terminal sample."""
@@ -1363,10 +1418,6 @@ class VSCController(_GraphRuntime):
                   ["p_pu", "q_pu", "p_ref_pu", "v_ref_pu", "freq_dev", "angle_rel"])
         return tuple(names)
 
-    def set_logging(self, enabled: bool) -> None:
-        """Enable per-interrupt log dictionaries when a run records or watches them."""
-        self.logging = bool(enabled)
-
     def mode_log_sources(self) -> Mapping[str, str]:
         """Return graph sources for control-family-specific log fields."""
         return self._mode_log_sources
@@ -1401,7 +1452,6 @@ class VSCController(_GraphRuntime):
             self.command_theta = self.theta
             if self._terminal_limit is not None:
                 self.stage._command_saturated = self._terminal_limit.saturated
-            self.stage.modulate(t, self.u_cmd, self.command_theta, meas.u_dc, count=False)
 
     def __call__(self, t, meas):
         if self.continuous:
@@ -1410,20 +1460,18 @@ class VSCController(_GraphRuntime):
         startup = self.startup
         if startup.in_progress:
             startup.advance()
-        self.stage.new_instant()
         if self._terminal_limit is not None:
             self._terminal_limit.limit = (
                 self._terminal_limit_scale * max(0.0, control_meas.u_dc)
             )
-        self.graph.sample(t, control_meas, finalize=self._accept_command)
-        frame = self.graph.values.get(self._frame_key, self.theta)
-        if self._frame_cc is not None:
-            frame = self.graph.input(self._frame_cc, "frame", control_meas)
+        graph = self.graph
+        graph.sample(t, control_meas, finalize=self._accept_command)
+        frame = graph._read(*graph._resolve(self._frame_path), control_meas)
         rot = cmath.exp(-1j * frame)
         self.v_dq, self.i_dq = control_meas.u_g * rot, control_meas.i_c * rot
         gates = startup.active
-        duty = self.stage.finish(t, self.u_cmd, self.command_theta, control_meas.u_dc,
-                                 count=gates)
+        duty = self.stage.modulate(t, self.u_cmd, self.command_theta, control_meas.u_dc,
+                                   count=gates)
         log = None
         if self.logging:
             log = {"id_pu": self.i_dq.real, "iq_pu": self.i_dq.imag,
@@ -1434,8 +1482,10 @@ class VSCController(_GraphRuntime):
                    **self._raw_log(meas, frame)}
             log.update(self._mode_log(t, control_meas))
             self.last_log = log
+        commands = ({port: self.graph.output(port, control_meas) for port in self._carried_outputs}
+                    if self._carried_outputs else None)
         return ControlOutput(duty, log=log, theta=self.theta, omega=self.omega,
-                             gates=gates, startup_complete=startup.complete)
+                             gates=gates, startup_complete=startup.complete, commands=commands)
 
     # ------------------------------------------------------------ continuous ODE
     def begin_algebraic(self):
@@ -1467,13 +1517,12 @@ class VSCController(_GraphRuntime):
         self.graph.flow(t, meas, only=only, derivatives=derivatives)
         self._algebraic_first = False
         graph = self.graph
-        self.theta = float(graph._read(*self._theta_source, meas))
-        self.omega = float(graph._read(*self._omega_source, meas))
-        self.u_cmd = complex(graph._read(*self._command_source, meas))
+        read, source = graph._read, graph._output_source  # graph.output, inlined: every ODE stage
+        self.theta = float(read(*source["theta"], meas))
+        self.omega = float(read(*source["omega"], meas))
+        self.u_cmd = complex(read(*source["u_dq"], meas))
         self.command_theta = self.theta
-        frame = graph.values.get(self._frame_key, self.theta)
-        if self._frame_source is not None:
-            frame = graph._read(*self._frame_source, meas)
+        frame = read(*graph._resolve(self._frame_path), meas)
         command_rot = complex(math.cos(self.command_theta), math.sin(self.command_theta))
         into_frame = (command_rot.conjugate() if frame == self.command_theta
                       else cmath.exp(-1j * frame))
@@ -1493,9 +1542,6 @@ class VSCController(_GraphRuntime):
             self.out.q = 0j
         self._last_control_meas = meas
 
-    def rhs(self, t):
-        return self._derivatives
-
     def continuous_log(self, t):
         """Controller observation at an output snapshot of the continuous model."""
         if not self.logging:
@@ -1512,39 +1558,39 @@ class VSCController(_GraphRuntime):
     # ------------------------------------------------------------ states and summary
     def overwritten_state_names(self, period):
         graph = self.graph
-        # Frames are read after each sample; the voltage command only after its producer runs.
-        reads = [(self._frame_key, 1), (graph.connections.get(f"{self._frame_cc}.frame"), 1),
+        # The frame is read after each sample; the voltage command only after its producer runs.
+        reads = [(self._frame_path, 1),
                  (graph.outputs["u_dq"], dict(graph._every).get(self._terminal, 1))]
         # initial_sync() also supplies the bridge before the first graph update.
         reads.extend((graph.outputs[port], None) for port in ("theta", "omega"))
         return graph.overwritten_state_names(period, reads=reads)
 
     def get_state(self):
-        if self.continuous:
-            return gather({"startup": self.startup})
-        return {**self.graph.get_state(), "command.u_dq_pu": self.u_cmd,
-                "command.theta": self.command_theta, "command.omega": self.omega,
-                **gather({"startup": self.startup})}
+        state = super().get_state()
+        if not self.continuous:
+            # The held command precedes the start-up entries in the restart schema.
+            startup = {name: state.pop(name) for name in self.discrete_state_names}
+            state.update({"command.u_dq_pu": self.u_cmd, "command.theta": self.command_theta,
+                          "command.omega": self.omega})
+            state.update(startup)
+        return state
 
     def set_state(self, values):
-        if self.continuous:
-            scatter({"startup": self.startup}, values)
-            return
-        rest, startup = {}, {}
-        for name, value in values.items():
-            if name.startswith("startup."):
-                startup[name] = value
-            elif name == "command.u_dq_pu":
-                self.u_cmd = complex(value)
-            elif name == "command.theta":
-                self.command_theta = float(value)
-            elif name == "command.omega":
-                self.omega = float(value)
-            else:
-                rest[name] = value
-        self.graph.set_state(rest)
-        scatter({"startup": self.startup}, startup)
-        self.theta, self.omega = self.initial_sync()
+        if not self.continuous:
+            rest = {}
+            for name, value in values.items():
+                if name == "command.u_dq_pu":
+                    self.u_cmd = complex(value)
+                elif name == "command.theta":
+                    self.command_theta = float(value)
+                elif name == "command.omega":
+                    self.omega = float(value)
+                else:
+                    rest[name] = value
+            values = rest
+        super().set_state(values)
+        if not self.continuous:
+            self.theta, self.omega = self.initial_sync()
 
     def summary(self):
         """Return controller and modulation observations."""
@@ -1599,14 +1645,40 @@ RESONANT_CONVERTER_INTERFACE = ControlInterface(
 )
 
 
-def _converter_log_sources(**specific: str) -> Mapping[str, str]:
+OPEN_LOOP_CONVERTER_INTERFACE = ControlInterface(
+    inputs=MappingProxyType({
+        **_CONVERTER_MEASUREMENT_INPUTS,
+        "references.duty": DUTY_RATIO,
+    }),
+    outputs=MappingProxyType({"duty": DUTY_RATIO}),
+    optional_inputs=frozenset(("meas.power",)),
+)
+
+
+PHASE_SHIFT_CONVERTER_INTERFACE = ControlInterface(
+    inputs=MappingProxyType({
+        **_CONVERTER_MEASUREMENT_INPUTS,
+        "references.width": MODULATION,
+        "references.frequency": HERTZ,
+        "references.phase": ANGLE,
+        "references.power": SI_POWER,
+        "references.mode": MODE,
+    }),
+    outputs=MappingProxyType({"width": MODULATION, "phase": ANGLE, "frequency": HERTZ,
+                              "mode": MODE}),
+    optional_inputs=frozenset(("meas.power",)),
+)
+
+
+def _converter_log_sources(outputs: tuple[str, ...] = ("duty",),
+                           **specific: str) -> Mapping[str, str]:
     """Build the common scalar-converter log boundary in display order."""
     return MappingProxyType({
         "current": "meas.current",
         "voltage": "meas.voltage",
         "power": "meas.power",
         **specific,
-        "duty": "duty",
+        **{name: name for name in outputs},
         "in_service": "startup.active",
     })
 
@@ -1626,16 +1698,28 @@ _RESONANT_LOG_SOURCES = _converter_log_sources(
 )
 
 
-def _resonant_converter_wiring(cfg):
+_PHASE_SHIFT_LOG_SOURCES = _converter_log_sources(
+    ("width", "phase", "frequency", "mode"),
+    input_voltage="meas.vin",
+    width_reference="references.width",
+    phase_reference="references.phase",
+    power_reference="references.power",
+)
+
+
+def _modulation_wiring(cfg):
+    """Wire the modulation-role loop: each of its inputs named like a reference of the control
+    type reads that reference, and each controller output reads the loop output of its name."""
     find = _role_finder(cfg, cfg.ctrl.type)
     modulation = find("modulation")
     if modulation is None:
         return {}, {}
-    return {
-        f"{modulation}.modulation": "references.modulation",
-        f"{modulation}.frequency": "references.frequency",
-        f"{modulation}.phase": "references.phase",
-    }, {"duty": f"{modulation}.duty"}
+    interface = control_type(cfg.ctrl.type).interface
+    loop = LOOP_TYPES[cfg.ctrl.loops[modulation].type]
+    connections = {f"{modulation}.{port}": f"references.{port}" for port in loop.inputs
+                   if f"references.{port}" in interface.inputs}
+    outputs = {port: f"{modulation}.{port}" for port in interface.outputs if port in loop.outputs}
+    return connections, outputs
 
 
 def _dc_converter_wiring(cfg):
@@ -1671,16 +1755,8 @@ class ConverterMeasurement:
     samples: tuple["ConverterMeasurement", ...] = ()
 
 
-class _ConverterControlState:
-    """Dynamic attributes containing a converter graph's continuous states."""
-
-
 class _ConverterControlInp(Bag):
     __slots__ = ("current", "voltage", "vin", "power_voltage", "power_current", "power")
-
-
-class _ConverterControlOut(Bag):
-    __slots__ = ("q",)
 
 
 class GraphController(_GraphRuntime):
@@ -1689,9 +1765,6 @@ class GraphController(_GraphRuntime):
     This class supplies only the plant boundary and lifecycle. Feedback and open-loop laws are both
     ordinary graph loops; no application-specific controller bypasses the graph.
     """
-
-    outputs_need_inputs = True
-    observer = True
 
     def __init__(self, cfg, topology) -> None:
         self.p = cfg
@@ -1739,9 +1812,16 @@ class GraphController(_GraphRuntime):
             source in self.graph.values for source in self._log_sources.values()
         )
         self._last_measurement = ConverterMeasurement(vin=cfg.dclink.vdc_ref)
-        self._last_duty = topology.neutral_duty
+        self._command_ports = tuple(port for port in self.graph.interface.outputs
+                                    if port in self.graph.outputs)
+        self._last_outputs = {port: (topology.neutral_duty if port == "duty" else 0.0)
+                              for port in self._command_ports}
         if self.continuous:
-            self._build_flow_state()
+            self._install_flow_state(
+                _ConverterControlInp(current=0.0, voltage=0.0, vin=cfg.dclink.vdc_ref,
+                                     power_voltage=0.0, power_current=0.0, power=0.0),
+                _ContinuousControlOut(q=topology.zero),
+            )
 
     def control_inputs(self, current, voltage, vin, power=None) -> dict[str, Any]:
         """Return canonical measurements and converter feedforward at the control boundary."""
@@ -1779,18 +1859,6 @@ class GraphController(_GraphRuntime):
             power=power,
         )
 
-    def _build_flow_state(self) -> None:
-        self._install_flow_state(
-            _ConverterControlState,
-            [(name, self.graph.nodes[name].flow_state()) for name in self.graph.order],
-            _ConverterControlInp(current=0.0, voltage=0.0, vin=self.p.dclink.vdc_ref,
-                                 power_voltage=0.0, power_current=0.0, power=0.0),
-            _ConverterControlOut(q=self.topology.zero),
-        )
-
-    def _loop_retuned(self, _name=None) -> None:
-        self._graph_retuned()
-
     def sample(self, t: float, current: float, voltage: float, vin: float,
                power: float | None = None) -> BridgeControlOutput:
         """Evaluate one sampled control interrupt from physical plant values."""
@@ -1800,15 +1868,16 @@ class GraphController(_GraphRuntime):
         if self.startup.in_progress:
             self.startup.advance()
         self.graph.sample(t, measurement)
-        duty = float(self.graph.output("duty", measurement))
-        self._last_measurement, self._last_duty = measurement, duty
+        outputs = {port: float(self.graph.output(port, measurement))
+                   for port in self._command_ports}
+        self._last_measurement, self._last_outputs = measurement, outputs
         gates = self.startup.active
-        log = self._log(duty, gates) if self.logging else None
+        log = self._log(outputs, gates) if self.logging else None
         return BridgeControlOutput(
-            duty=duty,
             log=log,
             gates=gates,
             startup_complete=self.startup.complete,
+            commands=outputs,
         )
 
     def __call__(self, t: float, meas) -> BridgeControlOutput:
@@ -1821,18 +1890,16 @@ class GraphController(_GraphRuntime):
         self.graph.flow(t, measurement, derivatives=self._derivatives)
         duty = float(self.graph.output("duty", measurement))
         self.out.q = self.topology.state_from_duty(duty) if self.startup.active else self.topology.zero
-        self._last_measurement, self._last_duty = measurement, duty
+        self._last_measurement = measurement
+        self._last_outputs["duty"] = duty
 
-    def rhs(self, t: float):
-        return self._derivatives
-
-    def _log(self, duty: float, active: bool) -> dict[str, float]:
+    def _log(self, outputs: Mapping[str, float], active: bool) -> dict[str, float]:
         measurement = self._last_measurement
         values = {
             "meas.current": measurement.current,
             "meas.voltage": measurement.voltage,
             "meas.vin": measurement.vin,
-            "duty": duty,
+            **outputs,
             "startup.active": 1.0 if active else 0.0,
         }
         if self._needs_power:
@@ -1849,7 +1916,7 @@ class GraphController(_GraphRuntime):
         # model has synchronized every input by the time it asks for a snapshot observation.
         if self.logging:
             self._flow_measurement()
-        return self._log(self._last_duty, self.startup.active) if self.logging else None
+        return self._log(self._last_outputs, self.startup.active) if self.logging else None
 
     def log_names(self) -> tuple[str, ...]:
         return tuple(self._log_sources)
@@ -1858,25 +1925,11 @@ class GraphController(_GraphRuntime):
         """Map log columns to public control ports or controller lifecycle values."""
         return self._log_sources
 
-    def set_logging(self, enabled: bool) -> None:
-        self.logging = bool(enabled)
-
-    def get_state(self) -> dict[str, Any]:
-        startup = {f"startup.{name}": value for name, value in self.startup.get_state().items()}
-        return startup if self.continuous else {**self.graph.get_state(), **startup}
-
     def overwritten_state_names(self, period):
         # sample() consumes every boundary output after graph.sample() on each interrupt.
         return self.graph.overwritten_state_names(
             period, reads=((source, 1) for source in self.graph.outputs.values()),
         )
-
-    def set_state(self, values: Mapping[str, Any]) -> None:
-        startup = {name[8:]: value for name, value in values.items() if name.startswith("startup.")}
-        self.startup.set_state(startup)
-        if not self.continuous:
-            self.graph.set_state({name: value for name, value in values.items()
-                                  if not name.startswith("startup.")})
 
     def summary(self) -> dict[str, Any]:
         return {"alarms": []}
@@ -1913,11 +1966,35 @@ register_control_type(
     reference_validator=validate_scalar_voltage_references,
 )
 register_control_type(
+    "open_loop",
+    references=DutyReferenceParams,
+    unit_types=frozenset(("dc_converter",)),
+    interface=OPEN_LOOP_CONVERTER_INTERFACE,
+    wiring=_modulation_wiring,
+    log_sources=_converter_log_sources(input_voltage="meas.vin",
+                                       duty_reference="references.duty"),
+    default_bridge="half_bridge",
+    controller_factory=GraphController,
+    reference_validator=validate_duty_references,
+)
+register_control_type(
+    "phase_shift",
+    references=PhaseShiftReferenceParams,
+    unit_types=frozenset(("dc_converter",)),
+    interface=PHASE_SHIFT_CONVERTER_INTERFACE,
+    wiring=_modulation_wiring,
+    log_sources=_PHASE_SHIFT_LOG_SOURCES,
+    default_bridge="full_bridge",
+    controller_factory=GraphController,
+    reference_validator=validate_phase_shift_references,
+    modulator="phase_shift",
+)
+register_control_type(
     "resonant",
     references=ResonantReferenceParams,
     unit_types=frozenset(("dc_converter",)),
     interface=RESONANT_CONVERTER_INTERFACE,
-    wiring=_resonant_converter_wiring,
+    wiring=_modulation_wiring,
     log_sources=_RESONANT_LOG_SOURCES,
     default_bridge="full_bridge",
     controller_factory=GraphController,

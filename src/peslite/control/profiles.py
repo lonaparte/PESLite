@@ -50,6 +50,26 @@ class ResonantReferenceParams:
 
 
 @dataclass(frozen=True)
+class DutyReferenceParams:
+    """Open-loop duty-ratio command in [0, 1]."""
+
+    duty: float
+
+
+@dataclass(frozen=True)
+class PhaseShiftReferenceParams:
+    """Square-wave commands: pulse ``width`` in half periods, ``frequency`` (Hz), ``phase``
+    (rad, centre of the positive pulse), ``mode`` (0 bipolar pulses, 1 positive pulse,
+    3 zero level, 4 negative pulse) and an optional signed port-power reference (W)."""
+
+    width: float
+    frequency: float
+    phase: float = 0.0
+    power: float = 0.0
+    mode: int = 0
+
+
+@dataclass(frozen=True)
 class ControlTypeSpec:
     """Behavior selected by one ``ctrl.type`` value."""
 
@@ -63,6 +83,9 @@ class ControlTypeSpec:
     default_bridge: str | None = None
     controller_factory: Callable[..., Any] | None = None
     reference_validator: Callable[[Any, str], None] | None = None
+    # Registered modulator (components.pwm.MODULATOR_TYPES) of a sampled bridge commanded by
+    # this type's outputs; None: the carrier modulation of duty ratios.
+    modulator: str | None = None
 
 
 def validate_scalar_voltage_references(references: Any, where: str) -> None:
@@ -70,15 +93,40 @@ def validate_scalar_voltage_references(references: Any, where: str) -> None:
         raise ConfigError(f"{where}.voltage must be finite and positive")
 
 
-def validate_resonant_references(references: Any, where: str) -> None:
-    if not math.isfinite(references.modulation) or not 0.0 <= references.modulation <= 1.0:
-        raise ConfigError(f"{where}.modulation must be in [0, 1]")
+def _validate_modulation_references(references: Any, where: str, amplitude: str) -> None:
+    value = getattr(references, amplitude)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ConfigError(f"{where}.{amplitude} must be in [0, 1]")
     if not math.isfinite(references.frequency) or references.frequency <= 0.0:
         raise ConfigError(f"{where}.frequency must be finite and positive")
-    if not math.isfinite(references.phase):
-        raise ConfigError(f"{where}.phase must be finite")
-    if not math.isfinite(references.power):
-        raise ConfigError(f"{where}.power must be finite")
+    for name in ("phase", "power"):
+        if not math.isfinite(getattr(references, name)):
+            raise ConfigError(f"{where}.{name} must be finite")
+
+
+def validate_resonant_references(references: Any, where: str) -> None:
+    _validate_modulation_references(references, where, "modulation")
+
+
+def validate_duty_references(references: Any, where: str) -> None:
+    if not math.isfinite(references.duty) or not 0.0 <= references.duty <= 1.0:
+        raise ConfigError(f"{where}.duty must be in [0, 1]")
+
+
+# Each mode defines its pulses as (centre offset in rad, signed bridge level).
+PHASE_SHIFT_MODES = {
+    0: ((0.0, 1), (math.pi, -1)),
+    1: ((0.0, 1),),
+    3: (),
+    4: ((math.pi, -1),),
+}
+
+
+def validate_phase_shift_references(references: Any, where: str) -> None:
+    _validate_modulation_references(references, where, "width")
+    # Keep membership as one condition when replayed with tunable parameter expressions.
+    if sum(references.mode == mode for mode in PHASE_SHIFT_MODES) != 1:
+        raise ConfigError(f"{where}.mode must be one of {sorted(PHASE_SHIFT_MODES)}")
 
 
 CONTROL_TYPES: dict[str, ControlTypeSpec] = {}

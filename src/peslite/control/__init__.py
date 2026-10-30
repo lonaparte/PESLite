@@ -11,10 +11,13 @@ solver's kernel: the hardware adapts to its interface (:class:`Measurement`, :cl
 
 from ..solver import ConfigError
 from .blocks import Filter, Integrator, OutputLimit, PI, complex_power, unit_delay
-from .loops import (ANGLE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES, POWER, V, V_AB, V_DQ,
+from .loops import (ANGLE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES, MODE, POWER, V, V_AB, V_DQ,
                     DUTY_RATIO, HERTZ, MODULATION, SI_CURRENT, SI_VOLTAGE, SI_POWER, DCVoltageControl,
-                    InductorCurrentControl, PowerControl, PhasePowerControl, ResonantModulation,
-                    Loop, SignalType, SyncLaw, register_loop_type)
+                    InductorCurrentControl, PowerControl, PhasePowerControl, FrequencyPowerControl,
+                    VoltageControl, PhaseVoltageControl, FrequencyVoltageControl, CurrentControl,
+                    PhaseCurrentControl, FrequencyCurrentControl, ResonantModulation,
+                    PhaseShiftModulation, DutyModulation, Loop, SignalType, SyncLaw,
+                    register_loop_type)
 from .modulation import ModulationLimiter, OutputStage
 from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, ControlMeasurement,
                          BridgeControlOutput, ControlOutput, Controller, ConverterMeasurement,
@@ -24,8 +27,12 @@ from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, Cont
 
 __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter",
            "complex_power", "unit_delay", "SignalType", "ConfigError",
-           "SI_CURRENT", "SI_VOLTAGE", "SI_POWER", "DUTY_RATIO", "MODULATION", "HERTZ",
-           "DCVoltageControl", "InductorCurrentControl", "PowerControl", "PhasePowerControl", "ResonantModulation",
+           "SI_CURRENT", "SI_VOLTAGE", "SI_POWER", "DUTY_RATIO", "MODULATION", "HERTZ", "MODE",
+           "DCVoltageControl", "InductorCurrentControl", "PowerControl", "PhasePowerControl",
+           "FrequencyPowerControl", "VoltageControl", "PhaseVoltageControl",
+           "FrequencyVoltageControl", "CurrentControl", "PhaseCurrentControl",
+           "FrequencyCurrentControl", "ResonantModulation", "PhaseShiftModulation",
+           "DutyModulation",
            "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER",
            "LOOP_TYPES", "register_loop_type", "ControlInterface", "CONTROL_INTERFACE",

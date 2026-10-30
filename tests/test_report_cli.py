@@ -99,13 +99,18 @@ def test_report_runtime_errors_do_not_fall_back_to_running_the_simulation_again(
     assert not (tmp_path / "summary.json").exists()
 
 
-def test_without_the_flag_the_addon_is_not_imported(tmp_path, monkeypatch):
+def test_without_the_flag_the_addon_is_not_imported(tmp_path, monkeypatch, capsys):
     def forbidden(_name):
         raise AssertionError("normal CLI runs must not import the report addon")
 
     monkeypatch.setattr(simulation, "import_module", forbidden)
     assert peslite.main(_args(tmp_path)) == 0
     assert not list(tmp_path.glob("*_report.json"))
+    assert "ph_verdict" not in json.loads((tmp_path / "summary.json").read_text())
+
+    capsys.readouterr()
+    assert peslite.main(_args(tmp_path, "--ph-report")) == 0
+    assert "port-hamiltonian" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("options", [["--list-states"], ["--ph-report"], ["--resolved"],

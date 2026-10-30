@@ -45,6 +45,11 @@ def test_make_solver_builds_the_configured_integrator():
     for expected, changes in cases.items():
         configured = settings.__class__(**{**vars(settings), **changes})
         assert type(make_solver(configured, model)) is expected
+    # A group's subsystems share one step count, as they share one method.
+    for subsystems in ({"vsc.dclink": 4, "pcc": 2}, {"vsc.dclink": 0.5, "pcc": 0.25}):
+        configured = settings.__class__(**{**vars(settings), "subsystems": subsystems})
+        with pytest.raises(ValueError, match="share one ratio"):
+            make_solver(configured, model)
 
 
 def test_dp45_float_model_path_matches_the_array_path():
@@ -152,9 +157,11 @@ def test_observational_output_stage_is_pruned_or_promoted_by_rhs_dependencies():
     assert producer.observations == 1
 
 
-def test_a_run_continues_exactly_from_a_saved_state(tmp_path):
+@pytest.mark.parametrize("split", [{}, {"simulation.solver.subsystems": {"pcc": 3}}],
+                         ids=["single-rate", "mid-window"])  # 2 ms lies inside a 3 dt window
+def test_a_run_continues_exactly_from_a_saved_state(tmp_path, split):
     def run(t_end, out, **changes):
-        params = peslite.load(EXAMPLES / "gfl-example.pes", **QUIET, **FAST,
+        params = peslite.load(EXAMPLES / "gfl-example.pes", **QUIET, **FAST, **split,
                               **{"simulation.t_end": t_end}, **changes)
         return peslite.Simulation(params).run(out_dir=out)
 

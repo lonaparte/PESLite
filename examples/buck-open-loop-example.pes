@@ -1,0 +1,56 @@
+# PESLite 0.4.0
+# Open-loop synchronous Buck. The duty command is a controller reference and is changed by the
+# event below. The filter, output capacitor and load remain ordinary network components.
+
+base:
+  s_base: 500.0
+  v_ll_rms: 230.0
+  f0: 50.0
+
+buses:
+  output:
+    phases: 1
+    c: 100.0e-6
+
+elements:
+  load:
+    type: resistor
+    bus: output
+    r: 2.0
+
+units:
+  converter:
+    type: dc_converter
+    bus: output
+    filter: {l_f: 0.5e-3, r_f: 0.05}
+    dclink:
+      vdc_ref: 48.0
+      source: {type: voltage}
+    pwm:
+      f_sw: 20000.0
+    ctrl:
+      type: open_loop
+      loops:
+        DutyModulation: {}
+      references:
+        duty: 0.4
+
+events:
+  duty_step:
+    type: set
+    t: 0.004
+    set:
+      units.converter.ctrl.references.duty: 0.6
+
+simulation:
+  t_end: 0.008
+  solver:
+    dt: 2.5e-6
+    linearisations: 0
+  output:
+    period: 10.0e-6
+    signals: 1
+
+meta:
+  title: Open-loop synchronous Buck
+  description: Duty-ratio reference and step event applied to an open-loop Buck converter.

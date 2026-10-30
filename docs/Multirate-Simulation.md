@@ -15,7 +15,9 @@ Multirate schedules currently require the fixed-step solver.
 - `1` means the normal system step;
 - `10` means `10 * dt`: one subsystem update over a ten-step window.
 
-A ratio below one must be `1/N`; a ratio above one must be an integer `N`. The mapping key is the
+A ratio below one must be `1/N`; a ratio above one must be an integer `N`. All entries below one
+form one fast group and all entries above one form one windowed group; each group uses one ratio,
+and building the simulation rejects different ratios in one group. The mapping key is the
 assembled subsystem name, such as `pcc`, `grid.branch` or `vsc.dclink`.
 
 ```yaml
@@ -58,13 +60,9 @@ windows across strong coupling can reduce accuracy or erase dynamics that matter
 
 ## Events and exact boundaries
 
-Every event time is still an exact integration boundary. If an event interrupts a slow window,
-PESLite closes the pending work using the actual shortened interval, applies the event, and starts
-the updated model without moving the original future time grid. Parameter-changing events also
-refresh the affected storage declarations.
-
-Output points and the requested end time likewise remain exact; they are not rounded to a
-multirate, controller or PWM grid.
+Event, output and end times remain exact integration boundaries; they are not rounded to a
+multirate, controller or PWM grid. An event inside a slow window is handled as described in
+[Exact event semantics](Events-and-Restart.md#exact-event-semantics).
 
 ## Complete example
 
@@ -145,9 +143,13 @@ diagnostics, not as a replacement for convergence against a tighter reference ru
 ## Limitations
 
 - Multirate schedules are supported only with `simulation.solver.type: fixed`.
-- Fast groups share the system fixed method.
-- Windowed groups share one method and window length.
-- The current C++ exporter supports single-rate fixed solvers and adaptive DP45, not multirate
-  subsystem schedules.
+- A fast group uses the system fixed method; a windowed group uses one method.
+- A system with commutating subsystems, such as diode rectifiers or switch-controlled capacitors,
+  cannot use a windowed group because it cannot locate their commutation instants.
+- The filter of an averaged unilateral half bridge requests a state-dependent local step in DCM
+  ([Converter and Bridge Models](Converter-and-Bridge-Models.md#scalar-converter-ports-device-placement-and-dcm))
+  and therefore cannot be windowed.
+- C++ export does not support multirate subsystem schedules
+  ([C++ Export](Cpp-Export.md#current-limitations)).
 
 For bridge-dependent time grids, see [Converter and Bridge Models](Converter-and-Bridge-Models.md).

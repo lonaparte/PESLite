@@ -35,6 +35,44 @@ def test_buses_section_may_be_omitted_when_no_public_bus_is_used(filename):
     assert result.summary["t_stop"] == pytest.approx(2e-6)
 
 
+def test_scalar_si_network_needs_neither_converters_nor_ac_base_values(tmp_path):
+    params = from_dict({
+        "base": {"s_base": 500.0},
+        "buses": {"node": {"c": 1.0e-3, "phases": 1}},
+        "elements": {"load": {"type": "resistor", "bus": "node", "r": 10.0}},
+        "simulation": {
+            "t_end": 0.01,
+            "solver": {"dt": 1.0e-5},
+            "initial": {"states": {"node.u_C": 10.0}},
+            "output": {"period": 1.0e-3},
+            "energy_check": "strict",
+        },
+    })
+    assert params.units == {}
+    assert params.base.v_ll_rms is None and params.base.f0 is None
+    assert from_dict(to_dict(params)) == params
+
+    result = peslite.Simulation(params).run(out_dir=tmp_path)
+    assert result.states["node.u_C"][-1] == pytest.approx(10.0 / math.e, rel=2e-8)
+
+
+def test_missing_optional_base_values_are_reported_only_when_used():
+    tree = {
+        "base": {"s_base": 500.0},
+        "buses": {"node": {"c": 1.0e-3, "phases": 1}},
+        "simulation": {"t_end": 0.01},
+    }
+    with pytest.raises(ConfigError, match=r"per-unit capacitance.*corresponding base"):
+        from_dict({**tree, "buses": {"node": {"c_pu": 0.1, "phases": 1}}})
+    with pytest.raises(ConfigError, match=r"three-phase bus requires base\.v_ll_rms"):
+        from_dict({**tree, "buses": {"node": {"c": 1.0e-3, "phases": 3}}})
+
+    vsc = read_tree(EXAMPLES / "gfl-example.pes")
+    vsc["base"] = {"s_base": vsc["base"]["s_base"]}
+    with pytest.raises(ConfigError, match=r"per-unit .*capacitance.*corresponding base|a VSC requires"):
+        from_dict(vsc)
+
+
 @pytest.mark.parametrize("filename", ["gfl-example.pes", "buck-example.pes", "wpt-load-example.pes"])
 def test_shared_unit_schema_round_trips_without_persisting_cached_derived_fields(filename):
     params = peslite.load(EXAMPLES / filename)
@@ -83,6 +121,12 @@ def test_log_and_old_parameter_names_are_rejected():
     with pytest.raises(ConfigError, match=r"unknown key.*bw_hz"):
         from_dict(tree)
 
+    tree = _tree()  # a legacy node name colliding with the controller's start-up state
+    loops = tree["units"]["vsc"]["ctrl"]["loops"]
+    loops["startup"] = {**loops.pop("DCVoltageControl"), "type": "dc_voltage_control"}
+    with pytest.raises(ConfigError, match=r"loops\.startup: reserved loop name"):
+        from_dict(tree)
+
     tree = _tree()
     tree["units"]["vsc"]["control"] = tree["units"]["vsc"].pop("ctrl")
     with pytest.raises(ConfigError, match=r"units\.vsc: unknown key.*control"):
@@ -122,6 +166,22 @@ def test_nested_electrical_values_follow_si_and_pu_spelling():
         p.replace(**{"units.vsc.protection.overcurrent.limit": amperes,
                      "units.vsc.protection.overcurrent.limit_pu": 1.15})
 
+    # A scalar unit's protection compares against its DC base, in the file and in set events,
+    # and needs no AC base for SI limits.
+    buck = peslite.load(EXAMPLES / "buck-example.pes")
+    limits = {"units.converter.protection.overcurrent.limit": 20.0,
+              "units.converter.protection.overvoltage.limit": 30.0,
+              "events.tighten.type": "set", "events.tighten.t": 1e-3,
+              "events.tighten.set.units.converter.protection.undervoltage.limit": 12.0}
+    for q in (buck.replace(**limits),
+              buck.replace(**limits, **{"base.v_ll_rms": None, "base.f0": None})):
+        converter = q.unit("converter")
+        dc = converter.dc_base
+        assert converter.protection.overcurrent.limit_pu == pytest.approx(20.0 / dc.i)
+        assert converter.protection.overvoltage.limit_pu == pytest.approx(30.0 / dc.v)
+        written = q.changes[0].values["units.converter.protection.undervoltage.limit_pu"]
+        assert written == pytest.approx(12.0 / dc.v)
+
 
 def test_switched_sections_require_settings_and_write_zero_or_one():
     p = peslite.load(EXAMPLES / "gfl-example.pes")
@@ -156,6 +216,15 @@ def test_dependent_defaults_follow_replace_and_stay_fixed_when_explicit():
 
     rebased = p.replace(**{"base.s_base": 1e6})
     assert rebased.unit("vsc").base.s_base == 1e6
+    revolted = p.replace(**{"base.v_ll_rms": 400.0})
+    assert revolted.sources["grid"].v == pytest.approx(revolted.base.v_phase_peak)
+    explicit = p.replace(**{"sources.grid.v": 500.0}).replace(**{"base.v_ll_rms": 400.0})
+    assert explicit.sources["grid"].v == 500.0
+    buck = peslite.load(EXAMPLES / "buck-example.pes")
+    assert buck.replace(**{"units.converter.dclink.vdc_ref": 60.0}).unit(
+        "converter").dclink.source.v == 60.0
+    assert buck.replace(**{"units.converter.dclink.source.v": 50.0}).replace(
+        **{"units.converter.dclink.vdc_ref": 60.0}).unit("converter").dclink.source.v == 50.0
     averaged = p.replace(**{"units.vsc.bridge.model": "pwm_averaging",
                             "units.vsc.meas.average": ["u_g", "i_c"],
                             "units.vsc.pwm.f_sw": 10_000.0})

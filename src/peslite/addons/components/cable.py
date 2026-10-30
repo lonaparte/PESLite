@@ -9,7 +9,7 @@ physical length.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from types import FunctionType
 from typing import Any, ClassVar
@@ -74,9 +74,7 @@ class CableModel:
         self.series_l = tuple(l_per_km * span for span in lengths)
         self.shunt_g = g_per_km * cell
         self.shunt_c = c_per_km * cell
-        self.state_names = tuple(f"iL{k}" for k in range(1, sections + 2)) + tuple(
-            f"uC{k}" for k in range(1, sections + 1)
-        )
+        self.state_names = _state_record(sections).__slots__
         initial = {name: 0j for name in self.state_names}
         initial.update({f"uC{k}": complex(voltage0) for k in range(1, sections + 1)})
         self.state = _state_record(sections)(**initial)
@@ -136,7 +134,7 @@ class Cable(Element):
         l_per_km: float
         c_per_km: float
         g_per_km: float = 0.0
-        sections: int = 4
+        sections: int = field(default=4, metadata={"structural": True})
         type: str = "cable"
 
         def __post_init__(self) -> None:
@@ -158,6 +156,7 @@ class Cable(Element):
                 raise ConfigError("bus1 and bus2 must name different buses")
 
     type = "cable"
+    domain_transparent = True
 
     def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
         self.name, self.cfg = name, cfg

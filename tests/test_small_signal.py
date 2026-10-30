@@ -429,12 +429,30 @@ def test_normal_run_does_not_construct_a_map_or_compute_modes(monkeypatch):
     assert sim.result.summary["t_stop"] == sim.p.simulation.t_end
 
 
+def test_loop_scales_plant_coordinates_by_rating_with_a_single_rate_solver(gfl):
+    sim = peslite.Simulation(gfl())
+    cols = SystemLoop(sim, period=0.02, frame_frequency=0.0).coordinates(list(sim._states.read_flat()))
+    assert {group[0]: scale for _kind, group, scale in cols}["pcc.u_C.re"] == pytest.approx(
+        sim.p.base.v_phase_peak)
+
+
 def test_loop_preserves_output_grid_when_disabling_histories(gfl):
     sim = peslite.Simulation(gfl())
     loop = SystemLoop(sim, period=0.02, frame_frequency=0.0)
     assert loop._p.simulation.output.period == sim.p.simulation.output.period
     assert not loop._p.simulation.output.states
     assert not loop._p.simulation.output.signals
+
+
+@pytest.mark.parametrize("model", ["switching", "averaging"])
+def test_loop_reads_controller_angle_coordinates_from_state_owner_metadata(gfl, model):
+    sim = peslite.Simulation(gfl(**{"units.vsc.bridge.model": model}))
+    angles = sim._states.angle_names
+    assert "vsc.ctrl.SRFPLL.theta" in angles
+    if model == "switching":
+        assert {"vsc.ctrl.held.SRFPLL.theta", "vsc.ctrl.command.theta"} <= angles
+    loop = SystemLoop(sim, period=0.02, frame_frequency=0.0)
+    assert loop._angles == set(angles)
 
 
 def test_analysis_requires_settled_state_and_does_not_silently_trim():

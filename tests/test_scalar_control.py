@@ -19,6 +19,7 @@ from peslite.control import (
     PowerControl,
     PhasePowerControl,
     ResonantModulation,
+    DutyModulation,
     OutputLimit,
     PI,
 )
@@ -51,6 +52,7 @@ def _graph(*, continuous=False):
         loops=loops,
         references=_References(),
         period=period,
+        offset=None,
         connections={},
         outputs={},
     )
@@ -97,6 +99,59 @@ def test_scalar_control_uses_the_shared_control_package():
     assert {"dc_voltage_control", "inductor_current_control"} <= set(LOOP_TYPES)
     assert LOOP_TYPES["dc_voltage_control"] is DCVoltageControl
     assert LOOP_TYPES["resonant_modulation"] is ResonantModulation
+
+
+def test_scalar_output_alias_and_named_commands_share_one_value():
+    from peslite.control.controller import BridgeControlOutput
+
+    output = BridgeControlOutput(duty=0.25)
+    output.commands["duty"] = 0.4
+    assert output.duty == 0.4
+    output.duty = 0.6
+    assert output.commands == {"duty": 0.6}
+    with pytest.raises(ValueError, match="conflicting duty"):
+        BridgeControlOutput(duty=0.2, commands={"duty": 0.8})
+
+
+@pytest.mark.parametrize(("bridge", "neutral"), [
+    ("half_bridge", 0.0),
+    ("full_bridge", 0.5),
+])
+def test_open_loop_startup_ramps_from_the_topology_neutral_duty(bridge, neutral):
+    from peslite.assembly.params import BridgeParams
+
+    startup = SimpleNamespace(value=0.0)
+    unit = SimpleNamespace(
+        bridge=BridgeParams(model="pwm_averaging", type=bridge),
+        ctrl=SimpleNamespace(references=SimpleNamespace(duty=0.8)),
+    )
+    loop = DutyModulation(DutyModulation.Params(period=1.0e-4), unit, startup)
+    assert loop.sample(0.0, {"duty": 0.8})["duty"] == pytest.approx(neutral)
+    startup.value = 0.5
+    assert loop.sample(0.0, {"duty": 0.8})["duty"] == pytest.approx(
+        neutral + 0.5 * (0.8 - neutral)
+    )
+
+
+def test_registered_carrier_keeps_its_own_topology_capabilities(monkeypatch):
+    from dataclasses import replace
+    import peslite
+    from conftest import EXAMPLES
+    from peslite.components.converter import HalfBridge, make_bridge
+    from peslite.components.pwm import CarrierComparison, MODULATOR_TYPES, validate_modulator
+    from peslite.control.profiles import CONTROL_TYPES
+
+    class CustomCarrier(CarrierComparison):
+        pass
+
+    unit = peslite.load(EXAMPLES / "buck-example.pes",
+                        **{"units.converter.bridge.model": "switching"}).units["converter"]
+    monkeypatch.setitem(MODULATOR_TYPES, "test_carrier", CustomCarrier)
+    monkeypatch.setitem(CONTROL_TYPES, "dc", replace(CONTROL_TYPES["dc"], modulator="test_carrier"))
+    validate_modulator(unit, HalfBridge(), "units.converter")
+    bridge = make_bridge(unit)
+    assert isinstance(bridge.modulator, CustomCarrier)
+    assert len(bridge.register_names) == 1
 
 
 def test_control_profiles_declare_one_static_interface_contract():
@@ -192,7 +247,7 @@ def test_output_limit_tracks_sampled_and_continuous_pi_states():
     continuous = PI(2.0, 4.0, None)
     requested = continuous(2.0, 0.0)
     limiter = OutputLimit(1.0, lower=0.0, pi=continuous)
-    assert limiter.flow(requested) == 1.0
+    assert limiter.sample(0.0, requested) == 1.0
     assert continuous.derivative == pytest.approx(0.5)
 
 
@@ -274,7 +329,6 @@ def test_scalar_output_limits_keep_the_original_positive_upper_contract(lower, u
     for value in (lower - 1.0, lower, (lower + upper) / 2.0, upper, upper + 1.0):
         expected = min(upper, max(lower, value))
         assert limiter.sample(0.0, value) == expected
-        assert limiter.flow(value) == expected
 
 
 @pytest.mark.parametrize("lower,upper", [(-1.0, float("inf")), (float("nan"), 1.0),

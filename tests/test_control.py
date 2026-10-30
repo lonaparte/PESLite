@@ -9,10 +9,11 @@ import pytest
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import from_dict, read_tree, to_dict
-from peslite.control import (ANGLE, CONTROL_INTERFACE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES,
-                             POWER, V, V_AB, V_DQ, Filter, Integrator, Loop, Measurement, PI,
-                             SignalType, SyncLaw, complex_power, register_loop_type, unit_delay)
+from peslite.assembly.params import from_dict, read_tree, runtime_changeable, to_dict
+from peslite.control import (ANGLE, CONTROL_INTERFACE, DUTY_RATIO, FREQUENCY, I, I_AB, I_DQ,
+                             LOOP_TYPES, POWER, V, V_AB, V_DQ, Filter, Integrator, Loop,
+                             Measurement, PI, SignalType, SyncLaw, complex_power,
+                             register_loop_type, unit_delay)
 from peslite.solver.model import ConfigError
 
 CONTROL = Path(peslite.control.__file__).parent
@@ -63,6 +64,50 @@ class _AffineFeedback(Loop):
         return self.sample(t, inputs), {}
 
 
+@register_loop_type
+class _UnobservedDCVoltage(Loop):
+    """A stateless registered dc_voltage-role loop without DCVoltageControl's limit observer."""
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        gain: float
+        period: float | None = None
+        type: str = "test_unobserved_dc_voltage"
+
+    type = "test_unobserved_dc_voltage"
+    role = "dc_voltage"
+    inputs = {"reference": V, "voltage": V}
+    outputs = {"current_reference": I}
+    flow_inputs = ("reference", "voltage")
+
+    def initial_outputs(self):
+        return {"current_reference": 0.0}
+
+    def equation(self, reference, voltage):
+        return (self.cfg.gain * (voltage - reference),)
+
+
+@register_loop_type
+class _SampledDuty(Loop):
+    """A registered modulation loop with only a sampled law."""
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: float | None = None
+        type: str = "test_sampled_duty"
+
+    type = "test_sampled_duty"
+    role = "modulation"
+    inputs = {"duty": DUTY_RATIO}
+    outputs = {"duty": DUTY_RATIO}
+
+    def initial_outputs(self):
+        return {"duty": 0.5}
+
+    def sample(self, t, inputs):
+        return {"duty": inputs["duty"]}
+
+
 def test_registered_loop_owns_its_schema_and_uses_default_role_wiring(tmp_path):
     p = peslite.load(
         EXAMPLES / "gfm-psc-example.pes",
@@ -77,6 +122,8 @@ def test_registered_loop_owns_its_schema_and_uses_default_role_wiring(tmp_path):
         "units.vsc.bridge.model": "pwm_averaging",
         "units.vsc.ctrl.loops": loops,
     })
+    assert not runtime_changeable("units.vsc.ctrl.loops._FixedFrequency.type", p)
+    assert not runtime_changeable("units.vsc.ctrl.loops._FixedFrequency.period", p)
     sim = peslite.Simulation(p)
     ctrl = sim.unit().ctrl
     assert type(p.unit().ctrl.loops["_FixedFrequency"]) is _FixedFrequency.Params
@@ -99,6 +146,14 @@ def test_sampled_custom_loop_must_supply_its_own_continuous_equations_for_averag
     p = p.replace(**{"units.vsc.ctrl.loops": loops})
     with pytest.raises(ConfigError, match="no continuous-time flow implementation"):
         peslite.Simulation(p)
+
+    # A DC converter's graph is checked by the same construction-time rule.
+    tree = read_tree(EXAMPLES / "buck-open-loop-example.pes")
+    tree["units"]["converter"]["bridge"] = {"model": "averaging"}
+    tree["units"]["converter"]["ctrl"]["loops"] = {"_SampledDuty": {}}
+    tree["events"] = {}
+    with pytest.raises(ConfigError, match="_SampledDuty: .* no continuous-time implementation"):
+        peslite.Simulation(from_dict(tree))
 
 
 def test_continuous_control_graph_automatically_solves_feedback_between_loops():
@@ -237,6 +292,60 @@ def test_control_graph_has_one_typed_boundary_for_inputs_and_outputs(gfl):
         owner, _, source_port = source.partition(".")
         assert graph.nodes[owner].outputs[source_port] == CONTROL_INTERFACE.outputs[port]
 
+    # Without a PLL, theta, omega and the logged dq frame are references; a set event moves the
+    # controller's outputs and frame through the same boundary as the loop inputs.
+    for model in ("pwm_averaging", "averaging"):
+        params = gfl(**{"units.vsc.bridge.model": model})
+        loops = {name: loop for name, loop in params.unit("vsc").ctrl.loops.items()
+                 if name != "SRFPLL"}
+        params = params.replace(**{"units.vsc.ctrl.loops": loops})
+        cfg = params.unit("vsc")
+        controller = peslite.VSCController(cfg)
+        moved = params.replace(**{"units.vsc.ctrl.references.theta": 0.5,
+                                  "units.vsc.ctrl.references.omega": 300.0})
+        controller.retune(moved.unit("vsc"), ["ctrl.references.theta", "ctrl.references.omega"], 0.0)
+        if controller.continuous:
+            controller.inp.u_g = cfg.base.v_phase_peak + 0j
+            controller.set_outputs(0.0)
+        else:
+            controller(0.0, Measurement(0.0, cfg.base.v_phase_peak + 0j, 0j,
+                                        cfg.dclink.vdc_ref, np.zeros(3)))
+        assert (controller.theta, controller.command_theta, controller.omega) == (0.5, 0.5, 300.0)
+        assert controller.v_dq == pytest.approx(np.exp(-0.5j))
+
+
+@pytest.mark.parametrize("model", ["pwm_averaging", "averaging"])
+def test_reference_changes_rewire_graph_outputs_and_frame(gfl, model):
+    params = gfl(**{"units.vsc.bridge.model": model})
+    loops = {
+        name: loop
+        for name, loop in params.unit("vsc").ctrl.loops.items()
+        if name != "SRFPLL"
+    }
+    params = params.replace(**{"units.vsc.ctrl.loops": loops})
+    cfg = params.unit("vsc")
+    controller = peslite.VSCController(cfg)
+    moved = params.replace(**{
+        "units.vsc.ctrl.references.theta": 0.5,
+        "units.vsc.ctrl.references.omega": 300.0,
+    })
+
+    controller.retune(
+        moved.unit("vsc"),
+        ["ctrl.references.theta", "ctrl.references.omega"],
+        0.0,
+    )
+    if controller.continuous:
+        controller.inp.u_g = cfg.base.v_phase_peak + 0j
+        controller.set_outputs(0.0)
+    else:
+        controller(0.0, Measurement(
+            0.0, cfg.base.v_phase_peak + 0j, 0j, cfg.dclink.vdc_ref, np.zeros(3),
+        ))
+
+    assert (controller.theta, controller.command_theta, controller.omega) == (0.5, 0.5, 300.0)
+    assert controller.v_dq == pytest.approx(np.exp(-0.5j))
+
 
 def test_control_ports_have_the_canonical_signal_types():
     signals = (I_AB, V_AB, I_DQ, V_DQ, I, V, ANGLE, FREQUENCY, POWER)
@@ -308,11 +417,40 @@ def test_dc_voltage_control_owns_its_limit_in_both_execution_modes(gfl):
     assert (continuous.graph.nodes["DCVoltageControl"].limit.pi
             is continuous.graph.nodes["DCVoltageControl"].pi)
 
+    # A current-loop set event rebuilds the dq command limit for the new PI, still scaled to the
+    # measured DC voltage in the interrupt that applies it (0.6 pu: the command saturates).
+    sampled.command(True, 0.0)
+    sampled.retune(gfl(**{"units.vsc.ctrl.loops.CurrentLoop.bandwidth": 250.0}).unit("vsc"),
+                   ["ctrl.loops.CurrentLoop.bandwidth"], 0.0)
+    sampled(0.0, Measurement(0.0, sampled.p.base.v_phase_peak + 0j, 0j,
+                             0.6 * sampled.p.dclink.vdc_ref, np.zeros(3)))
+    limit = sampled.graph._limits["CurrentLoop"][1]
+    assert limit is sampled._terminal_limit and limit.pi is sampled.graph.nodes["CurrentLoop"].pi
+    assert limit.limit == pytest.approx(0.6 * sampled._terminal_limit_scale)
+    assert abs(sampled.u_cmd) == pytest.approx(limit.limit)
+
+    # A registered loop in the dc_voltage role without the limit observer is wired by its role
+    # but neither observed nor counted in the summary.
+    loops = dict(gfl().unit("vsc").ctrl.loops)
+    period = loops.pop("DCVoltageControl").period
+    loops["_UnobservedDCVoltage"] = _UnobservedDCVoltage.Params(gain=1.0, period=period)
+    for model in ("pwm_averaging", "averaging"):
+        ctrl = peslite.Simulation(gfl(**{"units.vsc.bridge.model": model}).replace(
+            **{"units.vsc.ctrl.loops": loops})).unit().ctrl
+        assert ctrl.graph.connections["CurrentLoop.id_ref"] == "_UnobservedDCVoltage.current_reference"
+        assert ctrl._flow_limits == {}
+        assert "id_ref_limit_fraction" not in ctrl.summary()
+    # Its period, annotated ``float | None``, accepts null (the controller period) like
+    # ``Optional[float]``.
+    every_interrupt = gfl().replace(**{"units.vsc.ctrl.loops": loops}).replace(
+        **{"units.vsc.ctrl.loops._UnobservedDCVoltage.period": None}).unit("vsc").ctrl
+    assert every_interrupt.loops["_UnobservedDCVoltage"].period == every_interrupt.period
+
 
 def test_averaging_clips_dc_current_reference_and_tracks_antiwindup(gfl):
     ctrl = peslite.Simulation(gfl(**{"units.vsc.bridge.model": "averaging"})).unit().ctrl
     dvc = ctrl.graph.nodes["DCVoltageControl"]
-    ctrl.command_at(True, 0.0, 0.0)
+    ctrl.command(True, 0.0, 0.0)
     intended = 2.0 * dvc.maximum
     integral = (intended - dvc.cfg.feedforward) / dvc.ki
     setattr(ctrl.state, "DCVoltageControl.integral", integral)
@@ -329,9 +467,9 @@ def test_averaging_clips_dc_current_reference_and_tracks_antiwindup(gfl):
     assert ctrl.alarms == ["ID_REF_LIMIT"]
 
 
-def test_unknown_controller_output_boundary_port_is_rejected(gfl):
+def test_unknown_auxiliary_output_source_is_rejected(gfl):
     params = gfl().replace(**{"units.vsc.ctrl.outputs": {"status": "cc.u_dq"}})
-    with pytest.raises(ConfigError, match="unknown output ports.*status"):
+    with pytest.raises(ConfigError, match="ctrl.outputs.status: missing or unknown source"):
         peslite.Simulation(params)
 
 

@@ -6,8 +6,8 @@
 one model.
 """
 
-from .params import (BaseValues, ConfigError, ControlParams, LCCLinkParams, Params,
-                     SSLinkParams, UnitParams,
+from .params import (BaseValues, ConfigError, ControlParams, LCCLinkParams, LCCSLinkParams,
+                     MultiSSLinkParams, Params, SCCParams, SSLinkParams, UnitParams,
                      dump, dumps, from_dict, load,
                      read_initial, to_dict)
 from .events import (EVENT_TYPES, Event, Scenario, SourceScenario,
@@ -68,4 +68,5 @@ __all__ = ["Params", "BaseValues", "ConfigError", "load", "dump", "dumps", "from
            "Event", "EVENT_TYPES", "register_event_type", "Scenario",
            "SourceScenario", "Protection", "ProtectionSample", "Unit", "VSC", "DCConverter",
            "UnitParams", "ControlParams",
-           "SSLinkParams", "LCCLinkParams", "System"]
+           "SSLinkParams", "LCCLinkParams", "LCCSLinkParams", "MultiSSLinkParams", "SCCParams",
+           "System"]

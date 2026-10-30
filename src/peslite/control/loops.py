@@ -7,18 +7,18 @@ How loops are connected is not theirs to know (:mod:`.controller`). Built-in loo
 their continuous-time outputs and state derivatives for the ideal averaged converter model.
 Grid-control signals use pu and scalar converter signals use SI. Unit-system-independent loops
 declare generic scalar voltage/current ports that bind to either control-graph boundary.
-Time is in s, angles in rad and frequencies in rad/s.
+Time is in s, angles in rad, grid angular frequencies in rad/s and modulation frequencies in Hz.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, field, is_dataclass, make_dataclass
 from typing import Any, ClassVar, Mapping, Optional
 
 import numpy as np
 
-from ..solver.model import ConfigError, _complex, assign, gather, join, scatter
+from ..solver.model import ConfigError, _complex, _real, assign, gather, join, scatter
 from .blocks import Filter, OutputLimit, PI, complex_power
 
 __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
@@ -29,7 +29,10 @@ __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "PSC", "Droop", "VSG", "DVOC",
            "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping",
            "SI_CURRENT", "SI_VOLTAGE", "SI_POWER", "DUTY_RATIO", "MODULATION", "HERTZ",
-           "InductorCurrentControl", "PowerControl", "PhasePowerControl", "ResonantModulation"]
+           "InductorCurrentControl", "PowerControl", "PhasePowerControl", "FrequencyPowerControl",
+           "VoltageControl", "PhaseVoltageControl", "FrequencyVoltageControl", "CurrentControl",
+           "PhaseCurrentControl", "FrequencyCurrentControl", "ResonantModulation",
+           "PhaseShiftModulation", "DutyModulation", "MODE"]
 
 
 # ------------------------------------------------------------------ signals
@@ -318,7 +321,7 @@ def _into(frame: float):
 class PowerFilterParams:
     """Optional first-order low-pass filter on measured active and reactive power."""
 
-    enable: bool = False
+    enable: bool = field(default=False, metadata={"runtime": False})  # switches filter states
     bandwidth: Optional[float] = None  # Hz
 
     def __post_init__(self) -> None:
@@ -354,7 +357,7 @@ class SRFPLL(Loop):
     class Params:
         kp_pu: float
         ki_pu: float
-        normalisation: str = "rated"
+        normalisation: str = field(default="rated", metadata={"runtime": False})
         period: Optional[float] = None
         type: str = "srf_pll"
 
@@ -388,15 +391,17 @@ class SRFPLL(Loop):
     def initial_outputs(self):
         return {"theta": self.theta, "frame": self.theta, "omega": self.omega}
 
-    def sample(self, t, inputs):
-        frame = self.theta
-        v = inputs["v"] * _into(frame)
-        u_g = self.u_g
-        if u_g is None:                                    # rated
-            eps = v.imag
-        else:                                              # amplitude
-            eps = v.imag / u_g if u_g > 0.0 else 0.0
+    def _frequency(self, voltage):
+        """Set ``omega`` from the error in the present frame; return the rotated voltage."""
+        v = voltage * _into(self.theta)
+        u_g = self.u_g                                     # None: rated normalisation
+        eps = v.imag if u_g is None else v.imag / u_g if u_g > 0.0 else 0.0
         self.omega = self.pi(eps, 0.0, self.w0)
+        return v
+
+    def sample(self, t, inputs):
+        frame, u_g = self.theta, self.u_g
+        v = self._frequency(inputs["v"])
         self.theta += self.T * self.omega
         if u_g is not None:
             self.u_g = u_g + self.T * self.kp * (v.real - u_g)
@@ -404,12 +409,7 @@ class SRFPLL(Loop):
 
     def flow_path(self, voltage):
         """Positional form used by the construction-time compiled continuous graph."""
-        v = voltage * _into(self.theta)
-        if self.u_g is None:
-            eps = v.imag
-        else:
-            eps = v.imag / self.u_g if self.u_g > 0.0 else 0.0
-        self.omega = self.pi(eps, 0.0, self.w0)
+        v = self._frequency(voltage)
         d_integral = self.pi.derivative
         if self.u_g is not None:
             return (self.theta, self.theta, self.omega, self.omega, d_integral,
@@ -598,9 +598,7 @@ class DCVoltageControl(Loop):
 
     def equation(self, reference, voltage):
         self.raw = self._requested(reference, voltage)
-        current = (self.limit.flow(self.raw) if self.block_period is None
-                   else self.limit.sample(0.0, self.raw))
-        return (current,)
+        return (self.limit.sample(0.0, self.raw),)
 
     def sample(self, t, inputs):
         current, = self.equation(inputs["reference"], inputs["voltage"])
@@ -637,9 +635,11 @@ class SyncLaw(Loop):
     """Base of the grid-forming synchronization laws: angle (rad), frequency (rad/s) and voltage
     magnitude reference (pu) from the power feedback, the setpoints and the measured voltage.
 
-    A law implements ``step(T, p, q, v_mag, v_dc, p_ref, q_ref, v_ref, i_dq)``, which advances
-    ``theta``, ``omega`` and ``v_mag`` by one period ``T``; its inputs are in pu (the voltage
-    magnitude on the ac base, ``v_dc`` on the dc base) and ``i_dq`` is the current in the law's frame.
+    A law implements ``_flow(p, q, v_mag, v_dc, p_ref, q_ref, v_ref, i_dq)``, which sets ``omega``
+    and ``v_mag`` and returns the derivatives of its named states (``theta`` first); its sampled
+    form is one forward-Euler step of that law unless it overrides ``_sample(T, ...)``. The inputs
+    are in pu (the voltage magnitude on the ac base, ``v_dc`` on the dc base) and ``i_dq`` is the
+    current in the law's frame.
     The active-power setpoint follows the controller's start-up ramp. Before it runs, a grid-forming
     law follows the measured terminal voltage so that it starts in phase with the grid.
     """
@@ -706,9 +706,13 @@ class SyncLaw(Loop):
         return {"theta": self.theta, "frame": frame, "omega": self.omega,
                 "v_ref": self.v_mag, "p": p, "q": q}
 
-    def _sample(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
-                p_ref_pu, q_ref_pu, v_ref_pu, i_dq) -> None:
-        raise NotImplementedError
+    def _sample(self, T, *inputs) -> None:
+        """Advance the named states by one forward-Euler step of :meth:`_flow`."""
+        names = self.state_names
+        attributes = names if isinstance(names, tuple) else names.values()
+        values = [getattr(self, name) for name in attributes]  # before _flow sets omega, v_mag
+        for name, value, derivative in zip(attributes, values, self._flow(*inputs)):
+            setattr(self, name, value + T * derivative)
 
     def flow_path(self, voltage, current, u_dc, p_ref, q_ref, v_ref):
         """Shared continuous evaluation for all synchronization laws."""
@@ -834,12 +838,6 @@ class Droop(SyncLaw):
         super().__init__(cfg, unit, startup)
         self.m_p, self.n_q = cfg.m_p_pu, cfg.n_q_pu
 
-    def _sample(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
-                p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
-        self.omega = self.w0 + self.m_p * (p_ref_pu - p_pu)
-        self.theta += T * self.omega
-        self.v_mag = v_ref_pu + self.n_q * (q_ref_pu - q_pu)
-
     def _flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
               q_ref_pu, v_ref_pu, i_dq):
         self.omega = self.w0 + self.m_p * (p_ref_pu - p_pu)
@@ -924,15 +922,6 @@ class DVOC(SyncLaw):
         self.eta, self.alpha = cfg.eta_pu, cfg.alpha_pu
         self.rot = _complex(np.exp(1j * cfg.kappa))
 
-    def _sample(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
-                p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
-        V = self.v_mag
-        i_star = (p_ref_pu - 1j * q_ref_pu) * V / (v_ref_pu * v_ref_pu)
-        w = self.eta * self.rot * (i_star - i_dq) + self.eta * self.alpha * (1.0 - V * V / (v_ref_pu * v_ref_pu)) * V
-        self.omega = self.w0 + w.imag / V
-        self.v_mag = V + T * w.real
-        self.theta += T * self.omega
-
     def _flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
               q_ref_pu, v_ref_pu, i_dq):
         V = max(self.v_mag, 1e-12)
@@ -966,12 +955,6 @@ class Matching(SyncLaw):
         self.k_theta = cfg.k_theta_pu if cfg.k_theta_pu is not None else self.w0 / vdc_ref_pu
         self.k_q = cfg.k_q_pu
 
-    def _sample(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
-                p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
-        self.omega = self.k_theta * v_dc_pu
-        self.theta += T * self.omega
-        self.v_mag = v_ref_pu + self.k_q * (q_ref_pu - q_pu)
-
     def _flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
               q_ref_pu, v_ref_pu, i_dq):
         self.omega = self.k_theta * v_dc_pu
@@ -992,7 +975,8 @@ class VirtualImpedance(Loop):
     class Params:
         r_v_pu: float = 0.0
         x_v_pu: float = 0.0
-        period: Optional[float] = None  # None: runs on upstream updates
+        # period None: runs on upstream updates
+        period: Optional[float] = None
         type: str = "virtual_impedance"
 
         _quantities = {"r_v_pu": "resistance", "x_v_pu": "resistance"}
@@ -1010,11 +994,6 @@ class VirtualImpedance(Loop):
 
     def initial_outputs(self):
         return {"u_dq": 0j}
-
-    def sample(self, t, inputs):
-        output, = self.equation(inputs["v_ref"], inputs["i"], inputs["frame"],
-                                inputs["omega"], inputs["extra"])
-        return {"u_dq": output}
 
     def equation(self, v_ref, current, frame, omega, extra):
         i = current * _into(frame)
@@ -1124,29 +1103,15 @@ class ActiveDamping(Loop):
         super().__init__(cfg, unit, startup)
         self.r_a = cfg.r_a_pu
         self.alpha_d = cfg.alpha_d
-        self.lpf = Filter((cfg.alpha_d,), (1.0, cfg.alpha_d),
-                          self.block_period, initial=0j)
+        self.lpf = self.state_block("hpf_pu", Filter((cfg.alpha_d,), (1.0, cfg.alpha_d),
+                                                     self.block_period, initial=0j))
 
     def initial_outputs(self):
         return {"extra": 0j}
 
-    def sample(self, t, inputs):
-        current = inputs["i"] * _into(inputs["frame"])
-        return {"extra": -self.r_a * (current - self.lpf(current))}
-
-    def flow_path(self, current, frame):
-        current_dq = current * _into(frame)
-        delta = current_dq - self.lpf(current_dq)
-        return -self.r_a * delta, self.lpf.derivative[0]
-
-    def get_state(self):
-        return gather({"hpf_pu": self.lpf})
-
-    def flow_state_bindings(self):
-        return {"hpf_pu": (self.lpf, "x0")}
-
-    def set_state(self, values):
-        scatter({"hpf_pu": self.lpf}, values)
+    def equation(self, current, frame):
+        current = current * _into(frame)
+        return (-self.r_a * (current - self.lpf(current)),)
 
 
 # ------------------------------------------------------------------ scalar SI converter loops
@@ -1182,8 +1147,6 @@ class _LimitedScalarPI(Loop):
         return cfg.minimum, cfg.maximum
 
     def constrain(self, requested):
-        if self.block_period is None:
-            return self.limit.flow(requested)
         return self.limit.sample(0.0, requested)
 
     def initial_outputs(self):
@@ -1213,80 +1176,122 @@ class InductorCurrentControl(_LimitedScalarPI):
         return self.constrain(requested), requested
 
 
-@dataclass(frozen=True, kw_only=True)
-class _PowerControlParams(_ScalarPIParams):
-    power_filter: PowerFilterParams = field(default_factory=PowerFilterParams)
+class _FeedbackControl(_LimitedScalarPI):
+    """PI feedback of one measured scalar onto one converter command.
 
+    ``command = feedforward + PI(startup * reference - measured)``, limited to
+    ``[minimum, maximum]`` with the shared anti-windup tracking. The measured input and its
+    optional first-order filter (``<measured>_filter``) are named after the measured quantity;
+    the filtered value is echoed as an output for observation. A phase command limits a
+    translated coordinate (``phase - minimum`` in ``[0, maximum - minimum]``), so an
+    all-negative phase range is valid; a crossing of a whole turn remains a saturation.
+    """
 
-class _PowerFeedbackControl(_LimitedScalarPI):
-    """Local signed port power with the existing filter, PI and output constraint."""
-
-    flow_inputs = ("reference", "power", "feedforward")
-    log_outputs = ("power",)
+    measured: ClassVar[str]
+    command: ClassVar[str]
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
-        self.power_filter = None
-        if cfg.power_filter.enable:
-            pole = 2.0 * math.pi * cfg.power_filter.bandwidth
-            self.power_filter = self.state_block(
-                "power", Filter((pole,), (1.0, pole), self.block_period)
+        name = f"{self.measured}_filter"
+        settings = getattr(cfg, name)
+        filtered = None
+        if settings.enable:
+            pole = 2.0 * math.pi * settings.bandwidth
+            filtered = self.state_block(
+                self.measured, Filter((pole,), (1.0, pole), self.block_period)
             )
+        setattr(self, name, filtered)
+        self._filter = filtered
 
-    def initial_outputs(self):
-        command, power = self.outputs
-        return {command: self.cfg.minimum, power: 0.0}
-
-    def equation(self, reference, power, feedforward):
-        if self.power_filter is not None:
-            power = self.power_filter(power)
-        requested = self.pi(self.startup.value * reference, power, feedforward)
-        return self.constrain(requested), power
-
-
-@register_loop_type
-class PowerControl(_PowerFeedbackControl):
-    """Signed power feedback in watts; output is modulation amplitude.
-
-    Positive power leaves the measured port. Under PWM, use the ADC's mean of instantaneous
-    voltage times current, not their separately averaged waveforms or a carrier-boundary product.
-    Gains are modulation/W and modulation/(W*s); feedforward is a modulation amplitude.
-    """
-
-    @dataclass(frozen=True, kw_only=True)
-    class Params(_PowerControlParams):
-        type: str = "power_control"
-
-    type = "power_control"
-    inputs = {"reference": SI_POWER, "power": SI_POWER, "feedforward": MODULATION}
-    outputs = {"modulation": MODULATION, "power": SI_POWER}
-
-
-@register_loop_type
-class PhasePowerControl(_PowerFeedbackControl):
-    """The same local power-feedback law with a phase command in radians.
-
-    Gains are rad/W and rad/(W*s). Choose their sign and phase limits for a monotonic operating
-    branch of the connected circuit; phase-to-power polarity is not a converter-type property.
-    Only the constraint uses a translated coordinate: phase - minimum is bounded in
-    [0, maximum - minimum], then translated back. The shared limiter and PI tracking are unchanged.
-    """
-
-    @dataclass(frozen=True, kw_only=True)
-    class Params(_PowerControlParams):
-        type: str = "phase_power_control"
-
-    type = "phase_power_control"
-    inputs = {"reference": SI_POWER, "power": SI_POWER, "feedforward": ANGLE}
-    outputs = {"phase": ANGLE, "power": SI_POWER}
-
-    @staticmethod
-    def _limit_bounds(cfg):
-        return 0.0, cfg.maximum - cfg.minimum
+    def _limit_bounds(self, cfg):
+        if self.command == "phase":
+            return 0.0, cfg.maximum - cfg.minimum
+        if self.command == "frequency" and not cfg.minimum > 0.0:
+            raise ConfigError(f"{type(self).__name__}.minimum must be > 0: it is the lowest "
+                              "frequency command and the initial output")
+        return cfg.minimum, cfg.maximum
 
     def constrain(self, requested):
+        if self.command != "phase":
+            return _LimitedScalarPI.constrain(self, requested)
         minimum = self.cfg.minimum
         return minimum + _LimitedScalarPI.constrain(self, requested - minimum)
+
+    def initial_outputs(self):
+        return {self.command: self.cfg.minimum, self.measured: 0.0}
+
+    def equation(self, reference, measured, feedforward):
+        if self._filter is not None:
+            measured = self._filter(measured)
+        requested = self.pi(self.startup.value * reference, measured, feedforward)
+        return self.constrain(requested), measured
+
+
+_MEASURED = {"power": ("W", SI_POWER), "voltage": ("V", SI_VOLTAGE),
+             "current": ("A", SI_CURRENT)}
+_COMMANDS = {"modulation": ("1", MODULATION), "phase": ("rad", ANGLE),
+             "frequency": ("Hz", HERTZ)}
+
+
+def _feedback_loop(name: str, measured: str, command: str, summary: str) -> type:
+    """Register one member of the scalar feedback family (one class per measured/command pair,
+    all sharing :class:`_FeedbackControl`)."""
+    type_name = "".join(f"_{c.lower()}" if c.isupper() else c for c in name).lstrip("_")
+    unit, measured_type = _MEASURED[measured]
+    command_unit, command_type = _COMMANDS[command]
+    params = make_dataclass(
+        "Params",
+        [("type", str, field(default=type_name)),
+         (f"{measured}_filter", PowerFilterParams, field(default_factory=PowerFilterParams))],
+        bases=(_ScalarPIParams,), frozen=True, kw_only=True,
+    )
+    params.__qualname__ = f"{name}.Params"
+    params.__module__ = __name__
+    doc = (f"{summary}\n\n    Measured {measured} ({unit}); command and feedforward: {command} "
+           f"({command_unit}). Gains are {command_unit}/{unit} and {command_unit}/({unit}*s).\n"
+           f"    The law is :class:`_FeedbackControl`'s.\n    ")
+    cls = type(name, (_FeedbackControl,), {
+        "__doc__": doc, "__module__": __name__, "__qualname__": name,
+        "Params": params, "type": type_name, "measured": measured, "command": command,
+        "inputs": {"reference": measured_type, measured: measured_type,
+                   "feedforward": command_type},
+        "outputs": {command: command_type, measured: measured_type},
+        "flow_inputs": ("reference", measured, "feedforward"),
+        "log_outputs": (measured,),
+    })
+    return register_loop_type(cls)
+
+
+PowerControl = _feedback_loop(
+    "PowerControl", "power", "modulation",
+    "Signed power feedback; output is modulation amplitude (or a phase-shift width).\n\n"
+    "    Positive power leaves the measured port. Under PWM, use the ADC's mean of instantaneous\n"
+    "    voltage times current, not their separately averaged waveforms or a carrier-boundary\n"
+    "    product.")
+PhasePowerControl = _feedback_loop(
+    "PhasePowerControl", "power", "phase",
+    "The same local power-feedback law with a phase command in radians.\n\n"
+    "    Choose the gain sign and phase limits for a monotonic operating branch of the connected\n"
+    "    circuit; phase-to-power polarity is not a converter-type property.")
+FrequencyPowerControl = _feedback_loop(
+    "FrequencyPowerControl", "power", "frequency",
+    "Power feedback onto a frequency command in Hz.")
+VoltageControl = _feedback_loop(
+    "VoltageControl", "voltage", "modulation",
+    "Output-voltage feedback onto modulation amplitude or phase-shift width.")
+PhaseVoltageControl = _feedback_loop(
+    "PhaseVoltageControl", "voltage", "phase", "Output-voltage feedback onto a phase command.")
+FrequencyVoltageControl = _feedback_loop(
+    "FrequencyVoltageControl", "voltage", "frequency",
+    "Output-voltage feedback onto the switching frequency.")
+CurrentControl = _feedback_loop(
+    "CurrentControl", "current", "modulation",
+    "Port-current feedback onto modulation amplitude or phase-shift width.")
+PhaseCurrentControl = _feedback_loop(
+    "PhaseCurrentControl", "current", "phase", "Port-current feedback onto a phase command.")
+FrequencyCurrentControl = _feedback_loop(
+    "FrequencyCurrentControl", "current", "frequency",
+    "Port-current feedback onto the switching frequency.")
 
 
 @register_loop_type
@@ -1326,3 +1331,70 @@ class ResonantModulation(Loop):
 
     def flow(self, t, inputs):
         return {"duty": self._duty(t, inputs)}, {}
+
+
+MODE = SignalType("1", "mode")
+
+
+@register_loop_type
+class PhaseShiftModulation(Loop):
+    """Square-wave phase-shift commands from width, phase, frequency and mode graph inputs.
+
+    The outputs are the compare registers of the phase-shift modulator
+    (:class:`~peslite.components.pwm.PhaseShiftModulator`): ``width`` (pulse width in half
+    periods, scaled by the start-up ramp and clipped to [0, 1]), ``phase`` (rad, centre of the
+    positive pulse), ``frequency`` (Hz) and ``mode`` (0 full bridge, 1 half bridge, 3 short,
+    4 reverse half bridge). References give open-loop operation; feedback loops (for example
+    :class:`PowerControl` onto ``width`` or :class:`PhasePowerControl` onto ``phase``) drive
+    the same typed inputs.
+    """
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: Optional[float] = None
+        type: str = "phase_shift_modulation"
+
+    type = "phase_shift_modulation"
+    role = "modulation"
+    inputs = {"width": MODULATION, "phase": ANGLE, "frequency": HERTZ, "mode": MODE}
+    outputs = {"width": MODULATION, "phase": ANGLE, "frequency": HERTZ, "mode": MODE}
+    flow_inputs = ("width", "phase", "frequency", "mode")
+
+    def initial_outputs(self):
+        references = self.unit.ctrl.references
+        return {"width": 0.0, "phase": references.phase, "frequency": references.frequency,
+                "mode": _real(references.mode)}
+
+    forcing_periods = ResonantModulation.forcing_periods
+
+    def equation(self, width, phase, frequency, mode):
+        width = min(1.0, max(0.0, self.startup.value * width))
+        return width, phase, frequency, mode
+
+
+@register_loop_type
+class DutyModulation(Loop):
+    """Apply the common start-up ramp and [0, 1] limit to an open-loop duty command."""
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: Optional[float] = None
+        type: str = "duty_modulation"
+
+    type = "duty_modulation"
+    role = "modulation"
+    inputs = {"duty": DUTY_RATIO}
+    outputs = {"duty": DUTY_RATIO}
+    flow_inputs = ("duty",)
+
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
+        # Duty is a topology coordinate: zero bridge voltage is not necessarily duty zero.
+        self.neutral_duty = unit.bridge.neutral_duty
+
+    def initial_outputs(self):
+        return {"duty": self.unit.ctrl.references.duty}
+
+    def equation(self, duty):
+        duty = self.neutral_duty + self.startup.value * (duty - self.neutral_duty)
+        return (min(1.0, max(0.0, duty)),)

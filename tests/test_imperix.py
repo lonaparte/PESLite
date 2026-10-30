@@ -822,6 +822,9 @@ def test_sdk_boundary_compiles_for_complex_and_nested_units(name, tmp_path):
 
 @pytest.mark.parametrize("settings, message", [
     ({"units.converter.bridge.model": "averaging"}, "sampled"),
+    ({"units.converter.pwm.pattern_sync": "pulse"}, "complete-pulse"),
+    ({"units.converter.ctrl.offset": 0.0}, "CLK0 grid"),
+    ({"units.converter.meas.offset": 5e-6}, "CLK0 grid"),
     ({"units.converter.meas.rms": {"current": 200e-6}}, "ADC-history"),
     ({"simulation.initial.states": {"output.u_C": 24.0}}, "starts cold"),
 ])

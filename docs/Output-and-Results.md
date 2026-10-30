@@ -44,7 +44,9 @@ simulation:
     write_length: 1000
 ```
 
-- `period` is the plant/state snapshot interval. It does not set the integration step.
+- `period` is the plant/state snapshot interval. It does not set the integration step, but it is
+  the default measurement and protection clock of a continuous unit
+  ([ADC sampling](Control-and-PWM-Timing.md#adc-sampling)).
 - `record_every` keeps every N-th controller log sample.
 - `states`, `signals` and `energy` enable their corresponding histories.
 - `write_length` is the number of rows buffered per streamed CSV write batch.
@@ -55,6 +57,10 @@ Numerical failures in optional observations are reported independently: a failed
 does not discard valid plant, state or energy output. Declared log columns use NaN for an
 unavailable sample. Each CSV retains its own sampling timestamps; different tables are not
 required to have equal row counts.
+
+After a run with `energy: 1`, `peslite.addons.energy_closure(result)` integrates supplied and
+dissipated power from `energy.csv` and compares them with stored-energy change and impulsive loss.
+It returns the component energies, the closure residual and a relative residual.
 
 ## State and signal names
 
@@ -94,7 +100,7 @@ Aliases such as `<unit>.i_c` and `<unit>.u_dc` may resolve to the underlying phy
 - per-unit quantities retain `_pu` in their names.
 
 Protection entries are prefixed by unit name in a multi-converter system. Multirate runs add
-interface/window diagnostics; adaptive runs include rejected-step counts.
+interface/window diagnostics; `n_rhs` is the common solver-count entry.
 
 ## Python result API
 
@@ -111,13 +117,14 @@ last = result.final_states()
 files = result.files
 ```
 
-CSV-backed properties are loaded lazily from their final files when first requested. They are not
-part of the write hot path.
+`Simulation.run()` writes to `output/run` unless `out_dir` is given; `run(t_end=...)` overrides the
+end time recorded in `simulation.pes`. CSV-backed properties load lazily and are not on the write
+hot path.
 
 The optional plotting add-on operates only after the CSV streams have closed:
 
 ```python
-figure = result.plot(
+pdf = result.plot(
     ["vsc.dclink.u_C", "vsc.ctrl.SRFPLL.theta"],
     labels=[r"$u_{dc}$", r"$\theta$"],
     ylabel=r"$x$ (pu)",
@@ -126,17 +133,18 @@ figure = result.plot(
 # The same function can process Python or standalone C++ output directly.
 from peslite.addons import plot_csv
 
-figure = plot_csv(
+pdf = plot_csv(
     "output/run/states.csv",
     "vsc.dclink.u_C",
 )
 ```
 
-It is implemented under `peslite.addons`, imports Matplotlib only when called and is not included in
-the generated C++ simulator. Install it with `pip install "peslite[plot]"`.
+Both calls return the written PDF path. Plotting lives under `peslite.addons`, imports Matplotlib
+only when called and is not included in the generated C++ simulator. Install it with
+`pip install "peslite[plot]"`.
 
-Controller logs are grouped by unit under `result.ctrl`. The final-state mapping can be passed back
-as initial state through a saved CSV or used programmatically.
+`result.ctrl` uses `<unit>.<column>` keys. The final-state mapping can be reused through a saved CSV
+or programmatically.
 
 ## Progress and watch
 
@@ -148,14 +156,17 @@ peslite case.pes --progress 0.1 \
   --watch vsc.i_c,vsc.u_dc
 ```
 
-`--progress` is measured in simulated seconds. `--watch` accepts state columns, public
+`--progress` is measured in simulated seconds. The options set the file section
+`simulation.progress: {enable, period, watch}`, which a simulation file may also contain; `--watch`
+replaces its watch list. `--watch` accepts state columns, public
 plant/controller columns and aliases. Naming a complex state without `.re` or `.im` displays its
 magnitude. Unknown names are reported with the available names when progress first prints.
 
-Watching a value does not alter solver state or simulation results.
+Watching does not enable CSV histories or alter solver state or results.
 
 ## Restart from output
 
-Any `states.csv` row can initialize another run. Use the matching resolved `simulation.pes` to
-preserve every parameter and derived default. See [Events and Restart](Events-and-Restart.md) for the
-continuation commands and discrete-state limitations.
+A `states.csv` row can initialize another run. Use the matching resolved `simulation.pes` to
+preserve every parameter and derived default. See
+[Events and Restart](Events-and-Restart.md#continue-from-a-saved-csv) for the continuation commands
+and the rows that cannot be used.

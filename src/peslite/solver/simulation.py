@@ -39,19 +39,17 @@ from ..assembly.params import (Params, _connection_variable, _parameterized, _un
 from ..assembly.system import System, _start_connections
 from ..assembly.types import unit_type
 from ..assembly.unit import Plant, Unit
-from ..components.pwm import Modulator
+from .timing import TIME_EPS
 from ..control.blocks import abc2complex, complex2abc
-from ..control.controller import Controller
 from .integrators import Solver
+from .linearization import coordinate_width
 from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
-from .multirate import make_solver
+from .multirate import make_solver, rated_effort
 from .splitbound import split_error_bound
 
-__all__ = ["Simulation", "SimulationResult", "Recorder", "main", "convert_main", "read_csv", "align", "window_ptp",
-           "pointwise_errors"]
+__all__ = ["Simulation", "SimulationResult", "Recorder", "main", "convert_main", "read_csv"]
 
 
-_EPS = 1e-10  # seconds; intervals shorter than this are not integrated separately
 _UNAVAILABLE = object()
 
 
@@ -91,29 +89,54 @@ def _finite(y: np.ndarray) -> bool:
     return all(map(math.isfinite, y.tolist()))
 
 
+def _compile_interval_integrator(solver, rhs, conduction, settle, project):
+    """Compile the assembled interval stages so structural choices leave the run loop.
+
+    Conduction participation, solver settlement and state bounds cannot change during a run.
+    Only whether the current boundary is an event remains dynamic.
+    """
+    env = {"solver": solver, "rhs": rhs}
+    if conduction:
+        env["conduction"] = conduction
+        advance = "conduction.advance(t_a, t_b, y)"
+    else:
+        advance = "solver(rhs, t_a, t_b, y).y"
+    body = [f"y = {advance}"]
+    if settle is not None:
+        env["settle"] = settle
+        body += ["if event:", "    y = settle(t_b, y)"]
+    if project is not None:
+        env["project"] = project
+        body.append("y = project(y)")
+    body.append("return y")
+    source = "def integrate(t_a, t_b, y, event):\n" + "\n".join(
+        "    " + line for line in body
+    )
+    exec(compile(source, "<peslite interval integrator>", "exec"), env)
+    return np.errstate(over="raise")(env["integrate"])
+
+
 def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
                       ctrl_logs: Mapping[str, Mapping[str, float]],
                       ctrl_names: Mapping[str, Iterable[str]] | None = None) -> dict[str, float]:
     """Convert one raw plant snapshot into one public, real-valued output row."""
     row: dict[str, float] = {"t": t}
-    unit_names = {name for name, _unit in _unit_items(params.units)}
     for key, value in plant.items():
-        head, _, what = key.rpartition(".")
-        if np.iscomplexobj(value):
+        if isinstance(value, complex):  # signals are scalars; np.complex128 is a complex
             for name, phase_value in zip(_signal_names(key, 3), complex2abc(complex(value))):
                 row[name] = float(phase_value)
-        elif not ((head in unit_names and what in ("u_dc", "i_dc"))
-                  or (head in params.sources and what == "angle")):
+        else:
             row[key] = float(value)
-    for name in unit_names:
+    # the units' DC quantities, then the source angles, follow in configuration order
+    for name, _unit in _unit_items(params.units):
         for what in ("u_dc", "i_dc"):
             key = f"{name}.{what}"
             if key in plant:
-                row[key] = float(plant[key])
+                row[key] = row.pop(key)
     for name in params.sources:
         key = f"{name}.angle"
         if key in plant:
-            row[key] = float(plant[key])
+            row[key] = row.pop(key)
     names_by_unit = ctrl_names or {unit: log for unit, log in ctrl_logs.items()}
     for unit, names in names_by_unit.items():
         log = ctrl_logs.get(unit, {})
@@ -349,7 +372,10 @@ class Recorder:
                     log: Mapping[str, float] | Callable[[], Mapping[str, float] | None], *,
                     record: bool = True) -> None:
         """Read and publish one controller log independently of every other output."""
-        names = self.ctrl_names.get(unit)
+        # Names a controller does not declare are discovered for ctrl.<unit>.csv only, whose first
+        # row fixes them; plant.csv, whose columns are fixed at its own first row, keeps the declared.
+        table = self._ctrl.get(unit)
+        names = self.ctrl_names.get(unit) or (tuple(table.keys[1:]) if table is not None else ())
 
         def read():
             nonlocal names
@@ -357,7 +383,7 @@ class Recorder:
             if values is None:
                 return None
             if not names:
-                names = self.ctrl_names[unit] = tuple(values)
+                names = tuple(values)
             return {name: float(values.get(name, math.nan)) for name in names}
 
         values = _optional_output(t, f"controller log {unit!r}", read)
@@ -392,36 +418,6 @@ class Recorder:
 def read_csv(path: str | Path, skip_header: int = 0) -> np.ndarray:
     """Read a CSV file with a header row into a structured array, keeping column names verbatim (dots included)."""
     return np.genfromtxt(path, delimiter=",", names=True, skip_header=skip_header, deletechars="")
-
-
-def align(a: np.ndarray, b: np.ndarray, period: float) -> tuple[np.ndarray, np.ndarray]:
-    """Rows of ``a`` and ``b`` whose times fall on the same multiple of ``period``."""
-    ia = np.round(a["t"] / period).astype(int)
-    ib = np.round(b["t"] / period).astype(int)
-    _common, ka, kb = np.intersect1d(ia, ib, return_indices=True)
-    return a[ka], b[kb]
-
-
-def window_ptp(d: np.ndarray, t0: float, t1: float, key: str) -> float:
-    """Peak-to-peak of ``d[key]`` on ``[t0, t1)`` (NaN with fewer than 11 samples)."""
-    m = (d["t"] >= t0) & (d["t"] < t1)
-    return float(np.ptp(d[key][m])) if m.sum() > 10 else float("nan")
-
-
-def pointwise_errors(a: np.ndarray, b: np.ndarray, keys: Iterable[str],
-                     scale: Optional[Mapping[str, float]] = None) -> dict[str, dict[str, float]]:
-    """Max and RMS of ``|a[k] - b[k]| / scale[k]`` for aligned arrays, per key present in both."""
-    scale = scale or {}
-    out = {}
-    for key in keys:
-        if key not in a.dtype.names or key not in b.dtype.names:
-            continue
-        s = scale.get(key, 1.0)
-        x, y = a[key] / s, b[key] / s
-        e = np.abs(x - y)
-        out[key] = {"max": float(e.max()), "rms": float(np.sqrt(np.mean(e * e))),
-                    "t_max": float(a["t"][int(e.argmax())]), "rms_ref": float(np.sqrt(np.mean(y * y)))}
-    return out
 
 
 # ------------------------------------------------------------------ the run
@@ -479,15 +475,6 @@ class Simulation:
         else:
             self.solver = make_solver(p.simulation.solver, model=self.system.model,
                                       ratings=self._ratings())
-        for unit in self.system.units.values():
-            parts = [(unit.ctrl, Controller)]
-            modulator = getattr(unit.bridge, "modulator", None)
-            if modulator is not None:
-                parts.append((modulator, Modulator))
-            for obj, proto in parts:
-                if not isinstance(obj, proto):
-                    raise TypeError(f"{unit.name}: {type(obj).__name__} does not satisfy the "
-                                    f"{proto.__name__} protocol")
         check_events = getattr(self.system, "check_events", None)
         if check_events is not None:
             check_events(p)
@@ -543,10 +530,12 @@ class Simulation:
 
         def port_rating(port: Any) -> tuple[float, float]:
             cfg = self.p.unit(port.owner)
-            if port.domain == "dc":
+            if port.phases == 1:
                 dc = cfg.dc_base
                 return dc.v, dc.i
-            return cfg.base.v_phase_peak, cfg.base.i_phase_peak
+            if port.phases == 3:
+                return cfg.base.v_phase_peak, cfg.base.i_phase_peak
+            raise ConfigError(f"unit port has unsupported phase count {port.phases!r}")
 
         port_bindings = self.system._port_bindings
         subsystems = dict(zip(self.system.model.names, self.system.model.subsystems))
@@ -571,18 +560,16 @@ class Simulation:
         return rating
 
     def _check_energy(self) -> None:
-        """Build the structure report and apply ``simulation.energy_check`` (warn, strict or off)."""
+        """Build the structure report and apply ``simulation.energy_check`` (warn or strict; off: neither)."""
         mode = self.p.simulation.energy_check
         model = getattr(self.system, "model", None)
-        if model is None or not hasattr(model, "ph_report"):
+        if mode == "off" or model is None or not hasattr(model, "ph_report"):
             return
         solver = self.solver
         groups = getattr(solver, "groups", None)
         if groups is not None and len(groups) < 2:  # not split
             groups = None
-        hold = None
-        if hasattr(solver, "window") and hasattr(solver, "dt"):
-            hold = {"step": solver.dt, "window": solver.window}
+        hold = {"step": solver.dt, "window": solver.window} if groups else None  # the split's hold times
         zoh = {
             unit.zoh: (0.7 + 0.2j if isinstance(unit.bridge.topology.zero, complex) else 0.7)
             for unit in self.system.units.values()
@@ -604,8 +591,6 @@ class Simulation:
                             + "; ".join(f"{c.group} {c.members} holds {c.unaccounted}" for c in bad_cuts))
         problems += report.warnings
         self.energy_problems = problems
-        if mode == "off":
-            return
         if problems and mode == "strict":
             raise ConfigError("energy check: " + "; ".join(problems))
         for msg in problems:
@@ -614,17 +599,7 @@ class Simulation:
     # ------------------------------------------------------------ states
     def _state_parts(self) -> list[tuple[str, Any]]:
         """State owners by fixed state-table prefix, in state-table order."""
-        provide = getattr(self.system, "state_parts", None)
-        if provide is not None:
-            parts = list(provide())
-        else:  # custom systems written for the original aggregate Stateful interface
-            parts = [("", self.system)]
-            for name, unit in self.system.units.items():
-                bridge = unit.bridge
-                parts.extend([(f"{name}.ctrl", unit.ctrl),
-                              (f"{name}.{bridge.state_prefix}", bridge.state_owner)])
-                if unit.adc is not None and unit.adc.averaging:
-                    parts.append((f"{name}.meas", unit.adc))
+        parts = list(self.system.state_parts())
         parts.append(("solver", self.solver))
         return parts
 
@@ -747,9 +722,12 @@ class Simulation:
         system = self.system
         values = self._initial_values(t0)
         # 1. power stage (unset states stay zero), events up to t0, then the solver vector
-        self._states.load(values, ["", *system.units])
+        timing = {prefix for name, unit in system.units.items()
+                  for prefix in (f"{name}.ctrl", f"{name}.{unit.bridge.state_prefix}", f"{name}.meas")}
+        self._states.load(values, [prefix for prefix, _part in system.state_parts()
+                                  if prefix not in timing])
         for event_t, _, what in self._actions():
-            if event_t <= t0 + _EPS:
+            if event_t <= t0 + TIME_EPS:
                 paths = tuple(path for path in what.paths if path not in what.connections)
                 if paths:
                     self._apply_change(dataclasses.replace(what, paths=paths, connections=()))
@@ -761,9 +739,10 @@ class Simulation:
         for name, unit in system.units.items():
             bridge_prefix = f"{name}.{unit.bridge.state_prefix}"
             self._states.load(values, [f"{name}.ctrl", bridge_prefix])
-            if any(key.startswith((f"{name}.ctrl.", bridge_prefix + ".")) for key in values):
+            # Continued: any of the unit's registered states is given.
+            if not values.keys().isdisjoint(self._states.read(prefix for prefix, _ in unit.state_parts())):
                 self._continued.add(name)
-            if unit.adc is not None and unit.adc.accumulating:
+            if unit.adc is not None and (unit.adc.accumulating or unit.adc.independent):
                 self._states.load(values, [f"{name}.meas"])
                 if any(key.startswith(f"{name}.meas.") for key in values):
                     self._windows_given.add(name)
@@ -814,7 +793,7 @@ class Simulation:
         observe_output = times is None
         requested = sorted(set(() if times is None else times))
         t_start = p.simulation.initial.t
-        if any(not math.isfinite(t) or t < t_start - _EPS or t > t_end + _EPS
+        if any(not math.isfinite(t) or t < t_start - TIME_EPS or t > t_end + TIME_EPS
                for t in requested):
             raise ValueError("observation times must be finite and within the simulation interval")
         if requested and observe is None:
@@ -836,22 +815,33 @@ class Simulation:
 
         units = list(system.units.values())
         diode_conduction = DiodeConduction(mdl, solver)
-        if t_end <= t_start + _EPS:
+        if t_end <= t_start + TIME_EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         t_final = t_end
-        plant = Plant(mdl, self._apply_initial(t_start), project=project)
+        plant = Plant(mdl, self._apply_initial(t_start), project=project,
+                      synchronize=diode_conduction.synchronize if diode_conduction.commutating else None)
         if project is not None:
+            # Establish natural modes before projecting: an initial inductor current may
+            # turn a previously blocked port on and must not be erased by its old mode.
+            plant.outputs(t_start)
             plant.state = project(plant.state)
+            plant.invalidate()
         if parameters_changed is not None:
             parameters_changed()
         windowed = [unit for unit in units if unit.windowed]
-        ctrl_names = {
-            unit.name: getattr(unit.ctrl, "log_names", lambda: ())() for unit in units
-        }
-        for unit in units:
-            set_logging = getattr(unit.ctrl, "set_logging", None)
+        controls = tuple((unit.name, unit.ctrl) for unit in units if unit.ctrl is not None)
+        continuous_controls = tuple((unit_name, ctrl) for unit_name, ctrl in controls
+                                    if getattr(ctrl, "continuous", False))
+        # Sampled units' bridge/ADC events and file events change the circuit for every window;
+        # a continuous unit's own clock samples only that unit.
+        sampled_units = tuple(unit for unit in units if not unit.continuous)
+        clocked_units = tuple(unit for unit in units if unit.continuous)
+        ctrl_names = {unit_name: getattr(ctrl, "log_names", lambda: ())()
+                      for unit_name, ctrl in controls}
+        for unit_name, ctrl in controls:
+            set_logging = getattr(ctrl, "set_logging", None)
             if set_logging is not None:
-                log_names = {f"{unit.name}.{key}" for key in ctrl_names[unit.name]}
+                log_names = {f"{unit_name}.{key}" for key in ctrl_names[unit_name]}
                 set_logging(output.signals or bool(watch)
                             or (observe is not None and (value_names is None
                                 or bool(log_names.intersection(value_names)))))
@@ -859,7 +849,7 @@ class Simulation:
                        keep_signals=output.signals, keep_energy=output.energy,
                        batch_rows=p.simulation.solver.write_length, name=name)
         n_log = max(0, math.ceil(t_start / log_period - 1e-9))
-        actions = deque(action for action in self._actions() if action[0] > t_start + _EPS)
+        actions = deque(action for action in self._actions() if action[0] > t_start + TIME_EPS)
         next_report = t_start + progress_every if progress_every > 0 else math.inf
         t_local = t_start
         n_rhs0 = getattr(solver, "n_rhs", 0)
@@ -900,11 +890,9 @@ class Simulation:
 
             @_SnapshotRead
             def read_logs():
-                for unit in units:
-                    if getattr(unit, "continuous", False):
-                        rec.ctrl_sample(unit.name, t_now,
-                                        lambda unit=unit: unit.ctrl.continuous_log(t_now),
-                                        record=record and continuous_record_index % record_every == 0)
+                for unit_name, ctrl in continuous_controls:
+                    rec.ctrl_sample(unit_name, t_now, lambda ctrl=ctrl: ctrl.continuous_log(t_now),
+                                    record=record and continuous_record_index % record_every == 0)
                 return rec.last_ctrl_log
 
             @_SnapshotRead
@@ -929,12 +917,10 @@ class Simulation:
                 worst["balance"] = max(worst["balance"], rep.max_residual / scale)
 
             if record and available:
-                for unit in units:
-                    if getattr(unit, "continuous", False):
-                        observe_limits = getattr(unit.ctrl, "observe_limits", None)
-                        if observe_limits is not None:
-                            _optional_output(t_now, f"controller limits {unit.name!r}",
-                                             observe_limits, t_now)
+                for unit_name, ctrl in continuous_controls:
+                    observe_limits = getattr(ctrl, "observe_limits", None)
+                    if observe_limits is not None:
+                        _optional_output(t_now, f"controller limits {unit_name!r}", observe_limits, t_now)
                 read_logs()
                 if rec.keep_signals:
                     _optional_output(t_now, "plant signals",
@@ -949,8 +935,8 @@ class Simulation:
                 if next_observation is not None:
                     if final:
                         raise ValueError("a final observation cannot request another time")
-                    if (not math.isfinite(next_observation) or next_observation <= t_now + _EPS
-                            or next_observation > t_final + _EPS):
+                    if (not math.isfinite(next_observation) or next_observation <= t_now + TIME_EPS
+                            or next_observation > t_final + TIME_EPS):
                         raise ValueError("an observer's next time must be finite, later, and within the run")
                     if next_observation not in pending_observations:
                         heapq.heappush(observations, next_observation)
@@ -966,25 +952,9 @@ class Simulation:
                                   f"known: {sorted(values)}")
             return "".join(f"   {name} = {values[name]:.6g}" for name in watch)
 
-        if diode_conduction:
-            @np.errstate(over="raise")
-            def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
-                y = diode_conduction.advance(t_a, t_b, y)
-                if event and settle is not None:
-                    y = settle(t_b, y)
-                return project(y) if project is not None else y
-        elif project is None:
-            @np.errstate(over="raise")  # overflow counts as divergence
-            def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
-                y = solver(mdl.rhs, t_a, t_b, y).y
-                return settle(t_b, y) if event and settle is not None else y
-        else:
-            @np.errstate(over="raise")  # overflow counts as divergence
-            def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
-                y = solver(mdl.rhs, t_a, t_b, y).y
-                if event and settle is not None:
-                    y = settle(t_b, y)
-                return project(y)
+        integrate = _compile_interval_integrator(
+            solver, mdl.rhs, diode_conduction, settle, project,
+        )
 
         def advance(t_a: float, t_b: float, event: bool = False) -> bool:
             """Integrate over ``[t_a, t_b]``; ``event`` means the model changes at ``t_b``."""
@@ -993,20 +963,16 @@ class Simulation:
             try:
                 plant.state = integrate(t_a, t_b, plant.state, event)
             except (OverflowError, FloatingPointError):
-                stop_reason = f"diverged: the states overflowed between t = {t_a:.6g} s and {t_b:.6g} s"
+                stop_reason = (f"diverged: the states overflowed between t = {t_a:.6g} s "
+                               f"and {t_b:.6g} s")
                 t_local = t_a
                 return True
+            plant.invalidate()
             t_local = t_b
-            finite = _finite(plant.state)
-            if windowed and finite:
-                sync_if_needed(t_b)
-                for unit in windowed:
-                    unit.accumulate(t_b - t_a)
-            elif finite:
-                mdl.set_states(plant.state)
-            if not finite:
+            if not _finite(plant.state):
                 stop_reason = f"diverged: non-finite states at t = {t_b:.6g} s"
                 return True
+            mdl.set_states(plant.state)
             coarse = getattr(solver, "coarse_hold", None)
             if coarse is not None and not coarse_reported:
                 coarse_reported = True
@@ -1021,87 +987,100 @@ class Simulation:
             return False
 
         def settle_now() -> None:
-            """Finish deferred integration with the plant as it is, before it changes now."""
+            """Finish deferred integration and open ADC windows with the plant as it is,
+            before it changes now."""
             if settle is not None:
                 plant.state = settle(t_local, plant.state)
                 if project is not None:
                     plant.state = project(plant.state)
                 mdl.set_states(plant.state)
                 plant.invalidate()
-
-        plant.settle = settle_now
+            if windowed:
+                sync_if_needed(t_local)
+                for unit in windowed:
+                    unit.accumulate(t_local)
 
         def window_edge(t_now: float, changed: bool) -> None:
             """Restart ADC integrals from the values on the new side of a plant/input jump."""
-            if windowed and (changed or plant.zoh_changed):
+            if windowed and changed:
                 sync_if_needed(t_now)
                 for unit in windowed:
-                    unit.restart_windows()
+                    unit.restart_windows(t_now)
 
         # ---------------------------------------------------------------- the event grid
         self._begin_units(t_start, plant)
+        plant.settle = settle_now
         while True:
             plant.inputs_changed = False
             t_log = n_log * log_period
-            t_stop = t_log
-            for unit in units:
-                t_stop = min(t_stop, unit.next_time())
-            if actions:
-                t_stop = min(t_stop, actions[0][0])
-            if t_stop > t_final - _EPS:
-                t_stop = t_final
+            circuit_stop = actions[0][0] if actions else math.inf
+            for unit in sampled_units:
+                circuit_stop = min(circuit_stop, unit.next_time())
+            physical_stop = circuit_stop
+            for unit in clocked_units:
+                physical_stop = min(physical_stop, unit.next_time())
+            t_stop = min(t_final, t_log, physical_stop)
             native_stop = t_stop
-            if observations and observations[0] < t_stop - _EPS:
+            if observations and observations[0] < t_stop - TIME_EPS:
                 t_stop = observations[0]
-            observation_only = t_stop < native_stop - _EPS
-            observation_due = bool(observations and observations[0] <= t_stop + _EPS)
-            while observations and observations[0] <= t_stop + _EPS:
+            observation_only = t_stop < native_stop - TIME_EPS
+            observation_due = bool(observations and observations[0] <= t_stop + TIME_EPS)
+            while observations and observations[0] <= t_stop + TIME_EPS:
                 pending_observations.discard(heapq.heappop(observations))
-            event_due = bool(actions and actions[0][0] <= t_stop + _EPS)
-            advancing = t_stop > t_local + _EPS
+            event_due = bool(actions and actions[0][0] <= t_stop + TIME_EPS)
+            advancing = t_stop > t_local + TIME_EPS
             if advancing and advance(t_local, t_stop, event_due):
                 stopped = True
                 break
             if observation_only:
                 snapshot(t_local, record=False)
                 continue
-            # File events run before the coincident protection/control/PWM events.
-            if event_due:
-                if advancing:  # advance() already settled at t_stop
-                    mdl.set_states(plant.state)
-                else:
-                    settle_now()
-                while actions and actions[0][0] <= t_stop + _EPS:
-                    self._apply_change(actions.popleft()[2])
-                if parameters_changed is not None:
-                    parameters_changed()
-                plant.read_state()
-                plant.inputs_changed = True
-            # Every unit protects first, then every unit samples, then every unit actuates.  This
-            # makes coincident multi-unit events independent of the units' dictionary order.
             protection_changed = False
-            for unit in units:
-                if unit.protect(t_stop, plant):
-                    protection_changed = True
-                    stopped = stop_on_trip
-            if stopped:
+            if physical_stop <= t_stop + TIME_EPS:  # otherwise only the output snapshot is due
+                # A window integrates where the circuit changes or where its own unit samples;
+                # trips and other plant changes integrate through settle_now.
+                circuit = circuit_stop <= t_stop + TIME_EPS
+                for unit in windowed:
+                    if circuit or unit.next_time() <= t_stop + TIME_EPS:
+                        sync_if_needed(t_stop)
+                        unit.accumulate(t_stop)
+                # File events run before the coincident protection/control/PWM events.
+                if event_due:
+                    if advancing:  # advance() already settled at t_stop
+                        mdl.set_states(plant.state)
+                    else:
+                        settle_now()
+                    while actions and actions[0][0] <= t_stop + TIME_EPS:
+                        self._apply_change(actions.popleft()[2])
+                    if parameters_changed is not None:
+                        parameters_changed()
+                    plant.read_state()
+                    plant.inputs_changed = True
+                # Every unit protects first, then every unit samples, then every unit actuates.  This
+                # makes coincident multi-unit events independent of the units' dictionary order.
+                for unit in units:
+                    if unit.protect(t_stop, plant):
+                        protection_changed = True
+                        stopped = stop_on_trip
+                if stopped:
+                    break
+                for unit in units:
+                    done = unit.sense(t_stop, plant)
+                    if done is not None:
+                        k, out = done
+                        if out.log is not None:
+                            rec.ctrl_sample(unit.name, t_stop, out.log, record=k % record_every == 0)
+                for unit in units:
+                    if unit.actuate(t_stop, plant):
+                        protection_changed = True
+                        stopped = stop_on_trip
+                if stopped:
+                    break
+                # Held inputs change only at circuit events; elsewhere they are only re-asserted.
+                window_edge(t_local, plant.inputs_changed or circuit and plant.zoh_changed)
+            if t_stop >= t_final - TIME_EPS:
                 break
-            for unit in units:
-                done = unit.sense(t_stop, plant)
-                if done is not None:
-                    k, out = done
-                    if out.log is not None:
-                        rec.ctrl_sample(unit.name, t_stop, out.log, record=k % record_every == 0)
-            for unit in units:
-                if unit.actuate(t_stop, plant):
-                    protection_changed = True
-                    stopped = stop_on_trip
-            if stopped:
-                break
-            window_edge(t_local, plant.inputs_changed)
-            if t_stop >= t_final - _EPS:
-                break
-            if abs(t_log - t_stop) < _EPS:
+            if abs(t_log - t_stop) < TIME_EPS:
                 snapshot(t_local, notify=(observe_output or observation_due
                                           or event_due or protection_changed))
                 n_log += 1
@@ -1120,14 +1099,15 @@ class Simulation:
         summary: dict[str, Any] = {}
         for name, unit in system.units.items():
             summary.update({f"{name}.{k}": v for k, v in unit.summary().items()})
+        for name, sub in zip(system.model.names, system.model.subsystems):
+            report = getattr(sub, "diagnostics", None)
+            if callable(report):
+                summary.update({f"{name}.{k}": v for k, v in report().items()})
         summary["tripped"] = int(any(unit.tripped for unit in units))
         summary["t_start"] = t_start
         summary["t_stop"] = rec.last_t if rec.last_t is not None else t_start
         if stop_reason:
             summary["stop_reason"] = stop_reason
-        coarse = getattr(solver, "coarse_hold", None)
-        if coarse is not None:
-            summary["interface_coarse_hold"] = f"{coarse[1]} at t = {coarse[0]:.6g} s: {coarse[2]:.3g} of rating"
         if self.ph_report is not None:
             summary["ph_verdict"] = self.ph_report.verdict
             summary["ph_defaulted"] = list(self.ph_report.defaulted)
@@ -1147,10 +1127,12 @@ class Simulation:
                                               f"loads, carriers and loops) have no common multiple within "
                                               f"64 of the longest, so the loop has no period to linearise: "
                                               f"no bound")
-                else:
+                else:  # the bound reads whole rows: parse states.csv once, not once per column
+                    table = records.states_table
+                    rows = np.atleast_1d(read_csv(table.path)) if table is not None and table.n_rows else None
                     summary.update(split_error_bound(
-                        solver, loop, records.t, records.states, p.simulation.solver.linearisations,
-                        labels=mdl.state_labels(), prefix=""))
+                        solver, loop, records.t, {key: rows[key] for key in rows.dtype.names} if rows is not None
+                        else {}, p.simulation.solver.linearisations, labels=mdl.state_labels(), prefix=""))
             else:  # parts given as instances
                 summary["split_bound"] = ("the loop has custom parts given as instances, so it cannot be "
                                           "rebuilt for the linearisation: pass them as factories of the "
@@ -1167,7 +1149,7 @@ class Simulation:
             summary_path = output_dir / "summary.json"
             params_path = output_dir / "simulation.pes"
             summary_path.write_text(json.dumps(payload, indent=2, default=float), encoding="utf-8")
-            dump(p, params_path)
+            dump(p if t_end == p.simulation.t_end else p.replace(**{"simulation.t_end": t_end}), params_path)
             files += [summary_path, params_path]
         self.result = SimulationResult(
             params=p, _records=records, out_dir=output_dir, files=files, summary=summary,
@@ -1204,10 +1186,9 @@ class SystemLoop:
         self._cls = Simulation
         self._factories = dict(sim._factories)
         self.split_reference = bool(getattr(sim.solver, "groups", ()))
-        frequency = sim.p.base.f0 if frame_frequency is None else frame_frequency
+        frequency = (sim.p.base.f0 or 0.0) if frame_frequency is None else frame_frequency
         self.w0 = 2.0 * math.pi * frequency
         periods = {value for unit in sim.units.values() for value in unit.periods}
-        self._angles: set[str] = set()
         control_columns: set[str] = set()
         for name, unit in sim.units.items():
             ctrl = unit.ctrl
@@ -1218,10 +1199,6 @@ class SystemLoop:
                 control_columns.update((f"{name}.ctrl.{local}.re", f"{name}.ctrl.{local}.im"))
             measured = None
             for label, node in graph.nodes.items():
-                for port, spec in node.outputs.items():
-                    if spec.unit == "rad":
-                        self._angles.update((f"{name}.ctrl.{label}.{port}",
-                                             f"{name}.ctrl.held.{graph._state_port(label + '.' + port)}"))
                 forcing = getattr(node, "forcing_periods", None)
                 if repeat_forcing and forcing is not None:
                     if measured is None:
@@ -1230,8 +1207,7 @@ class SystemLoop:
                             for key, value in unit.control_inputs().items()
                         })
                     periods.update(forcing(graph._gather(graph._wiring[label], measured)))
-            self._angles.update(f"{name}.ctrl.command.{port}"
-                                for port, spec in ctrl.interface.outputs.items() if spec.unit == "rad")
+        self._angles = set(sim._states.angle_names)
         if repeat_forcing:
             for source in getattr(sim.system, "sources", {}).values():
                 relative = abs(source.cfg.f - frequency)
@@ -1254,7 +1230,7 @@ class SystemLoop:
         self._states = sim._states
         self._map_columns = set(sim._states.linearization_columns)
         self._plant_columns = set(sim._states.read_flat(["", *sim.units])) - control_columns
-        rated = getattr(sim.solver, "rated_effort", None)
+        rated = rated_effort(sim.system.model, sim._ratings())  # the same scales for every solver
         self._rated = ({lab: float(r) for lab, r in zip(sim.system.model.state_labels(), rated)}
                        if rated is not None else {})
         p = sim.p
@@ -1272,7 +1248,7 @@ class SystemLoop:
     # ------------------------------------------------------------ coordinates
     def overwritten_columns(self, t: float) -> frozenset[str]:
         """Reuse owner proofs only while file events cannot change the execution schedule."""
-        if any(t < change.t <= t + self.period + _EPS for change in self._p.changes):
+        if any(t < change.t <= t + self.period + TIME_EPS for change in self._p.changes):
             return frozenset()
         return self._states.overwritten_columns(self.period)
 
@@ -1349,7 +1325,7 @@ class SystemLoop:
                     out[name] = float(d[k])
             elif kind in ("scalar", "angle"):
                 out[names[0]] = float(x[i])
-            i += 2 if kind in ("vector", "fixed") else 3 if kind == "triple" else 1
+            i += coordinate_width(kind)
         return out
 
     # --------------------------------------------------------- one period of it
@@ -1381,7 +1357,7 @@ class SystemLoop:
         res = sim.run(out_dir=None)
         out = res.final_states()
         if res.summary.get("stop_reason") or not math.isclose(
-                out.pop("t"), t + self.period, rel_tol=0.0, abs_tol=_EPS):
+                out.pop("t"), t + self.period, rel_tol=0.0, abs_tol=TIME_EPS):
             raise FloatingPointError("loop advance did not complete its analysis period")
         if view is not None and view[2] == "c":
             out[view[0]] -= view[1]
@@ -1470,7 +1446,7 @@ def main(argv=None) -> int:
     """Run a simulation file and save its states, summary and configured signals."""
     ap = argparse.ArgumentParser(description=main.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("config", nargs="?",
-                    help="simulation file path or bundled example name; default: first example by filename")
+                    help="simulation file path or bundled example name; default: gfl-example")
     ap.add_argument("--set", action="append", default=[], type=parse_override, metavar="PATH=VALUE",
                     help="override a dotted parameter path (repeatable)")
     ap.add_argument("--initial", default=None, metavar="FILE",
@@ -1501,7 +1477,8 @@ def main(argv=None) -> int:
     ap.add_argument("--list-states", action="store_true",
                     help="print the state names generated for this configuration and exit")
     ap.add_argument("--ph-report", action="store_true",
-                    help="print the port-Hamiltonian structure report of the system (always built) and exit")
+                    help="print the port-Hamiltonian structure report of the system and exit "
+                         "(built also with simulation.energy_check: off)")
     ap.add_argument("--report", action="store_true",
                     help="generate <simulation name>_report.json using the optional analysis addon")
     ap.add_argument("--resolved", action="store_true",
@@ -1509,40 +1486,35 @@ def main(argv=None) -> int:
     plots = ap.add_argument_group("IEEE-style PDF plot (after simulation)")
     plots.add_argument("--plot", nargs="+", default=None, metavar="NAME",
                        help="plot these recorded columns against time; all must belong to one result CSV")
-    plots.add_argument("--plot-output", default=None, metavar="PDF",
-                       help="PDF path relative to the run directory (default: fig_<table>.pdf)")
-    plots.add_argument("--plot-x", default="t", metavar="NAME",
-                       help="horizontal-axis column (default: t)")
-    plots.add_argument("--plot-time-unit", choices=("auto", "s", "ms", "us"), default="auto",
-                       help="time-axis unit (default: choose s, ms, or us from the range)")
-    plots.add_argument("--plot-title", default=None, metavar="TEXT")
-    plots.add_argument("--plot-xlabel", default=None, metavar="TEXT")
-    plots.add_argument("--plot-ylabel", default=None, metavar="TEXT")
-    plots.add_argument("--plot-label", action="append", default=None, metavar="TEXT",
-                       help="legend label for each waveform, in --plot order; repeatable")
-    plots.add_argument("--plot-color", action="append", default=None, metavar="COLOR",
-                       help="Matplotlib color for each waveform, in --plot order; repeatable")
-    plots.add_argument("--plot-style", action="append", default=None, metavar="STYLE",
-                       help="line style for each waveform, in --plot order; repeatable")
-    plots.add_argument("--plot-width", choices=("single", "double"), default="single",
-                       help="IEEE single- or double-column width (default: single)")
-    plots.add_argument("--plot-height", type=float, default=None, metavar="INCHES")
-    plots.add_argument("--plot-linewidth", type=float, default=1.5, metavar="POINTS")
-    plots.add_argument("--plot-xlim", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
-    plots.add_argument("--plot-ylim", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
-    plots.add_argument("--plot-no-grid", action="store_true", help="disable the background grid")
-    plots.add_argument("--plot-no-legend", action="store_true", help="disable the legend")
+    presentation = [  # their destinations are the keywords of SimulationResult.plot
+        plots.add_argument("--plot-output", dest="output", default=None, metavar="PDF",
+                           help="PDF path relative to the run directory (default: fig_<table>.pdf)"),
+        plots.add_argument("--plot-x", dest="x", default="t", metavar="NAME",
+                           help="horizontal-axis column (default: t)"),
+        plots.add_argument("--plot-time-unit", dest="time_unit", choices=("auto", "s", "ms", "us"), default="auto",
+                           help="time-axis unit (default: choose s, ms, or us from the range)"),
+        plots.add_argument("--plot-title", dest="title", default=None, metavar="TEXT"),
+        plots.add_argument("--plot-xlabel", dest="xlabel", default=None, metavar="TEXT"),
+        plots.add_argument("--plot-ylabel", dest="ylabel", default=None, metavar="TEXT"),
+        plots.add_argument("--plot-label", dest="labels", action="append", default=None, metavar="TEXT",
+                           help="legend label for each waveform, in --plot order; repeatable"),
+        plots.add_argument("--plot-color", dest="colors", action="append", default=None, metavar="COLOR",
+                           help="Matplotlib color for each waveform, in --plot order; repeatable"),
+        plots.add_argument("--plot-style", dest="linestyles", action="append", default=None, metavar="STYLE",
+                           help="line style for each waveform, in --plot order; repeatable"),
+        plots.add_argument("--plot-width", dest="width", choices=("single", "double"), default="single",
+                           help="IEEE single- or double-column width (default: single)"),
+        plots.add_argument("--plot-height", dest="height", type=float, default=None, metavar="INCHES"),
+        plots.add_argument("--plot-linewidth", dest="linewidth", type=float, default=1.5, metavar="POINTS"),
+        plots.add_argument("--plot-xlim", dest="xlim", type=float, nargs=2, default=None, metavar=("MIN", "MAX")),
+        plots.add_argument("--plot-ylim", dest="ylim", type=float, nargs=2, default=None, metavar=("MIN", "MAX")),
+        plots.add_argument("--plot-no-grid", dest="grid", action="store_false", help="disable the background grid"),
+        plots.add_argument("--plot-no-legend", dest="legend", action="store_false", help="disable the legend"),
+    ]
     args = ap.parse_args(argv)
 
-    plot_option_without_plot = (
-        args.plot_output is not None or args.plot_x != "t" or args.plot_time_unit != "auto"
-        or args.plot_title is not None or args.plot_xlabel is not None or args.plot_ylabel is not None
-        or args.plot_label is not None or args.plot_color is not None or args.plot_style is not None
-        or args.plot_width != "single" or args.plot_height is not None or args.plot_linewidth != 1.5
-        or args.plot_xlim is not None or args.plot_ylim is not None
-        or args.plot_no_grid or args.plot_no_legend
-    )
-    if args.plot is None and plot_option_without_plot:
+    plot_options = {action.dest: getattr(args, action.dest) for action in presentation}
+    if args.plot is None and any(plot_options[action.dest] != action.default for action in presentation):
         ap.error("plot presentation options require --plot NAME [NAME ...]")
     for flag, enabled in (("--plot", args.plot is not None), ("--report", args.report)):
         if enabled and (args.export or args.imperix or args.list_states or args.ph_report or args.resolved):
@@ -1571,11 +1543,10 @@ def main(argv=None) -> int:
                                                    for name in value.split(",") if name]
     p = load(config, initial=args.initial,
                     initial_time=args.initial_time, **overrides)
-    preset = (("switching", "fixed", "rk4") if args.switching else
-              ("pwm_averaging", "fixed", "rk4") if args.pwm_averaging else
-              ("averaging", "adaptive", "DP45") if args.averaging else None)
-    if preset is not None:
-        model, solver_type, method = preset
+    presets = {"switching": ("fixed", "rk4"), "pwm_averaging": ("fixed", "rk4"), "averaging": ("adaptive", "DP45")}
+    model = next((flag for flag in presets if getattr(args, flag)), None)  # each flag names its bridge model
+    if model is not None:
+        solver_type, method = presets[model]
         changes = {f"units.{name}.bridge.model": model for name, _cfg in _unit_items(p.units)
                    if f"units.{name}.bridge.model" not in set_overrides}
         if not _solver_choice_is_set(set_overrides):
@@ -1592,9 +1563,13 @@ def main(argv=None) -> int:
             p = p.replace(**changes)
     if args.watch and not p.simulation.progress.enable:
         ap.error("--watch prints on the progress lines: add --progress SECONDS")
+    if args.initial_time is not None and args.initial is None:
+        ap.error("--initial-time selects a row of a states.csv: add --initial FILE")
     if args.resolved:
         print(dumps(p), end="")
         return 0
+    if args.ph_report and p.simulation.energy_check == "off":  # the check builds the report
+        p = p.replace(**{"simulation.energy_check": "warn"})
     sim = Simulation(p)
     if args.list_states:
         print("\n".join(sim.state_names()))
@@ -1602,9 +1577,7 @@ def main(argv=None) -> int:
     if args.ph_report:
         print(sim.ph_report)
         return 0
-    suffix = ("-switching" if args.switching else
-              "-pwm-averaging" if args.pwm_averaging else
-              "-averaging" if args.averaging else "")
+    suffix = "-" + model.replace("_", "-") if model is not None else ""
     if args.export:
         export_format, *export_variables = args.export
         out = Path(args.out) if args.out else Path("export") / f"{config.stem}{suffix}"
@@ -1621,7 +1594,8 @@ def main(argv=None) -> int:
             print("warning:", diagnostic["message"], file=sys.stderr)
         print("wrote", ", ".join(str(path) for path in result.files))
         return 0
-    units = ", ".join(f"{n} ({u.ctrl.type}, {u.bridge.model.replace('_', ' ')}, "
+    units = ", ".join(f"{n} ({u.ctrl.type if u.ctrl is not None else 'diode full-bridge rectifier'}, "
+                      f"{u.bridge.model.replace('_', ' ')}, "
                       f"{sim.units[n].bridge.describe()})"
                       for n, u in _unit_items(p.units))
     print(f"peslite: {config}  units={units}  "
@@ -1668,33 +1642,12 @@ def main(argv=None) -> int:
         print(f"split error, from the linearised closed loop: <= {s['split_error_bound_rated']:.2e} of rating "
               f"({s['split_bound']})")
     if args.plot:
-        plot_output = None
-        if args.plot_output:
-            plot_output = Path(args.plot_output)
-            if not plot_output.is_absolute():
-                plot_output = out / plot_output
-            if not plot_output.suffix:
-                plot_output = plot_output.with_suffix(".pdf")
+        output, plot_options["output"] = plot_options["output"], None
+        if output:
+            output = Path(output) if Path(output).is_absolute() else out / output
+            plot_options["output"] = output if output.suffix else output.with_suffix(".pdf")
         try:
-            r.plot(
-                args.plot,
-                output=plot_output,
-                x=args.plot_x,
-                time_unit=args.plot_time_unit,
-                labels=args.plot_label,
-                title=args.plot_title,
-                xlabel=args.plot_xlabel,
-                ylabel=args.plot_ylabel,
-                width=args.plot_width,
-                height=args.plot_height,
-                xlim=tuple(args.plot_xlim) if args.plot_xlim else None,
-                ylim=tuple(args.plot_ylim) if args.plot_ylim else None,
-                colors=args.plot_color,
-                linestyles=args.plot_style,
-                linewidth=args.plot_linewidth,
-                grid=not args.plot_no_grid,
-                legend=not args.plot_no_legend,
-            )
+            r.plot(args.plot, **plot_options)
         except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:
             ap.error(str(exc))
     print("wrote", ", ".join(str(w) for w in r.files))

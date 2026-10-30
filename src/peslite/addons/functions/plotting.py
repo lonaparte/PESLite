@@ -79,11 +79,9 @@ def _read_numeric_columns(path: Path, x: str,
                           columns: tuple[str, ...]) -> tuple[np.ndarray, list[np.ndarray]]:
     if not path.is_file():
         raise FileNotFoundError(f"CSV file not found: {path}")
-    with path.open(newline="", encoding="utf-8-sig") as stream:
-        try:
-            header = next(csv.reader(stream))
-        except StopIteration:
-            raise ValueError(f"CSV file is empty: {path}") from None
+    header = _header(path)
+    if header is None:
+        raise ValueError(f"CSV file is empty: {path}")
     if not header or any(not name for name in header):
         raise ValueError(f"CSV header contains an empty column name: {path}")
     duplicates = sorted({name for name in header if header.count(name) > 1})
@@ -110,17 +108,16 @@ def _read_numeric_columns(path: Path, x: str,
     return x_values, [data[:, index] for index in range(1, data.shape[1])]
 
 
-def _header(path: Path) -> tuple[str, ...]:
+def _header(path: Path) -> tuple[str, ...] | None:
+    """The first row of a CSV file, or ``None`` when the file is empty."""
     with path.open(newline="", encoding="utf-8-sig") as stream:
-        try:
-            return tuple(next(csv.reader(stream)))
-        except StopIteration:
-            return ()
+        row = next(csv.reader(stream), None)
+    return None if row is None else tuple(row)
 
 
 def _result_csv(files: Sequence[str | Path], columns: tuple[str, ...], x: str) -> Path:
     tables = [Path(path) for path in files if Path(path).suffix.lower() == ".csv"]
-    headers = {path: _header(path) for path in tables if path.is_file()}
+    headers = {path: _header(path) or () for path in tables if path.is_file()}
     requested = {x, *columns}
     matches = [path for path, header in headers.items() if requested <= set(header)]
     if len(matches) == 1:

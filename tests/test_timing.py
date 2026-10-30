@@ -9,7 +9,8 @@ import peslite
 from peslite.assembly.params import ConfigError
 from peslite.assembly.unit import Plant
 from peslite.components.network import RCNode
-from peslite.components.pwm import PWM, ZOH, carrier_position
+from peslite.components.converter import PWMAveragingModel, ThreePhaseBridge
+from peslite.components.pwm import ZOH, carrier_position
 from peslite.solver.model import Model
 
 
@@ -96,17 +97,19 @@ def test_timing_defaults_follow_the_carrier(gfl):
     ({"units.vsc.ctrl.computation": 5e-5}, "shorter than the control period"),
     ({"units.vsc.ctrl.computation": -1e-6}, "must be at least 0"),
     ({"units.vsc.ctrl.computation": math.nan}, "computation"),
+    ({"units.vsc.ctrl.offset": -1e-6}, "offset"),
+    ({"units.vsc.ctrl.offset": T}, "offset"),
     ({"units.vsc.ctrl.loops.DCVoltageControl.period": 7.5e-5},
      "not a multiple of ctrl.period"),
     ({"units.vsc.meas.period": 2e-5}, "does not divide ctrl.period"),
-    ({"units.vsc.meas.period": 1e-4}, "longer than ctrl.period"),
+    ({"units.vsc.meas.period": 1e-4}, "longer than the sampling period"),
+    ({"units.vsc.meas.offset": -1e-6}, "offset"),
+    ({"units.vsc.meas.period": T / 2, "units.vsc.meas.offset": T / 2}, "offset"),
     ({"units.vsc.meas.average": "window"}, "expected a list of channels"),
     ({"units.vsc.meas.average": ["u_g", "unknown"]}, "unknown channel"),
     ({"units.vsc.meas.average": ["u_g", "u_g"]}, "must not be repeated"),
     ({"units.vsc.meas.average": ["u_g", "i_c"], "units.vsc.meas.window": 1e-4},
-     "longer than ctrl.period"),
-    ({"units.vsc.meas.average": ["u_g", "i_c"], "units.vsc.meas.period": 2.5e-5},
-     "cannot be combined"),
+     "longer than the sampling period"),
     ({"units.vsc.pwm.update": "triple"}, "update"),
     ({"units.vsc.delay.steps": 1}, "unknown key"),
     ({"units.vsc.pwm.computation_delay.steps": 1}, "unknown key"),
@@ -140,14 +143,19 @@ def test_twice_per_carrier_control_loads_the_previous_peak_duty_at_a_valley(gfl,
     assert np.allclose(lags, T / 2)
 
 
-@pytest.mark.parametrize("computation, lag", [(1e-6, T / 2), (2.5e-5, T / 2), (3e-5, T)])
-def test_double_update_uses_the_first_load_after_computation(gfl, computation, lag, tmp_path):
-    _result, interrupts, loads = _record(gfl(**{
-        "units.vsc.pwm.update": "double",
-        "units.vsc.ctrl.computation": computation,
-    }), tmp_path)
+@pytest.mark.parametrize("over, lag", [
+    ({"units.vsc.ctrl.computation": 1e-6}, T / 2),
+    ({"units.vsc.ctrl.computation": 2.5e-5}, T / 2),
+    ({"units.vsc.ctrl.computation": 3e-5}, T),
+    # Every load falls within an interrupt's computation and takes the previous completed word.
+    ({"units.vsc.ctrl.period": T / 2, "units.vsc.ctrl.offset": T / 2 - 5e-7}, T / 2 + 5e-7),
+])
+def test_double_update_uses_the_first_load_after_computation(gfl, over, lag, tmp_path):
+    _result, interrupts, loads = _record(gfl(**{"units.vsc.pwm.update": "double", **over}), tmp_path)
     assert all(period == pytest.approx(T / 2) for _t, period, _duty in loads)
-    assert np.allclose(_lags(interrupts, loads), lag)
+    lags = _lags(interrupts, loads)
+    assert len(lags) > 0.9 * len(interrupts)
+    assert np.allclose(lags, lag)
 
 
 def test_timing_follows_an_asynchronous_carrier_phase(gfl, tmp_path):
@@ -161,6 +169,37 @@ def test_timing_follows_an_asynchronous_carrier_phase(gfl, tmp_path):
     assert np.allclose(_lags(interrupts, loads), T)
 
 
+def test_control_adc_and_pwm_use_independent_offsets_on_the_shared_clock_grid(gfl, tmp_path):
+    params = gfl(**{
+        "units.vsc.ctrl.offset": 10e-6,
+        "units.vsc.meas.period": T / 2,
+        "units.vsc.meas.offset": 5e-6,
+        "simulation.t_end": 3 * T,
+        "events.connect_vsc.t": 1.0,  # an initially disconnected unit has no tracking sync
+    })
+    simulation = peslite.Simulation(params)
+    unit = simulation.unit("vsc")
+    conversions = []
+    convert = unit.adc.convert
+
+    def record_conversion(t):
+        conversions.append(t)
+        convert(t)
+
+    unit.adc.convert = record_conversion
+    controller = []
+    unit.ctrl = _Recorder(unit.ctrl, controller, "ctrl")
+    result = simulation.run(out_dir=tmp_path)
+
+    # The held conversion before the first one is the start value, not a construction leftover.
+    assert result.states["vsc.meas.held_u_dc"][0] == result.states["vsc.dclink.u_C"][0]
+    assert unit.bridge.control_clock.offset == pytest.approx(10e-6)
+    assert unit.bridge.load_clock.offset == pytest.approx(0.0)
+    assert unit.adc.independent
+    np.testing.assert_allclose([t for t, _output in controller], [10e-6, 60e-6, 110e-6])
+    np.testing.assert_allclose(conversions, np.arange(5e-6, 3 * T, T / 2))
+
+
 def test_a_slow_loop_runs_at_every_nth_interrupt(gfl):
     sim = peslite.Simulation(gfl(**{
         "units.vsc.ctrl.loops.DCVoltageControl.period": 4 * T,
@@ -172,7 +211,7 @@ def test_a_slow_loop_runs_at_every_nth_interrupt(gfl):
 
 
 def _pwm(computation):
-    return PWM(T, T, 0.0, computation, T, ZOH())
+    return PWMAveragingModel(T, T, 0.0, 0.0, computation, T, ZOH(), ThreePhaseBridge())
 
 
 def test_shadow_duty_loads_only_after_computation():
@@ -189,6 +228,16 @@ def test_shadow_duty_loads_only_after_computation():
     pwm.write(T, np.full(3, 0.2))
     assert (pwm.active[0], pwm.shadow[0]) == (0.1, 0.2)
 
+    # Interrupts within the computation before every load: each load takes the replaced word.
+    offset = PWMAveragingModel(T, T, T - 1e-5, 0.0, 2e-5, T, ZOH(), ThreePhaseBridge())
+    offset.reset(np.full(3, 0.5))
+    loaded = []
+    for k, duty in enumerate((0.1, 0.2, 0.3)):
+        offset.write(offset.interrupt(k), np.full(3, duty))
+        offset.load(offset.load_time(k + 1))
+        loaded.append(offset.active[0])
+    assert loaded == [0.5, 0.1, 0.2]
+
     other = _pwm(2e-5)
     other.set_state(pwm.get_state())
     other.start(6e-5, (None, None), True)
@@ -203,7 +252,9 @@ def test_timer_starts_at_the_first_carrier_valley(gfl):
         "units.vsc.pwm.carrier_phase": 0.25,
         "units.vsc.pwm.update": "double",
     })).unit().bridge
-    assert (pwm.offset, pwm.period, pwm.load_period) == (pytest.approx(0.75 * T), T, T / 2)
+    assert (pwm.control_clock.offset, pwm.load_clock.offset, pwm.period, pwm.load_period) == (
+        pytest.approx(0.75 * T), pytest.approx(0.75 * T), T, T / 2,
+    )
     assert pwm.after(0.0) == 0
     assert pwm.after(pwm.interrupt(3)) == 4
     assert pwm.after(pwm.interrupt(3) + 1e-7) == 4
@@ -215,7 +266,7 @@ def test_timer_starts_at_the_first_carrier_valley(gfl):
         "units.vsc.pwm.carrier_phase": 0.25,
         "units.vsc.pwm.sync": "synchronous",
     })).unit().bridge
-    assert synchronous.offset == 0.0
+    assert synchronous.control_clock.offset == synchronous.load_clock.offset == 0.0
 
 
 def test_duty_registers_are_states_and_loop_clocks_are_not(gfl):
@@ -233,6 +284,8 @@ def test_duty_registers_are_states_and_loop_clocks_are_not(gfl):
     ({"units.vsc.meas.average": ["u_g", "i_c", "u_dc"],
       "units.vsc.meas.window": 2.5e-5, "units.vsc.bridge.model": "switching"},
      0.003025),  # an ADC window is open
+    ({"units.vsc.ctrl.offset": 4.5e-5, "units.vsc.ctrl.computation": 1e-5},
+     0.003000),  # a load took the previous word during the computation
 ])
 def test_a_run_continues_exactly_from_any_output_row(gfl, tmp_path, over, t0):
     params = gfl(**{"simulation.t_end": 0.004, "simulation.output.period": 5e-6, **over})
@@ -271,6 +324,11 @@ def test_an_oversampled_continuation_starts_at_an_interrupt(gfl):
     gfl(**over, **state, **{"simulation.initial.t": 3.5e-5 + 1e-4})
     with pytest.raises(ConfigError, match="between two control interrupts"):
         gfl(**over, **state, **{"simulation.initial.t": 1.25e-4})
+    # The next load would take the word the interrupt replaced, which no load has applied.
+    late = {"units.vsc.ctrl.offset": 4.5e-5, "units.vsc.ctrl.computation": 1e-5}
+    gfl(**late, **state, **{"simulation.initial.t": 1e-4})
+    with pytest.raises(ConfigError, match="outside a controller computation window"):
+        gfl(**late, **state, **{"simulation.initial.t": 9.5e-5})
 
 
 def test_a_window_open_before_a_new_run_uses_the_start_values(gfl, tmp_path):

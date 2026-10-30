@@ -184,7 +184,9 @@ a resolved `clocks` table containing each used clock's frequency and full-path b
 including defaults. Assignment happens only during export; no runtime clock allocator is added.
 
 `sampling_phase` is in `[0, 1)` relative to CLK0. PWM uses the configured carrier phase,
-frequency and single/double register-update selection. Only asynchronous carriers are supported;
+frequency and single/double register-update selection. The hardware adapter uses
+`pattern_sync: interval`; complete-pulse software updates require a hardware adapter and are
+rejected rather than approximated. Only asynchronous carriers are supported;
 an angle-locked simulation carrier needs a separate hardware timing adapter. Here
 `pwm.sync: asynchronous` refers to the simulated electrical angle, not independently clocked ADC
 channels. Hardware acquisition, execution time and register latency replace numerical timing:
@@ -201,6 +203,13 @@ valid after startup. Ordinary single-rate channels need no history and retain th
 RMS windows are still rejected: averaged samples cannot reconstruct a mean-square waveform.
 Continuous `averaging` controllers and saved simulation initial states are also rejected.
 Use a sampled bridge configuration and a cold start.
+
+The hardware adapters bind duty registers only, so phase-shift (non-duty) modulator registers are
+rejected. Plants with commutating subsystems, such as diode rectifiers and switch-controlled
+capacitors, are rejected because no hardware adapter implements their commutations. An explicit
+`ctrl.offset` or `meas.offset` is rejected before files are written: hardware timing comes from
+`sampling_phase` on the CLK0 grid, and no adapter places a controller or ADC clock at a
+configured position.
 
 Period mapping uses rational common divisors, not a per-tick search or an expanded schedule.
 It rejects a common period below the SDK's 4 ns clock resolution. Periods still need to be
@@ -336,7 +345,7 @@ The optional top-level `build` mapping contains `sdk`, `command`, `elf_machine` 
 against the binding file. `command` is an explicit argument list, executed without a shell,
 using `{sdk}`, `{source}` and `{elf}` placeholders. It must write its fresh target executable to
 `{elf}`. `{source}` is the generated package, containing the user source/header files for the
-official SDK project. `timeout` defaults to 300 seconds.
+official SDK project. `timeout` is in (0, 3600] seconds and defaults to 300.
 
 Use the actual compiler, C++17 flags, include paths, target ABI, linker script/specs, startup and
 BBOS libraries from the installed official SDK project. The exporter deliberately does not guess

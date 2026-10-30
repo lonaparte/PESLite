@@ -15,7 +15,7 @@ from ..solver.energy import PowerPort, StoragePort, port_power
 from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _complex, _real
 
 __all__ = [
-    "Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
+    "Terminal", "ACVoltageSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
     "register_element_type", "element_buses", "Load", "Resistor", "VoltageSource",
 ]
 
@@ -35,6 +35,8 @@ class Terminal:
     current: str
     direction: int
     drives_voltage: bool = False
+    hold_voltage_input: Optional[str] = None
+    electrical_domain: Optional[str] = None
     current_sources: Any = field(init=False, repr=False, compare=False, default=None)
     voltage_source: Any = field(init=False, repr=False, compare=False, default=None)
     power_port: PowerPort = field(init=False, repr=False, compare=False)
@@ -46,6 +48,11 @@ class Terminal:
             )
         if self.direction not in (-1, 1) or isinstance(self.direction, bool):
             raise ValueError(f"terminal direction must be +1 or -1, got {self.direction!r}")
+        if self.electrical_domain not in (None, "ac", "dc"):
+            raise ValueError(
+                "terminal electrical_domain must be 'ac', 'dc' or None, got "
+                f"{self.electrical_domain!r}"
+            )
         voltage_record = self.subsystem.out if self.drives_voltage else self.subsystem.inp
         current_record = self.subsystem.inp if self.drives_voltage else self.subsystem.out
         voltage_scope = "out" if self.drives_voltage else "inp"
@@ -100,6 +107,30 @@ class Terminal:
             raise ValueError("only a voltage-driving terminal owns the bus current target")
         object.__setattr__(self, "current_sources", sources)
 
+    def hold_voltage_source(self, current_constraint=None) -> tuple:
+        """Ask this current-owning component for its zero-current voltage law."""
+        provider = getattr(self.subsystem, "hold_voltage_source", None)
+        if self.drives_voltage or provider is None:
+            raise ConfigError(
+                f"{type(self.subsystem).__name__}.{self.voltage}: no zero-current voltage law")
+        return provider(self, current_constraint=current_constraint)
+
+
+def _phase_convention(phases: int, initial: complex | float = 0.0):
+    """Power scale, zero and ``initial`` of peak complex space vectors (3) or real scalars (1)."""
+    if phases not in (1, 3):
+        raise ValueError(f"phases must be 1 or 3, got {phases!r}")
+    if phases == 3:
+        return 1.5, 0j, _complex(initial)
+    return 1.0, 0.0, _real(initial.real if isinstance(initial, complex) else initial)
+
+
+def _extend_record(record: Bag, *names: str) -> Bag:
+    """Copy ``record`` into a record type with the additional fields ``names``."""
+    fields = type(record).__slots__
+    return type(type(record).__name__, (Bag,), {"__slots__": (*fields, *names)})(
+        **{name: getattr(record, name) for name in fields})
+
 
 class _BranchState(Bag):
     __slots__ = ("i",)
@@ -121,16 +152,12 @@ class RLBranch:
     outputs_need_inputs: ClassVar[bool] = False
     def __init__(self, L: float, R: float, i0: complex | float = 0j, *, phases: int = 3,
                  unilateral: bool = False) -> None:
-        if phases not in (1, 3):
-            raise ValueError(f"phases must be 1 or 3, got {phases!r}")
+        self.power_scale, self.zero, initial = _phase_convention(phases, i0)
         if unilateral and phases != 1:
             raise ValueError("unilateral current is only available for scalar branches")
         self.L, self.R = L, R
         self.phases = phases
-        self.power_scale = 1.5 if phases == 3 else 1.0
-        self.zero = 0j if phases == 3 else 0.0
         self.unilateral = bool(unilateral)
-        initial = _complex(i0) if phases == 3 else _real(i0.real if isinstance(i0, complex) else i0)
         self.ports = (PowerPort("inp.u1", "out.i", self.power_scale, 1.0),
                       PowerPort("inp.u2", "out.i", self.power_scale, -1.0))
         self.storage = (StoragePort(
@@ -146,19 +173,25 @@ class RLBranch:
         self.breaker_open = False
         if self.unilateral:
             self.state_bounds = {"i": (0.0, None)}
-        if type(self) is RLBranch:
-            self.rhs = self._rhs_ordinary
+        self._output_equation = (self._set_outputs_unilateral if self.unilateral
+                                 else self._set_outputs_bilateral)
+        self._closed_rhs = self._rhs_unilateral if self.unilateral else self._rhs_bilateral
+        self._uses_default_rhs = type(self).rhs is RLBranch.rhs
+        if type(self).set_outputs is RLBranch.set_outputs:
+            self.set_outputs = self._output_equation
+        if self._uses_default_rhs:
+            self.rhs = self._closed_rhs
 
     def open_breaker(self) -> None:
         self.breaker_open = True
         self.state.i = self.zero
-        if type(self) is RLBranch:
+        if self._uses_default_rhs:
             self.rhs = self._rhs_open
 
     def close_breaker(self) -> None:
         """Close the breaker; current resumes from zero after an opening."""
         self.breaker_open = False
-        if type(self) is RLBranch:
+        if self._uses_default_rhs:
             self.rhs = self._closed_rhs
 
     def retune(self, L: float, R: float) -> None:
@@ -167,10 +200,17 @@ class RLBranch:
         self.storage = (replace(self.storage[0], value=L),)
 
     def set_outputs(self, t: float) -> None:
-        current = self.state.i
-        self.out.i = max(0.0, current) if self.unilateral else current
+        """Evaluate the output equation selected when the branch was constructed."""
+        self._output_equation(t)
+
+    def _set_outputs_bilateral(self, t: float) -> None:
+        self.out.i = self.state.i
+
+    def _set_outputs_unilateral(self, t: float) -> None:
+        self.out.i = max(0.0, self.state.i)
 
     def rhs(self, t: float):
+        """Evaluate the active state equation without duplicating its electrical law."""
         if self.breaker_open:
             return (self.zero,)
         return self._closed_rhs(t)
@@ -178,13 +218,12 @@ class RLBranch:
     def _rhs_open(self, t: float):
         return (self.zero,)
 
-    def _rhs_ordinary(self, t: float):
-        derivative = (self.inp.u1 - self.inp.u2 - self.R * self.state.i) / self.L
-        if self.unilateral and self.state.i <= 0.0 and derivative < 0.0:
-            derivative = 0.0
-        return (derivative,)
+    def _rhs_bilateral(self, t: float):
+        return ((self.inp.u1 - self.inp.u2 - self.R * self.state.i) / self.L,)
 
-    _closed_rhs = _rhs_ordinary
+    def _rhs_unilateral(self, t: float):
+        derivative = (self.inp.u1 - self.inp.u2 - self.R * self.state.i) / self.L
+        return (0.0 if self.state.i <= 0.0 and derivative < 0.0 else derivative,)
 
     def _rhs_conduction(self, _t: float):
         return (self.inp.di_dt,)
@@ -196,12 +235,46 @@ class RLBranch:
             "cycle-averaged DCM current does not have the branch's linear instantaneous "
             "storage function"
         )
-        if not self.breaker_open and type(self) is RLBranch:
+        if not self.breaker_open and self._uses_default_rhs:
             self.rhs = self._closed_rhs
 
     def diode_blocks_reverse_current(self) -> bool:
         """Return whether this branch represents a diode-bounded current path."""
         return self.unilateral
+
+    def hold_voltage_source(self, terminal: Terminal, *, current_constraint=None) -> tuple:
+        """Publish the terminal voltage at which this branch's current is constant."""
+        closed = getattr(self._closed_rhs, "__func__", self._closed_rhs)
+        if (self.phases != 1 or self.unilateral
+                or closed is not RLBranch._rhs_bilateral):
+            raise ConfigError("a blocking port needs an ordinary scalar R-L branch")
+        if current_constraint is not None:
+            if not hasattr(self, "_current_constraints"):
+                self._current_constraints = []
+                self.project_state = self._project_current
+            self._current_constraints.append(current_constraint)
+        name = f"hold_{terminal.voltage}"
+        other = "u2" if terminal.voltage == "u1" else "u1"
+        if not hasattr(self.out, name):
+            self.out = _extend_record(self.out, name)
+            stages = getattr(self, "output_stages", (
+                OutputMethod("set_outputs", inputs=(), outputs=("i",)),))
+            self.output_stages = (*stages, OutputMethod(
+                f"set_{name}", inputs=(other,), outputs=(name,)))
+        return self, name
+
+    def _project_current(self) -> None:
+        targets = {value for read in self._current_constraints if (value := read()) is not None}
+        if len(targets) > 1:
+            raise ConfigError("incompatible current constraints on the same R-L branch")
+        if targets:
+            self.state.i = targets.pop()
+
+    def set_hold_u1(self, t: float) -> None:
+        self.out.hold_u1 = self.inp.u2 + self.R * self.state.i
+
+    def set_hold_u2(self, t: float) -> None:
+        self.out.hold_u2 = self.inp.u1 - self.R * self.state.i
 
     def dissipated_power(self) -> float:
         return self.power_scale * self.R * self.inp.loss_factor * abs(self.state.i) ** 2
@@ -227,13 +300,9 @@ class RCNode:
     state_names: ClassVar[tuple[str, ...]] = ("u_C",)
     outputs_need_inputs: ClassVar[bool] = True
     def __init__(self, C: float, R_d: float, u0: complex | float = 0j, *, phases: int = 3) -> None:
-        if phases not in (1, 3):
-            raise ValueError(f"phases must be 1 or 3, got {phases!r}")
+        self.power_scale, zero, initial = _phase_convention(phases, u0)
         self.C, self.R_d = C, R_d
         self.phases = phases
-        self.power_scale = 1.5 if phases == 3 else 1.0
-        initial = _complex(u0) if phases == 3 else _real(u0.real if isinstance(u0, complex) else u0)
-        zero = 0j if phases == 3 else 0.0
         self.ports = (PowerPort("out.u", "inp.i", self.power_scale),)
         self.storage = (StoragePort("u_C", C, self.power_scale, (("inp.i", 1.0),)),)
         self.state = _NodeState(u_C=initial)
@@ -267,35 +336,62 @@ class _SourceInp(Bag):
     __slots__ = ("i",)
 
 
-class ThreePhaseSource:
-    """Ideal three-phase voltage source ``e_g(t) = E exp(j (w0 t + phi(t)))``.
+class ACVoltageSource:
+    """Ideal single- or three-phase AC voltage source.
 
+    Three phases use ``E exp(j (w0 t + phi(t)))``; one phase uses its real cosine.
     ``w0`` is in rad/s, ``e_peak`` in V and ``phi(t)`` is the relative angle in rad.
-    Event handling updates ``e_peak`` or ``phi`` at the event time.
     """
 
     state_names: ClassVar[tuple[str, ...]] = ()
     outputs_need_inputs: ClassVar[bool] = False
     storage: ClassVar[tuple[StoragePort, ...]] = ()
-    ports: ClassVar[tuple[PowerPort, ...]] = (PowerPort("out.e_g", "inp.i", 1.5, -1.0),)
     has_source: ClassVar[bool] = True
 
     def __init__(self, w0: float, e_peak: float,
-                 phi: Optional[Callable[[float], float]] = None) -> None:
-        self.w0, self.e_peak = w0, e_peak
+                 phi: Optional[Callable[[float], float]] = None, *, phases: int = 3) -> None:
+        self.power_scale, zero, _ = _phase_convention(phases)
+        self.w0, self.e_peak, self.phases = w0, e_peak, phases
         self.phi = phi
         self.state = Empty()
-        self.inp = _SourceInp(i=0j)
+        self.inp = _SourceInp(i=zero)
         self.out = _SourceOut()
-        self.terminal = Terminal(self, "e_g", "i", -1, drives_voltage=True)
+        self.out.e_g = zero
+        self.ports = (PowerPort("out.e_g", "inp.i", self.power_scale, -1.0),)
+        self.terminal = Terminal(
+            self, "e_g", "i", -1, drives_voltage=True, electrical_domain="ac"
+        )
+        self._output_equation = (self._set_three_phase_outputs if phases == 3
+                                 else self._set_single_phase_outputs)
+        if type(self).set_outputs is ACVoltageSource.set_outputs:
+            self.set_outputs = self._output_equation
 
     def set_outputs(self, t: float) -> None:
+        """Evaluate the phase representation selected when the source was constructed."""
+        self._output_equation(t)
+
+    def _set_single_phase_outputs(self, t: float) -> None:
+        phi = self.phi(t) if self.phi is not None else 0.0
+        theta = self.w0 * t + phi
+        out = self.out
+        out.phi = phi
+        out.theta = theta
+        out.e_g = self.e_peak * math.cos(theta)
+
+    def _set_three_phase_outputs(self, t: float) -> None:
         phi = self.phi(t) if self.phi is not None else 0.0
         theta = self.w0 * t + phi
         out = self.out
         out.phi = phi
         out.theta = theta
         out.e_g = complex(self.e_peak * math.cos(theta), self.e_peak * math.sin(theta))
+
+    @classmethod
+    def uses_standard_outputs(cls, method: Any) -> bool:
+        """Whether ``method`` is one of the built-in phase-specialized source equations."""
+        return getattr(method, "__func__", None) in (
+            cls.set_outputs, cls._set_single_phase_outputs, cls._set_three_phase_outputs,
+        )
 
     def rhs(self, t: float):
         return ()
@@ -304,7 +400,7 @@ class ThreePhaseSource:
         return 0.0
 
     def supplied_power(self) -> float:
-        return 1.5 * (self.out.e_g * self.inp.i.conjugate()).real
+        return self.power_scale * (self.out.e_g * self.inp.i.conjugate()).real
 
 
 # ------------------------------------------------------------------ circuit element types
@@ -325,6 +421,7 @@ class Element:
 
     type: ClassVar[str]
     Params: ClassVar[type]
+    domain_transparent: ClassVar[bool] = False
 
 
 ELEMENT_TYPES: dict[str, type] = {}
@@ -417,8 +514,7 @@ class _ResistorModel:
     def __init__(self, resistance: float, phases: int, series: bool = False) -> None:
         self.resistance = resistance
         self.series = series
-        self.power_scale = 1.5 if phases == 3 else 1.0
-        zero = 0j if phases == 3 else 0.0
+        self.power_scale, zero, _ = _phase_convention(phases)
         self.state = Empty()
         self.inp = _ResistorInp(u=zero, i=zero)
         self.out = _ResistorOut(i=zero, u=zero, power=0.0)
@@ -432,6 +528,20 @@ class _ResistorModel:
             OutputMethod("set_voltage", ("u", "i") if series else (), ("u",), rhs=series),
             OutputMethod("set_power", ("i",) if series else ("u",), ("power",), rhs=False),
         )
+        if series:
+            self._current_equation = self._set_series_current
+            self._voltage_equation = self._set_series_voltage
+            self._loss_equation = self._series_loss
+        else:
+            self._current_equation = self._set_shunt_current
+            self._voltage_equation = self._set_shunt_voltage
+            self._loss_equation = self._shunt_loss
+        if type(self).set_current is _ResistorModel.set_current:
+            self.set_current = self._current_equation
+        if type(self).set_voltage is _ResistorModel.set_voltage:
+            self.set_voltage = self._voltage_equation
+        if type(self).dissipated_power is _ResistorModel.dissipated_power:
+            self.dissipated_power = self._loss_equation
 
     def set_outputs(self, t: float) -> None:
         self.set_current(t)
@@ -439,10 +549,24 @@ class _ResistorModel:
         self.set_power(t)
 
     def set_current(self, t: float) -> None:
-        self.out.i = self.inp.i if self.series else self.inp.u / self.resistance
+        """Evaluate the current equation selected when the resistor was constructed."""
+        self._current_equation(t)
 
     def set_voltage(self, t: float) -> None:
-        self.out.u = self.inp.u - self.resistance * self.inp.i if self.series else 0.0
+        """Evaluate the voltage equation selected when the resistor was constructed."""
+        self._voltage_equation(t)
+
+    def _set_series_current(self, t: float) -> None:
+        self.out.i = self.inp.i
+
+    def _set_series_voltage(self, t: float) -> None:
+        self.out.u = self.inp.u - self.resistance * self.inp.i
+
+    def _set_shunt_current(self, t: float) -> None:
+        self.out.i = self.inp.u / self.resistance
+
+    def _set_shunt_voltage(self, t: float) -> None:
+        self.out.u = 0.0
 
     def set_power(self, t: float) -> None:
         self.out.power = self.dissipated_power()
@@ -451,8 +575,13 @@ class _ResistorModel:
         return ()
 
     def dissipated_power(self) -> float:
-        if self.series:
-            return self.power_scale * self.resistance * abs(self.inp.i) ** 2
+        """Evaluate the loss equation selected when the resistor was constructed."""
+        return self._loss_equation()
+
+    def _series_loss(self) -> float:
+        return self.power_scale * self.resistance * abs(self.inp.i) ** 2
+
+    def _shunt_loss(self) -> float:
         return self.power_scale * abs(self.inp.u) ** 2 / self.resistance
 
     def supplied_power(self) -> float:
@@ -479,6 +608,7 @@ class Resistor(Element):
                 raise ConfigError("series must be bool")
 
     type = "resistor"
+    domain_transparent = True
 
     def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
         self.name, self.cfg = name, cfg
@@ -535,7 +665,7 @@ class _VoltageSourceModel:
         self.inp = _VoltageSourceInp(u=0.0)
         self.out = _VoltageSourceOut(i=0.0)
         self.ports = (PowerPort("inp.u", "out.i", 1.0),)
-        self.terminal = Terminal(self, "u", "i", 1)
+        self.terminal = Terminal(self, "u", "i", 1, electrical_domain="dc")
 
     def set_outputs(self, t: float) -> None:
         self.out.i = (self.inp.u - self.voltage) / self.resistance

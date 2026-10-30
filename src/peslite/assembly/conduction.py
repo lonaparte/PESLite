@@ -1,22 +1,48 @@
-"""Ideal-diode conduction handling around an otherwise generic ODE solver."""
+"""Ideal-diode conduction and discrete commutation around an otherwise generic ODE solver."""
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
 
-__all__ = ["DiodeConduction"]
+from .params import ConfigError
+from ..solver.model import commutation_tolerance
+
+__all__ = ["DiodeConduction", "CommutationError"]
+
+_MAX_COMMUTATIONS = 64  # commutations allowed at one instant before the model is rejected
+_LOCATOR_ITERATIONS = 80
+
+
+class CommutationError(RuntimeError):
+    """Commutating subsystems kept switching without time advancing (a Zeno condition)."""
 
 
 class DiodeConduction:
-    """Apply ideal-diode current blocking and DCM resolution for one assembled model.
+    """Apply ideal-diode blocking and exact discrete commutations for one assembled model.
 
-    A plant participates by declaring a zero lower state bound and providing
-    ``diode_blocks_reverse_current()`` for an exact-switching diode path, or
-    ``diode_maximum_step()`` when its averaged diode law needs a local resolution limit.
-    Solvers receive that limit through their generic per-call ``advance`` interface.
+    A plant participates in one of three ways:
+
+    * an ideal diode in series with one current state declares a zero lower state bound and
+      ``diode_blocks_reverse_current()``; the state is clamped at its located zero;
+    * an averaged diode law declares ``diode_maximum_step()``, a local resolution limit passed to
+      the solver through its generic per-call ``advance`` interface;
+    * a *commutating* subsystem holds a discrete state (for example the conducting pair of a diode
+      bridge or a switch position) that is valid while ``commutation_margin()`` is nonnegative.
+      ``commutate(t)`` changes it at the located instant where the margin becomes negative, and
+      an optional ``next_commutation_time()`` names a scheduled instant at which ``commutate`` is
+      called exactly. ``commutate`` may reinitialize the subsystem's own continuous states; their
+      values are written back into the state vector.
+
+    The margin is checked against the state *after* every probe interval, so a margin which an
+    outer event (a bridge edge, a register load) makes negative at the start of an interval is
+    handled exactly like one which crosses zero inside it. Between commutations the model is
+    smooth and the solver keeps its order. The probe interval is the fixed step ``dt`` or, for an
+    adaptive solver, its ``max_step``, which must then be finite: the checks must not depend on how
+    far apart the outer events (output, control and PWM instants) happen to be.
     """
 
     def __init__(self, model: Any, solver: Any = None) -> None:
@@ -33,56 +59,160 @@ class DiodeConduction:
             subsystem for subsystem in model.subsystems
             if callable(getattr(subsystem, "diode_maximum_step", None))
         )
+        self.commutating = tuple(
+            subsystem for subsystem in model.subsystems
+            if callable(getattr(subsystem, "commutation_margin", None))
+            and callable(getattr(subsystem, "commutate", None))
+        )
+        self._scheduled = tuple(
+            subsystem for subsystem in self.commutating
+            if callable(getattr(subsystem, "next_commutation_time", None))
+        )
+        if self.commutating and getattr(solver, "outer", None) is not None:
+            raise ConfigError(
+                "simulation.solver.subsystems: commutating subsystems "
+                f"{sorted(model.name_of(sub) for sub in self.commutating)} need a single-rate "
+                "solver; a windowed subsystem group cannot locate their commutation instants"
+            )
+        self._probe = None
+        if self.commutating and solver is not None:
+            dt = getattr(solver, "dt", None)
+            probe = dt if dt is not None and dt > 0.0 else getattr(solver, "max_step", math.inf)
+            if not math.isfinite(probe) or probe <= 0.0:
+                raise ConfigError(
+                    "simulation.solver.max_step must be finite with an adaptive solver: it is the "
+                    "interval at which commutating subsystems "
+                    f"{sorted(model.name_of(sub) for sub in self.commutating)} are checked"
+                )
+            self._probe = float(probe)
         validate = getattr(solver, "validate_local_step", None)
         if validate is not None:
             validate(self.resolution_subsystems)
 
     def __bool__(self) -> bool:
-        return bool(self.current_states or self.resolution_subsystems)
+        return bool(self.current_states or self.resolution_subsystems or self.commutating)
+
+    def synchronize(self, t: float, state: NDArray[np.float64]) -> None:
+        """Resolve boundary modes before measurements, controls or observations read them."""
+        self._settle(t, state)
 
     def advance(
             self, t0: float, t1: float, state: NDArray[np.float64]
     ) -> NDArray[np.float64]:
-        """Advance while enforcing this model's ideal-diode conduction transitions."""
+        """Advance all conduction guards through one locator and one boundary dispatcher."""
         if self.solver is None:
             raise RuntimeError("diode conduction cannot advance without a solver")
-        if not self.current_states:
+        if not self.current_states and not self.commutating:
             return self._advance_with_resolution(t0, t1, state)
-
+        if self.commutating:
+            state = self._settle(t0, state)
         t = t0
-        while t < t1 - 1e-15:
-            initial = state.copy()
-            trial = self._advance_with_resolution(t, t1, initial)
-            guarded = tuple(
-                index for subsystem, index in self.current_states
-                if subsystem.diode_blocks_reverse_current()
-            )
-            crossing = tuple(
-                index for index in guarded
-                if initial[index] > 0.0 and trial[index] < 0.0
-            )
-            if not crossing:
-                return trial
-
-            roots: list[tuple[float, int]] = []
-            for index in crossing:
-                lower, upper = t, t1
-                for _ in range(24):
-                    middle = lower + 0.5 * (upper - lower)
-                    value = self._advance_with_resolution(t, middle, initial)[index]
-                    if value > 0.0:
-                        lower = middle
+        end = t1 - commutation_tolerance(t1)
+        stalled = 0
+        while t < end:
+            target = min(t1, t + self._probe) if self._probe is not None else t1
+            scheduled = math.inf
+            if self._scheduled:
+                scheduled = min(float(sub.next_commutation_time()) for sub in self._scheduled)
+                target = min(target, scheduled)
+            guarded = tuple(index for sub, index in self.current_states
+                            if sub.diode_blocks_reverse_current() and state[index] > 0.0)
+            trial = self._advance_with_resolution(t, target, state.copy())
+            upper_margin = self._margin(target, trial, guarded)
+            if upper_margin < 0.0:
+                lower, upper = t, target
+                lower_margin = self._margin(t, state, guarded)
+                bisect_next = False
+                for _ in range(_LOCATOR_ITERATIONS):
+                    tolerance = commutation_tolerance(upper)
+                    width = upper - lower
+                    if width <= tolerance:
+                        break
+                    middle = lower + 0.5 * width
+                    interpolated = False
+                    if not bisect_next and lower_margin > 0.0 and upper_margin < 0.0:
+                        candidate = lower + width * lower_margin / (lower_margin - upper_margin)
+                        candidate = max(lower + tolerance, min(upper - tolerance, candidate))
+                        if lower < candidate < upper:
+                            middle = candidate
+                            interpolated = True
+                    # Alternation guarantees bracket contraction even if a secant hugs an end.
+                    bisect_next = interpolated
+                    value = self._advance_with_resolution(t, middle, state.copy())
+                    margin = self._margin(middle, value, guarded)
+                    invalid = margin < 0.0
+                    if invalid:
+                        upper, upper_margin, trial = middle, margin, value
                     else:
-                        upper = middle
-                roots.append((lower + 0.5 * (upper - lower), index))
-
-            first = min(at for at, _index in roots)
-            state = self._advance_with_resolution(t, first, initial)
-            for at, index in roots:
-                if abs(at - first) <= 2e-14:
-                    state[index] = 0.0
-            t = first
+                        lower, lower_margin = middle, margin
+                    if interpolated:
+                        # Verify the opposite side of an interpolated zero in time, rather than
+                        # accepting a small residual (a valid guard may have a zero plateau).
+                        adjacent = middle - tolerance if invalid else middle + tolerance
+                        if lower < adjacent < upper:
+                            value = self._advance_with_resolution(t, adjacent, state.copy())
+                            margin = self._margin(adjacent, value, guarded)
+                            if margin < 0.0:
+                                upper, upper_margin, trial = adjacent, margin, value
+                            else:
+                                lower, lower_margin = adjacent, margin
+                target = upper
+                for index in guarded:
+                    if trial[index] < 0.0:
+                        trial[index] = 0.0
+            state = trial
+            if self.commutating and (upper_margin < 0.0 or scheduled <= target):
+                state = self._settle(target, state)
+            if target == t1:
+                return state
+            stalled = stalled + 1 if target - t <= commutation_tolerance(t) else 0
+            if stalled >= _MAX_COMMUTATIONS:
+                raise CommutationError(f"t = {t:.12g} s: conduction events cannot advance time")
+            t = target
         return state
+
+    def _margin(self, t: float, state: NDArray[np.float64], guarded=()) -> float:
+        """Minimum guard margin; no owner lists are needed to bracket a boundary."""
+        if self.commutating:
+            self.model.sync(t, state)
+        margin = math.inf
+        for sub in self.commutating:
+            margin = min(margin, sub.commutation_margin())
+        for index in guarded:
+            if state[index] < margin:
+                margin = state[index]
+        return float(margin)
+
+    def _settle(self, t: float, state: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Dispatch every due schedule and invalid mode at the same physical boundary.
+
+        Scheduled and located guards share this path, including the initial boundary and events
+        exposed by another commutation. Each owner is synchronized before its state transition.
+        """
+        if not self.commutating:
+            return state
+        due = t + commutation_tolerance(t)
+        for _ in range(_MAX_COMMUTATIONS):
+            self.model.sync(t, state)
+            pending = {sub for sub in self.commutating if sub.commutation_margin() < 0.0}
+            pending.update(sub for sub in self._scheduled
+                           if float(sub.next_commutation_time()) <= due)
+            if not pending:
+                return state
+            for sub in self.commutating:
+                if sub not in pending:
+                    continue
+                self.model.sync(t, state)
+                scheduled = sub in self._scheduled and float(sub.next_commutation_time()) <= due
+                if not scheduled and sub.commutation_margin() >= 0.0:
+                    continue
+                sub.commutate(t)
+                state[:] = self.model.get_initial_values()
+        names = sorted(self.model.name_of(sub) for sub in pending)
+        raise CommutationError(
+            f"t = {t:.12g} s: {names} commutated {_MAX_COMMUTATIONS} times without time "
+            "advancing; the configured circuit has no consistent conduction state here"
+        )
 
     def _advance_with_resolution(
             self, t0: float, t1: float, state: NDArray[np.float64]

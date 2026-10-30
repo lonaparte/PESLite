@@ -15,7 +15,7 @@ interface must use the matching PESLite version.
 
 ```text
 src/peslite/
-├── components/   network, converter, ADC and PWM hardware
+├── components/   network, converter, WPT link, ADC and PWM hardware
 ├── control/      control loops, graphs, startup and modulation
 ├── assembly/     parameters, events, protection, units, systems and exporters
 ├── solver/       connected model kernel, energy model, integrators and simulation run
@@ -42,27 +42,26 @@ core time stepping never imports the analysis implementation; the CLI loads it o
 finite-difference calculation without depending on the stability addon.
 See [Small-Signal Stability Analysis](Small-Signal-Analysis.md).
 
-Loading a simulation file also merges a sibling `PESaddons/` tree into these three package paths.
-Its controller and component modules register before parameter-schema resolution; its function
-modules remain lazy. The merge is a construction-time project extension and adds no work to the
-simulation loop. `PESaddons` is anchored to the simulation file, while the CLI's default `output/`
-directory is anchored to the current working directory.
+Loading a simulation file also merges a sibling `PESaddons/` tree into these three package paths
+without adding run-loop work; see
+[Project Workspace](Project-Workspace.md#project-local-pesaddons).
 
 ## Components
 
 `components/network.py` contains grid sources, R-L branches, bus R-C nodes and registered element
-types. `components/converter.py` provides the common lossless bridge boundary, three bridge
-implementations and DC-link models. `components/adc.py` and `components/pwm.py` implement sampled
+types. `components/converter.py` provides the common lossless bridge boundary, bridge topologies,
+simulation models and DC-link models. `components/wpt.py` provides compensated WPT links and
+switch-controlled capacitors. `components/adc.py` and `components/pwm.py` implement sampled
 converter peripherals.
 
 Physical component state and parameters are SI quantities. Components declare ports, state,
 derivatives and energy/storage relationships without knowing the global system order.
 
-Every physical network attachment uses the same construction-time `Terminal` contract. A terminal
-names its voltage and current once, with positive direction defined into the component, and states
-whether it drives or follows the bus voltage. Each named bus has exactly one voltage driver. System
-assembly fans that voltage out, sums every signed terminal current into the driver, and lowers the
-result to direct model connections before integration begins.
+Every physical network attachment uses the construction-time `Terminal` contract. A terminal names
+its voltage and current, declares whether positive current enters or leaves the component and
+identifies whether it drives or follows voltage; assembly lowers those declarations to direct
+model connections. See
+[Extending PESLite](Extending-PESLite.md#custom-circuit-elements).
 
 ## Control
 
@@ -73,7 +72,8 @@ groups iteratively.
 
 The graph has one typed, directed boundary. Its input ports are measured feedback signals
 (`meas.*`) and controller references (`references.*`). Its output schema belongs to that boundary:
-AC control exposes `u_dq`, `theta` and `omega`, while scalar bridge control exposes `duty`. A
+AC control exposes `u_dq`, `theta` and `omega`, while scalar bridge control exposes its modulator
+registers, such as `duty` (see [Converter and Bridge Models](Converter-and-Bridge-Models.md)). A
 connection always binds a loop input to a boundary or loop output. Default wiring and explicit
 custom wiring are both lowered to this same graph before the run.
 
@@ -103,10 +103,9 @@ owns its power stage, controller, sensing, startup interface, breakers and gates
 Construction assembles these objects without issuing connection commands. Before loading named
 control state, the connection owner initializes its source and controller command once from the
 event timeline. After state loading, cold starts track the physical inputs and restore
-bridge/ADC timing; restarts preserve the supplied control state. Cold-start and reconnect
-tracking use the same loop `track()`
-callbacks in Python and generated C++, including custom loops. Parameter selection does not
-change this initialization sequence.
+bridge/ADC timing; restarts preserve the supplied control state. Cold-start and reconnect tracking
+use the same loop `track()` callbacks in Python and generated C++, including custom loops.
+Parameter selection does not change this initialization sequence.
 
 The contract also assembles two internal power boundaries. `<unit>.bus.dc` connects a DCLink
 voltage driver to the bridge DC terminal. `<unit>.bus.power` always denotes the bridge power-side
@@ -116,8 +115,8 @@ a WPT link. Normally, a filter's other terminal connects to the public bus selec
 connects to the lower rail, while the filter connects the midpoint power bus to the common point.
 This is the single-inductor Buck-Boost connection. The scoped internal names disappear into direct
 connections; there is no runtime bus lookup or WPT-specific solver path. Every Unit exposes named
-ports and one default port. A
-single-port Unit selects it automatically; a multi-port Unit type must select one explicitly.
+ports and one default port. A single-port Unit selects it automatically; a multi-port Unit type
+must select one explicitly.
 Composite ports forward existing child ports without copying their electrical base. WPT exposes
 `primary` and `secondary` and selects `primary` by default, so common assembly, event scaling and
 solver ratings never interpret those WPT-specific names.
@@ -136,19 +135,10 @@ converter units without WPT-specific scheduling.
 For compatibility with version 0.3.0 files, an omitted type means `vsc`; DC converters always use
 the explicit `dc_converter` type.
 
-Parameter ownership is explicit:
-
-| Scope | Selector | Fields interpreted in that scope |
-|---|---|---|
-| Common converter unit | none | `bus`, initial `connected` command, `dclink`, `pwm`, `ctrl`, `bridge`, `meas`, `protection`, `s_base`, resolved `base`, and unit events |
-| VSC only | `unit.type: vsc` | `ac_filter` |
-| DC converter only | `unit.type: dc_converter` | `filter`; a composite parent may omit it and the common `bus`, creating a scoped internal power bus |
-| WPT composite only | `unit.type: wpt` | `primary`, `secondary`, and `link`; it has no bridge, PWM or controller of its own |
-| Common bridge | none | `type` selects `three_phase_bridge`, `half_bridge`, or `full_bridge`; `model` independently selects switching, PWM averaging, or ideal averaging |
-| Half bridge only | `bridge.type: half_bridge` | `upper_controlled`, `lower_controlled`, `reverse_port`, and `external_terminal` |
-| Common control | none | `type`, `period`, `computation`, `loops`, `connections`, and `outputs` |
-| Control architecture | `ctrl.type` | reference fields and default wiring unique to the selected architecture |
-| Control loop | `ctrl.loops.<ClassName>` | parameters unique to the selected loop class |
+Parameter ownership is explicit: all converter units share common fields; `unit.type` adds
+electrical fields, `bridge.type` topology fields, `ctrl.type` reference/default-wiring fields, and
+each `ctrl.loops` key its class parameters. See
+[Simulation Files](Simulation-Files.md#units-and-per-unit-values).
 
 Every `ctrl` section is represented by the same `ControlParams` type. Its discriminator narrows the
 valid fields inside that object; it never switches to another public parameter container. The unit
@@ -184,7 +174,10 @@ use one integration method.
 - requested end and output times;
 - file events;
 - converter ADC, control, PWM load and switching instants;
-- multirate window boundaries.
+- continuous-unit measurement/protection clocks;
+- observation times requested by analyses such as the small-signal report.
+
+Multirate windows advance inside the solver and settle before model-changing events.
 
 The solver advances only to that boundary. The simulation then settles deferred work, applies file
 events, evaluates fast protection, samples every due unit, actuates every unit and records output.

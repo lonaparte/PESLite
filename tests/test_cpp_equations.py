@@ -10,7 +10,7 @@ from peslite.assembly.cpp import (_ALGEBRAIC_SOLVER, _ControlGenerator, _ModelGe
                                   _RuntimeParameters, _number, _uses_implementation)
 from peslite.components import Bag
 from peslite.components.converter import DCCapacitor, DCLink, DCVoltageSource
-from peslite.components.network import RLBranch, RCNode, ThreePhaseSource
+from peslite.components.network import ACVoltageSource, RLBranch, RCNode
 from peslite.solver.model import Empty, Model
 from peslite.control import Loop
 from peslite.control.blocks import PI
@@ -29,7 +29,8 @@ def _generator(model):
     return _ModelGenerator(simulation, None)
 
 
-def _run_model(model, readings, tmp_path, *, times=(0.0,)):
+def _run_model(model, readings, tmp_path, *, times=(0.0,), initial_state=None,
+               check_floating_exceptions=False):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
@@ -39,7 +40,7 @@ def _run_model(model, readings, tmp_path, *, times=(0.0,)):
     source = tmp_path / "equations.cpp"
     initial = ", ".join(_number(value) for value in model.get_initial_values())
     source.write_text(
-        '#include <algorithm>\n#include <array>\n#include <cmath>\n#include <complex>\n'
+        '#include <algorithm>\n#include <array>\n#include <cmath>\n#include <complex>\n#include <cfenv>\n#include <cstdlib>\n'
         '#include <iomanip>\n#include <iostream>\n#include <limits>\n#include <stdexcept>\n'
         'using Complex = std::complex<double>;\n' + _ALGEBRAIC_SOLVER
         + '\nstruct Probe {\n' + '\n'.join(generator.members())
@@ -48,15 +49,19 @@ def _run_model(model, readings, tmp_path, *, times=(0.0,)):
         + '\nstd::cout << std::setprecision(17)'
         + ''.join(f" << std::real({item}) << ' ' << std::imag({item}) << ' '"
                   for item in expressions)
-        + ';\n}\n};\nint main() { try { Probe probe; '
-        + ''.join(f'probe.run({_number(t)});' for t in times) + '} '
+        + ';\n}\n};\nint main(int argc, char** argv) { try { Probe probe; '
+        + ('if (argc > 1) probe.y[0] = std::strtod(argv[1], nullptr); ' if initial_state is not None else '')
+        + ('std::feclearexcept(FE_ALL_EXCEPT); ' if check_floating_exceptions else '')
+        + ''.join(f'probe.run({_number(t)});' for t in times)
+        + ('if (std::fetestexcept(FE_INVALID | FE_DIVBYZERO)) return 3; ' if check_floating_exceptions else '') + '} '
         + 'catch(const std::exception& e) { std::cerr << e.what(); return 2; } }\n',
         encoding="utf-8",
     )
     executable = tmp_path / "equations"
     subprocess.run([compiler, "-O2", "-std=c++17", str(source), "-o", str(executable)],
                    check=True, capture_output=True, text=True)
-    result = subprocess.run([str(executable)], capture_output=True, text=True)
+    result = subprocess.run([str(executable), *([] if initial_state is None else [str(initial_state)])],
+                            capture_output=True, text=True)
     if result.returncode:
         raise RuntimeError(result.stderr)
     values = np.fromstring(result.stdout, sep=" ").reshape(-1, 2)
@@ -69,6 +74,35 @@ class _Input(Bag):
 
 class _Output(Bag):
     __slots__ = ("value",)
+
+
+class _RepeatedEquation:
+    state_names = ("x",)
+    outputs_need_inputs = False
+
+    def __init__(self):
+        self.state = _Input(x=0.0)
+        self.inp = Empty()
+        self.out = _Output()
+
+    def set_outputs(self, t):
+        x = self.state.x
+        common = (x + 1.25) * (x + 2.5) * (x + 3.75)
+        self.out.value = common + common * (1.0 / x + np.sqrt(x)) if x > 0.0 else common
+
+    def rhs(self, t):
+        return (0.0,)
+
+
+@pytest.mark.parametrize("value", [-1.0, 0.0, 2.0])
+def test_shared_expressions_preserve_guarded_division_and_square_root(value, tmp_path):
+    component = _RepeatedEquation()
+    component.state.x = value
+    model = Model({"component": component}, {})
+    component.set_outputs(0.0)
+    actual, = _run_model(model, [(component.out, "value")], tmp_path,
+                         initial_state=value, check_floating_exceptions=True)
+    assert actual == pytest.approx(component.out.value)
 
 
 class _Feedback:
@@ -205,12 +239,25 @@ def test_native_multivariable_feedback_keeps_the_previous_output_between_calls(t
 
 
 def test_native_inherited_source_keeps_the_existing_adapter():
-    class AnnotatedSource(ThreePhaseSource):
+    class AnnotatedSource(ACVoltageSource):
         pass
 
     source = AnnotatedSource(314.0, 325.0)
     generator = _generator(Model({'source': source}, {}))
     assert any('std::cos' in line for line in generator._output(source.set_outputs))
+
+
+@pytest.mark.parametrize("phases", [1, 3])
+def test_native_ac_source_preserves_the_connected_phase_representation(phases, tmp_path):
+    source = ACVoltageSource(2.0 * np.pi * 50.0, 325.0, phases=phases)
+    model = Model({"source": source}, {})
+    times = (0.0, 1.0e-3, 2.5e-3)
+    actual = _run_model(model, [(source.out, "e_g")], tmp_path, times=times)
+    expected = []
+    for time in times:
+        source.set_outputs(time)
+        expected.append(source.out.e_g)
+    np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
 
 
 class _ModifiedBranch(RLBranch):

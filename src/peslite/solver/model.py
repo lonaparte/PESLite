@@ -13,6 +13,7 @@ real columns of ``states.csv`` and resolved from ``initial.states`` values.
 
 from __future__ import annotations
 
+import cmath
 import keyword
 import linecache
 import math
@@ -28,8 +29,8 @@ from numpy.typing import NDArray
 
 from . import energy as _energy
 
-__all__ = ["ConfigError", "Bag", "Empty", "OutputMethod", "Subsystem", "Model", "GroupPlan",
-           "Stateful", "StateRegistry", "join", "gather", "scatter", "flatten", "resolve",
+__all__ = ["ConfigError", "LocatedZero", "Bag", "Empty", "OutputMethod", "Subsystem", "Model",
+           "GroupPlan", "Stateful", "StateRegistry", "join", "gather", "scatter", "flatten", "resolve",
            "expand_aliases", "assign"]
 
 
@@ -39,10 +40,47 @@ class ConfigError(ValueError):
     """Invalid model or solver configuration."""
 
 
+def commutation_tolerance(t: float) -> float:
+    """Absolute time resolution shared by commutation owners and their dispatcher."""
+    return 1e-15 * max(1.0, abs(t))
+
+
+class LocatedZero:
+    """The sign of a signal (a current) between its exactly located zeros.
+
+    Values are compared with the *residual* the signal had at its last located zero, not with
+    zero, so the solver's residual at that instant does not register as another crossing.
+    ``sign`` is +1 or -1 while the signal keeps that sign and 0 while it is held at its zero.
+    """
+
+    __slots__ = ("sign", "residual")
+
+    def __init__(self, sign: float = 0.0, residual: float = 0.0) -> None:
+        self.sign = float(sign)
+        self.residual = float(residual)
+
+    def offset(self, value: float) -> float:
+        return value - self.residual
+
+    def margin(self, value: float, tolerance: float = 0.0) -> float:
+        """Nonnegative while ``value`` keeps ``sign``, or (sign 0) stays within ``tolerance`` of
+        its located zero."""
+        offset = value - self.residual
+        return self.sign * offset if self.sign else tolerance - abs(offset)
+
+    def locate(self, value: float, sign: float) -> None:
+        """Record a located zero with residual ``value``; the signal continues with ``sign``."""
+        self.residual = _real(value)
+        self.sign = _real(sign)
+
+
 def _real(value):
     """Normalize scalar numbers while preserving their arithmetic semantics."""
     if hasattr(value, "item"):
-        value = value.item()
+        scalar = value.item()
+        if scalar is value:
+            return scalar
+        value = scalar
     return value if isinstance(value, numbers.Real) else float(value)
 
 
@@ -101,7 +139,9 @@ class Subsystem(Protocol):
     ``outputs_need_inputs``: whether ``set_outputs`` reads ``inp``; optional ``output_stages``
     (tuple of :class:`OutputMethod`) replaces ``set_outputs``. A subsystem may declare real-state
     unilateral constraints as ``state_bounds = {name: (lower, upper)}``, using ``None`` for an
-    open side.
+    open side. An optional ``project_state()`` enforces coupled constraints on the component's
+    own state. The host applies projections after integration and when preparing audit states;
+    they must be idempotent and must not change other components or discrete modes.
     ``out`` and connected ``inp`` fields are current when ``rhs`` runs.
     """
 
@@ -247,6 +287,16 @@ class StateRegistry:
             for state in group.states:
                 if state.local_name in declared or isinstance(values[state.local_name], (bool, int)):
                     names.add(state.name)
+        return frozenset(names)
+
+    @property
+    def angle_names(self) -> frozenset[str]:
+        """States an owner declares as angles (rad) in ``angle_state_names``: compared and
+        differenced modulo a turn by post-run loop maps."""
+        names = set()
+        for group in self._groups:
+            declared = set(getattr(group.part, "angle_state_names", ()))
+            names.update(state.name for state in group.states if state.local_name in declared)
         return frozenset(names)
 
     @property
@@ -506,13 +556,57 @@ def _copy_value(operation: tuple) -> Any:
 
 
 def _run_output_operation(operation: tuple, t: float) -> None:
-    """Execute one uncompiled output/copy operation."""
+    """Execute one uncompiled output, algebraic-loop or copy operation."""
     kind, item = operation
-    if kind == "out":
-        item(t)
+    if kind == "copy":
+        setattr(item[0], item[1], _copy_value(item))
     else:
-        dst, field, _src, _src_field, _fanin = item
-        setattr(dst, field, _copy_value(item))
+        item(t)
+
+
+def _source_writers(env: dict[str, Any]):
+    """Writers for generated source executed in ``env``.
+
+    ``ref(obj)`` names ``obj`` in ``env``; ``put`` assigns a field; ``value`` is a copy operation's
+    value; ``step`` writes one output-plan operation.
+    """
+    refs: dict[int, str] = {}
+
+    def ref(obj: Any) -> str:
+        key = refs.get(id(obj))
+        if key is None:
+            key = refs[id(obj)] = f"_{len(refs)}"
+            env[key] = obj
+        return key
+
+    def plain(field: str) -> bool:
+        return field.isidentifier() and not keyword.iskeyword(field)
+
+    def get(obj: Any, field: str) -> str:
+        return f"{ref(obj)}.{field}" if plain(field) else f"getattr({ref(obj)}, {field!r})"
+
+    def put(obj: Any, field: str, value: str) -> str:
+        return f"{ref(obj)}.{field} = {value}" if plain(field) else f"setattr({ref(obj)}, {field!r}, {value})"
+
+    def value(item: tuple) -> str:
+        _dst, _field, src, src_field, fanin = item
+        if fanin is None:
+            return get(src, src_field)
+        expression = "0"
+        for out, name, gain in fanin:
+            expression = f"({expression} + {ref(gain)} * {get(out, name)})"
+        return expression
+
+    def step(operation: tuple) -> str:
+        kind, item = operation
+        return put(item[0], item[1], value(item)) if kind == "copy" else f"{ref(item)}(t)"
+
+    return ref, put, value, step
+
+
+def _function(signature: str, body: list[str]) -> list[str]:
+    """Source lines for a generated function."""
+    return [f"def {signature}:"] + ["    " + line for line in body or ["pass"]]
 
 
 def _signal_error(a: Any, b: Any) -> tuple[float, float]:
@@ -536,7 +630,7 @@ class _AlgebraicLoop:
     """
 
     __slots__ = ("operations", "tears", "owners", "labels", "max_sweeps", "rtol", "atol",
-                 "_inverse", "_scalar_sweep")
+                 "_inverse", "_scalar_sweep", "_hooks")
     step_limit = 10.0
 
     def __init__(self, operations: tuple, tears: tuple, owners: tuple,
@@ -547,6 +641,11 @@ class _AlgebraicLoop:
         self.operations = tuple(operation for operation in operations
                                 if not (operation[0] == "copy" and id(operation[1]) in torn))
         self.owners = owners
+        self._hooks = tuple(
+            (owner.begin_algebraic, owner.end_algebraic)
+            for owner in owners
+            if getattr(owner, "begin_algebraic", None) is not None
+        )
         self.labels = labels
         self.max_sweeps = max_sweeps
         self.rtol = rtol
@@ -557,87 +656,42 @@ class _AlgebraicLoop:
     def _compile_scalar_sweep(self):
         """Compile the torn scalar assignment and its acyclic operations into one Python call."""
         env: dict[str, Any] = {}
-        refs: dict[int, str] = {}
-
-        def ref(obj: Any) -> str:
-            key = refs.get(id(obj))
-            if key is None:
-                key = refs[id(obj)] = f"_{len(refs)}"
-                env[key] = obj
-            return key
-
-        def get(obj: Any, field: str) -> str:
-            return (f"{ref(obj)}.{field}" if field.isidentifier() and not keyword.iskeyword(field)
-                    else f"getattr({ref(obj)}, {field!r})")
-
-        def put(obj: Any, field: str, value: str) -> str:
-            return (f"{ref(obj)}.{field} = {value}"
-                    if field.isidentifier() and not keyword.iskeyword(field)
-                    else f"setattr({ref(obj)}, {field!r}, {value})")
-
-        def value(item: tuple) -> str:
-            _dst, _field, src, src_field, fanin = item
-            if fanin is None:
-                return get(src, src_field)
-            expression = "0"
-            for out, name, gain in fanin:
-                expression = f"({expression} + {ref(gain)} * {get(out, name)})"
-            return expression
-
+        _ref, put, value, step = _source_writers(env)
         tear = self.tears[0]
-        body = [put(tear[0], tear[1], "x")]
-        for kind, item in self.operations:
-            if kind == "out":
-                body.append(f"{ref(item)}(t)")
-            else:
-                body.append(put(item[0], item[1], value(item)))
-        body.append("return " + value(tear))
-        source = "def sweep(t, x):\n" + "\n".join("    " + line for line in body) + "\n"
+        body = [put(tear[0], tear[1], "x"), *map(step, self.operations), "return " + value(tear)]
+        source = "\n".join(_function("sweep(t, x)", body)) + "\n"
         exec(compile(source, "<peslite algebraic scalar>", "exec"), env)
         return env["sweep"]
 
-    def _evaluate_scalar(self, t: float, x: complex | float) -> complex | float:
-        return self._scalar_sweep(t, x)
-
-    def _close(self, a: Any, b: Any) -> bool:
-        error, scale = _signal_error(a, b)
-        return error <= self.atol + self.rtol * scale
-
-    @staticmethod
-    def _finite_scalar(value: Any) -> bool:
-        return (isinstance(value, (int, float, complex))
-                and math.isfinite(value.real if isinstance(value, complex) else value)
-                and (not isinstance(value, complex) or math.isfinite(value.imag)))
-
     def _scalar(self, t: float) -> None:
-        """Warm-started secant solve for the common one-scalar feedback case."""
-        item = self.tears[0]
-        dst, field, _src, _src_field, _fanin = item
+        """Warm-started secant solve for a scalar feedback system."""
+        dst, field, _src, _src_field, _fanin = self.tears[0]
+        sweep, atol, rtol, limit = self._scalar_sweep, self.atol, self.rtol, self.step_limit
         x0 = getattr(dst, field)
-        y0 = self._evaluate_scalar(t, x0)
+        y0 = sweep(t, x0)
         r0 = y0 - x0
-        if self._close(y0, x0):
+        scale = max(1.0, abs(x0), abs(y0))
+        if abs(r0) <= atol + rtol * scale:
             return
 
         inverse = self._inverse
         x1 = x0 - inverse * r0 if inverse is not None else y0
-        scale = max(1.0, abs(x0), abs(y0))
-        if (not self._finite_scalar(x1)) or abs(x1 - x0) > self.step_limit * scale:
+        if not cmath.isfinite(x1) or abs(x1 - x0) > limit * scale:
             x1 = y0
         for _iteration in range(self.max_sweeps - 1):
-            y1 = self._evaluate_scalar(t, x1)
+            y1 = sweep(t, x1)
             r1 = y1 - x1
             denominator = r1 - r0
             if denominator != 0:
                 estimate = (x1 - x0) / denominator
-                if self._finite_scalar(estimate):
+                if cmath.isfinite(estimate):
                     self._inverse = estimate
-            if self._close(y1, x1):
+            scale = max(1.0, abs(x1), abs(y1))
+            if abs(r1) <= atol + rtol * scale:
                 return
             inverse = self._inverse
             x2 = x1 - inverse * r1 if inverse is not None else y1
-            scale = max(1.0, abs(x1), abs(y1))
-            if (not self._finite_scalar(x2)) or abs(x2 - x1) > self.step_limit * scale:
+            if not cmath.isfinite(x2) or abs(x2 - x1) > limit * scale:
                 x2 = y1
             x0, r0, x1 = x1, r1, x2
         raise FloatingPointError(
@@ -646,12 +700,8 @@ class _AlgebraicLoop:
         )
 
     def __call__(self, t: float) -> None:
-        begun = []
-        for owner in self.owners:
-            begin = getattr(owner, "begin_algebraic", None)
-            if begin is not None:
-                begin()
-                begun.append(owner)
+        for begin, _end in self._hooks:
+            begin()
         try:
             if len(self.tears) == 1:
                 item = self.tears[0]
@@ -684,8 +734,8 @@ class _AlgebraicLoop:
                 + ", ".join(self.labels)
             )
         finally:
-            for owner in begun:
-                owner.end_algebraic()
+            for _begin, end in self._hooks:
+                end()
 
 
 class GroupPlan:
@@ -695,12 +745,25 @@ class GroupPlan:
     ``own``: member outputs and intra-group copies only. ``feed``: copies from outside the group.
     """
 
-    __slots__ = ("members", "mask", "plan", "own", "feed", "inputs", "rhs")
+    __slots__ = (
+        "members", "mask", "plan", "own", "feed", "inputs", "rhs",
+        "run_plan", "run_own", "run_feed",
+    )
 
     def __init__(self, members: tuple, mask: NDArray[np.bool_], plan: tuple, own: tuple, feed: tuple,
                  inputs: tuple, rhs: tuple) -> None:
         self.members, self.mask, self.plan, self.own, self.feed, self.inputs, self.rhs = (
             members, mask, plan, own, feed, inputs, rhs)
+        env: dict[str, Any] = {}
+        step = _source_writers(env)[3]
+        runs = {"run_plan": plan, "run_own": own, "run_feed": feed}
+        source = "\n".join(
+            line
+            for name, operations in runs.items()
+            for line in _function(f"{name}(t)", [*map(step, operations)])
+        ) + "\n"
+        exec(compile(source, "<peslite group plan>", "exec"), env)
+        self.run_plan, self.run_own, self.run_feed = (env[name] for name in runs)
 
 
 def _snake(name: str) -> str:
@@ -899,6 +962,8 @@ class Model:
                     )
                 bounds.append((entry[0], lower, upper))
         self._state_bounds = tuple(bounds)
+        self._state_projections = tuple(sub.project_state for sub in self.subsystems
+                                        if callable(getattr(sub, "project_state", None)))
         # stateful subsystems with complex flags, in vector order
         self._rhs_flags = tuple((sub, tuple(is_c for _idx, is_c in entries))
                                 for sub, entries in rhs_layout if entries)
@@ -1099,58 +1164,20 @@ class Model:
                     or any(dependency in affected for dependency in self._plan_dependencies[i])):
                 affected.add(i)
         self._zoh_plan = tuple(sorted(affected))
-        # staged subsystems appear once per output call
-        aliases = [s for s in self.subsystems if id(s) in legacy and legacy[id(s)] is None]
-        output_order = list(aliases)
-        for (kind, _), (op_owners, _) in zip(self._plan, self._plan_owners):
-            if kind not in ("out", "algebraic"):
-                continue
-            for owner in op_owners:
-                if owner not in output_order:
-                    output_order.append(owner)
-        self.output_order = output_order
 
     def _compile(self) -> None:
         """Generate and compile ``_load``, ``_outputs``, ``rhs_list`` (source in ``compiled_source``)."""
         owners = {id(s): n for n, s in zip(self.names, self.subsystems)}
         env: dict[str, Any] = {}
-        refs: dict[int, str] = {}
-
-        def ref(obj: Any) -> str:
-            key = refs.get(id(obj))
-            if key is None:
-                key = refs[id(obj)] = f"_{len(refs)}"
-                env[key] = obj
-            return key
-
-        def plain(field: str) -> bool:
-            return field.isidentifier() and not keyword.iskeyword(field)
-
-        def get(obj: Any, field: str) -> str:
-            return f"{ref(obj)}.{field}" if plain(field) else f"getattr({ref(obj)}, {field!r})"
-
-        def put(obj: Any, field: str, value: str) -> str:
-            return f"{ref(obj)}.{field} = {value}" if plain(field) else f"setattr({ref(obj)}, {field!r}, {value})"
-
+        ref, put, _value, step = _source_writers(env)
         load = [put(st, name, f"complex(v[{idx}], v[{idx + 1}])" if is_c else f"v[{idx}]")
                 for st, name, idx, is_c in self._state_ops]
 
         plan, derivative_plan = [], []
-        for (kind, item), (op_owners, _srcs), rhs_required in zip(
+        for operation, (op_owners, _srcs), rhs_required in zip(
                 self._plan, self._plan_owners, self._plan_rhs):
-            if kind in ("out", "algebraic"):
-                line = f"{ref(item)}(t)"
-            else:
-                dst, field, src, src_field, fanin = item
-                if fanin is None:
-                    value = get(src, src_field)
-                else:
-                    value = "0"
-                    for out, name, gain in fanin:
-                        value = f"({value} + {ref(gain)} * {get(out, name)})"
-                line = put(dst, field, value)
             comment = ", ".join(owners[id(owner)] for owner in op_owners)
-            line = f"{line}  # {comment}"
+            line = f"{step(operation)}  # {comment}"
             plan.append(line)
             if rhs_required:
                 derivative_plan.append(line)
@@ -1162,13 +1189,10 @@ class Model:
             for d, is_c in zip(got, flags):
                 packed += [f"{d}.real", f"{d}.imag"] if is_c else [d]
 
-        def function(signature: str, body: list[str]) -> list[str]:
-            return [f"def {signature}:"] + ["    " + line for line in body or ["pass"]]
-
-        source = "\n".join(function("_load(v)", load) + function("_outputs(t)", plan)
-                           + function("_zoh_outputs(t)", [plan[i] for i in self._zoh_plan])
-                           + function("rhs_list(t, v)", load + derivative_plan + derive
-                                      + [f"return [{', '.join(packed)}]"])) + "\n"
+        source = "\n".join(_function("_load(v)", load) + _function("_outputs(t)", plan)
+                           + _function("_zoh_outputs(t)", [plan[i] for i in self._zoh_plan])
+                           + _function("rhs_list(t, v)", load + derivative_plan + derive
+                                       + [f"return [{', '.join(packed)}]"])) + "\n"
         filename = f"<peslite model {id(self):#x}>"
         exec(compile(source, filename, "exec"), env)
         linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
@@ -1234,28 +1258,13 @@ class Model:
         rhs = tuple((sub, entries) for sub, entries in self._rhs_layout if entries and id(sub) in member_ids)
         return GroupPlan(tuple(members), mask, plan, own, feed, inputs, rhs)
 
-    def run_plan(self, t: float, plan: tuple) -> None:
-        """Run a plan (subset of the output plan) on the current subsystem records."""
-        for kind, item in plan:
-            if kind in ("out", "algebraic"):
-                item(t)
-            else:
-                dst_inp, dst_name, src_out, src_name, fanin = item
-                if fanin is None:
-                    setattr(dst_inp, dst_name, getattr(src_out, src_name))
-                else:
-                    total = 0
-                    for out, name, gain in fanin:
-                        total += gain * getattr(out, name)
-                    setattr(dst_inp, dst_name, total)
-
     def rhs_group(self, t: float, y: NDArray[np.float64], group: GroupPlan, own: bool = False) -> NDArray[np.float64]:
         """Return the derivatives of one group's states (zeros elsewhere) for the full state ``y``.
 
         ``own=True`` keeps inputs from outside the group unchanged.
         """
         self.set_states(y)
-        self.run_plan(t, group.own if own else group.plan)
+        (group.run_own if own else group.run_plan)(t)
         dy = np.zeros(self.n_states)
         for sub, entries in group.rhs:
             for d, (idx, is_c) in zip(sub.rhs(t), entries):
@@ -1283,16 +1292,21 @@ class Model:
 
     @property
     def has_state_bounds(self) -> bool:
-        """Whether any subsystem declares a real-state constraint."""
-        return bool(self._state_bounds)
+        """Whether any subsystem declares bounds or a state projection."""
+        return bool(self._state_bounds or self._state_projections)
 
     def project_states(self, y: NDArray[np.float64]) -> NDArray[np.float64]:
-        """Project declared real-state bounds in place and return ``y``."""
+        """Apply declared bounds and component-owned state constraints in place."""
         for index, lower, upper in self._state_bounds:
             if lower is not None and y[index] < lower:
                 y[index] = lower
             elif upper is not None and y[index] > upper:
                 y[index] = upper
+        if self._state_projections:
+            self.set_states(y)
+            for project in self._state_projections:
+                project()
+            y[:] = self.get_initial_values()
         return y
 
     def state_labels(self) -> list[str]:
@@ -1326,6 +1340,16 @@ class Model:
             for name in sub.state_names:
                 out[f"{sname}.{name}"] = getattr(st, name)
         return out
+
+    @property
+    def angle_state_names(self) -> tuple[str, ...]:
+        """Qualified continuous states declared as angles by their owning subsystems."""
+        return tuple(
+            f"{prefix}.{name}"
+            for prefix, subsystem in zip(self.names, self.subsystems)
+            for name in getattr(subsystem, "angle_state_names", ())
+            if name in subsystem.state_names
+        )
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         """Write named states into the subsystem records (repack with :meth:`get_initial_values`)."""

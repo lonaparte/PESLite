@@ -10,11 +10,11 @@ import pytest
 import peslite
 import peslite.components
 from peslite.components import (
-    AveragingBridge,
+    AveragingModel,
     FullBridge,
     HalfBridge,
-    PWMBridge,
-    SwitchingBridge,
+    PWMAveragingModel,
+    SwitchingModel,
     ThreePhaseBridge,
     make_bridge,
 )
@@ -38,14 +38,17 @@ def test_bridge_topologies_share_the_existing_converter_module():
         "Buck",
         "Boost",
         "BuckBoost",
+        "DiodeFullBridge",
+        "PassiveBridge",
     ):
         assert not hasattr(peslite.components, obsolete)
 
 
 def _bridge_configuration(model):
     return SimpleNamespace(
-        bridge=SimpleNamespace(model=model),
-        ctrl=SimpleNamespace(period=1e-4, computation=0.0),
+        bridge=SimpleNamespace(model=model, parallel_capacitance=0.0, on_resistance=0.0),
+        ctrl=SimpleNamespace(type="custom", period=1e-4, offset=None, computation=0.0, outputs={},
+                             references=None),
         pwm=SimpleNamespace(
             load_period=1e-4,
             grid_offset=0.0,
@@ -53,6 +56,7 @@ def _bridge_configuration(model):
             f_sw=10_000.0,
             sync="asynchronous",
             carrier_phase=0.0,
+            pattern_sync="interval",
         ),
         base=SimpleNamespace(f0=50.0),
     )
@@ -73,9 +77,9 @@ def test_each_bridge_topology_has_switching_pwm_and_averaging_forms(
     pwm = make_bridge(_bridge_configuration("pwm_averaging"), topology=topology)
     averaging = make_bridge(_bridge_configuration("averaging"), topology=topology)
 
-    assert isinstance(switching, SwitchingBridge)
-    assert isinstance(pwm, PWMBridge)
-    assert isinstance(averaging, AveragingBridge)
+    assert isinstance(switching, SwitchingModel)
+    assert isinstance(pwm, PWMAveragingModel)
+    assert isinstance(averaging, AveragingModel)
     assert switching.topology is pwm.topology is averaging.topology is topology
     assert switching.duty.shape == pwm.duty.shape == duties.shape
 
@@ -90,6 +94,23 @@ def test_each_bridge_topology_has_switching_pwm_and_averaging_forms(
     factor = 1.5 if three_phase else 1.0
     assert averaging.out.u_c == pytest.approx(48.0 * expected)
     assert averaging.out.i_dc == pytest.approx(factor * (expected * 2.0).real)
+
+
+
+def test_full_bridge_device_attributes_select_rectification_on_the_same_structure():
+    controlled = FullBridge()
+    rectifier = FullBridge(upper_controlled=False, lower_controlled=False)
+    assert type(controlled) is type(rectifier)
+    assert controlled.controlled and not rectifier.controlled
+    cfg = _bridge_configuration("switching")
+    cfg.bridge.parallel_capacitance = 0.0
+    model = make_bridge(cfg, topology=rectifier)
+    assert model.topology is rectifier and model.modulator is None
+    model.inp.u_dc, model.inp.i_c, model.inp.u_hold = 100.0, 2.0, 0.0
+    assert model.commutation_margin() < 0.0
+    model.commutate(0.0)
+    model.set_outputs(0.0)
+    assert model.out.u_c == -100.0 and model.out.i_dc == -2.0
 
 
 def test_half_bridge_fixes_device_placement_at_construction():

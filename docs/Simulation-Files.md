@@ -8,11 +8,11 @@ cross-references are reported before the run starts.
 
 | Section | Purpose |
 |---|---|
-| `base` | System power, line-line RMS voltage and nominal frequency. |
-| `buses` | Electrical nodes, including optional shunt capacitance and damping. |
-| `branches` | R-L connections between buses. |
-| `sources` | Grid voltage sources and their connection impedance. |
-| `units` | Converter power stage, sensing, controller, bridge and protection. |
+| `base` | System power rating and, when needed, AC voltage and nominal frequency bases. |
+| `buses` | Electrical nodes with a shunt capacitance and optional damping. |
+| `branches` | R-L connections between named buses or Unit ports. |
+| `sources` | AC voltage sources behind R-L impedance, connected to a bus or Unit port. |
+| `units` | Converter power stage, sensing, controller, bridge and protection, when present. |
 | `elements` | Built-in or registered circuit elements such as R-L loads. |
 | `events` | Timed connect, disconnect and parameter-change operations. |
 | `simulation` | End time, solver, initial state, output and progress settings. |
@@ -38,19 +38,28 @@ branches:
 
 Each converter may define its own `s_base`; otherwise it uses the system base. Controller
 references and loop parameters use that converter's base. Time is in seconds, angles are radians,
-frequencies are hertz unless named `omega`, and switches are written as `0` or `1`.
+frequencies are hertz unless named `omega`, and switches are `0` or `1`. YAML `true` and `false` are
+also accepted; resolved files write `0` and `1`.
+
+`s_base` is the only unconditional base field. `v_ll_rms` is required by three-phase buses, VSCs
+and AC per-unit voltage or impedance values; `f0` is required by VSCs, AC sources, synchronous PWM
+and frequency-based per-unit values. A scalar circuit written in SI therefore uses, for example,
+`base: {s_base: 500.0}` without placeholder AC values. A model with no converters simply has no
+`units` section; buses, branches, sources and elements use the same assembly and solver path.
 
 `bus`, `dclink`, `pwm`, `ctrl`, `bridge`, `meas`, `protection` and `s_base` are common to every
 non-composite converter unit. The selected `unit.type` contributes its own electrical fields:
 `vsc` adds `ac_filter`, while `dc_converter` adds `filter`. The common ADC and protection lifecycle
-are shared by both converter families.
+are shared by both converter families. A scalar unit's protection voltage and current limits are
+per unit of its DC base (`dclink.vdc_ref` and `s_base / dclink.vdc_ref`), the base its protection
+compares against, so SI limits need no AC base.
 
 `meas.sources` optionally maps existing channel names to physical subsystem outputs or named
 port quantities. `meas.rms` maps channels to sliding RMS windows in seconds. Both use the same
-measurement path for VSC and DCConverter; no WPT-specific channel schema is required. Configured
-RMS overcurrent criteria use `protection.rms_current` and the existing `hold` and trip latch.
-For wiring, window semantics and an independent load example, see
-[Independent loads and measurement selection](Examples.md#independent-loads-and-measurement-selection).
+measurement path for VSC and DCConverter; no WPT-specific channel schema is required. RMS
+overcurrent protection is configured under [Protection](#protection). See
+[Measurement sources and RMS](Control-and-PWM-Timing.md#measurement-sources-and-rms) for semantics
+and [Examples](Examples.md#independent-loads-and-measurement-selection) for a complete case.
 
 ## Converter section
 
@@ -75,11 +84,13 @@ units:
       references: {p_ref_pu: 0.5}
 ```
 
-`ctrl.type` selects the controller architecture: its reference schema, public ports and default
-wiring. Built-in architectures include `gfl`, `gfm`, scalar `dc` and `resonant`; a custom graph can
-override loop connections and controller outputs explicitly. Normally, each key under `ctrl.loops`
-is the registered loop class name and also its graph-node name; no duplicate `type` field is
-needed. PESLite builds only nodes that can reach a controller output through the connection graph.
+`ctrl.type` selects the reference schema, public ports and default wiring: `gfl`, `gfm`, `custom`,
+scalar `dc`, `open_loop`, `resonant` or `phase_shift`. `gfl` and `gfm` wire loops by role; a custom
+loop with that role replaces the built-in, while duplicate roles require explicit connections.
+`custom` has no default wiring, and explicit `ctrl.connections` or `ctrl.outputs` override defaults.
+
+Each `ctrl.loops` key is the registered class and graph-node name; no `type` field is needed.
+PESLite builds only nodes that reach a controller output.
 Examples use `{}` for an empty parameter mapping. A bare key or explicit YAML `null` is accepted
 as an equivalent input in `ctrl.loops`.
 Repeated uses of one class use a class-qualified name, such as `Observer[voltage]` and
@@ -94,17 +105,35 @@ passes it explicitly to `unit_delay(value, previous)`. Consequently, unused help
 no objects or runtime state. `VirtualImpedance`, `ActiveDamping` and `ResonantModulation` remain
 ordinary registered loops because they have configurable behavior and graph ports.
 
+`dclink` holds the rated voltage `vdc_ref` (V, the unit's DC base), an optional
+`capacitor: {c, r_esr}` and a `source`, always in the DC electrical domain. `source.type` is
+`current` (current `i` into the link plus the droop `k * (vdc_ref - u_C)`, with `k` in A/V),
+`voltage` (emf `v`, default `vdc_ref`, behind series resistance `r`) or `none`; fields that the
+selected type does not use must stay zero. Without a capacitor the source must be a voltage source,
+and a voltage source with a capacitor needs `r + r_esr > 0`.
+
+The top-level `sources` section describes AC voltage sources behind an R-L impedance. A source
+connected to a three-phase bus uses the complex space-vector representation; one connected to a
+single-phase bus or Unit port uses a real sinusoid. For example, `bus: rectifier.power` connects a
+single-phase source directly to the ordinary power port of a `DCConverter`.
+
+Phase count and electrical domain are independent. `phases: 1` is a real scalar network that may
+be AC or DC, while `phases: 3` is a three-phase AC space-vector network. Ports that are inherently
+AC or DC carry an `electrical_domain` assembly constraint; general buses, branches, passive
+components and `DCConverter.power` remain unconstrained. A connected passive network is rejected
+only if it joins explicit AC and DC constraints.
+
 A WPT unit is a configuration-time composite. It owns no bridge or controller itself; each child
 is an ordinary independently clocked `DCConverter`. Each bridge and its matching link terminal
 attach through the child's own assembly boundary. The WPT exposes `primary` and `secondary` Unit
 ports and explicitly selects `primary` as its default port. Composite event parameters and shared
 subsystem ratings therefore inherit the primary port unless another port is selected. The bundled
 open-loop example selects a full bridge and `ResonantModulation` for each child; neither choice
-creates a separate converter class. `link.type` selects series-series (`ss`) or LCC-LCC (`lcc`)
-compensation. `wpt-ss-example` and `wpt-lcc-example` connect ordinary power-feedback loops to the
-same modulation inputs. The `resonant` profile's `references.power` is signed watts; `modulation`,
-`frequency` and `phase` remain amplitude, hertz and radians. The complete runnable schemas are
-shown in [Examples](Examples.md#wpt-power-feedback).
+creates a separate converter class. `wpt-ss-example` and `wpt-lcc-example` connect ordinary
+power-feedback loops to the same modulation inputs. The `resonant` profile's `references.power`
+is signed watts; `modulation`, `frequency` and `phase` remain amplitude, hertz and radians. See the
+bundled `wpt-ss-example` and `wpt-lcc-example` cases in
+[Examples](Examples.md#wpt-power-feedback).
 
 ```yaml
 units:
@@ -140,6 +169,166 @@ units:
       secondary_capacitance: 35.07e-9
 ```
 
+### Phase-shift bridges
+
+`ctrl.type: phase_shift` drives a child's full bridge with square-wave pulses. Its references are
+`width`, `frequency`, `phase`, `mode` (default 0) and signed `power` in watts. The first four are
+registers described, together with the required switching bridge model, under
+[Phase-shift modulation](Converter-and-Bridge-Models.md#phase-shift-square-wave-modulation).
+`PhaseShiftModulation` passes them to the registers and scales `width` by the start-up ramp;
+feedback loops drive its inputs through `ctrl.connections`. `pwm.f_sw` sets the control and
+register-load clock.
+
+The optional `ModeSequence` add-on emits one entry of its repeating integer list `modes` (default
+`[0]`) per sampled update; `period` defaults to `ctrl.period`, and the receiving loop defines each
+mode. See `wpt-phase-shift-example.pes` for the complete graph.
+
+```yaml
+    primary:
+      type: dc_converter
+      dclink: {vdc_ref: 400.0, source: {type: voltage}}
+      pwm: {f_sw: 85000.0, pattern_sync: pulse}
+      bridge: {model: switching}
+      ctrl:
+        type: phase_shift
+        computation: 0.0
+        loops:
+          PhaseShiftModulation: {}
+        references: {width: 0.8, frequency: 85000.0, phase: 0.0}
+```
+
+The scalar feedback loops share `command = feedforward + PI(startup * reference - measured)`, where
+`startup` is the start-up ramp; feedforward uses the command unit and gains use command/measured and
+command/(measured * s). Each class pairs one measured port (`power` in W, `voltage` in
+V, `current` in A, read from `meas.power`, `meas.voltage` or `meas.current`) with one command
+(`modulation`, also used for a phase-shift `width`; `phase` in rad; `frequency` in Hz); an optional
+`<measured>_filter` (`enable`, `bandwidth`) filters the measured value:
+
+| Measured | `modulation` | `phase` | `frequency` |
+|---|---|---|---|
+| power | `PowerControl` | `PhasePowerControl` | `FrequencyPowerControl` |
+| voltage | `VoltageControl` | `PhaseVoltageControl` | `FrequencyVoltageControl` |
+| current | `CurrentControl` | `PhaseCurrentControl` | `FrequencyCurrentControl` |
+
+A phase command limits the translated coordinate `phase - minimum`, so an all-negative phase range
+is valid. A frequency command needs `minimum > 0`: it is also the loop's initial output.
+
+### Compensated links
+
+All link types are configurations of one compensated-link model: coupled coils, each with a series
+capacitor and resistance, and per side either *series* compensation (the coils connect to the port)
+or *LCC* compensation (a series compensation inductor from the port to a shunt-capacitor node).
+
+| `link.type` | Primary | Secondary | Fields |
+|---|---|---|---|
+| `ss` | series | series | `primary_/secondary_inductance`, `mutual_inductance`, `primary_/secondary_capacitance`, optional `primary_/secondary_resistance` |
+| `lcc` | LCC | LCC | coil inductances and `mutual_inductance`; per side `*_series_capacitance`, `*_compensation_inductance`, `*_parallel_capacitance`, optional `*_resistance`, `*_compensation_resistance`, `*_parallel_resistance` (ESR of the shunt capacitor) |
+| `lcc_s` | LCC | series | the `lcc` primary fields and `secondary_capacitance`, `secondary_resistance` |
+| `ss_multi` | N series modules | N series modules | `inductance` (symmetric 2N x 2N matrix in the order Tx1..TxN, Rx1..RxN), lists `primary_/secondary_capacitance` and optional `primary_/secondary_resistance` with one value per module |
+
+`mutual_inductance` may be negative; its sign is that of the coupled flux with both currents
+positive into their dotted terminals. The link records its modal currents (`i_mode_k`) and every
+capacitor voltage as states; the capacitor voltages are also link outputs, so `meas.sources` can
+select them (for example `charger.link.u_secondary_cap`). The link signals are the two port
+currents `i_primary`/`i_secondary`, the summed coil currents `i_primary_coil`/`i_secondary_coil`
+and, for `ss_multi`, each coil current `i_primary_coil_k`/`i_secondary_coil_k`. All declared
+compensation-capacitor voltages are also published with their ordinary link output names.
+
+### Switch-controlled capacitors
+
+`ss`, `lcc` and `lcc_s` links accept `primary_scc` and `secondary_scc`: a capacitor in series with
+that side's coil, shunted by two source-to-source MOSFETs with body diodes. The gate drive and
+the electrical conduction state are separate: a single gated MOSFET allows current in one
+direction through the other device's body diode. Both gates on allow either direction; both
+off block either direction. Actual conduction follows the capacitor voltage and coil current.
+
+| Field | Meaning |
+|---|---|
+| `capacitance` | switched capacitance (F) |
+| `angle` | nominal conduction angle in [0, pi] (not set with `command`) |
+| `drive` | `common` (default): identical gate pulses, centred at pi/2 modulo pi, of width `angle`; `alternating`: two gate pulses centred at 0 and pi, each of width `pi + angle`, whose overlap is `angle` |
+| `sync` | `current` (default): phase from located coil-current zeros and the measured half period; `bridge`: follow the same-side PWM phase clock |
+| `sync_angle` | rad, phase offset from the bridge's pulse centre (`sync: bridge`) |
+| `command` | take the angle from controller output `scc_angle` (`ctrl.outputs.scc_angle`), through the same-side bridge's ordinary registers |
+
+```yaml
+    link:
+      type: ss
+      # ... coil and capacitor fields ...
+      primary_scc: {capacitance: 120.0e-9, angle: 1.5, drive: alternating, sync: bridge,
+                    sync_angle: 1.5708}
+```
+
+`sync: bridge` follows the bridge's existing phase clock and active phase register. A phase or
+frequency change immediately updates the gate schedule. `command` uses the active `scc_angle`
+register, with the ordinary shadow/active path and computation delay; optional carried registers
+do not become extra switching legs. `sync: current` accepts every located current zero, measures
+the interval between successive zeros, and latches the angle there. Phase-dependent pulses wait
+until two crossings establish that interval; constant gate commands need no phase acquisition.
+There is no fixed-period debounce or restriction on diode
+conduction to the overlap of the gates.
+
+With `drive: common`, `angle: 0` keeps the capacitor in circuit and `pi` bypasses it. With
+`drive: alternating`, complementary gates at zero angle still permit body-diode conduction;
+their actual effect depends on the waveform. At pi both gates stay on.
+
+The switch and clock state (`<link>.<side>_scc.*`) is restored on continuation. Current-synchronised
+clock memory remains part of the small-signal coordinates. The capacitor voltage `u_<side>_scc`
+and switch state `<side>_scc_on` are link signals. The summary counts `switchings` and
+`hard_turn_ons` (actual clamping with a residual voltage above the 1 nV zero tolerance) and reports
+`max_turn_on_voltage` and `turn_on_energy`; the energy table adds the cumulative discharge loss
+`<link>.dissipated_impulsive_J`. Python and standalone C++ use the same component equations and
+commutation protocol, including named-state continuation and parameter overrides.
+
+### Diode full-bridge rectifiers
+
+A `full_bridge` with neither device row gated is a diode rectifier. It has no `ctrl` or `pwm`,
+and the bridge model preset does not replace its natural-commutation law. For example, a WPT
+secondary may be configured as:
+
+```yaml
+    secondary:
+      type: dc_converter
+      dclink: {vdc_ref: 300.0, source: {type: voltage}}
+      bridge: {type: full_bridge, upper_controlled: 0, lower_controlled: 0}
+```
+
+Its exactly located commutations, hold voltage, optional port capacitance and protection rules are
+described in [Converter and Bridge Models](Converter-and-Bridge-Models.md#diode-full-bridge-rectifier).
+Its `meas` section may configure independent sampling, means, RMS and existing physical sources on
+the unit's own measurement clock ([ADC sampling](Control-and-PWM-Timing.md#adc-sampling)).
+
+### Protection
+
+Each `protection` criterion is switched by `enable`; an enabled limit must be positive. Current and
+voltage limits are per unit of the converter's base (the DC base for a scalar unit, as above).
+
+| Criterion | Limit | Effect |
+|---|---|---|
+| `overcurrent` | `limit_pu` | trips as soon as the instantaneous converter current exceeds the limit |
+| `rms_current` | `limit_pu` | trips when the RMS of the unit's current channel stays above the limit for `hold`; needs `meas.rms.i_c` (VSC) or `meas.rms.current` (DC converter) |
+| `undervoltage`, `overvoltage` | `limit_pu` | trips when the terminal-voltage magnitude stays at or below, or at or above, the limit for `hold` |
+| `dc_voltage` | `limit_pu` | trips when the DC-link voltage deviates from its reference by at least the limit for `hold` |
+| `frequency` | `limit` (Hz) | trips when the synchronization frequency deviation stays at or above the limit for `hold`; VSC only |
+| `rocof` | `limit` (Hz/s), `window` (s, default 0.1) | raises the `ROCOF` alarm; never trips; VSC only |
+
+`hold` (s, default 0.02) is the time a held criterion must persist.
+[Protection clocks](Control-and-PWM-Timing.md#protection-clocks) describes when each criterion is
+evaluated and armed, and what a trip does.
+
+## Elements
+
+The built-in element types are:
+
+| `type` | Fields |
+|---|---|
+| `load` | `bus`, series inductance `l` (or `x_pu`, positive) and resistance `r` (default 0): a series R-L load from the bus to ground |
+| `resistor` | `bus`, resistance `r` (positive) and `series` (default 0): a shunt resistor, or with `series: 1` a series resistor inserted after the bus's voltage driver ([Examples](Examples.md#independent-loads-and-measurement-selection)) |
+| `voltage_source` | single-phase `bus`, constant voltage `v` and series resistance `r` (positive) |
+
+Per-unit element inputs use the system base. Registered element types define their own fields
+([Extending PESLite](Extending-PESLite.md#custom-circuit-elements)).
+
 ## Simulation settings
 
 ```yaml
@@ -155,19 +344,22 @@ simulation:
     states: 1
     signals: 0
     energy: 0
+  stop_on_trip: 1
   energy_check: warn
 ```
 
-The start and end times are exact and are not rounded to an ADC, PWM or solver grid. Initial state
-keys use the same names as `states.csv`; complex values may be written as `[real, imag]` or through
-`.re` and `.im` entries. The keywords `source` and `rated` initialize supported electrical states
-from the connected source or converter rating.
+With `stop_on_trip: 1` (the default) the run ends at the first unit trip; with `0` it continues
+and the tripped unit stays blocked.
+
+The start and end times are exact and are not rounded to an ADC, PWM or solver grid. Initial-state
+names, values and keywords are described in [Events and Restart](Events-and-Restart.md#initial-state).
 
 ## Defaults and resolved files
 
 Some defaults are derived from other values. For example, sampled control defaults to one carrier
-period and ADC timing defaults to the control period. Derived defaults are recomputed after
-`--set` or `Params.replace()` changes their source parameter.
+period, ADC timing defaults to the control period, an AC source's `v` defaults to 1 pu of the
+system base and a DC voltage source's `v` to `dclink.vdc_ref`. Derived defaults are recomputed
+after `--set` or `Params.replace()` changes their source parameter.
 
 Print the complete resolved tree with:
 
@@ -176,7 +368,7 @@ peslite case.pes --resolved
 ```
 
 Every completed run writes the same complete tree to `simulation.pes`. Loading that file reproduces
-the configuration without relying on implicit defaults.
+the configuration; fields written as `null` are derived again in the same way.
 
 ## Command-line overrides
 
@@ -188,8 +380,8 @@ peslite case.pes \
   --set units.vsc.ctrl.references.p_ref_pu=0.4
 ```
 
-The priority is `--set` over a bridge/solver command preset, over the simulation file, over package
-defaults. Invalid combinations are checked after all overrides are applied.
+Their priority is given in [CLI Reference](CLI-Reference.md#override-parameters). Invalid
+combinations are checked after all overrides are applied.
 
 ## Python loading and replacement
 

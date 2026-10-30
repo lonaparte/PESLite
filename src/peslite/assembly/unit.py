@@ -20,10 +20,11 @@ from ..components.adc import ADC, ADCSample, MeasurementPorts
 from ..components.converter import (HalfBridgeDiodeConduction, make_bridge, make_dclink,
                                     make_topology)
 from ..components.network import RLBranch, Terminal
-from ..components.pwm import TIME_EPS, Modulator
+from ..components.pwm import Modulator
 from ..control.blocks import phases
-from ..control.controller import (Controller, ConverterMeasurement, Measurement,
-                                  make_controller)
+from ..control.controller import (Controller, ConverterMeasurement,
+                                  Measurement, make_controller)
+from ..solver.timing import TIME_EPS, PeriodicClock, control_clock_offset, resolve_clock_offset
 from .events import Scenario
 from .params import SimulationParams, UnitParams, _parameterized
 from .protection import Protection, ProtectionSample
@@ -40,11 +41,15 @@ class Plant:
     """
 
     def __init__(self, model: Any, state: Any, *,
-                 project: Optional[Callable] = None, settle: Optional[Callable] = None) -> None:
+                 project: Optional[Callable] = None, settle: Optional[Callable] = None,
+                 synchronize: Optional[Callable] = None) -> None:
         self.model, self.state = model, state
         self.project, self.settle = project, settle
         self.inputs_changed = self.zoh_changed = False
         self._synced_at: Optional[float] = None
+        self._sync = synchronize or model.sync
+        self._sync_zoh = ((getattr(model, "sync_zoh", None) if synchronize is None else None)
+                          or (lambda t: self._sync(t, self.state)))
 
     def invalidate(self) -> None:
         self._synced_at = None
@@ -58,10 +63,10 @@ class Plant:
 
     def outputs(self, t: float) -> None:
         if self._synced_at != t:
-            self.model.sync(t, self.state)
+            self._sync(t, self.state)
             self._synced_at = t
         elif self.zoh_changed:
-            self.model.sync_zoh(t)
+            self._sync_zoh(t)
         self.zoh_changed = False
 
     def hold(self, label: str, value: Any) -> None:
@@ -80,6 +85,13 @@ class Plant:
 class Unit(ABC):
     """Common runtime interface and lifecycle mechanics for one converter unit."""
 
+    def __init__(self, name: str, cfg: UnitParams, bus: Any) -> None:
+        """Bind the identity, event scenario and DC link shared by converter units."""
+        self.name, self.cfg, self.bus = name, cfg, bus
+        self.scenario = Scenario(cfg.events, f"units.{name}", initial=cfg.connected)
+        self.dclink = _parameterized(lambda c: make_dclink(c.dclink), cfg)
+        self.zoh = f"{name}.q"  # model label of the bridge's held switching state
+
     @property
     def dc_bus(self) -> str:
         """The scoped internal bus between this unit's DC link and bridge."""
@@ -93,16 +105,25 @@ class Unit(ABC):
     def _configure_runtime(
         self,
         sim: SimulationParams,
-        ports: MeasurementPorts,
         channel_zeros: Mapping[str, complex | float],
         current_base: Callable[[UnitParams], float],
     ) -> None:
         """Build the sensing, protection and lifecycle state shared by converter units."""
-        self.ports = ports
+        def sampling_clock(values):
+            """Control interrupts, or a continuous unit's own protection/measurement clock."""
+            cfg, simulation = values
+            if not self.continuous:
+                return PeriodicClock(cfg.ctrl.period, control_clock_offset(cfg.ctrl, cfg.pwm))
+            meas = cfg.meas
+            return PeriodicClock(
+                simulation.output.period if meas.period is None else meas.period,
+                meas.offset if cfg.ctrl is None and meas.offset is not None else 0.0)
+
+        self.clock = _parameterized(sampling_clock, (self.cfg, sim))
+        self._clock_index = 0
+        self._clock_time = math.inf
         self.protection = _parameterized(lambda values: Protection(
-            values[0].protection,
-            values[1].output.period if self.continuous else values[0].ctrl.period,
-            current_base(values[0]),
+            values[0].protection, sampling_clock(values).period, current_base(values[0]),
             rms_available=bool(values[0].meas.rms)), (self.cfg, sim))
         self._trip_due = False
         self._track_due = False
@@ -111,25 +132,43 @@ class Unit(ABC):
         self.breaker = True
         self.gates = False
 
-        if self.continuous and not self.cfg.meas.rms:
+        meas = self.cfg.meas
+        channels = ({name: channel_zeros[name] for name in meas.average}
+                    if not self.continuous or self.cfg.ctrl is None else {})
+        if self.continuous and not (meas.rms or channels or (
+                self.cfg.ctrl is None and meas.period is not None)):
             self.adc = None
             self.windowed = self._oversamples = False
             return
-        meas = self.cfg.meas
-        channels = {} if self.continuous else {name: channel_zeros[name] for name in meas.average}
-        self.adc = _parameterized(lambda values: ADC(
-            ports,
-            values[1].output.period if self.continuous else values[0].ctrl.period,
-            values[0].meas.period if values[0].meas.period is not None else (
-                values[1].output.period if self.continuous else values[0].ctrl.period),
-            values[0].meas.window if values[0].meas.window is not None else (
-                values[1].output.period if self.continuous else values[0].ctrl.period),
-            channels,
-            rms=values[0].meas.rms,
-        ), (self.cfg, sim))
+        def make_adc(values):
+            cfg = values[0]
+            control = sampling_clock(values)
+            period = control.period
+            sample_period = cfg.meas.period if cfg.meas.period is not None else period
+            window = cfg.meas.window if cfg.meas.window is not None else period
+            sample_offset = (control.offset if self.continuous
+                             else resolve_clock_offset(sample_period, cfg.meas.offset, control.offset))
+            return ADC(self.ports, period, sample_period, window, channels,
+                       rms=cfg.meas.rms, clocked=cfg.ctrl is None,
+                       control_offset=control.offset, sample_offset=sample_offset)
+
+        self.adc = _parameterized(make_adc, (self.cfg, sim))
         self.windowed = self.adc.accumulating
-        self.accumulate, self.restart_windows = self.adc.accumulate, self.adc.seed
-        self._oversamples = self.adc.samples > 1
+        self.accumulate, self.restart_windows = self.adc.accumulate_to, self.adc.seed
+        self._oversamples = self.adc.samples > 1 and not self.adc.independent
+
+    def _check_parts(self) -> None:
+        """Reject a controller timed unlike the bridge, or a part outside its protocol."""
+        if self.ctrl is not None and bool(getattr(self.ctrl, "continuous", False)) != self.continuous:
+            raise TypeError(
+                f"{self.name}: the controller and bridge must both be sampled or both be continuous"
+            )
+        modulator = self.bridge.modulator
+        for obj, proto in ((self.ctrl, Controller), (modulator, Modulator)):
+            if obj is not None and not isinstance(obj, proto):
+                raise TypeError(
+                    f"{self.name}: {type(obj).__name__} does not satisfy the {proto.__name__} protocol"
+                )
 
     @abstractmethod
     def subsystems(self) -> dict[str, Any]: ...
@@ -161,15 +200,22 @@ class Unit(ABC):
             ))
         return tuple(terminals)
 
-    @abstractmethod
-    def aliases(self) -> dict[str, str]: ...
+    def aliases(self) -> dict[str, str]:
+        """Return the aliases ``<unit>.i_c`` (filter current) and ``<unit>.u_dc`` (dc-link voltage)."""
+        out = ({f"{self.name}.i_c": f"{self.name}.branch_f.i"}
+               if self.branch_f is not None else {})
+        if self.cfg.dclink.capacitor is not None:
+            out[f"{self.name}.u_dc"] = f"{self.name}.dclink.u_C"
+        return out
 
     def state_parts(self) -> list[tuple[str, Any]]:
         """Return this unit's fixed state owners and their public prefixes."""
-        parts = [(self.name, self), (f"{self.name}.ctrl", self.ctrl),
-                 (f"{self.name}.{self.bridge.state_prefix}", self.bridge.state_owner)]
-        adc = getattr(self, "adc", None)
-        if adc is not None and adc.accumulating:
+        parts = [(self.name, self)]
+        if self.ctrl is not None:
+            parts.append((f"{self.name}.ctrl", self.ctrl))
+        parts.append((f"{self.name}.{self.bridge.state_prefix}", self.bridge.state_owner))
+        adc = self.adc
+        if adc is not None and (adc.accumulating or adc.independent):
             parts.append((f"{self.name}.meas", adc))
         return parts
 
@@ -193,9 +239,12 @@ class Unit(ABC):
 
     def next_time(self) -> float:
         if self.continuous:
-            return math.inf
+            next_ = self._clock_time
+            return next_ if self.adc is None else min(next_, self.adc.next_time())
         bridge = self.bridge
         next_ = bridge.next_time()
+        if self.adc.independent:
+            next_ = min(next_, self.adc.next_time())
         if self.windowed:
             next_ = min(next_, self.adc.t_window(bridge.next_control_time))
         if self._oversamples:
@@ -234,7 +283,6 @@ class Unit(ABC):
         self._connection_command(effective, t, ramp)
         if self.continuous:
             self._track_due = effective and not was_active
-            self.bridge.enabled = effective
             self._set_gates(effective)
         elif self.branch_f is None:
             self._set_gates(effective and self.bridge.on)
@@ -242,7 +290,15 @@ class Unit(ABC):
     def retune(self, cfg: Any, paths: list[str], t: float) -> None:
         if any(path.startswith("protection.") for path in paths):
             self.protection.retune(cfg.protection)
-        self._retune_controller(cfg, paths, t, ("protection.",))
+        self.cfg = cfg
+        if any(path.startswith("dclink.source.") for path in paths):
+            source = cfg.dclink.source
+            self.dclink.retune_source(source.i, source.k, source.v, source.r)
+        rest = [path for path in paths if not path.startswith(("dclink.", "protection."))]
+        if rest:
+            if self.ctrl is None:
+                raise ValueError(f"{self.name}: no controller to retune")
+            self.ctrl.retune(cfg, rest, t)
 
     def trip(self, t: float, cause: str, plant: Optional[Plant] = None,
              detail: str = "") -> None:
@@ -296,17 +352,26 @@ class Unit(ABC):
         self._track_due = False
         if self.continuous:
             self._start_continuous_bridge(t)
+            index = self.clock.index_after(t) if continued else self.clock.index_at_or_after(t)
+            self._clock_index = int(index)
+            self._clock_time = self.clock.at(self._clock_index)
+            plant.outputs(t)
             if self.adc is not None:
-                plant.outputs(t)
-                self.adc.seed()
+                if not self.adc.integration_anchor_restored:
+                    self.adc.seed(t)
+                if self.adc.clocked:
+                    self.adc.start(t, held=not window_given)
             return
         initial_sync = getattr(self.ctrl, "initial_sync", None)
         sync = initial_sync() if initial_sync is not None else (None, None)
         self._begin_sampled(t, plant, sync, continued, window_given)
 
     def protect(self, t: float, plant: Plant) -> bool:
-        """Run the common fast over-current path at a physical bridge edge."""
-        if self.tripped or (not self.continuous and not self.bridge.fast_edge(t)):
+        """Run the common fast over-current path at a physical bridge edge or a continuous
+        unit's own protection clock."""
+        due = (abs(t - self._clock_time) < TIME_EPS if self.continuous
+               else self.bridge.fast_edge(t))
+        if self.tripped or not due:
             return False
         if not self.protection.check_fast(t, self._protection_currents()):
             return False
@@ -318,15 +383,27 @@ class Unit(ABC):
     def sense(self, t: float, plant: Plant) -> Optional[tuple[int, Any]]:
         """Sample, control and protect one converter through the common runtime path."""
         if self.continuous:
+            clock_due = abs(t - self._clock_time) < TIME_EPS
+            adc_due = (self.adc is not None and self.adc.clocked
+                       and abs(t - self.adc.next_time()) < TIME_EPS)
+            if not clock_due and not adc_due and not self._track_due:
+                return None
             plant.outputs(t)
             if self._track_due:
                 self.track(t, plant)
                 plant.outputs(t)
                 self._track_due = False
-            self.ctrl.startup.at(t)
-            rms_fresh = self.adc is not None and self.adc.sample_rms(t)
-            self._check_sampled_protection(t, self._instantaneous_measurement(t),
-                                           rms_fresh=rms_fresh)
+            if adc_due:
+                self.adc.sample_clock(t)
+            if not clock_due:
+                return None
+            if self.ctrl is not None:
+                self.ctrl.startup.at(t)
+            self._clock_index += 1
+            self._clock_time = self.clock.at(self._clock_index)
+            if self.adc is not None and not self.adc.clocked:
+                self.adc.sample_rms()
+            self._check_sampled_protection(t, self._instantaneous_measurement(t))
             return None
         measurement = self._sample_control(t, plant)
         if measurement is None:
@@ -356,9 +433,9 @@ class Unit(ABC):
     @abstractmethod
     def signals(self) -> dict[str, float | complex]: ...
 
-    @abstractmethod
     def control_inputs(self) -> dict[str, float | complex]:
         """Return instantaneous values at the controller graph's public input ports."""
+        return self.control_inputs_from(self.ports.read())
 
     @abstractmethod
     def control_inputs_from(
@@ -368,7 +445,7 @@ class Unit(ABC):
 
     def enabled_subsystems(self) -> tuple[Any, ...]:
         """Return subsystems whose equations are enabled and disabled with the unit gates."""
-        return ()
+        return (self.bridge,)
 
     @property
     def trip_cause(self) -> Optional[str]:
@@ -376,19 +453,19 @@ class Unit(ABC):
         return trip.cause if trip is not None else None
 
     def source_preset(self) -> float | None:
-        """Return an internal source voltage for initial-state presets, when one exists."""
+        """Return an internal source voltage for initial-state presets."""
         return None
 
     def _controller_command(self, run: bool, ramp: float = 0.0,
                             t: float | None = None, *, reset: bool = True) -> None:
-        """Dispatch one run command through the controller's common lifecycle interface."""
-        if self.continuous:
-            command = getattr(self.ctrl, "command_at", None)
-            if command is not None:
-                command(run, ramp, 0.0 if t is None else t, reset=reset)
-                return
+        """Dispatch one run command through the controller's common lifecycle interface; a
+        continuous controller takes it at absolute time ``t``."""
         command = getattr(self.ctrl, "command", None)
-        if command is not None:
+        if command is None:
+            return
+        if self.continuous:
+            command(run, ramp, 0.0 if t is None else t, reset=reset)
+        else:
             command(run, ramp)
 
     def _connection_command(self, run: bool, t: float, ramp: float, *, reset: bool = True,
@@ -397,18 +474,6 @@ class Unit(ABC):
         source_ramp = ramp if at is None or at < t + ramp else 0.0
         self.dclink.connect(run, t, source_ramp)
         self._controller_command(run, ramp, t, reset=reset)
-
-    def _retune_controller(self, cfg: UnitParams, paths: list[str], t: float,
-                           excluded: tuple[str, ...] = ()) -> None:
-        """Apply the common DC-source update and pass remaining paths to the controller."""
-        self.cfg = cfg
-        if any(path.startswith("dclink.source.") for path in paths):
-            source = cfg.dclink.source
-            self.dclink.retune_source(source.i, source.k, source.v, source.r)
-        rest = [path for path in paths
-                if not path.startswith(("dclink.", *excluded))]
-        if rest:
-            self.ctrl.retune(cfg, rest, t)
 
     def _actuate_bridge(self, t: float, plant: Plant, enabled: bool) -> None:
         """Apply one pending command and every bridge edge at the current instant."""
@@ -442,6 +507,7 @@ class Unit(ABC):
                 self.bridge.inp.q = self._held_bridge_command(self.bridge.inp.q)
         else:
             self._update_terminal()
+        self.bridge.enabled = self.gates
 
     def _held_bridge_command(self, value: Any) -> Any:
         """Block a sampled command on a disconnected unfiltered power bus."""
@@ -452,8 +518,6 @@ class Unit(ABC):
     def _shutdown(self, t: float) -> None:
         """Stop controller and power stage through the common unit boundary."""
         self._controller_command(False, 0.0, t)
-        if hasattr(self.bridge, "enabled"):
-            self.bridge.enabled = False
         self.breaker = False
         self._set_gates(False)
         self.dclink.open_breaker()
@@ -464,7 +528,7 @@ class Unit(ABC):
             self._controller_command(False, 0.0, 0.0, reset=False)
         if self.continuous:
             self.bridge.enabled = (
-                self.ctrl.startup.active and self.breaker and not self.tripped
+                (self.ctrl is None or self.ctrl.startup.active) and self.breaker and not self.tripped
             )
         self._set_gates(self.bridge.on)
         if given_current is not None and self.blocked and given_current != 0:
@@ -476,8 +540,9 @@ class Unit(ABC):
 
     def _start_continuous_bridge(self, t: float) -> None:
         """Apply continuous startup state to the common bridge/gate boundary."""
-        self.ctrl.startup.at(t)
-        self.bridge.enabled = self.ctrl.startup.active and self.breaker and not self.tripped
+        if self.ctrl is not None:
+            self.ctrl.startup.at(t)
+        self.bridge.enabled = (self.ctrl is None or self.ctrl.startup.active) and self.breaker and not self.tripped
         self._set_gates(self.bridge.enabled)
 
     @abstractmethod
@@ -492,36 +557,39 @@ class Unit(ABC):
     def _protection_sample(self, measurement: Any, output: Any | None) -> ProtectionSample:
         """Adapt one controller-rate observation to common protection quantities."""
 
+    def _startup_complete(self, output: Any | None) -> bool:
+        """Startup completion reported by a sampled output, else by the live controller."""
+        return ((self.ctrl is None or self.ctrl.startup.complete) if output is None
+                else getattr(output, "startup_complete", True))
+
     def _instantaneous_measurement(self, t: float) -> Any:
         return self._control_measurement(ADCSample(t=t, values=self.ports.read()))
 
     def _check_sampled_protection(self, t: float, measurement: Any,
-                                  output: Any | None = None, *, rms_fresh: bool = True) -> None:
+                                  output: Any | None = None) -> None:
         if self.tripped:
             return
         sample = self._protection_sample(measurement, output)
         if self.protection.rms_enabled:
-            window = self.adc.rms[unit_type(self.cfg.type).current_channel]
-            value = window.value if rms_fresh else None
+            value = self.adc.rms[unit_type(self.cfg.type).current_channel].value
             sample = replace(sample, rms_current_pu=(
                 None if value is None else value / self.protection.i_base
             ))
-        if (not self.tripped
-                and self.protection.check_sampled(t, sample)):
+        if self.protection.check_sampled(t, sample):
             self._trip_due = True
 
     def measurement_signals(self) -> dict[str, float]:
         if self.adc is None:
             return {}
-        signals = {}
+        signals = {f"{self.name}.meas.{channel}_mean": value
+                   for channel, value in self.adc.means.items()}
+        signals.update((f"{self.name}.meas.{channel}", value)
+                       for channel, value in self.adc.values.items()
+                       if channel not in self.adc.channels)
         for channel, window in self.adc.rms.items():
             value = window.value
             signals[f"{self.name}.meas.{channel}_rms"] = math.nan if value is None else value
         return signals
-
-    def _held_start_command(self, value: Any) -> Any:
-        """Adapt the reconstructed bridge command to the unit's physical boundary."""
-        return self._held_bridge_command(value)
 
     def _before_sampled_control(self, t: float, measurement: Any) -> None:
         """Run an optional converter-family check immediately before sampled control."""
@@ -536,11 +604,11 @@ class Unit(ABC):
     ) -> None:
         plant.hold(
             self.zoh,
-            self._held_start_command(self.bridge.start(t, sync, continued)),
+            self._held_bridge_command(self.bridge.start(t, sync, continued)),
         )
-        if self.windowed:
-            plant.outputs(t)
-            self.adc.seed()
+        plant.outputs(t)
+        if self.windowed and not self.adc.integration_anchor_restored:
+            self.adc.seed(t)
         bridge = self.bridge
         self.adc.start(
             t,
@@ -551,15 +619,18 @@ class Unit(ABC):
 
     def _sample_control(self, t: float, plant: Plant) -> Any | None:
         """Run common oversampling and return one controller sample when its interrupt is due."""
-        bridge = self.bridge
-        if not bridge.control_due(t):
-            if (self._oversamples
-                    and abs(self.adc.t_sample(bridge.previous_control_time()) - t) < TIME_EPS):
-                plant.outputs(t)
-                self.adc.peek(t)
+        bridge, adc = self.bridge, self.adc
+        control, conversion = bridge.control_due(t), adc.conversion_due(t)
+        oversample = (not control and self._oversamples
+                      and abs(adc.t_sample(bridge.previous_control_time()) - t) < TIME_EPS)
+        if not (control or conversion or oversample):
             return None
         plant.outputs(t)
-        return self._control_measurement(self.adc.sample(t))
+        if conversion:
+            adc.convert(t)
+        if oversample:
+            adc.peek(t)
+        return self._control_measurement(adc.sample(t, held=adc.independent)) if control else None
 
     def _actuate_sampled(self, t: float, plant: Plant, enabled: bool) -> bool:
         """Apply a pending trip, bridge events and the next ADC window."""
@@ -588,19 +659,15 @@ class VSC(Unit):
 
     def __init__(self, name: str, cfg: UnitParams, sim: SimulationParams, bus: Any,
                  ctrl: Optional[Controller] = None, modulator: Optional[Modulator] = None) -> None:
-        self.name = name
-        self.cfg = cfg
-        self.bus = bus
-        self.scenario = Scenario(cfg.events, f"units.{name}", initial=cfg.connected)
+        super().__init__(name, cfg, bus)
 
         # ------------------------------------------------------------ power
-        self.dclink = _parameterized(make_dclink, cfg.dclink)
         try:
             self.bridge = _parameterized(lambda c: make_bridge(c, modulator), cfg)
         except ValueError as exc:
             raise ValueError(f"{name}: {exc}") from None
+        self.continuous = self.bridge.continuous
         self.branch_f = _parameterized(lambda c: RLBranch(c.l_f, c.r_f), cfg.ac_filter)
-        self.continuous = bool(getattr(self.bridge, "continuous", False))
         self._diodes_warned = False
 
         # ------------------------------------------------------------ ADC
@@ -613,26 +680,13 @@ class VSC(Unit):
         )
         self._configure_runtime(
             sim,
-            self.ports,
             {"u_g": 0j, "i_c": 0j, "u_dc": 0.0},
             lambda c: c.base.i_phase_peak,
         )
 
-        # ------------------------------------------------------------ bridge actuation and control
-        self.bridge.reset(np.full(3, 0.5), on=False)
-        self.zoh = f"{name}.q"                   # model label of the bridge's held switching state
+        # ------------------------------------------------------------ control
         self.ctrl = ctrl if ctrl is not None else _parameterized(make_controller, cfg)
-        if bool(getattr(self.ctrl, "continuous", False)) != self.continuous:
-            raise TypeError(
-                f"{name}: the controller and bridge must both be sampled or both be continuous"
-            )
-        parts = [(self.ctrl, Controller)]
-        modulator = getattr(self.bridge, "modulator", None)
-        if modulator is not None:
-            parts.append((modulator, Modulator))
-        for obj, proto in parts:
-            if not isinstance(obj, proto):
-                raise TypeError(f"{name}: {type(obj).__name__} does not satisfy the {proto.__name__} protocol")
+        self._check_parts()
 
     # ---------------------------------------------------------------- assembly
     def subsystems(self) -> dict[str, Any]:
@@ -667,16 +721,9 @@ class VSC(Unit):
             self.branch_f.terminal2,
         ))
 
-    def aliases(self) -> dict[str, str]:
-        """Return the aliases ``<unit>.i_c`` (filter current) and ``<unit>.u_dc`` (dc-link voltage)."""
-        out = {f"{self.name}.i_c": f"{self.name}.branch_f.i"}
-        if self.cfg.dclink.capacitor is not None:
-            out[f"{self.name}.u_dc"] = f"{self.name}.dclink.u_C"
-        return out
-
     # ---------------------------------------------------------------- run instants
     def _before_sampled_control(self, t: float, measurement: Measurement) -> None:
-        if self.blocked and not self._diodes_warned:
+        if self.blocked and not self.bridge.models_blocked_diodes and not self._diodes_warned:
             self._warn_diodes(t, measurement)
 
     def _warn_diodes(self, t: float, measurement: Measurement) -> None:
@@ -700,10 +747,6 @@ class VSC(Unit):
             f"{self.name}.u_dc": self.dclink.out.u_dc,
             f"{self.name}.i_dc": self.dclink.inp.i_dc,
         }
-
-    def control_inputs(self) -> dict[str, float | complex]:
-        """Return the instantaneous per-unit inputs exposed by the control interface."""
-        return self.control_inputs_from(self.ports.read())
 
     def control_inputs_from(
         self, values: Mapping[str, complex | float],
@@ -748,10 +791,7 @@ class VSC(Unit):
                 measurement.u_dc / self.cfg.dc_base.v
                 - self.cfg.ctrl.references.vdc_ref_pu
             ),
-            startup_complete=(
-                self.ctrl.startup.complete if output is None
-                else getattr(output, "startup_complete", True)
-            ),
+            startup_complete=self._startup_complete(output),
         )
 
 
@@ -766,19 +806,18 @@ class DCConverter(Unit):
     def __init__(self, name: str, cfg: UnitParams, sim: SimulationParams,
                  bus: Any = None, *,
                  ctrl: Optional[Any] = None, modulator: Optional[Modulator] = None) -> None:
-        self.name = name
-        self.cfg = cfg
-        self.scenario = Scenario(cfg.events, f"units.{name}", initial=cfg.connected)
-        self.bus = bus
+        super().__init__(name, cfg, bus)
         topology = make_topology(cfg.bridge)
-        self.dclink = _parameterized(make_dclink, cfg.dclink)
+        self.bridge = _parameterized(lambda c: make_bridge(c, modulator, topology=topology), cfg)
+        self.continuous = self.bridge.continuous
         self.branch_f = None if cfg.filter is None else _parameterized(lambda c: RLBranch(
             c.l_f,
             c.r_f,
             phases=1,
-            unilateral=topology.unilateral,
+            unilateral=self.bridge.diode_blocks_reverse_current(),
         ), cfg.filter)
-        self.bridge = _parameterized(lambda c: make_bridge(c, modulator, topology=topology), cfg)
+        controlled = getattr(topology, "controlled", True)
+        self._blocked_warned = False
         self._external_lower_rail = getattr(topology, "external_terminal", None) == "lower_rail"
         power_voltage_port = (bus, "u") if bus is not None else (self.bridge, "u_c")
         self._control_voltage_port = (
@@ -794,25 +833,17 @@ class DCConverter(Unit):
             self.conduction = _parameterized(lambda c: HalfBridgeDiodeConduction(
                 c.pwm.switching_period,
                 c.filter.l_f,
-                c.filter.r_f,
+                c.filter.r_f + c.bridge.on_resistance,
                 topology,
             ), cfg)
             self.conduction.local_step_state = self.branch_f
             self.branch_f.use_external_conduction()
             self.bridge.use_current_transfer_ratios()
-        self.continuous = bool(getattr(self.bridge, "continuous", False))
-        self.ctrl = ctrl if ctrl is not None else _parameterized(
+        if not controlled and ctrl is not None:
+            raise TypeError(f"{name}: a diode full-bridge rectifier takes no controller part")
+        self.ctrl = None if not controlled else ctrl if ctrl is not None else _parameterized(
             lambda c: make_controller(c, topology=topology), cfg)
-        if bool(getattr(self.ctrl, "continuous", False)) != self.continuous:
-            raise TypeError(
-                f"{name}: the controller and bridge must both be sampled or both be continuous"
-            )
-        if not isinstance(self.ctrl, Controller):
-            raise TypeError(
-                f"{name}: {type(self.ctrl).__name__} does not satisfy the Controller protocol"
-            )
-        self.bridge.reset(np.full(len(topology.duty_names), topology.neutral_duty), on=False)
-        self.zoh = f"{name}.q"
+        self._check_parts()
         self.ports = MeasurementPorts({
             "current": self._current,
             "voltage": lambda: self._port_value(self._control_voltage_port),
@@ -833,10 +864,27 @@ class DCConverter(Unit):
                 self.ctrl.bind_power_port(self._power_terminal.power_port)
         self._configure_runtime(
             sim,
-            self.ports,
             channel_zeros,
             lambda c: c.dc_base.i,
         )
+
+    def _before_sampled_control(self, t: float, measurement: ConverterMeasurement) -> None:
+        """Report once when gated-off devices would conduct through their diodes.
+
+        A sampled bridge without gates applies its zero state; on a port without a series filter
+        a nonzero port current then flows through that zero state rather than through the
+        anti-parallel diodes, which a diode full-bridge rectifier models.
+        """
+        if (self.branch_f is None and not self.bridge.models_blocked_diodes
+                and not self.gates and not self._blocked_warned
+                and abs(measurement.current) > 1e-6 * max(1.0, self.cfg.dc_base.i)):
+            self._blocked_warned = True
+            warnings.warn(
+                f"t = {t:.6g} s: unit {self.name!r} has blocked gates while its port carries "
+                f"{measurement.current:.4g} A; the blocked bridge applies its zero state, not "
+                "diode conduction, which requires the bridge's natural-conduction equations",
+                stacklevel=4,
+            )
 
     def subsystems(self) -> dict[str, Any]:
         parts = {
@@ -847,7 +895,7 @@ class DCConverter(Unit):
             parts[f"{self.name}.branch_f"] = self.branch_f
         if self.conduction is not None:
             parts[f"{self.name}.conduction"] = self.conduction
-        if self.continuous:
+        if self.continuous and self.ctrl is not None:
             parts[f"{self.name}.ctrl"] = self.ctrl
         return parts
 
@@ -868,6 +916,7 @@ class DCConverter(Unit):
                 (self.bridge, "lower_current_ratio"): (
                     self.conduction, "lower_current_ratio",
                 ),
+                (self.bridge, "loss_factor"): (self.conduction, "resistance_factor"),
             })
             if self._external_lower_rail:
                 connections[(self.conduction, "lower")] = self._control_voltage_port
@@ -877,7 +926,7 @@ class DCConverter(Unit):
                     if self.bridge.topology.reverse_port
                     else self._control_voltage_port
                 )
-        if self.continuous:
+        if self.continuous and self.ctrl is not None:
             connections.update({
                 (self.ctrl, "current"): self._current_connection(),
                 (self.ctrl, "voltage"): self._control_voltage_port,
@@ -916,13 +965,6 @@ class DCConverter(Unit):
             bridge_side, network_side = self.branch_f.terminal1, self.branch_f.terminal2
         return self._power_terminals((self.cfg.bus, bridge_side, network_side))
 
-    def aliases(self) -> dict[str, str]:
-        out = ({f"{self.name}.i_c": f"{self.name}.branch_f.i"}
-               if self.branch_f is not None else {})
-        if self.cfg.dclink.capacitor is not None:
-            out[f"{self.name}.u_dc"] = f"{self.name}.dclink.u_C"
-        return out
-
     def signals(self) -> dict[str, float]:
         return {
             f"{self.name}.i_c": self._current(),
@@ -933,13 +975,11 @@ class DCConverter(Unit):
             f"{self.name}.i_dc": self.bridge.out.i_dc,
         }
 
-    def control_inputs(self) -> dict[str, float]:
-        """Return the SI values exposed by the converter control interface."""
-        return self.control_inputs_from(self.ports.read())
-
     def control_inputs_from(
         self, values: Mapping[str, complex | float],
     ) -> dict[str, Any]:
+        if self.ctrl is None:
+            return {}
         return self.ctrl.control_inputs(
             values["current"], values["voltage"], values["vin"],
             values.get("power"),
@@ -983,10 +1023,7 @@ class DCConverter(Unit):
             dc_voltage_error_pu=(
                 float(self.dclink.out.u_dc) / self.cfg.dc_base.v - 1.0
             ),
-            startup_complete=(
-                self.ctrl.startup.complete if output is None
-                else getattr(output, "startup_complete", True)
-            ),
+            startup_complete=self._startup_complete(output),
         )
 
     @staticmethod

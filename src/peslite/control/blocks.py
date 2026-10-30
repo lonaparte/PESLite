@@ -147,7 +147,7 @@ class PI:
 
     The sampled integral branch is the Tustin realisation of ``1/s``.  The continuous branch
     records ``r - fb`` as its state derivative.  Output constraints are owned by the controller;
-    sampled tracking anti-windup remains local to the PI state.
+    tracking anti-windup (``antiwindup``) remains local to the PI state in either branch.
     """
 
     def __new__(cls, kp: float, ki: float, period: float | None, *,
@@ -170,26 +170,6 @@ class PI:
 
     def __call__(self, r, fb, ff=0.0):
         raise NotImplementedError
-
-    def antiwindup(self, intended, output) -> None:
-        """Apply sampled tracking anti-windup after a controller constraint acts."""
-        if self.T is not None and self.antiwindup_enabled:
-            self.integral += self.T * (output - intended) / self.kp
-
-    def track(self, intended, output) -> None:
-        """Track a constrained output in sampled or continuous execution."""
-        if not self.antiwindup_enabled or output == intended:
-            return
-        if self.kp != 0.0:
-            correction = (output - intended) / self.kp
-        elif (intended - output) * self.derivative > 0.0:
-            correction = -self.derivative
-        else:
-            correction = 0.0
-        if self.T is None:
-            self.derivative += correction
-        else:
-            self.integral += self.T * correction
 
     def reset(self) -> None:
         self.integral = self.initial
@@ -217,6 +197,11 @@ class _SampledPI(PI):
         self.integral = integrated + half_step
         return ff + self.kp * error + self.ki * integrated
 
+    def antiwindup(self, intended, output) -> None:
+        """Track a constrained output by correcting the integral."""
+        if self.antiwindup_enabled:
+            self.integral += self.T * (output - intended) / self.kp
+
 
 class _ContinuousPI(PI):
     def __call__(self, r, fb, ff=0.0):
@@ -224,16 +209,21 @@ class _ContinuousPI(PI):
         self.derivative = error
         return ff + self.kp * error + self.ki * self.integral
 
+    def antiwindup(self, intended, output) -> None:
+        """Track a constrained output by correcting the integral's derivative."""
+        if not self.antiwindup_enabled or output == intended:
+            return
+        self.derivative += (output - intended) / self.kp
+
 
 class OutputLimit:
     """Scalar or magnitude constraint for sampled and continuous loops."""
 
-    def __init__(self, limit, *, lower=None, pi=None, active=None, observer=None):
+    def __init__(self, limit, *, lower=None, pi=None, active=None):
         self.pi = pi
         self.limit = _real(limit)
         self.lower = lower
         self.active = active
-        self.observer = observer
         self.saturated = False
         if not math.isfinite(self.limit) or self.limit <= 0.0:
             raise ConfigError("a controller output limit must be finite and positive")
@@ -248,25 +238,12 @@ class OutputLimit:
         magnitude = abs(intended)
         return intended * (self.limit / magnitude) if magnitude > self.limit else intended
 
-    def exceeded(self, intended):
-        if self.lower is not None:
-            return intended < self.lower or intended > self.limit
-        return abs(intended) > self.limit
-
     def sample(self, t, intended):
+        """Constrain ``intended`` at ``t``; an active PI tracks a saturated output in either mode."""
         output = self._apply(intended)
         self.saturated = output != intended
         if self.saturated and self.pi is not None and (self.active is None or self.active()):
             self.pi.antiwindup(intended, output)
-        if self.observer is not None:
-            self.observer(t, intended, output, count=True)
-        return output
-
-    def flow(self, intended):
-        output = self._apply(intended)
-        self.saturated = output != intended
-        if self.saturated and self.pi is not None and (self.active is None or self.active()):
-            self.pi.track(intended, output)
         return output
 
 

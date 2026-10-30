@@ -111,16 +111,8 @@ class OutputStage:
         self.n_updates = 0
         self.n_saturated = 0
         self.first_saturation_t: float | None = None
-        self.saturated = False
         self.m_abc = np.zeros(3)
-        self._memo = None  # cached evaluation for the current control instant
-        self._prepared = None
         self._command_saturated = False
-
-    def new_instant(self) -> None:
-        """Start a new control instant (clear the cached evaluation)."""
-        self._memo = None
-        self._prepared = None
 
     def command_limit(self, u_dc_pu: float) -> float | None:
         """Circular dq-command limit for the configured standard PWM, otherwise ``None``."""
@@ -155,16 +147,6 @@ class OutputStage:
             m = tuple(limited)
         return m, saturated
 
-    def _evaluate(self, command: complex, rot: complex, u_dc: float) -> tuple[np.ndarray, bool]:
-        """Modulating signals and saturation for a dq command (pu), cached for this control instant."""
-        memo = self._memo
-        if memo is not None and memo[0] == command and memo[1] == (rot, u_dc):
-            return memo[2], memo[3]
-        values, saturated = self.equation(command, rot, u_dc)
-        m = np.asarray(values, dtype=float)
-        self._memo = (command, (rot, u_dc), m, saturated)
-        return m, saturated
-
     def modulate(self, t: float, u_cmd_dq: complex, theta: float, u_dc: float, *,
                  count: bool = True) -> np.ndarray:
         """Convert a dq voltage command to duty ratios.
@@ -173,14 +155,11 @@ class OutputStage:
         DC base. ``count=False`` leaves the controller-update and saturation counters unchanged.
         """
         rot = np.exp(1j * theta)
-        u_dc_pu = u_dc
         u_dc = u_dc * self.v_dc_base  # PWM receives DC volts; loop feedback stays pu
-        u_dq = u_cmd_dq
-        m_abc, saturated = self._evaluate(u_dq, rot, u_dc)
+        values, saturated = self.equation(u_cmd_dq, rot, u_dc)
         saturated = saturated or self._command_saturated
-        self.m_abc, self.saturated = m_abc, saturated
+        self.m_abc = np.asarray(values, dtype=float)
         duty = 0.5 * (1.0 + self.m_abc)
-        self._prepared = ((u_dq, theta, u_dc_pu), duty)
         if count:
             self.n_updates += 1
             if saturated:
@@ -188,17 +167,3 @@ class OutputStage:
                 if self.first_saturation_t is None:
                     self.first_saturation_t = t
         return duty
-
-    def finish(self, t: float, u_cmd_dq: complex, theta: float, u_dc: float, *,
-               count: bool = True) -> np.ndarray:
-        """Count and return a command already prepared at this control instant when possible."""
-        prepared = self._prepared
-        if prepared is None or prepared[0] != (u_cmd_dq, theta, u_dc):
-            return self.modulate(t, u_cmd_dq, theta, u_dc, count=count)
-        if count:
-            self.n_updates += 1
-            if self.saturated:
-                self.n_saturated += 1
-                if self.first_saturation_t is None:
-                    self.first_saturation_t = t
-        return prepared[1]

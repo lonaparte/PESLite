@@ -17,8 +17,10 @@ from typing import Callable, Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
+from .model import commutation_tolerance
+
 __all__ = ["RHS", "SolverStep", "Solver", "FIXED_METHODS", "ADAPTIVE_METHODS", "TABLEAUS", "combine", "integrator",
-           "FixedStepSolver", "AdaptiveSolver", "DormandPrince45"]
+           "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "subintervals"]
 
 RHS = Callable[[float, NDArray[np.float64]], NDArray[np.float64]]
 
@@ -87,6 +89,11 @@ def integrator(method: str, dt: float, rtol: float = 1e-6, atol: float = 1e-9,
     return AdaptiveSolver(method, rtol, atol, max_step, warm_start)
 
 
+def subintervals(span: float, step: float) -> int:
+    """Return equal pieces that cover ``span`` without exceeding ``step``."""
+    return max(1, int(math.ceil(span / step - 1e-9)))
+
+
 class FixedStepSolver:
     """Explicit RK with a maximum step ``dt`` (s); sub-steps are equal within an interval.
 
@@ -112,7 +119,7 @@ class FixedStepSolver:
         step = min(self.dt, max_step)
         if step <= 0.0:
             raise ValueError("max_step must be positive")
-        n = max(1, int(math.ceil(span / step - 1e-9)))
+        n = subintervals(span, step)
         h = span / n
         c, a, _b = TABLEAUS[self.method]
         self.n_rhs += len(c) * n
@@ -267,7 +274,7 @@ class DormandPrince45:
         h = min(h, span, step)
         k1 = f(t, y)
         self.n_rhs += 1
-        while t < t1 - 1e-15 * max(1.0, abs(t1)):
+        while t < t1 - commutation_tolerance(t1):
             if t + h > t1:
                 h = t1 - t
             k2 = f(t + c[1] * h, y + h * (a[1][0] * k1))
@@ -281,22 +288,25 @@ class DormandPrince45:
             err_vec = h * (e[0] * k1 + e[2] * k3 + e[3] * k4 + e[4] * k5 + e[5] * k6 + e[6] * k7)
             scale = self.atol + self.rtol * np.maximum(np.abs(y), np.abs(y1))
             err = float(np.max(np.abs(err_vec) / scale))
-            if err <= 1.0 or h <= 1e-15:
-                t += h
-                y, k1 = y1, k7
-                # PI step-size controller
-                if err == 0.0:
-                    factor = 5.0
-                else:
-                    factor = self.safety * err ** -0.14 * self._err_prev ** 0.08
-                    factor = min(5.0, max(0.2, factor))
-                self._err_prev = max(err, 1e-4)
-                h = min(h * factor, step)
-            else:
-                self.n_rejected += 1
-                h = h * max(0.1, self.safety * err ** -0.25)
+            accepted, h_next = self._control(h, err, step)
+            if accepted:
+                t, y, k1 = t + h, y1, k7
+            h = h_next
         self._h = h
         return SolverStep(t1, y, self.n_rhs)
+
+    def _control(self, h: float, err: float, max_step: float) -> tuple[bool, float]:
+        """Whether a step ``h`` with scaled error ``err`` is accepted, and the next step (PI control)."""
+        if err <= 1.0 or h <= 1e-15:
+            if err == 0.0:
+                factor = 5.0
+            else:
+                factor = self.safety * err ** -0.14 * self._err_prev ** 0.08
+                factor = min(5.0, max(0.2, factor))
+            self._err_prev = max(err, 1e-4)
+            return True, min(h * factor, max_step)
+        self.n_rejected += 1
+        return False, h * max(0.1, self.safety * err ** -0.25)
 
     def _call_lists(self, f, t0: float, t1: float,
                     y0: NDArray[np.float64], max_step: float) -> SolverStep:
@@ -317,8 +327,7 @@ class DormandPrince45:
         h = min(h, span, max_step)
         k1 = f(t, y)
         self.n_rhs += 1
-        end_eps = 1e-15 * max(1.0, abs(t1))
-        while t < t1 - end_eps:
+        while t < t1 - commutation_tolerance(t1):
             if t + h > t1:
                 h = t1 - t
             k2 = f(t + c2 * h,
@@ -346,19 +355,10 @@ class DormandPrince45:
                 ratio = estimate / (atol + rtol * max(abs(v), abs(v1)))
                 if ratio > err:
                     err = ratio
-            if err <= 1.0 or h <= 1e-15:
-                t += h
-                y, k1 = y1, k7
-                if err == 0.0:
-                    factor = 5.0
-                else:
-                    factor = self.safety * err ** -0.14 * self._err_prev ** 0.08
-                    factor = min(5.0, max(0.2, factor))
-                self._err_prev = max(err, 1e-4)
-                h = min(h * factor, max_step)
-            else:
-                self.n_rejected += 1
-                h = h * max(0.1, self.safety * err ** -0.25)
+            accepted, h_next = self._control(h, err, max_step)
+            if accepted:
+                t, y, k1 = t + h, y1, k7
+            h = h_next
         self._h = h
         return SolverStep(t1, np.asarray(y), self.n_rhs)
 

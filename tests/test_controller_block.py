@@ -1,13 +1,15 @@
 """Issue #1: the controller is a closed sampled block; protection belongs to its converter unit."""
 
 import cmath
-from types import SimpleNamespace
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
 import peslite
 from conftest import EXAMPLES
+from peslite.assembly.params import (DCVoltageLimitParams, FrequencyLimitParams, OvercurrentParams,
+                                     ProtectionParams, VoltageLimitParams)
 from peslite.control import Measurement, Startup
 from peslite.control.blocks import smoothstep
 
@@ -170,16 +172,15 @@ def test_fast_unit_protection_trips_during_unarmed_ramp(gfl, tmp_path):
     ("overvoltage", "voltage_ov", "VOLTAGE_OVER", (1.5, 0.0, 0.0)),
 ])
 def test_sampled_protection_arms_and_holds(criterion, cause, alarm, inputs):
-    cfg = SimpleNamespace(
+    cfg = ProtectionParams(
         hold=0.02,
-        rocof=SimpleNamespace(window=0.1, enable=False),
-        overcurrent=SimpleNamespace(enable=False, limit_pu=1.0),
-        dc_voltage=SimpleNamespace(enable=False, limit_pu=0.1),
-        frequency=SimpleNamespace(enable=False, limit=1.0),
-        undervoltage=SimpleNamespace(enable=False, limit_pu=0.8),
-        overvoltage=SimpleNamespace(enable=False, limit_pu=1.2),
+        overcurrent=OvercurrentParams(limit_pu=1.0),
+        dc_voltage=DCVoltageLimitParams(limit_pu=0.1),
+        frequency=FrequencyLimitParams(limit=1.0),
+        undervoltage=VoltageLimitParams(limit_pu=0.8),
+        overvoltage=VoltageLimitParams(limit_pu=1.2),
     )
-    getattr(cfg, criterion).enable = True
+    cfg = replace(cfg, **{criterion: replace(getattr(cfg, criterion), enable=True)})
     protection = peslite.Protection(cfg, 0.01, 1.0)
     protection.check_sampled(0.0, peslite.ProtectionSample(
         terminal_voltage_pu=inputs[0],
@@ -201,14 +202,13 @@ def test_sampled_protection_arms_and_holds(criterion, cause, alarm, inputs):
 
 
 def test_fast_and_sampled_paths_share_one_trip_latch():
-    cfg = SimpleNamespace(
+    cfg = ProtectionParams(
         hold=0.0,
-        rocof=SimpleNamespace(window=0.1, enable=False),
-        overcurrent=SimpleNamespace(enable=True, limit_pu=0.5),
-        dc_voltage=SimpleNamespace(enable=True, limit_pu=0.1),
-        frequency=SimpleNamespace(enable=False, limit=1.0),
-        undervoltage=SimpleNamespace(enable=False, limit_pu=0.8),
-        overvoltage=SimpleNamespace(enable=False, limit_pu=1.2),
+        overcurrent=OvercurrentParams(enable=True, limit_pu=0.5),
+        dc_voltage=DCVoltageLimitParams(enable=True, limit_pu=0.1),
+        frequency=FrequencyLimitParams(limit=1.0),
+        undervoltage=VoltageLimitParams(limit_pu=0.8),
+        overvoltage=VoltageLimitParams(limit_pu=1.2),
     )
     protection = peslite.Protection(cfg, 0.01, 1.0)
     assert protection.check_fast(0.01, (0.6, 0.0, 0.0))
@@ -232,6 +232,11 @@ def test_controller_block_states_use_entity_first_names(gfl):
     assert "vsc.prot.hold_uv" in names
     assert not any(".ctrl.prot." in name for name in names)
     assert not any(".pending." in name for name in names)
+    # Every graph controller restores its start-up entries strictly, like its loop states.
+    for model in ("pwm_averaging", "averaging"):
+        controller = peslite.VSCController(gfl(**{"units.vsc.bridge.model": model}).unit("vsc"))
+        with pytest.raises(KeyError, match="start-up sequence has no state"):
+            controller.set_state({"startup.stpes": 1})
 
 
 @pytest.mark.parametrize("name", ["gfm-psc-example.pes", "gfm-vsg-example.pes"])
@@ -256,6 +261,10 @@ def test_split_bound_holds_startup_and_pwm_modes(gfl, tmp_path):
     })
     summary = _run(params, tmp_path).summary
     assert summary["split_bound"].startswith("linearised loop at t = 0.002, 0.004 s")
+    # windows closed, but without the state history there is no row to linearise at
+    summary = _run(params.replace(**{"simulation.output.states": 0}), tmp_path / "no-states").summary
+    assert summary["interface_windows"] > 0
+    assert summary["split_bound"].startswith("no recorded state row to linearise at")
 
 
 def test_startup_and_registers_continue_from_a_saved_row(gfl, tmp_path):

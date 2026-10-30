@@ -18,6 +18,15 @@ from peslite.solver.simulation import _plant_output_row
 UNIT_SUFFIX = re.compile(r"_(s|hz|hz_s|J|rad)$")
 
 
+def test_multi_unit_output_columns_follow_configuration_order():
+    from conftest import EXAMPLES
+    params = peslite.load(EXAMPLES / 'wpt-example.pes')
+    signals = {'charger.primary.u_dc': 400., 'charger.primary.i_dc': 2.,
+               'charger.secondary.u_dc': 200., 'charger.secondary.i_dc': 3.}
+    row = _plant_output_row(params, 0., signals, {})
+    assert tuple(row) == ('t', *signals)
+
+
 def _run(params, out):
     return peslite.Simulation(params).run(out_dir=out)
 
@@ -131,21 +140,29 @@ def test_grid_following_and_grid_forming_logs_share_names(gfl, examples, tmp_pat
     assert not hasattr(result_gfl, "control")
 
 
-def test_ctrl_output_uses_only_the_abbreviated_name(gfl, tmp_path):
-    result = _run(gfl(**{"simulation.output.signals": 1}), tmp_path)
-    assert tmp_path / "ctrl.vsc.csv" in result.files
-    assert (tmp_path / "ctrl.vsc.csv").is_file()
-    assert not (tmp_path / "control.vsc.csv").exists()
+def test_ctrl_output_uses_only_the_abbreviated_name(gfl, tmp_path, monkeypatch):
+    result = _run(gfl(**{"simulation.output.signals": 1}), tmp_path / "declared")
+    assert tmp_path / "declared" / "ctrl.vsc.csv" in result.files
+    assert (tmp_path / "declared" / "ctrl.vsc.csv").is_file()
+    assert not (tmp_path / "declared" / "control.vsc.csv").exists()
+
+    # log_names() is optional: the names found in the first log fill ctrl.vsc.csv only
+    simulation = peslite.Simulation(gfl(**{"simulation.output.signals": 1}))
+    monkeypatch.delattr(type(simulation.unit().ctrl), "log_names")
+    discovered = simulation.run(out_dir=tmp_path / "discovered")
+    assert list(discovered.ctrl) == list(result.ctrl)
+    assert list(discovered.plant) == [key for key in result.plant if key not in result.ctrl]
 
 
 def test_continuation_uses_the_renamed_states(gfl, tmp_path):
     first_dir = tmp_path / "first"
-    result = _run(gfl(**{"simulation.t_end": 0.004}), first_dir)
+    result = peslite.Simulation(gfl(**{"simulation.t_end": 0.006})).run(0.004, out_dir=first_dir)
     restarted = peslite.load(
         first_dir / "simulation.pes",
         initial=first_dir / "states.csv",
         initial_time=0.002,
     )
+    assert restarted.simulation.t_end == 0.004  # the written file repeats the run's end time
     continued = _run(restarted, tmp_path / "continued")
     index = int(np.argmin(abs(result.states["t"] - 0.003)))
     continued_index = int(np.argmin(abs(continued.states["t"] - 0.003)))

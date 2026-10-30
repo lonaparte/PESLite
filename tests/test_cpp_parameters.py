@@ -1,6 +1,7 @@
 """One compiled model uses the ordinary parameter tree for physical and control changes."""
 
 import csv
+import json
 import subprocess
 
 import numpy as np
@@ -50,25 +51,43 @@ def _table(path):
         return keys, np.array([[float(row[key]) for key in keys] for row in reader])
 
 
-def _compare_run(p, binary, changes, directory, *, rtol=3e-6, atol=3e-5):
+def _compare_run(p, binary, changes, directory, *, rtol=3e-6, atol=3e-5, parts=None):
     native, python = directory / "native", directory / "python"
     args = [str(binary), "--out", str(native)]
     for key, value in changes.items():
         args.extend(["--set", f"{key}={value}"])
     subprocess.run(args, check=True, capture_output=True, text=True)
     expected = p.replace(**changes)
-    peslite.Simulation(expected).run(out_dir=python)
+    simulation = peslite.Simulation(expected, parts=parts)
+    simulation.run(out_dir=python)
     filenames = ("states.csv", "energy.csv") if p.simulation.energy_check != "off" else ("states.csv",)
     for filename in filenames:
         keys, actual = _table(native / filename)
         expected_keys, reference = _table(python / filename)
         assert keys == expected_keys
-        np.testing.assert_allclose(actual, reference, rtol=rtol, atol=atol)
+        if filename == "states.csv":
+            for index, name in enumerate(keys):
+                if name in simulation._states.angle_names:
+                    actual[:, index] = reference[:, index] + (
+                        actual[:, index] - reference[:, index] + np.pi) % (2 * np.pi) - np.pi
+        compared = list(range(len(keys)))
+        if filename == "energy.csv":
+            # Conservation residuals are zero identities. Compare them against the circuit's
+            # power flow: iterative algebraic solves and direct elimination leave different
+            # small residuals even when their physical states agree.
+            residuals = [i for i, key in enumerate(keys)
+                         if key in ("tellegen_W", "balance_residual_W")]
+            watts = [i for i, key in enumerate(keys) if key.endswith("_W")]
+            scale = np.maximum(1.0, np.max(np.abs(reference[:, watts]), axis=1))[:, None]
+            np.testing.assert_allclose(actual[:, residuals] / scale, reference[:, residuals] / scale,
+                                       rtol=rtol, atol=rtol)
+            compared = [i for i in compared if i not in residuals]
+        np.testing.assert_allclose(actual[:, compared], reference[:, compared], rtol=rtol, atol=atol)
     assert _written_out(peslite.load(native / "simulation.pes")) == _written_out(expected)
 
 
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
-@pytest.mark.parametrize("name", ["buck", "gfl", "wpt", "wpt-lcc"])
+@pytest.mark.parametrize("name", ["buck", "gfl", "cable-gfl", "wpt", "wpt-lcc"])
 def test_compiled_parameters_reinitialize_physics_control_and_energy(name, mode, tmp_path):
     p = _case(name, mode)
     if name == "buck":
@@ -89,6 +108,12 @@ def test_compiled_parameters_reinitialize_physics_control_and_energy(name, mode,
             "units.vsc.dclink.capacitor.c": p.unit().dclink.capacitor.c * 1.2,
             "units.vsc.ctrl.loops.CurrentLoop.bandwidth": 250.0,
         }
+    elif name == "cable-gfl":
+        changes = {
+            "elements.cable1.r_per_km": 0.07,
+            "elements.cable1.c_per_km": 0.25e-6,
+            "units.vsc.ctrl.loops.CurrentLoop.bandwidth": 250.0,
+        }
     else:
         changes = {
             "units.charger.link.primary_inductance": 110e-6,
@@ -97,6 +122,7 @@ def test_compiled_parameters_reinitialize_physics_control_and_energy(name, mode,
             "units.charger.primary.dclink.source.v": 420.0,
         }
         if name == "wpt-lcc":
+            changes["units.charger.link.primary_parallel_resistance"] = 0.05
             changes["units.charger.secondary.ctrl.loops.PhasePowerControl.ki"] = 0.1
             changes["units.charger.secondary.ctrl.loops.PhasePowerControl.power_filter.bandwidth"] = 1500.0
     binary = _compile(p, tmp_path / "model")
@@ -179,6 +205,11 @@ def test_explicit_connection_variable_events_match_python(name, target, mode, tm
     }})
     binary = _compile(p, tmp_path / "model")
     _compare_run(p, binary, {}, tmp_path / "run")
+    # Interrupts while stopped are not modulation updates in either target.
+    native, python = (json.loads((tmp_path / "run" / side / "summary.json").read_text())
+                      for side in ("native", "python"))
+    key = f"{target}.modulation_saturation_fraction"
+    assert native.get(key) == pytest.approx(python.get(key))
 
 
 @pytest.mark.parametrize("name, target", [("buck", "converter"), ("gfl", "vsc"), ("gfm-dvoc", "vsc"),
@@ -373,6 +404,84 @@ def test_runtime_reuses_parameter_validation_instead_of_a_cpp_device_whitelist(t
         assert not native.exists()
 
 
+
+@pytest.mark.parametrize("selection", ["all", "common"])
+def test_zero_parallel_capacitance_keeps_the_compiled_structure(selection, tmp_path):
+    params = _case("wpt", "averaging")
+    binary = _compile(params, tmp_path / "model", (selection,))
+    path = "units.charger.primary.bridge.parallel_capacitance"
+    baseline = subprocess.run([binary, "--set", f"{path}=0", "--out", tmp_path / "zero"],
+                              capture_output=True, text=True)
+    assert baseline.returncode == 0
+    changed = subprocess.run([binary, "--set", f"{path}=1e-9", "--out", tmp_path / "changed"],
+                             capture_output=True, text=True)
+    assert changed.returncode == 1
+    assert "changed structural specialization" in changed.stderr
+    assert not (tmp_path / "changed").exists()
+
+
+@pytest.mark.parametrize("initial, changed", [(0.0, 1.0e-6), (1.0e-6, 0.0)])
+def test_vsc_computation_delay_uses_the_shared_structural_guard(
+        initial, changed, tmp_path):
+    params = _case("gfl", "pwm_averaging").replace(**{
+        "units.vsc.ctrl.computation": initial,
+    })
+    binary = _compile(
+        params,
+        tmp_path / "model",
+        ("units.vsc.ctrl.computation",),
+    )
+    output = tmp_path / "changed"
+    result = subprocess.run(
+        [binary, "--set", f"units.vsc.ctrl.computation={changed}", "--out", output],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "changed structural specialization" in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("initial, changed", [(0.0, 5.0e-6), (5.0e-6, 0.0)])
+def test_adc_offset_uses_the_shared_structural_guard(initial, changed, tmp_path):
+    path = "units.vsc.meas.offset"
+    params = _case("gfl", "pwm_averaging").replace(**{path: initial})
+    binary = _compile(params, tmp_path / "model", (path,))
+    output = tmp_path / "changed"
+    result = subprocess.run(
+        [binary, "--set", f"{path}={changed}", "--out", output],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "changed structural specialization" in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("name,mode,selection", [
+    ("buck", "switching", "all"),
+    ("wpt", "averaging", "all"),
+    ("gfl", "pwm_averaging", "common"),
+])
+def test_finite_bridge_parameters_use_the_shared_native_equations(name, mode, selection, tmp_path):
+    from peslite.assembly.params import _unit_items
+
+    p = _case(name, mode)
+    names = tuple(unit for unit, _ in _unit_items(p.units))
+    changes = {"simulation.t_end": 30e-6, "simulation.solver.dt": 0.25e-6}
+    for unit in names:
+        changes.update({
+            f"units.{unit}.bridge.parallel_capacitance": 1e-5,
+            f"units.{unit}.bridge.on_resistance": 1.0,
+            f"units.{unit}.protection.overcurrent.enable": False,
+        })
+    p = p.replace(**changes)
+    binary = _compile(p, tmp_path / "model", (selection,))
+    unit = names[0]
+    _compare_run(p, binary, {f"units.{unit}.bridge.parallel_capacitance": 1.2e-5,
+                             f"units.{unit}.bridge.on_resistance": 1.1}, tmp_path / "run")
+
+
 def test_parameter_selection_rejects_structural_paths_before_writing(tmp_path):
     p = _case("buck", "pwm_averaging")
     for path in ("units.converter.type", "units.converter.bridge.model", "buses.output.phases"):
@@ -442,10 +551,23 @@ def test_retained_carrier_phase_uses_normal_startup_clock(mode, tmp_path):
     p = _case("buck", mode)
     binary = _compile(p, tmp_path / "model")
     _compare_run(p, binary, {"units.converter.pwm.carrier_phase": 0.25}, tmp_path / "run")
+    # A unit connected at t0 has already counted the interrupt at t0 for its start-up ramp.
+    p = _case("gfl", mode).replace(**{"events.connect_vsc.ramp": 1e-3})
+    binary = _compile(p, tmp_path / "connected")
+    _compare_run(p, binary, {"units.vsc.ctrl.period": 1e-4,
+                             "units.vsc.protection.rocof.window": 0.2}, tmp_path / "same_count")
+    output = tmp_path / "changed_count"
+    result = subprocess.run([binary, "--set", "units.vsc.pwm.carrier_phase=0.25", "--out", output],
+                            capture_output=True, text=True)
+    assert result.returncode == 1
+    assert "changed structural specialization" in result.stderr
+    assert not output.exists()
 
 
-def test_retained_clock_and_supply_reinitialize_the_adc_window_before_first_sample(tmp_path):
-    p = _case("buck", "pwm_averaging").replace(**{"units.converter.meas.average": ["vin"]})
+@pytest.mark.parametrize("offset", [None, 1e-5])  # an independent ADC also seeds its held values
+def test_retained_clock_and_supply_reinitialize_the_adc_window_before_first_sample(offset, tmp_path):
+    p = _case("buck", "pwm_averaging").replace(**{"units.converter.meas.average": ["vin"],
+                                                  "units.converter.meas.offset": offset})
     binary = _compile(p, tmp_path / "model")
     _compare_run(p, binary, {"units.converter.pwm.carrier_phase": 0.25,
                              "units.converter.dclink.source.v": 52.0}, tmp_path / "run")

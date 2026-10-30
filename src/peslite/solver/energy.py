@@ -12,7 +12,7 @@ from typing import Any, ClassVar, Optional, Protocol, runtime_checkable
 import numpy as np
 
 __all__ = ["StoragePort", "PowerPort", "Energetic", "EnergySpec", "EnergyReport", "SubsystemEnergy", "PHReport", "SubsystemStatus", "CutStatus", "signal",
-           "re_product", "spec_of", "energy_of", "power_in", "balance", "ph_report"]
+           "re_product", "spec_of", "balance", "ph_report"]
 
 
 # ------------------------------------------------------------------ declarations
@@ -87,9 +87,14 @@ class EnergySpec:
     supplied: Optional[Any] = None
     has_source: bool = False
 
-    @property
-    def accounted(self) -> bool:
-        return self.kind in ("declared", "default")
+
+def _power_law(sub: Any, name: str):
+    """Read the configured method, including equations bound to an individual component."""
+    method = getattr(sub, name)
+    implementation = getattr(method, "__func__", None)
+    if implementation is not None:
+        return implementation
+    return lambda owner: getattr(owner, name)()
 
 
 def spec_of(sub: Any) -> EnergySpec:
@@ -103,28 +108,9 @@ def spec_of(sub: Any) -> EnergySpec:
         return EnergySpec("dirac")
     if isinstance(sub, Energetic):
         return EnergySpec("declared", tuple(getattr(sub, "storage", ())), tuple(getattr(sub, "ports", ())),
-                          type(sub).dissipated_power, type(sub).supplied_power,
+                          _power_law(sub, "dissipated_power"), _power_law(sub, "supplied_power"),
                           has_source=bool(getattr(sub, "has_source", False)))
     return EnergySpec("default", (), (), lambda sub: 0.0, lambda sub: 0.0, has_source=True)
-
-
-def energy_of(sub: Any, spec: Optional[EnergySpec] = None) -> float:
-    """Stored energy from the storage declarations (J)."""
-    spec = spec or spec_of(sub)
-    total = 0.0
-    for st in spec.storage:
-        x = getattr(sub.state, st.state)
-        total += 0.5 * st.scale * st.value * (abs(x) ** 2)
-    return total
-
-
-def energy_rate(sub: Any, derivatives: dict[str, Any], spec: EnergySpec) -> float:
-    """``dH/dt`` from the state derivatives ``{state name: value}``."""
-    total = 0.0
-    for st in spec.storage:
-        x, dx = getattr(sub.state, st.state), derivatives[st.state]
-        total += st.scale * st.value * (x * np.conj(dx)).real if isinstance(x, complex) else st.scale * st.value * x * dx
-    return float(total)
 
 
 def re_product(e: Any, f: Any) -> float:
@@ -134,37 +120,6 @@ def re_product(e: Any, f: Any) -> float:
 
 def port_power(sub: Any, port: PowerPort) -> float:
     return port.sign * port.scale * re_product(signal(sub, port.effort), signal(sub, port.flow))
-
-
-def power_in(sub: Any, spec: Optional[EnergySpec] = None) -> float:
-    """Power entering the subsystem through its connection ports (W)."""
-    spec = spec or spec_of(sub)
-    return sum(port_power(sub, port) for port in spec.ports)
-
-
-def port_terms(model: Any, sub: Any, port: PowerPort) -> list[tuple[Any, float]]:
-    """Split a port's power by the subsystem at the other end of each connection.
-
-    Returns ``[(source subsystem, power in W), ...]``; empty when neither port signal is an input.
-    """
-    for name, is_flow in ((port.flow, True), (port.effort, False)):
-        where, _, attr = name.partition(".")
-        if where != "inp":
-            continue
-        sources = model.connections.get((sub, attr))
-        if sources is None:
-            return []
-        entries = sources if isinstance(sources, list) else [sources]
-        other = signal(sub, port.effort if is_flow else port.flow)
-        terms = []
-        for entry in entries:
-            src, out_name = entry[0], entry[1]
-            gain = float(entry[2]) if len(entry) > 2 else 1.0
-            piece = gain * getattr(src.out, out_name)
-            p = re_product(other, piece) if is_flow else re_product(piece, other)
-            terms.append((src, port.sign * port.scale * p))
-        return terms
-    return []
 
 
 @dataclass
@@ -177,6 +132,8 @@ class SubsystemEnergy:
     energy_rate: float  # dH/dt, W
     residual: float  # power_in + supplied - dissipated - energy_rate, W
     kind: str = "declared"
+    # J, cumulative energy dissipated at state jumps (switch closings); None: none declared
+    impulsive: Optional[float] = None
 
 
 @dataclass
@@ -228,6 +185,8 @@ class EnergyReport:
                 cols[f"{s.name}.power_supplied_W"] = s.supplied  # inferred net injection
             else:
                 cols[f"{s.name}.energy_J"] = s.energy
+            if s.impulsive is not None:
+                cols[f"{s.name}.dissipated_impulsive_J"] = s.impulsive
         return cols
 
 
@@ -280,6 +239,7 @@ class _BalancePlan:
     """Static topology and state-vector accesses for repeated energy audits of one model."""
 
     model: Any
+    specs: dict  # the declarations it was compiled from (``model.energy_specs``)
     subsystems: tuple[_SubsystemCheck, ...]
     transfers: tuple[_DefaultTransfer, ...]
     n_defaults: int
@@ -330,10 +290,14 @@ class _BalancePlan:
             )
             supplied = float(spec.supplied(check.subsystem))
             dissipated = float(spec.dissipated(check.subsystem))
-            report.subsystems.append(SubsystemEnergy(
+            entry = SubsystemEnergy(
                 check.name, energy, p_in, supplied, dissipated, rate,
                 p_in + supplied - dissipated - rate,
-            ))
+            )
+            impulsive = getattr(check.subsystem, "impulsive_dissipated_energy", None)
+            if impulsive is not None:
+                entry.impulsive = float(impulsive)
+            report.subsystems.append(entry)
         return report
 
 
@@ -397,13 +361,13 @@ def compile_balance(model: Any) -> _BalancePlan:
             name, sub, spec, default_index.get(id(sub)),
             tuple(storage_checks), tuple(power_checks),
         ))
-    return _BalancePlan(model, tuple(checks), tuple(transfers), len(default_index))
+    return _BalancePlan(model, specs, tuple(checks), tuple(transfers), len(default_index))
 
 
 def balance(model: Any, t: float, y: np.ndarray) -> EnergyReport:
     """Energy accounting of ``model`` at ``(t, y)``; leaves the records synced to ``(t, y)``."""
     plan = getattr(model, "_energy_balance_plan", None)
-    if plan is None:
+    if plan is None or plan.specs is not model.energy_specs:  # declarations replaced by a set event
         plan = model._energy_balance_plan = compile_balance(model)
     return plan(t, y)
 
@@ -467,10 +431,6 @@ class PHReport:
         if self.problems:
             return "inconsistent"
         return "defaulted" if self.defaulted else "port-hamiltonian"
-
-    @property
-    def is_port_hamiltonian(self) -> bool:
-        return self.verdict == "port-hamiltonian"
 
     @property
     def coverage(self) -> float:

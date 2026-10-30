@@ -10,7 +10,7 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import ConfigError, _unit_items
+from peslite.assembly.params import ConfigError
 
 
 SHORT = ["--set", "simulation.t_end=0.004",
@@ -102,23 +102,15 @@ def test_bridge_flags_are_mutually_exclusive(capsys):
     assert "not allowed with argument" in capsys.readouterr().err
 
 
-def _with_model(params, model):
-    return params.replace(**{
-        f"units.{name}.bridge.model": model for name, _unit in _unit_items(params.units)
-    })
-
-
 @pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda path: path.stem)
-@pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
-def test_every_bundled_file_runs_with_every_completed_model(path, model, tmp_path):
+def test_every_bundled_file_runs_with_its_configured_model(path, tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         params = peslite.load(path, **{"simulation.solver.linearisations": 0})
         duration = min(0.004, params.simulation.t_end)
         params = params.replace(**{"simulation.t_end": duration,
                                    "simulation.output.states": True})
-        params = _with_model(params, model)
-    result = peslite.Simulation(params).run(out_dir=tmp_path / f"{path.stem}-{model}")
+    result = peslite.Simulation(params).run(out_dir=tmp_path / path.stem)
     assert np.isfinite(result.states["t"]).all()
     assert result.states["t"][-1] == pytest.approx(duration)
 
@@ -148,7 +140,7 @@ def test_ideal_averaging_is_a_bridge_implementation_without_a_pwm(tmp_path):
     )
     simulation = peslite.Simulation(params)
     assert not isinstance(simulation.units["vsc_1"].bridge, peslite.PWM)
-    assert isinstance(simulation.units["vsc_1"].bridge, peslite.AveragingBridge)
+    assert isinstance(simulation.units["vsc_1"].bridge, peslite.AveragingModel)
     assert not hasattr(simulation.units["vsc_1"], "pwm")
     assert not hasattr(simulation.units["vsc_1"], "averaging")
     assert type(simulation.units["vsc_2"].bridge.modulator).__name__ == "CarrierComparison"
@@ -192,6 +184,7 @@ def test_averaging_silently_ignores_all_sampled_timing_semantics(tmp_path):
         "events.connect_vsc.ramp": 0.0,
         "simulation.t_end": 0.001,
         "simulation.solver.linearisations": 0,
+        "units.vsc.meas.period": 7e-6,  # not ignored: the unit's protection clock
     }
     baseline = peslite.load(EXAMPLES / "gfl-example.pes", **common)
     configured = peslite.load(EXAMPLES / "gfl-example.pes", **common, **{
@@ -200,7 +193,6 @@ def test_averaging_silently_ignores_all_sampled_timing_semantics(tmp_path):
         "units.vsc.ctrl.loops.SRFPLL.period": 31e-6,
         "units.vsc.ctrl.loops.CurrentLoop.period": 43e-6,
         "units.vsc.ctrl.loops.DCVoltageControl.period": 59e-6,
-        "units.vsc.meas.period": 7e-6,
         "units.vsc.meas.window": 0.2,
         "units.vsc.meas.average": ["u_g", "i_c", "u_dc"],
         "units.vsc.pwm.f_sw": 19_999.0,
@@ -214,6 +206,7 @@ def test_averaging_silently_ignores_all_sampled_timing_semantics(tmp_path):
     first = peslite.Simulation(baseline).run(out_dir=tmp_path / "baseline")
     second_sim = peslite.Simulation(configured)
     assert second_sim.unit().adc is None
+    assert second_sim.unit().clock.period == 7e-6
     assert second_sim.unit().periods == []
     assert second_sim.unit().ctrl.periods == {
         "SRFPLL": 31e-6,

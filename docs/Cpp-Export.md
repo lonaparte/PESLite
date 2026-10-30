@@ -71,6 +71,7 @@ export/case/peslite \
   --out output/cpp-run
 ```
 
+The output directory may also be given as a positional argument instead of `--out`.
 `--list-params` shows the paths compiled as variables and their current defaults. Only these paths
 can be changed. Setting any other path fails with:
 
@@ -105,8 +106,8 @@ peslite-convert buck-example common
 
 Leaf converters also expose `units.<name>.connected`, the initial connection command. Select it
 individually or through a unit section, `all`, or `common`, and set it to `0` or `1` with `--set`.
-Scheduled connection events retain their normal precedence and timing. The command uses the same
-startup, PWM and protection lifecycle as a local simulation; it is not a writable gate-status flag.
+Scheduled connection events retain their normal precedence and timing; see
+[Built-in events](Events-and-Restart.md#built-in-events).
 
 `common` means `all` minus the parameters identified by the existing structural sensitivity
 check. It keeps those detected parameters constant at their configured values; every other
@@ -140,6 +141,11 @@ ADC oversample count or RMS/ROCOF history size requires a new export. Parameter 
 checked initialization branches come from the ordinary schemas and constructors. Invalid values
 and changes outside the compiled specialization fail before simulation output is created.
 Clock changes that would alter an already initialized switching-edge sequence also require a new export.
+So do clock changes that would alter the start-up interrupt count of a unit connected at or before
+the initial time.
+The generated schedule uses the same PWM-load, controller and ADC period-and-offset clocks as
+Python. Changing an exported offset across the aligned/independent ADC boundary changes held-state
+layout and is therefore rejected by the same structural-specialization guard.
 
 Runtime values are stored as direct typed fields. Component construction is recorded during export
 and replayed with parameter expressions, reusing the normal numerical initialization rather than
@@ -154,10 +160,8 @@ fully constant build; select only the fields you need when maximum specializatio
 
 Export also reports retained parameters that control conditional dependencies inside algebraic
 loops. The command prints these diagnostics; the Python API exposes the same records through
-`project.diagnostics`, including `parameters`, `condition`, `dependencies` and `loop`. For example,
-the Buck model reports `buses.output.r_d` and `units.converter.dclink.source.r`, with their public
-input-to-output dependency paths. These names are discovered from the traced equations, not a
-device or parameter list. They remain adjustable with `--set`.
+`project.diagnostics`, including `parameters`, `condition`, `dependencies` and `loop`. These names
+come from traced equations, not a device or parameter list, and remain adjustable with `--set`.
 
 The check reuses the existing equation trace and topological sort. Only cyclic residual graphs
 need SCC analysis. Products with parameter-only coefficients and parameter-controlled scalar
@@ -173,18 +177,8 @@ validation constraints is not proved by this basic check.
 
 ## Results
 
-The compiled simulator uses the same result structure as the Python runner:
-
-```text
-output/cpp-run/
-├── states.csv
-├── summary.json
-└── simulation.pes
-```
-
-Optional plant, controller and energy files follow the same configuration. The output
-`simulation.pes` records the actual values after `--config` and `--set`, so the C++ run remains
-auditable.
+The compiled simulator writes the same [result files](Output-and-Results.md#files) as Python; its
+`simulation.pes` records values after `--config` and `--set`.
 
 ## What is specialized
 
@@ -264,6 +258,30 @@ common trip path, not a WPT phase override.
   infer an optional-value protocol from a field's initial value. Built-in first-occurrence times
   use numeric sentinels internally and report absent occurrences as JSON `null`.
 - Only parameters reported by `--list-params` can change in the compiled simulator.
+- Scheduled `set` events are lowered for controller references
+  (`units.<unit>.ctrl.references.<name>`), source `v`, `f` and `angle`, connection commands and
+  element scalars declared by `parameter_bindings()`. Export refuses the other `set` targets that
+  a Python run accepts, with `event '<name>' writes unsupported variable '<path>'`: bus `c` and
+  `r_d`, branch and source `l` and `r`, controller loop parameters
+  (`units.<unit>.ctrl.loops.<loop>.<field>`), protection settings (`units.<unit>.protection.*`),
+  DC-link source values (`units.<unit>.dclink.source.*`) and element fields without a binding.
+  A retained parameter can still start a run with another value through `--set`.
 
-The exporter supports the built-in switching, PWM-period-averaged and ideal averaged bridge models.
+The exporter supports the built-in switching, PWM-period-averaged and ideal averaged bridge models,
+including square-wave phase-shift modulation in the switching model.
 For their semantics, see [Converter and Bridge Models](Converter-and-Bridge-Models.md).
+
+Controllerless Units retain their electrical equations and independently clocked ADCs. Ideal
+diode full bridges and switch-controlled capacitors participate through the ordinary
+`commutation_margin()`, `commutate(t)` and optional `next_commutation_time()` component methods.
+The native dispatcher shares scheduled boundaries, margin location, simultaneous transitions,
+state resets and the no-progress guard. Adaptive commutations require a finite `max_step`.
+Component-owned state projections, discharge-energy columns and diagnostics are exported too.
+
+Custom components declare mutable scalar equation memory with `equation_state_bindings()`, a
+mapping from local names to `(owner, attribute)` storage references. These bindings describe the
+existing memory; they do not create another state store or restart schema. `get_state()` and
+`set_state()` retain public restart names. Annotated scalar and void helper methods are traced
+at their existing boundaries to avoid multiplying unrelated branch paths. Component equations and
+state-changing callbacks are traced from their Python implementation; no converter-specific
+commutation equations are maintained in the backend.

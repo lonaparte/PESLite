@@ -12,7 +12,7 @@ base:                      # system base
   v_ll_rms: 690.0          # V
   f0: 50.0                 # Hz
 
-buses:                     # ac nodes; every bus needs a shunt capacitor
+buses:                     # nodes (AC or scalar); every bus needs a shunt capacitor
   pcc:
     # phases: 3             # 3: AC space vector (default), 1: real scalar bus
     c_pu: 0.02             # shunt capacitor, pu susceptance at f0
@@ -52,12 +52,14 @@ units:                     # converters, one entry each
         # k_pu: 0.2        # current-source droop: k_pu * (1 - u_C_pu)
         # voltage source: v_pu (emf, default 1), r_pu (series R)
 
-    # meas:                # binding/statistics in all modes; ADC timing is sampled-mode only
+    # meas:                # ADC settings; averaging keeps only sources, rms and period
     #   average: []        # window-averaged channels: any of [u_g, i_c, u_dc]; others instantaneous
     #   sources: {}        # optional channel -> physical output or <bus/Unit-port>.<quantity>
-    #   rms: {}            # channel -> RMS window in seconds; whole sampling periods
+    #   rms: {}            # channel -> RMS window in seconds; whole control periods
     #   window: 50.0e-6    # averaging window, s (default: ctrl.period)
-    #   period: 25.0e-6    # oversampling period, s; divides ctrl.period (default: one sample)
+    #   period: 25.0e-6    # oversampling period, s; divides ctrl.period (default: ctrl.period);
+    #                      # averaging: protection/RMS clock (default: simulation.output.period)
+    #   offset: 0.0         # ADC clock position, s (default: aligned with the control clock)
 
     pwm:
       f_sw: 20000.0        # carrier frequency, Hz
@@ -66,12 +68,15 @@ units:                     # converters, one entry each
       # method: spwm       # spwm | svpwm
       # sync: asynchronous # asynchronous | synchronous (carrier locked to the controller angle)
       # carrier_phase: 0.0 # carrier position at t = 0, in periods
+      # pattern_sync: interval # waveform updates: interval | pulse (preserve complete pulses)
 
     # bridge:
     #   model: pwm_averaging       # pwm_averaging (default) | averaging | switching
     #   type: three_phase_bridge   # inferred from the unit/control; scalar: half_bridge | full_bridge
-    #   upper_controlled: 1        # half-bridge device placement; ignored by three/full bridges
-    #   lower_controlled: 1
+    #   upper_controlled: 1        # half bridge: device placement; full bridge: both 0 = diode
+    #   lower_controlled: 1        # rectifier (no ctrl/pwm); half/full bridge only
+    #   on_resistance: 0           # conducting-device resistance [ohm]; positive for nonzero capacitance
+    #   parallel_capacitance: 0    # capacitance across the power terminals [F]
     #   reverse_port: 0            # half-bridge scalar-port orientation
     #   external_terminal: midpoint # half bridge: midpoint | lower_rail
     #                              # CLI: --averaging | --pwm-averaging | --switching
@@ -79,6 +84,7 @@ units:                     # converters, one entry each
     ctrl:
       type: gfl            # default wiring: gfl | gfm | custom (explicit connections and outputs)
       # period: 50.0e-6    # sampled modes: control interrupt (ignored by averaging)
+      # offset: 0.0        # sampled modes: control-clock position, s (default: PWM load clock)
       # computation: 1.0e-6  # sampled modes: sample-to-PWM-load eligibility (ignored by averaging)
       loops:               # sampled by interrupts, or integrated continuously by averaging
         SRFPLL:
@@ -141,8 +147,8 @@ events:                    # what happens during the run, by name; written only 
   # load_on: {type: connect, target: load1, t: 1.0}                # load1 starts disconnected
   # p_step: {type: set, t: 2.0, set: {units.vsc.ctrl.references.p_ref_pu: 0.8}}
   #                        # set: new values from t on, paths as for --set: references, loop parameters
-  #                        # (not type, period), protection, dc source; a source's v, f, angle, l, r;
-  #                        # l, r of lines and elements; c, r_d of buses
+  #                        # (not type, period or state switches), protection, dc source; a source's
+  #                        # v, f, angle, l, r; l, r of lines and elements; c, r_d of buses
   # weak_grid: {type: set, t: 4.0, set: {sources.grid.x_pu: 0.6, sources.grid.f: 49.8}}
   # A custom event type, registered with peslite.register_event_type, is written here too.
 
@@ -163,7 +169,7 @@ simulation:                # how the model is simulated
     # phs_check_step: 1000  # snapshots between port-Hamiltonian energy audits
   # initial:               # default: buses at their source's emf, dc capacitors at vdc_ref, the rest at zero
   #   t: 0.0               # exact start time; not moved to a control or PWM timer point
-  #   states: {vsc.u_dc: 1450.0}  # any states.csv row can continue a run; keywords: source, rated
+  #   states: {vsc.u_dc: 1450.0}  # states.csv names; keywords: source, rated
   output:
     record_every: 10       # keep every 10th controller sample
     # period: 0.5e-3       # snapshot interval, s

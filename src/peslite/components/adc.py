@@ -8,10 +8,10 @@ from typing import Any, Callable, Mapping, Optional
 
 import numpy as np
 
-from .pwm import TIME_EPS
 from ..control.blocks import MovingWindow
 from ..solver.energy import PowerPort, port_power, re_product
 from ..solver.model import Bag, Empty, _real
+from ..solver.timing import TIME_EPS, PeriodicClock
 
 __all__ = ["ADCSample", "MeasurementPorts", "ADC"]
 
@@ -146,7 +146,8 @@ class ADC:
     def __init__(self, ports: MeasurementPorts, period: float, sample_period: float,
                  length: Optional[float] = None,
                  channels: Mapping[str, complex | float] | None = None,
-                 rms: Mapping[str, float] | None = None) -> None:
+                 rms: Mapping[str, float] | None = None, *, clocked: bool = False,
+                 control_offset: float = 0.0, sample_offset: float = 0.0) -> None:
         self.ports = ports
         channels = dict(channels or {})
         if channels and (length is None or length <= 0.0):
@@ -156,10 +157,20 @@ class ADC:
         self._zero = channels
         self.accumulated = dict(channels)
         self._last = dict(channels)  # previous sample
+        self.integration_time = 0.0
+        self._anchor_restored = False
+        self.control_clock = PeriodicClock(period, control_offset)
+        self.sampling_clock = PeriodicClock(sample_period, sample_offset)
         self.period, self.sample_period = period, sample_period
         self.samples = max(1, int(round(period / sample_period)))
         self.peeks: list[ADCSample] = []  # instantaneous samples since the last interrupt
         self.n_samp = 1  # sample 0 of a period is its control interrupt
+        self.clocked = clocked
+        # Aligned when the control interrupts are conversion instants within the clock tolerance.
+        self.independent = bool(clocked or not self.sampling_clock.due(
+            control_offset, self.sampling_clock.index_at_or_after(control_offset)))
+        self._clock_index = 0
+        self.values = ports.read() if self.independent else {}
         # the next interrupt's window is open (a full-period window opens at the interrupt itself)
         self.window_open = self.length is None or self._full
         self.rms = {channel: _RMSWindow(period, window)
@@ -174,6 +185,16 @@ class ADC:
         return self.averaging or bool(self.rms)
 
     @property
+    def integration_anchor_restored(self) -> bool:
+        """Whether restart data supplied the complete quadrature anchor."""
+        return self._anchor_restored
+
+    @property
+    def means(self) -> dict[str, complex | float]:
+        """The mean channels of the same held sample, without a second value store."""
+        return {channel: self.values[channel] for channel in self.channels} if self.clocked else {}
+
+    @property
     def periods(self) -> tuple[float, ...]:
         """Sampling schedules, also when a continuous unit uses sampled protection."""
         return self.period, self.sample_period
@@ -186,6 +207,7 @@ class ADC:
     def periodic_state(self, values: Mapping[str, Any]) -> dict[str, Any]:
         """Compare RMS history in chronological order, without its rotating storage index."""
         result = dict(values)
+        result.pop("integration_time", None)
         for channel, window in self.rms.items():
             prefix = f"rms_{channel}."
             index = int(result.pop(prefix + "index"))
@@ -203,7 +225,8 @@ class ADC:
     def averaging(self) -> bool:
         return bool(self.channels)
 
-    def start(self, t: float, last: float, next_: float, held: bool) -> None:
+    def start(self, t: float, last: float | None = None, next_: float | None = None,
+              held: bool = False) -> None:
         """Resume sampling at ``t`` between the interrupts ``last`` and ``next_``.
 
         ADC integrals are named states, while the position of the sampler and whether the next
@@ -212,19 +235,39 @@ class ADC:
         run only at an interrupt.  For a new run, ``held`` makes a window which began before
         ``t`` count the value at ``t`` over that preceding part.
         """
-        self.n_samp = max(1, int(math.floor((t - last + TIME_EPS) / self.sample_period)) + 1)
+        if self.clocked:
+            self._clock_index = int(self._start_index(t, held))
+            next_ = self.control_clock.at(self._clock_index)
+            last = next_ - self.period
+        elif self.independent:
+            self._clock_index = int(self._start_index(t, held))
+        if last is None or next_ is None:
+            raise ValueError("an externally clocked ADC needs its preceding and next interrupt")
+        self.n_samp = (1 if self.independent else
+                       max(1, int(math.floor((t - last + TIME_EPS) / self.sample_period)) + 1))
         length = self.length
         self.window_open = length is None or self._full or t >= next_ - length - TIME_EPS
         if length is not None and held and self.window_open:
             self.held_before(_real(np.maximum(0.0, t - (next_ - length))))
         self.peeks = []
-        if self.n_samp > 1:  # a new run between interrupts: earlier samples use its start values
+        if self.independent and held:
+            self.values = values = self.ports.read()
+            index = int(self.sampling_clock.index_after(last))
+            while self.sampling_clock.at(index) < t - TIME_EPS:
+                self.peeks.append(ADCSample(self.sampling_clock.at(index), values))
+                index += 1
+        elif self.n_samp > 1:  # a new run between interrupts: earlier samples use its start values
             values = self.ports.read()
             self.peeks = [ADCSample(last + i * self.sample_period, values)
                           for i in range(1, self.n_samp)]
 
+    def _start_index(self, t, held):
+        """The same owned-clock placement for ordinary startup and standalone lowering."""
+        return (self.sampling_clock.index_at_or_after(t) if held else
+                self.sampling_clock.index_after(t))
+
     # ------------------------------------------------------------ the window
-    def seed(self) -> None:
+    def seed(self, t: float | None = None) -> None:
         """Start the next integration interval from the values after changes at this instant."""
         for channel, averaged, window in self._integrated:
             value = self.ports.readers[channel]()
@@ -232,6 +275,9 @@ class ADC:
                 self._last[channel] = value
             if window is not None:
                 window.last = re_product(value, value)
+        if t is not None:
+            self.integration_time = float(t)
+        self._anchor_restored = True
 
     def held_before(self, duration: float) -> None:
         """Count the current values as held for ``duration`` seconds before the run starts."""
@@ -252,6 +298,14 @@ class ADC:
             if window is not None:
                 window.accumulate(dt, value)
 
+    def accumulate_to(self, t: float) -> None:
+        """Advance every open integral to absolute time ``t`` on the physical event grid."""
+        dt = float(t) - self.integration_time
+        if dt < -TIME_EPS:
+            raise ValueError("ADC integration time cannot move backwards")
+        self.accumulate(max(0.0, dt))
+        self.integration_time = float(t)
+
     def open(self) -> None:
         """Start the window ending at the next control interrupt."""
         self.accumulated = dict(self._zero)
@@ -263,7 +317,7 @@ class ADC:
 
     # ------------------------------------------------------------ the samples
     def t_sample(self, start: float) -> float:
-        """The next sample between two interrupts in the period starting at ``start``; ``inf`` if none."""
+        """The next aligned oversample in the period starting at ``start``; ``inf`` if none."""
         return (start + self.n_samp * self.sample_period) if self.n_samp < self.samples else math.inf
 
     def peek(self, t: float) -> None:
@@ -271,10 +325,20 @@ class ADC:
         self.peeks.append(ADCSample(t, self.ports.read()))
         self.n_samp += 1
 
-    def sample(self, t: float) -> ADCSample:
+    def convert(self, t: float) -> None:
+        """Take one conversion on an ADC clock independent of the control interrupt."""
+        sample = ADCSample(t, self.ports.read())
+        self.values = dict(sample.values)
+        self.peeks.append(sample)
+        self._clock_index += 1
+
+    def conversion_due(self, t: float) -> bool:
+        return self.independent and self.sampling_clock.due(t, self._clock_index)
+
+    def sample(self, t: float, *, held: bool = False) -> ADCSample:
         """Take the sample at the control interrupt ``t``, with the preceding oversamples,
         and rearm the averaging window."""
-        meas = self.measure(t)
+        meas = self.measure(t, self.values if held else None, include_sample=not held)
         self.sample_rms()
         if self.length is not None:
             self.window_open = self._full
@@ -285,35 +349,68 @@ class ADC:
         if self.peeks:
             meas = ADCSample(meas.t, meas.values, tuple(self.peeks) + meas.samples)
         self.peeks, self.n_samp = [], 1
+        if self.clocked:
+            self.values = meas.values
+            self._clock_index += 1
         return meas
 
-    def sample_rms(self, t: float | None = None) -> bool:
+    def next_time(self) -> float:
+        """Next owned interrupt/window boundary; external triggers keep their existing clock."""
+        if not (self.clocked or self.independent):
+            return math.inf
+        conversion = self.sampling_clock.at(self._clock_index)
+        return (min(conversion, self.t_window(conversion)) if self.clocked else conversion)
+
+    def sample_clock(self, t: float) -> None:
+        """Use the ordinary sample/window operations when this ADC owns its trigger clock."""
+        interrupt = self.sampling_clock.at(self._clock_index)
+        if abs(t - interrupt) < TIME_EPS:
+            self.sample(t)
+        elif abs(t - self.t_window(interrupt)) < TIME_EPS:
+            self.open()
+
+    def sample_rms(self) -> None:
         """Finish one statistics period without changing instantaneous control measurements."""
-        if t is not None and abs(t - round(t / self.period) * self.period) >= TIME_EPS:
-            return False
         for window in self.rms.values():
             window.sample()
-        return True
 
-    def measure(self, t: float) -> ADCSample:
+    def measure(self, t: float, reading: Mapping[str, complex | float] | None = None, *,
+                include_sample: bool = True) -> ADCSample:
         """Read every named channel at ``t`` and apply configured window means."""
-        reading = self.ports.read()
+        reading = self.ports.read() if reading is None else dict(reading)
         mean = {channel: self.accumulated[channel] / self.length for channel in self.channels}
         values = {channel: mean.get(channel, value) for channel, value in reading.items()}
-        return ADCSample(t=t, values=values, samples=(ADCSample(t=t, values=reading),))
+        samples = (ADCSample(t=t, values=reading),) if include_sample else ()
+        return ADCSample(t=t, values=values, samples=samples)
 
     # ------------------------------------------------------------ its states
     def get_state(self) -> dict[str, Any]:
+        anchor = ({"integration_time": self.integration_time,
+                   **{f"last_{channel}": value for channel, value in self._last.items()}}
+                  if self.accumulating else {})
+        held = ({f"held_{channel}": value for channel, value in self.values.items()}
+                if self.independent else {})
         return {**{f"x_{channel}": value for channel, value in self.accumulated.items()},
+                **anchor,
+                **held,
                 **{f"rms_{channel}.{key}": value for channel, window in self.rms.items()
                    for key, value in window.get_state().items()}}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
+        anchor_names = {"integration_time", *(f"last_{channel}" for channel in self._last)}
+        self._anchor_restored = bool(anchor_names) and anchor_names <= set(values)
+        if "integration_time" in values:
+            self.integration_time = float(values["integration_time"])
+        self.values = {channel: values.get(f"held_{channel}", value)
+                       for channel, value in self.values.items()}
         for channel, zero in self._zero.items():
             cast = complex if isinstance(zero, complex) else float
             key = f"x_{channel}"
             if key in values:
                 self.accumulated[channel] = cast(values[key])
+            key = f"last_{channel}"
+            if key in values:
+                self._last[channel] = cast(values[key])
         for channel, window in self.rms.items():
             prefix = f"rms_{channel}."
             window.set_state({key[len(prefix):]: value for key, value in values.items()

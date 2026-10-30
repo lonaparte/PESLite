@@ -42,9 +42,7 @@ writes. If unspecified, the existing rule applies: the unit starts in the opposi
 first connection event, or connected when it has no connection events. Events at or before the
 simulation start take precedence; later events continue to write the same command normally.
 
-The same leaf-unit path can be selected for C++ export, for example
-`peslite-convert case.pes units.vsc.connected`, then set before starting the executable with
-`--set units.vsc.connected=0` or `=1`. It is also included by `all` and `common`.
+Its C++ export selection is described in [C++ Export](Cpp-Export.md#exported-variables).
 The command does not reset a protection latch or force a PWM register load. In sampled models,
 startup, control computation and the existing PWM load timing determine when the gates activate.
 
@@ -63,7 +61,8 @@ opens its series branch when present, and blocks an unfiltered bridge on its nam
 Changes runtime-safe parameter paths and validates the complete parameter tree before use. Supported
 families include source values, line/bus electrical parameters, controller references and loop
 gains, protection settings, DC-source values and retunable element parameters. Structural fields
-such as component type, bus assignment, loop type and loop period cannot change at run time.
+such as component type, bus assignment, loop type and loop period cannot change at run time, nor can
+loop switches that add or remove states, such as `SRFPLL.normalisation` or a filter `enable`.
 
 Changed control loops retain their named state. Source frequency/angle changes preserve phase
 continuity, and solver caches are notified after the parameter update.
@@ -96,7 +95,9 @@ simulation:
 ```
 
 The state names are the `states.csv` columns. Complex state can use a two-element value or `.re`
-and `.im` paths. The start time is not aligned or rounded to a PWM or solver grid.
+and `.im` paths. The keywords `source` and `rated` initialize supported electrical states from the
+connected source or the converter rating. The start time is not aligned or rounded to a PWM or
+solver grid.
 
 Parameter events at or before the start time, including `t: 0`, take effect before controller
 startup. Explicit controller state overrides are loaded afterward and retain precedence. Python
@@ -118,6 +119,11 @@ peslite output/part-a/simulation.pes \
   --out output/part-b
 ```
 
+If the configured `simulation.t_end` is not after the restart time, the continuation runs for that
+duration beyond it. `--initial` also accepts a YAML or JSON file holding a `t`/`states` mapping or
+a simulation file's `simulation.initial` block; `--initial-time` then replaces its `t`. In Python,
+`peslite.load(path, initial=..., initial_time=...)` does the same.
+
 Select another saved output time with `--initial-time T`:
 
 ```bash
@@ -127,8 +133,8 @@ peslite output/part-a/simulation.pes \
   --out output/restarted-at-075
 ```
 
-The requested time must identify a saved row. Increase output frequency before the original run if
-a denser set of restart points is required.
+The requested time must identify a saved row. Reduce `simulation.output.period` in the original
+run if a denser set of restart points is required.
 
 ## What is restored
 
@@ -138,15 +144,22 @@ Depending on the selected model, named state includes:
 - controller integrators, filters, startup progress and protection timers;
 - PWM active and shadow registers and enable bits;
 - ADC averaging-window accumulators;
-- multirate window anchors and slopes;
+- multirate window anchors, slopes and input integrals, so a row inside a window also continues
+  exactly;
 - unit trip/fault latches.
 
-Timer indices and the next ADC/PWM instants are reconstructed from the saved time. Intermediate ADC
-oversamples are deliberately not stored, so a case using oversampling should restart from a control
-interrupt for exact continuation.
+Timer indices and the next ADC/PWM instants are reconstructed from the saved time; a continuous
+unit's clock resumes at its first tick after that time. Intermediate ADC oversamples and a shadow
+word replaced during a computation are not states, so a continuation from saved unit state is
+rejected:
 
-Ideal averaging has no ADC or PWM register state; its continuous controller state is restored with
-the plant state instead.
+- between two control interrupts of a unit whose ADC oversamples (`meas.period` shorter than
+  `ctrl.period`);
+- inside a controller computation window when the next PWM register load would take a word that
+  no load has applied yet (see [Computation time](Control-and-PWM-Timing.md#computation-time)).
+
+Ideal averaging has no PWM register state or ADC samples; its continuous controller state, and the
+history of any `meas.rms` window, are restored with the plant state instead.
 
 ## Restart consistency
 
@@ -161,8 +174,5 @@ The continuation output starts a new result directory; PESLite does not append t
 
 ## Custom events
 
-Register a custom event class with `register_event_type`. Its frozen `Params` dataclass must include
-`type` and `t`. Its pure `variables(event, params)` function declares a nonempty mapping of paths
-to values. Bindings are evaluated against the parameter state preceding the event during assembly;
-the common writer performs the checked update at the exact boundary. Action-only callbacks are
-not supported. See [Extending PESLite](Extending-PESLite.md).
+A registered event type declares the variables it writes and follows the built-in event path; see
+[Custom events](Extending-PESLite.md#custom-events).

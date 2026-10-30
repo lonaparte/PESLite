@@ -9,7 +9,8 @@ that schedule with continuous controller equations; see
 At one controller interrupt, PESLite performs these operations in order:
 
 1. finish the integration interval exactly at the interrupt;
-2. read instantaneous ADC channels and close any configured averaging windows;
+2. read instantaneous ADC channels, or consume the latest held conversion from an independent
+   ADC clock, and close any configured averaging windows;
 3. update the control loops due at this interrupt;
 4. evaluate sampled protection from the same measurement;
 5. make the controller command eligible after `ctrl.computation`;
@@ -23,23 +24,24 @@ converter access to another converter's newly updated output.
 
 For sampled bridges, `units.<u>.ctrl.period` defaults to one switching period. It must be a whole
 multiple of half a carrier period because interrupts are tied to carrier valleys or peaks.
+`ctrl.offset` is the first clock position in seconds within one control period. It defaults to the
+PWM load-clock position, so existing files retain the carrier-aligned schedule. Setting it
+explicitly moves controller interrupts without moving PWM register loads; both schedules use the
+same period-and-offset clock representation.
 
-Individual loops may run more slowly:
+Individual loops may run more slowly. This fragment shows only the periods; the loops' other
+fields are omitted:
 
 ```yaml
 ctrl:
   period: 50e-6
   loops:
-    CurrentLoop: {period: 50e-6}
-    DCVoltageControl: {period: 500e-6}
+    CurrentLoop: {period: 50e-6}        # other fields omitted
+    DCVoltageControl: {period: 500e-6}  # other fields omitted
 ```
 
-The class names are also the graph-node names used by `connections`, outputs and state paths.
-Configuration loading resolves them to parameter schemas without constructing control objects.
-During assembly, PESLite traces dependencies backward from controller outputs and constructs only
-the nodes on that active graph; an unreferenced declaration consumes no runtime loop object.
-If a class occurs more than once, an optional label remains part of the node name, for example
-`Observer[voltage]` and `Observer[current]`. No loop entry needs a `type` field.
+Loop keys and graph-node names follow the naming rules in
+[Simulation Files](Simulation-Files.md#converter-section).
 
 A loop period must be an integer multiple of `ctrl.period`. If omitted, it inherits the controller
 period. Loop state is preserved when run-time parameter changes rebuild a loop.
@@ -73,14 +75,48 @@ meas:
   period: 12.5e-6
 ```
 
-`meas.period` is the oversampling period and defaults to `ctrl.period`. `meas.window` defaults to
-the control period and cannot exceed it. Window integrals are named states so a saved run can
-restore an open window; the individual intermediate oversamples are not persisted.
+`meas.period` is the ADC conversion period. For a sampled unit it defaults to `ctrl.period` and must
+divide it. A continuous unit (ideal averaging, or a bridge without a controller) uses `meas.period`
+as its own measurement and protection clock, which defaults to `simulation.output.period` (see
+[Protection clocks](#protection-clocks)). `meas.window` defaults to the control period and cannot
+exceed it. Window integrals and their latest quadrature anchors are
+named states so a saved run can restore an open window; the individual intermediate conversions
+are not persisted.
+
+`meas.offset` is the ADC conversion-clock position in seconds within one `meas.period`. When it is
+omitted, the ADC grid contains every controller interrupt and preserves the existing direct-sample
+path. An explicit offset may place conversions between controller interrupts. In that case the ADC
+runs on its own periodic grid and the controller consumes the most recent held conversion. If a
+conversion and controller interrupt coincide, conversion occurs first. This held value is a named
+restart state. Ideal averaging has no sampled controller/ADC schedule, so these offsets do not
+affect it. For a unit without a controller, `meas.offset` positions its own measurement clock
+(default 0).
+
+Sampled-converter ADC windows integrate on physical event boundaries, including configured ADC
+conversions, control interrupts, PWM edges and file events, and immediately before a trip changes
+the plant. Output snapshots and the end time do not add ADC integration points, and neither does a
+continuous unit's protection/measurement clock, which is an integration point only for that unit's
+own windows. A window open at the end of a run continues from its saved quadrature anchor. Use
+`meas.period` when a window needs a finer conversion grid than the controller period. Python and
+generated C++ use the same ADC schedule.
 
 For oscillating scalar ports, average `power` itself rather than multiplying separately averaged
 voltage and current. A carrier-boundary voltage sample may be zero even during nonzero power
 transfer. The WPT feedback cases use the ordinary ADC window for that product and an ordinary
 power-loop low-pass filter for the remaining excitation ripple; see [Examples](Examples.md#wpt-power-feedback).
+
+### Measurement sources and RMS
+
+`meas.sources` routes an existing physical output to a channel; bus and Unit ports expose
+`.voltage`, `.current` and `.power`, with port power positive outward from the voltage-driving
+terminal; named element outputs such as `load.power` are also valid. Bindings are non-loading,
+resolve during assembly and do not imply hardware-local measurement or communication.
+
+RMS is `sqrt(mean(abs(signal)**2))` over whole control periods, or whole `meas.period` intervals for
+a continuous unit. It is total waveform RMS, not a fundamental or per-phase estimate, and an
+averaged model cannot restore omitted switching harmonics; for a complex space vector it is the
+RMS of its magnitude. Values become available after one full window as
+`<unit>.meas.<channel>_rms`; only configured windows allocate state.
 
 ## Computation time
 
@@ -88,9 +124,13 @@ power-loop low-pass filter for the remaining excitation ripple; see [Examples](E
 PWM register load. It defaults to 1 microsecond in sampled modes and must be nonnegative and shorter
 than the controller period.
 
-There is one shadow register, not a queue of delayed duty words. A new controller result replaces
-the shadow word. At a load instant, the active register copies the shadow word only when the
-corresponding computation has completed; otherwise the previous active word remains in force.
+There is one shadow register, not a queue of delayed duty words. As on a DSP, an interrupt's result
+replaces the shadow word when its computation completes, and a register load copies whatever the
+shadow holds: a load during an interrupt's computation, including one at the interrupt instant,
+takes the previous completed result. An explicit `ctrl.offset` that places interrupts less than
+`ctrl.computation` before loads therefore adds one control period of delay. The replaced word is
+not a saved state: a continuation (`simulation.initial`) restores it from the active word where
+possible ([What is restored](Events-and-Restart.md#what-is-restored)).
 
 ## Shadow and active registers
 
@@ -125,8 +165,10 @@ pwm:
 - `single` loads the active register at carrier valleys: one load per switching period;
 - `double` loads at valleys and peaks: two loads per switching period.
 
-`pwm.method` selects `spwm` or `svpwm` for a three-phase VSC. `pwm.sync: asynchronous` places the
-carrier on absolute time and allows `carrier_phase`; `synchronous` locks three-phase carrier timing
+`pwm.method` selects `spwm` or `svpwm` for a three-phase VSC, whose output stage scales the
+modulating signals uniformly so that their peak does not exceed `pwm.modulation_limit` (default 1).
+`pwm.sync: asynchronous` places the carrier on absolute time and allows `carrier_phase` (the
+carrier position at `t = 0`, in carrier periods); `synchronous` locks three-phase carrier timing
 to the controller angle and requires an integer pulse ratio `f_sw / base.f0`. Scalar converters use
 the same PWM scheduler with asynchronous timing.
 
@@ -148,6 +190,9 @@ signal adapter:
 
 - instantaneous overcurrent protection runs at switching or held-bridge edges;
 - voltage, frequency, DC-voltage and ROCOF criteria run from controller-rate measurements;
+- a continuous unit (ideal averaging, or a controllerless natural-conduction bridge) runs both on
+  its own clock with period `meas.period` ([ADC sampling](#adc-sampling)); other units' events,
+  file events and output snapshots do not advance its hold timers, ROCOF window or RMS periods;
 - sampled criteria are armed after startup reports completion;
 - a trip blocks the gates, opens an external terminal when present and disconnects the DC source.
 
@@ -161,4 +206,8 @@ The controller reports measurements and startup status but does not own the phys
 
 With `bridge.model: averaging`, controller states and plant states are integrated together. There
 is no ADC sampler, interrupt grid, computation wait, carrier, shadow register or active register.
-The sampled timing settings may remain in a shared file but are silently ignored for that unit.
+The sampled timing settings may remain in a shared file but are silently ignored for that unit,
+except `meas.period`, which sets the unit's protection and RMS clock (see
+[Protection clocks](#protection-clocks)). Every loop in the active graph needs a continuous-time
+implementation (`flow` or `equation`, or `_flow` for a synchronization law); a loop without one,
+such as the `ModeSequence` add-on, is rejected.

@@ -13,6 +13,7 @@ import numpy as np
 
 from .linearization import (DEFAULT_STEP as _FD, LoopMap, coordinate_width as _width,
                             coordinate_difference, linearize_loop)
+from .multirate import rated_effort
 
 __all__ = ["LoopMap", "split_error_bound"]
 
@@ -126,10 +127,15 @@ def split_error_bound(solver: Any, loop: LoopMap, t: np.ndarray, states: dict[st
     only ``split_bound`` when no estimate can be formed; ``{}`` without ratings.
     """
     log = solver.window_log
-    rated = solver.rated_effort
+    rated = rated_effort(solver.model, solver.ratings)
     t_rows = np.asarray(states.get("t", ()), dtype=float)
-    if not log or rated is None or rows < 1 or len(t) == 0 or len(t_rows) == 0:
-        return {"split_bound": "no windows closed: nothing to bound"} if rated is not None else {}
+    if rated is None:
+        return {}
+    if not log:
+        return {"split_bound": "no windows closed: nothing to bound"}
+    if rows < 1 or len(t) == 0 or len(t_rows) == 0:
+        return {"split_bound": "no recorded state row to linearise at (simulation.output.states and "
+                               "simulation.solver.linearisations): nothing to bound"}
     labels = list(labels if labels is not None else [])
     T_s, W = loop.period, solver.window
     n = len(labels)

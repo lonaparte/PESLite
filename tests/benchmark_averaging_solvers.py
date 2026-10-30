@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -54,18 +55,19 @@ def _scale(name: str, reference: np.ndarray) -> float:
     return max(1.0, float(np.max(np.abs(reference))))
 
 
-def _errors(reference: np.ndarray, candidate: np.ndarray) -> dict[str, float | str]:
+def _errors(reference: np.ndarray, candidate: np.ndarray,
+            scale: Callable[[str, np.ndarray], float]) -> dict[str, float | str]:
+    """Scaled error on the state columns shared with the reference."""
     if reference.shape != candidate.shape or not np.allclose(reference["t"], candidate["t"],
                                                               rtol=0.0, atol=1e-12):
         return {"max_scaled": float("inf"), "rms_scaled": float("inf"),
                 "worst_state": "incompatible output grid"}
+    shared = tuple(name for name in reference.dtype.names or ()
+                   if name != "t" and name in (candidate.dtype.names or ()))
     worst_name, worst = "", 0.0
     squared: list[np.ndarray] = []
-    for name in reference.dtype.names or ():
-        if name == "t":
-            continue
-        difference = candidate[name] - reference[name]
-        scaled = difference / _scale(name, reference[name])
+    for name in shared:
+        scaled = (candidate[name] - reference[name]) / scale(name, reference[name])
         value = float(np.max(np.abs(scaled)))
         if value > worst:
             worst_name, worst = name, value
@@ -106,7 +108,7 @@ def main() -> int:
                 reference = states
                 error = {"max_scaled": 0.0, "rms_scaled": 0.0, "worst_state": ""}
             else:
-                error = _errors(reference, states)
+                error = _errors(reference, states, _scale)
             row = {
                 "case": name,
                 "wall_time": result.wall_time,
