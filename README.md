@@ -28,8 +28,6 @@ API—designed as a deterministic simulation backend for LLM reasoning and verif
 pip install peslite
 ```
 
-Use `pip install "peslite[all]"` to include every optional runtime add-on.
-
 PESLite requires Python 3.10 or newer.
 
 ## Quick start

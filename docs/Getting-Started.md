@@ -9,7 +9,8 @@ resolved example into a new simulation file.
 python -m pip install peslite
 ```
 
-To include every optional runtime add-on, including [PDF plotting](Plotting.md):
+Addon modules are included in the package. To install PESLite with all dependencies, including the
+optional dependencies required by addons such as [PDF plotting](Plotting.md):
 
 ```bash
 python -m pip install "peslite[all]"
