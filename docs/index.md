@@ -38,11 +38,14 @@ Run a bundled example:
 peslite gfl-example
 ```
 
-The results are streamed to `output/gfl-example/`. A simulation file can be run in the same way:
+To run a file named `case.pes` in the current directory:
 
 ```bash
 peslite case.pes
 ```
+
+Results are written to `output/<case-name>/`; these commands use `output/gfl-example/` and
+`output/case/`, respectively.
 
 See [Getting Started](Getting-Started.md) to create a case and inspect its results.
 
@@ -72,6 +75,3 @@ See [Getting Started](Getting-Started.md) to create a case and inspect its resul
 - [GitHub repository](https://github.com/lonaparte/PESLite)
 - [PyPI](https://pypi.org/project/peslite/)
 - [Issue tracker](https://github.com/lonaparte/PESLite/issues)
-
-The root README is intentionally a short introduction and five-minute quick start. Detailed user,
-configuration and architecture documentation belongs in this documentation.

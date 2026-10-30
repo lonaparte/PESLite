@@ -70,7 +70,7 @@ peslite wpt-lcc-example --averaging
 ```
 
 `PowerControl` produces a modulation amplitude and `PhasePowerControl` a phase in radians through
-the scalar feedback law in [Simulation Files](Simulation-Files.md#phase-shift-bridges). Set phase
+the [scalar feedback loops](Control-and-PWM-Timing.md#scalar-feedback-loops). Set phase
 limits and gain polarity for a monotonic circuit branch; the controller does not infer them.
 
 The power channel uses the paired voltage and current of the converter's external `power` terminal,

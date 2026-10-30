@@ -83,20 +83,17 @@ cd converter-study
 peslite case.pes
 ```
 
-The three relevant paths follow two rules:
-
-- `case.pes` anchors the `PESaddons/` lookup;
-- the process working directory anchors the default `output/<case-name>/` result path.
-
-Therefore this also finds the same project extensions:
+PESLite looks for `PESaddons/` beside the simulation file, so the same extensions are found when
+the file is run from another directory:
 
 ```bash
 cd /tmp
 peslite /work/converter-study/case.pes
 ```
 
-but its default results go to `/tmp/output/case/`. Select a project-local result directory
-explicitly when running from elsewhere:
+Unless `--out` is specified, results are written in the directory where the command is run. The
+command above therefore writes to `/tmp/output/case/`. To write the results beside the project
+instead, specify the output directory:
 
 ```bash
 peslite /work/converter-study/case.pes \

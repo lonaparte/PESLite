@@ -25,15 +25,34 @@ PESLite requires Python 3.10 or newer.
 
 ## Run the first case
 
+### Bundled example
+
 ```bash
 peslite gfl-example
 ```
 
-`gfl-example` is bundled in the wheel, so it is available without cloning the repository. The
-default result directory is:
+`gfl-example` is included with PESLite, so it is available without cloning the repository.
+
+### Your own case
+
+If `case.pes` is in the current directory, run:
+
+```bash
+peslite case.pes
+```
+
+To run a file in another directory, provide its path:
+
+```bash
+peslite cases/case.pes
+```
+
+## Results
+
+Results are written to `output/<case-name>/` by default. For `peslite case.pes`, the directory is:
 
 ```text
-output/gfl-example/
+output/case/
 ├── states.csv
 ├── summary.json
 └── simulation.pes
@@ -41,12 +60,8 @@ output/gfl-example/
 
 Signal and energy files appear only when enabled ([Output and Results](Output-and-Results.md#files)).
 
-`simulation.pes` is the complete configuration actually used after defaults, derived values,
-presets and command-line overrides. It can be run again directly:
-
-```bash
-peslite output/gfl-example/simulation.pes
-```
+`simulation.pes` records the complete configuration used for the run after defaults, derived
+values, presets and command-line overrides.
 
 ## Inspect and override a case
 

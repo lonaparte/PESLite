@@ -41,7 +41,7 @@ ctrl:
 ```
 
 Loop keys and graph-node names follow the naming rules in
-[Simulation Files](Simulation-Files.md#converter-section).
+[Simulation Files](Simulation-Files.md#units-and-controllers).
 
 A loop period must be an integer multiple of `ctrl.period`. If omitted, it inherits the controller
 period. Loop state is preserved when run-time parameter changes rebuild a loop.
@@ -54,6 +54,23 @@ commanded current charges the controlled capacitor and `-1` when positive comman
 energy from it, as with the VSC convention that positive d-axis current exports power. A DCConverter
 normally sends the result to `InductorCurrentControl`; a VSC sends it to the d-axis input of
 `CurrentLoop`.
+
+### Scalar feedback loops
+
+Scalar voltage, current and power loops use
+`command = feedforward + PI(startup * reference - measured)`. Each loop pairs one measurement with
+one command:
+
+| Measured quantity | Modulation command | Phase command | Frequency command |
+|---|---|---|---|
+| power | `PowerControl` | `PhasePowerControl` | `FrequencyPowerControl` |
+| voltage | `VoltageControl` | `PhaseVoltageControl` | `FrequencyVoltageControl` |
+| current | `CurrentControl` | `PhaseCurrentControl` | `FrequencyCurrentControl` |
+
+The measurement is selected through the control graph, and an optional measurement filter is
+configured on the loop. Command limits and gains use the units of the selected command and
+measurement. A positive phase or frequency command follows the polarity of the connected plant;
+the controller does not infer it.
 
 ## ADC sampling
 

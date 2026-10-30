@@ -34,20 +34,27 @@ PESLite requires Python 3.10 or newer.
 
 ## Quick start
 
-Run a bundled case:
+Run a bundled example:
 
 ```bash
 peslite gfl-example
 ```
 
-Run a simulation file and override any parameter by dotted path:
+Run `case.pes` from the current directory:
+
+```bash
+peslite case.pes
+```
+
+Results are written to `output/<case-name>/` by default.
+
+Override a parameter by dotted path when needed:
 
 ```bash
 peslite case.pes --set simulation.t_end=1.0 --out output/test
 ```
 
-Results are written to `output/<name>/`. Bridge/solver presets are available through
-three run modes:
+Bridge and solver presets are available through three run modes:
 
 ```bash
 peslite case.pes --switching
