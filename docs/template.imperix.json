@@ -17,7 +17,6 @@
         "u_dc": {"channel": 6, "device": 0, "sensitivity": 1.0, "offset": 0.0, "sign": 1}
       },
       "pwm": [0, 1, 2],
-      "dead_time": 0.000001,
       "hardware_overcurrent_configured": false
     }
   },

@@ -1636,9 +1636,26 @@ def main(argv=None) -> int:
     presets = {"switching": ("fixed", "rk4"), "pwm_averaging": ("fixed", "rk4"), "averaging": ("adaptive", "DP45")}
     model = next((flag for flag in presets if getattr(args, flag)), None)  # each flag names its bridge model
     if model is not None:
-        solver_type, method = presets[model]
-        changes = {f"units.{name}.bridge.model": model for name, _cfg in _unit_items(p.units)
-                   if f"units.{name}.bridge.model" not in set_overrides}
+        effective_models = []
+        for name, cfg in _unit_items(p.units):
+            path = f"units.{name}.bridge.model"
+            selected = cfg.bridge.model
+            if path not in set_overrides:
+                try:
+                    p = p.replace(**{path: model})
+                except ConfigError as exc:
+                    warnings.warn(
+                        f"--{model.replace('_', '-')} does not apply to units.{name}: "
+                        f"{exc}; keeping bridge.model = {selected!r}",
+                        stacklevel=2,
+                    )
+                else:
+                    selected = model
+            effective_models.append(selected)
+        solver_type, method = (presets[model] if all(
+            selected == model for selected in effective_models
+        ) else presets["switching"])
+        changes = {}
         if not _solver_choice_is_set(set_overrides):
             changes.update({
                 "simulation.solver.type": solver_type,

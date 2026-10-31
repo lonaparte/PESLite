@@ -288,7 +288,7 @@ def _bindings(simulation, config, model, *, events=None):
     for name, unit in units.items():
         cfg, binding = unit.cfg, bindings[name]
         configured = model.runtime.copy(cfg)
-        _keys(binding, {"adc", "pwm", "dead_time", "hardware_overcurrent_configured", "startup_ramp"},
+        _keys(binding, {"adc", "pwm", "hardware_overcurrent_configured", "startup_ramp"},
               f"imperix.units.{name}")
         if cfg.pwm.sync != "asynchronous":
             raise ValueError(f"{name}: angle-locked simulation carriers have no hardware adapter")
@@ -311,10 +311,12 @@ def _bindings(simulation, config, model, *, events=None):
             raise ValueError(f"{name}: the averaging window requires {history} ADC history samples; "
                              "the SDK supports at most 64")
         unilateral = unit.bridge.topology.unilateral
-        dead_time = _positive(binding.get("dead_time", 0.0 if unilateral else None),
-                              f"{name}.dead_time", zero=unilateral)
-        if dead_time >= 0.5 / configured.pwm.f_sw:
-            raise ValueError(f"{name}: dead_time must be shorter than half a switching period")
+        dead_time = configured.pwm.dead_time
+        if not unilateral and dead_time == 0.0:
+            raise ValueError(
+                f"{name}: complementary hardware PWM requires positive "
+                f"units.{name}.pwm.dead_time"
+            )
         if cfg.protection.overcurrent.enable and binding.get("hardware_overcurrent_configured") is not True:
             raise ValueError(f"{name}: enabled fast protection requires hardware_overcurrent_configured=true")
         default_ramp = next((event.ramp for event in (simulation.p.changes if events is None else events)

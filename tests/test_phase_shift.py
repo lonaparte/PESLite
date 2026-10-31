@@ -382,7 +382,6 @@ def test_phase_shift_configuration_is_checked():
         (("bridge", "model"), "averaging", "resolved switching edges"),
         (("bridge", "model"), "pwm_averaging", "resolved switching edges"),
         (("bridge", "type"), "half_bridge", "requires 2 switching legs"),
-        (("pwm", "carrier_phase"), 0.25, "carrier_phase"),
         (("ctrl", "references", "mode"), 2, "mode must be one of"),
         (("ctrl", "references", "width"), 1.2, "width must be in"),
     ]:
@@ -393,6 +392,11 @@ def test_phase_shift_configuration_is_checked():
         node[path[-1]] = value
         with pytest.raises(ConfigError, match=message):
             from_dict(tree)
+
+    tree = copy.deepcopy(base)
+    tree["units"]["charger"]["primary"]["pwm"]["carrier_phase"] = 0.25
+    with pytest.warns(UserWarning, match="carrier_phase is ignored"):
+        from_dict(tree)
     resonant = copy.deepcopy(base)
     resonant["units"]["charger"]["primary"]["ctrl"] = {
         "type": "resonant", "loops": {"ResonantModulation": {}},
@@ -422,6 +426,37 @@ def test_imperix_reports_the_missing_hardware_modulator_adapter(tmp_path):
     config = {"units": {name: {} for name in simulation.system.units}}
     with pytest.raises(ValueError, match="hardware modulation adapter is not implemented"):
         simulation.export("imperix", tmp_path, target_config=config, build=False)
+
+
+@pytest.mark.parametrize("sync", ["interval", "pulse"])
+def test_native_phase_shift_dead_time_matches_python(sync, tmp_path):
+    import csv
+    import shutil
+    import subprocess
+
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required")
+    primary, secondary = _phase_shift(.7, sync=sync), _phase_shift(.8)
+    primary["pwm"]["dead_time"] = secondary["pwm"]["dead_time"] = 0.5e-6
+    params = from_dict(_ps_tree(primary, secondary, 30e-6, states=True))
+    peslite.Simulation(params).export("cpp", tmp_path / "model")
+    subprocess.run([compiler, "-std=c++17", "-O2", str(tmp_path / "model/peslite.cpp"),
+                    "-o", str(tmp_path / "run")], check=True)
+    subprocess.run([str(tmp_path / "run"), "--out", str(tmp_path / "native")], check=True)
+    peslite.Simulation(params).run(out_dir=tmp_path / "python")
+
+    for filename in ("plant.csv", "states.csv"):
+        with (tmp_path / "native" / filename).open() as stream:
+            native = list(csv.DictReader(stream))
+        with (tmp_path / "python" / filename).open() as stream:
+            python = list(csv.DictReader(stream))
+        assert native[0].keys() == python[0].keys()
+        for key in native[0]:
+            actual = np.array([float(row[key]) for row in native])
+            expected = np.array([float(row[key]) for row in python])
+            np.testing.assert_allclose(actual, expected, rtol=2e-7, atol=2e-7,
+                                       equal_nan=True, err_msg=f"{sync}:{filename}:{key}")
 
 
 @pytest.mark.parametrize("sync", ["interval", "pulse"])

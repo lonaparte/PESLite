@@ -68,7 +68,10 @@ jobs:
           python -m pip install ".[test,reference]"
 
       - name: Run reference comparisons
-        run: python -m pytest --run-full tests/reference/test_motulator.py
+        run: >-
+          python -m pytest --run-full
+          tests/reference/test_motulator.py
+          tests/reference/test_motulator_dead_time.py
 
 
   onnx-test:

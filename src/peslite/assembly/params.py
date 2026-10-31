@@ -363,6 +363,8 @@ class PWMParams:
     ``pattern_sync``: ``"interval"`` applies newly loaded waveform commands
     at the load; ``"pulse"`` lets a pulse in progress finish and starts the new
     pattern at its next pulse.
+    ``dead_time`` delays complementary-device turn-on; ``dead_time_compensation`` applies the
+    ideal current-polarity correction.
     """
 
     f_sw: float  # carrier frequency, Hz
@@ -372,6 +374,8 @@ class PWMParams:
     method: str = "spwm"  # "spwm" | "svpwm"
     sync: str = field(default="asynchronous", metadata={"modulator": True})
     pattern_sync: str = "interval"
+    dead_time: float = field(default=0.0, metadata={"structural": True})  # s
+    dead_time_compensation: bool = False
 
     _choices = {"update": ("single", "double"), "method": ("spwm", "svpwm"),
                 "sync": ("asynchronous", "synchronous"), "pattern_sync": ("interval", "pulse")}

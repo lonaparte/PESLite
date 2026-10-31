@@ -265,6 +265,33 @@ def test_export_preserves_system_factories_without_mutating_the_caller(tmp_path)
                                rtol=2e-9, atol=2e-8)
 
 
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging"))
+def test_generated_cpp_matches_current_directed_pwm_dead_time(mode, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = _quick(mode).replace(**{
+        "units.vsc.pwm.dead_time": 1.0e-6,
+        "simulation.t_end": 0.2003,
+        "simulation.output.period": 5.0e-6,
+        "simulation.output.signals": True,
+    })
+
+    source, cpp_out, python_out = _run_generated(
+        params, tmp_path / f"dead-time-{mode}", compiler
+    )
+
+    for filename in ("states.csv", "plant.csv"):
+        actual = np.genfromtxt(cpp_out / filename, delimiter=",", names=True)
+        expected = np.genfromtxt(python_out / filename, delimiter=",", names=True)
+        assert actual.dtype.names == expected.dtype.names
+        for column in expected.dtype.names:
+            np.testing.assert_allclose(actual[column], expected[column], rtol=2e-7, atol=2e-7,
+                                       equal_nan=True, err_msg=f"{mode}:{filename}:{column}")
+    text = source.read_text(encoding="utf-8")
+    assert ("DeadTimeSequenceState" in text) == (mode == "switching")
+
+
 def test_export_rejects_unrebuildable_instances_before_creating_files(tmp_path):
     params = _quick("pwm_averaging")
     simulation = peslite.Simulation(params, system=peslite.System(params))

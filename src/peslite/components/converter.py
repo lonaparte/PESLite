@@ -158,6 +158,11 @@ class ThreePhaseBridge:
         return ThreePhaseBridge.switching_state(values)
 
     @staticmethod
+    def pole_currents(current):
+        """Currents leaving the three pole midpoints, in modulation-leg order."""
+        return phases(current)
+
+    @staticmethod
     def command_duties(output):
         return output.d_abc
 
@@ -424,6 +429,8 @@ class _SampledModel(_BridgeModel, PWM):
                  load_offset: float, computation: float,
                  carrier_period: float, modulator: Modulator, topology=None, *,
                  pattern_sync: str = "interval",
+                 dead_time: float = 0.0,
+                 dead_time_compensation: bool = False,
                  parallel_capacitance: float = 0.0, on_resistance: float = 0.0) -> None:
         self.pulse_update = None
         self.has_switching_events = not isinstance(modulator, ZOH)
@@ -441,6 +448,9 @@ class _SampledModel(_BridgeModel, PWM):
             carrier_period,
             modulator,
             pattern_sync=pattern_sync,
+            dead_time=dead_time,
+            dead_time_compensation=dead_time_compensation,
+            pole_currents=getattr(self.topology, "pole_currents", None),
             duty_names=(self.topology.duty_names + carried if registers is None else tuple(registers)),
             switching_state=self.topology.switching_state,
             pwm_state=self.topology.pwm_state,
@@ -543,13 +553,15 @@ def topology_type(name: str, where: str = "bridge.type") -> type:
 def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None) -> _BridgeModel:
     """Compose a bridge topology with switching, PWM or averaging behavior."""
     topology = topology if topology is not None else make_topology(cfg.bridge)
+    pwm = cfg.pwm
     impedance = {"parallel_capacitance": cfg.bridge.parallel_capacitance,
                  "on_resistance": cfg.bridge.on_resistance}
     if not getattr(topology, "controlled", True):
         if modulator is not None:
             raise ValueError("a diode full-bridge rectifier does not use a PWM modulator")
+        if pwm is not None and (pwm.dead_time > 0.0 or pwm.dead_time_compensation):
+            raise ValueError("PWM dead time requires a controlled bridge")
         return _BridgeModel(topology, switching=True, **impedance)
-    pwm = cfg.pwm
     if cfg.bridge.model == "averaging":
         if modulator is not None:
             raise ValueError("an averaging bridge does not use a PWM modulator")
@@ -562,6 +574,8 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None) -> 
         modulator if modulator is not None else make_unit_modulator(cfg),
         topology,
         pattern_sync=pwm.pattern_sync,
+        dead_time=pwm.dead_time,
+        dead_time_compensation=pwm.dead_time_compensation,
         **impedance,
     )
 
@@ -632,6 +646,11 @@ class HalfBridge:
     def pwm_state(self, duties) -> float:
         duty = min(1.0, max(0.0, duties[0]))
         return 1.0 - duty if self._reverse_port else duty
+
+    def pole_currents(self, current):
+        """Pole current expressed in the commanded leg's orientation."""
+        current = np.real(current)
+        return (-current if self._reverse_port else current,)
 
     @staticmethod
     def command_duties(output):
@@ -873,6 +892,12 @@ class FullBridge:
         left = min(1.0, max(0.0, duties[0]))
         right = min(1.0, max(0.0, duties[1]))
         return left - right
+
+    @staticmethod
+    def pole_currents(current):
+        """Currents leaving the left and right pole midpoints."""
+        current = np.real(current)
+        return current, -current
 
     @staticmethod
     def command_duties(output):

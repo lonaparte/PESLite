@@ -251,27 +251,17 @@ class BlackBoxSubsystem:
         self.discrete_state_names = all_state_names if discrete else ()
         self.update_clock = None
         self._update_index = 0
-        if continuous:
-            self._call_output = lambda t, x, u: output(t, x, u)
-            self._call_rhs = lambda t, x, u: rhs(t, x, u)
-            self._call_update = None
-            if offset:
-                raise ValueError("offset is only valid for a discrete black box")
-        elif discrete:
+        self._call_output = output if all_state_names else lambda t, _x, u: output(t, u)
+        self._call_rhs = rhs if continuous else None
+        self._call_update = update if discrete else None
+        if discrete:
             if not math.isfinite(period) or period <= 0.0:
                 raise ValueError("period must be finite and positive")
             if not math.isfinite(offset):
                 raise ValueError("offset must be finite")
-            self._call_output = lambda t, x, u: output(t, x, u)
-            self._call_rhs = None
-            self._call_update = lambda t, x, u: update(t, x, u)
             self.update_clock = PeriodicClock(period, resolve_clock_offset(period, offset))
-        else:
-            self._call_output = lambda t, _x, u: output(t, u)
-            self._call_rhs = None
-            self._call_update = None
-            if offset:
-                raise ValueError("offset is only valid for a discrete black box")
+        elif offset:
+            raise ValueError("offset is only valid for a discrete black box")
 
         dependencies = self.input_names if feedthrough is None else tuple(feedthrough)
         if len(set(dependencies)) != len(dependencies):

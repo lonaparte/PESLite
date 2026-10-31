@@ -9,8 +9,23 @@ import yaml
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import from_dict, read_initial
-from peslite.components.pwm import CarrierComparison, PulseSequence, SynchronousCarrier
+from peslite.components.pwm import (CarrierComparison, _DeadTimeSequence, PulseSequence,
+                                    SwitchingSequence, SynchronousCarrier)
 from test_cpp_parameters import _case, _compare_run, _compile
+
+
+def _with_explicit_pwm_defaults(params):
+    from peslite.assembly.params import _unit_items
+
+    return params.replace(**{
+        path: value
+        for name, _ in _unit_items(params.units)
+        for path, value in (
+            (f"units.{name}.pwm.pattern_sync", "interval"),
+            (f"units.{name}.pwm.dead_time", 0.0),
+            (f"units.{name}.pwm.dead_time_compensation", False),
+        )
+    })
 
 
 @pytest.mark.parametrize("width", [1, 2, 3])
@@ -52,6 +67,52 @@ def test_constant_gate_commands_do_not_wait_for_nonexistent_edges():
     assert update.next == (0.0,)
 
 
+@pytest.mark.parametrize(("current", "durations"), [
+    (1.0, [0.5, 0.3, 0.2]),
+    (-1.0, [0.4, 0.5, 0.1]),
+])
+def test_dead_time_delays_only_the_turn_on_opposed_by_the_clamping_diode(current, durations):
+    dead_time = _DeadTimeSequence(0.1, 1)
+    held = SwitchingSequence(np.array([1.0]), np.array([[0.0]]))
+    dead_time(-1.0, 1.0, held, (current,), enabled=True)
+    raw = SwitchingSequence(np.array([0.4, 0.4, 0.2]),
+                            np.array([[0.0], [1.0], [0.0]]))
+
+    actual = dead_time(0.0, 1.0, raw, (current,), enabled=True)
+
+    assert actual.dt == pytest.approx(durations)
+    assert actual.q_abc[:, 0] == pytest.approx([0.0, 1.0, 0.0])
+
+
+def test_dead_time_applies_to_the_first_turn_on_after_blocking():
+    dead_time = _DeadTimeSequence(0.1, 1)
+    blocked = SwitchingSequence(np.array([1.0]), np.array([[0.0]]))
+    command = SwitchingSequence(np.array([1.0]), np.array([[0.0]]))
+
+    dead_time(0.0, 1.0, blocked, (-1.0,), enabled=False)
+    actual = dead_time(1.0, 1.0, command, (-1.0,), enabled=True)
+
+    assert actual.dt == pytest.approx([0.1, 0.9])
+    assert actual.q_abc[:, 0] == pytest.approx([1.0, 0.0])
+
+
+def test_dead_time_state_carries_a_delayed_turn_on_across_register_loads():
+    first = _DeadTimeSequence(0.1, 1)
+    raw = SwitchingSequence(np.array([0.95, 0.05]), np.array([[0.0], [1.0]]))
+    first(0.0, 1.0, raw, (1.0,), enabled=True)
+    held = SwitchingSequence(np.array([1.0]), np.array([[1.0]]))
+    first(1.0, 1.0, held, (1.0,), enabled=True)
+    state = first.get_state()
+
+    restored = _DeadTimeSequence(0.1, 1)
+    restored.set_state(state)
+    actual = restored(1.0, 1.0, held, (1.0,), enabled=True)
+
+    assert state["dead_time.remaining_0"] == pytest.approx(0.05)
+    assert actual.dt == pytest.approx([0.05, 0.95])
+    assert actual.q_abc[:, 0] == pytest.approx([0.0, 1.0])
+
+
 def test_bridge_phase_clock_describes_the_applied_reference():
     from peslite.components.converter import SwitchingModel, ThreePhaseBridge
 
@@ -70,7 +131,7 @@ def test_bridge_phase_clock_describes_the_applied_reference():
     (("d", "d"), CarrierComparison(100e3), "unique"),
     (("on",), CarrierComparison(100e3), "unique"),
     (("shadow.d",), CarrierComparison(100e3), "path segments"),
-    (("angle",), SynchronousCarrier(1), "conflict with modulator states"),
+    (("angle",), SynchronousCarrier(1), "conflict with timing states"),
 ])
 def test_pwm_register_layout_rejects_state_collisions(registers, modulator, match):
     from peslite.components.converter import HalfBridge
@@ -90,8 +151,7 @@ def test_explicit_default_does_not_add_policy_or_state(example, mode):
     initial = from_dict(tree)
     changes = {f"units.{name}.bridge.model": mode for name, _ in _unit_items(initial.units)}
     omitted = initial.replace(**changes)
-    explicit = omitted.replace(**{f"units.{name}.pwm.pattern_sync": "interval"
-                                   for name, _ in _unit_items(omitted.units)})
+    explicit = _with_explicit_pwm_defaults(omitted)
     assert omitted == explicit
     left, right = peslite.Simulation(omitted), peslite.Simulation(explicit)
     assert left._states.columns == right._states.columns
@@ -107,18 +167,21 @@ def test_explicit_default_does_not_add_policy_or_state(example, mode):
 @pytest.mark.full
 def test_default_configuration_generates_identical_cpp(example, tmp_path):
     params = _case(example, "switching")
-    from peslite.assembly.params import _unit_items
-    explicit = params.replace(**{f"units.{name}.pwm.pattern_sync": "interval"
-                                 for name, _ in _unit_items(params.units)})
+    explicit = _with_explicit_pwm_defaults(params)
     for name, config in (("omitted", params), ("explicit", explicit)):
         peslite.Simulation(config).export("cpp", tmp_path / name, name="equivalent", variables=("common",))
     assert (tmp_path / "omitted/peslite.cpp").read_bytes() == (tmp_path / "explicit/peslite.cpp").read_bytes()
 
 
-@pytest.mark.parametrize("update", ["interval", "pulse"])
-def test_synchronous_continuation_restores_the_applied_waveform(update, tmp_path):
+@pytest.mark.parametrize(("update", "dead_time"), [
+    ("interval", 0.0),
+    ("pulse", 0.0),
+    ("interval", 1e-6),
+])
+def test_switching_continuation_restores_the_applied_waveform(update, dead_time, tmp_path):
     params = _case("gfl", "switching").replace(**{
         "units.vsc.pwm.sync": "synchronous", "units.vsc.pwm.pattern_sync": update,
+        "units.vsc.pwm.dead_time": dead_time,
         "simulation.t_end": .001, "simulation.output.period": 1e-6,
     })
     whole = peslite.Simulation(params)

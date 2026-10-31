@@ -88,6 +88,15 @@ def _pwm(w, base, where: str, continuous: bool = False) -> None:
         raise ConfigError(f"{where}.f_sw must be finite and positive, got {w.f_sw}")
     if not math.isfinite(w.carrier_phase):
         raise ConfigError(f"{where}.carrier_phase must be finite, got {w.carrier_phase}")
+    if not math.isfinite(w.dead_time) or w.dead_time < 0.0:
+        raise ConfigError(f"{where}.dead_time must be finite and nonnegative, got {w.dead_time}")
+    if continuous and (w.dead_time > 0.0 or w.dead_time_compensation):
+        warnings.warn(
+            f"{where}.dead_time and {where}.dead_time_compensation are ignored by ideal averaging",
+            stacklevel=4,
+        )
+    if not continuous and w.dead_time >= 0.5 * w.switching_period:
+        raise ConfigError(f"{where}.dead_time must be shorter than half a switching period")
     if not continuous and w.sync == "synchronous":
         base.require("f0", where=f"{where}.sync = 'synchronous'")
         ratio = w.f_sw / base.f0

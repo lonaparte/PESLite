@@ -2499,6 +2499,90 @@ _PULSE_SEQUENCE_KERNEL = r'''template <std::size_t N, std::size_t G> struct Puls
 '''.replace("@@SNAP@@", _number(_SNAP))
 
 
+_DEAD_TIME_KERNEL = r'''template <std::size_t N> struct DeadTimeSequenceState {
+    using Word = std::array<double, N>;
+    using Sequence = std::vector<std::pair<double, Word>>;
+    Word entry{}, next{}, command{}, next_command{}, remaining{}, next_remaining{}, direction{};
+    double time;
+    bool restored;
+
+    static int sign(double value) { return (value > 0.0) - (value < 0.0); }
+
+    Sequence load(double t, double span, const Sequence& raw, const Word& currents,
+                  bool enabled, double delay, double minimum_interval) {
+        const bool restoring = restored;
+        if (time != t) {
+            if (!restoring) { entry = next; command = next_command; remaining = next_remaining; }
+            time = t;
+            restored = false;
+        }
+        if (!enabled) {
+            // -1 distinguishes both gates blocked from the lower-device command 0.
+            next.fill(0.0); next_command.fill(-1.0); next_remaining.fill(0.0);
+            return {{span, Word{}}};
+        }
+        struct Change { double time; std::size_t leg; double value; };
+        std::vector<Change> changes;
+        Word final_output{}, final_command{}, final_remaining{};
+        if (!restoring)
+            for (std::size_t leg = 0; leg < N; ++leg) direction[leg] = sign(currents[leg]);
+        for (std::size_t leg = 0; leg < N; ++leg) {
+            double actual = entry[leg], desired = command[leg];
+            double due = remaining[leg] > time_eps ? remaining[leg]
+                                                    : std::numeric_limits<double>::infinity();
+            const int current_direction = static_cast<int>(direction[leg]);
+            double clamp = current_direction > 0 ? 0.0 : current_direction < 0 ? 1.0 : desired;
+            if (std::isfinite(due) && desired == clamp) {
+                if (actual != desired) changes.push_back({0.0, leg, desired});
+                actual = desired;
+                due = std::numeric_limits<double>::infinity();
+            }
+            std::vector<std::pair<double, double>> commands;
+            double at = 0.0, previous = desired;
+            for (const auto& segment : raw) {
+                const double target = segment.second[leg];
+                if (target != previous) { commands.emplace_back(at, target); previous = target; }
+                at += segment.first;
+            }
+            std::size_t index = 0;
+            while (index < commands.size() || due <= span + time_eps) {
+                const double command_at = index < commands.size() ? commands[index].first
+                                        : std::numeric_limits<double>::infinity();
+                if (command_at <= due + time_eps) {
+                    at = commands[index].first;
+                    desired = commands[index].second;
+                    ++index;
+                    due = std::numeric_limits<double>::infinity();
+                    clamp = current_direction > 0 ? 0.0 : current_direction < 0 ? 1.0 : desired;
+                    const double next_value = clamp;
+                    if (desired != clamp) due = at + delay;
+                    if (next_value != actual) { changes.push_back({at, leg, next_value}); actual = next_value; }
+                } else {
+                    at = due;
+                    due = std::numeric_limits<double>::infinity();
+                    if (actual != desired) { changes.push_back({at, leg, desired}); actual = desired; }
+                }
+            }
+            final_output[leg] = actual;
+            final_command[leg] = desired;
+            final_remaining[leg] = std::isfinite(due) ? std::max(0.0, due - span) : 0.0;
+        }
+        next = final_output; next_command = final_command; next_remaining = final_remaining;
+        std::sort(changes.begin(), changes.end(), [](const Change& a, const Change& b) {
+            return a.time < b.time || (a.time == b.time && a.leg < b.leg);
+        });
+        std::vector<std::pair<double, Word>> words;
+        Word word = entry;
+        for (const auto& change : changes) {
+            word[change.leg] = change.value;
+            words.emplace_back(change.time, word);
+        }
+        return merge_short_intervals(span, minimum_interval, entry, words);
+    }
+};
+'''
+
+
 def _phase_shift_kernel():
     cases = []
     for mode, pulses in PHASE_SHIFT_MODES.items():
@@ -2581,6 +2665,15 @@ class _CarrierModulatorGenerator:
             )
         else:
             values = tuple(f"{generator.m('active')}[{index}]" for index in range(generator.bridge.modulation_width))
+            if generator.bridge._dead_time_average > 0.0:
+                currents = generator._dead_time_currents()
+                fraction = _number(generator.bridge._dead_time_average / generator.bridge.carrier_period)
+                values = tuple(
+                    f"std::clamp({value} - (({value}) > 0.0 && ({value}) < 1.0 ? "
+                    f"{fraction} * (({current}) > 0.0 ? 1.0 : "
+                    f"(({current}) < 0.0 ? -1.0 : 0.0)) : 0.0), 0.0, 1.0)"
+                    for value, current in zip(values, currents)
+                )
             mapped = f"{hold} = {generator._topology_expression(generator.topology.pwm_state, values)};"
         return [*clock_lines, f"        {mapped}",
                 f"        {generator.m('load_end')} = t + {_number(bridge.load_period)};"]
@@ -2595,13 +2688,14 @@ class _CarrierModulatorGenerator:
         q_kind = _CPP_TYPES[_Expression.of(generator.topology.zero).kind]
         minimum_interval = _number(generator.bridge.modulator.min_interval)
         pulse = generator.bridge.pulse_update
-        switches = "edges_out" if pulse is not None else generator.m("switches")
-        method = "raw_switches" if pulse is not None else "make_switches"
+        raw_required = pulse is not None or generator.bridge._dead_time_sequence is not None
+        switches = "edges_out" if raw_required else generator.m("switches")
+        method = "raw_switches" if raw_required else "make_switches"
         extra = ""
         index_reset = f"{generator.m('switch_index')} = 0;"
         finish = (f"{generator.m('next_switch')} = {switches}.empty() ? "
                   f"std::numeric_limits<double>::infinity() : {switches}[0].first;")
-        if pulse is not None:
+        if raw_required:
             q_kind = f"std::array<double, {generator.bridge.modulation_width}>"
             encoded = "q"
             extra = f", std::vector<std::pair<double, {q_kind}>>& edges_out"
@@ -2676,6 +2770,28 @@ class _CarrierModulatorGenerator:
 {_pulse_application(generator, "raw", "period")}
 }}
 '''
+        elif generator.bridge._dead_time_sequence is not None:
+            width = generator.bridge.modulation_width
+            kind = _CPP_TYPES[_Expression.of(generator.topology.zero).kind]
+            values = tuple(f"word[{index}]" for index in range(width))
+            encoded = generator._topology_expression(generator.topology.switching_state, values)
+            result += f'''void make_switches_{generator.tag}(double t, double span, double frequency,
+        double phase, {kind}& held) {{
+    using Word = std::array<double, {width}>;
+    Word initial{{}};
+    std::vector<std::pair<double, Word>> edges;
+    raw_switches_{generator.tag}(t, span, frequency, phase, initial, edges);
+    std::vector<std::pair<double, Word>> segments;
+    double previous = t;
+    for (const auto& edge : edges) {{
+        segments.emplace_back(edge.first - previous, initial);
+        previous = edge.first; initial = edge.second;
+    }}
+    segments.emplace_back(t + span - previous, initial);
+{_dead_time_application(generator)}
+{_sequence_schedule(generator, encoded, 'word')}
+}}
+'''
         return result
 
 
@@ -2728,6 +2844,24 @@ class _PhaseShiftModulatorGenerator:
 {_pulse_application(generator, "raw", "period")}
 }}
 '''
+        if generator.bridge._dead_time_sequence is not None:
+            width = len(generator.bridge._dead_time_sequence.entry)
+            encoded_word = generator._topology_expression(
+                generator.topology.switching_state,
+                tuple(f"word[{index}]" for index in range(width)),
+            )
+            return f'''void make_switches_{generator.tag}(double t, double span, {kind}& held) {{
+    auto levels = {self._member(generator)}.load(t, span, {values});
+    std::vector<std::pair<double, std::array<double, {width}>>> segments;
+    for (const auto& item : levels) {{
+        const int level = item.second;
+        segments.push_back({{item.first,
+            {{(level == 1 ? 1.0 : 0.0), (level == -1 ? 1.0 : 0.0)}}}});
+    }}
+{_dead_time_application(generator)}
+{_sequence_schedule(generator, encoded_word, 'word')}
+}}
+'''
         return f'''void make_switches_{generator.tag}(double t, double span, {kind}& held) {{
     auto segments = {self._member(generator)}.load(t, span, {values});
 {_sequence_schedule(generator, encoded, 'level')}
@@ -2742,7 +2876,20 @@ def _pulse_application(generator, raw, period):
     return f'''    auto segments = {generator.m('pulse_sequence')}.load(t, span, {period}, {raw},
         {generator.m('active')}[{generator.width}] != 0.0,
         {_number(generator.bridge.modulator.min_interval)});
+{_dead_time_application(generator)}
 {_sequence_schedule(generator, encoded, 'word')}'''
+
+
+def _dead_time_application(generator):
+    """Apply the shared leg-level dead-time state to a generated raw sequence."""
+    dead_time = generator.bridge._dead_time_sequence
+    if dead_time is None:
+        return ""
+    currents = ", ".join(generator._dead_time_currents())
+    enabled = f"{generator.m('active')}[{generator.width}] != 0.0"
+    return (f"    segments = {generator.m('dead_time')}.load(t, span, segments, "
+            f"std::array<double, {len(dead_time.entry)}>{{{{{currents}}}}}, {enabled}, "
+            f"{_number(dead_time.delay)}, {_number(dead_time.min_interval)});")
 
 
 def _sequence_schedule(generator, encoded, value):
@@ -3580,7 +3727,10 @@ class _ControlGenerator:
 
     def shared_code(self):
         return (*(self.modulation.shared_code() if self.modulation is not None else ()),
-                *((_SHORT_INTERVALS, _PULSE_SEQUENCE_KERNEL) if self.bridge.pulse_update is not None else ()))
+                *((_SHORT_INTERVALS, _PULSE_SEQUENCE_KERNEL)
+                  if self.bridge.pulse_update is not None else ()),
+                *((_SHORT_INTERVALS, _DEAD_TIME_KERNEL)
+                  if self.bridge._dead_time_sequence is not None else ()))
 
     def _pulse_members(self):
         pulse = self.bridge.pulse_update
@@ -3595,12 +3745,42 @@ class _ControlGenerator:
                 f"{_number(pulse.time) if pulse.time is not None else '-std::numeric_limits<double>::infinity()'}, "
                 f"{str(pulse.restored).lower()}" + "};"]
 
+    def _dead_time_currents(self):
+        dead_time = self.bridge._dead_time_sequence
+        if dead_time is None and self.bridge._dead_time_average <= 0.0:
+            return ()
+        bridge = self.bridge
+        current = self.model.solver_observation(bridge.inp, "i_c")
+        kind = self.model.record_types[id(bridge.inp), "i_c"]
+        values = self.model._trace(
+            lambda: bridge.topology.pole_currents(_Expression(current, kind))
+        )
+        return tuple(value.code for value in values)
+
+    def _dead_time_members(self):
+        dead_time = self.bridge._dead_time_sequence
+        if dead_time is None:
+            return []
+        literal = lambda values: "{" + ", ".join(_number(x) for x in values) + "}"
+        return [f"DeadTimeSequenceState<{len(dead_time.entry)}> {self.m('dead_time')}{{"
+                f"{literal(dead_time.entry)}, {literal(dead_time.next)}, "
+                f"{literal(dead_time.command)}, {literal(dead_time.next_command)}, "
+                f"{literal(dead_time.remaining)}, {literal(dead_time.next_remaining)}, "
+                f"{literal(dead_time.direction)}, "
+                f"{_number(dead_time.time) if dead_time.time is not None else '-std::numeric_limits<double>::infinity()'}, "
+                f"{str(dead_time.restored).lower()}" + "};"]
+
     def _timing_state_expression(self, local):
-        if self.bridge.pulse_update is None or not local.startswith("pulse."):
-            return self.modulation.state_expression(self, local)
-        field, _, index = local.removeprefix("pulse.").rpartition("_")
-        member = "entry" if field == "q" else "remaining"
-        return f"{self.m('pulse_sequence')}.{member}[{int(index)}]"
+        if local.startswith("pulse.") and self.bridge.pulse_update is not None:
+            field, _, index = local.removeprefix("pulse.").rpartition("_")
+            member = "entry" if field == "q" else "remaining"
+            return f"{self.m('pulse_sequence')}.{member}[{int(index)}]"
+        if local.startswith("dead_time.") and self.bridge._dead_time_sequence is not None:
+            field, _, index = local.removeprefix("dead_time.").rpartition("_")
+            member = {"output": "entry", "command": "command", "remaining": "remaining",
+                      "direction": "direction"}[field]
+            return f"{self.m('dead_time')}.{member}[{int(index)}]"
+        return self.modulation.state_expression(self, local)
 
     def _load_modulation(self, hold, switching):
         return self.modulation.load(self, hold, switching)
@@ -3615,6 +3795,7 @@ class _ControlGenerator:
     def _pwm_members(self) -> list[str]:
         """Declare the shared sampled bridge timer, register and edge state."""
         bridge = self.bridge
+        self._dead_time_currents()  # register the physical-current observation before declarations
         if any(value != self.topology.zero for _, value in bridge.schedule):
             # Restored register values may already have produced a fixed initial edge sequence.
             # Its constructor inputs must remain in that specialization until it is re-exported.
@@ -3630,6 +3811,7 @@ class _ControlGenerator:
         return [
             *self.modulation.members(self),
             *self._pulse_members(),
+            *self._dead_time_members(),
             f"long long {self.m('pwm_k')} = static_cast<long long>({_number(control_index)});",
             f"long long {self.m('pwm_j')} = static_cast<long long>({_number(load_index)});",
             f"double {self.m('t_interrupt')} = {_number(bridge.interrupt(control_index))};",

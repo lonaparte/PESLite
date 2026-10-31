@@ -55,7 +55,7 @@ Create the Cockpit project from the target ELF; PESLite does not invent a propri
 
 Copy [template.imperix.json](template.imperix.json) as a starting point for a single three-phase
 Unit named `vsc`. Rename it to match the PES file or select it with `--imperix-config`. Replace
-the Unit name, channel assignments, calibration, dead time and SDK build placeholders for the
+the Unit name, channel assignments, calibration and SDK build placeholders for the
 actual setup. The template's unit sensitivities are placeholders, not sensor calibration.
 The build wrapper path is also a placeholder for the user's SDK project integration, not a
 command supplied by the SDK; it must accept the shown SDK/source/output arguments and produce
@@ -88,7 +88,6 @@ syntax, not a validated wiring diagram or sensor calibration:
         "u_dc": {"channel": 6, "sensitivity": 0.005}
       },
       "pwm": [0, 1, 2],
-      "dead_time": 0.000001,
       "startup_ramp": 1.0,
       "hardware_overcurrent_configured": true
     }
@@ -115,8 +114,9 @@ be shared by different bridge legs. Physical channel ranges must match the insta
 two for a full bridge and one for a half bridge. Fully controlled legs use complementary outputs.
 A unilateral half bridge uses `PWMH_ACTIVE`; wire that active output to its controlled transistor,
 including the lower transistor in a Boost circuit. An unused complementary lane is not a diode.
-Complementary legs require an explicit positive `dead_time`, shorter than half the carrier period.
-A single controlled transistor does not use complementary dead time and may omit it.
+Complementary legs require a positive `pwm.dead_time` in the PES file, shorter than half the
+carrier period; the hardware-binding file does not repeat it.
+A single controlled transistor does not use complementary dead time.
 
 ## Timing and run commands
 

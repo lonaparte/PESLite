@@ -56,6 +56,8 @@ pwm:
   update: single
   sync: asynchronous
   pattern_sync: interval
+  dead_time: 0.0
+  dead_time_compensation: false
 meas:
   period: 25e-6
   offset: 0.0
@@ -72,6 +74,8 @@ meas:
 | `pwm.carrier_phase` | 0 | carrier periods | asynchronous carrier position at `t = 0` |
 | `pwm.sync` | `asynchronous` | `asynchronous` or `synchronous` | carrier clock source |
 | `pwm.pattern_sync` | `interval` | `interval` or `pulse` | waveform replacement rule |
+| `pwm.dead_time` | 0 | seconds, less than half a switching period | complementary-device turn-on delay |
+| `pwm.dead_time_compensation` | `false` | Boolean | cancel the ideal current-polarity dead-time error |
 | `meas.period` | `ctrl.period`; otherwise `simulation.output.period` | divides `ctrl.period` when sampled | ADC conversion period |
 | `meas.offset` | aligned with controller interrupts | within one ADC period | ADC conversion position |
 | `meas.window` | `ctrl.period` | no longer than `ctrl.period` | averaging window |
@@ -163,6 +167,12 @@ Synchronous PWM requires an integer ratio `pwm.f_sw / base.f0`.
 `pulse` may insert a zero gap of up to one pattern period. Averaged models do not construct
 pulse-preservation state.
 
+Dead time is applied to the leg sequence after modulation, so carrier and phase-shift modulation
+share the same current-directed diode-clamping rule. `pwm_averaging` applies its cycle average;
+legs held at duty 0 or 1 do not commutate and have no dead-time error. Ideal `averaging` has no PWM
+hardware, so it warns and ignores dead time and compensation. Compensation in the sampled models
+applies an ideal polarity-based correction and removes the corresponding voltage error.
+
 ## Protection periods
 
 | Criterion | Evaluation boundary |
@@ -184,6 +194,7 @@ With `bridge.model: averaging`, controller and plant states are integrated conti
 | ADC interrupt and `meas.offset` | not used |
 | `ctrl.period`, `ctrl.offset`, `ctrl.computation` | not used for controller execution |
 | carrier and PWM register loads | not used |
+| `pwm.dead_time`, `pwm.dead_time_compensation` | ignored |
 | `meas.period` | protection and RMS period |
 | loop implementation | must provide a continuous-time equation |
 

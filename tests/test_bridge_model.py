@@ -51,6 +51,33 @@ def test_averaging_flag_selects_every_unit(name):
     assert set(_models(name, "--averaging").values()) == {"averaging"}
 
 
+@pytest.mark.parametrize("flag", ["--pwm-averaging", "--averaging"])
+def test_bridge_flag_keeps_an_incompatible_unit_with_a_warning(flag):
+    with pytest.warns(UserWarning, match="PhaseShiftModulator.*keeping bridge.model"):
+        resolved = _resolved("wpt-phase-shift-example", flag)
+
+    assert resolved["units"]["charger"]["primary"]["bridge"]["model"] == "switching"
+    assert (resolved["simulation"]["solver"]["type"],
+            resolved["simulation"]["solver"]["method"]) == ("fixed", "rk4")
+
+
+@pytest.mark.parametrize("flag", ["--switching", "--pwm-averaging"])
+def test_bridge_flag_warns_and_keeps_a_model_whose_dormant_config_is_incompatible(
+        flag, tmp_path):
+    tree = yaml.safe_load((EXAMPLES / "gfl-example.pes").read_text(encoding="utf-8"))
+    tree["units"]["vsc"]["bridge"] = {"model": "averaging"}
+    tree["units"]["vsc"]["pwm"]["dead_time"] = 1.0
+    path = tmp_path / "configured.pes"
+    path.write_text(yaml.safe_dump(tree), encoding="utf-8")
+
+    with pytest.warns(UserWarning, match=r"does not apply.*dead_time"):
+        resolved = _resolved(str(path), flag)
+
+    assert resolved["units"]["vsc"]["bridge"]["model"] == "averaging"
+    assert (resolved["simulation"]["solver"]["type"],
+            resolved["simulation"]["solver"]["method"]) == ("fixed", "rk4")
+
+
 @pytest.mark.parametrize(("flag", "expected"), [
     (None, ("fixed", "rk4")),
     ("--switching", ("fixed", "rk4")),
@@ -284,6 +311,30 @@ def test_pwm_averaging_accepts_synchronous_pwm(gfl, tmp_path):
                     "units.vsc.pwm.carrier_phase": 0.3})
     result = peslite.Simulation(params).run(out_dir=tmp_path)
     assert result.t[-1] == pytest.approx(params.simulation.t_end)
+
+
+def test_pwm_dead_time_is_bounded_by_the_carrier(gfl):
+    with pytest.raises(ConfigError, match="shorter than half a switching period"):
+        peslite.Simulation(gfl(**{"units.vsc.pwm.dead_time": 25e-6}))
+
+
+def test_ideal_averaging_ignores_pwm_dead_time(gfl):
+    baseline = peslite.Simulation(gfl(**{"units.vsc.bridge.model": "averaging"}))
+    with pytest.warns(UserWarning, match="ignored by ideal averaging"):
+        configured = peslite.Simulation(gfl(**{
+            "units.vsc.bridge.model": "averaging",
+            "units.vsc.pwm.dead_time": 1.0,
+            "units.vsc.pwm.dead_time_compensation": True,
+        }))
+
+    assert baseline.state_names() == configured.state_names()
+    np.testing.assert_array_equal(
+        baseline.system.model.get_initial_values(), configured.system.model.get_initial_values()
+    )
+    initial = baseline.system.model.get_initial_values()
+    np.testing.assert_array_equal(
+        baseline.system.model.rhs(0.0, initial), configured.system.model.rhs(0.0, initial)
+    )
 
 
 def test_ideal_averaging_has_continuous_control_states_and_no_sampled_hardware_states(gfl):
