@@ -12,7 +12,7 @@ import peslite
 from peslite.assembly.exporter import _signal_names
 from peslite.control.blocks import complex2abc
 from peslite.solver.model import ConfigError
-from peslite.solver.simulation import _plant_output_row
+from peslite.solver.simulation import _PlantRows, _plant_output_row
 
 
 UNIT_SUFFIX = re.compile(r"_(s|hz|hz_s|J|rad)$")
@@ -25,6 +25,25 @@ def test_multi_unit_output_columns_follow_configuration_order():
                'charger.secondary.u_dc': 200., 'charger.secondary.i_dc': 3.}
     row = _plant_output_row(params, 0., signals, {})
     assert tuple(row) == ('t', *signals)
+
+
+def test_compiled_output_rows_keep_the_fixed_public_schema():
+    params = SimpleNamespace(units={}, sources={})
+    signals = {"scalar": 2.0, "vector": 2.0 + 3.0j}
+    names = {"converter": ("duty",)}
+    logs = {"converter": {"duty": 0.4}}
+    rows = _PlantRows(params, signals, names)
+
+    phases = complex2abc(signals["vector"])
+    assert rows.columns == (
+        "t", "scalar", "vector_a", "vector_b", "vector_c", "converter.duty",
+    )
+    assert rows.values(0.25, signals, logs) == pytest.approx(
+        [0.25, 2.0, *phases, 0.4]
+    )
+
+    with pytest.raises(RuntimeError, match="recorded columns changed"):
+        rows.values(0.25, {**signals, "new": 1.0}, logs)
 
 
 def _run(params, out):
