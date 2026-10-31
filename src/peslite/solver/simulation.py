@@ -813,6 +813,10 @@ class Simulation:
                     self._windows_given.add(name)
             unit.states_loaded()
         self._states.load(values, ["solver"])
+        self._continued_discrete = {
+            name for name, _owner in getattr(system.model, "discrete_updates", ())
+            if any(key == name or key.startswith(name + ".") for key in values)
+        }
         return system.model.get_initial_values()
 
     # ------------------------------------------------------------ the loop
@@ -901,6 +905,9 @@ class Simulation:
         # a continuous unit's own clock samples only that unit.
         sampled_units = tuple(unit for unit in units if not unit.continuous)
         clocked_units = tuple(unit for unit in units if unit.continuous)
+        discrete_updates = getattr(mdl, "discrete_updates", ())
+        circuit_clocks = (*[unit.next_time for unit in sampled_units],
+                          *[owner.next_discrete_time for _name, owner in discrete_updates])
         ctrl_names = {unit_name: getattr(ctrl, "log_names", lambda: ())()
                       for unit_name, ctrl in controls}
         for unit_name, ctrl in controls:
@@ -1074,14 +1081,16 @@ class Simulation:
                     unit.restart_windows(t_now)
 
         # ---------------------------------------------------------------- the event grid
+        for name, owner in discrete_updates:
+            owner.start_discrete(t_start, name in self._continued_discrete)
         self._begin_units(t_start, plant)
         plant.settle = settle_now
         while True:
             plant.inputs_changed = False
             t_log = n_log * log_period
             circuit_stop = actions[0][0] if actions else math.inf
-            for unit in sampled_units:
-                circuit_stop = min(circuit_stop, unit.next_time())
+            for next_time in circuit_clocks:
+                circuit_stop = min(circuit_stop, next_time())
             physical_stop = circuit_stop
             for unit in clocked_units:
                 physical_stop = min(physical_stop, unit.next_time())
@@ -1094,8 +1103,11 @@ class Simulation:
             while observations and observations[0] <= t_stop + TIME_EPS:
                 pending_observations.discard(heapq.heappop(observations))
             event_due = bool(actions and actions[0][0] <= t_stop + TIME_EPS)
+            discrete_due = bool(discrete_updates) and any(
+                owner.next_discrete_time() <= t_stop + TIME_EPS
+                for _name, owner in discrete_updates)
             advancing = t_stop > t_local + TIME_EPS
-            if advancing and advance(t_local, t_stop, event_due):
+            if advancing and advance(t_local, t_stop, event_due or discrete_due):
                 stopped = True
                 break
             if observation_only:
@@ -1121,6 +1133,18 @@ class Simulation:
                     if parameters_changed is not None:
                         parameters_changed()
                     plant.read_state()
+                    plant.inputs_changed = True
+                due_updates = ([owner for _name, owner in discrete_updates
+                                if owner.next_discrete_time() <= t_stop + TIME_EPS]
+                               if discrete_updates else ())
+                if due_updates:
+                    plant.outputs(t_stop)
+                    sampled_updates = [(owner, owner.sample_discrete(t_stop))
+                                       for owner in due_updates]
+                    for owner, values in sampled_updates:
+                        owner.apply_discrete(values)
+                    plant.invalidate()
+                    plant.outputs(t_stop)
                     plant.inputs_changed = True
                 # Every unit protects first, then every unit samples, then every unit actuates.  This
                 # makes coincident multi-unit events independent of the units' dictionary order.

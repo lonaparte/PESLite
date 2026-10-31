@@ -31,8 +31,8 @@ model = BlackBoxSubsystem(
 
 ## Stateful models
 
-Supplying initial `state` values registers them as PESLite states. PESLite passes the current state
-vector to both functions and obtains its derivative from `rhs`:
+Supplying initial `state` values registers them as PESLite states. A continuous model provides
+`rhs`, from which PESLite obtains the state derivative:
 
 ```python
 model = BlackBoxSubsystem(
@@ -47,8 +47,27 @@ model = BlackBoxSubsystem(
 
 A state vector may be supplied directly and receives the stable names `state_0`, `state_1`, and so
 on. Dynamic memory, including filter histories and recurrent hidden values, must be registered state
-rather than mutable data retained by the callable. Sampled models follow the same rule through a
-registered control `Loop`.
+rather than mutable data retained by the callable.
+
+## Discrete state updates
+
+A discrete model replaces `rhs` with `update` and a sampling `period`. PESLite samples all models
+due at the same instant before committing any new state:
+
+```python
+model = BlackBoxSubsystem(
+    output=lambda t, state, inputs: state,
+    update=lambda t, state, inputs: recurrent_model(state, inputs),
+    period=100e-6,
+    inputs=("signal",),
+    outputs=("estimate",),
+    state={"hidden": 0.0},
+    feedthrough=(),
+)
+```
+
+`offset` selects the position of the periodic update grid. Restored discrete states resume after the
+restart instant instead of repeating its update.
 
 ## Callable boundary
 
@@ -56,3 +75,8 @@ Inputs, outputs and states use ordered one-dimensional NumPy-compatible values. 
 adapter can therefore reshape tensors or invoke any external runtime without adding that runtime to
 PESLite. `feedthrough` lists the current inputs read while calculating outputs and defaults to all
 inputs; the solver uses it for dependency ordering and algebraic-loop detection.
+
+ONNX Runtime, PyTorch and other runtimes remain outside the core package. Their sessions are called
+from the same array boundary; install `peslite[onnx]` to use the optional ONNX dependencies.
+Standalone C++ export supports callables that the existing scalar equation tracer can lower. An
+external runtime session is not embedded into the generated C++ executable.

@@ -3,8 +3,24 @@
 import numpy as np
 import pytest
 
-from peslite import BlackBoxSubsystem
+from peslite import BlackBoxSubsystem, Simulation
+from peslite.assembly.params import from_dict
 from peslite.solver import Model
+
+
+class _System:
+    def __init__(self, model):
+        self.model = model
+        self.units = {}
+        self.sources = {}
+        self._port_bindings = {}
+
+    def state_parts(self):
+        return [("", self.model), *self.model.discrete_updates]
+
+    def signals(self, _t):
+        return {f"{name}.output": subsystem.out.y
+                for name, subsystem in self.model.discrete_updates}
 
 
 def test_stateless_black_box_needs_only_input_and_output_callables():
@@ -95,6 +111,94 @@ def test_state_output_breaks_feedback_dependency():
 
     assert not model.algebraic_loops
     assert model.rhs(0.0, np.array([3.0])) == pytest.approx([3.0])
+
+
+def test_discrete_black_box_updates_on_the_shared_simulation_event_grid(tmp_path):
+    block = BlackBoxSubsystem(
+        lambda _t, state, _inputs: state,
+        inputs=(),
+        outputs=("y",),
+        state={"hidden": 0.0},
+        update=lambda _t, state, _inputs: state + 1.0,
+        period=1.0e-3,
+        feedthrough=(),
+    )
+    model = Model({"block": block}, {})
+    params = from_dict({
+        "base": {"s_base": 1.0},
+        "simulation": {
+            "t_end": 2.1e-3,
+            "solver": {"dt": 1.0e-4},
+            "output": {"period": 1.0e-3},
+            "energy_check": "off",
+        },
+    })
+
+    result = Simulation(params, system=_System(model)).run(out_dir=tmp_path)
+
+    assert model.n_states == 0
+    assert result.states["block.hidden"][-1] == pytest.approx(3.0)
+    assert block.out.y == pytest.approx(3.0)
+
+
+def test_restored_discrete_state_does_not_repeat_the_restart_instant(tmp_path):
+    block = BlackBoxSubsystem(
+        lambda _t, state, _inputs: state,
+        inputs=(),
+        outputs=("y",),
+        state={"hidden": 0.0},
+        update=lambda _t, state, _inputs: state + 1.0,
+        period=1.0e-3,
+        feedthrough=(),
+    )
+    model = Model({"block": block}, {})
+    params = from_dict({
+        "base": {"s_base": 1.0},
+        "simulation": {
+            "t_end": 3.1e-3,
+            "initial": {"t": 2.0e-3, "states": {"block.hidden": 7.0}},
+            "solver": {"dt": 1.0e-4},
+            "output": {"period": 1.0e-3},
+            "energy_check": "off",
+        },
+    })
+
+    Simulation(params, system=_System(model)).run(out_dir=tmp_path)
+
+    assert block.out.y == pytest.approx(8.0)
+
+
+def test_coincident_discrete_updates_sample_before_any_state_is_committed(tmp_path):
+    def block(initial):
+        return BlackBoxSubsystem(
+            lambda _t, state, _inputs: state,
+            inputs=("other",),
+            outputs=("y",),
+            state={"hidden": initial},
+            update=lambda _t, _state, inputs: inputs,
+            period=1.0e-3,
+            feedthrough=(),
+        )
+
+    first, second = block(1.0), block(10.0)
+    model = Model(
+        {"first": first, "second": second},
+        {(first, "other"): (second, "y"), (second, "other"): (first, "y")},
+    )
+    params = from_dict({
+        "base": {"s_base": 1.0},
+        "simulation": {
+            "t_end": 1.0e-4,
+            "solver": {"dt": 1.0e-5},
+            "output": {"period": 1.0e-4},
+            "energy_check": "off",
+        },
+    })
+
+    Simulation(params, system=_System(model)).run(out_dir=tmp_path)
+
+    assert first.state.hidden == pytest.approx(10.0)
+    assert second.state.hidden == pytest.approx(1.0)
 
 
 def test_black_box_validates_declared_dimensions_and_dependencies():

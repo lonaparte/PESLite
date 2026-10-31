@@ -29,6 +29,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from . import energy as _energy
+from .timing import PeriodicClock, resolve_clock_offset
 
 __all__ = ["ConfigError", "LocatedZero", "Bag", "Empty", "OutputMethod", "Subsystem",
            "BlackBoxSubsystem", "Model",
@@ -194,9 +195,9 @@ class BlackBoxSubsystem:
     ``inputs`` and ``outputs`` are ordered names or mappings to initial scalar values. With no
     ``state``, ``output`` is called as ``output(t, inputs)`` and the subsystem is stateless. A
     stateful model supplies initial values as a mapping, or a vector whose entries are registered
-    as ``state_0``, ``state_1`` and so on; ``output`` and ``rhs`` are then called as
-    ``function(t, state, inputs)``. PESLite owns and passes the state on every evaluation, so the
-    callables must not keep hidden dynamic state.
+    as ``state_0``, ``state_1`` and so on. Continuous state supplies ``rhs``; discrete state supplies
+    ``update`` and ``period``. Their callables use ``function(t, state, inputs)``. PESLite owns and
+    passes the state on every evaluation, so the callables must not keep hidden dynamic state.
 
     The callables accept and return scalar or one-dimensional array-like values. ``feedthrough``
     names the current inputs read by ``output`` and defaults to all inputs. The declaration becomes
@@ -212,6 +213,9 @@ class BlackBoxSubsystem:
         outputs: Sequence[str] | Mapping[str, Any],
         state: NDArray | Sequence[complex | float] | Mapping[str, complex | float] | None = None,
         rhs: Callable[..., Any] | None = None,
+        update: Callable[..., Any] | None = None,
+        period: float | None = None,
+        offset: float = 0.0,
         feedthrough: Sequence[str] | None = None,
     ) -> None:
         if not callable(output):
@@ -229,17 +233,45 @@ class BlackBoxSubsystem:
             if isinstance(state, (str, bytes)):
                 raise TypeError("state must be a numeric sequence or a mapping of initial values")
             state_values = {f"state_{index}": value for index, value in enumerate(state)}
-        self.state_names, self.state = _black_box_record(state_values, "state")
-        if self.state_names:
-            if not callable(rhs):
-                raise TypeError("a stateful black box requires a callable rhs")
+        all_state_names, self.state = _black_box_record(state_values, "state")
+        continuous = rhs is not None
+        discrete = update is not None or period is not None
+        if all_state_names:
+            if continuous == discrete:
+                raise TypeError("a stateful black box requires exactly one of rhs or update with period")
+            if continuous and not callable(rhs):
+                raise TypeError("rhs must be callable")
+            if discrete and (not callable(update) or period is None):
+                raise TypeError("a discrete black box requires a callable update and period")
+        elif rhs is not None or update is not None or period is not None:
+            raise TypeError("a stateless black box does not use rhs, update or period")
+
+        self._state_names = all_state_names
+        self.state_names = all_state_names if continuous else ()
+        self.discrete_state_names = all_state_names if discrete else ()
+        self.update_clock = None
+        self._update_index = 0
+        if continuous:
             self._call_output = lambda t, x, u: output(t, x, u)
             self._call_rhs = lambda t, x, u: rhs(t, x, u)
+            self._call_update = None
+            if offset:
+                raise ValueError("offset is only valid for a discrete black box")
+        elif discrete:
+            if not math.isfinite(period) or period <= 0.0:
+                raise ValueError("period must be finite and positive")
+            if not math.isfinite(offset):
+                raise ValueError("offset must be finite")
+            self._call_output = lambda t, x, u: output(t, x, u)
+            self._call_rhs = None
+            self._call_update = lambda t, x, u: update(t, x, u)
+            self.update_clock = PeriodicClock(period, resolve_clock_offset(period, offset))
         else:
-            if rhs is not None:
-                raise TypeError("a stateless black box does not use rhs")
             self._call_output = lambda t, _x, u: output(t, u)
             self._call_rhs = None
+            self._call_update = None
+            if offset:
+                raise ValueError("offset is only valid for a discrete black box")
 
         dependencies = self.input_names if feedthrough is None else tuple(feedthrough)
         if len(set(dependencies)) != len(dependencies):
@@ -251,7 +283,7 @@ class BlackBoxSubsystem:
         self.output_stages = (OutputMethod("set_outputs", tuple(dependencies), self.output_names),)
 
         self._input_values = _black_box_values(self.inp, self.input_names)
-        self._state_values = _black_box_values(self.state, self.state_names)
+        self._state_values = _black_box_values(self.state, self._state_names)
 
     @staticmethod
     def _result(values: Any, size: int, label: str) -> NDArray:
@@ -268,13 +300,16 @@ class BlackBoxSubsystem:
     def _read(record: Any, names: Sequence[str], values: NDArray) -> NDArray:
         for index, name in enumerate(names):
             value = getattr(record, name)
-            if values.dtype.kind != "c" and np.iscomplexobj(value):
+            if (values.dtype.kind not in ("c", "O")
+                    and not isinstance(value, numbers.Number)):
+                values = values.astype(object)
+            elif values.dtype.kind != "c" and np.iscomplexobj(value):
                 values = values.astype(complex)
             values[index] = value
         return values
 
     def _arguments(self) -> tuple[NDArray, NDArray]:
-        self._state_values = self._read(self.state, self.state_names, self._state_values)
+        self._state_values = self._read(self.state, self._state_names, self._state_values)
         self._input_values = self._read(self.inp, self.input_names, self._input_values)
         return self._state_values, self._input_values
 
@@ -290,6 +325,45 @@ class BlackBoxSubsystem:
         state, inputs = self._arguments()
         values = self._result(self._call_rhs(t, state, inputs), len(self.state_names), "rhs")
         return tuple(self._scalar(value) for value in values)
+
+    def get_state(self) -> dict[str, complex | float]:
+        """Return discrete state; continuous state is already owned by :class:`Model`."""
+        return {name: getattr(self.state, name) for name in self.discrete_state_names}
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        """Restore any subset of the registered discrete state."""
+        unknown = set(values) - set(self.discrete_state_names)
+        if unknown:
+            raise KeyError(f"unknown discrete black-box states {sorted(unknown)}")
+        for name, value in values.items():
+            current = getattr(self.state, name)
+            setattr(self.state, name, complex(value) if isinstance(current, complex) else float(value))
+
+    def start_discrete(self, t: float, continued: bool = False) -> None:
+        """Position a discrete model's clock for a fresh or continued run."""
+        if self.update_clock is None:
+            raise TypeError("this black box has no discrete update")
+        self._update_index = int(self.update_clock.start_index(t, continued))
+
+    def next_discrete_time(self) -> float:
+        """Return the next periodic state-update time."""
+        if self.update_clock is None:
+            return math.inf
+        return self.update_clock.at(self._update_index)
+
+    def sample_discrete(self, t: float) -> NDArray:
+        """Calculate but do not commit the next discrete state."""
+        if self._call_update is None:
+            raise TypeError("this black box has no discrete update")
+        state, inputs = self._arguments()
+        return self._result(self._call_update(t, state, inputs), len(self._state_names), "update")
+
+    def apply_discrete(self, values: Sequence[complex | float]) -> None:
+        """Commit one previously sampled discrete state and advance its clock."""
+        result = self._result(values, len(self._state_names), "update")
+        for name, value in zip(self._state_names, result):
+            setattr(self.state, name, self._scalar(value))
+        self._update_index += 1
 
 
 # ------------------------------------------------------------------ named states
@@ -1008,6 +1082,16 @@ class Model:
                     f"{type(sub).__name__} does not satisfy the Subsystem protocol "
                     "(needs state/inp/out, state_names, outputs_need_inputs, set_outputs, rhs)")
         self.subsystems: list[Subsystem] = list(subsystems)
+        self.discrete_updates: tuple[tuple[str, Any], ...] = tuple(
+            (name, sub) for name, sub in zip(names, self.subsystems)
+            if getattr(sub, "update_clock", None) is not None
+        )
+        for name, sub in self.discrete_updates:
+            missing = [method for method in ("start_discrete", "next_discrete_time",
+                                              "sample_discrete", "apply_discrete")
+                       if not callable(getattr(sub, method, None))]
+            if missing:
+                raise TypeError(f"{name}: periodic state update is missing {missing}")
         self.connections = dict(connections)
         self.zoh_connections = dict(zoh_connections or {})
         self._zoh_targets: dict[str, list[tuple[Any, str]]] = {}

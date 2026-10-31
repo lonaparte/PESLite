@@ -1275,6 +1275,11 @@ class _ModelGenerator:
                 self._algebraic_fields[id(record), name] = record
         for key in self.state_index.keys() | self.zoh_fields.keys():
             self._algebraic_fields.pop(key, None)
+        self._discrete_fields = {
+            (id(sub.state), field): sub.state
+            for _name, sub in getattr(self.model, "discrete_updates", ())
+            for field in sub.discrete_state_names
+        }
 
     def breaker_lines(self, branch: RLBranch, open_expression: str) -> list[str]:
         """Render the state transition implemented by ``RLBranch`` breaker methods."""
@@ -1718,6 +1723,25 @@ class _ModelGenerator:
         return [self.solver_expression(line) for line in
                 self._term_declarations(prefix, terms, lines)]
 
+    def discrete_update_assignments(self, sub) -> list[tuple[str, _Expression]]:
+        """Trace one pure discrete-state sample without committing it."""
+        def run():
+            clone = self._equation_clone(sub)
+            return tuple(clone.sample_discrete(_Expression("t", "real")))
+
+        label = self.subsystem_name.get(id(sub), type(sub).__name__)
+        try:
+            values = self._trace(run)
+        except Exception as exc:
+            raise TypeError(
+                f"C++ export: cannot lower the discrete update of subsystem {label!r} "
+                f"({type(sub).__name__}): {exc}"
+            ) from exc
+        targets = [self.value(sub.state, field) for field in sub.discrete_state_names]
+        if len(values) != len(targets):
+            raise TypeError("a discrete update changed its registered state dimension")
+        return list(zip(targets, values))
+
     def named_equation_state(self, part):
         def run():
             clone = self._equation_clone(part)
@@ -1781,7 +1805,8 @@ class _ModelGenerator:
                         tuple((record, name) for record, name, _gain in fanin))
 
     def declarations(self, persistent_fields=None) -> list[str]:
-        persistent_fields = self._algebraic_fields if persistent_fields is None else persistent_fields
+        persistent_fields = set(self._algebraic_fields if persistent_fields is None else persistent_fields)
+        persistent_fields.update(self._discrete_fields)
         lines: list[str] = []
         declared: set[str] = set()
         for sub in self.model.subsystems:
@@ -2148,9 +2173,10 @@ class _ModelGenerator:
         return self.declarations(persistent_fields) + lines
 
     def members(self, controllers=()) -> list[str]:
+        persistent = {**self._algebraic_fields, **self._discrete_fields}
         lines = [f"{_CPP_TYPES[self.record_types[key]]} {self.value(record, key[1])} = "
                  f"{_literal(getattr(record, key[1]))};"
-                 for key, record in self._algebraic_fields.items()]
+                 for key, record in persistent.items()]
         lines += [f"{_CPP_TYPES[kind]} {name} = {_literal(getattr(self.runtime.object(owner), attribute))};"
                   for name, kind, owner, attribute in self.equation_members.values()]
         for loop in self.model.algebraic_loops:
@@ -4688,8 +4714,11 @@ class _CppGenerator:
                     generator = next((item for item in generators.values()
                                       if part in (item.unit, item.unit.ctrl, item.unit.bridge,
                                                   item.unit.adc)), None)
+                    state_record = getattr(part, "state", None)
                     if id(part) in equation_states:
                         value = model.solver_expression(equation_states[id(part)][state.local_name].code)
+                    elif ((id(state_record), state.local_name) in model._discrete_fields):
+                        value = model.value(state_record, state.local_name)
                     elif statistics is not None and state.local_name.startswith("rms_"):
                         value = statistics._rms_state(state.local_name)
                     elif generator is not None:
@@ -4921,6 +4950,7 @@ class _CppGenerator:
                              else _make_unit_generator(name, unit, model))
                       for name, unit in self.system.units.items() if unit.continuous}
         generators = {**sampled, **continuous}
+        discrete_updates = tuple(getattr(self.model, "discrete_updates", ()))
         for sub in self.model.subsystems:
             if id(sub) in model.equation_bindings and id(sub) not in model.equation_references:
                 model.equation_references[id(sub)] = model._equation_clone(sub)
@@ -4928,6 +4958,24 @@ class _CppGenerator:
         state_names = self.model.state_labels()
         initial = self.model.get_initial_values().tolist()
         initialized = self._initial_values(model)
+        discrete_specs = []
+        discrete_initialization = []
+        t0 = self.p.simulation.initial.t
+        for name, subsystem in discrete_updates:
+            tag = model.prefix[id(subsystem)]
+            clock = subsystem.update_clock
+            continued = any(key == name or key.startswith(name + ".") for key in initialized)
+            index = int(clock.start_index(t0, continued))
+            index_name = f"discrete_index_{tag}"
+            next_time = f"({_number(clock.offset)} + {index_name} * {_number(clock.period)})"
+            assignments = model.discrete_update_assignments(subsystem)
+            discrete_specs.append((tag, index_name, index, next_time, assignments))
+            for field in subsystem.discrete_state_names:
+                key = f"{name}.{field}"
+                if key in initialized:
+                    discrete_initialization.append(
+                        f"{model.value(subsystem.state, field)} = {_literal(initialized[key])};"
+                    )
         state_names_by_record = {(id(sub.state), field): f"{name}.{field}"
                                  for name, sub in zip(self.model.names, self.model.subsystems)
                                  for field in sub.state_names}
@@ -4982,6 +5030,8 @@ class _CppGenerator:
             commutation_transitions.append(model.trace_transition(sub, "commutate"))
         raw_projection_call = "" if diode_conduction else projection_call
         member_lines = model.members(generators.values())
+        member_lines.extend(f"long long {index_name} = {index};"
+                            for _tag, index_name, index, _next, _assignments in discrete_specs)
         for generator in (*sampled.values(), *(item for item in continuous.values() if item.ctrl is None)):
             member_lines.extend(generator.members())
         for generator in generators.values():
@@ -5017,11 +5067,37 @@ class _CppGenerator:
         methods += [method for generator in continuous.values()
                     for method in (generator.sense_method(), generator.actuate_method(),
                                    generator.protection_method(), generator.adc_methods())]
+        if discrete_specs:
+            declarations = []
+            commits = []
+            for tag, index_name, _index, next_time, assignments in discrete_specs:
+                due = f"discrete_due_{tag}"
+                declarations.append(f"const bool {due} = {next_time} <= t + time_eps;")
+                for assignment_index, (target, value) in enumerate(assignments):
+                    temporary = f"discrete_next_{tag}_{assignment_index}"
+                    declarations.append(
+                        f"const auto {temporary} = {due} ? ({value.code}) : ({target});"
+                    )
+                    commits.append(f"if ({due}) {target} = {temporary};")
+                commits += [f"if ({due}) ++{index_name};",
+                            f"changed = {due} || changed;"]
+            methods.append("\n".join([
+                "bool update_discrete(double t) {",
+                "    bool changed = false;",
+                *("    " + line for line in declarations),
+                *("    " + line for line in commits),
+                "    return changed;",
+                "}",
+            ]))
         energy_method, energy_columns = self._energy_method(model)
         if energy_method:
             methods.append(energy_method)
         methods_text = "\n\n    ".join(method.replace("\n", "\n    ") for method in methods if method)
-        next_units = ", ".join(f"next_{generator.tag}()" for generator in sampled.values())
+        circuit_times = [f"next_{generator.tag}()" for generator in sampled.values()]
+        circuit_times.extend(next_time for _tag, _index_name, _index, next_time, _assignments
+                             in discrete_specs)
+        next_circuit = (f"circuit_boundary = std::min({{{', '.join(circuit_times)}}});"
+                        if circuit_times else "")
         # A continuous unit's own clock and owned ADC timing sample only that unit.
         clocks = {name: [generator._clock_time(), *(
             generator._adc_next_values() if generator.adc is not None and generator.adc.clocked
@@ -5512,6 +5588,7 @@ public:
 
     explicit Simulator(RuntimeParameters configured = {{}}) : parameters(std::move(configured)) {{
         {self.runtime.validation()}
+        {' '.join(discrete_initialization)}
         {chr(10).join(connection_initialization)}
         {'DiodeConduction initial_conduction(*this); initial_conduction.synchronize(' + _number(self.p.simulation.initial.t) + ');' if conduction_sync else ''}
         {projection_call}
@@ -5593,7 +5670,7 @@ public:
         }};
         while (true) {{
             double circuit_boundary = std::numeric_limits<double>::infinity();
-            {'circuit_boundary = std::min({' + next_units + '});' if next_units else ''}
+            {next_circuit}
             if (action_index < action_times.size())
                 circuit_boundary = std::min(circuit_boundary, action_times[action_index]);
             const double physical_boundary = {'std::min({circuit_boundary, ' + ', '.join(value for values in clocks.values() for value in values) + '})' if clocks else 'circuit_boundary'};
@@ -5615,6 +5692,7 @@ public:
                     ++action_index;
                 }}
                 if (actions_applied) sync(t);
+                {'if (update_discrete(t)) sync(t);' if discrete_specs else ''}
                 {conduction_sync}
                 bool trip_now = false;
                 {' '.join(protect)}

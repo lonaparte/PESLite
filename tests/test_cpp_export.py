@@ -17,6 +17,7 @@ import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import from_dict
 from peslite.components import Bag, Element, Terminal, register_element_type
+from peslite.solver import BlackBoxSubsystem
 from peslite.solver.simulation import convert_main
 from test_measurement_network import load_case
 
@@ -89,6 +90,76 @@ class _ConditionalElement(Element):
     def signals(self):
         return {f"{self.name}.i": self.model.out.i,
                 f"{self.name}.i_mag": abs(self.model.out.i)}
+
+
+@register_element_type
+class _BlackBoxElement(Element):
+    type = "test_black_box"
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        decay: float
+        initial: float
+        type: str = "test_black_box"
+
+    def __init__(self, name, cfg, buses, p):
+        self.name = name
+        self.model = BlackBoxSubsystem(
+            lambda _t, state, _inputs: state,
+            inputs=(),
+            outputs=("y",),
+            state={"x": cfg.initial},
+            rhs=lambda _t, state, _inputs: -cfg.decay * state,
+            feedthrough=(),
+        )
+
+    def subsystems(self):
+        return {self.name: self.model}
+
+    def connections(self):
+        return {}
+
+    def terminals(self):
+        return ()
+
+    def signals(self):
+        return {f"{self.name}.y": self.model.out.y}
+
+
+@register_element_type
+class _DiscreteBlackBoxElement(Element):
+    type = "test_discrete_black_box"
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: float
+        increment: float
+        initial: float
+        type: str = "test_discrete_black_box"
+
+    def __init__(self, name, cfg, buses, p):
+        self.name = name
+        self.model = BlackBoxSubsystem(
+            lambda _t, state, _inputs: state,
+            inputs=(),
+            outputs=("y",),
+            state={"hidden": cfg.initial},
+            update=lambda _t, state, _inputs: state + cfg.increment,
+            period=cfg.period,
+            feedthrough=(),
+        )
+
+    def subsystems(self):
+        return {self.name: self.model}
+
+    def connections(self):
+        return {}
+
+    def terminals(self):
+        return ()
+
+    def signals(self):
+        return {f"{self.name}.y": self.model.out.y}
 
 
 def _compiler() -> str | None:
@@ -967,6 +1038,75 @@ def test_generated_cpp_runs_custom_cable_equations(tmp_path):
     actual_plant = _final_csv(cpp_out / "plant.csv")
     assert actual_plant.keys() == expected_plant.keys()
     assert {"cable1.i1_a", "cable1.i2_a"} <= actual_plant.keys()
+
+
+def test_generated_cpp_runs_black_box_outputs_and_peslite_state_equations(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = from_dict({
+        "base": {"s_base": 1.0},
+        "elements": {
+            "model": {"type": "test_black_box", "decay": 4.0, "initial": 3.0},
+        },
+        "simulation": {
+            "t_end": 0.02,
+            "solver": {"type": "fixed", "method": "rk4", "dt": 1.0e-4,
+                       "linearisations": 0},
+            "output": {"period": 1.0e-3, "signals": True},
+            "energy_check": "off",
+        },
+    })
+
+    source, cpp_out, python_out = _run_generated(params, tmp_path / "black-box", compiler)
+
+    cpp_state = _final_csv(cpp_out / "states.csv")
+    python_state = _final_csv(python_out / "states.csv")
+    assert cpp_state["model.x"] == pytest.approx(python_state["model.x"], rel=2e-10)
+    assert cpp_state["model.x"] == pytest.approx(3.0 * np.exp(-0.08), rel=1e-10)
+    cpp_plant = _final_csv(cpp_out / "plant.csv")
+    python_plant = _final_csv(python_out / "plant.csv")
+    assert cpp_plant["model.y"] == pytest.approx(python_plant["model.y"], rel=2e-10)
+    text = source.read_text(encoding="utf-8")
+    assert "dy[0]" in text and "model.y" in text
+
+
+@pytest.mark.parametrize(("initial", "t_end", "expected"), [
+    ({}, 2.1e-3, 3.0),
+    ({"t": 2.0e-3, "states": {"model.hidden": 7.0}}, 3.1e-3, 8.0),
+])
+def test_generated_cpp_runs_discrete_black_box_state_updates(tmp_path, initial, t_end, expected):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = from_dict({
+        "base": {"s_base": 1.0},
+        "elements": {
+            "model": {"type": "test_discrete_black_box", "period": 1.0e-3,
+                      "increment": 1.0, "initial": 0.0},
+        },
+        "simulation": {
+            "t_end": t_end,
+            "initial": initial,
+            "solver": {"type": "fixed", "method": "rk4", "dt": 1.0e-4,
+                       "linearisations": 0},
+            "output": {"period": 1.0e-3, "signals": True},
+            "energy_check": "off",
+        },
+    })
+
+    source, cpp_out, python_out = _run_generated(
+        params, tmp_path / f"discrete-black-box-{expected:g}", compiler
+    )
+
+    cpp_state = _final_csv(cpp_out / "states.csv")
+    python_state = _final_csv(python_out / "states.csv")
+    assert cpp_state["model.hidden"] == pytest.approx(expected)
+    assert cpp_state["model.hidden"] == pytest.approx(python_state["model.hidden"])
+    cpp_plant = _final_csv(cpp_out / "plant.csv")
+    python_plant = _final_csv(python_out / "plant.csv")
+    assert cpp_plant["model.y"] == pytest.approx(python_plant["model.y"])
+    assert "update_discrete" in source.read_text(encoding="utf-8")
 
 
 def test_generic_cpp_fallback_lowers_custom_equations_and_state_branches(tmp_path):

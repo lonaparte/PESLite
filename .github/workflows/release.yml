@@ -71,11 +71,36 @@ jobs:
         run: python -m pytest --run-full tests/reference/test_motulator.py
 
 
+  onnx-test:
+    name: Test ONNX black-box models
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install ONNX test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[test,onnx]"
+
+      - name: Run ONNX compatibility tests
+        run: python -m pytest --run-full tests/test_black_box_onnx.py
+
+
   build:
     name: Build distribution
     needs:
       - test
       - reference-test
+      - onnx-test
     runs-on: ubuntu-24.04
 
     steps:
