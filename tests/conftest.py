@@ -1,4 +1,4 @@
-"""Import the package from ``src/`` and provide shared issue #2 cases."""
+"""Import the package from ``src/`` and provide shared test cases."""
 
 import copy
 import sys
@@ -15,6 +15,24 @@ sys.path.insert(0, str(ROOT / "src"))
 import peslite  # noqa: E402
 
 QUIET = {"simulation.solver.linearisations": 0, "simulation.progress.enable": 0}
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-full",
+        action="store_true",
+        help="include the full test suite",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Run fast tests by default; the explicit switch includes the full suite."""
+    if config.getoption("--run-full"):
+        return
+    selected = [item for item in items if "full" not in item.keywords]
+    deselected = [item for item in items if "full" in item.keywords]
+    items[:] = selected
+    config.hook.pytest_deselected(items=deselected)
 
 
 @pytest.fixture
@@ -40,11 +58,11 @@ CASE = {
         "pwm": {"f_sw": 20000.0, "modulation_limit": 0.95},
         "bridge": {"model": "pwm_averaging"},
         "ctrl": {"type": "gfl", "loops": {
-            "pll": {"type": "srf_pll", "period": 5e-5, "kp_pu": 20.0, "ki_pu": 1200.0},
-            "cc": {"type": "dq_current_pi", "period": 5e-5, "bandwidth": 200.0},
-            "dvc": {"type": "dc_voltage_control", "period": 5e-5, "kp": 0.8,
-                    "ki": 90.0, "minimum": 0.0, "maximum": 1.15,
-                    "feedforward": 0.9, "output_polarity": -1.0},
+            "SRFPLL": {"period": 5e-5, "kp_pu": 20.0, "ki_pu": 1200.0},
+            "CurrentLoop": {"period": 5e-5, "bandwidth": 200.0},
+            "DCVoltageControl": {"period": 5e-5, "kp": 0.8, "ki": 90.0,
+                                 "minimum": 0.0, "maximum": 1.15,
+                                 "feedforward": 0.9, "output_polarity": -1.0},
         }},
     }},
     "simulation": {"t_end": 0.004, "solver": {"dt": 12.5e-6, "linearisations": 0}},

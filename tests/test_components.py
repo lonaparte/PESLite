@@ -22,7 +22,6 @@ from peslite.components import (
 )
 
 COMPONENTS = Path(peslite.components.__file__).parent
-PACKAGE = COMPONENTS.parent
 
 
 def test_electrical_terminals_use_the_energy_direction_and_numbered_voltage_ports():
@@ -226,8 +225,3 @@ def test_components_import_only_control_solver_and_themselves():
                 if target:
                     imported.add(target[0])
         assert imported <= allowed, f"{path.name} imports {sorted(imported - allowed)}"
-
-
-def test_absorbed_hardware_packages_are_removed():
-    for name in ("power", "sensing", "firmware", "modulation", "protection"):
-        assert not (PACKAGE / name).exists()

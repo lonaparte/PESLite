@@ -1,4 +1,4 @@
-"""Issue #1: the controller is a closed sampled block; protection belongs to its converter unit."""
+"""Sampled controller, converter lifecycle and protection boundaries."""
 
 import cmath
 from dataclasses import replace

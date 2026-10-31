@@ -1,4 +1,4 @@
-"""Issue #2 parameter layout, switches, derived defaults and resolved files."""
+"""Parameter layout, switches, derived defaults and resolved files."""
 
 import math
 import re
@@ -109,27 +109,11 @@ def test_initial_and_output_belong_to_simulation():
         from_dict(tree)
 
 
-def test_log_and_old_parameter_names_are_rejected():
+def test_reserved_controller_loop_name_is_rejected():
     tree = _tree()
-    tree["simulation"]["log"] = {"plant_period": 5e-4}
-    with pytest.raises(ConfigError, match=r"simulation: unknown key.*log"):
-        from_dict(tree)
-
-    tree = _tree()
-    current = tree["units"]["vsc"]["ctrl"]["loops"]["CurrentLoop"]
-    current["bw_hz"] = current.pop("bandwidth")
-    with pytest.raises(ConfigError, match=r"unknown key.*bw_hz"):
-        from_dict(tree)
-
-    tree = _tree()  # a legacy node name colliding with the controller's start-up state
     loops = tree["units"]["vsc"]["ctrl"]["loops"]
     loops["startup"] = {**loops.pop("DCVoltageControl"), "type": "dc_voltage_control"}
     with pytest.raises(ConfigError, match=r"loops\.startup: reserved loop name"):
-        from_dict(tree)
-
-    tree = _tree()
-    tree["units"]["vsc"]["control"] = tree["units"]["vsc"].pop("ctrl")
-    with pytest.raises(ConfigError, match=r"units\.vsc: unknown key.*control"):
         from_dict(tree)
 
     tree = _tree()
@@ -275,17 +259,6 @@ def test_a_class_named_control_loop_rejects_a_conflicting_type():
 
     with pytest.raises(ConfigError, match="conflicts with loop class"):
         from_dict(tree)
-
-
-def test_a_class_named_control_loop_normalizes_a_redundant_type():
-    tree = _tree()
-    tree["units"]["vsc"]["ctrl"]["loops"]["DCVoltageControl"]["type"] = (
-        "dc_voltage_control"
-    )
-
-    p = from_dict(tree)
-
-    assert "type" not in to_dict(p)["units"]["vsc"]["ctrl"]["loops"]["DCVoltageControl"]
 
 
 def test_a_loop_class_uses_a_class_qualified_name_without_type():

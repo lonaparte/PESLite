@@ -1,4 +1,4 @@
-"""Protection runtime behavior and output semantics from the issue #2 reference tests."""
+"""Protection runtime behavior and output semantics."""
 
 import peslite
 from dataclasses import replace

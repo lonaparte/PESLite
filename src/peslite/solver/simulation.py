@@ -120,28 +120,63 @@ def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
                       ctrl_logs: Mapping[str, Mapping[str, float]],
                       ctrl_names: Mapping[str, Iterable[str]] | None = None) -> dict[str, float]:
     """Convert one raw plant snapshot into one public, real-valued output row."""
-    row: dict[str, float] = {"t": t}
-    for key, value in plant.items():
-        if isinstance(value, complex):  # signals are scalars; np.complex128 is a complex
-            for name, phase_value in zip(_signal_names(key, 3), complex2abc(complex(value))):
-                row[name] = float(phase_value)
-        else:
-            row[key] = float(value)
-    # the units' DC quantities, then the source angles, follow in configuration order
-    for name, _unit in _unit_items(params.units):
-        for what in ("u_dc", "i_dc"):
-            key = f"{name}.{what}"
-            if key in plant:
-                row[key] = row.pop(key)
-    for name in params.sources:
-        key = f"{name}.angle"
-        if key in plant:
-            row[key] = row.pop(key)
     names_by_unit = ctrl_names or {unit: log for unit, log in ctrl_logs.items()}
-    for unit, names in names_by_unit.items():
-        log = ctrl_logs.get(unit, {})
-        row.update({f"{unit}.{key}": float(log.get(key, math.nan)) for key in names})
-    return row
+    rows = _PlantRows(params, plant, names_by_unit)
+    return dict(zip(rows.columns, rows.values(t, plant, ctrl_logs)))
+
+
+class _PlantRows:
+    """Compile one fixed signal schema into ordered numeric rows."""
+
+    def __init__(self, params: Params, sample: Mapping[str, Any],
+                 ctrl_names: Mapping[str, Iterable[str]]) -> None:
+        columns = {"t": None}
+        for key, value in sample.items():
+            for name in _signal_names(key, 3) if isinstance(value, complex) else (key,):
+                columns[name] = None
+        # The units' DC quantities, then the source angles, follow in configuration order.
+        for name, _unit in _unit_items(params.units):
+            for what in ("u_dc", "i_dc"):
+                key = f"{name}.{what}"
+                if key in columns:
+                    columns[key] = columns.pop(key)
+        for name in params.sources:
+            key = f"{name}.angle"
+            if key in columns:
+                columns[key] = columns.pop(key)
+        for unit, names in ctrl_names.items():
+            for name in names:
+                columns[f"{unit}.{name}"] = None
+        self.columns = tuple(columns)
+        self.source_keys = tuple(sample)
+        positions = {name: index for index, name in enumerate(self.columns)}
+        self.sources = tuple(
+            (key, True, tuple(positions[name] for name in _signal_names(key, 3)))
+            if isinstance(value, complex) else (key, False, (positions[key],))
+            for key, value in sample.items()
+        )
+        self.controls = tuple(
+            (unit, name, positions[f"{unit}.{name}"])
+            for unit, names in ctrl_names.items() for name in names
+        )
+
+    def values(self, t: float, plant: Mapping[str, Any],
+               ctrl_logs: Mapping[str, Mapping[str, float]]) -> list[float]:
+        if tuple(plant) != self.source_keys:
+            raise RuntimeError("the set of recorded columns changed during the run")
+        row = [0.0] * len(self.columns)
+        row[0] = t
+        for key, is_complex, indices in self.sources:
+            value = plant[key]
+            complex_value = isinstance(value, complex)
+            if complex_value != is_complex:
+                raise RuntimeError("the representation of a recorded signal changed during the run")
+            values = complex2abc(complex(value)) if complex_value else (value,)
+            for index, item in zip(indices, values):
+                row[index] = float(item)
+        for unit, name, index in self.controls:
+            row[index] = float(ctrl_logs.get(unit, {}).get(name, math.nan))
+        return row
 
 
 # ------------------------------------------------------------------ what a run produces
@@ -208,23 +243,40 @@ class SimulationResult:
 class _CSVTable:
     """A fixed-width numeric table flushed to CSV every ``batch_rows`` rows."""
 
-    def __init__(self, path: Path, batch_rows: int = 1000) -> None:
+    def __init__(self, path: Path, batch_rows: int = 1000,
+                 columns: Iterable[str] | None = None) -> None:
         self.path = path
         self.batch_rows = batch_rows
-        self.keys: list[str] | None = None
+        self.keys: list[str] | None = list(columns) if columns is not None else None
         self.n_rows = 0
         self._pending: list[list[float]] = []
         self._fh: Any = None
 
-    def append(self, row: Mapping[str, float]) -> None:
-        if self.keys is None:
-            self.keys = list(row)
+    def _open(self) -> None:
+        if self._fh is None:
+            assert self.keys is not None
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._fh = self.path.open("w", newline="")
             self._fh.write(",".join(self.keys) + "\n")
+
+    def append(self, row: Mapping[str, float]) -> None:
+        if self.keys is None:
+            self.keys = list(row)
         elif list(row) != self.keys:
             raise RuntimeError("the set of recorded columns changed during the run")
-        self._pending.append(list(row.values()))
+        self.append_values(row.values())
+
+    def append_values(self, values: Iterable[float]) -> None:
+        """Append values already ordered by the fixed table columns."""
+        if self.keys is None:
+            raise RuntimeError("CSV columns must be fixed before ordered values are appended")
+        row = values if isinstance(values, list) else list(values)
+        if len(row) != len(self.keys):
+            raise RuntimeError(
+                f"CSV row has {len(row)} values for {len(self.keys)} columns"
+            )
+        self._open()
+        self._pending.append(row)
         self.n_rows += 1
         if len(self._pending) == self.batch_rows:
             self.flush()
@@ -317,7 +369,8 @@ class Recorder:
                  ctrl_names: Mapping[str, Iterable[str]] | None = None,
                  keep_states: bool = True,
                  keep_signals: bool = False, keep_energy: bool = True,
-                 batch_rows: int = 1000, name: str = "simulation") -> None:
+                 batch_rows: int = 1000, name: str = "simulation",
+                 state_columns: Iterable[str] = ()) -> None:
         self.params = params
         self.out_dir = out_dir
         self.keep_states = keep_states
@@ -326,6 +379,8 @@ class Recorder:
         self.last_ctrl_log: dict[str, dict[str, float]] = {}
         self.ctrl_names = {unit: tuple(names) for unit, names in (ctrl_names or {}).items()}
         self._batch_rows = batch_rows
+        self._state_columns = ("t", *state_columns)
+        self._plant_rows: _PlantRows | None = None
         if out_dir is not None:
             out_dir.mkdir(parents=True, exist_ok=True)
             names = ["states.csv", "plant.csv", "energy.csv", "summary.json", "simulation.pes",
@@ -336,12 +391,12 @@ class Recorder:
         self._plant = (_CSVTable(out_dir / "plant.csv", batch_rows)
                        if keep_signals and out_dir is not None else None)
         self._ctrl: dict[str, _CSVTable] = {}
-        self._states = (_CSVTable(out_dir / "states.csv", batch_rows)
+        self._states = (_CSVTable(out_dir / "states.csv", batch_rows, self._state_columns)
                         if keep_states and out_dir is not None else None)
         self._energy = (_CSVTable(out_dir / "energy.csv", batch_rows)
                         if keep_energy and out_dir is not None else None)
         self._last_t: float | None = None
-        self._final_states: dict[str, float] = {}
+        self._final_state_values: list[float] = []
 
     @property
     def last_t(self) -> float | None:
@@ -352,10 +407,10 @@ class Recorder:
             self._energy.append({"t": t, **columns})
 
     def state_row(self, t: float, row: dict[str, float]) -> None:
-        full = {"t": t, **row}
+        full = [t, *row.values()]
         if self._states is not None:
-            self._states.append(full)
-        self._final_states = full
+            self._states.append_values(full)
+        self._final_state_values = full
 
     def snapshot(self, t: float, states: dict[str, float] | None = None) -> None:
         """Record the physical time/state independently of optional output calculations."""
@@ -365,8 +420,12 @@ class Recorder:
 
     def plant_snapshot(self, t: float, signals: dict[str, Any]) -> None:
         if self._plant is not None:
-            self._plant.append(_plant_output_row(
-                self.params, t, signals, self.last_ctrl_log, self.ctrl_names))
+            if self._plant_rows is None:
+                self._plant_rows = _PlantRows(self.params, signals, self.ctrl_names)
+                self._plant.keys = list(self._plant_rows.columns)
+            self._plant.append_values(
+                self._plant_rows.values(t, signals, self.last_ctrl_log)
+            )
 
     def ctrl_sample(self, unit: str, t: float,
                     log: Mapping[str, float] | Callable[[], Mapping[str, float] | None], *,
@@ -395,8 +454,10 @@ class Recorder:
         if not record or not self.keep_signals or self.out_dir is None or not names:
             return
         if unit not in self._ctrl:
-            self._ctrl[unit] = _CSVTable(self.out_dir / f"ctrl.{unit}.csv", self._batch_rows)
-        self._ctrl[unit].append({"t": t, **values})
+            self._ctrl[unit] = _CSVTable(
+                self.out_dir / f"ctrl.{unit}.csv", self._batch_rows, ("t", *names),
+            )
+        self._ctrl[unit].append_values([t, *values.values()])
 
     def finish(self) -> _RecordedOutput:
         tables = [table for table in (self._plant, self._states, self._energy) if table is not None]
@@ -408,7 +469,9 @@ class Recorder:
             ctrl_tables=self._ctrl,
             states_table=self._states,
             energy_table=self._energy,
-            final_states={key: float(value) for key, value in self._final_states.items()},
+            final_states={key: float(value) for key, value in zip(
+                self._state_columns, self._final_state_values,
+            )},
             t_stop=self._last_t or 0.0,
         )
 
@@ -739,8 +802,10 @@ class Simulation:
         for name, unit in system.units.items():
             bridge_prefix = f"{name}.{unit.bridge.state_prefix}"
             self._states.load(values, [f"{name}.ctrl", bridge_prefix])
-            # Continued: any of the unit's registered states is given.
-            if not values.keys().isdisjoint(self._states.read(prefix for prefix, _ in unit.state_parts())):
+            # Restored controller or PWM state means this timer point was already processed.
+            # Plant initial conditions alone still describe a fresh run.
+            timer_states = self._states.read((f"{name}.ctrl", bridge_prefix))
+            if not values.keys().isdisjoint(timer_states):
                 self._continued.add(name)
             if unit.adc is not None and (unit.adc.accumulating or unit.adc.independent):
                 self._states.load(values, [f"{name}.meas"])
@@ -847,7 +912,8 @@ class Simulation:
                                 or bool(log_names.intersection(value_names)))))
         rec = Recorder(p, output_dir, ctrl_names, keep_states=output.states,
                        keep_signals=output.signals, keep_energy=output.energy,
-                       batch_rows=p.simulation.solver.write_length, name=name)
+                       batch_rows=p.simulation.solver.write_length, name=name,
+                       state_columns=self._states.columns)
         n_log = max(0, math.ceil(t_start / log_period - 1e-9))
         actions = deque(action for action in self._actions() if action[0] > t_start + TIME_EPS)
         next_report = t_start + progress_every if progress_every > 0 else math.inf

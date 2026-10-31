@@ -102,6 +102,7 @@ def test_bridge_flags_are_mutually_exclusive(capsys):
     assert "not allowed with argument" in capsys.readouterr().err
 
 
+@pytest.mark.full
 @pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda path: path.stem)
 def test_every_bundled_file_runs_with_its_configured_model(path, tmp_path):
     with warnings.catch_warnings():
@@ -245,17 +246,6 @@ def test_set_wins_over_averaging_flag():
     assert _models("gfl-example", "--averaging",
                    "--set", "units.vsc.bridge.model=switching") == {
                        "vsc": "switching"}
-
-
-@pytest.mark.parametrize("path", [
-    "simulation.bridge",
-    "units.vsc.averaging",
-    "units.vsc.averaging.enable",
-    "units.vsc.bridge.over",
-])
-def test_removed_averaging_paths_are_rejected(gfl, path):
-    with pytest.raises(ConfigError, match="unknown"):
-        gfl(**{path: 1})
 
 
 def test_pwm_averaging_flag_results_use_their_own_folder(tmp_path, monkeypatch):

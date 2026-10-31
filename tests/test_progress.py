@@ -1,4 +1,4 @@
-"""Issue #3: progress lines and the quantities they watch."""
+"""Progress lines and the quantities they watch."""
 
 import io
 import re

@@ -23,6 +23,8 @@ from peslite.solver.linearization import (active_coordinates, coordinate_differe
                                          linearize_loop)
 from peslite.solver.simulation import SystemLoop
 
+pytestmark = pytest.mark.full
+
 
 @pytest.fixture(scope="module")
 def ac_parameters():
