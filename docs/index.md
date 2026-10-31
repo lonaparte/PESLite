@@ -63,6 +63,7 @@ See [Getting Started](Getting-Started.md) to create a case and inspect its resul
 - [Bridge and PWM](Bridge-and-PWM.md)
 - [Voltage-Source Converters](Voltage-Source-Converters.md)
 - [DC converters and WPT](DC-Converters-and-WPT.md)
+- [Black-box Models](Black-Box-Models.md)
 - [Architecture](Architecture.md)
 - [Plotting](Plotting.md)
 - [Online Stability Analysis](Online-Stability-Analysis.md)

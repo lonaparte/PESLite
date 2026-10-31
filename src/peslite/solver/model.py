@@ -22,14 +22,16 @@ import re
 import weakref
 from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Any, ClassVar, Iterable, Mapping, Protocol, Sequence, runtime_checkable
+from types import SimpleNamespace
+from typing import Any, Callable, ClassVar, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
 
 from . import energy as _energy
 
-__all__ = ["ConfigError", "LocatedZero", "Bag", "Empty", "OutputMethod", "Subsystem", "Model",
+__all__ = ["ConfigError", "LocatedZero", "Bag", "Empty", "OutputMethod", "Subsystem",
+           "BlackBoxSubsystem", "Model",
            "GroupPlan", "Stateful", "StateRegistry", "join", "gather", "scatter", "flatten", "resolve",
            "expand_aliases", "assign"]
 
@@ -156,6 +158,138 @@ class Subsystem(Protocol):
 
     def rhs(self, t: float) -> Sequence[complex | float]:
         """Time derivatives of the states, in ``state_names`` order."""
+
+
+def _black_box_record(spec: Sequence[str] | Mapping[str, Any], label: str) -> tuple[tuple[str, ...], Any]:
+    """Build one named signal record from names or initial values."""
+    if isinstance(spec, Mapping):
+        entries = tuple(spec.items())
+    else:
+        if isinstance(spec, (str, bytes)):
+            raise TypeError(f"{label} must be a sequence of names or a mapping of initial values")
+        entries = tuple((name, 0.0) for name in spec)
+    names = tuple(name for name, _value in entries)
+    if any(not isinstance(name, str) or not name for name in names):
+        raise ValueError(f"{label} names must be nonempty strings")
+    if len(set(names)) != len(names):
+        raise ValueError(f"{label} names must be unique")
+    record = SimpleNamespace()
+    for name, value in entries:
+        if not isinstance(value, numbers.Number):
+            raise TypeError(f"{label} field {name!r} must have a scalar numeric initial value")
+        setattr(record, name, value)
+    return names, record
+
+
+def _black_box_values(record: Any, names: Sequence[str]) -> NDArray:
+    """Allocate a real or complex floating vector for a fixed named record."""
+    values = [getattr(record, name) for name in names]
+    dtype = complex if any(np.iscomplexobj(value) for value in values) else float
+    return np.asarray(values, dtype=dtype)
+
+
+class BlackBoxSubsystem:
+    """Adapt array-valued callables to the ordinary continuous :class:`Subsystem` protocol.
+
+    ``inputs`` and ``outputs`` are ordered names or mappings to initial scalar values. With no
+    ``state``, ``output`` is called as ``output(t, inputs)`` and the subsystem is stateless. A
+    stateful model supplies initial values as a mapping, or a vector whose entries are registered
+    as ``state_0``, ``state_1`` and so on; ``output`` and ``rhs`` are then called as
+    ``function(t, state, inputs)``. PESLite owns and passes the state on every evaluation, so the
+    callables must not keep hidden dynamic state.
+
+    The callables accept and return scalar or one-dimensional array-like values. ``feedthrough``
+    names the current inputs read by ``output`` and defaults to all inputs. The declaration becomes
+    an ordinary :class:`OutputMethod`, so dependency sorting and algebraic-loop handling remain in
+    :class:`Model`.
+    """
+
+    def __init__(
+        self,
+        output: Callable[..., Any],
+        *,
+        inputs: Sequence[str] | Mapping[str, Any],
+        outputs: Sequence[str] | Mapping[str, Any],
+        state: NDArray | Sequence[complex | float] | Mapping[str, complex | float] | None = None,
+        rhs: Callable[..., Any] | None = None,
+        feedthrough: Sequence[str] | None = None,
+    ) -> None:
+        if not callable(output):
+            raise TypeError("output must be callable")
+        self.input_names, self.inp = _black_box_record(inputs, "inputs")
+        self.output_names, self.out = _black_box_record(outputs, "outputs")
+        if not self.output_names:
+            raise ValueError("outputs must contain at least one name")
+
+        if state is None:
+            state_values: Mapping[str, complex | float] = {}
+        elif isinstance(state, Mapping):
+            state_values = state
+        else:
+            if isinstance(state, (str, bytes)):
+                raise TypeError("state must be a numeric sequence or a mapping of initial values")
+            state_values = {f"state_{index}": value for index, value in enumerate(state)}
+        self.state_names, self.state = _black_box_record(state_values, "state")
+        if self.state_names:
+            if not callable(rhs):
+                raise TypeError("a stateful black box requires a callable rhs")
+            self._call_output = lambda t, x, u: output(t, x, u)
+            self._call_rhs = lambda t, x, u: rhs(t, x, u)
+        else:
+            if rhs is not None:
+                raise TypeError("a stateless black box does not use rhs")
+            self._call_output = lambda t, _x, u: output(t, u)
+            self._call_rhs = None
+
+        dependencies = self.input_names if feedthrough is None else tuple(feedthrough)
+        if len(set(dependencies)) != len(dependencies):
+            raise ValueError("feedthrough input names must be unique")
+        unknown = set(dependencies) - set(self.input_names)
+        if unknown:
+            raise ValueError(f"feedthrough contains unknown inputs {sorted(unknown)}")
+        self.outputs_need_inputs = bool(dependencies)
+        self.output_stages = (OutputMethod("set_outputs", tuple(dependencies), self.output_names),)
+
+        self._input_values = _black_box_values(self.inp, self.input_names)
+        self._state_values = _black_box_values(self.state, self.state_names)
+
+    @staticmethod
+    def _result(values: Any, size: int, label: str) -> NDArray:
+        result = np.asarray(values).reshape(-1)
+        if result.size != size:
+            raise ValueError(f"black-box {label} returned {result.size} values; expected {size}")
+        return result
+
+    @staticmethod
+    def _scalar(value: Any) -> Any:
+        return value.item() if isinstance(value, np.generic) else value
+
+    @staticmethod
+    def _read(record: Any, names: Sequence[str], values: NDArray) -> NDArray:
+        for index, name in enumerate(names):
+            value = getattr(record, name)
+            if values.dtype.kind != "c" and np.iscomplexobj(value):
+                values = values.astype(complex)
+            values[index] = value
+        return values
+
+    def _arguments(self) -> tuple[NDArray, NDArray]:
+        self._state_values = self._read(self.state, self.state_names, self._state_values)
+        self._input_values = self._read(self.inp, self.input_names, self._input_values)
+        return self._state_values, self._input_values
+
+    def set_outputs(self, t: float) -> None:
+        state, inputs = self._arguments()
+        values = self._result(self._call_output(t, state, inputs), len(self.output_names), "output")
+        for name, value in zip(self.output_names, values):
+            setattr(self.out, name, self._scalar(value))
+
+    def rhs(self, t: float) -> Sequence[complex | float]:
+        if self._call_rhs is None:
+            return ()
+        state, inputs = self._arguments()
+        values = self._result(self._call_rhs(t, state, inputs), len(self.state_names), "rhs")
+        return tuple(self._scalar(value) for value in values)
 
 
 # ------------------------------------------------------------------ named states
