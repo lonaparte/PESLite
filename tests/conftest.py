@@ -19,18 +19,18 @@ QUIET = {"simulation.solver.linearisations": 0, "simulation.progress.enable": 0}
 
 def pytest_addoption(parser):
     parser.addoption(
-        "--run-slow",
+        "--run-full",
         action="store_true",
-        help="include compiler, external-reference and long numerical tests",
+        help="include the full test suite",
     )
 
 
 def pytest_collection_modifyitems(config, items):
-    """Keep the default suite short while retaining one explicit full-suite switch."""
-    if config.getoption("--run-slow"):
+    """Run fast tests by default; the explicit switch includes the full suite."""
+    if config.getoption("--run-full"):
         return
-    selected = [item for item in items if "slow" not in item.keywords]
-    deselected = [item for item in items if "slow" in item.keywords]
+    selected = [item for item in items if "full" not in item.keywords]
+    deselected = [item for item in items if "full" in item.keywords]
     items[:] = selected
     config.hook.pytest_deselected(items=deselected)
 

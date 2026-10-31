@@ -102,7 +102,7 @@ def test_bridge_flags_are_mutually_exclusive(capsys):
     assert "not allowed with argument" in capsys.readouterr().err
 
 
-@pytest.mark.slow
+@pytest.mark.full
 @pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda path: path.stem)
 def test_every_bundled_file_runs_with_its_configured_model(path, tmp_path):
     with warnings.catch_warnings():

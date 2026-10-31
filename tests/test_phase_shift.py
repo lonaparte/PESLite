@@ -11,7 +11,7 @@ from peslite.components.pwm import PhaseShiftModulator, PulseSequence, phase_shi
 
 from phase_shift_reference import level as reference_level, waveform
 
-pytestmark = pytest.mark.slow
+pytestmark = pytest.mark.full
 
 
 def _phase_modulator(frequency, update):
@@ -77,7 +77,7 @@ def test_random_register_sequences_match_time_stepped_reference(pulse):
                 registers = [float(rng.choice([rng.uniform(0.0, 1.0), 1.0, 0.0],
                                               p=[0.8, 0.15, 0.05])),
                              float(rng.uniform(-math.pi, math.pi)),
-                             f_nominal * float(rng.uniform(0.9, 1.1)),
+                             f_nominal if pulse else f_nominal * float(rng.uniform(0.9, 1.1)),
                              int(rng.choice([0, 1, 3, 4], p=[0.55, 0.15, 0.1, 0.2]))]
             loads.append((t, tuple(registers)))
             t += load
@@ -92,16 +92,13 @@ def test_random_register_sequences_match_time_stepped_reference(pulse):
     assert mismatches == 0
 
 
-def test_frequency_register_keeps_the_angle_continuous():
+def test_frequency_register_reanchors_the_angle_to_absolute_time():
     modulator = PhaseShiftModulator(100e3)
-    loads = [(0.0, (1.0, 0.0, 100e3, 0)), (5e-6, (1.0, 0.0, 50e3, 0)),
-             (15e-6, (1.0, 0.0, 100e3, 0))]
-    edges = _levels(modulator, loads, 25e-6)
-    switching = [t for (t, v), (_t0, v0) in zip(edges[1:], edges[:-1]) if v != v0]
-    # theta = 2 pi 100k t until 5 us (pi), then 2 pi 50k: edges every pi/2 of the axis
-    expected = [2.5e-6, 10e-6, 17.5e-6, 22.5e-6]
-    assert switching == pytest.approx(expected, rel=0, abs=1e-15)
-    assert math.remainder(modulator.angle(25e-6), 2.0 * math.pi) == pytest.approx(0.0, abs=1e-9)
+    at = 7e-6
+    slow = modulator.phase_clock(at, registers=np.array([1.0, 0.0, 50e3, 0.0]))
+    fast = modulator.phase_clock(at, registers=np.array([1.0, 0.0, 100e3, 0.0]))
+    assert slow.at(at) == pytest.approx(2.0 * math.pi * 50e3 * at)
+    assert fast.at(at) == pytest.approx(2.0 * math.pi * 100e3 * at)
 
 
 def test_register_load_on_a_switching_edge_is_applied_once():
@@ -301,7 +298,7 @@ def test_register_steps_through_events_follow_the_reference_waveform(sync, tmp_p
         assert all(abs(n - full) <= 1.01 for n in lengths)
 
 
-def test_saved_states_continue_the_angle_axis_and_registers(tmp_path):
+def test_saved_states_continue_registers_and_pulses(tmp_path):
     whole = _ps_tree(_phase_shift(0.8, sync="pulse"), _rectifier(220.0), 0.2e-3, states=True,
                      events={"f": {"type": "set", "t": 40e-6, "set": {
                          "units.charger.primary.ctrl.references.frequency": 0.93 * F}}})
@@ -327,8 +324,8 @@ def test_phase_shift_states_are_declared_for_loop_maps():
     simulation = peslite.Simulation(from_dict(_ps_tree(_phase_shift(0.8, sync="pulse"),
                                                        _rectifier(200.0), 1e-5)))
     angles = simulation._states.angle_names
-    assert {"charger.primary.pwm.angle", "charger.primary.pwm.phase",
-            "charger.primary.pwm.shadow.phase"} <= angles
+    assert {"charger.primary.pwm.phase", "charger.primary.pwm.shadow.phase"} <= angles
+    assert "charger.primary.pwm.angle" not in angles
     assert {"charger.primary.pwm.mode", "charger.primary.pwm.pulse.q_0",
             "charger.primary.pwm.pulse.q_1"} <= simulation._states.discrete_names
     assert "charger.primary.pwm.pulse.remaining_0" in simulation._states.linearization_columns

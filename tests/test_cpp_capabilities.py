@@ -6,7 +6,7 @@ import peslite
 from conftest import EXAMPLES
 from test_cpp_export import _compiler, _final_csv, _run_generated
 
-pytestmark = pytest.mark.slow
+pytestmark = pytest.mark.full
 
 
 def test_generated_cpp_matches_the_open_loop_buck(tmp_path):

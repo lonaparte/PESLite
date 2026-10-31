@@ -16,7 +16,7 @@ from peslite.solver.simulation import SystemLoop
 from peslite.solver.splitbound import _period_map
 from test_small_signal import _AffineMap
 
-pytestmark = pytest.mark.slow
+pytestmark = pytest.mark.full
 
 
 def _simulation(**changes):

@@ -16,7 +16,7 @@ from test_cpp_equations import _Feedback
 from test_cpp_parameters import _case, _compare_run, _compile
 from conftest import EXAMPLES
 
-pytestmark = pytest.mark.slow
+pytestmark = pytest.mark.full
 
 
 @dataclass(frozen=True)

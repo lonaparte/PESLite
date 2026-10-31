@@ -58,7 +58,7 @@ def test_single_phase_source_connects_directly_to_converter_power_port(tmp_path)
     assert result.t[-1] == pytest.approx(10.0e-6)
 
 
-@pytest.mark.slow
+@pytest.mark.full
 def test_single_phase_source_cpp_export_matches_python(tmp_path):
     from test_cpp_export import _compiler, _final_csv, _run_generated
 

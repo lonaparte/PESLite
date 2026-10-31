@@ -19,7 +19,7 @@ from test_phase_shift import _phase_shift, _ps_tree, _square_wave_breaks
 from test_wpt_rectifier import F, L1, L2, LCC, LCC_VALUES, SS, V1, C_60K, _rectifier
 from wpt_reference import Circuit, switched
 
-pytestmark = pytest.mark.slow
+pytestmark = pytest.mark.full
 
 V2 = 150.0
 T_END = 0.3e-3

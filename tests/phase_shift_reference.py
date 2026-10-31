@@ -1,8 +1,8 @@
 """Independent reference for square-wave phase-shift modulation, by time stepping.
 
-The reference never solves for an edge: it integrates the angle axis on a fine time grid and
-evaluates the bridge level pointwise, so it shares no edge arithmetic with the modulator under
-test. Levels are +1 (positive pulse), -1 (negative pulse) and 0.
+The reference never solves for an edge: it evaluates the absolute-time angle axis on a fine time
+grid, so it shares no edge arithmetic with the modulator under test. Levels are +1 (positive
+pulse), -1 (negative pulse) and 0.
 
 Register semantics: ``width`` is the pulse width in half periods, ``phase`` the angle of the
 positive pulse centre, ``frequency`` the angle-axis frequency (acting at its load), ``mode`` one
@@ -39,14 +39,13 @@ def level(mode: float, width: float, y: float) -> int:
 def waveform(loads, t_end: float, dt: float, pulse: bool):
     """Sampled level on ``t = t0 + k dt`` for register loads ``[(t, (w, phi, f, mode)), ...]``.
 
-    The first load starts the run with the angle axis at ``2 pi f t0``. Returns ``(t, level)``.
+    Each register interval uses the absolute-time angle ``2 pi f t``. Returns ``(t, level)``.
     """
     loads = sorted(loads, key=lambda item: item[0])
     t0 = loads[0][0]
     n = int(math.floor((t_end - t0) / dt)) + 1
     times = t0 + dt * np.arange(n)
     out = np.zeros(n)
-    theta = 2.0 * math.pi * loads[0][1][2] * t0
     k_load = 0
     frequency = loads[0][1][2]
     governing = None            # (w, phi, mode) producing the output
@@ -55,11 +54,11 @@ def waveform(loads, t_end: float, dt: float, pulse: bool):
     previous_level = 0
     previous_target_level = 0
     for i, t in enumerate(times):
-        if i:
-            theta += 2.0 * math.pi * frequency * dt
+        theta = 2.0 * math.pi * frequency * t
         while k_load < len(loads) and loads[k_load][0] <= t + 1e-15:
             w, phi, f, mode = loads[k_load][1]
             frequency = f
+            theta = 2.0 * math.pi * frequency * t
             new = (w, phi, mode)
             if governing is None and pulse:
                 governing = target = (0.0, 0.0, 3)     # zero output before the first load

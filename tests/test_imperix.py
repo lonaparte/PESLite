@@ -19,7 +19,7 @@ from peslite.solver.simulation import convert_main, main
 from conftest import EXAMPLES
 from test_cpp_export import _compiler, _run_generated
 
-pytestmark = pytest.mark.slow
+pytestmark = pytest.mark.full
 
 
 def _simulation(name="buck"):

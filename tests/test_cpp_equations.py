@@ -17,7 +17,7 @@ from peslite.control.blocks import PI
 from peslite.control.loops import DUTY_RATIO
 from test_cpp_export import _compiler
 
-pytestmark = pytest.mark.slow
+pytestmark = pytest.mark.full
 
 
 def test_parameter_identifier_collisions_are_rejected_by_the_shared_interface():

@@ -12,7 +12,7 @@ from peslite.assembly.params import _written_out
 from conftest import EXAMPLES
 from test_cpp_export import _compiler
 
-pytestmark = pytest.mark.slow
+pytestmark = pytest.mark.full
 
 
 def _case(name, mode):
