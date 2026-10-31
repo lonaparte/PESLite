@@ -254,16 +254,14 @@ class PWM:
         self.schedule: list[tuple[float, Any]] = []
         self.next_switch = math.inf
         self.load_end = math.inf
+        self._phase_clock = PhaseClock(0.0, 0.0, 2.0 * math.pi / self.carrier_period)
 
     @property
     def register_names(self) -> tuple[str, ...]:
         return self._names[:-1]
 
     def phase_clock(self) -> PhaseClock:
-        read = getattr(self.modulator, "phase_clock", None)
-        if read is not None:
-            return read(self.t_sync, *self.sync)
-        return PhaseClock(0.0, 0.0, 2.0 * math.pi / self.carrier_period)
+        return self._phase_clock
 
     def phase_reference(self) -> float:
         name = getattr(self.modulator, "phase_register", None)
@@ -341,9 +339,14 @@ class PWM:
         return bool(self.active[-1])
 
     def start(self, t: float, sync: tuple[float | None, float | None], continued: bool):
-        """Resume the timer and switching sequence at ``t`` after named states were loaded."""
-        self.k = int(self.control_clock.index_after(t))
-        self.j = int(self.load_clock.index_after(t))
+        """Place the timer at ``t`` and restore the switching sequence.
+
+        A fresh run includes a timer event coincident with its start. A continued run has already
+        processed that event and therefore resumes at the next one.
+        """
+        control_index = self.control_clock.start_index(t, continued)
+        load_index = self.load_clock.start_index(t, continued)
+        self.k, self.j = int(control_index), int(load_index)
         self.t_interrupt, self.t_load = self.interrupt(self.k), self.load_time(self.j)
         # The word the latest interrupt replaced, once a load has followed its completion.
         self.completed = self.active
@@ -376,6 +379,9 @@ class PWM:
         if theta is not None and omega is not None and t_l != self.t_sync:
             theta = theta + omega * (t_l - self.t_sync)
         values = np.asarray(d[:self.modulation_width], dtype=float)
+        phase_clock = getattr(self.modulator, "phase_clock", None)
+        if phase_clock is not None:
+            self._phase_clock = phase_clock(t_l, theta, omega, registers=values)
         seq = self._sequence(t_l, self.load_period, values, theta, omega)
         dt = np.asarray(seq.dt, dtype=float).tolist()
         states = np.asarray(seq.q_abc, dtype=float).tolist()
@@ -698,11 +704,9 @@ class PhaseShiftModulator:
     same shadow/active register path, computation delay and enable as the duty ratios of a
     carrier modulator.
 
-    The angle axis ``theta`` is continuous: every load continues it from the previous load with
-    the previous active frequency, then runs the newly loaded one. The frequency therefore may
-    differ from the PWM timer and may change at every load without a phase jump. A fresh run
-    starts the axis at ``2 pi f t``, so converters sharing a time base share the axis and their
-    ``phase`` registers set their relative phase directly.
+    The angle axis is ``theta(t) = 2 pi f t`` for the frequency active in each register interval.
+    Converters sharing a time base therefore share the axis and their ``phase`` registers set
+    their relative phase directly. Changing frequency may change the phase at the load boundary.
 
     Edges within ``1e-9`` of a period after a load are applied at the load; edges within the same
     distance before the end of an interval belong to the next interval (the load that coincides
@@ -728,15 +732,9 @@ class PhaseShiftModulator:
         return cls(references.frequency, carried=carried)
 
     def phase_clock(self, t, theta=None, omega=None, *, registers=None):
-        if registers is None:
-            return PhaseClock(self._t or 0.0, self._theta, 2.0 * math.pi * self.frequency)
-        frequency = self._registers(registers)[2]
-        return PhaseClock(t, self._start_angle(t, frequency), 2.0 * math.pi * frequency)
-
-    def _start_angle(self, t: float, frequency: float) -> float:
-        """Angle of an interval starting at ``t``: restored, first-anchored or continued."""
-        return (self._theta if self._restored else 2.0 * math.pi * frequency * t
-                if self._t is None else self.angle(t))
+        frequency = (self.nominal_frequency if registers is None
+                     else self._registers(registers)[2])
+        return PhaseClock(0.0, 0.0, 2.0 * math.pi * frequency)
 
     def __init__(self, frequency: float, min_interval: float = 1e-12,
                  carried: tuple[str, ...] = ()) -> None:
@@ -747,10 +745,6 @@ class PhaseShiftModulator:
         self.min_interval = min_interval
         self.carried = tuple(carried)
         self.registers = self.pattern_registers + self.carried
-        self._t: float | None = None       # start of the current interval (None: not anchored)
-        self._theta = 0.0                  # angle at that start (rad, wrapped to [0, 2 pi))
-        self._f = frequency                # active frequency of the current interval (Hz)
-        self._restored = False
 
     # -- registers -------------------------------------------------------------------------------
     def command_registers(self, output: Any) -> tuple[float, ...]:
@@ -772,18 +766,6 @@ class PhaseShiftModulator:
             raise ValueError(f"phase-shift mode register must be one of "
                              f"{sorted(PHASE_SHIFT_MODES)}, got {mode}")
         return min(1.0, max(0.0, width)), phase, frequency, int(mode)
-
-    # -- the angle axis --------------------------------------------------------------------------
-    def angle(self, t: float) -> float:
-        """Angle axis (rad, unwrapped from the current interval start) at ``t``."""
-        if self._t is None:
-            return 2.0 * math.pi * self._f * t
-        return self._theta + 2.0 * math.pi * self._f * (t - self._t)
-
-    @property
-    def frequency(self) -> float:
-        """Active angle-axis frequency (Hz)."""
-        return self._f
 
     # -- edges -----------------------------------------------------------------------------------
     @staticmethod
@@ -822,25 +804,11 @@ class PhaseShiftModulator:
     def __call__(self, t: float, T_s: float, values: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence:
         width, phase, frequency, mode = self._registers(values)
-        theta0 = self._start_angle(t, frequency) % (2.0 * math.pi)
-        self._t, self._theta, self._f, self._restored = t, theta0, frequency, False
+        theta0 = (2.0 * math.pi * frequency * t) % (2.0 * math.pi)
         level, changes = self._edges(
             (width, phase, mode), theta0, 2.0 * math.pi * frequency, 0.0, T_s, _SNAP / frequency)
         return _switching_sequence(T_s, self.min_interval, list(_LEGS[level]),
                                    ((x, self.pulse_groups[0], _LEGS[after]) for x, after in changes))
-
-    # -- named state -----------------------------------------------------------------------------
-    angle_state_names = ("angle",)
-
-    def get_state(self) -> dict[str, Any]:
-        return {"angle": float(self._theta)}
-
-    def set_state(self, values: Mapping[str, Any]) -> None:
-        if unknown := set(values) - {"angle"}:
-            raise KeyError(f"phase-shift modulator: unknown state(s) {sorted(unknown)}")
-        if "angle" in values:
-            self._theta = float(values["angle"]) % (2.0 * math.pi)
-            self._restored = True
 
 
 MODULATOR_TYPES = {"phase_shift": PhaseShiftModulator}

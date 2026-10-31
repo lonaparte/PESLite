@@ -739,8 +739,10 @@ class Simulation:
         for name, unit in system.units.items():
             bridge_prefix = f"{name}.{unit.bridge.state_prefix}"
             self._states.load(values, [f"{name}.ctrl", bridge_prefix])
-            # Continued: any of the unit's registered states is given.
-            if not values.keys().isdisjoint(self._states.read(prefix for prefix, _ in unit.state_parts())):
+            # Restored controller or PWM state means this timer point was already processed.
+            # Plant initial conditions alone still describe a fresh run.
+            timer_states = self._states.read((f"{name}.ctrl", bridge_prefix))
+            if not values.keys().isdisjoint(timer_states):
                 self._continued.add(name)
             if unit.adc is not None and (unit.adc.accumulating or unit.adc.independent):
                 self._states.load(values, [f"{name}.meas"])

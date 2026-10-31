@@ -20,6 +20,8 @@ dependencies = [
 plot = ["matplotlib>=3.7"]
 all = ["matplotlib>=3.7"]
 test = ["pytest>=7", "matplotlib>=3.7"]
+reference = ["motulator==0.21.0; python_version >= '3.12'"]
+pyspice = ["PySpice==1.5"]
 
 [project.scripts]
 peslite = "peslite.solver.simulation:main"
@@ -39,3 +41,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "full: compiler, external-reference or long numerical integration tests",
+    "motulator: cross-checks PESLite against the pinned motulator reference simulator",
+    "pyspice: optional DC-converter and WPT cross-checks against PySpice and ngspice",
+]

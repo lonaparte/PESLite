@@ -20,7 +20,7 @@ from functools import cached_property
 from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -322,6 +322,12 @@ def _fields(record: Any) -> tuple[str, ...]:
     dynamic = vars(record) if hasattr(record, "__dict__") else {}
     names.extend(name for name in dynamic if name not in names)
     return tuple(names)
+
+
+def _sequence_like(record: Any, values: Iterable[Any]) -> Any:
+    """Rebuild a list, tuple or named tuple without losing its declared layout."""
+    values = tuple(values)
+    return type(record)(*values) if hasattr(type(record), "_fields") else type(record)(values)
 
 
 def _complex(value: complex) -> str:
@@ -855,7 +861,7 @@ class _RuntimeParameters:
         if id(value) in self.initial_copies:
             return self.initial_copies[id(value)]
         if isinstance(value, (tuple, list)):
-            return type(value)(self.construction_parameters(item) for item in value)
+            return _sequence_like(value, (self.construction_parameters(item) for item in value))
         return self.copy(value)
 
     @staticmethod
@@ -966,8 +972,8 @@ class _RuntimeParameters:
         if isinstance(original, (tuple, list)) and isinstance(initialized, type(original)):
             if len(original) != len(initialized):
                 raise TypeError("parameter initialization changes a collection's layout")
-            return type(original)(self.pair(left, right, seen)
-                                  for left, right in zip(original, initialized))
+            return _sequence_like(original, (self.pair(left, right, seen)
+                                              for left, right in zip(original, initialized)))
         if isinstance(original, dict) and isinstance(initialized, dict):
             if original.keys() != initialized.keys():
                 raise TypeError("parameter initialization changes an object's fields")
@@ -1013,7 +1019,7 @@ class _RuntimeParameters:
         if id(original) in self.copies:
             return self.copies[id(original)]
         if isinstance(original, tuple):
-            return tuple(self.object(value) for value in original)
+            return _sequence_like(original, (self.object(value) for value in original))
         if isinstance(original, list):
             return [self.object(value) for value in original]
         if isinstance(original, dict):
@@ -1493,7 +1499,8 @@ class _ModelGenerator:
                 return references[id(original)]
             if (isinstance(original, (tuple, list)) and isinstance(value, type(original))
                     and len(original) == len(value)):
-                return type(value)(rebind(left, right) for left, right in zip(original, value))
+                return _sequence_like(value, (rebind(left, right)
+                                              for left, right in zip(original, value)))
             if (isinstance(original, dict) and isinstance(value, dict)
                     and original.keys() == value.keys()):
                 return {key: rebind(left, value[key]) for key, left in original.items()}
@@ -2288,9 +2295,8 @@ _PHASE_SHIFT_KERNEL = r'''struct PhaseShiftPattern {
     double width, phase;
     int mode;
 };
-struct PhaseShiftModulatorState {
+struct PhaseShiftModulator {
     using Edges = std::vector<std::pair<double, int>>;
-    double angle, time, frequency;
     double minimum_interval;
 
     static const Edges& pulses(int mode) {
@@ -2341,15 +2347,13 @@ struct PhaseShiftModulatorState {
         }
         return {initial, result};
     }
-    Edges load(double t, double span, double width, double phase, double next_frequency, double mode) {
-        if (!(std::isfinite(width) && std::isfinite(phase) && std::isfinite(next_frequency)
-                && next_frequency > 0.0 && std::isfinite(mode) && mode == std::trunc(mode)))
+    Edges load(double t, double span, double width, double phase, double frequency, double mode) const {
+        if (!(std::isfinite(width) && std::isfinite(phase) && std::isfinite(frequency)
+                && frequency > 0.0 && std::isfinite(mode) && mode == std::trunc(mode)))
             throw std::runtime_error("invalid phase-shift registers");
         pulses(static_cast<int>(mode));
-        angle = std::fmod(angle + 2.0 * pi * frequency * (t - time), 2.0 * pi);
+        double angle = std::fmod(2.0 * pi * frequency * t, 2.0 * pi);
         if (angle < 0.0) angle += 2.0 * pi;
-        time = t;
-        frequency = next_frequency;
         const double omega = 2.0 * pi * frequency;
         const double period = 1.0 / frequency;
         const double snap = @@SNAP@@ * period;
@@ -2662,18 +2666,16 @@ class _PhaseShiftModulatorGenerator:
 
     def members(self, generator):
         mod = generator.bridge.modulator
-        return [f"PhaseShiftModulatorState {self._member(generator)}{{"
-                f"{_number(mod._theta)}, {_number(mod._t)}, {_number(mod._f)}, "
+        return [f"PhaseShiftModulator {self._member(generator)}{{"
                 f"{_number(mod.min_interval)}" + "};"]
 
     def state_expression(self, generator, local):
-        return self._member(generator) + ".angle" if local == "angle" else None
+        return None
 
     def phase_clock(self, generator):
-        member = self._member(generator)
-        return PhaseClock(_Expression(member + ".time", "real"),
-                          _Expression(member + ".angle", "real"),
-                          _Expression(f"(2.0 * pi * {member}.frequency)", "real"))
+        index = generator.bridge.register_names.index("frequency")
+        frequency = f"{generator.m('active')}[{index}]"
+        return PhaseClock(0.0, 0.0, _Expression(f"(2.0 * pi * {frequency})", "real"))
 
     def load(self, generator, hold, switching):
         return [f"        make_switches_{generator.tag}(t, {_number(generator.bridge.load_period)}, {hold});",
@@ -3594,9 +3596,7 @@ class _ControlGenerator:
                 value = getattr(bridge, name, None)
                 if isinstance(value, _InitializationExpression):
                     bool(value == value.default)
-        t0 = self.p.simulation.initial.t
-        control_index = bridge.control_clock.index_after(t0)
-        load_index = bridge.load_clock.index_after(t0)
+        control_index, load_index = self._pwm_start_indices()
         q_kind = _CPP_TYPES[_Expression.of(self.topology.zero).kind]
         schedule = ", ".join(
             "{" + _number(at) + ", " + _literal(q) + "}" for at, q in bridge.schedule
@@ -3620,6 +3620,15 @@ class _ControlGenerator:
             f"double {self.m('next_switch')} = {_number(bridge.next_switch)};",
             f"double {self.m('load_end')} = {_number(bridge.load_end)};",
         ]
+
+    def _pwm_start_indices(self):
+        """Return the shared fresh-or-continued control and load clock positions."""
+        t0 = self.p.simulation.initial.t
+        continued = self.name in self.model.simulation._continued
+        return (
+            self.bridge.control_clock.start_index(t0, continued),
+            self.bridge.load_clock.start_index(t0, continued),
+        )
 
     def _pwm_write_lines(self, on: str) -> list[str]:
         bridge = self.bridge
@@ -3803,9 +3812,8 @@ class _ProtectionGenerator:
         clock_index = None
         if self.continuous:
             clock = self.model.runtime.object(unit.clock)
-            place = (clock.index_after if self.name in self.model.simulation._continued
-                     else clock.index_at_or_after)
-            clock_index = place(self.p.simulation.initial.t)
+            continued = self.name in self.model.simulation._continued
+            clock_index = clock.start_index(self.p.simulation.initial.t, continued)
         return [
             f"bool {self.m('tripped')} = {'true' if unit.tripped else 'false'};",
             f"bool {self.m('fault')} = {'true' if unit.protection.fault else 'false'};",

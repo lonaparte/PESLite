@@ -47,10 +47,35 @@ jobs:
         run: python -m pytest
 
 
+  reference-test:
+    name: Compare with motulator
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install reference dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[test,reference]"
+
+      - name: Run reference comparisons
+        run: python -m pytest --run-full tests/reference/test_motulator.py
+
+
   build:
     name: Build distribution
     needs:
       - test
+      - reference-test
     runs-on: ubuntu-24.04
 
     steps:

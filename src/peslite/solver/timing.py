@@ -27,6 +27,10 @@ class PeriodicClock:
         """Index of the first event at or after ``t`` within :data:`TIME_EPS`."""
         return np.ceil((t - self.offset - TIME_EPS) / self.period)
 
+    def start_index(self, t: float, continued: bool):
+        """Index at which a fresh or continued run starts processing this clock."""
+        return self.index_after(t) if continued else self.index_at_or_after(t)
+
     def due(self, t: float, index: int) -> bool:
         return abs(t - self.at(index)) < TIME_EPS
 

@@ -122,11 +122,13 @@ cd PESLite
 python -m pip install -e ".[test]"
 ```
 
-Run the test suite from the repository root:
+Run the fast test suite from the repository root:
 
 ```bash
 python -m pytest
 ```
+
+Use `python -m pytest --run-full` to include compiler, external-reference and long numerical tests.
 
 ## License
 
