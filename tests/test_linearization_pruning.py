@@ -16,6 +16,8 @@ from peslite.solver.simulation import SystemLoop
 from peslite.solver.splitbound import _period_map
 from test_small_signal import _AffineMap
 
+pytestmark = pytest.mark.slow
+
 
 def _simulation(**changes):
     params = peslite.load(EXAMPLES / "buck-example.pes", **{

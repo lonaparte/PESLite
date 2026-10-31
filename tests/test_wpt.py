@@ -385,6 +385,7 @@ def test_wpt_power_reference_rejects_voltage_signal_connections():
     ("lcc", "secondary", "PhasePowerControl", "phase", (-500.0, -800.0)),
 ])
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
+@pytest.mark.slow
 def test_wpt_tracks_both_power_plateaus_without_remote_measurements(
         case, side, loop, command, targets, mode, tmp_path):
     params = peslite.load(EXAMPLES / f"wpt-{case}-example.pes").replace(**{

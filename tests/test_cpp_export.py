@@ -20,6 +20,8 @@ from peslite.components import Bag, Element, Terminal, register_element_type
 from peslite.solver.simulation import convert_main
 from test_measurement_network import load_case
 
+pytestmark = pytest.mark.slow
+
 
 class _ConditionalState(Bag):
     __slots__ = ("i",)

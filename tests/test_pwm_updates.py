@@ -59,6 +59,7 @@ def test_bridge_phase_clock_describes_the_applied_reference():
     pwm = SwitchingModel(1e-5, 1e-5, 0.0, 0.0, 0.0, 1e-5, SynchronousCarrier(1), ThreePhaseBridge())
     pwm.reset(np.full(3, .5), on=True)
     pwm.start(0.0, (0.0, omega), False)
+    pwm.load(0.0)
     pwm.tick(1e-5, .4, omega)
     assert pwm.phase_clock().at(1e-5) == pytest.approx(2 * math.pi)
     pwm.load(1e-5)
@@ -103,6 +104,7 @@ def test_explicit_default_does_not_add_policy_or_state(example, mode):
 
 
 @pytest.mark.parametrize("example", ["gfl", "buck", "wpt"])
+@pytest.mark.slow
 def test_default_configuration_generates_identical_cpp(example, tmp_path):
     params = _case(example, "switching")
     from peslite.assembly.params import _unit_items
@@ -146,6 +148,7 @@ def test_synchronous_continuation_restores_the_applied_waveform(update, tmp_path
 ])
 @pytest.mark.parametrize("restart", [False, True])
 @pytest.mark.parametrize("variables", [("common",), ("all",)])
+@pytest.mark.slow
 def test_native_carrier_pulse_updates_match_python(example, synchronous, update, control_offset, restart,
                                                    variables, tmp_path):
     params = _case(example, "switching")

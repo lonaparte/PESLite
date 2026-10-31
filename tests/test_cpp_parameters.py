@@ -12,6 +12,8 @@ from peslite.assembly.params import _written_out
 from conftest import EXAMPLES
 from test_cpp_export import _compiler
 
+pytestmark = pytest.mark.slow
+
 
 def _case(name, mode):
     p = peslite.load(EXAMPLES / f"{name}-example.pes")

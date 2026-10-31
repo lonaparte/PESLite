@@ -109,6 +109,7 @@ class _SampledDuty(Loop):
 
 
 def test_registered_loop_owns_its_schema_and_uses_default_role_wiring(tmp_path):
+    period = 5e-5
     p = peslite.load(
         EXAMPLES / "gfm-psc-example.pes",
         **QUIET,
@@ -117,7 +118,7 @@ def test_registered_loop_owns_its_schema_and_uses_default_role_wiring(tmp_path):
     )
     loops = dict(p.unit().ctrl.loops)
     loops.pop("PSC")
-    loops["_FixedFrequency"] = _FixedFrequency.Params(period=5e-5)
+    loops["_FixedFrequency"] = _FixedFrequency.Params(period=period)
     p = p.replace(**{
         "units.vsc.bridge.model": "pwm_averaging",
         "units.vsc.ctrl.loops": loops,
@@ -131,7 +132,7 @@ def test_registered_loop_owns_its_schema_and_uses_default_role_wiring(tmp_path):
     result = sim.run(out_dir=tmp_path)
     assert result.summary["vsc.law"] == "test_fixed_frequency"
     assert result.states["vsc.ctrl._FixedFrequency.theta"][-1] == pytest.approx(
-        2 * np.pi * 50.0 * 0.01, rel=1e-9
+        2 * np.pi * 50.0 * (0.01 + period), rel=1e-9
     )
 
 

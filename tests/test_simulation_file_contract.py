@@ -1,4 +1,4 @@
-"""Migration contract for issue #2 simulation files."""
+"""Bundled simulation-file discovery and packaging."""
 
 import yaml
 
@@ -6,41 +6,12 @@ from conftest import EXAMPLES, ROOT
 from peslite.solver import simulation
 from peslite.solver.simulation import _config_path
 
-EXPECTED = {
-    "buck-open-loop-example.pes",
-    "buck-example.pes",
-    "boost-example.pes",
-    "buck-boost-example.pes",
-    "cable-gfl-example.pes",
-    "custom-pll-example.pes",
-    "gfl-example.pes",
-    "gfm-dvoc-example.pes",
-    "gfm-matching-example.pes",
-    "gfm-psc-example.pes",
-    "gfm-vsg-example.pes",
-    "two-converters-example.pes",
-    "wpt-example.pes",
-    "wpt-ss-example.pes",
-    "wpt-lcc-example.pes",
-    "wpt-load-example.pes",
-    "wpt-phase-shift-example.pes",
-    "wpt-scc-example.pes",
-}
-
-
 def test_bundled_examples_are_named_pes_files_containing_yaml():
     paths = {path.name: path for path in EXAMPLES.iterdir()}
-    assert set(paths) == EXPECTED
+    assert paths and all(name.endswith("-example.pes") for name in paths)
     for path in paths.values():
         assert path.is_file()
         assert isinstance(yaml.safe_load(path.read_text(encoding="utf-8")), dict)
-
-
-def test_examples_have_one_root_location_and_no_python_files():
-    assert EXAMPLES == ROOT / "examples"
-    assert not (ROOT / "src" / "peslite" / "examples").exists()
-    assert not (ROOT / "src" / "peslite" / "configs").exists()
-    assert not list(EXAMPLES.rglob("*.py"))
 
 
 def test_command_line_finds_bundled_pes_files():

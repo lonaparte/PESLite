@@ -17,6 +17,8 @@ from peslite.solver.linearization import linearize_loop
 from peslite.solver.model import Empty, Model
 from peslite.solver.simulation import SystemLoop
 
+pytestmark = pytest.mark.slow
+
 
 def _params(**overrides):
     return peslite.load(EXAMPLES / "buck-example.pes", **{

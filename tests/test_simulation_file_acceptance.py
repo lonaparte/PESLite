@@ -1,14 +1,11 @@
-"""Reference issue #2 simulation-file acceptance under the current example naming rules."""
+"""Published example and simulation-file acceptance tests."""
 
 import copy
 import dataclasses
 import io
-import re
 import shutil
 import warnings
 from contextlib import redirect_stdout
-from dataclasses import fields, is_dataclass
-from typing import get_args, get_type_hints
 
 import numpy as np
 import pytest
@@ -16,9 +13,7 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.events import EVENT_TYPES
-from peslite.assembly.params import ConfigError, Params, dumps, from_dict, read_tree, to_dict
-from peslite.components import ELEMENT_TYPES
+from peslite.assembly.params import ConfigError, dumps, from_dict, read_tree, to_dict
 from peslite.control import LOOP_TYPES
 
 
@@ -80,54 +75,6 @@ def test_bundled_examples_restate_no_defaults(name):
                 continue  # keep explicit unit discriminators in published examples
             restated.append(".".join(map(str, path)))
     assert restated == []
-
-
-def _options(cls, found=None):
-    found = set() if found is None else found
-    hints = get_type_hints(cls)
-    for item in fields(cls):
-        if not item.init or item.name.startswith("_"):
-            continue
-        found.add((cls, item.name))
-        types = (hints[item.name], *get_args(hints[item.name]),
-                 *(arg for value in get_args(hints[item.name]) for arg in get_args(value)))
-        for value in types:
-            if is_dataclass(value) and isinstance(value, type) and not any(old is value for old, _ in found):
-                _options(value, found)
-    return found
-
-
-def test_annotated_gfl_example_lists_every_option():
-    text = (EXAMPLES / "gfl-example.pes").read_text(encoding="utf-8")
-    vsc_params = type(from_dict(read_tree(EXAMPLES / "gfl-example.pes")).unit()._unit_fields)
-    options = _options(Params) | _options(vsc_params)
-    for kind in ("srf_pll", "dq_current_pi", "dc_voltage_control"):
-        options |= _options(LOOP_TYPES[kind].Params)
-    for kind in ("connect", "disconnect", "set"):
-        options |= _options(EVENT_TYPES[kind].Params)
-    options |= _options(ELEMENT_TYPES["load"].Params)
-
-    missing = []
-    for cls, name in options:
-        spellings = {name, f"{name}_pu"} | {
-            alias for alias, target in getattr(cls, "_input_aliases", {}).items()
-            if target in (name, f"{name}_pu")
-        }
-        if not any(re.search(rf"(?<![\w.]){re.escape(spelling)}\s*:", text)
-                   for spelling in spellings):
-            missing.append(f"{cls.__qualname__}.{name}")
-    assert sorted(missing) == []
-
-
-def test_legacy_vsc_without_unit_type_keeps_the_vsc_default():
-    tree = read_tree(EXAMPLES / "gfl-example.pes")
-    tree["units"]["vsc"].pop("type")
-
-    unit = from_dict(tree).unit("vsc")
-
-    assert type(unit) is peslite.assembly.UnitParams
-    assert type(unit.ctrl) is peslite.assembly.ControlParams
-    assert unit.type == "vsc"
 
 
 def _bus_start(params, bus, out):

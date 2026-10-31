@@ -22,6 +22,8 @@ from peslite.solver.model import Empty, Model, StateRegistry
 from peslite.solver.simulation import SystemLoop, macro_period
 from peslite.solver.splitbound import LoopMap as SplitLoopMap, _period_map
 
+pytestmark = pytest.mark.slow
+
 
 class _AffineMap:
     period = 0.01

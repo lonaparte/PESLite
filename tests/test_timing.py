@@ -1,4 +1,4 @@
-"""Issue #4 timing parameters, control interrupts and PWM duty registers."""
+"""Control timing, sampling clocks, interrupts and PWM registers."""
 
 import math
 
@@ -212,6 +212,26 @@ def test_a_slow_loop_runs_at_every_nth_interrupt(gfl):
 
 def _pwm(computation):
     return PWMAveragingModel(T, T, 0.0, 0.0, computation, T, ZOH(), ThreePhaseBridge())
+
+
+def test_fresh_timer_processes_the_starting_grid_point_once():
+    pwm = _pwm(0.0)
+
+    pwm.start(0.0, (None, None), continued=False)
+    assert (pwm.t_interrupt, pwm.t_load) == pytest.approx((0.0, 0.0))
+
+    pwm.start(0.0, (None, None), continued=True)
+    assert (pwm.t_interrupt, pwm.t_load) == pytest.approx((T, T))
+
+
+def test_initial_state_overrides_do_not_turn_a_fresh_run_into_a_continuation(
+        gfl, tmp_path):
+    _result, interrupts, _loads = _record(gfl(**{
+        "simulation.initial.states.vsc.dclink.u_C": 1300.0,
+        "simulation.t_end": T,
+    }), tmp_path)
+
+    assert interrupts[0][0] == pytest.approx(0.0)
 
 
 def test_shadow_duty_loads_only_after_computation():

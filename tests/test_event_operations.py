@@ -1,4 +1,4 @@
-"""Component switching, retuning and registered circuit elements for issue #2."""
+"""Component switching, retuning and registered circuit elements."""
 
 from dataclasses import dataclass
 

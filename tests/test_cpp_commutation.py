@@ -16,6 +16,8 @@ from test_phase_shift import _phase_shift, _ps_tree
 from test_scc import CASES, _case, _commanded
 from test_wpt_rectifier import LCC, LCC_S, MULTI, SS, _rectifier, _tree
 
+pytestmark = pytest.mark.slow
+
 
 def _short(tree, end=90e-6):
     tree = copy.deepcopy(tree)

@@ -23,6 +23,7 @@ def test_solver_and_control_output_stage_names_do_not_collide():
     assert peslite.OutputStage is peslite.control.OutputStage
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda p: p.stem)
 def test_every_bundled_example_runs_with_the_solver(path, tmp_path):
     sim = peslite.Simulation(peslite.load(path, **QUIET, **{"simulation.t_end": 0.002}))

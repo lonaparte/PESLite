@@ -296,6 +296,7 @@ def test_buck_boost_uses_the_three_physical_half_bridge_terminals():
 
 
 @pytest.mark.parametrize("resistance,mode", [(10.0, "ccm"), (40.0, "dcm")])
+@pytest.mark.slow
 def test_buck_boost_switching_matches_an_independent_circuit_reference(
         resistance, mode, tmp_path):
     vin, duty = 24.0, 0.4

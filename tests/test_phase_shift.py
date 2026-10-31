@@ -11,6 +11,8 @@ from peslite.components.pwm import PhaseShiftModulator, PulseSequence, phase_shi
 
 from phase_shift_reference import level as reference_level, waveform
 
+pytestmark = pytest.mark.slow
+
 
 def _phase_modulator(frequency, update):
     modulator = PhaseShiftModulator(frequency)
@@ -251,7 +253,7 @@ def test_square_wave_into_a_diode_rectifier_matches_the_circuit_reference(v2, wi
     t = np.asarray(result.t)
     keep = (t > 0.0) & (t < t_end - 1e-9)
     t = t[keep]
-    t_on = 1.0 / F                                   # the first control interrupt enables gates
+    t_on = 0.0                                        # the fresh-run interrupt enables gates
 
     def source(at):
         return 0.0 if at < t_on else V1 * reference_level(0, width, 2.0 * math.pi * F * at)
@@ -282,7 +284,7 @@ def test_register_steps_through_events_follow_the_reference_waveform(sync, tmp_p
     result = peslite.Simulation(from_dict(tree)).run(out_dir=tmp_path)
     t = np.asarray(result.t)
     u = np.asarray(result.columns()["charger.primary.u_g"])
-    t_on, t_step = 1.0 / F, _first_interrupt_after(t_event)
+    t_on, t_step = 0.0, _first_interrupt_after(t_event)
     loads = [(t_on, (width, 0.0, F, 0)), (t_step, (width, phase_step, F, 0))]
     dt = 1.0 / F / 2000.0
     times, levels = waveform(loads, t_end, dt, sync == "pulse")
