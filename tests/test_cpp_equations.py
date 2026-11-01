@@ -26,7 +26,8 @@ def test_parameter_identifier_collisions_are_rejected_by_the_shared_interface():
 
 
 def _generator(model):
-    system = SimpleNamespace(model=model, units={}, sources={}, named_elements={})
+    system = SimpleNamespace(model=model, units={}, sources={}, named_elements={},
+                             event_subsystems=())
     simulation = SimpleNamespace(system=system, p=SimpleNamespace(changes=()))
     return _ModelGenerator(simulation, None)
 

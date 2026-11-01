@@ -1275,9 +1275,16 @@ class _ModelGenerator:
                 self._algebraic_fields[id(record), name] = record
         for key in self.state_index.keys() | self.zoh_fields.keys():
             self._algebraic_fields.pop(key, None)
+        for name, subsystem in self.system.event_subsystems:
+            if (not getattr(subsystem, "discrete_state_names", ())
+                    or not callable(getattr(subsystem, "next_state", None))):
+                raise TypeError(
+                    f"C++ export: clocked subsystem {name!r} must expose registered "
+                    "discrete state and next_state(t)"
+                )
         self._discrete_fields = {
             (id(sub.state), field): sub.state
-            for _name, sub in getattr(self.model, "discrete_updates", ())
+            for _name, sub in self.system.event_subsystems
             for field in sub.discrete_state_names
         }
 
@@ -1727,7 +1734,7 @@ class _ModelGenerator:
         """Trace one pure discrete-state sample without committing it."""
         def run():
             clone = self._equation_clone(sub)
-            return tuple(clone.sample_discrete(_Expression("t", "real")))
+            return tuple(clone.next_state(_Expression("t", "real")))
 
         label = self.subsystem_name.get(id(sub), type(sub).__name__)
         try:
@@ -5164,7 +5171,6 @@ class _CppGenerator:
                              else _make_unit_generator(name, unit, model))
                       for name, unit in self.system.units.items() if unit.continuous}
         generators = {**sampled, **continuous}
-        discrete_updates = tuple(getattr(self.model, "discrete_updates", ()))
         for sub in self.model.subsystems:
             if id(sub) in model.equation_bindings and id(sub) not in model.equation_references:
                 model.equation_references[id(sub)] = model._equation_clone(sub)
@@ -5172,18 +5178,43 @@ class _CppGenerator:
         state_names = self.model.state_labels()
         initial = self.model.get_initial_values().tolist()
         initialized = self._initial_values(model)
-        discrete_specs = []
-        discrete_initialization = []
+        event_tags, event_members, event_methods, discrete_initialization = [], [], [], []
         t0 = self.p.simulation.initial.t
-        for name, subsystem in discrete_updates:
-            tag = model.prefix[id(subsystem)]
-            clock = subsystem.update_clock
-            continued = any(key == name or key.startswith(name + ".") for key in initialized)
+        for name, subsystem in self.system.event_subsystems:
+            tag = f"model_{model.prefix[id(subsystem)]}"
+            clock = subsystem.clock
+            continued = name in self.simulation._continued
             index = int(clock.start_index(t0, continued))
-            index_name = f"discrete_index_{tag}"
-            next_time = f"({_number(clock.offset)} + {index_name} * {_number(clock.period)})"
             assignments = model.discrete_update_assignments(subsystem)
-            discrete_specs.append((tag, index_name, index, next_time, assignments))
+            event_tags.append(tag)
+            event_members += [
+                f"long long {tag}_index = {index};",
+                f"bool {tag}_pending = false;",
+                *(f"{_CPP_TYPES[model.record_types[id(subsystem.state), field]]} "
+                  f"{tag}_next_{position} = {{}};"
+                  for position, field in enumerate(subsystem.discrete_state_names)),
+            ]
+            event_methods.append("\n".join([
+                f"double next_{tag}() const noexcept {{ return "
+                f"{_number(clock.offset)} + {tag}_index * {_number(clock.period)}; }}",
+                f"bool sense_{tag}(double t) {{",
+                f"    {tag}_pending = next_{tag}() <= t + time_eps;",
+                f"    if ({tag}_pending) {{",
+                *(f"        {tag}_next_{position} = {value.code};"
+                  for position, (_target, value) in enumerate(assignments)),
+                "    }",
+                "    return false;",
+                "}",
+                f"bool actuate_{tag}(double) {{",
+                f"    if ({tag}_pending) {{",
+                *(f"        {target} = {tag}_next_{position};"
+                  for position, (target, _value) in enumerate(assignments)),
+                f"        ++{tag}_index;",
+                f"        {tag}_pending = false;",
+                "    }",
+                "    return false;",
+                "}",
+            ]))
             for field in subsystem.discrete_state_names:
                 key = f"{name}.{field}"
                 if key in initialized:
@@ -5244,8 +5275,7 @@ class _CppGenerator:
             commutation_transitions.append(model.trace_transition(sub, "commutate"))
         raw_projection_call = "" if diode_conduction else projection_call
         member_lines = model.members(generators.values())
-        member_lines.extend(f"long long {index_name} = {index};"
-                            for _tag, index_name, index, _next, _assignments in discrete_specs)
+        member_lines.extend(event_members)
         for generator in (*sampled.values(), *(item for item in continuous.values() if item.ctrl is None)):
             member_lines.extend(generator.members())
         for generator in generators.values():
@@ -5281,43 +5311,24 @@ class _CppGenerator:
         methods += [method for generator in continuous.values()
                     for method in (generator.sense_method(), generator.actuate_method(),
                                    generator.protection_method(), generator.adc_methods())]
-        if discrete_specs:
-            declarations = []
-            commits = []
-            for tag, index_name, _index, next_time, assignments in discrete_specs:
-                due = f"discrete_due_{tag}"
-                declarations.append(f"const bool {due} = {next_time} <= t + time_eps;")
-                for assignment_index, (target, value) in enumerate(assignments):
-                    temporary = f"discrete_next_{tag}_{assignment_index}"
-                    declarations.append(
-                        f"const auto {temporary} = {due} ? ({value.code}) : ({target});"
-                    )
-                    commits.append(f"if ({due}) {target} = {temporary};")
-                commits += [f"if ({due}) ++{index_name};",
-                            f"changed = {due} || changed;"]
-            methods.append("\n".join([
-                "bool update_discrete(double t) {",
-                "    bool changed = false;",
-                *("    " + line for line in declarations),
-                *("    " + line for line in commits),
-                "    return changed;",
-                "}",
-            ]))
+        methods += event_methods
         energy_method, energy_columns = self._energy_method(model)
         if energy_method:
             methods.append(energy_method)
         methods_text = "\n\n    ".join(method.replace("\n", "\n    ") for method in methods if method)
-        circuit_times = [f"next_{generator.tag}()" for generator in sampled.values()]
-        circuit_times.extend(next_time for _tag, _index_name, _index, next_time, _assignments
-                             in discrete_specs)
+        circuit_times = [
+            f"next_{tag}()"
+            for tag in (*(generator.tag for generator in sampled.values()), *event_tags)
+        ]
         next_circuit = (f"circuit_boundary = std::min({{{', '.join(circuit_times)}}});"
                         if circuit_times else "")
         # A continuous unit's own clock and owned ADC timing sample only that unit.
         clocks = {name: [generator._clock_time(), *(
             generator._adc_next_values() if generator.adc is not None and generator.adc.clocked
             else [])] for name, generator in continuous.items()}
-        sense = [f"if (sense_{generators[name].tag}(t)) sync(t);" for name in unit_names]
-        actuate = [f"trip_now = actuate_{generators[name].tag}(t) || trip_now;" for name in unit_names]
+        owner_tags = (*(generators[name].tag for name in unit_names), *event_tags)
+        sense = [f"if (sense_{tag}(t)) sync(t);" for tag in owner_tags]
+        actuate = [f"trip_now = actuate_{tag}(t) || trip_now;" for tag in owner_tags]
         protect = [f"trip_now = protect_{generators[name].tag}(t) || trip_now;" for name in unit_names]
         adc_accumulate = [generator.adc_accumulate_call("t")
                           for generator in generators.values()]
@@ -5906,7 +5917,6 @@ public:
                     ++action_index;
                 }}
                 if (actions_applied) sync(t);
-                {'if (update_discrete(t)) sync(t);' if discrete_specs else ''}
                 {conduction_sync}
                 bool trip_now = false;
                 {' '.join(protect)}

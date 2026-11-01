@@ -602,6 +602,17 @@ class System:
                                           "controller has no matching continuous input")
                     connections[(unit.ctrl, channel)] = (subsystem, output)
         self.model = Model(subsystems, connections, zoh)
+        self.event_subsystems = tuple(
+            (name, subsystem)
+            for name, subsystem in zip(self.model.names, self.model.subsystems)
+            if getattr(subsystem, "clock", None) is not None
+        )
+        event_methods = ("begin", "next_time", "sense", "actuate")
+        for name, subsystem in self.event_subsystems:
+            missing = [method for method in event_methods
+                       if not callable(getattr(subsystem, method, None))]
+            if missing:
+                raise TypeError(f"{name}: clocked subsystem event interface is missing {missing}")
 
         self.state_aliases: dict[str, str] = {}
         for unit in self.units.values():

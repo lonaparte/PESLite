@@ -111,6 +111,7 @@ class _BlackBoxElement(Element):
             state={"x": cfg.initial},
             rhs=lambda _t, state, _inputs: -cfg.decay * state,
             feedthrough=(),
+            observer=True,
         )
 
     def subsystems(self):
@@ -147,13 +148,23 @@ class _DiscreteBlackBoxElement(Element):
             update=lambda _t, state, _inputs: state + cfg.increment,
             period=cfg.period,
             feedthrough=(),
+            observer=True,
+        )
+        self.lag = BlackBoxSubsystem(
+            lambda _t, state, _inputs: state,
+            inputs=("y",),
+            outputs=("z",),
+            state={"z": 0.0},
+            rhs=lambda _t, state, inputs: inputs - state,
+            feedthrough=(),
+            observer=True,
         )
 
     def subsystems(self):
-        return {self.name: self.model}
+        return {self.name: self.model, f"{self.name}.lag": self.lag}
 
     def connections(self):
-        return {}
+        return {(self.lag, "y"): (self.model, "y")}
 
     def terminals(self):
         return ()
@@ -1115,7 +1126,7 @@ def test_generated_cpp_runs_black_box_outputs_and_peslite_state_equations(tmp_pa
             "solver": {"type": "fixed", "method": "rk4", "dt": 1.0e-4,
                        "linearisations": 0},
             "output": {"period": 1.0e-3, "signals": True},
-            "energy_check": "off",
+            "energy_check": "strict",
         },
     })
 
@@ -1135,26 +1146,36 @@ def test_generated_cpp_runs_black_box_outputs_and_peslite_state_equations(tmp_pa
 @pytest.mark.parametrize(("initial", "t_end", "expected"), [
     ({}, 2.1e-3, 3.0),
     ({"t": 2.0e-3, "states": {"model.hidden": 7.0}}, 3.1e-3, 8.0),
+    ({"t": 0.0, "states": {"model.lag.z": 0.5}}, 2.1e-3, 3.0),
+    (None, 3.01e-4, 7.0),
 ])
 def test_generated_cpp_runs_discrete_black_box_state_updates(tmp_path, initial, t_end, expected):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
-    params = from_dict({
-        "base": {"s_base": 1.0},
-        "elements": {
-            "model": {"type": "test_discrete_black_box", "period": 1.0e-3,
-                      "increment": 1.0, "initial": 0.0},
-        },
-        "simulation": {
-            "t_end": t_end,
-            "initial": initial,
-            "solver": {"type": "fixed", "method": "rk4", "dt": 1.0e-4,
-                       "linearisations": 0},
-            "output": {"period": 1.0e-3, "signals": True},
-            "energy_check": "off",
-        },
-    })
+    model = {"type": "test_discrete_black_box", "increment": 1.0, "initial": 0.0}
+    if initial is None:
+        params = peslite.load(EXAMPLES / "buck-example.pes").replace(**{
+            "elements.model": {**model, "period": 5.0e-5},
+            "units.converter.meas.sources": {"voltage": "model.y"},
+            "simulation.t_end": t_end,
+            "simulation.output.signals": True,
+            "simulation.output.record_every": 1,
+            "simulation.energy_check": "off",
+        })
+    else:
+        params = from_dict({
+            "base": {"s_base": 1.0},
+            "elements": {"model": {**model, "period": 1.0e-3}},
+            "simulation": {
+                "t_end": t_end,
+                "initial": initial,
+                "solver": {"type": "fixed", "method": "rk4", "dt": 1.0e-4,
+                           "linearisations": 0},
+                "output": {"period": 1.0e-3, "signals": True},
+                "energy_check": "strict",
+            },
+        })
 
     source, cpp_out, python_out = _run_generated(
         params, tmp_path / f"discrete-black-box-{expected:g}", compiler
@@ -1167,7 +1188,13 @@ def test_generated_cpp_runs_discrete_black_box_state_updates(tmp_path, initial, 
     cpp_plant = _final_csv(cpp_out / "plant.csv")
     python_plant = _final_csv(python_out / "plant.csv")
     assert cpp_plant["model.y"] == pytest.approx(python_plant["model.y"])
-    assert "update_discrete" in source.read_text(encoding="utf-8")
+    text = source.read_text(encoding="utf-8")
+    assert "sense_model_" in text and "actuate_model_" in text
+    assert "update_discrete" not in text
+    if initial is None:
+        for out in (cpp_out, python_out):
+            log = np.genfromtxt(out / "ctrl.converter.csv", delimiter=",", names=True)
+            np.testing.assert_array_equal(log["voltage"], np.arange(7.0))
 
 
 def test_generic_cpp_fallback_lowers_custom_equations_and_state_branches(tmp_path):

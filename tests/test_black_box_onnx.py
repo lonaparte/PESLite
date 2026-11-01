@@ -105,11 +105,10 @@ def test_onnx_recurrent_update_is_committed_as_discrete_peslite_state():
         feedthrough=(),
     )
     block.inp.u0, block.inp.u1 = 3.0, 1.0
-    block.start_discrete(0.0)
 
-    pending = block.sample_discrete(0.0)
+    pending = block.next_state(0.0)
     assert block.get_state() == {"hidden_0": 2.0, "hidden_1": -4.0}
-    block.apply_discrete(pending)
+    block.set_state(dict(zip(block.discrete_state_names, pending)))
     block.set_outputs(0.0)
 
     assert block.get_state() == pytest.approx({"hidden_0": 4.0, "hidden_1": -1.0})

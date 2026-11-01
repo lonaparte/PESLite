@@ -812,19 +812,17 @@ class Simulation:
                 if any(key.startswith(f"{name}.meas.") for key in values):
                     self._windows_given.add(name)
             unit.states_loaded()
+        for name, _subsystem in system.event_subsystems:
+            if not values.keys().isdisjoint(self._states.read([name])):
+                self._continued.add(name)
         self._states.load(values, ["solver"])
-        self._continued_discrete = {
-            name for name, _owner in getattr(system.model, "discrete_updates", ())
-            if any(key == name or key.startswith(name + ".") for key in values)
-        }
         return system.model.get_initial_values()
 
     # ------------------------------------------------------------ the loop
-    def _begin_units(self, t: float, plant: Plant) -> None:
-        """Initialize all units through the same state and output boundary used during a run."""
-        for unit in self.system.units.values():
-            unit.begin(t, plant, unit.name in self._continued,
-                       unit.name in self._windows_given)
+    def _begin_event_owners(self, t: float, plant: Plant) -> None:
+        """Initialize every clocked event owner through the common runtime boundary."""
+        for name, owner in (*self.system.units.items(), *self.system.event_subsystems):
+            owner.begin(t, plant, name in self._continued, name in self._windows_given)
         plant.read_state()
 
     def run(self, t_end: float | None = None, *, out_dir: str | Path | None = "output/run",
@@ -901,13 +899,14 @@ class Simulation:
         controls = tuple((unit.name, unit.ctrl) for unit in units if unit.ctrl is not None)
         continuous_controls = tuple((unit_name, ctrl) for unit_name, ctrl in controls
                                     if getattr(ctrl, "continuous", False))
-        # Sampled units' bridge/ADC events and file events change the circuit for every window;
-        # a continuous unit's own clock samples only that unit.
+        # Sampled units, clocked model subsystems and file events change the circuit for every
+        # window; a continuous unit's own clock samples only that unit.
         sampled_units = tuple(unit for unit in units if not unit.continuous)
         clocked_units = tuple(unit for unit in units if unit.continuous)
-        discrete_updates = getattr(mdl, "discrete_updates", ())
-        circuit_clocks = (*[unit.next_time for unit in sampled_units],
-                          *[owner.next_discrete_time for _name, owner in discrete_updates])
+        model_event_owners = tuple(owner for _name, owner in system.event_subsystems)
+        circuit_clocks = tuple(owner.next_time
+                               for owner in (*sampled_units, *model_event_owners))
+        event_owners = (*units, *model_event_owners)
         ctrl_names = {unit_name: getattr(ctrl, "log_names", lambda: ())()
                       for unit_name, ctrl in controls}
         for unit_name, ctrl in controls:
@@ -1081,9 +1080,7 @@ class Simulation:
                     unit.restart_windows(t_now)
 
         # ---------------------------------------------------------------- the event grid
-        for name, owner in discrete_updates:
-            owner.start_discrete(t_start, name in self._continued_discrete)
-        self._begin_units(t_start, plant)
+        self._begin_event_owners(t_start, plant)
         plant.settle = settle_now
         while True:
             plant.inputs_changed = False
@@ -1103,11 +1100,11 @@ class Simulation:
             while observations and observations[0] <= t_stop + TIME_EPS:
                 pending_observations.discard(heapq.heappop(observations))
             event_due = bool(actions and actions[0][0] <= t_stop + TIME_EPS)
-            discrete_due = bool(discrete_updates) and any(
-                owner.next_discrete_time() <= t_stop + TIME_EPS
-                for _name, owner in discrete_updates)
+            model_event_due = bool(model_event_owners) and any(
+                owner.next_time() <= t_stop + TIME_EPS for owner in model_event_owners
+            )
             advancing = t_stop > t_local + TIME_EPS
-            if advancing and advance(t_local, t_stop, event_due or discrete_due):
+            if advancing and advance(t_local, t_stop, event_due or model_event_due):
                 stopped = True
                 break
             if observation_only:
@@ -1134,34 +1131,23 @@ class Simulation:
                         parameters_changed()
                     plant.read_state()
                     plant.inputs_changed = True
-                due_updates = ([owner for _name, owner in discrete_updates
-                                if owner.next_discrete_time() <= t_stop + TIME_EPS]
-                               if discrete_updates else ())
-                if due_updates:
-                    plant.outputs(t_stop)
-                    sampled_updates = [(owner, owner.sample_discrete(t_stop))
-                                       for owner in due_updates]
-                    for owner, values in sampled_updates:
-                        owner.apply_discrete(values)
-                    plant.invalidate()
-                    plant.outputs(t_stop)
-                    plant.inputs_changed = True
-                # Every unit protects first, then every unit samples, then every unit actuates.  This
-                # makes coincident multi-unit events independent of the units' dictionary order.
+                # Every unit protects first, then every event owner samples before any owner
+                # actuates. Coincident updates are therefore independent of assembly order.
                 for unit in units:
                     if unit.protect(t_stop, plant):
                         protection_changed = True
                         stopped = stop_on_trip
                 if stopped:
                     break
-                for unit in units:
-                    done = unit.sense(t_stop, plant)
+                for owner in event_owners:
+                    done = owner.sense(t_stop, plant)
                     if done is not None:
                         k, out = done
                         if out.log is not None:
-                            rec.ctrl_sample(unit.name, t_stop, out.log, record=k % record_every == 0)
-                for unit in units:
-                    if unit.actuate(t_stop, plant):
+                            rec.ctrl_sample(owner.name, t_stop, out.log,
+                                            record=k % record_every == 0)
+                for owner in event_owners:
+                    if owner.actuate(t_stop, plant):
                         protection_changed = True
                         stopped = stop_on_trip
                 if stopped:

@@ -22,14 +22,14 @@ import re
 import weakref
 from collections import Counter, deque
 from dataclasses import dataclass
-from types import SimpleNamespace
+from types import MethodType
 from typing import Any, Callable, ClassVar, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
 
 from . import energy as _energy
-from .timing import PeriodicClock, resolve_clock_offset
+from .timing import TIME_EPS, PeriodicClock
 
 __all__ = ["ConfigError", "LocatedZero", "Bag", "Empty", "OutputMethod", "Subsystem",
            "BlackBoxSubsystem", "Model",
@@ -161,8 +161,10 @@ class Subsystem(Protocol):
         """Time derivatives of the states, in ``state_names`` order."""
 
 
-def _black_box_record(spec: Sequence[str] | Mapping[str, Any], label: str) -> tuple[tuple[str, ...], Any]:
-    """Build one named signal record from names or initial values."""
+def _black_box_record(
+    spec: Sequence[str] | Mapping[str, Any], label: str,
+) -> tuple[tuple[str, ...], Bag]:
+    """Build one named :class:`Bag` record from names or initial values."""
     if isinstance(spec, Mapping):
         entries = tuple(spec.items())
     else:
@@ -170,16 +172,16 @@ def _black_box_record(spec: Sequence[str] | Mapping[str, Any], label: str) -> tu
             raise TypeError(f"{label} must be a sequence of names or a mapping of initial values")
         entries = tuple((name, 0.0) for name in spec)
     names = tuple(name for name, _value in entries)
-    if any(not isinstance(name, str) or not name for name in names):
-        raise ValueError(f"{label} names must be nonempty strings")
+    if any(not isinstance(name, str) or not name.isidentifier() or keyword.iskeyword(name)
+           for name in names):
+        raise ValueError(f"{label} names must be valid identifiers")
     if len(set(names)) != len(names):
         raise ValueError(f"{label} names must be unique")
-    record = SimpleNamespace()
     for name, value in entries:
         if not isinstance(value, numbers.Number):
             raise TypeError(f"{label} field {name!r} must have a scalar numeric initial value")
-        setattr(record, name, value)
-    return names, record
+    record_type = type(f"_BlackBox_{label}", (Bag,), {"__slots__": names})
+    return names, record_type(**dict(entries))
 
 
 def _black_box_values(record: Any, names: Sequence[str]) -> NDArray:
@@ -203,6 +205,10 @@ class BlackBoxSubsystem:
     names the current inputs read by ``output`` and defaults to all inputs. The declaration becomes
     an ordinary :class:`OutputMethod`, so dependency sorting and algebraic-loop handling remain in
     :class:`Model`.
+
+    A discrete model uses the same ``begin``, ``next_time``, ``sense`` and ``actuate`` event phases
+    as a converter unit. The optional energy declaration uses the ordinary
+    :class:`~peslite.solver.energy.Energetic` members, or ``observer=True`` for a non-loading model.
     """
 
     def __init__(
@@ -217,6 +223,11 @@ class BlackBoxSubsystem:
         period: float | None = None,
         offset: float = 0.0,
         feedthrough: Sequence[str] | None = None,
+        observer: bool = False,
+        ports: Sequence[_energy.PowerPort] | None = None,
+        storage: Sequence[_energy.StoragePort] | None = None,
+        dissipated_power: Callable[[Any], float] | None = None,
+        supplied_power: Callable[[Any], float] | None = None,
     ) -> None:
         if not callable(output):
             raise TypeError("output must be callable")
@@ -249,19 +260,33 @@ class BlackBoxSubsystem:
         self._state_names = all_state_names
         self.state_names = all_state_names if continuous else ()
         self.discrete_state_names = all_state_names if discrete else ()
-        self.update_clock = None
-        self._update_index = 0
+        self.clock = None
+        self._clock_index = 0
+        self._pending = None
         self._call_output = output if all_state_names else lambda t, _x, u: output(t, u)
         self._call_rhs = rhs if continuous else None
         self._call_update = update if discrete else None
         if discrete:
             if not math.isfinite(period) or period <= 0.0:
                 raise ValueError("period must be finite and positive")
-            if not math.isfinite(offset):
-                raise ValueError("offset must be finite")
-            self.update_clock = PeriodicClock(period, resolve_clock_offset(period, offset))
+            if not (math.isfinite(offset) and 0.0 <= offset < period):
+                raise ValueError(f"offset must be in [0, period), got {offset}")
+            self.clock = PeriodicClock(period, offset)
         elif offset:
             raise ValueError("offset is only valid for a discrete black box")
+
+        declared = (ports, storage, dissipated_power, supplied_power)
+        if observer:
+            if any(item is not None for item in declared):
+                raise ValueError("an observer black box declares no ports, storage or power")
+            self.observer = True
+        elif any(item is not None for item in declared):
+            def zero_power(_subsystem):
+                return 0.0
+
+            self.ports, self.storage = tuple(ports or ()), tuple(storage or ())
+            self.dissipated_power = MethodType(dissipated_power or zero_power, self)
+            self.supplied_power = MethodType(supplied_power or zero_power, self)
 
         dependencies = self.input_names if feedthrough is None else tuple(feedthrough)
         if len(set(dependencies)) != len(dependencies):
@@ -329,31 +354,37 @@ class BlackBoxSubsystem:
             current = getattr(self.state, name)
             setattr(self.state, name, complex(value) if isinstance(current, complex) else float(value))
 
-    def start_discrete(self, t: float, continued: bool = False) -> None:
-        """Position a discrete model's clock for a fresh or continued run."""
-        if self.update_clock is None:
-            raise TypeError("this black box has no discrete update")
-        self._update_index = int(self.update_clock.start_index(t, continued))
+    def begin(self, t: float, plant: Any, continued: bool, window_given: bool) -> None:
+        """Position the update clock for a fresh or continued run."""
+        self._clock_index = int(self.clock.start_index(t, continued))
+        self._pending = None
 
-    def next_discrete_time(self) -> float:
-        """Return the next periodic state-update time."""
-        if self.update_clock is None:
-            return math.inf
-        return self.update_clock.at(self._update_index)
+    def next_time(self) -> float:
+        """Return the next update time."""
+        return self.clock.at(self._clock_index)
 
-    def sample_discrete(self, t: float) -> NDArray:
-        """Calculate but do not commit the next discrete state."""
+    def next_state(self, t: float) -> NDArray:
+        """Calculate, without committing, the state after the update at ``t``."""
         if self._call_update is None:
             raise TypeError("this black box has no discrete update")
         state, inputs = self._arguments()
         return self._result(self._call_update(t, state, inputs), len(self._state_names), "update")
 
-    def apply_discrete(self, values: Sequence[complex | float]) -> None:
-        """Commit one previously sampled discrete state and advance its clock."""
-        result = self._result(values, len(self._state_names), "update")
-        for name, value in zip(self._state_names, result):
-            setattr(self.state, name, self._scalar(value))
-        self._update_index += 1
+    def sense(self, t: float, plant: Any) -> None:
+        """Sample a due update before any event owner commits at ``t``."""
+        if self.next_time() <= t + TIME_EPS:
+            plant.outputs(t)
+            self._pending = self.next_state(t)
+
+    def actuate(self, t: float, plant: Any) -> bool:
+        """Commit a sampled update as a plant change; a model subsystem never trips."""
+        if self._pending is not None:
+            with plant.change():
+                for name, value in zip(self._state_names, self._pending):
+                    setattr(self.state, name, self._scalar(value))
+            self._pending = None
+            self._clock_index += 1
+        return False
 
 
 # ------------------------------------------------------------------ named states
@@ -1072,16 +1103,6 @@ class Model:
                     f"{type(sub).__name__} does not satisfy the Subsystem protocol "
                     "(needs state/inp/out, state_names, outputs_need_inputs, set_outputs, rhs)")
         self.subsystems: list[Subsystem] = list(subsystems)
-        self.discrete_updates: tuple[tuple[str, Any], ...] = tuple(
-            (name, sub) for name, sub in zip(names, self.subsystems)
-            if getattr(sub, "update_clock", None) is not None
-        )
-        for name, sub in self.discrete_updates:
-            missing = [method for method in ("start_discrete", "next_discrete_time",
-                                              "sample_discrete", "apply_discrete")
-                       if not callable(getattr(sub, method, None))]
-            if missing:
-                raise TypeError(f"{name}: periodic state update is missing {missing}")
         self.connections = dict(connections)
         self.zoh_connections = dict(zoh_connections or {})
         self._zoh_targets: dict[str, list[tuple[Any, str]]] = {}
