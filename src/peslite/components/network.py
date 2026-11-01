@@ -409,12 +409,13 @@ class Element:
     """Base of a registered ``elements`` entry, built as ``cls(name, cfg, buses, p)``.
 
     A type defines ``type`` and a frozen ``Params`` dataclass with a matching ``type`` field.
-    An instance supplies ``subsystems()``, ``connections()`` and ``terminals()``.  Each terminal
-    binds a configured bus name to a :class:`Terminal`; one- and multi-terminal elements use the
-    same interface. Optional ``breakers`` or ``connect()`` enable switching; optional ``retune()``
-    enables runtime parameter changes. Optional ``series_connections()`` maps a bus to an inlet
-    bus: assembly moves the original voltage driver to that inlet, inserting a two-port element
-    before the bus's followers without adding an artificial energy-storage state.
+    An instance supplies ``subsystems()``, ``connections()`` and ``terminals()``. A connection
+    source is another subsystem output or a configured physical-output path resolved by assembly.
+    Each terminal binds a configured bus name to a :class:`Terminal`; one- and multi-terminal
+    elements use the same interface. Optional ``breakers`` or ``connect()`` enable switching;
+    optional ``retune()`` enables runtime parameter changes. Optional ``series_connections()`` maps
+    a bus to an inlet bus: assembly moves the original voltage driver to that inlet, inserting a
+    two-port element before the bus's followers without adding an artificial energy-storage state.
     Optional ``parameter_bindings()`` maps retunable scalar fields to ``(subsystem, attribute)``
     pairs so native export uses the same parameters as Python, including energy equations.
     """

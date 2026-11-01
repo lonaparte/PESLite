@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 plot = ["matplotlib>=3.7"]
-all = ["matplotlib>=3.7"]
+all = ["matplotlib>=3.7", "onnx>=1.17", "onnxruntime>=1.18"]
 test = ["pytest>=7", "matplotlib>=3.7"]
 reference = ["motulator==0.21.0; python_version >= '3.12'"]
 pyspice = ["PySpice==1.5"]

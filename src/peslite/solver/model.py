@@ -352,7 +352,13 @@ class BlackBoxSubsystem:
             raise KeyError(f"unknown discrete black-box states {sorted(unknown)}")
         for name, value in values.items():
             current = getattr(self.state, name)
-            setattr(self.state, name, complex(value) if isinstance(current, complex) else float(value))
+            if isinstance(current, bool):
+                value = bool(value)
+            elif isinstance(current, complex):
+                value = complex(value)
+            else:
+                value = float(value)
+            setattr(self.state, name, value)
 
     def begin(self, t: float, plant: Any, continued: bool, window_given: bool) -> None:
         """Position the update clock for a fresh or continued run."""

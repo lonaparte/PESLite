@@ -92,7 +92,35 @@ Inputs, outputs and states have identifier names and use ordered one-dimensional
 values. `feedthrough` lists the current inputs read while calculating outputs and defaults to all
 inputs; the solver uses it for dependency ordering and algebraic-loop detection.
 
-ONNX Runtime, PyTorch and other runtimes remain outside the core package. Their sessions are called
-through the same array boundary; install `peslite[onnx]` for the optional ONNX dependencies.
-Standalone C++ export supports callables that the scalar equation tracer can lower, but does not
-embed external runtime sessions.
+PyTorch and other runtimes can use this array boundary directly. Standalone C++ export supports
+callables that the scalar equation tracer can lower, but does not embed external runtime sessions.
+
+## ONNX files
+
+Install `peslite[onnx]`, then add an ONNX file as a non-loading element. Tensor names are mapping
+keys; each list maps its flattened values to PESLite signal paths or public scalar outputs:
+
+```yaml
+elements:
+  onnx_model:
+    type: onnx
+    model: models/model.onnx
+    inputs:
+      input: [load.power]
+    outputs:
+      output: [estimate]
+```
+
+Relative model paths start beside the `.pes` file. The output above is available as
+`onnx_model.estimate` for recording, measurement routing and other configured model inputs.
+
+Set `period` to sample the inputs and hold the outputs. Recurrent tensor state is registered as
+PESLite state by mapping each state input to its next-state output:
+
+```yaml
+    period: 100.0e-6
+    state:
+      hidden_in:
+        output: hidden_out
+        initial: [0.0, 0.0]
+```

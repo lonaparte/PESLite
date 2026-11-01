@@ -215,6 +215,23 @@ def test_stateful_black_box_state_is_owned_by_model():
     assert block.out.y == pytest.approx(2.5)
 
 
+def test_discrete_black_box_restores_boolean_state_without_changing_its_type():
+    block = BlackBoxSubsystem(
+        lambda _t, state, _inputs: state,
+        inputs=(),
+        outputs=("enabled",),
+        state={"enabled": False},
+        update=lambda _t, state, _inputs: state,
+        period=1.0,
+        feedthrough=(),
+        observer=True,
+    )
+
+    block.set_state({"enabled": 1.0})
+
+    assert block.get_state()["enabled"] is True
+
+
 def test_vector_state_receives_stable_registered_names():
     block = BlackBoxSubsystem(
         lambda _t, state, _inputs: (state.sum(),),

@@ -20,6 +20,7 @@ from .pwm import (ZOH, CarrierComparison, PWM, PhaseShiftModulator, SwitchingSeq
                   SynchronousCarrier, make_modulator)
 from .wpt import (CompensatedLink, SwitchControlledCapacitor, SwitchedCompensatedLink,
                   make_wpt_link)
+from .onnx import ONNXModel, ONNXStateParams
 
 __all__ = ["Terminal", "ACVoltageSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
            "Bag", "ConfigError", "PowerPort", "StoragePort",
@@ -30,4 +31,5 @@ __all__ = ["Terminal", "ACVoltageSource", "RLBranch", "RCNode", "Element", "ELEM
            "MeasurementPorts", "AveragingModel", "HalfBridge",
            "FullBridge", "HalfBridgeDiodeConduction", "PWM", "SwitchingSequence",
            "CarrierComparison", "SynchronousCarrier", "ZOH", "PhaseShiftModulator", "make_modulator",
-           "CompensatedLink", "SwitchedCompensatedLink", "SwitchControlledCapacitor", "make_wpt_link"]
+           "CompensatedLink", "SwitchedCompensatedLink", "SwitchControlledCapacitor", "make_wpt_link",
+           "ONNXModel", "ONNXStateParams"]
