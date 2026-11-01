@@ -625,6 +625,7 @@ def test_dc_converter_restart_uses_the_common_named_state_contract(tmp_path):
         "units.converter.meas.average": ["current", "voltage", "vin"],
         "units.converter.meas.window": 50.0e-6,
         "simulation.output.period": 5.0e-6,
+        "simulation.output.precision": 17,
     })
     whole_dir = tmp_path / "whole"
     whole = peslite.Simulation(params).run(out_dir=whole_dir)

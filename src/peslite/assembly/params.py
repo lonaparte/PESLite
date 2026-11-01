@@ -52,6 +52,9 @@ __all__ = [
 
 
 _PARAMETER_RECORDER: ContextVar[Any] = ContextVar("peslite_parameter_recorder", default=None)
+_ASSET_DIRECTORY: ContextVar[Optional[Path]] = ContextVar(
+    "peslite_asset_directory", default=None,
+)
 
 
 def _parameterized(factory, parameters):
@@ -363,6 +366,8 @@ class PWMParams:
     ``pattern_sync``: ``"interval"`` applies newly loaded waveform commands
     at the load; ``"pulse"`` lets a pulse in progress finish and starts the new
     pattern at its next pulse.
+    ``dead_time`` delays complementary-device turn-on; ``dead_time_compensation`` adds
+    current-polarity duty-ratio feedforward before the physical dead time.
     """
 
     f_sw: float  # carrier frequency, Hz
@@ -372,6 +377,8 @@ class PWMParams:
     method: str = "spwm"  # "spwm" | "svpwm"
     sync: str = field(default="asynchronous", metadata={"modulator": True})
     pattern_sync: str = "interval"
+    dead_time: float = field(default=0.0, metadata={"structural": True})  # s
+    dead_time_compensation: bool = False
 
     _choices = {"update": ("single", "double"), "method": ("spwm", "svpwm"),
                 "sync": ("asynchronous", "synchronous"), "pattern_sync": ("interval", "pulse")}
@@ -893,6 +900,7 @@ class OutputParams:
 
     period: float = 5e-4  # plant snapshot interval, s
     record_every: int = 1  # keep every n-th controller sample
+    precision: int = 5  # significant digits in CSV history rows
     states: bool = True  # states.csv
     signals: bool = False  # plant.csv and ctrl.<unit>.csv
     energy: bool = False  # energy.csv
@@ -1318,17 +1326,23 @@ def _target_scales(event: Any, parent: dict, base: Any) -> Optional[dict]:
         return scales
 
 
-def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dict], parent: dict) -> dict:
-    """Build a name -> entry mapping; names must be non-empty and contain no dots.
+def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dict], parent: dict,
+                 *, literal_keys: bool = False) -> dict:
+    """Build a name -> entry mapping; scoped names are nonempty and contain no dots.
 
     ``item_cls`` is a dataclass, a raw type, or a registered typed entry (``loop``/``event``).
+    Literal-key mappings preserve nonempty string keys such as external tensor names.
     """
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: expected a mapping of names to entries, got {type(data).__name__}")
     out = {}
     for name, item in data.items():
-        name = str(name)
-        if not name or "." in name:
+        if literal_keys:
+            if not isinstance(name, str) or not name:
+                raise ConfigError(f"{path}: mapping keys must be nonempty strings")
+        else:
+            name = str(name)
+        if not literal_keys and (not name or "." in name):
             raise ConfigError(f"{path}: {name!r} is not a usable name (non-empty, no '.')")
         where = f"{path}.{name}"
         if item_cls == "unit":
@@ -1421,7 +1435,8 @@ def _build_fields(cls, data: dict, path: str, base: Any, scales: Optional[dict],
                 kwargs[f.name] = _build(inner, value, key, base, scales)
             elif get_origin(inner) in (dict, _Mapping):
                 kwargs[f.name] = _build_named(f.metadata.get("entries", get_args(inner)[1]), value, key,
-                                              base, scales, data)
+                                              base, scales, data,
+                                              literal_keys=f.metadata.get("literal_keys", False))
             elif inner is float:
                 if isinstance(value, str):  # YAML 1.1 reads "2.0e6" as a string
                     try:
@@ -1440,6 +1455,14 @@ def _build_fields(cls, data: dict, path: str, base: Any, scales: Optional[dict],
             elif inner is str:
                 if f.name in getattr(cls, "_text", ()) and not isinstance(value, str):
                     raise ConfigError(f"{key}: expected text, got {value!r}")
+                if f.metadata.get("asset"):
+                    if not isinstance(value, str) or not value:
+                        raise ConfigError(f"{key}: expected a nonempty path")
+                    directory = _ASSET_DIRECTORY.get()
+                    asset = Path(value).expanduser()
+                    if directory is not None:
+                        asset = asset if asset.is_absolute() else directory / asset
+                        value = str(asset.resolve())
                 kwargs[f.name] = str(value)
             elif inner is dict:
                 kwargs[f.name] = dict(value)
@@ -1521,7 +1544,8 @@ def runtime_changeable(path: str, p: Params) -> bool:
     for key in keys[:-1]:
         owner = getattr(owner, key) if is_dataclass(owner) else None
     field = owner.__dataclass_fields__.get(keys[-1]) if is_dataclass(owner) else None
-    return field is not None and field.metadata.get("runtime", True)
+    return (field is not None and field.metadata.get("runtime", True)
+            and not field.metadata.get("structural", False))
 
 
 def _event_assignments(p: Params, event: Any):
@@ -1647,18 +1671,20 @@ def load(path: str | Path, initial: str | Path | None = None,
     """
     for prepare in _LOAD_PREPARERS:
         prepare(path)
-    p = from_dict(read_tree(path))
-    if initial is not None:
-        init = read_initial(initial, initial_time)
-        merged = to_dict(p)
-        merged["simulation"]["initial"] = init
-        if merged["simulation"]["t_end"] <= init.get("t", 0.0):
-            # keep the configured duration after the new start time
-            merged["simulation"]["t_end"] = init.get("t", 0.0) + p.simulation.t_end
-        p = from_dict(merged)
-    if overrides:
-        p = p.replace(**overrides)
-    return p
+    token = _ASSET_DIRECTORY.set(Path(path).resolve().parent)
+    try:
+        p = from_dict(read_tree(path))
+        if initial is not None:
+            init = read_initial(initial, initial_time)
+            merged = to_dict(p)
+            merged["simulation"]["initial"] = init
+            if merged["simulation"]["t_end"] <= init.get("t", 0.0):
+                # keep the configured duration after the new start time
+                merged["simulation"]["t_end"] = init.get("t", 0.0) + p.simulation.t_end
+            p = from_dict(merged)
+        return p.replace(**overrides) if overrides else p
+    finally:
+        _ASSET_DIRECTORY.reset(token)
 
 
 def _read(path: Path) -> Any:

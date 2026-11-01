@@ -153,9 +153,9 @@ class ThreePhaseBridge:
                               + complex(-0.5, -math.sqrt(3.0) / 2.0) * c)
 
     @staticmethod
-    def pwm_state(duties):
-        values = tuple(min(1.0, max(0.0, duty)) for duty in duties)
-        return ThreePhaseBridge.switching_state(values)
+    def pole_currents(current):
+        """Currents leaving the three pole midpoints, in modulation-leg order."""
+        return phases(current)
 
     @staticmethod
     def command_duties(output):
@@ -387,7 +387,7 @@ class _BridgeModel:
     def start(self, t: float, sync: tuple[float | None, float | None], continued: bool):
         return self.topology.zero
 
-    def actuate(self, t: float, command: tuple[float, Any] | None,
+    def actuate(self, t: float, command: tuple[float, Any, complex | float] | None,
                 enabled: bool) -> list[Any]:
         self.enabled = bool(enabled)
         return []
@@ -424,6 +424,8 @@ class _SampledModel(_BridgeModel, PWM):
                  load_offset: float, computation: float,
                  carrier_period: float, modulator: Modulator, topology=None, *,
                  pattern_sync: str = "interval",
+                 dead_time: float = 0.0,
+                 dead_time_compensation: bool = False,
                  parallel_capacitance: float = 0.0, on_resistance: float = 0.0) -> None:
         self.pulse_update = None
         self.has_switching_events = not isinstance(modulator, ZOH)
@@ -441,9 +443,11 @@ class _SampledModel(_BridgeModel, PWM):
             carrier_period,
             modulator,
             pattern_sync=pattern_sync,
+            dead_time=0.0 if self.topology.unilateral else dead_time,
+            dead_time_compensation=dead_time_compensation,
+            pole_currents=self.topology.pole_currents,
             duty_names=(self.topology.duty_names + carried if registers is None else tuple(registers)),
             switching_state=self.topology.switching_state,
-            pwm_state=self.topology.pwm_state,
         )
         self.continuous = False
         self.command_registers = (self.topology.command_duties if registers is None
@@ -484,7 +488,7 @@ class _SampledModel(_BridgeModel, PWM):
     def control_due(self, t: float) -> bool:
         return abs(self.t_interrupt - t) < TIME_EPS
 
-    def actuate(self, t: float, command: tuple[float, Any] | None,
+    def actuate(self, t: float, command: tuple[float, Any, Any] | None,
                 enabled: bool) -> list[Any]:
         """Accept one sampled command and return bridge inputs which become active at ``t``.
 
@@ -494,14 +498,14 @@ class _SampledModel(_BridgeModel, PWM):
         """
         changes: list[Any] = []
         if command is not None and self.computation == 0.0:
-            at, output = command
-            self.write(at, self.command_registers(output), bool(output.gates) and enabled,
+            at, registers, output = command
+            self.write(at, registers, bool(output.gates) and enabled,
                        output.theta, output.omega)
         if abs(self.t_load - t) < TIME_EPS:
             changes.append(self.load(t))
         if command is not None and self.computation > 0.0:
-            at, output = command
-            self.write(at, self.command_registers(output), bool(output.gates) and enabled,
+            at, registers, output = command
+            self.write(at, registers, bool(output.gates) and enabled,
                        output.theta, output.omega)
         changes.extend(self.switches(t))
         return changes
@@ -543,13 +547,15 @@ def topology_type(name: str, where: str = "bridge.type") -> type:
 def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None) -> _BridgeModel:
     """Compose a bridge topology with switching, PWM or averaging behavior."""
     topology = topology if topology is not None else make_topology(cfg.bridge)
+    pwm = cfg.pwm
     impedance = {"parallel_capacitance": cfg.bridge.parallel_capacitance,
                  "on_resistance": cfg.bridge.on_resistance}
     if not getattr(topology, "controlled", True):
         if modulator is not None:
             raise ValueError("a diode full-bridge rectifier does not use a PWM modulator")
+        if pwm is not None and (pwm.dead_time > 0.0 or pwm.dead_time_compensation):
+            raise ValueError("PWM dead time requires a controlled bridge")
         return _BridgeModel(topology, switching=True, **impedance)
-    pwm = cfg.pwm
     if cfg.bridge.model == "averaging":
         if modulator is not None:
             raise ValueError("an averaging bridge does not use a PWM modulator")
@@ -562,6 +568,8 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None) -> 
         modulator if modulator is not None else make_unit_modulator(cfg),
         topology,
         pattern_sync=pwm.pattern_sync,
+        dead_time=pwm.dead_time,
+        dead_time_compensation=pwm.dead_time_compensation,
         **impedance,
     )
 
@@ -629,9 +637,10 @@ class HalfBridge:
         state = states[0]
         return 1.0 - state if self._reverse_port else state
 
-    def pwm_state(self, duties) -> float:
-        duty = min(1.0, max(0.0, duties[0]))
-        return 1.0 - duty if self._reverse_port else duty
+    def pole_currents(self, current):
+        """Pole current expressed in the commanded leg's orientation."""
+        current = np.real(current)
+        return (-current if self._reverse_port else current,)
 
     @staticmethod
     def command_duties(output):
@@ -673,7 +682,7 @@ class HalfBridge:
 
     def state_from_duty(self, duty: float) -> float:
         """Return the bridge output ratio produced by its controlled device's duty."""
-        return self.pwm_state((duty,))
+        return self.switching_state((min(1.0, max(0.0, duty)),))
 
     @property
     def reverse_port(self) -> bool:
@@ -869,10 +878,10 @@ class FullBridge:
         return states[0] - states[1]
 
     @staticmethod
-    def pwm_state(duties) -> float:
-        left = min(1.0, max(0.0, duties[0]))
-        right = min(1.0, max(0.0, duties[1]))
-        return left - right
+    def pole_currents(current):
+        """Currents leaving the left and right pole midpoints."""
+        current = np.real(current)
+        return current, -current
 
     @staticmethod
     def command_duties(output):

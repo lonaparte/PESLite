@@ -6,6 +6,8 @@ A modulator is called at every load of the compare registers for the interval un
 from __future__ import annotations
 
 import math
+import numbers
+import warnings
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Iterator, Mapping, Optional, Protocol, NamedTuple, runtime_checkable
 
@@ -45,6 +47,36 @@ class SwitchingSequence:
     q_abc: NDArray[np.float64]
 
 
+def _dead_time_shifted_duties(duties, currents, fraction):
+    """Shift each commutating leg by ``fraction * sign(pole current)``.
+
+    Positive ``fraction`` compensates the physical dead time; negative ``fraction`` gives its
+    cycle average. Clamped legs do not commutate. Scalar NumPy operations preserve the expression
+    objects used by native-code exporters.
+    """
+    duties, currents = tuple(duties), tuple(currents)
+    if len(duties) != len(currents):
+        raise ValueError(
+            f"dead time expected {len(duties)} pole currents, got {len(currents)}"
+        )
+    corrected = []
+    for duty, current in zip(duties, currents):
+        if all(isinstance(value, numbers.Real) for value in (duty, current, fraction)):
+            value = duty
+            if 0.0 < duty < 1.0:
+                value += fraction * (int(current > 0.0) - int(current < 0.0))
+            corrected.append(min(1.0, max(0.0, value)))
+            continue
+        polarity = np.where(current > 0.0, 1.0, np.where(current < 0.0, -1.0, 0.0))
+        correction = np.where(
+            duty > 0.0,
+            np.where(duty < 1.0, fraction * polarity, 0.0),
+            0.0,
+        )
+        corrected.append(np.minimum(1.0, np.maximum(0.0, duty + correction)).item())
+    return tuple(corrected)
+
+
 def _switching_sequence(span, min_interval, word, changes) -> SwitchingSequence:
     """Apply time-ordered ``(time, positions, values)`` changes to ``word`` over ``span``.
 
@@ -79,6 +111,7 @@ class Modulator(Protocol):
 
     carried: tuple[str, ...] = ()  # controller outputs passed after the modulated registers
     config_fields = frozenset(("carrier_phase", "sync"))  # the pwm options the modulator reads
+    duty_ratio_commands = True
 
     def __call__(self, t: float, T: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence: ...
@@ -206,6 +239,138 @@ class PulseSequence:
             (at, self.groups[index], value) for at, index, value in sorted(changes)))
 
 
+class _DeadTimeSequence:
+    """Apply current-directed dead time to an arbitrary leg switching sequence.
+
+    Positive pole current is clamped to the lower rail while both gates are off; negative pole
+    current is clamped to the upper rail. Delayed turn-ons crossing a register-load boundary are
+    retained as PWM state, so continuation does not depend on the output interval.
+    """
+
+    def __init__(self, delay: float, width: int, min_interval: float = 0.0) -> None:
+        self.delay = _real(delay)
+        self.min_interval = _real(min_interval)
+        self.entry = self.next = (0.0,) * width
+        # -1 distinguishes both gates blocked from the lower-device command 0.
+        self.command = self.next_command = (-1.0,) * width
+        self.remaining = self.next_remaining = (0.0,) * width
+        self.direction = (0.0,) * width
+        self.time = None
+        self.restored = False
+
+    @property
+    def discrete_state_names(self) -> tuple[str, ...]:
+        width = len(self.entry)
+        return (*(f"dead_time.output_{k}" for k in range(width)),
+                *(f"dead_time.command_{k}" for k in range(width)),
+                *(f"dead_time.remaining_{k}" for k in range(width)),
+                *(f"dead_time.direction_{k}" for k in range(width)))
+
+    def get_state(self) -> dict[str, float]:
+        return {
+            **{f"dead_time.output_{k}": _real(value) for k, value in enumerate(self.entry)},
+            **{f"dead_time.command_{k}": _real(value) for k, value in enumerate(self.command)},
+            **{f"dead_time.remaining_{k}": _real(value)
+               for k, value in enumerate(self.remaining)},
+            **{f"dead_time.direction_{k}": _real(value)
+               for k, value in enumerate(self.direction)},
+        }
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        unknown = set(values) - set(self.get_state())
+        if unknown:
+            raise KeyError(f"dead time: unknown state(s) {sorted(unknown)}")
+
+        def restored(field, current):
+            return tuple(float(values.get(f"dead_time.{field}_{k}", value))
+                         for k, value in enumerate(current))
+
+        self.entry = restored("output", self.entry)
+        self.command = restored("command", self.command)
+        self.remaining = restored("remaining", self.remaining)
+        self.direction = restored("direction", self.direction)
+        self.time, self.restored = None, True
+
+    @staticmethod
+    def _sign(value: Any) -> int:
+        value = float(np.real(value))
+        return int(value > 0.0) - int(value < 0.0)
+
+    def __call__(self, t: float, span: float, sequence: SwitchingSequence,
+                 currents, *, enabled: bool) -> SwitchingSequence:
+        """Return the electrically effective leg states for one register interval."""
+        currents = tuple(currents)
+        width = len(self.entry)
+        if len(currents) != width:
+            raise ValueError(f"dead time expected {width} pole currents, got {len(currents)}")
+        restoring = self.restored
+        if self.time != t:
+            if not restoring:
+                self.entry, self.command, self.remaining = (
+                    self.next, self.next_command, self.next_remaining)
+            self.time, self.restored = t, False
+        if not enabled:
+            zero = (0.0,) * width
+            self.next = zero
+            self.next_command = (-1.0,) * width
+            self.next_remaining = zero
+            return SwitchingSequence(np.asarray([span]), np.asarray([zero]))
+
+        raw = np.asarray(sequence.q_abc, dtype=float)
+        starts = np.r_[0.0, np.cumsum(np.asarray(sequence.dt, dtype=float))[:-1]]
+        directions = self.direction if restoring else tuple(self._sign(value) for value in currents)
+        self.direction = directions
+        changes: list[tuple[float, tuple[int], tuple[float]]] = []
+        next_output, next_command, next_remaining = [], [], []
+        for leg in range(width):
+            actual, command = self.entry[leg], self.command[leg]
+            remaining = max(0.0, self.remaining[leg])
+            sign = int(directions[leg])
+            clamp = 0.0 if sign > 0 else 1.0 if sign < 0 else command
+            due = remaining if remaining > TIME_EPS else math.inf
+            if due < math.inf and command == clamp:
+                if actual != command:
+                    changes.append((0.0, (leg,), (command,)))
+                actual, due = command, math.inf
+
+            commands = []
+            previous = command
+            for at, word in zip(starts, raw):
+                target = float(word[leg])
+                if target != previous:
+                    commands.append((float(at), target))
+                    previous = target
+            index = 0
+            while index < len(commands) or due <= span + TIME_EPS:
+                command_at = commands[index][0] if index < len(commands) else math.inf
+                if command_at <= due + TIME_EPS:
+                    at, command = commands[index]
+                    index += 1
+                    due = math.inf
+                    clamp = 0.0 if sign > 0 else 1.0 if sign < 0 else command
+                    next_actual = clamp
+                    if command != clamp:
+                        due = at + self.delay
+                    if next_actual != actual:
+                        changes.append((at, (leg,), (next_actual,)))
+                        actual = next_actual
+                else:
+                    at = due
+                    due = math.inf
+                    if actual != command:
+                        changes.append((at, (leg,), (command,)))
+                        actual = command
+            next_output.append(actual)
+            next_command.append(command)
+            next_remaining.append(max(0.0, due - span) if due < math.inf else 0.0)
+
+        self.next = tuple(next_output)
+        self.next_command = tuple(next_command)
+        self.next_remaining = tuple(next_remaining)
+        return _switching_sequence(
+            span, self.min_interval, list(self.entry), sorted(changes, key=lambda item: item[0]))
+
+
 class PWM:
     """Carrier timer, compare registers and switching schedule.
 
@@ -220,9 +385,11 @@ class PWM:
                  load_offset: float, computation: float,
                  carrier_period: float, modulator: Modulator, *,
                  pattern_sync: str = "interval",
+                 dead_time: float = 0.0,
+                 dead_time_compensation: bool = False,
+                 pole_currents: Callable[[Any], Any] | None = None,
                  duty_names: tuple[str, ...],
-                 switching_state: Callable[[Any], Any],
-                 pwm_state: Callable[[Any], Any]) -> None:
+                 switching_state: Callable[[Any], Any]) -> None:
         if not math.isfinite(computation) or computation < 0.0:
             raise ValueError(f"the computation time must be finite and >= 0, got {computation}")
         self.control_clock = PeriodicClock(_real(period), _real(control_offset))
@@ -236,15 +403,34 @@ class PWM:
             raise ValueError("PWM register names must be unique")
         self._width = len(self._names) - 1
         self.modulation_width = self._width - len(modulator.carried)
-        self._switching_state, self._pwm_state = switching_state, pwm_state
+        switching_width = getattr(modulator, "switching_legs", self.modulation_width)
+        if not math.isfinite(dead_time) or dead_time < 0.0:
+            raise ValueError(f"dead time must be finite and nonnegative, got {dead_time}")
+        if dead_time >= 0.5 * self.carrier_period:
+            raise ValueError("dead time must be shorter than half a switching period")
+        if type(dead_time_compensation) is not bool:
+            raise TypeError("dead_time_compensation must be bool")
+        if dead_time > 0.0 and pole_currents is None:
+            raise TypeError("dead time requires the topology's pole-current mapping")
+        if dead_time_compensation and not getattr(modulator, "duty_ratio_commands", False):
+            raise TypeError(
+                f"{type(modulator).__name__} does not accept duty-ratio dead-time compensation"
+            )
+        self.dead_time = _real(dead_time)
+        self.dead_time_compensation = dead_time_compensation and dead_time > 0.0
+        self._pole_currents = pole_currents
+        self._dead_time_sequence = (_DeadTimeSequence(
+            dead_time, switching_width, getattr(modulator, "min_interval", 0.0),
+        ) if dead_time > 0.0 and not isinstance(modulator, ZOH) else None)
+        self._switching_state = switching_state
         if pattern_sync not in ("interval", "pulse"):
             raise ValueError(f"pattern_sync must be 'interval' or 'pulse', got {pattern_sync!r}")
-        self.pulse_update = (PulseSequence(modulator, getattr(modulator, "switching_legs", self.modulation_width))
+        self.pulse_update = (PulseSequence(modulator, switching_width)
                              if pattern_sync == "pulse" and not isinstance(modulator, ZOH) else None)
         self.modulator = modulator
         registers = {*self._names, *(f"shadow.{name}" for name in self._names)}
-        if overlap := registers & self._modulator_state().keys():
-            raise ValueError(f"PWM registers conflict with modulator states: {sorted(overlap)}")
+        if overlap := registers & self._timing_state().keys():
+            raise ValueError(f"PWM registers conflict with timing states: {sorted(overlap)}")
         self.k = self.j = 0
         self.t_interrupt, self.t_load = self.interrupt(0), self.load_time(0)
         self.active = self.shadow = (0.0,) * (self._width + 1)
@@ -297,8 +483,11 @@ class PWM:
 
     def describe(self) -> str:
         double = self.load_period < 0.75 * self.carrier_period
+        dead_time = (f", dead time {self.dead_time * 1e9:g} ns"
+                     + (" compensated" if self.dead_time_compensation else "")
+                     if self.dead_time else "")
         return (f"control {1e-3 / self.period:g} kHz, computation {self.computation * 1e6:g} us, "
-                f"{'double' if double else 'single'} update")
+                f"{'double' if double else 'single'} update{dead_time}")
 
     def _word(self, registers, on: bool) -> tuple[float, ...]:
         # Registers are scalar values, not a numerical vector operation. Preserve each
@@ -372,7 +561,30 @@ class PWM:
         self.schedule.clear()
         self.next_switch = math.inf
         values = np.asarray(d[:self.modulation_width], dtype=float)
-        return self._pwm_state(values)
+        if self.dead_time > 0.0:
+            values = self._dead_time_average(values, self._pole_currents(self.inp.i_c))
+        return self._held_state(values)
+
+    def _dead_time_average(self, duties, currents):
+        """Apply the cycle-averaged loss of physical dead time."""
+        return _dead_time_shifted_duties(
+            duties, currents, -self.dead_time / self.carrier_period,
+        )
+
+    def compensated(self, registers, current):
+        """Apply duty-ratio dead-time feedforward from one sampled bridge current."""
+        if not self.dead_time_compensation:
+            return registers
+        width = self.modulation_width
+        duties = _dead_time_shifted_duties(
+            registers[:width], self._pole_currents(current),
+            self.dead_time / self.carrier_period,
+        )
+        return (*duties, *registers[width:])
+
+    def _held_state(self, duties):
+        """Map duty ratios limited to [0, 1] through the topology switching law."""
+        return self._switching_state(tuple(min(1.0, max(0.0, duty)) for duty in duties))
 
     def _switching_interval(self, t_l: float, d: NDArray[np.float64], t_now: float):
         theta, omega = self.sync
@@ -383,6 +595,11 @@ class PWM:
         if phase_clock is not None:
             self._phase_clock = phase_clock(t_l, theta, omega, registers=values)
         seq = self._sequence(t_l, self.load_period, values, theta, omega)
+        if self._dead_time_sequence is not None:
+            seq = self._dead_time_sequence(
+                t_l, self.load_period, seq, self._pole_currents(self.inp.i_c),
+                enabled=self.on,
+            )
         dt = np.asarray(seq.dt, dtype=float).tolist()
         states = np.asarray(seq.q_abc, dtype=float).tolist()
         self.load_end = t_l + self.load_period
@@ -419,14 +636,27 @@ class PWM:
         """Active value of one compare register."""
         return float(self.active[self._names.index(name)])
 
-    def _modulator_state(self) -> dict[str, Any]:
-        read = getattr(self.pulse_update or self._modulator, "get_state", None)
-        return dict(read()) if read is not None else {}
+    def _timing_state_owners(self) -> tuple[Any, ...]:
+        owners = [self.pulse_update or self._modulator]
+        if self._dead_time_sequence is not None:
+            owners.append(self._dead_time_sequence)
+        return tuple(owners)
+
+    def _timing_state(self) -> dict[str, Any]:
+        state: dict[str, Any] = {}
+        for owner in self._timing_state_owners():
+            read = getattr(owner, "get_state", None)
+            values = dict(read()) if read is not None else {}
+            if overlap := state.keys() & values.keys():
+                raise ValueError(f"PWM timing states conflict: {sorted(overlap)}")
+            state.update(values)
+        return state
 
     def _declared_registers(self, kind: str) -> tuple[str, ...]:
         """Register and modulator states a modulator declares as ``kind`` (discrete, angle)."""
         registers = getattr(self._modulator, f"{kind}_registers", ())
-        own = getattr(self.pulse_update or self._modulator, f"{kind}_state_names", ())
+        own = tuple(name for owner in self._timing_state_owners()
+                    for name in getattr(owner, f"{kind}_state_names", ()))
         return (*registers, *(f"shadow.{name}" for name in registers), *own)
 
     @property
@@ -441,21 +671,25 @@ class PWM:
         state = {f"{head}{name}": (bool(word[k]) if name == "on" else _real(word[k]))
                  for head, word in (("", self.active), ("shadow.", self.shadow))
                  for k, name in enumerate(self._names)}
-        state.update(self._modulator_state())
+        state.update(self._timing_state())
         return state
 
     def set_state(self, values: Mapping[str, Any]) -> None:
-        own = set(self._modulator_state())
-        names = set(self.get_state())
+        timing = self._timing_state()
+        names = set(timing)
+        names.update(f"{head}{name}" for head in ("", "shadow.") for name in self._names)
         unknown = set(values) - names
         if unknown:
             raise KeyError(f"PWM registers: no state(s) {sorted(unknown)}; known: {sorted(names)}")
-        if own & set(values):
-            (self.pulse_update or self._modulator).set_state(
-                {key: value for key, value in values.items() if key in own})
+        for owner in self._timing_state_owners():
+            read = getattr(owner, "get_state", None)
+            owned = set(read()) if read is not None else set()
+            selected = {key: value for key, value in values.items() if key in owned}
+            if selected:
+                owner.set_state(selected)
         active, shadow = list(self.active), list(self.shadow)
         for key, value in values.items():
-            if key in own:
+            if key in timing:
                 continue
             head, _, name = key.rpartition(".")
             k = self._names.index(name)
@@ -724,6 +958,7 @@ class PhaseShiftModulator:
     config_fields = frozenset()
     pulse_groups = ((0, 1),)
     supported_models = frozenset(("switching",))
+    duty_ratio_commands = False
     switching_legs = 2
     phase_register = "phase"
 
@@ -823,7 +1058,7 @@ def modulator_type(pwm, model, kind=None):
     return SynchronousCarrier if pwm.sync == "synchronous" else CarrierComparison
 
 
-def validate_modulator(unit, topology, where):
+def validate_modulator(unit, topology, where, *, dead_time_active=True):
     if unit.pwm is None:
         return
     cls = modulator_type(unit.pwm, unit.bridge.model, control_type(unit.ctrl.type).modulator)
@@ -832,10 +1067,18 @@ def validate_modulator(unit, topology, where):
     legs = getattr(cls, "switching_legs", None)
     if legs is not None and len(topology.voltage_factors) != legs:
         raise ConfigError(f"{where}.bridge: {cls.__name__} requires {legs} switching legs")
+    if (dead_time_active and unit.pwm.dead_time_compensation
+            and not getattr(cls, "duty_ratio_commands", False)):
+        raise ConfigError(
+            f"{where}.pwm.dead_time_compensation: {cls.__name__} does not use duty-ratio commands"
+        )
     for item in fields(unit.pwm):
         if (item.metadata.get("modulator") and item.name not in cls.config_fields
                 and getattr(unit.pwm, item.name) != item.default):
-            raise ConfigError(f"{where}.pwm.{item.name} does not apply to {cls.__name__}")
+            warnings.warn(
+                f"{where}.pwm.{item.name} is ignored by {cls.__name__}",
+                stacklevel=4,
+            )
 
 
 def make_modulator(pwm: Any, f0: float, bridge: Any, kind: str | None = None,

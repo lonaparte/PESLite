@@ -65,11 +65,12 @@ def test_single_phase_source_cpp_export_matches_python(tmp_path):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
-    params = from_dict(_rectifier_tree())
+    params = from_dict(_rectifier_tree()).replace(**{"simulation.output.signals": True})
     _source, cpp_out, python_out = _run_generated(params, tmp_path / "rectifier", compiler)
-    assert _final_csv(cpp_out / "states.csv") == pytest.approx(
-        _final_csv(python_out / "states.csv"), rel=1.0e-9, abs=1.0e-10
-    )
+    for filename in ("states.csv", "plant.csv"):
+        assert _final_csv(cpp_out / filename) == pytest.approx(
+            _final_csv(python_out / filename), rel=1.0e-9, abs=1.0e-10
+        )
 
 
 def test_ac_source_cannot_connect_to_the_converter_dc_port():

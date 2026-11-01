@@ -29,6 +29,7 @@ nav:
       - Bridge and PWM: Bridge-and-PWM.md
       - Voltage-Source Converters: Voltage-Source-Converters.md
       - DC converters and WPT: DC-Converters-and-WPT.md
+      - Black-box Models: Black-Box-Models.md
   - Advanced:
       - Architecture: Architecture.md
       - Plotting: Plotting.md

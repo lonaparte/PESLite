@@ -17,6 +17,7 @@ import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import from_dict
 from peslite.components import Bag, Element, Terminal, register_element_type
+from peslite.solver import BlackBoxSubsystem
 from peslite.solver.simulation import convert_main
 from test_measurement_network import load_case
 
@@ -91,6 +92,87 @@ class _ConditionalElement(Element):
                 f"{self.name}.i_mag": abs(self.model.out.i)}
 
 
+@register_element_type
+class _BlackBoxElement(Element):
+    type = "test_black_box"
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        decay: float
+        initial: float
+        type: str = "test_black_box"
+
+    def __init__(self, name, cfg, buses, p):
+        self.name = name
+        self.model = BlackBoxSubsystem(
+            lambda _t, state, _inputs: state,
+            inputs=(),
+            outputs=("y",),
+            state={"x": cfg.initial},
+            rhs=lambda _t, state, _inputs: -cfg.decay * state,
+            feedthrough=(),
+            observer=True,
+        )
+
+    def subsystems(self):
+        return {self.name: self.model}
+
+    def connections(self):
+        return {}
+
+    def terminals(self):
+        return ()
+
+    def signals(self):
+        return {f"{self.name}.y": self.model.out.y}
+
+
+@register_element_type
+class _DiscreteBlackBoxElement(Element):
+    type = "test_discrete_black_box"
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: float
+        increment: float
+        initial: float
+        type: str = "test_discrete_black_box"
+
+    def __init__(self, name, cfg, buses, p):
+        self.name = name
+        self.model = BlackBoxSubsystem(
+            lambda _t, state, _inputs: state,
+            inputs=(),
+            outputs=("y",),
+            state={"hidden": cfg.initial},
+            update=lambda _t, state, _inputs: state + cfg.increment,
+            period=cfg.period,
+            feedthrough=(),
+            observer=True,
+        )
+        self.lag = BlackBoxSubsystem(
+            lambda _t, state, _inputs: state,
+            inputs=("y",),
+            outputs=("z",),
+            state={"z": 0.0},
+            rhs=lambda _t, state, inputs: inputs - state,
+            feedthrough=(),
+            observer=True,
+        )
+
+    def subsystems(self):
+        return {self.name: self.model, f"{self.name}.lag": self.lag}
+
+    def connections(self):
+        return {(self.lag, "y"): (self.model, "y")}
+
+    def terminals(self):
+        return ()
+
+    def signals(self):
+        return {f"{self.name}.y": self.model.out.y}
+
+
 def _compiler() -> str | None:
     return next((path for name in ("c++", "g++", "clang++")
                  if (path := shutil.which(name)) is not None), None)
@@ -105,8 +187,8 @@ def _final_csv(path: Path) -> dict[str, float]:
         return {key: float(value) for key, value in list(csv.DictReader(stream))[-1].items()}
 
 
-def _run_generated(params, project: Path, compiler: str):
-    peslite.export(params, "cpp", project, name=project.name)
+def _run_generated(params, project: Path, compiler: str, *, variables=()):
+    peslite.export(params, "cpp", project, name=project.name, variables=variables)
     source = project / "peslite.cpp"
     executable = project / "peslite"
     subprocess.run(
@@ -192,6 +274,67 @@ def test_export_preserves_system_factories_without_mutating_the_caller(tmp_path)
     actual = _final_csv(tmp_path / "native" / "states.csv")
     np.testing.assert_allclose([actual[key] for key in expected], list(expected.values()),
                                rtol=2e-9, atol=2e-8)
+
+
+@pytest.mark.parametrize("mode", ("switching", "pwm_averaging"))
+@pytest.mark.parametrize("compensation", (False, True), ids=("uncompensated", "compensated"))
+def test_generated_cpp_matches_current_directed_pwm_dead_time(mode, compensation, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = _quick(mode).replace(**{
+        "units.vsc.pwm.dead_time": 1.0e-6,
+        "units.vsc.pwm.dead_time_compensation": compensation,
+        "simulation.t_end": 0.2003,
+        "simulation.output.period": 5.0e-6,
+        "simulation.output.signals": True,
+    })
+
+    source, cpp_out, python_out = _run_generated(
+        params, tmp_path / f"dead-time-{mode}-{compensation}", compiler,
+        variables=("all",) if compensation else (),
+    )
+
+    for filename in ("states.csv", "plant.csv"):
+        actual = np.genfromtxt(cpp_out / filename, delimiter=",", names=True)
+        expected = np.genfromtxt(python_out / filename, delimiter=",", names=True)
+        assert actual.dtype.names == expected.dtype.names
+        for column in expected.dtype.names:
+            np.testing.assert_allclose(actual[column], expected[column], rtol=2e-7, atol=2e-7,
+                                       equal_nan=True, err_msg=f"{mode}:{filename}:{column}")
+    text = source.read_text(encoding="utf-8")
+    assert ("DeadTimeSequenceState" in text) == (mode == "switching")
+
+
+def test_generated_cpp_matches_dc_dead_time_compensation(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "buck-example.pes").replace(**{
+        "units.converter.bridge.type": "full_bridge",
+        "units.converter.bridge.lower_controlled": True,
+        "units.converter.pwm.dead_time": 1.0e-6,
+        "units.converter.pwm.dead_time_compensation": True,
+        "units.converter.ctrl.references.voltage": 12.0,
+        "simulation.t_end": 0.002,
+        "simulation.output.signals": True,
+        "simulation.energy_check": "off",
+    })
+
+    _source, cpp_out, python_out = _run_generated(
+        params, tmp_path / "dc-dead-time-compensation", compiler,
+    )
+
+    for filename in ("states.csv", "plant.csv"):
+        actual = _final_csv(cpp_out / filename)
+        expected = _final_csv(python_out / filename)
+        assert actual.keys() == expected.keys()
+        np.testing.assert_allclose(
+            [actual[name] for name in actual],
+            [expected[name] for name in expected],
+            rtol=2e-8,
+            atol=2e-8,
+        )
 
 
 def test_export_rejects_unrebuildable_instances_before_creating_files(tmp_path):
@@ -969,6 +1112,91 @@ def test_generated_cpp_runs_custom_cable_equations(tmp_path):
     assert {"cable1.i1_a", "cable1.i2_a"} <= actual_plant.keys()
 
 
+def test_generated_cpp_runs_black_box_outputs_and_peslite_state_equations(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = from_dict({
+        "base": {"s_base": 1.0},
+        "elements": {
+            "model": {"type": "test_black_box", "decay": 4.0, "initial": 3.0},
+        },
+        "simulation": {
+            "t_end": 0.02,
+            "solver": {"type": "fixed", "method": "rk4", "dt": 1.0e-4,
+                       "linearisations": 0},
+            "output": {"period": 1.0e-3, "signals": True},
+            "energy_check": "strict",
+        },
+    })
+
+    source, cpp_out, python_out = _run_generated(params, tmp_path / "black-box", compiler)
+
+    cpp_state = _final_csv(cpp_out / "states.csv")
+    python_state = _final_csv(python_out / "states.csv")
+    assert cpp_state["model.x"] == pytest.approx(python_state["model.x"], rel=2e-10)
+    assert cpp_state["model.x"] == pytest.approx(3.0 * np.exp(-0.08), rel=1e-10)
+    cpp_plant = _final_csv(cpp_out / "plant.csv")
+    python_plant = _final_csv(python_out / "plant.csv")
+    assert cpp_plant["model.y"] == pytest.approx(python_plant["model.y"], rel=2e-10)
+    text = source.read_text(encoding="utf-8")
+    assert "dy[0]" in text and "model.y" in text
+
+
+@pytest.mark.parametrize(("initial", "t_end", "expected"), [
+    ({}, 2.1e-3, 3.0),
+    ({"t": 2.0e-3, "states": {"model.hidden": 7.0}}, 3.1e-3, 8.0),
+    ({"t": 0.0, "states": {"model.lag.z": 0.5}}, 2.1e-3, 3.0),
+    (None, 3.01e-4, 7.0),
+])
+def test_generated_cpp_runs_discrete_black_box_state_updates(tmp_path, initial, t_end, expected):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    model = {"type": "test_discrete_black_box", "increment": 1.0, "initial": 0.0}
+    if initial is None:
+        params = peslite.load(EXAMPLES / "buck-example.pes").replace(**{
+            "elements.model": {**model, "period": 5.0e-5},
+            "units.converter.meas.sources": {"voltage": "model.y"},
+            "simulation.t_end": t_end,
+            "simulation.output.signals": True,
+            "simulation.output.record_every": 1,
+            "simulation.energy_check": "off",
+        })
+    else:
+        params = from_dict({
+            "base": {"s_base": 1.0},
+            "elements": {"model": {**model, "period": 1.0e-3}},
+            "simulation": {
+                "t_end": t_end,
+                "initial": initial,
+                "solver": {"type": "fixed", "method": "rk4", "dt": 1.0e-4,
+                           "linearisations": 0},
+                "output": {"period": 1.0e-3, "signals": True},
+                "energy_check": "strict",
+            },
+        })
+
+    source, cpp_out, python_out = _run_generated(
+        params, tmp_path / f"discrete-black-box-{expected:g}", compiler
+    )
+
+    cpp_state = _final_csv(cpp_out / "states.csv")
+    python_state = _final_csv(python_out / "states.csv")
+    assert cpp_state["model.hidden"] == pytest.approx(expected)
+    assert cpp_state["model.hidden"] == pytest.approx(python_state["model.hidden"])
+    cpp_plant = _final_csv(cpp_out / "plant.csv")
+    python_plant = _final_csv(python_out / "plant.csv")
+    assert cpp_plant["model.y"] == pytest.approx(python_plant["model.y"])
+    text = source.read_text(encoding="utf-8")
+    assert "sense_model_" in text and "actuate_model_" in text
+    assert "update_discrete" not in text
+    if initial is None:
+        for out in (cpp_out, python_out):
+            log = np.genfromtxt(out / "ctrl.converter.csv", delimiter=",", names=True)
+            np.testing.assert_array_equal(log["voltage"], np.arange(7.0))
+
+
 def test_generic_cpp_fallback_lowers_custom_equations_and_state_branches(tmp_path):
     compiler = _compiler()
     if compiler is None:
@@ -1021,7 +1249,8 @@ def test_generated_cpp_runtime_parameters(tmp_path):
     params = _quick("pwm_averaging")
     project = tmp_path / "runtime-parameters"
     peslite.export(params, "cpp", project, variables=[
-        "simulation.t_end", "units.vsc.ctrl.references.p_ref_pu",
+        "simulation.t_end", "simulation.output.precision",
+        "units.vsc.ctrl.references.p_ref_pu",
     ])
     executable = project / "peslite"
     subprocess.run([compiler, "-O3", "-DNDEBUG", "-std=c++17",
@@ -1030,15 +1259,18 @@ def test_generated_cpp_runtime_parameters(tmp_path):
     listed = subprocess.run([executable, "--list-params"], check=True,
                             capture_output=True, text=True).stdout
     assert "simulation.t_end" in listed
+    assert "simulation.output.precision" in listed
     assert "units.vsc.ctrl.references.p_ref_pu" in listed
 
     output = project / "changed-output"
     subprocess.run([executable,
                     "--set", "simulation.t_end=0.204",
+                    "--set", "simulation.output.precision=7",
                     "--set", "units.vsc.ctrl.references.p_ref_pu=0.25",
                     "--out", output], check=True)
     resolved = peslite.load(output / "simulation.pes")
     assert resolved.simulation.t_end == pytest.approx(0.204)
+    assert resolved.simulation.output.precision == 7
     assert resolved.unit("vsc").ctrl.references.p_ref_pu == pytest.approx(0.25)
 
     config = project / "runtime.pes"

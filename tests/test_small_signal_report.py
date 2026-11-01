@@ -56,7 +56,7 @@ def _linear_sim(*, initial=0.0, growth=-4.0, decay_from_load=False, fail_at=None
 
         retune(params)
         model = Model({"plant": plant}, {})
-        return SimpleNamespace(units={}, model=model, _port_bindings={},
+        return SimpleNamespace(units={}, event_subsystems=(), model=model, _port_bindings={},
                                state_parts=lambda: [("", model)],
                                apply=lambda change: retune(change.params),
                                signals=lambda t: {"plant.signal": plant.out.x})

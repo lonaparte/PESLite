@@ -88,6 +88,7 @@ class Unit(ABC):
     def __init__(self, name: str, cfg: UnitParams, bus: Any) -> None:
         """Bind the identity, event scenario and DC link shared by converter units."""
         self.name, self.cfg, self.bus = name, cfg, bus
+        self._current_channel = unit_type(cfg.type).current_channel
         self.scenario = Scenario(cfg.events, f"units.{name}", initial=cfg.connected)
         self.dclink = _parameterized(lambda c: make_dclink(c.dclink), cfg)
         self.zoh = f"{name}.q"  # model label of the bridge's held switching state
@@ -121,13 +122,12 @@ class Unit(ABC):
 
         self.clock = _parameterized(sampling_clock, (self.cfg, sim))
         self._clock_index = 0
-        self._clock_time = math.inf
         self.protection = _parameterized(lambda values: Protection(
             values[0].protection, sampling_clock(values).period, current_base(values[0]),
             rms_available=bool(values[0].meas.rms)), (self.cfg, sim))
         self._trip_due = False
         self._track_due = False
-        self._write_due: Optional[tuple[float, Any]] = None
+        self._write_due: Optional[tuple[float, Any, Any]] = None
         self._initially_connected = False
         self.breaker = True
         self.gates = False
@@ -239,7 +239,7 @@ class Unit(ABC):
 
     def next_time(self) -> float:
         if self.continuous:
-            next_ = self._clock_time
+            next_ = self.clock.at(self._clock_index)
             return next_ if self.adc is None else min(next_, self.adc.next_time())
         bridge = self.bridge
         next_ = bridge.next_time()
@@ -352,9 +352,7 @@ class Unit(ABC):
         self._track_due = False
         if self.continuous:
             self._start_continuous_bridge(t)
-            index = self.clock.index_after(t) if continued else self.clock.index_at_or_after(t)
-            self._clock_index = int(index)
-            self._clock_time = self.clock.at(self._clock_index)
+            self._clock_index = int(self.clock.start_index(t, continued))
             plant.outputs(t)
             if self.adc is not None:
                 if not self.adc.integration_anchor_restored:
@@ -369,7 +367,7 @@ class Unit(ABC):
     def protect(self, t: float, plant: Plant) -> bool:
         """Run the common fast over-current path at a physical bridge edge or a continuous
         unit's own protection clock."""
-        due = (abs(t - self._clock_time) < TIME_EPS if self.continuous
+        due = (self.clock.due(t, self._clock_index) if self.continuous
                else self.bridge.fast_edge(t))
         if self.tripped or not due:
             return False
@@ -383,7 +381,7 @@ class Unit(ABC):
     def sense(self, t: float, plant: Plant) -> Optional[tuple[int, Any]]:
         """Sample, control and protect one converter through the common runtime path."""
         if self.continuous:
-            clock_due = abs(t - self._clock_time) < TIME_EPS
+            clock_due = self.clock.due(t, self._clock_index)
             adc_due = (self.adc is not None and self.adc.clocked
                        and abs(t - self.adc.next_time()) < TIME_EPS)
             if not clock_due and not adc_due and not self._track_due:
@@ -400,7 +398,6 @@ class Unit(ABC):
             if self.ctrl is not None:
                 self.ctrl.startup.at(t)
             self._clock_index += 1
-            self._clock_time = self.clock.at(self._clock_index)
             if self.adc is not None and not self.adc.clocked:
                 self.adc.sample_rms()
             self._check_sampled_protection(t, self._instantaneous_measurement(t))
@@ -411,7 +408,13 @@ class Unit(ABC):
         self._before_sampled_control(t, measurement)
         output = self.ctrl(t, measurement)
         self._check_sampled_protection(t, measurement, output)
-        self._write_due = (t, output)
+        registers = self.bridge.command_registers(output)
+        if self.bridge.dead_time_compensation:
+            registers = self.bridge.compensated(
+                registers,
+                getattr(measurement, self._current_channel),
+            )
+        self._write_due = (t, registers, output)
         return self.bridge.control_index, output
 
     def actuate(self, t: float, plant: Plant) -> bool:
@@ -571,7 +574,7 @@ class Unit(ABC):
             return
         sample = self._protection_sample(measurement, output)
         if self.protection.rms_enabled:
-            value = self.adc.rms[unit_type(self.cfg.type).current_channel].value
+            value = self.adc.rms[self._current_channel].value
             sample = replace(sample, rms_current_pu=(
                 None if value is None else value / self.protection.i_base
             ))

@@ -34,7 +34,7 @@ def _generator(factory=_Feedback, *, gain=0.0, offset=1.0, variable=("all",), fe
     model = Model({"custom": component},
                   {(component, "x"): (component, "value")} if feedback else {})
     simulation = SimpleNamespace(p=p, system=SimpleNamespace(
-        model=model, units={}, sources={}, named_elements={}))
+        model=model, units={}, sources={}, named_elements={}, event_subsystems=()))
     return _ModelGenerator(simulation, runtime)
 
 

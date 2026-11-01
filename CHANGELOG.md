@@ -102,6 +102,8 @@
 - Names need only be unique within their top-level section, while event targets remain unambiguous.
 - Imperix export rejects an explicit `ctrl.offset` or `meas.offset`: hardware timing comes from
   the binding file's `sampling_phase` on the CLK0 grid.
+- Added `BlackBoxSubsystem` for stateless, continuous or discrete array-valued callables, including
+  optional ONNX Runtime adapters, ordinary energy declarations and shared event phases.
 
 ## 0.3.0
 

@@ -37,6 +37,7 @@ simulation:
   output:
     period: 0.5e-3
     record_every: 10
+    precision: 5
     states: 1
     signals: 0
     energy: 0
@@ -48,6 +49,7 @@ simulation:
   the default measurement and protection clock of a continuous unit
   ([ADC sampling](Bridge-and-PWM.md#adc-sampling)).
 - `record_every` keeps every N-th controller log sample.
+- `precision` sets the significant digits recorded in CSV histories.
 - `states`, `signals` and `energy` enable their corresponding histories.
 - `write_length` is the number of rows buffered per streamed CSV write batch.
 

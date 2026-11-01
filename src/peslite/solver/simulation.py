@@ -51,6 +51,7 @@ __all__ = ["Simulation", "SimulationResult", "Recorder", "main", "convert_main",
 
 
 _UNAVAILABLE = object()
+_RESTART_PRECISION = 17
 
 
 def _optional_output(t: float, name: str, read: Callable, *args):
@@ -244,12 +245,14 @@ class _CSVTable:
     """A fixed-width numeric table flushed to CSV every ``batch_rows`` rows."""
 
     def __init__(self, path: Path, batch_rows: int = 1000,
-                 columns: Iterable[str] | None = None) -> None:
+                 columns: Iterable[str] | None = None, precision: int = 5) -> None:
         self.path = path
         self.batch_rows = batch_rows
+        self.precision = precision
         self.keys: list[str] | None = list(columns) if columns is not None else None
         self.n_rows = 0
         self._pending: list[list[float]] = []
+        self._pending_precision = precision
         self._fh: Any = None
 
     def _open(self) -> None:
@@ -259,15 +262,15 @@ class _CSVTable:
             self._fh = self.path.open("w", newline="")
             self._fh.write(",".join(self.keys) + "\n")
 
-    def append(self, row: Mapping[str, float]) -> None:
+    def append(self, row: Mapping[str, float], *, precision: int | None = None) -> None:
         if self.keys is None:
             self.keys = list(row)
         elif list(row) != self.keys:
             raise RuntimeError("the set of recorded columns changed during the run")
-        self.append_values(row.values())
+        self.append_values(row.values(), precision=precision)
 
-    def append_values(self, values: Iterable[float]) -> None:
-        """Append values already ordered by the fixed table columns."""
+    def append_values(self, values: Iterable[float], *, precision: int | None = None) -> None:
+        """Append ordered values with the requested number of significant digits."""
         if self.keys is None:
             raise RuntimeError("CSV columns must be fixed before ordered values are appended")
         row = values if isinstance(values, list) else list(values)
@@ -276,6 +279,12 @@ class _CSVTable:
                 f"CSV row has {len(row)} values for {len(self.keys)} columns"
             )
         self._open()
+        precision = self.precision if precision is None else precision
+        if not 1 <= precision <= 17:
+            raise ValueError("CSV precision must be between 1 and 17")
+        if self._pending and precision != self._pending_precision:
+            self.flush()
+        self._pending_precision = precision
         self._pending.append(row)
         self.n_rows += 1
         if len(self._pending) == self.batch_rows:
@@ -283,7 +292,8 @@ class _CSVTable:
 
     def flush(self) -> None:
         if self._pending:
-            np.savetxt(self._fh, np.asarray(self._pending), delimiter=",", fmt="%.17g")
+            np.savetxt(self._fh, np.asarray(self._pending), delimiter=",",
+                       fmt=f"%.{self._pending_precision}g")
             self._pending.clear()
 
     def close(self) -> None:
@@ -379,6 +389,7 @@ class Recorder:
         self.last_ctrl_log: dict[str, dict[str, float]] = {}
         self.ctrl_names = {unit: tuple(names) for unit, names in (ctrl_names or {}).items()}
         self._batch_rows = batch_rows
+        self._precision = params.simulation.output.precision
         self._state_columns = ("t", *state_columns)
         self._plant_rows: _PlantRows | None = None
         if out_dir is not None:
@@ -388,12 +399,13 @@ class Recorder:
                      *(f"ctrl.{unit}.csv" for unit, _cfg in _unit_items(params.units))]
             for name in names:
                 (out_dir / name).unlink(missing_ok=True)
-        self._plant = (_CSVTable(out_dir / "plant.csv", batch_rows)
+        self._plant = (_CSVTable(out_dir / "plant.csv", batch_rows, precision=self._precision)
                        if keep_signals and out_dir is not None else None)
         self._ctrl: dict[str, _CSVTable] = {}
-        self._states = (_CSVTable(out_dir / "states.csv", batch_rows, self._state_columns)
+        self._states = (_CSVTable(out_dir / "states.csv", batch_rows, self._state_columns,
+                                  precision=self._precision)
                         if keep_states and out_dir is not None else None)
-        self._energy = (_CSVTable(out_dir / "energy.csv", batch_rows)
+        self._energy = (_CSVTable(out_dir / "energy.csv", batch_rows, precision=self._precision)
                         if keep_energy and out_dir is not None else None)
         self._last_t: float | None = None
         self._final_state_values: list[float] = []
@@ -406,17 +418,18 @@ class Recorder:
         if self._energy is not None:
             self._energy.append({"t": t, **columns})
 
-    def state_row(self, t: float, row: dict[str, float]) -> None:
+    def state_row(self, t: float, row: dict[str, float], *, precision: int | None = None) -> None:
         full = [t, *row.values()]
         if self._states is not None:
-            self._states.append_values(full)
+            self._states.append_values(full, precision=precision)
         self._final_state_values = full
 
-    def snapshot(self, t: float, states: dict[str, float] | None = None) -> None:
+    def snapshot(self, t: float, states: dict[str, float] | None = None, *,
+                 state_precision: int | None = None) -> None:
         """Record the physical time/state independently of optional output calculations."""
         self._last_t = t
         if states is not None:
-            self.state_row(t, states)
+            self.state_row(t, states, precision=state_precision)
 
     def plant_snapshot(self, t: float, signals: dict[str, Any]) -> None:
         if self._plant is not None:
@@ -456,6 +469,7 @@ class Recorder:
         if unit not in self._ctrl:
             self._ctrl[unit] = _CSVTable(
                 self.out_dir / f"ctrl.{unit}.csv", self._batch_rows, ("t", *names),
+                precision=self._precision,
             )
         self._ctrl[unit].append_values([t, *values.values()])
 
@@ -812,15 +826,17 @@ class Simulation:
                 if any(key.startswith(f"{name}.meas.") for key in values):
                     self._windows_given.add(name)
             unit.states_loaded()
+        for name, _subsystem in system.event_subsystems:
+            if not values.keys().isdisjoint(self._states.read([name])):
+                self._continued.add(name)
         self._states.load(values, ["solver"])
         return system.model.get_initial_values()
 
     # ------------------------------------------------------------ the loop
-    def _begin_units(self, t: float, plant: Plant) -> None:
-        """Initialize all units through the same state and output boundary used during a run."""
-        for unit in self.system.units.values():
-            unit.begin(t, plant, unit.name in self._continued,
-                       unit.name in self._windows_given)
+    def _begin_event_owners(self, t: float, plant: Plant) -> None:
+        """Initialize every clocked event owner through the common runtime boundary."""
+        for name, owner in (*self.system.units.items(), *self.system.event_subsystems):
+            owner.begin(t, plant, name in self._continued, name in self._windows_given)
         plant.read_state()
 
     def run(self, t_end: float | None = None, *, out_dir: str | Path | None = "output/run",
@@ -897,10 +913,14 @@ class Simulation:
         controls = tuple((unit.name, unit.ctrl) for unit in units if unit.ctrl is not None)
         continuous_controls = tuple((unit_name, ctrl) for unit_name, ctrl in controls
                                     if getattr(ctrl, "continuous", False))
-        # Sampled units' bridge/ADC events and file events change the circuit for every window;
-        # a continuous unit's own clock samples only that unit.
+        # Sampled units, clocked model subsystems and file events change the circuit for every
+        # window; a continuous unit's own clock samples only that unit.
         sampled_units = tuple(unit for unit in units if not unit.continuous)
         clocked_units = tuple(unit for unit in units if unit.continuous)
+        model_event_owners = tuple(owner for _name, owner in system.event_subsystems)
+        circuit_clocks = tuple(owner.next_time
+                               for owner in (*sampled_units, *model_event_owners))
+        event_owners = (*units, *model_event_owners)
         ctrl_names = {unit_name: getattr(ctrl, "log_names", lambda: ())()
                       for unit_name, ctrl in controls}
         for unit_name, ctrl in controls:
@@ -947,7 +967,8 @@ class Simulation:
                     states = (flatten(state) if state is not None else self._states.read_flat()
                               if rec.keep_states or final else None)
                     if record:
-                        rec.snapshot(t_now, states)
+                        rec.snapshot(t_now, states,
+                                     state_precision=_RESTART_PRECISION if final else None)
             except (OverflowError, FloatingPointError) as exc:
                 if not final:
                     return
@@ -1074,14 +1095,14 @@ class Simulation:
                     unit.restart_windows(t_now)
 
         # ---------------------------------------------------------------- the event grid
-        self._begin_units(t_start, plant)
+        self._begin_event_owners(t_start, plant)
         plant.settle = settle_now
         while True:
             plant.inputs_changed = False
             t_log = n_log * log_period
             circuit_stop = actions[0][0] if actions else math.inf
-            for unit in sampled_units:
-                circuit_stop = min(circuit_stop, unit.next_time())
+            for next_time in circuit_clocks:
+                circuit_stop = min(circuit_stop, next_time())
             physical_stop = circuit_stop
             for unit in clocked_units:
                 physical_stop = min(physical_stop, unit.next_time())
@@ -1094,8 +1115,11 @@ class Simulation:
             while observations and observations[0] <= t_stop + TIME_EPS:
                 pending_observations.discard(heapq.heappop(observations))
             event_due = bool(actions and actions[0][0] <= t_stop + TIME_EPS)
+            model_event_due = bool(model_event_owners) and any(
+                owner.next_time() <= t_stop + TIME_EPS for owner in model_event_owners
+            )
             advancing = t_stop > t_local + TIME_EPS
-            if advancing and advance(t_local, t_stop, event_due):
+            if advancing and advance(t_local, t_stop, event_due or model_event_due):
                 stopped = True
                 break
             if observation_only:
@@ -1122,22 +1146,23 @@ class Simulation:
                         parameters_changed()
                     plant.read_state()
                     plant.inputs_changed = True
-                # Every unit protects first, then every unit samples, then every unit actuates.  This
-                # makes coincident multi-unit events independent of the units' dictionary order.
+                # Every unit protects first, then every event owner samples before any owner
+                # actuates. Coincident updates are therefore independent of assembly order.
                 for unit in units:
                     if unit.protect(t_stop, plant):
                         protection_changed = True
                         stopped = stop_on_trip
                 if stopped:
                     break
-                for unit in units:
-                    done = unit.sense(t_stop, plant)
+                for owner in event_owners:
+                    done = owner.sense(t_stop, plant)
                     if done is not None:
                         k, out = done
                         if out.log is not None:
-                            rec.ctrl_sample(unit.name, t_stop, out.log, record=k % record_every == 0)
-                for unit in units:
-                    if unit.actuate(t_stop, plant):
+                            rec.ctrl_sample(owner.name, t_stop, out.log,
+                                            record=k % record_every == 0)
+                for owner in event_owners:
+                    if owner.actuate(t_stop, plant):
                         protection_changed = True
                         stopped = stop_on_trip
                 if stopped:
@@ -1255,6 +1280,7 @@ class SystemLoop:
         frequency = (sim.p.base.f0 or 0.0) if frame_frequency is None else frame_frequency
         self.w0 = 2.0 * math.pi * frequency
         periods = {value for unit in sim.units.values() for value in unit.periods}
+        periods.update(owner.clock.period for _name, owner in sim.system.event_subsystems)
         control_columns: set[str] = set()
         for name, unit in sim.units.items():
             ctrl = unit.ctrl
@@ -1612,9 +1638,26 @@ def main(argv=None) -> int:
     presets = {"switching": ("fixed", "rk4"), "pwm_averaging": ("fixed", "rk4"), "averaging": ("adaptive", "DP45")}
     model = next((flag for flag in presets if getattr(args, flag)), None)  # each flag names its bridge model
     if model is not None:
-        solver_type, method = presets[model]
-        changes = {f"units.{name}.bridge.model": model for name, _cfg in _unit_items(p.units)
-                   if f"units.{name}.bridge.model" not in set_overrides}
+        effective_models = []
+        for name, cfg in _unit_items(p.units):
+            path = f"units.{name}.bridge.model"
+            selected = cfg.bridge.model
+            if path not in set_overrides:
+                try:
+                    p = p.replace(**{path: model})
+                except ConfigError as exc:
+                    warnings.warn(
+                        f"--{model.replace('_', '-')} does not apply to units.{name}: "
+                        f"{exc}; keeping bridge.model = {selected!r}",
+                        stacklevel=2,
+                    )
+                else:
+                    selected = model
+            effective_models.append(selected)
+        solver_type, method = (presets[model] if all(
+            selected == model for selected in effective_models
+        ) else presets["switching"])
+        changes = {}
         if not _solver_choice_is_set(set_overrides):
             changes.update({
                 "simulation.solver.type": solver_type,

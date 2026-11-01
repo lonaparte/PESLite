@@ -8,6 +8,7 @@ import pytest
 from peslite.addons import components as addon_components
 from peslite.addons import control as addon_control
 from peslite.addons.components.cable import CableModel
+from peslite.assembly.params import runtime_changeable
 from peslite.addons.control.voltage_adaptive_pll import VoltageAdaptivePLL
 from peslite.components import ELEMENT_TYPES
 from peslite.control import LOOP_TYPES, Loop
@@ -254,6 +255,7 @@ def test_custom_cable_gfl_case_runs_in_every_bridge_mode(examples, tmp_path, mod
     simulation = peslite.Simulation(params)
     result = simulation.run(out_dir=tmp_path / model)
 
+    assert not runtime_changeable("elements.cable1.sections", params)
     assert simulation.ph_report.verdict == "port-hamiltonian"
     assert not result.tripped
     assert np.isfinite(result.states["cable1.iL1.re"]).all()

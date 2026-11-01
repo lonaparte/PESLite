@@ -409,6 +409,17 @@ class System:
         subsystems: dict[str, Any] = dict(self.buses)
         _merge_unique(subsystems, assembled.subsystems, "subsystem name")
         connections: dict = {}
+        configured_connections: list[tuple[tuple[Any, str], str, str]] = []
+        connection_targets: set[tuple[Any, str]] = set()
+
+        def claim_connections(targets, where: str) -> None:
+            """Assign each model input to one connection mechanism during assembly."""
+            targets = set(targets)
+            overlap = connection_targets & targets
+            if overlap:
+                raise ConfigError(f"{where}: input target is already driven: {_names(overlap)}")
+            connection_targets.update(targets)
+
         bus_terminals: dict[str, list[Terminal]] = {
             name: [node.terminal] for name, node in self.buses.items()
         }
@@ -475,7 +486,6 @@ class System:
                     )
                 bus_terminals.setdefault(resolve_bus(bus_name), []).append(terminal)
         lowered_buses: dict[str, dict] = {}
-        terminal_targets = set(connections)
         for bus_name, terminals in bus_terminals.items():
             drivers = [terminal for terminal in terminals if terminal.drives_voltage]
             if len(drivers) != 1:
@@ -493,23 +503,15 @@ class System:
             voltage_connections = {}
             for terminal in followers:
                 target = (terminal.subsystem, terminal.voltage)
-                if target in terminal_targets:
-                    raise ConfigError(
-                        f"{type(terminal.subsystem).__name__}.{terminal.voltage} is connected both "
-                        "as an electrical terminal and by connections()"
-                    )
+                claim_connections((target,),
+                                  f"{type(terminal.subsystem).__name__}.{terminal.voltage}")
                 voltage_connections[target] = (
                     driver.subsystem, driver.voltage
                 )
                 terminal.bind_voltage_source(voltage_connections[target])
-                terminal_targets.add(target)
             current_target = (driver.subsystem, driver.current)
-            if current_target in terminal_targets:
-                raise ConfigError(
-                    f"{type(driver.subsystem).__name__}.{driver.current} is connected both as "
-                    "a bus driver and by connections()"
-                )
-            terminal_targets.add(current_target)
+            claim_connections((current_target,),
+                              f"{type(driver.subsystem).__name__}.{driver.current}")
             current_sources = [
                 (
                     terminal.subsystem,
@@ -525,7 +527,10 @@ class System:
                     raise ConfigError(
                         f"bus {bus_name!r}: blocking needs one current-owning terminal "
                         "with a zero-current voltage law")
-                lowered[(driver.subsystem, driver.hold_voltage_input)] = (
+                hold_target = (driver.subsystem, driver.hold_voltage_input)
+                claim_connections((hold_target,),
+                                  f"{type(driver.subsystem).__name__}.{driver.hold_voltage_input}")
+                lowered[hold_target] = (
                     followers[0].hold_voltage_source(
                         getattr(driver.subsystem, "current_constraint", None)))
             if bus_name not in self.buses:
@@ -542,57 +547,72 @@ class System:
                 connections.update(lowered)
         for element in elements:
             own_connections = element.connections()
-            overlap = (set(connections) | terminal_targets) & set(own_connections)
-            if overlap:
-                raise ConfigError(
-                    f"{type(element).__name__}.connections() duplicates an electrical-terminal "
-                    f"target: {[repr(item) for item in overlap]}"
-                )
-            connections.update(own_connections)
+            claim_connections(own_connections, f"{type(element).__name__}.connections()")
+            for target, source in own_connections.items():
+                if isinstance(source, str):
+                    configured_connections.append(
+                        (target, source, f"{type(element).__name__}.connections()")
+                    )
+                else:
+                    connections[target] = source
         for bus_name, lowered in lowered_buses.items():
             if bus_name in self.buses:
                 connections.update(lowered)
         zoh: dict = {}
         for unit in self.units.values():
             own_zoh = unit.zoh_connections()
-            overlap = set(connections) & set(own_zoh)
-            if overlap:
-                raise ConfigError(
-                    "connection target is driven both continuously and through a zero-order "
-                    f"hold: {_names(overlap)}"
-                )
+            claim_connections(own_zoh, f"unit {unit.name!r} zero-order hold")
             _merge_unique(zoh, own_zoh, "zero-order-hold connection target")
-        # Resolve physical measurement outputs once, before Model schedules its dependencies.
+        # Resolve configured physical outputs once, before Model schedules its dependencies.
         port_measurements = {}
+
+        def physical_output(source: str, where: str):
+            owner, separator, output = source.rpartition(".")
+            subsystem = subsystems.get(owner) if separator else None
+            if subsystem is None and owner in network_buses and output in (
+                    "voltage", "current", "power"):
+                bus = resolve_bus(owner)
+                if bus not in port_measurements:
+                    terminal, = (item for item in bus_terminals[bus] if item.drives_voltage)
+                    observer = _PortMeasurement(terminal)
+                    voltage, current = terminal.signal_sources()
+                    # Preserve the domain in record metadata before Model packs the graph.
+                    observer.inp.voltage = getattr(terminal.subsystem.out, terminal.voltage)
+                    observer.inp.current = getattr(terminal.subsystem.inp, terminal.current)
+                    observer.out.voltage = observer.inp.voltage
+                    observer.out.current = observer.inp.current
+                    _merge_unique(subsystems, {f"measurements.{owner}": observer},
+                                  "subsystem name")
+                    claim_connections(((observer, "voltage"), (observer, "current")),
+                                      f"measurement {owner!r}")
+                    connections[(observer, "voltage")] = voltage
+                    connections[(observer, "current")] = current
+                    port_measurements[bus] = observer
+                subsystem = port_measurements[bus]
+            if subsystem is None or not hasattr(subsystem.out, output):
+                raise ConfigError(f"{where}: unknown physical output {source!r}")
+            return subsystem, output
+
+        def connect_source(target: tuple[Any, str], source: str, where: str) -> None:
+            subsystem, output = physical_output(source, where)
+            target_subsystem, target_input = target
+            if not hasattr(target_subsystem.inp, target_input):
+                raise ConfigError(f"{where}: unknown input target {target_input!r}")
+            if (isinstance(getattr(subsystem.out, output), complex)
+                    and not isinstance(getattr(target_subsystem.inp, target_input), complex)):
+                raise ConfigError(f"{where}: a complex output cannot drive a scalar input")
+            connections[target] = (subsystem, output)
+
+        for target, source, where in configured_connections:
+            connect_source(target, source, where)
+
         for unit in self.units.values():
             for channel, source in unit.cfg.meas.sources.items():
-                owner, _, output = source.rpartition(".")
-                subsystem = subsystems.get(owner)
-                if subsystem is None and owner in network_buses and output in (
-                        "voltage", "current", "power"):
-                    bus = resolve_bus(owner)
-                    if bus not in port_measurements:
-                        terminal, = (item for item in bus_terminals[bus] if item.drives_voltage)
-                        observer = _PortMeasurement(terminal)
-                        voltage, current = terminal.signal_sources()
-                        # Preserve the domain in record metadata before Model packs the graph.
-                        observer.inp.voltage = getattr(terminal.subsystem.out, terminal.voltage)
-                        observer.inp.current = getattr(terminal.subsystem.inp, terminal.current)
-                        observer.out.voltage = observer.inp.voltage
-                        observer.out.current = observer.inp.current
-                        _merge_unique(subsystems, {f"measurements.{owner}": observer},
-                                      "subsystem name")
-                        connections[(observer, "voltage")] = voltage
-                        connections[(observer, "current")] = current
-                        port_measurements[bus] = observer
-                    subsystem = port_measurements[bus]
-                if subsystem is None or not hasattr(subsystem.out, output):
-                    raise ConfigError(f"units.{unit.name}.meas.sources.{channel}: "
-                                      f"unknown physical output {source!r}")
+                where = f"units.{unit.name}.meas.sources.{channel}"
+                subsystem, output = physical_output(source, where)
                 if (isinstance(getattr(subsystem.out, output), complex)
                         and not isinstance(unit.ports.value(channel), complex)):
-                    raise ConfigError(f"units.{unit.name}.meas.sources.{channel}: "
-                                      "a complex output cannot drive a scalar channel")
+                    raise ConfigError(f"{where}: a complex output cannot drive a scalar channel")
                 unit.ports.readers[channel] = (
                     lambda sub=subsystem, field=output: getattr(sub.out, field)
                 )
@@ -600,8 +620,21 @@ class System:
                     if not hasattr(unit.ctrl.inp, channel):
                         raise ConfigError(f"units.{unit.name}.meas.sources.{channel}: "
                                           "controller has no matching continuous input")
-                    connections[(unit.ctrl, channel)] = (subsystem, output)
+                    target = (unit.ctrl, channel)
+                    claim_connections((target,), where)
+                    connections[target] = (subsystem, output)
         self.model = Model(subsystems, connections, zoh)
+        self.event_subsystems = tuple(
+            (name, subsystem)
+            for name, subsystem in zip(self.model.names, self.model.subsystems)
+            if getattr(subsystem, "clock", None) is not None
+        )
+        event_methods = ("begin", "next_time", "sense", "actuate")
+        for name, subsystem in self.event_subsystems:
+            missing = [method for method in event_methods
+                       if not callable(getattr(subsystem, method, None))]
+            if missing:
+                raise TypeError(f"{name}: clocked subsystem event interface is missing {missing}")
 
         self.state_aliases: dict[str, str] = {}
         for unit in self.units.values():

@@ -13,6 +13,7 @@ import pytest
 import peslite
 from peslite.assembly import imperix
 from peslite.assembly.imperix_build import build_project
+from peslite.components.converter import make_topology
 from peslite.control.blocks import phases
 from peslite.control.controller import Measurement, VSCController
 from peslite.solver.simulation import convert_main, main
@@ -26,9 +27,11 @@ def _simulation(name="buck"):
     p = peslite.load(EXAMPLES / f"{name.removesuffix('-slow-terminal')}-example.pes")
     values = {"simulation.solver.linearisations": 0, "simulation.initial.states": {}}
     from peslite.assembly.params import _unit_items
-    for key, _ in _unit_items(p.units):
+    for key, unit in _unit_items(p.units):
         values.update({f"units.{key}.bridge.model": "pwm_averaging",
                        f"units.{key}.meas": {}, f"units.{key}.protection": {}})
+        if not make_topology(unit.bridge).unilateral:
+            values[f"units.{key}.pwm.dead_time"] = 1e-7
         if name.endswith("-slow-terminal"):
             values[f"units.{key}.ctrl.loops.CurrentLoop.period"] = 2.0 * p.unit(key).ctrl.period
     return peslite.Simulation(p.replace(**values))
@@ -46,7 +49,7 @@ def _mapping(simulation):
             adc_index += width
         width = len(unit.bridge.topology.duty_names)
         bindings[key] = dict(adc=adc, pwm=list(range(pwm_index, pwm_index + width)),
-                             dead_time=1e-7, startup_ramp=0.0,
+                             startup_ramp=0.0,
                              hardware_overcurrent_configured=True)
         pwm_index += width
     return {"units": bindings}
@@ -123,6 +126,49 @@ def test_generated_controller_matches_python_loops_states_and_duties(name, varia
         np.testing.assert_allclose(a, b, rtol=5e-6, atol=3e-6)
     header = (tmp_path / "peslite_control.hpp").read_text()
     assert not any(text in header for text in ("std::vector", "std::string ", "new ", "rhs("))
+
+
+def test_imperix_dead_time_compensation_preconditions_the_pwm_command(tmp_path):
+    base = _simulation("gfl")
+    sim = peslite.Simulation(base.p.replace(**{
+        "units.vsc.pwm.dead_time_compensation": True,
+    }))
+    _export(sim, tmp_path)
+    unit = sim.units["vsc"]
+    unit.ctrl.command(True, 0.0)
+    values = {
+        "u_g": complex(unit.cfg.base.v_phase_peak, 0.0),
+        "i_c": complex(0.05 * unit.cfg.base.i_phase_peak, 0.0),
+        "u_dc": unit.cfg.dc_base.v,
+    }
+    measurement = Measurement(0.0, **values, i_abc=np.array(phases(values["i_c"])))
+    output = unit.ctrl(0.0, measurement)
+    duties = tuple(unit.bridge.topology.command_duties(output))
+    expected = unit.bridge.compensated(duties, values["i_c"])
+    assert expected != pytest.approx(duties)
+
+    source = tmp_path / "check.cpp"
+    source.write_text("\n".join([
+        '#include "peslite_control.hpp"',
+        "#include <iomanip>",
+        "#include <iostream>",
+        "int main() {",
+        "    peslite_generated::Controller_vsc control;",
+        "    control.command(true);",
+        "    peslite_generated::Controller_vsc::Measurements measured;",
+        f"    measured.u_g = peslite_generated::Complex{{{values['u_g'].real!r}, 0.0}};",
+        f"    measured.i_c = peslite_generated::Complex{{{values['i_c'].real!r}, 0.0}};",
+        f"    measured.u_dc = {values['u_dc']!r};",
+        "    if (!control.sample(0.0, measured)) return 1;",
+        "    std::cout << std::setprecision(17);",
+        "    for (double value : control.duty) std::cout << value << ' ';",
+        "}",
+    ]), encoding="utf-8")
+    binary = tmp_path / "check"
+    _compile(source, binary)
+    result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+    actual = tuple(map(float, result.stdout.split()))
+    np.testing.assert_allclose(actual, expected, rtol=5e-6, atol=3e-6)
 
 
 def _sdk_double(directory):
@@ -909,10 +955,22 @@ def test_plant_algebraic_loop_warning_reuses_the_existing_model(name, tmp_path):
 def test_single_transistor_needs_no_complementary_dead_time(tmp_path):
     sim = _simulation()
     config = _mapping(sim)
-    config["units"]["converter"].pop("dead_time")
     _export(sim, tmp_path, config)
     source = (tmp_path / "user.cpp").read_text()
     assert "PWMH_ACTIVE" in source and "CbPwm_ConfigureDeadTime" not in source
+
+
+def test_complementary_dead_time_comes_from_the_pes_model(tmp_path):
+    sim = _simulation("gfl")
+    config = _mapping(sim)
+    _export(sim, tmp_path / "configured", config)
+    source = (tmp_path / "configured" / "user.cpp").read_text()
+    assert "CbPwm_ConfigureDeadTime(PWM_CHANNEL_0, 1e-07, 0);" in source
+
+    without_dead_time = peslite.Simulation(sim.p.replace(**{"units.vsc.pwm.dead_time": 0.0}))
+    with pytest.raises(ValueError, match=r"units\.vsc\.pwm\.dead_time"):
+        _export(without_dead_time, tmp_path / "missing", config)
+    assert not (tmp_path / "missing").exists()
 
 
 def test_unused_hardware_frequency_history_has_no_storage(tmp_path):
@@ -945,8 +1003,6 @@ def test_compatible_adc_sharing_is_allowed_but_pwm_ownership_is_unique(calibrati
 
 @pytest.mark.parametrize("mutation, message", [
     (lambda c: c["units"]["converter"].pop("adc"), "bind exactly"),
-    (lambda c: c["units"]["converter"].update(dead_time=-1.0), "nonnegative"),
-    (lambda c: c["units"]["converter"].update(dead_time=1.0), "half a switching"),
     (lambda c: c["units"]["converter"].update(pwm=[]), "bind each"),
     (lambda c: c["units"]["converter"]["adc"].update(current={"channel": 0, "sign": 0}), "sign"),
     (lambda c: c["units"]["converter"]["adc"].update(current={"channel": True}), "integer"),

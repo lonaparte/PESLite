@@ -12,7 +12,7 @@ import peslite
 from peslite.assembly.exporter import _signal_names
 from peslite.control.blocks import complex2abc
 from peslite.solver.model import ConfigError
-from peslite.solver.simulation import _PlantRows, _plant_output_row
+from peslite.solver.simulation import _CSVTable, _PlantRows, _plant_output_row
 
 
 UNIT_SUFFIX = re.compile(r"_(s|hz|hz_s|J|rad)$")
@@ -48,6 +48,36 @@ def test_compiled_output_rows_keep_the_fixed_public_schema():
 
 def _run(params, out):
     return peslite.Simulation(params).run(out_dir=out)
+
+
+def test_csv_rows_select_significant_digit_precision(tmp_path):
+    value = 1.2345678901234567
+    table = _CSVTable(tmp_path / "values.csv", columns=("x",), precision=5)
+    table.append_values([value])
+    table.append_values([value], precision=17)
+    table.close()
+
+    assert (tmp_path / "values.csv").read_text(encoding="utf-8").splitlines() == [
+        "x", format(value, ".5g"), format(value, ".17g"),
+    ]
+
+
+def test_output_precision_is_bounded(gfl):
+    for precision in (0, 18):
+        with pytest.raises(ConfigError, match="output.precision must be between 1 and 17"):
+            gfl(**{"simulation.output.precision": precision})
+
+
+def test_output_precision_changes_history_but_not_the_restart_row(gfl, tmp_path):
+    common = {"simulation.t_end": 0.002, "simulation.output.period": 1e-3}
+    low = _run(gfl(**common, **{"simulation.output.precision": 5}), tmp_path / "low")
+    high = _run(gfl(**common, **{"simulation.output.precision": 17}), tmp_path / "high")
+    low_rows = (tmp_path / "low/states.csv").read_text(encoding="utf-8").splitlines()
+    high_rows = (tmp_path / "high/states.csv").read_text(encoding="utf-8").splitlines()
+
+    assert low_rows[1:-1] != high_rows[1:-1]
+    assert low_rows[-1] == high_rows[-1]
+    assert low.final_states() == high.final_states()
 
 
 @pytest.mark.parametrize("path", ["pcc.u", "vsc.u_g", "vsc.i_c", "charger.primary.custom_signal", "signal"])
@@ -175,7 +205,10 @@ def test_ctrl_output_uses_only_the_abbreviated_name(gfl, tmp_path, monkeypatch):
 
 def test_continuation_uses_the_renamed_states(gfl, tmp_path):
     first_dir = tmp_path / "first"
-    result = peslite.Simulation(gfl(**{"simulation.t_end": 0.006})).run(0.004, out_dir=first_dir)
+    result = peslite.Simulation(gfl(**{
+        "simulation.t_end": 0.006,
+        "simulation.output.precision": 17,
+    })).run(0.004, out_dir=first_dir)
     restarted = peslite.load(
         first_dir / "simulation.pes",
         initial=first_dir / "states.csv",

@@ -204,7 +204,7 @@ def _linear_sim(matrix, *, feedback=False, **overrides):
                            (gain, "feedback"): (gain, "y"),
                            (plant, "feedback"): (gain, "y")}
         model = Model(subsystems, connections)
-        return SimpleNamespace(units={}, model=model, _port_bindings={},
+        return SimpleNamespace(units={}, event_subsystems=(), model=model, _port_bindings={},
                                state_parts=lambda: [("", model)])
 
     sim = peslite.Simulation(_params(**{"simulation.solver.dt": 1e-4, **overrides}),

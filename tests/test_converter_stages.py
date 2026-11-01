@@ -9,6 +9,7 @@ import pytest
 
 import peslite
 import peslite.components
+from conftest import EXAMPLES
 from peslite.components import (
     AveragingModel,
     FullBridge,
@@ -18,6 +19,8 @@ from peslite.components import (
     ThreePhaseBridge,
     make_bridge,
 )
+from peslite.control.blocks import phases
+from peslite.control.controller import ControlOutput, Measurement
 
 
 def test_bridge_topologies_share_the_existing_converter_module():
@@ -57,6 +60,8 @@ def _bridge_configuration(model):
             sync="asynchronous",
             carrier_phase=0.0,
             pattern_sync="interval",
+            dead_time=0.0,
+            dead_time_compensation=False,
         ),
         base=SimpleNamespace(f0=50.0),
     )
@@ -96,6 +101,115 @@ def test_each_bridge_topology_has_switching_pwm_and_averaging_forms(
     assert averaging.out.i_dc == pytest.approx(factor * (expected * 2.0).real)
 
 
+@pytest.mark.parametrize(("topology", "duties", "current", "expected", "commanded"), [
+    (HalfBridge(), np.array([0.75]), 2.0, 0.65, [0.85]),
+    (HalfBridge(), np.array([1.00]), 2.0, 1.00, [1.00]),
+    (HalfBridge(), np.array([0.00]), -2.0, 0.00, [0.00]),
+    (HalfBridge(reverse_port=True), np.array([0.75]), 2.0, 0.15, [0.65]),
+    (FullBridge(), np.array([0.75, 0.25]), 2.0, 0.30, [0.85, 0.15]),
+    (
+        ThreePhaseBridge(),
+        np.array([0.75, 0.25, 0.50]),
+        2.0 + 0.0j,
+        ThreePhaseBridge.switching_state((0.65, 0.35, 0.60)),
+        [0.85, 0.15, 0.40],
+    ),
+])
+def test_pwm_average_dead_time_uses_each_topologys_pole_current_mapping(
+        topology, duties, current, expected, commanded):
+    cfg = _bridge_configuration("pwm_averaging")
+    cfg.pwm.dead_time = 1.0e-5
+    bridge = make_bridge(cfg, topology=topology)
+    bridge.inp.i_c = current
+    bridge.reset(duties, on=True)
+
+    assert bridge.start(0.0, (None, None), continued=False) == pytest.approx(expected)
+
+    cfg.pwm.dead_time_compensation = True
+    compensated = make_bridge(cfg, topology=topology)
+    compensated.inp.i_c = current
+    compensated.reset(compensated.compensated(tuple(duties), current), on=True)
+    assert compensated.duty == pytest.approx(commanded)
+    assert compensated.start(0.0, (None, None), continued=False) == pytest.approx(
+        topology.switching_state(duties)
+    )
+    assert not any(name.startswith("dead_time.") for name in compensated.get_state())
+
+
+@pytest.mark.parametrize("model", ["switching", "pwm_averaging"])
+def test_unilateral_half_bridge_has_no_complementary_dead_time(model):
+    cfg = _bridge_configuration(model)
+    cfg.pwm.dead_time = 1.0e-6
+    cfg.pwm.dead_time_compensation = True
+
+    bridge = make_bridge(cfg, topology=HalfBridge(lower_controlled=False))
+
+    assert bridge.dead_time == 0.0
+    assert not bridge.dead_time_compensation
+    assert bridge._dead_time_sequence is None
+    assert bridge.compensated((0.75,), 2.0) == (0.75,)
+
+
+def test_pwm_dead_time_requires_controlled_devices():
+    cfg = _bridge_configuration("switching")
+    cfg.pwm.dead_time = 1.0e-6
+
+    with pytest.raises(ValueError, match="requires a controlled bridge"):
+        make_bridge(cfg, topology=FullBridge(upper_controlled=False, lower_controlled=False))
+
+
+def test_switching_dead_time_compensation_preconditions_the_command_before_physical_dead_time():
+    topology = HalfBridge()
+    cfg = _bridge_configuration("switching")
+    cfg.pwm.dead_time = 1.0e-5
+    cfg.pwm.dead_time_compensation = True
+    bridge = make_bridge(cfg, topology=topology)
+    bridge.inp.i_c = 2.0
+    bridge.reset(bridge.compensated((0.75,), bridge.inp.i_c), on=True)
+
+    assert bridge.duty == pytest.approx([0.85])
+    warmup = bridge.modulator(-bridge.carrier_period, bridge.carrier_period, bridge.duty)
+    bridge._dead_time_sequence(
+        -bridge.carrier_period, bridge.carrier_period, warmup,
+        topology.pole_currents(bridge.inp.i_c), enabled=True,
+    )
+    raw = bridge.modulator(0.0, bridge.carrier_period, bridge.duty)
+    actual = bridge._dead_time_sequence(
+        0.0, bridge.carrier_period, raw, topology.pole_currents(bridge.inp.i_c), enabled=True,
+    )
+    assert np.average(actual.q_abc[:, 0], weights=actual.dt) == pytest.approx(0.75)
+    assert bridge.dead_time == pytest.approx(1.0e-5)
+    assert bridge._dead_time_sequence is not None
+    assert any(name.startswith("dead_time.") for name in bridge.get_state())
+
+
+def test_unit_applies_dead_time_compensation_from_its_adc_measurement(monkeypatch):
+    params = peslite.load(EXAMPLES / "gfl-example.pes").replace(**{
+        "units.vsc.pwm.dead_time": 1.0e-5,
+        "units.vsc.pwm.dead_time_compensation": True,
+    })
+    unit = peslite.Simulation(params).units["vsc"]
+    measurement = Measurement(
+        t=0.0,
+        u_g=0j,
+        i_c=-2.0 + 0.0j,
+        u_dc=unit.cfg.dc_base.v,
+        i_abc=np.asarray(phases(-2.0 + 0.0j)),
+    )
+    output = ControlOutput(
+        np.asarray([0.75, 0.25, 0.5]), theta=0.0, omega=unit.cfg.base.w0,
+    )
+    unit.bridge.inp.i_c = 2.0 + 0.0j
+    monkeypatch.setattr(unit, "_sample_control", lambda _t, _plant: measurement)
+    unit.ctrl = lambda _t, _measurement: output
+
+    unit.sense(0.0, None)
+
+    fraction = unit.bridge.dead_time / unit.bridge.carrier_period
+    assert unit._write_due[1] == pytest.approx(
+        (0.75 - fraction, 0.25 + fraction, 0.5 + fraction)
+    )
+
 
 def test_full_bridge_device_attributes_select_rectification_on_the_same_structure():
     controlled = FullBridge()
@@ -130,7 +244,7 @@ def test_half_bridge_fixes_device_placement_at_construction():
 
     reverse_fully_controlled_leg = HalfBridge(reverse_port=True)
     assert reverse_fully_controlled_leg.reverse_port
-    assert reverse_fully_controlled_leg.pwm_state((0.25,)) == pytest.approx(0.75)
+    assert reverse_fully_controlled_leg.switching_state((0.25,)) == pytest.approx(0.75)
 
 
 def test_bridge_topologies_need_no_external_device_solver():
@@ -149,5 +263,5 @@ def test_full_bridge_produces_bipolar_switching_and_pwm_states():
 
     assert bridge.switching_state((1, 0)) == 1.0
     assert bridge.switching_state((0, 1)) == -1.0
-    assert bridge.pwm_state((0.75, 0.25)) == pytest.approx(0.5)
+    assert bridge.switching_state((0.75, 0.25)) == pytest.approx(0.5)
     assert bridge.state_from_duty(0.75) == pytest.approx(0.5)

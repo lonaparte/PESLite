@@ -109,7 +109,7 @@ def test_assembly_rejects_a_continuous_and_held_target_collision(case):
     unit = peslite.System(params).units["vsc"]
     unit.zoh_connections = lambda: {(unit.branch_f, "u1"): "duplicate"}
 
-    with pytest.raises(ConfigError, match="driven both continuously"):
+    with pytest.raises(ConfigError, match="input target is already driven"):
         peslite.System(params, parts={"vsc": unit})
 
 
