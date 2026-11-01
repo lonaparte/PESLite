@@ -191,6 +191,15 @@ def _black_box_values(record: Any, names: Sequence[str]) -> NDArray:
     return np.asarray(values, dtype=dtype)
 
 
+def _black_box_scalar_type(value: numbers.Number) -> type:
+    """Canonical scalar type retained when a black-box state is restored or updated."""
+    if isinstance(value, bool):
+        return bool
+    if isinstance(value, numbers.Integral):
+        return int
+    return complex if np.iscomplexobj(value) else float
+
+
 class BlackBoxSubsystem:
     """Adapt array-valued callables to the ordinary continuous :class:`Subsystem` protocol.
 
@@ -258,8 +267,11 @@ class BlackBoxSubsystem:
             raise TypeError("a stateless black box does not use rhs, update or period")
 
         self._state_names = all_state_names
+        self._state_types = tuple(
+            _black_box_scalar_type(getattr(self.state, name)) for name in all_state_names
+        )
         self.state_names = all_state_names if continuous else ()
-        self.discrete_state_names = all_state_names if discrete else ()
+        self._sampled_state_names = all_state_names if discrete else ()
         self.clock = None
         self._clock_index = 0
         self._pending = None
@@ -343,22 +355,16 @@ class BlackBoxSubsystem:
 
     def get_state(self) -> dict[str, complex | float]:
         """Return discrete state; continuous state is already owned by :class:`Model`."""
-        return {name: getattr(self.state, name) for name in self.discrete_state_names}
+        return {name: getattr(self.state, name) for name in self._sampled_state_names}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         """Restore any subset of the registered discrete state."""
-        unknown = set(values) - set(self.discrete_state_names)
+        unknown = set(values) - set(self._sampled_state_names)
         if unknown:
             raise KeyError(f"unknown discrete black-box states {sorted(unknown)}")
-        for name, value in values.items():
-            current = getattr(self.state, name)
-            if isinstance(current, bool):
-                value = bool(value)
-            elif isinstance(current, complex):
-                value = complex(value)
-            else:
-                value = float(value)
-            setattr(self.state, name, value)
+        for name, scalar_type in zip(self._state_names, self._state_types):
+            if name in values:
+                setattr(self.state, name, scalar_type(values[name]))
 
     def begin(self, t: float, plant: Any, continued: bool, window_given: bool) -> None:
         """Position the update clock for a fresh or continued run."""
@@ -371,8 +377,6 @@ class BlackBoxSubsystem:
 
     def next_state(self, t: float) -> NDArray:
         """Calculate, without committing, the state after the update at ``t``."""
-        if self._call_update is None:
-            raise TypeError("this black box has no discrete update")
         state, inputs = self._arguments()
         return self._result(self._call_update(t, state, inputs), len(self._state_names), "update")
 
@@ -386,8 +390,9 @@ class BlackBoxSubsystem:
         """Commit a sampled update as a plant change; a model subsystem never trips."""
         if self._pending is not None:
             with plant.change():
-                for name, value in zip(self._state_names, self._pending):
-                    setattr(self.state, name, self._scalar(value))
+                for name, value, scalar_type in zip(
+                        self._state_names, self._pending, self._state_types):
+                    setattr(self.state, name, scalar_type(value))
             self._pending = None
             self._clock_index += 1
         return False

@@ -267,6 +267,15 @@ def test_loop_registration_and_loop_owned_validation():
         params.replace(**{"units.vsc.ctrl.loops.vi": {
             "type": "virtual_admittance", "x_v_pu": 0.0,
         }})
+    matching = peslite.load(EXAMPLES / "gfm-matching-example.pes")
+    for changes, message in [
+        ({"units.vsc.dclink.capacitor": None,
+          "units.vsc.dclink.source": {"type": "voltage"}},
+         "Matching control needs dclink.capacitor"),
+        ({"units.vsc.ctrl.references.vdc_ref_pu": 0.0}, "vdc_ref_pu must be positive"),
+    ]:
+        with pytest.raises(ConfigError, match=message):
+            peslite.Simulation(matching.replace(**changes))
 
 
 def test_adc_sample_and_controller_measurement_have_distinct_scopes():

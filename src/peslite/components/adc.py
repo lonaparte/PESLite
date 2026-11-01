@@ -236,11 +236,11 @@ class ADC:
         ``t`` count the value at ``t`` over that preceding part.
         """
         if self.clocked:
-            self._clock_index = int(self._start_index(t, held))
+            self._clock_index = int(self.sampling_clock.start_index(t, not held))
             next_ = self.control_clock.at(self._clock_index)
             last = next_ - self.period
         elif self.independent:
-            self._clock_index = int(self._start_index(t, held))
+            self._clock_index = int(self.sampling_clock.start_index(t, not held))
         if last is None or next_ is None:
             raise ValueError("an externally clocked ADC needs its preceding and next interrupt")
         self.n_samp = (1 if self.independent else
@@ -260,11 +260,6 @@ class ADC:
             values = self.ports.read()
             self.peeks = [ADCSample(last + i * self.sample_period, values)
                           for i in range(1, self.n_samp)]
-
-    def _start_index(self, t, held):
-        """The same owned-clock placement for ordinary startup and standalone lowering."""
-        return (self.sampling_clock.index_at_or_after(t) if held else
-                self.sampling_clock.index_after(t))
 
     # ------------------------------------------------------------ the window
     def seed(self, t: float | None = None) -> None:

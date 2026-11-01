@@ -171,7 +171,7 @@ def test_pwm_owns_timer_registers_and_switching_schedule():
 
     pwm.write(0.0, np.array([0.8, 0.7, 0.6]))
     q = pwm.load(0.0)
-    assert q == ThreePhaseBridge.pwm_state(initial)
+    assert q == ThreePhaseBridge.switching_state(initial)
     assert pwm.k == 1
     assert pwm.t_interrupt == 1e-3
     assert pwm.next_switch == float("inf")

@@ -20,7 +20,7 @@ from ..components.adc import ADC, ADCSample, MeasurementPorts
 from ..components.converter import (HalfBridgeDiodeConduction, make_bridge, make_dclink,
                                     make_topology)
 from ..components.network import RLBranch, Terminal
-from ..components.pwm import Modulator, _dead_time_compensated_duties
+from ..components.pwm import Modulator
 from ..control.blocks import phases
 from ..control.controller import (Controller, ConverterMeasurement,
                                   Measurement, make_controller)
@@ -88,6 +88,7 @@ class Unit(ABC):
     def __init__(self, name: str, cfg: UnitParams, bus: Any) -> None:
         """Bind the identity, event scenario and DC link shared by converter units."""
         self.name, self.cfg, self.bus = name, cfg, bus
+        self._current_channel = unit_type(cfg.type).current_channel
         self.scenario = Scenario(cfg.events, f"units.{name}", initial=cfg.connected)
         self.dclink = _parameterized(lambda c: make_dclink(c.dclink), cfg)
         self.zoh = f"{name}.q"  # model label of the bridge's held switching state
@@ -121,7 +122,6 @@ class Unit(ABC):
 
         self.clock = _parameterized(sampling_clock, (self.cfg, sim))
         self._clock_index = 0
-        self._clock_time = math.inf
         self.protection = _parameterized(lambda values: Protection(
             values[0].protection, sampling_clock(values).period, current_base(values[0]),
             rms_available=bool(values[0].meas.rms)), (self.cfg, sim))
@@ -239,7 +239,7 @@ class Unit(ABC):
 
     def next_time(self) -> float:
         if self.continuous:
-            next_ = self._clock_time
+            next_ = self.clock.at(self._clock_index)
             return next_ if self.adc is None else min(next_, self.adc.next_time())
         bridge = self.bridge
         next_ = bridge.next_time()
@@ -352,9 +352,7 @@ class Unit(ABC):
         self._track_due = False
         if self.continuous:
             self._start_continuous_bridge(t)
-            index = self.clock.index_after(t) if continued else self.clock.index_at_or_after(t)
-            self._clock_index = int(index)
-            self._clock_time = self.clock.at(self._clock_index)
+            self._clock_index = int(self.clock.start_index(t, continued))
             plant.outputs(t)
             if self.adc is not None:
                 if not self.adc.integration_anchor_restored:
@@ -369,7 +367,7 @@ class Unit(ABC):
     def protect(self, t: float, plant: Plant) -> bool:
         """Run the common fast over-current path at a physical bridge edge or a continuous
         unit's own protection clock."""
-        due = (abs(t - self._clock_time) < TIME_EPS if self.continuous
+        due = (self.clock.due(t, self._clock_index) if self.continuous
                else self.bridge.fast_edge(t))
         if self.tripped or not due:
             return False
@@ -383,7 +381,7 @@ class Unit(ABC):
     def sense(self, t: float, plant: Plant) -> Optional[tuple[int, Any]]:
         """Sample, control and protect one converter through the common runtime path."""
         if self.continuous:
-            clock_due = abs(t - self._clock_time) < TIME_EPS
+            clock_due = self.clock.due(t, self._clock_index)
             adc_due = (self.adc is not None and self.adc.clocked
                        and abs(t - self.adc.next_time()) < TIME_EPS)
             if not clock_due and not adc_due and not self._track_due:
@@ -400,7 +398,6 @@ class Unit(ABC):
             if self.ctrl is not None:
                 self.ctrl.startup.at(t)
             self._clock_index += 1
-            self._clock_time = self.clock.at(self._clock_index)
             if self.adc is not None and not self.adc.clocked:
                 self.adc.sample_rms()
             self._check_sampled_protection(t, self._instantaneous_measurement(t))
@@ -412,16 +409,11 @@ class Unit(ABC):
         output = self.ctrl(t, measurement)
         self._check_sampled_protection(t, measurement, output)
         registers = self.bridge.command_registers(output)
-        if self.bridge.dead_time > 0.0 and self.bridge.dead_time_compensation:
-            width = self.bridge.modulation_width
-            duties = _dead_time_compensated_duties(
-                registers[:width],
-                self.bridge.topology.pole_currents(
-                    self._sampled_bridge_current(measurement)
-                ),
-                self.bridge.dead_time / self.bridge.carrier_period,
+        if self.bridge.dead_time_compensation:
+            registers = self.bridge.compensated(
+                registers,
+                getattr(measurement, self._current_channel),
             )
-            registers = (*duties, *registers[width:])
         self._write_due = (t, registers, output)
         return self.bridge.control_index, output
 
@@ -565,10 +557,6 @@ class Unit(ABC):
         """Adapt a generic ADC sample to this controller family's input object."""
 
     @abstractmethod
-    def _sampled_bridge_current(self, measurement: Any) -> complex | float:
-        """Return the ADC current sample used by bridge-command compensation."""
-
-    @abstractmethod
     def _protection_sample(self, measurement: Any, output: Any | None) -> ProtectionSample:
         """Adapt one controller-rate observation to common protection quantities."""
 
@@ -586,7 +574,7 @@ class Unit(ABC):
             return
         sample = self._protection_sample(measurement, output)
         if self.protection.rms_enabled:
-            value = self.adc.rms[unit_type(self.cfg.type).current_channel].value
+            value = self.adc.rms[self._current_channel].value
             sample = replace(sample, rms_current_pu=(
                 None if value is None else value / self.protection.i_base
             ))
@@ -787,10 +775,6 @@ class VSC(Unit):
             i_abc=np.asarray(phases(raw_current)),
             samples=tuple(self._control_measurement(item) for item in sample.samples),
         )
-
-    @staticmethod
-    def _sampled_bridge_current(measurement: Measurement) -> complex:
-        return measurement.i_c
 
     def _protection_sample(self, measurement: Measurement,
                            output: Any | None) -> ProtectionSample:
@@ -1034,10 +1018,6 @@ class DCConverter(Unit):
             power=values.get("power"),
             samples=tuple(self._control_measurement(item) for item in sample.samples),
         )
-
-    @staticmethod
-    def _sampled_bridge_current(measurement: ConverterMeasurement) -> float:
-        return measurement.current
 
     def _protection_sample(self, measurement: ConverterMeasurement,
                            output: Any | None) -> ProtectionSample:

@@ -116,7 +116,7 @@ A unilateral half bridge uses `PWMH_ACTIVE`; wire that active output to its cont
 including the lower transistor in a Boost circuit. An unused complementary lane is not a diode.
 Complementary legs require a positive `pwm.dead_time` in the PES file, shorter than half the
 carrier period; the hardware-binding file does not repeat it.
-A single controlled transistor does not use complementary dead time.
+A single controlled transistor has no complementary dead time in simulation or on the target.
 
 ## Timing and run commands
 

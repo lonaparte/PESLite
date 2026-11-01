@@ -153,11 +153,6 @@ class ThreePhaseBridge:
                               + complex(-0.5, -math.sqrt(3.0) / 2.0) * c)
 
     @staticmethod
-    def pwm_state(duties):
-        values = tuple(min(1.0, max(0.0, duty)) for duty in duties)
-        return ThreePhaseBridge.switching_state(values)
-
-    @staticmethod
     def pole_currents(current):
         """Currents leaving the three pole midpoints, in modulation-leg order."""
         return phases(current)
@@ -448,12 +443,11 @@ class _SampledModel(_BridgeModel, PWM):
             carrier_period,
             modulator,
             pattern_sync=pattern_sync,
-            dead_time=dead_time,
+            dead_time=0.0 if self.topology.unilateral else dead_time,
             dead_time_compensation=dead_time_compensation,
-            pole_currents=getattr(self.topology, "pole_currents", None),
+            pole_currents=self.topology.pole_currents,
             duty_names=(self.topology.duty_names + carried if registers is None else tuple(registers)),
             switching_state=self.topology.switching_state,
-            pwm_state=self.topology.pwm_state,
         )
         self.continuous = False
         self.command_registers = (self.topology.command_duties if registers is None
@@ -643,10 +637,6 @@ class HalfBridge:
         state = states[0]
         return 1.0 - state if self._reverse_port else state
 
-    def pwm_state(self, duties) -> float:
-        duty = min(1.0, max(0.0, duties[0]))
-        return 1.0 - duty if self._reverse_port else duty
-
     def pole_currents(self, current):
         """Pole current expressed in the commanded leg's orientation."""
         current = np.real(current)
@@ -692,7 +682,7 @@ class HalfBridge:
 
     def state_from_duty(self, duty: float) -> float:
         """Return the bridge output ratio produced by its controlled device's duty."""
-        return self.pwm_state((duty,))
+        return self.switching_state((min(1.0, max(0.0, duty)),))
 
     @property
     def reverse_port(self) -> bool:
@@ -886,12 +876,6 @@ class FullBridge:
     @staticmethod
     def switching_state(states) -> float:
         return states[0] - states[1]
-
-    @staticmethod
-    def pwm_state(duties) -> float:
-        left = min(1.0, max(0.0, duties[0]))
-        right = min(1.0, max(0.0, duties[1]))
-        return left - right
 
     @staticmethod
     def pole_currents(current):

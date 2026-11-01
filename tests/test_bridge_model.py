@@ -337,6 +337,18 @@ def test_ideal_averaging_ignores_pwm_dead_time(gfl):
     )
 
 
+def test_unilateral_bridge_ignores_complementary_dead_time():
+    with pytest.warns(UserWarning, match="without a complementary controlled pair"):
+        params = peslite.load(EXAMPLES / "buck-example.pes", **{
+            "units.converter.pwm.dead_time": 1.0,
+            "units.converter.pwm.dead_time_compensation": True,
+        })
+
+    bridge = peslite.Simulation(params).system.units["converter"].bridge
+    assert bridge.dead_time == 0.0
+    assert not bridge.dead_time_compensation
+
+
 def test_ideal_averaging_has_continuous_control_states_and_no_sampled_hardware_states(gfl):
     simulation = peslite.Simulation(gfl(**{"units.vsc.bridge.model": "averaging"}))
     names = set(simulation.state_names())

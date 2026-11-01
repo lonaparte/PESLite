@@ -27,7 +27,7 @@ import numpy as np
 from ..components.converter import DCLink
 from ..components.network import ACVoltageSource, RLBranch
 from ..components.pwm import (_EPS, _SNAP, CarrierComparison, SynchronousCarrier, PhaseClock,
-                               PhaseShiftModulator, ZOH, _dead_time_compensated_duties)
+                               PhaseShiftModulator, ZOH)
 from ..control.profiles import PHASE_SHIFT_MODES
 from ..control.blocks import OutputLimit
 from ..control.controller import GraphController, VSCController
@@ -1275,17 +1275,10 @@ class _ModelGenerator:
                 self._algebraic_fields[id(record), name] = record
         for key in self.state_index.keys() | self.zoh_fields.keys():
             self._algebraic_fields.pop(key, None)
-        for name, subsystem in self.system.event_subsystems:
-            if (not getattr(subsystem, "discrete_state_names", ())
-                    or not callable(getattr(subsystem, "next_state", None))):
-                raise TypeError(
-                    f"C++ export: clocked subsystem {name!r} must expose registered "
-                    "discrete state and next_state(t)"
-                )
         self._discrete_fields = {
             (id(sub.state), field): sub.state
             for _name, sub in self.system.event_subsystems
-            for field in sub.discrete_state_names
+            for field in sub.get_state()
         }
 
     def breaker_lines(self, branch: RLBranch, open_expression: str) -> list[str]:
@@ -1744,7 +1737,7 @@ class _ModelGenerator:
                 f"C++ export: cannot lower the discrete update of subsystem {label!r} "
                 f"({type(sub).__name__}): {exc}"
             ) from exc
-        targets = [self.value(sub.state, field) for field in sub.discrete_state_names]
+        targets = [self.value(sub.state, field) for field in sub.get_state()]
         if len(values) != len(targets):
             raise TypeError("a discrete update changed its registered state dimension")
         return list(zip(targets, values))
@@ -2249,9 +2242,9 @@ class _ModelGenerator:
         for name, branch in self.system.branches.items():
             add(f"{name}.i", self.value(branch.out, "i"),
                 self.record_types[id(branch.out), "i"])
-        for name, source in self.system.sources.items():
-            add(f"{name}.i", self.value(source.branch.out, "i"), "complex")
-            add(f"{name}.angle", self.value(source.emf.out, "phi"), "real")
+        for source in self.system.sources.values():
+            for signal, value in self.trace_element_signals(source).items():
+                add(signal, value.code, value.kind)
         for name, unit in self.system.units.items():
             for signal, value in self.trace_element_signals(unit).items():
                 add(signal, value.code, value.kind)
@@ -2272,12 +2265,7 @@ class _ModelGenerator:
                     add(f"{name}.meas.{public}", generator.m("adc_held_" + channel),
                         _Expression.of(value).kind)
         for name, element in self.system.named_elements.items():
-            signals = getattr(element, "signals", None)
-            if signals is not None:
-                values = signals()
-                if hasattr(element, "branch") and set(values) == {f"{name}.i"}:
-                    add(f"{name}.i", self.value(element.branch.out, "i"), "complex")
-                    continue
+            if hasattr(element, "signals"):
                 try:
                     traced = self.trace_element_signals(element)
                 except Exception as exc:
@@ -2672,16 +2660,14 @@ class _CarrierModulatorGenerator:
             )
         else:
             values = tuple(f"{generator.m('active')}[{index}]" for index in range(generator.bridge.modulation_width))
-            if generator.bridge._dead_time_average > 0.0:
-                currents = generator._dead_time_currents()
-                fraction = _number(generator.bridge._dead_time_average / generator.bridge.carrier_period)
-                values = tuple(
-                    f"std::clamp({value} - (({value}) > 0.0 && ({value}) < 1.0 ? "
-                    f"{fraction} * (({current}) > 0.0 ? 1.0 : "
-                    f"(({current}) < 0.0 ? -1.0 : 0.0)) : 0.0), 0.0, 1.0)"
-                    for value, current in zip(values, currents)
+            if bridge.dead_time > 0.0:
+                averaged = bridge._dead_time_average(
+                    tuple(_Expression(value, "real") for value in values),
+                    tuple(_Expression(current, "real")
+                          for current in generator._dead_time_currents()),
                 )
-            mapped = f"{hold} = {generator._topology_expression(generator.topology.pwm_state, values)};"
+                values = tuple(_Expression.of(value).code for value in averaged)
+            mapped = f"{hold} = {generator._topology_expression(bridge._held_state, values)};"
         return [*clock_lines, f"        {mapped}",
                 f"        {generator.m('load_end')} = t + {_number(bridge.load_period)};"]
 
@@ -3498,7 +3484,7 @@ class _ControlGenerator:
         lines = []
         if adc is not None and adc.independent:
             held = self.name not in self.model.simulation._windows_given
-            index = adc._start_index(self.p.simulation.initial.t, held)
+            index = adc.sampling_clock.start_index(self.p.simulation.initial.t, not held)
             lines.append(f"long long {self.m('adc_clock_index')} = static_cast<long long>({_number(index)});")
             for channel, value in adc.values.items():
                 lines.append(f"{_CPP_TYPES[_Expression.of(value).kind]} "
@@ -3753,8 +3739,7 @@ class _ControlGenerator:
                 f"{str(pulse.restored).lower()}" + "};"]
 
     def _dead_time_currents(self):
-        dead_time = self.bridge._dead_time_sequence
-        if dead_time is None and self.bridge._dead_time_average <= 0.0:
+        if self.bridge.dead_time <= 0.0:
             return ()
         bridge = self.bridge
         current = self.model.solver_observation(bridge.inp, "i_c")
@@ -3857,23 +3842,18 @@ class _ControlGenerator:
             f"{_number(bridge.interrupt(_Expression(self.m('pwm_k'), 'real')))};",
         ]
 
-    def _dead_time_compensation_lines(
-        self, duties: str, sampled_current: _Expression, fraction: Any, indent: str, *,
-        enabled: bool,
-    ) -> list[str]:
+    def _dead_time_compensation_lines(self, duties: str, indent: str) -> list[str]:
         """Condition duty commands from the same ADC current sample used by control."""
-        if not enabled:
+        bridge = self.model.runtime.object(self.unit.bridge)
+        if not bridge.dead_time_compensation:
             return []
-        currents = self.model._trace(
-            lambda: self.topology.pole_currents(sampled_current)
+        channel = unit_type(self.cfg.type).current_channel
+        current = _Expression(
+            self._adc_value(channel), self.model.unit_measurements(self.unit)[channel].kind,
         )
-        commands = tuple(
-            _Expression(f"{duties}[{index}]", "real")
-            for index in range(len(currents))
-        )
-        corrected = _dead_time_compensated_duties(
-            commands, currents, fraction,
-        )
+        commands = tuple(_Expression(f"{duties}[{index}]", "real")
+                         for index in range(bridge.modulation_width))
+        corrected = self.model._trace(lambda: bridge.compensated(commands, current))
         return [
             f"{indent}{duties}[{index}] = {_Expression.of(value).code};"
             for index, value in enumerate(corrected)
@@ -4563,11 +4543,7 @@ class _UnitGenerator(_ACControlGenerator):
         lines += ["    " + line for line in self._sampled_loop_lines()]
         lines += ["    " + line for line in self._sampled_vsc_command_lines()]
         lines += self._modulation_lines(indent="    ")
-        lines += self._dead_time_compensation_lines(
-            self.m("pending_d"), _Expression(self._adc_value("i_c"), "complex"),
-            self.bridge.dead_time / self.bridge.carrier_period, "    ",
-            enabled=(self.bridge.dead_time > 0.0 and self.bridge.dead_time_compensation),
-        )
+        lines += self._dead_time_compensation_lines(self.m("pending_d"), "    ")
         lines += self._log_lines("    ")
         lines += ["    " + line for line in self._rms_sample_lines()]
         lines += [f"    sampled_protect_{self.tag}(t, std::abs(meas_u_g),",
@@ -4772,11 +4748,7 @@ class _GraphUnitGenerator(_ElectricalUnitGenerator):
         lines += ["    " + line for line in self._sampled_loop_lines()]
         for index, duty in enumerate(self._command_registers()):
             lines.append(f"    {self.m('pending_d')}[{index}] = {duty.code};")
-        lines += self._dead_time_compensation_lines(
-            self.m("pending_d"), _Expression(self._adc_value("current"), "real"),
-            self.bridge.dead_time / self.bridge.carrier_period, "    ",
-            enabled=(self.bridge.dead_time > 0.0 and self.bridge.dead_time_compensation),
-        )
+        lines += self._dead_time_compensation_lines(self.m("pending_d"), "    ")
         lines += ["    " + line for line in self._log_lines()]
         lines += [
             f"    sampled_protect_{self.tag}(t, "
@@ -4993,8 +4965,6 @@ class _CppGenerator:
                 else:
                     element = self.system.named_elements[target]
                     breakers = getattr(element, "breakers", ())
-                    if hasattr(element, "branch"):
-                        breakers = (element.branch,)
                     if not breakers:
                         raise TypeError(f"C++ export: connection variable {path!r} has no static breaker")
                     lines += [
@@ -5192,11 +5162,11 @@ class _CppGenerator:
                 f"bool {tag}_pending = false;",
                 *(f"{_CPP_TYPES[model.record_types[id(subsystem.state), field]]} "
                   f"{tag}_next_{position} = {{}};"
-                  for position, field in enumerate(subsystem.discrete_state_names)),
+                  for position, field in enumerate(subsystem.get_state())),
             ]
             event_methods.append("\n".join([
                 f"double next_{tag}() const noexcept {{ return "
-                f"{_number(clock.offset)} + {tag}_index * {_number(clock.period)}; }}",
+                f"{_number(clock.at(_Expression(f'{tag}_index', 'real')))}; }}",
                 f"bool sense_{tag}(double t) {{",
                 f"    {tag}_pending = next_{tag}() <= t + time_eps;",
                 f"    if ({tag}_pending) {{",
@@ -5215,7 +5185,7 @@ class _CppGenerator:
                 "    return false;",
                 "}",
             ]))
-            for field in subsystem.discrete_state_names:
+            for field in subsystem.get_state():
                 key = f"{name}.{field}"
                 if key in initialized:
                     discrete_initialization.append(

@@ -951,7 +951,12 @@ class Matching(SyncLaw):
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
+        if unit.dclink is None or unit.dclink.capacitor is None:
+            raise ConfigError("Matching control needs dclink.capacitor")
         vdc_ref_pu = unit.ctrl.references.vdc_ref_pu
+        if cfg.k_theta_pu is None and not vdc_ref_pu > 0.0:
+            raise ConfigError("Matching: ctrl.references.vdc_ref_pu must be positive for the "
+                              "automatic gain k_theta_pu")
         self.k_theta = cfg.k_theta_pu if cfg.k_theta_pu is not None else self.w0 / vdc_ref_pu
         self.k_q = cfg.k_q_pu
 

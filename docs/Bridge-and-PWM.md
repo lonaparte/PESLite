@@ -168,11 +168,12 @@ Synchronous PWM requires an integer ratio `pwm.f_sw / base.f0`.
 pulse-preservation state.
 
 Dead time is applied to the leg sequence after modulation, so carrier and phase-shift modulation
-share the same current-directed diode-clamping rule. `pwm_averaging` applies its cycle average;
-legs held at duty 0 or 1 do not commutate and have no dead-time error. Ideal `averaging` has no PWM
-hardware, so it warns and ignores dead time and compensation. For duty-ratio modulation,
-compensation adds `dead_time * f_sw * sign(pole_current)` to each switching leg's command and then
-applies the physical dead time normally; clipping at 0 or 1 limits the achievable correction.
+share the same current-directed diode-clamping rule. The pole-current direction is sampled at each
+register load and held for that interval. `pwm_averaging` applies the cycle average; legs held at
+duty 0 or 1 do not commutate. A half bridge with one controlled device has no complementary
+turn-on, so it has no dead time or compensation. Ideal `averaging` warns and ignores both settings.
+For duty-ratio modulation, compensation adds `dead_time * f_sw * sign(pole_current)` using the ADC
+sample at the control interrupt; clipping at 0 or 1 limits the correction.
 Phase-shift patterns have no independent leg duty-ratio commands, so this compensation is not
 accepted for `ctrl.type: phase_shift`.
 

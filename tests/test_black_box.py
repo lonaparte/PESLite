@@ -1,6 +1,8 @@
 """Array-callable black-box subsystems on the ordinary model kernel."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -10,8 +12,9 @@ from conftest import EXAMPLES
 from peslite import BlackBoxSubsystem, Simulation
 from peslite.assembly.params import from_dict
 from peslite.components import Element, Terminal, register_element_type
-from peslite.solver import Bag, Model
+from peslite.solver import Bag, Model, StateRegistry
 from peslite.solver.energy import PowerPort
+from peslite.solver.simulation import SystemLoop
 
 
 @register_element_type
@@ -282,8 +285,42 @@ def test_discrete_black_box_updates_on_the_shared_simulation_event_grid(tmp_path
     result = simulation.run(out_dir=tmp_path)
 
     assert simulation.system.model.state_labels() == ["block.lag.z"]
+    assert SystemLoop(simulation).periods == [1.0e-3]
+    assert "block.hidden" not in simulation._states.discrete_names
     assert result.states["block.hidden"][-1] == pytest.approx(3.0)
     assert simulation.system.named_elements["block"].counter.out.y == pytest.approx(3.0)
+
+
+def test_restored_integer_black_box_state_remains_a_discrete_mode():
+    block = BlackBoxSubsystem(
+        lambda _t, state, _inputs: state,
+        inputs=(), outputs=("y",), state={"mode": 1},
+        update=lambda _t, state, _inputs: state, period=1.0,
+        feedthrough=(), observer=True,
+    )
+    states = StateRegistry((("block", block),))
+
+    block.set_state({"mode": 2.0})
+    assert block.get_state() == {"mode": 2}
+    assert "block.mode" in states.discrete_names
+
+    plant = SimpleNamespace(outputs=lambda _t: None, change=nullcontext)
+    block.begin(0.0, plant, continued=False, window_given=False)
+    block.sense(0.0, plant)
+    block.actuate(0.0, plant)
+
+    assert block.get_state() == {"mode": 2}
+    assert "block.mode" in states.discrete_names
+
+
+def test_clocked_subsystem_requires_the_common_event_interface(monkeypatch):
+    monkeypatch.setattr(BlackBoxSubsystem, "actuate", None)
+
+    with pytest.raises(TypeError, match="clocked subsystem event interface.*actuate"):
+        Simulation(_elements(
+            {"block": {"type": "test_black_box_counter", "period": 1.0e-3}},
+            1.0e-3,
+        ))
 
 
 @pytest.mark.parametrize(("initial", "t_end", "expected"), [

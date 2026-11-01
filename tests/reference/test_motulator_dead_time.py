@@ -17,8 +17,7 @@ from motulator.common.model import ZOH as MotulatorZOH
 from motulator.common.utils import abc2complex as motulator_abc2complex
 
 from peslite.components.converter import PWMAveragingModel, ThreePhaseBridge
-from peslite.components.pwm import (CarrierComparison, _DeadTimeSequence, ZOH,
-                                    _dead_time_compensated_duties)
+from peslite.components.pwm import CarrierComparison, _DeadTimeSequence, ZOH
 from peslite.control.blocks import abc2complex
 
 
@@ -66,10 +65,7 @@ def _averaged_bridge(duties, currents, *, compensated=False):
         dead_time_compensation=compensated,
     )
     bridge.inp.i_c = abc2complex(currents)
-    duties = (_dead_time_compensated_duties(
-        duties, bridge.topology.pole_currents(motulator_abc2complex(currents)),
-        bridge.dead_time / bridge.carrier_period,
-    ) if compensated else duties)
+    duties = bridge.compensated(tuple(duties), motulator_abc2complex(currents))
     bridge.reset(np.asarray(duties), on=True)
     return bridge
 

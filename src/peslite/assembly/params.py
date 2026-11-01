@@ -1544,7 +1544,8 @@ def runtime_changeable(path: str, p: Params) -> bool:
     for key in keys[:-1]:
         owner = getattr(owner, key) if is_dataclass(owner) else None
     field = owner.__dataclass_fields__.get(keys[-1]) if is_dataclass(owner) else None
-    return field is not None and field.metadata.get("runtime", True)
+    return (field is not None and field.metadata.get("runtime", True)
+            and not field.metadata.get("structural", False))
 
 
 def _event_assignments(p: Params, event: Any):

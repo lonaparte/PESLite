@@ -350,6 +350,13 @@ def test_an_oversampled_continuation_starts_at_an_interrupt(gfl):
     gfl(**late, **state, **{"simulation.initial.t": 1e-4})
     with pytest.raises(ConfigError, match="outside a controller computation window"):
         gfl(**late, **state, **{"simulation.initial.t": 9.5e-5})
+    gfl(**late, **{
+        "units.vsc.bridge.model": "switching",
+        "units.vsc.bridge.parallel_capacitance": 1e-8,
+        "units.vsc.bridge.on_resistance": 1e-3,
+        "simulation.initial.states": {"vsc.bridge.u_C.re": 0.0},
+        "simulation.initial.t": 9.5e-5,
+    })
 
 
 def test_a_window_open_before_a_new_run_uses_the_start_values(gfl, tmp_path):

@@ -47,17 +47,17 @@ class SwitchingSequence:
     q_abc: NDArray[np.float64]
 
 
-def _dead_time_compensated_duties(duties, currents, fraction):
-    """Add current-polarity feedforward to duty-ratio commands.
+def _dead_time_shifted_duties(duties, currents, fraction):
+    """Shift each commutating leg by ``fraction * sign(pole current)``.
 
-    ``fraction`` is dead time divided by carrier period. Clamped legs do not commutate and are
-    left unchanged. The physical dead-time model remains separate and acts on the result.
-    Scalar NumPy operations preserve the expression objects used by native-code exporters.
+    Positive ``fraction`` compensates the physical dead time; negative ``fraction`` gives its
+    cycle average. Clamped legs do not commutate. Scalar NumPy operations preserve the expression
+    objects used by native-code exporters.
     """
     duties, currents = tuple(duties), tuple(currents)
     if len(duties) != len(currents):
         raise ValueError(
-            f"dead-time compensation expected {len(duties)} pole currents, got {len(currents)}"
+            f"dead time expected {len(duties)} pole currents, got {len(currents)}"
         )
     corrected = []
     for duty, current in zip(duties, currents):
@@ -389,8 +389,7 @@ class PWM:
                  dead_time_compensation: bool = False,
                  pole_currents: Callable[[Any], Any] | None = None,
                  duty_names: tuple[str, ...],
-                 switching_state: Callable[[Any], Any],
-                 pwm_state: Callable[[Any], Any]) -> None:
+                 switching_state: Callable[[Any], Any]) -> None:
         if not math.isfinite(computation) or computation < 0.0:
             raise ValueError(f"the computation time must be finite and >= 0, got {computation}")
         self.control_clock = PeriodicClock(_real(period), _real(control_offset))
@@ -418,13 +417,12 @@ class PWM:
                 f"{type(modulator).__name__} does not accept duty-ratio dead-time compensation"
             )
         self.dead_time = _real(dead_time)
-        self.dead_time_compensation = dead_time_compensation
+        self.dead_time_compensation = dead_time_compensation and dead_time > 0.0
         self._pole_currents = pole_currents
-        self._dead_time_average = dead_time if isinstance(modulator, ZOH) else 0.0
         self._dead_time_sequence = (_DeadTimeSequence(
             dead_time, switching_width, getattr(modulator, "min_interval", 0.0),
         ) if dead_time > 0.0 and not isinstance(modulator, ZOH) else None)
-        self._switching_state, self._pwm_state = switching_state, pwm_state
+        self._switching_state = switching_state
         if pattern_sync not in ("interval", "pulse"):
             raise ValueError(f"pattern_sync must be 'interval' or 'pulse', got {pattern_sync!r}")
         self.pulse_update = (PulseSequence(modulator, switching_width)
@@ -563,14 +561,30 @@ class PWM:
         self.schedule.clear()
         self.next_switch = math.inf
         values = np.asarray(d[:self.modulation_width], dtype=float)
-        if self._dead_time_average > 0.0:
-            signs = np.sign(np.asarray(self._pole_currents(self.inp.i_c), dtype=float))
-            switching = (values > 0.0) & (values < 1.0)
-            values = np.clip(
-                values - (self._dead_time_average / self.carrier_period) * signs * switching,
-                0.0, 1.0,
-            )
-        return self._pwm_state(values)
+        if self.dead_time > 0.0:
+            values = self._dead_time_average(values, self._pole_currents(self.inp.i_c))
+        return self._held_state(values)
+
+    def _dead_time_average(self, duties, currents):
+        """Apply the cycle-averaged loss of physical dead time."""
+        return _dead_time_shifted_duties(
+            duties, currents, -self.dead_time / self.carrier_period,
+        )
+
+    def compensated(self, registers, current):
+        """Apply duty-ratio dead-time feedforward from one sampled bridge current."""
+        if not self.dead_time_compensation:
+            return registers
+        width = self.modulation_width
+        duties = _dead_time_shifted_duties(
+            registers[:width], self._pole_currents(current),
+            self.dead_time / self.carrier_period,
+        )
+        return (*duties, *registers[width:])
+
+    def _held_state(self, duties):
+        """Map duty ratios limited to [0, 1] through the topology switching law."""
+        return self._switching_state(tuple(min(1.0, max(0.0, duty)) for duty in duties))
 
     def _switching_interval(self, t_l: float, d: NDArray[np.float64], t_now: float):
         theta, omega = self.sync
@@ -1044,7 +1058,7 @@ def modulator_type(pwm, model, kind=None):
     return SynchronousCarrier if pwm.sync == "synchronous" else CarrierComparison
 
 
-def validate_modulator(unit, topology, where):
+def validate_modulator(unit, topology, where, *, dead_time_active=True):
     if unit.pwm is None:
         return
     cls = modulator_type(unit.pwm, unit.bridge.model, control_type(unit.ctrl.type).modulator)
@@ -1053,7 +1067,8 @@ def validate_modulator(unit, topology, where):
     legs = getattr(cls, "switching_legs", None)
     if legs is not None and len(topology.voltage_factors) != legs:
         raise ConfigError(f"{where}.bridge: {cls.__name__} requires {legs} switching legs")
-    if unit.pwm.dead_time_compensation and not getattr(cls, "duty_ratio_commands", False):
+    if (dead_time_active and unit.pwm.dead_time_compensation
+            and not getattr(cls, "duty_ratio_commands", False)):
         raise ConfigError(
             f"{where}.pwm.dead_time_compensation: {cls.__name__} does not use duty-ratio commands"
         )

@@ -14,7 +14,6 @@ import peslite
 from peslite.assembly import imperix
 from peslite.assembly.imperix_build import build_project
 from peslite.components.converter import make_topology
-from peslite.components.pwm import _dead_time_compensated_duties
 from peslite.control.blocks import phases
 from peslite.control.controller import Measurement, VSCController
 from peslite.solver.simulation import convert_main, main
@@ -145,11 +144,7 @@ def test_imperix_dead_time_compensation_preconditions_the_pwm_command(tmp_path):
     measurement = Measurement(0.0, **values, i_abc=np.array(phases(values["i_c"])))
     output = unit.ctrl(0.0, measurement)
     duties = tuple(unit.bridge.topology.command_duties(output))
-    expected = _dead_time_compensated_duties(
-        duties,
-        unit.bridge.topology.pole_currents(values["i_c"]),
-        unit.cfg.pwm.dead_time * unit.cfg.pwm.f_sw,
-    )
+    expected = unit.bridge.compensated(duties, values["i_c"])
     assert expected != pytest.approx(duties)
 
     source = tmp_path / "check.cpp"

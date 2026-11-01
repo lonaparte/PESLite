@@ -11,6 +11,7 @@ from onnx import TensorProto, helper
 import peslite
 from peslite import BlackBoxSubsystem
 from peslite.solver import Model
+from peslite.solver.simulation import SystemLoop
 
 
 pytestmark = [pytest.mark.full, pytest.mark.onnx]
@@ -116,7 +117,7 @@ def test_onnx_recurrent_update_is_committed_as_discrete_peslite_state():
 
     pending = block.next_state(0.0)
     assert block.get_state() == {"hidden_0": 2.0, "hidden_1": -4.0}
-    block.set_state(dict(zip(block.discrete_state_names, pending)))
+    block.set_state(dict(zip(block.get_state(), pending)))
     block.set_outputs(0.0)
 
     assert block.get_state() == pytest.approx({"hidden_0": 4.0, "hidden_1": -1.0})
@@ -208,6 +209,8 @@ def test_configured_recurrent_onnx_model_uses_registered_sampled_state(tmp_path)
     result = simulation.run(out_dir=tmp_path / "run")
     block = simulation.system.named_elements["onnx_model"].model
 
+    assert SystemLoop(simulation).periods == [1.0e-3]
+    assert "onnx_model.state_0" not in simulation._states.discrete_names
     assert block.get_state() == pytest.approx({
         "state_0": 0.5,
         "state_1": -1.0,

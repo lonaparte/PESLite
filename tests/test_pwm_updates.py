@@ -140,7 +140,7 @@ def test_pwm_register_layout_rejects_state_collisions(registers, modulator, matc
     topology = HalfBridge()
     with pytest.raises(ValueError, match=match):
         PWM(1e-5, 1e-5, 0.0, 0.0, 0.0, 1e-5, modulator, duty_names=registers,
-            switching_state=topology.switching_state, pwm_state=topology.pwm_state)
+            switching_state=topology.switching_state)
 
 
 @pytest.mark.parametrize("example", ["gfl", "buck", "wpt"])

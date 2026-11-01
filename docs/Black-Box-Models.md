@@ -67,6 +67,8 @@ model = BlackBoxSubsystem(
 
 `offset`, in [0, `period`), selects the update grid position. At one instant, all due units and
 clocked models sample before any commits; restored discrete states resume after the restart instant.
+The update period joins post-run loop-map schedules, where sampled floating-point state remains a
+smooth coordinate rather than a lifecycle mode.
 
 ## Energy declaration
 

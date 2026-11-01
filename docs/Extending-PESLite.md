@@ -179,7 +179,9 @@ An optional `parameter_bindings()` mapping `{field: (subsystem, attribute)}` exp
 scalar parameters to C++ event lowering. Implement `retune()` using the same bindings so Python
 and native output/energy equations share one parameter definition. Structural changes, such as
 changing the element's series connection, remain assembly-time configuration. Mark structural
-parameter fields with dataclass metadata `{"runtime": False}` to reject their `set` events.
+parameter fields with dataclass metadata `{"runtime": False}` to reject their `set` events. A
+numerical field marked `{"structural": True}` is also fixed during a run and excluded from native
+runtime parameters.
 
 Every entry returned by `signals()` follows the same output path. Complex values become three
 phase columns with `_a`, `_b` and `_c` suffixes, while scalar values retain their declared name;

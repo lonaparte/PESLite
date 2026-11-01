@@ -1280,6 +1280,7 @@ class SystemLoop:
         frequency = (sim.p.base.f0 or 0.0) if frame_frequency is None else frame_frequency
         self.w0 = 2.0 * math.pi * frequency
         periods = {value for unit in sim.units.values() for value in unit.periods}
+        periods.update(owner.clock.period for _name, owner in sim.system.event_subsystems)
         control_columns: set[str] = set()
         for name, unit in sim.units.items():
             ctrl = unit.ctrl
