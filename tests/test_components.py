@@ -162,14 +162,14 @@ def test_pwm_owns_timer_registers_and_switching_schedule():
     pwm = PWMAveragingModel(period=1e-3, load_period=1e-3, control_offset=0.0, load_offset=0.0,
                             computation=2e-4, carrier_period=1e-3, modulator=ZOH(),
                             topology=ThreePhaseBridge())
-    pwm.reset(initial, sampled_current=0j)
+    pwm.reset(initial)
     assert pwm.get_state() == {
         "d_a": 0.2, "d_b": 0.4, "d_c": 0.6, "on": False,
         "shadow.d_a": 0.2, "shadow.d_b": 0.4, "shadow.d_c": 0.6,
         "shadow.on": False,
     }
 
-    pwm.write(0.0, np.array([0.8, 0.7, 0.6]), sampled_current=0j)
+    pwm.write(0.0, np.array([0.8, 0.7, 0.6]))
     q = pwm.load(0.0)
     assert q == ThreePhaseBridge.pwm_state(initial)
     assert pwm.k == 1

@@ -20,7 +20,7 @@ from ..components.adc import ADC, ADCSample, MeasurementPorts
 from ..components.converter import (HalfBridgeDiodeConduction, make_bridge, make_dclink,
                                     make_topology)
 from ..components.network import RLBranch, Terminal
-from ..components.pwm import Modulator
+from ..components.pwm import Modulator, _dead_time_compensated_duties
 from ..control.blocks import phases
 from ..control.controller import (Controller, ConverterMeasurement,
                                   Measurement, make_controller)
@@ -127,7 +127,7 @@ class Unit(ABC):
             rms_available=bool(values[0].meas.rms)), (self.cfg, sim))
         self._trip_due = False
         self._track_due = False
-        self._write_due: Optional[tuple[float, Any, complex | float]] = None
+        self._write_due: Optional[tuple[float, Any, Any]] = None
         self._initially_connected = False
         self.breaker = True
         self.gates = False
@@ -411,7 +411,18 @@ class Unit(ABC):
         self._before_sampled_control(t, measurement)
         output = self.ctrl(t, measurement)
         self._check_sampled_protection(t, measurement, output)
-        self._write_due = (t, output, self._sampled_bridge_current(measurement))
+        registers = self.bridge.command_registers(output)
+        if self.bridge.dead_time > 0.0 and self.bridge.dead_time_compensation:
+            width = self.bridge.modulation_width
+            duties = _dead_time_compensated_duties(
+                registers[:width],
+                self.bridge.topology.pole_currents(
+                    self._sampled_bridge_current(measurement)
+                ),
+                self.bridge.dead_time / self.bridge.carrier_period,
+            )
+            registers = (*duties, *registers[width:])
+        self._write_due = (t, registers, output)
         return self.bridge.control_index, output
 
     def actuate(self, t: float, plant: Plant) -> bool:

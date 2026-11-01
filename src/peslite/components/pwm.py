@@ -491,27 +491,18 @@ class PWM:
         return (f"control {1e-3 / self.period:g} kHz, computation {self.computation * 1e6:g} us, "
                 f"{'double' if double else 'single'} update{dead_time}")
 
-    def _word(self, registers, on: bool,
-              sampled_current: complex | float) -> tuple[float, ...]:
+    def _word(self, registers, on: bool) -> tuple[float, ...]:
         # Registers are scalar values, not a numerical vector operation. Preserve each
         # scalar's arithmetic semantics so ordinary construction also binds export parameters.
         values = registers.tolist() if isinstance(registers, np.ndarray) else list(registers)
         if len(values) != self._width:
             raise ValueError(f"expected {self._width} command registers, got {len(values)}")
-        if on and self.dead_time > 0.0 and self.dead_time_compensation:
-            duties = values[:self.modulation_width]
-            values[:self.modulation_width] = _dead_time_compensated_duties(
-                duties,
-                self._pole_currents(sampled_current),
-                self.dead_time / self.carrier_period,
-            )
         values.append(1.0 if on else 0.0)
         return tuple(values)
 
-    def reset(self, d_abc: NDArray[np.float64], on: bool = False, *,
-              sampled_current: complex | float) -> None:
+    def reset(self, d_abc: NDArray[np.float64], on: bool = False) -> None:
         """Put commands and enable in both register banks; the default is blocked."""
-        word = self._word(d_abc, on, sampled_current)
+        word = self._word(d_abc, on)
         self.active = self.shadow = self.completed = word
 
     def tick(self, t: float, theta: float | None = None, omega: float | None = None) -> None:
@@ -522,14 +513,11 @@ class PWM:
 
     def write(self, t: float, d_abc: NDArray[np.float64], on: bool = True,
               theta: float | None = None,
-              omega: float | None = None, *,
-              sampled_current: complex | float) -> None:
-        """Advance an interrupt and write its command with the corresponding ADC sample."""
+              omega: float | None = None) -> None:
+        """Advance an interrupt and write its computed commands and enable to shadow."""
         self.tick(t, theta, omega)
         # computation < period: the replaced word's computation has completed.
-        self.completed, self.shadow = self.shadow, self._word(
-            d_abc, on, sampled_current,
-        )
+        self.completed, self.shadow = self.shadow, self._word(d_abc, on)
 
     @property
     def duty(self) -> NDArray[np.float64]:

@@ -118,7 +118,7 @@ def test_bridge_phase_clock_describes_the_applied_reference():
 
     omega = 2 * math.pi * 100e3
     pwm = SwitchingModel(1e-5, 1e-5, 0.0, 0.0, 0.0, 1e-5, SynchronousCarrier(1), ThreePhaseBridge())
-    pwm.reset(np.full(3, .5), on=True, sampled_current=0j)
+    pwm.reset(np.full(3, .5), on=True)
     pwm.start(0.0, (0.0, omega), False)
     pwm.load(0.0)
     pwm.tick(1e-5, .4, omega)

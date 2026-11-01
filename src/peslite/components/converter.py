@@ -465,7 +465,7 @@ class _SampledModel(_BridgeModel, PWM):
             tuple(modulator.neutral_registers()) if registers is not None
             else (self.topology.neutral_duty,) * len(self.topology.duty_names) + (0.0,) * len(carried)
         )
-        self.reset(self.neutral_registers, on=False, sampled_current=0.0)
+        self.reset(self.neutral_registers, on=False)
         self.state_owner = self
 
     @property
@@ -494,7 +494,7 @@ class _SampledModel(_BridgeModel, PWM):
     def control_due(self, t: float) -> bool:
         return abs(self.t_interrupt - t) < TIME_EPS
 
-    def actuate(self, t: float, command: tuple[float, Any, complex | float] | None,
+    def actuate(self, t: float, command: tuple[float, Any, Any] | None,
                 enabled: bool) -> list[Any]:
         """Accept one sampled command and return bridge inputs which become active at ``t``.
 
@@ -504,19 +504,15 @@ class _SampledModel(_BridgeModel, PWM):
         """
         changes: list[Any] = []
         if command is not None and self.computation == 0.0:
-            at, output, sampled_current = command
-            self.write(
-                at, self.command_registers(output), bool(output.gates) and enabled,
-                output.theta, output.omega, sampled_current=sampled_current,
-            )
+            at, registers, output = command
+            self.write(at, registers, bool(output.gates) and enabled,
+                       output.theta, output.omega)
         if abs(self.t_load - t) < TIME_EPS:
             changes.append(self.load(t))
         if command is not None and self.computation > 0.0:
-            at, output, sampled_current = command
-            self.write(
-                at, self.command_registers(output), bool(output.gates) and enabled,
-                output.theta, output.omega, sampled_current=sampled_current,
-            )
+            at, registers, output = command
+            self.write(at, registers, bool(output.gates) and enabled,
+                       output.theta, output.omega)
         changes.extend(self.switches(t))
         return changes
 
