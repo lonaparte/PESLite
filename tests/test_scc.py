@@ -410,7 +410,9 @@ def test_clock_and_carried_commands_do_not_depend_on_phase_shift_modulation():
     modulator.carried = ("scc_angle",)
     bridge = SwitchingModel(1e-5, 1e-5, 0.0, 0.0, 0.0, 1e-5, modulator, HalfBridge())
     output = BridgeControlOutput(commands={"duty": 0.4, "scc_angle": 1.2})
-    bridge.reset(bridge.command_registers(output), on=True)
+    bridge.reset(
+        bridge.command_registers(output), on=True, sampled_current=bridge.inp.i_c,
+    )
     sequence = bridge.load(0.0)
     assert bridge.modulation_width == 1
     assert np.isfinite(sequence)

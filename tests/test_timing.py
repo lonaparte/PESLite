@@ -236,8 +236,8 @@ def test_initial_state_overrides_do_not_turn_a_fresh_run_into_a_continuation(
 
 def test_shadow_duty_loads_only_after_computation():
     pwm = _pwm(2e-5)
-    pwm.reset(np.full(3, 0.5))
-    pwm.write(0.0, np.full(3, 0.1))
+    pwm.reset(np.full(3, 0.5), sampled_current=0j)
+    pwm.write(0.0, np.full(3, 0.1), sampled_current=0j)
     pwm.load(0.0)
     assert pwm.active[0] == 0.5
     pwm.load(1e-5)
@@ -245,15 +245,15 @@ def test_shadow_duty_loads_only_after_computation():
     pwm.load(2e-5)
     assert pwm.active[0] == 0.1
 
-    pwm.write(T, np.full(3, 0.2))
+    pwm.write(T, np.full(3, 0.2), sampled_current=0j)
     assert (pwm.active[0], pwm.shadow[0]) == (0.1, 0.2)
 
     # Interrupts within the computation before every load: each load takes the replaced word.
     offset = PWMAveragingModel(T, T, T - 1e-5, 0.0, 2e-5, T, ZOH(), ThreePhaseBridge())
-    offset.reset(np.full(3, 0.5))
+    offset.reset(np.full(3, 0.5), sampled_current=0j)
     loaded = []
     for k, duty in enumerate((0.1, 0.2, 0.3)):
-        offset.write(offset.interrupt(k), np.full(3, duty))
+        offset.write(offset.interrupt(k), np.full(3, duty), sampled_current=0j)
         offset.load(offset.load_time(k + 1))
         loaded.append(offset.active[0])
     assert loaded == [0.5, 0.1, 0.2]

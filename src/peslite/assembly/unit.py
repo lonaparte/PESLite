@@ -127,7 +127,7 @@ class Unit(ABC):
             rms_available=bool(values[0].meas.rms)), (self.cfg, sim))
         self._trip_due = False
         self._track_due = False
-        self._write_due: Optional[tuple[float, Any]] = None
+        self._write_due: Optional[tuple[float, Any, complex | float]] = None
         self._initially_connected = False
         self.breaker = True
         self.gates = False
@@ -411,7 +411,7 @@ class Unit(ABC):
         self._before_sampled_control(t, measurement)
         output = self.ctrl(t, measurement)
         self._check_sampled_protection(t, measurement, output)
-        self._write_due = (t, output)
+        self._write_due = (t, output, self._sampled_bridge_current(measurement))
         return self.bridge.control_index, output
 
     def actuate(self, t: float, plant: Plant) -> bool:
@@ -552,6 +552,10 @@ class Unit(ABC):
     @abstractmethod
     def _control_measurement(self, sample: ADCSample) -> Any:
         """Adapt a generic ADC sample to this controller family's input object."""
+
+    @abstractmethod
+    def _sampled_bridge_current(self, measurement: Any) -> complex | float:
+        """Return the ADC current sample used by bridge-command compensation."""
 
     @abstractmethod
     def _protection_sample(self, measurement: Any, output: Any | None) -> ProtectionSample:
@@ -772,6 +776,10 @@ class VSC(Unit):
             i_abc=np.asarray(phases(raw_current)),
             samples=tuple(self._control_measurement(item) for item in sample.samples),
         )
+
+    @staticmethod
+    def _sampled_bridge_current(measurement: Measurement) -> complex:
+        return measurement.i_c
 
     def _protection_sample(self, measurement: Measurement,
                            output: Any | None) -> ProtectionSample:
@@ -1015,6 +1023,10 @@ class DCConverter(Unit):
             power=values.get("power"),
             samples=tuple(self._control_measurement(item) for item in sample.samples),
         )
+
+    @staticmethod
+    def _sampled_bridge_current(measurement: ConverterMeasurement) -> float:
+        return measurement.current
 
     def _protection_sample(self, measurement: ConverterMeasurement,
                            output: Any | None) -> ProtectionSample:

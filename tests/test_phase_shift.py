@@ -397,6 +397,13 @@ def test_phase_shift_configuration_is_checked():
     tree["units"]["charger"]["primary"]["pwm"]["carrier_phase"] = 0.25
     with pytest.warns(UserWarning, match="carrier_phase is ignored"):
         from_dict(tree)
+    tree = copy.deepcopy(base)
+    tree["units"]["charger"]["primary"]["pwm"].update({
+        "dead_time": 0.5e-6,
+        "dead_time_compensation": True,
+    })
+    with pytest.raises(ConfigError, match="does not use duty-ratio commands"):
+        from_dict(tree)
     resonant = copy.deepcopy(base)
     resonant["units"]["charger"]["primary"]["ctrl"] = {
         "type": "resonant", "loops": {"ResonantModulation": {}},

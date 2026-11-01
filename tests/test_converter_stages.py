@@ -85,7 +85,7 @@ def test_each_bridge_topology_has_switching_pwm_and_averaging_forms(
     assert switching.topology is pwm.topology is averaging.topology is topology
     assert switching.duty.shape == pwm.duty.shape == duties.shape
 
-    pwm.reset(duties, on=True)
+    pwm.reset(duties, on=True, sampled_current=0.0)
     assert pwm.start(0.0, (None, None), continued=False) == pytest.approx(expected)
 
     averaging.inp.q = expected
@@ -98,33 +98,35 @@ def test_each_bridge_topology_has_switching_pwm_and_averaging_forms(
     assert averaging.out.i_dc == pytest.approx(factor * (expected * 2.0).real)
 
 
-@pytest.mark.parametrize(("topology", "duties", "current", "expected"), [
-    (HalfBridge(), np.array([0.75]), 2.0, 0.65),
-    (HalfBridge(), np.array([1.00]), 2.0, 1.00),
-    (HalfBridge(), np.array([0.00]), -2.0, 0.00),
-    (HalfBridge(reverse_port=True), np.array([0.75]), 2.0, 0.15),
-    (FullBridge(), np.array([0.75, 0.25]), 2.0, 0.30),
+@pytest.mark.parametrize(("topology", "duties", "current", "expected", "commanded"), [
+    (HalfBridge(), np.array([0.75]), 2.0, 0.65, [0.85]),
+    (HalfBridge(), np.array([1.00]), 2.0, 1.00, [1.00]),
+    (HalfBridge(), np.array([0.00]), -2.0, 0.00, [0.00]),
+    (HalfBridge(reverse_port=True), np.array([0.75]), 2.0, 0.15, [0.65]),
+    (FullBridge(), np.array([0.75, 0.25]), 2.0, 0.30, [0.85, 0.15]),
     (
         ThreePhaseBridge(),
         np.array([0.75, 0.25, 0.50]),
         2.0 + 0.0j,
         ThreePhaseBridge.pwm_state((0.65, 0.35, 0.60)),
+        [0.85, 0.15, 0.40],
     ),
 ])
 def test_pwm_average_dead_time_uses_each_topologys_pole_current_mapping(
-        topology, duties, current, expected):
+        topology, duties, current, expected, commanded):
     cfg = _bridge_configuration("pwm_averaging")
     cfg.pwm.dead_time = 1.0e-5
     bridge = make_bridge(cfg, topology=topology)
     bridge.inp.i_c = current
-    bridge.reset(duties, on=True)
+    bridge.reset(duties, on=True, sampled_current=current)
 
     assert bridge.start(0.0, (None, None), continued=False) == pytest.approx(expected)
 
     cfg.pwm.dead_time_compensation = True
     compensated = make_bridge(cfg, topology=topology)
     compensated.inp.i_c = current
-    compensated.reset(duties, on=True)
+    compensated.reset(duties, on=True, sampled_current=current)
+    assert compensated.duty == pytest.approx(commanded)
     assert compensated.start(0.0, (None, None), continued=False) == pytest.approx(
         topology.pwm_state(duties)
     )
@@ -139,24 +141,41 @@ def test_pwm_dead_time_requires_controlled_devices():
         make_bridge(cfg, topology=FullBridge(upper_controlled=False, lower_controlled=False))
 
 
-def test_ideal_dead_time_compensation_preserves_the_switching_sequence_without_state():
+def test_switching_dead_time_compensation_preconditions_the_command_before_physical_dead_time():
     topology = HalfBridge()
     cfg = _bridge_configuration("switching")
     cfg.pwm.dead_time = 1.0e-5
     cfg.pwm.dead_time_compensation = True
-    compensated = make_bridge(cfg, topology=topology)
-    baseline_cfg = _bridge_configuration("switching")
-    baseline = make_bridge(baseline_cfg, topology=topology)
-    for bridge in (baseline, compensated):
-        bridge.inp.i_c = 2.0
-        bridge.reset(np.array([0.75]), on=True)
+    bridge = make_bridge(cfg, topology=topology)
+    bridge.inp.i_c = 2.0
+    bridge.reset(np.array([0.75]), on=True, sampled_current=bridge.inp.i_c)
 
-    assert compensated.start(0.0, (None, None), False) == pytest.approx(
-        baseline.start(0.0, (None, None), False)
+    assert bridge.duty == pytest.approx([0.85])
+    warmup = bridge.modulator(-bridge.carrier_period, bridge.carrier_period, bridge.duty)
+    bridge._dead_time_sequence(
+        -bridge.carrier_period, bridge.carrier_period, warmup,
+        topology.pole_currents(bridge.inp.i_c), enabled=True,
     )
-    assert compensated.dead_time == pytest.approx(1.0e-5)
-    assert compensated._dead_time_sequence is None
-    assert not any(name.startswith("dead_time.") for name in compensated.get_state())
+    raw = bridge.modulator(0.0, bridge.carrier_period, bridge.duty)
+    actual = bridge._dead_time_sequence(
+        0.0, bridge.carrier_period, raw, topology.pole_currents(bridge.inp.i_c), enabled=True,
+    )
+    assert np.average(actual.q_abc[:, 0], weights=actual.dt) == pytest.approx(0.75)
+    assert bridge.dead_time == pytest.approx(1.0e-5)
+    assert bridge._dead_time_sequence is not None
+    assert any(name.startswith("dead_time.") for name in bridge.get_state())
+
+
+def test_dead_time_compensation_uses_the_controller_current_sample():
+    cfg = _bridge_configuration("pwm_averaging")
+    cfg.pwm.dead_time = 1.0e-5
+    cfg.pwm.dead_time_compensation = True
+    bridge = make_bridge(cfg, topology=HalfBridge())
+    bridge.inp.i_c = 2.0
+
+    bridge.write(0.0, np.array([0.75]), on=True, sampled_current=-2.0)
+
+    assert bridge.shadow[0] == pytest.approx(0.65)
 
 
 def test_full_bridge_device_attributes_select_rectification_on_the_same_structure():

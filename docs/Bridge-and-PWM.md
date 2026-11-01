@@ -75,7 +75,7 @@ meas:
 | `pwm.sync` | `asynchronous` | `asynchronous` or `synchronous` | carrier clock source |
 | `pwm.pattern_sync` | `interval` | `interval` or `pulse` | waveform replacement rule |
 | `pwm.dead_time` | 0 | seconds, less than half a switching period | complementary-device turn-on delay |
-| `pwm.dead_time_compensation` | `false` | Boolean | cancel the ideal current-polarity dead-time error |
+| `pwm.dead_time_compensation` | `false` | Boolean | add current-polarity duty-ratio feedforward |
 | `meas.period` | `ctrl.period`; otherwise `simulation.output.period` | divides `ctrl.period` when sampled | ADC conversion period |
 | `meas.offset` | aligned with controller interrupts | within one ADC period | ADC conversion position |
 | `meas.window` | `ctrl.period` | no longer than `ctrl.period` | averaging window |
@@ -170,8 +170,11 @@ pulse-preservation state.
 Dead time is applied to the leg sequence after modulation, so carrier and phase-shift modulation
 share the same current-directed diode-clamping rule. `pwm_averaging` applies its cycle average;
 legs held at duty 0 or 1 do not commutate and have no dead-time error. Ideal `averaging` has no PWM
-hardware, so it warns and ignores dead time and compensation. Compensation in the sampled models
-applies an ideal polarity-based correction and removes the corresponding voltage error.
+hardware, so it warns and ignores dead time and compensation. For duty-ratio modulation,
+compensation adds `dead_time * f_sw * sign(pole_current)` to each switching leg's command and then
+applies the physical dead time normally; clipping at 0 or 1 limits the achievable correction.
+Phase-shift patterns have no independent leg duty-ratio commands, so this compensation is not
+accepted for `ctrl.type: phase_shift`.
 
 ## Protection periods
 

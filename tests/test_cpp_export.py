@@ -176,8 +176,8 @@ def _final_csv(path: Path) -> dict[str, float]:
         return {key: float(value) for key, value in list(csv.DictReader(stream))[-1].items()}
 
 
-def _run_generated(params, project: Path, compiler: str):
-    peslite.export(params, "cpp", project, name=project.name)
+def _run_generated(params, project: Path, compiler: str, *, variables=()):
+    peslite.export(params, "cpp", project, name=project.name, variables=variables)
     source = project / "peslite.cpp"
     executable = project / "peslite"
     subprocess.run(
@@ -266,19 +266,22 @@ def test_export_preserves_system_factories_without_mutating_the_caller(tmp_path)
 
 
 @pytest.mark.parametrize("mode", ("switching", "pwm_averaging"))
-def test_generated_cpp_matches_current_directed_pwm_dead_time(mode, tmp_path):
+@pytest.mark.parametrize("compensation", (False, True), ids=("uncompensated", "compensated"))
+def test_generated_cpp_matches_current_directed_pwm_dead_time(mode, compensation, tmp_path):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
     params = _quick(mode).replace(**{
         "units.vsc.pwm.dead_time": 1.0e-6,
+        "units.vsc.pwm.dead_time_compensation": compensation,
         "simulation.t_end": 0.2003,
         "simulation.output.period": 5.0e-6,
         "simulation.output.signals": True,
     })
 
     source, cpp_out, python_out = _run_generated(
-        params, tmp_path / f"dead-time-{mode}", compiler
+        params, tmp_path / f"dead-time-{mode}-{compensation}", compiler,
+        variables=("all",) if compensation else (),
     )
 
     for filename in ("states.csv", "plant.csv"):
@@ -290,6 +293,37 @@ def test_generated_cpp_matches_current_directed_pwm_dead_time(mode, tmp_path):
                                        equal_nan=True, err_msg=f"{mode}:{filename}:{column}")
     text = source.read_text(encoding="utf-8")
     assert ("DeadTimeSequenceState" in text) == (mode == "switching")
+
+
+def test_generated_cpp_matches_dc_dead_time_compensation(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "buck-example.pes").replace(**{
+        "units.converter.bridge.type": "full_bridge",
+        "units.converter.bridge.lower_controlled": True,
+        "units.converter.pwm.dead_time": 1.0e-6,
+        "units.converter.pwm.dead_time_compensation": True,
+        "units.converter.ctrl.references.voltage": 12.0,
+        "simulation.t_end": 0.002,
+        "simulation.output.signals": True,
+        "simulation.energy_check": "off",
+    })
+
+    _source, cpp_out, python_out = _run_generated(
+        params, tmp_path / "dc-dead-time-compensation", compiler,
+    )
+
+    for filename in ("states.csv", "plant.csv"):
+        actual = _final_csv(cpp_out / filename)
+        expected = _final_csv(python_out / filename)
+        assert actual.keys() == expected.keys()
+        np.testing.assert_allclose(
+            [actual[name] for name in actual],
+            [expected[name] for name in expected],
+            rtol=2e-8,
+            atol=2e-8,
+        )
 
 
 def test_export_rejects_unrebuildable_instances_before_creating_files(tmp_path):

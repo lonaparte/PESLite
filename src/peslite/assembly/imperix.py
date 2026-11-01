@@ -129,6 +129,7 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
             voltage = "std::abs(meas_u_g)"
             frequency = f"({self.source(self.graph.outputs['omega'])} - {_number(self.cfg.base.w0)}) / (2.0 * pi)"
             vdc_error = f"meas_u_dc - {self._reference('vdc_ref_pu')}"
+            bridge_current = _Expression(self._adc_value("i_c"), "complex")
         else:
             output = SimpleNamespace(**{port: _Expression(self.source(port), "real")
                                         for port in self.graph.interface.outputs})
@@ -140,8 +141,14 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
                 raise ValueError(f"{self.name}: DC-link protection has no mapped DC-link measurement")
             vdc_error = (f"measured.{_identifier(dc_channel)} / {_number(self.cfg.dc_base.v)} - 1.0"
                          if dc_channel is not None else "std::numeric_limits<double>::quiet_NaN()")
+            bridge_current = _Expression(self._adc_value("current"), "real")
         for index, value in enumerate(self.topology.command_duties(output)):
             lines.append(f"duty[{index}] = {_Expression.of(value).code};")
+        lines += self._dead_time_compensation_lines(
+            "duty", bridge_current, self.binding["dead_time"] * self.cfg.pwm.f_sw, "",
+            enabled=(self.cfg.pwm.dead_time_compensation
+                     and self.binding["dead_time"] > 0.0),
+        )
         lines += [f"sampled_protect_{self.tag}(t, {voltage}, {frequency}, {vdc_error}, "
                   f"{self.m('startup_complete')});",
                   f"++{self.m('pwm_k')};",
@@ -311,12 +318,12 @@ def _bindings(simulation, config, model, *, events=None):
             raise ValueError(f"{name}: the averaging window requires {history} ADC history samples; "
                              "the SDK supports at most 64")
         unilateral = unit.bridge.topology.unilateral
-        dead_time = configured.pwm.dead_time
-        if not unilateral and dead_time == 0.0:
+        if not unilateral and configured.pwm.dead_time == 0.0:
             raise ValueError(
                 f"{name}: complementary hardware PWM requires positive "
                 f"units.{name}.pwm.dead_time"
             )
+        dead_time = 0.0 if unilateral else configured.pwm.dead_time
         if cfg.protection.overcurrent.enable and binding.get("hardware_overcurrent_configured") is not True:
             raise ValueError(f"{name}: enabled fast protection requires hardware_overcurrent_configured=true")
         default_ramp = next((event.ramp for event in (simulation.p.changes if events is None else events)

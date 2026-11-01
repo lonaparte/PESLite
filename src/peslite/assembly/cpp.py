@@ -27,7 +27,7 @@ import numpy as np
 from ..components.converter import DCLink
 from ..components.network import ACVoltageSource, RLBranch
 from ..components.pwm import (_EPS, _SNAP, CarrierComparison, SynchronousCarrier, PhaseClock,
-                               PhaseShiftModulator, ZOH)
+                               PhaseShiftModulator, ZOH, _dead_time_compensated_duties)
 from ..control.profiles import PHASE_SHIFT_MODES
 from ..control.blocks import OutputLimit
 from ..control.controller import GraphController, VSCController
@@ -3850,6 +3850,28 @@ class _ControlGenerator:
             f"{_number(bridge.interrupt(_Expression(self.m('pwm_k'), 'real')))};",
         ]
 
+    def _dead_time_compensation_lines(
+        self, duties: str, sampled_current: _Expression, fraction: Any, indent: str, *,
+        enabled: bool,
+    ) -> list[str]:
+        """Condition duty commands from the same ADC current sample used by control."""
+        if not enabled:
+            return []
+        currents = self.model._trace(
+            lambda: self.topology.pole_currents(sampled_current)
+        )
+        commands = tuple(
+            _Expression(f"{duties}[{index}]", "real")
+            for index in range(len(currents))
+        )
+        corrected = _dead_time_compensated_duties(
+            commands, currents, fraction,
+        )
+        return [
+            f"{indent}{duties}[{index}] = {_Expression.of(value).code};"
+            for index, value in enumerate(corrected)
+        ]
+
     def _pwm_load_lines(self, hold: str, switching: bool, gates: str,
                         tail: tuple[str, ...] = ()) -> list[str]:
         bridge = self.bridge
@@ -4534,6 +4556,11 @@ class _UnitGenerator(_ACControlGenerator):
         lines += ["    " + line for line in self._sampled_loop_lines()]
         lines += ["    " + line for line in self._sampled_vsc_command_lines()]
         lines += self._modulation_lines(indent="    ")
+        lines += self._dead_time_compensation_lines(
+            self.m("pending_d"), _Expression(self._adc_value("i_c"), "complex"),
+            self.bridge.dead_time / self.bridge.carrier_period, "    ",
+            enabled=(self.bridge.dead_time > 0.0 and self.bridge.dead_time_compensation),
+        )
         lines += self._log_lines("    ")
         lines += ["    " + line for line in self._rms_sample_lines()]
         lines += [f"    sampled_protect_{self.tag}(t, std::abs(meas_u_g),",
@@ -4738,6 +4765,11 @@ class _GraphUnitGenerator(_ElectricalUnitGenerator):
         lines += ["    " + line for line in self._sampled_loop_lines()]
         for index, duty in enumerate(self._command_registers()):
             lines.append(f"    {self.m('pending_d')}[{index}] = {duty.code};")
+        lines += self._dead_time_compensation_lines(
+            self.m("pending_d"), _Expression(self._adc_value("current"), "real"),
+            self.bridge.dead_time / self.bridge.carrier_period, "    ",
+            enabled=(self.bridge.dead_time > 0.0 and self.bridge.dead_time_compensation),
+        )
         lines += ["    " + line for line in self._log_lines()]
         lines += [
             f"    sampled_protect_{self.tag}(t, "

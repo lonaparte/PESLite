@@ -118,7 +118,7 @@ def test_bridge_phase_clock_describes_the_applied_reference():
 
     omega = 2 * math.pi * 100e3
     pwm = SwitchingModel(1e-5, 1e-5, 0.0, 0.0, 0.0, 1e-5, SynchronousCarrier(1), ThreePhaseBridge())
-    pwm.reset(np.full(3, .5), on=True)
+    pwm.reset(np.full(3, .5), on=True, sampled_current=0j)
     pwm.start(0.0, (0.0, omega), False)
     pwm.load(0.0)
     pwm.tick(1e-5, .4, omega)
@@ -173,15 +173,18 @@ def test_default_configuration_generates_identical_cpp(example, tmp_path):
     assert (tmp_path / "omitted/peslite.cpp").read_bytes() == (tmp_path / "explicit/peslite.cpp").read_bytes()
 
 
-@pytest.mark.parametrize(("update", "dead_time"), [
-    ("interval", 0.0),
-    ("pulse", 0.0),
-    ("interval", 1e-6),
+@pytest.mark.parametrize(("update", "dead_time", "compensation"), [
+    ("interval", 0.0, False),
+    ("pulse", 0.0, False),
+    ("interval", 1e-6, False),
+    ("interval", 1e-6, True),
 ])
-def test_switching_continuation_restores_the_applied_waveform(update, dead_time, tmp_path):
+def test_switching_continuation_restores_the_applied_waveform(
+        update, dead_time, compensation, tmp_path):
     params = _case("gfl", "switching").replace(**{
         "units.vsc.pwm.sync": "synchronous", "units.vsc.pwm.pattern_sync": update,
         "units.vsc.pwm.dead_time": dead_time,
+        "units.vsc.pwm.dead_time_compensation": compensation,
         "simulation.t_end": .001, "simulation.output.period": 1e-6,
     })
     whole = peslite.Simulation(params)

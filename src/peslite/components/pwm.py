@@ -6,6 +6,7 @@ A modulator is called at every load of the compare registers for the interval un
 from __future__ import annotations
 
 import math
+import numbers
 import warnings
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Iterator, Mapping, Optional, Protocol, NamedTuple, runtime_checkable
@@ -46,6 +47,36 @@ class SwitchingSequence:
     q_abc: NDArray[np.float64]
 
 
+def _dead_time_compensated_duties(duties, currents, fraction):
+    """Add current-polarity feedforward to duty-ratio commands.
+
+    ``fraction`` is dead time divided by carrier period. Clamped legs do not commutate and are
+    left unchanged. The physical dead-time model remains separate and acts on the result.
+    Scalar NumPy operations preserve the expression objects used by native-code exporters.
+    """
+    duties, currents = tuple(duties), tuple(currents)
+    if len(duties) != len(currents):
+        raise ValueError(
+            f"dead-time compensation expected {len(duties)} pole currents, got {len(currents)}"
+        )
+    corrected = []
+    for duty, current in zip(duties, currents):
+        if all(isinstance(value, numbers.Real) for value in (duty, current, fraction)):
+            value = duty
+            if 0.0 < duty < 1.0:
+                value += fraction * (int(current > 0.0) - int(current < 0.0))
+            corrected.append(min(1.0, max(0.0, value)))
+            continue
+        polarity = np.where(current > 0.0, 1.0, np.where(current < 0.0, -1.0, 0.0))
+        correction = np.where(
+            duty > 0.0,
+            np.where(duty < 1.0, fraction * polarity, 0.0),
+            0.0,
+        )
+        corrected.append(np.minimum(1.0, np.maximum(0.0, duty + correction)).item())
+    return tuple(corrected)
+
+
 def _switching_sequence(span, min_interval, word, changes) -> SwitchingSequence:
     """Apply time-ordered ``(time, positions, values)`` changes to ``word`` over ``span``.
 
@@ -80,6 +111,7 @@ class Modulator(Protocol):
 
     carried: tuple[str, ...] = ()  # controller outputs passed after the modulated registers
     config_fields = frozenset(("carrier_phase", "sync"))  # the pwm options the modulator reads
+    duty_ratio_commands = True
 
     def __call__(self, t: float, T: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence: ...
@@ -381,14 +413,17 @@ class PWM:
             raise TypeError("dead_time_compensation must be bool")
         if dead_time > 0.0 and pole_currents is None:
             raise TypeError("dead time requires the topology's pole-current mapping")
+        if dead_time_compensation and not getattr(modulator, "duty_ratio_commands", False):
+            raise TypeError(
+                f"{type(modulator).__name__} does not accept duty-ratio dead-time compensation"
+            )
         self.dead_time = _real(dead_time)
         self.dead_time_compensation = dead_time_compensation
         self._pole_currents = pole_currents
-        residual = 0.0 if dead_time_compensation else dead_time
-        self._dead_time_average = residual if isinstance(modulator, ZOH) else 0.0
+        self._dead_time_average = dead_time if isinstance(modulator, ZOH) else 0.0
         self._dead_time_sequence = (_DeadTimeSequence(
-            residual, switching_width, getattr(modulator, "min_interval", 0.0),
-        ) if residual > 0.0 and not isinstance(modulator, ZOH) else None)
+            dead_time, switching_width, getattr(modulator, "min_interval", 0.0),
+        ) if dead_time > 0.0 and not isinstance(modulator, ZOH) else None)
         self._switching_state, self._pwm_state = switching_state, pwm_state
         if pattern_sync not in ("interval", "pulse"):
             raise ValueError(f"pattern_sync must be 'interval' or 'pulse', got {pattern_sync!r}")
@@ -456,18 +491,27 @@ class PWM:
         return (f"control {1e-3 / self.period:g} kHz, computation {self.computation * 1e6:g} us, "
                 f"{'double' if double else 'single'} update{dead_time}")
 
-    def _word(self, registers, on: bool) -> tuple[float, ...]:
+    def _word(self, registers, on: bool,
+              sampled_current: complex | float) -> tuple[float, ...]:
         # Registers are scalar values, not a numerical vector operation. Preserve each
         # scalar's arithmetic semantics so ordinary construction also binds export parameters.
         values = registers.tolist() if isinstance(registers, np.ndarray) else list(registers)
         if len(values) != self._width:
             raise ValueError(f"expected {self._width} command registers, got {len(values)}")
+        if on and self.dead_time > 0.0 and self.dead_time_compensation:
+            duties = values[:self.modulation_width]
+            values[:self.modulation_width] = _dead_time_compensated_duties(
+                duties,
+                self._pole_currents(sampled_current),
+                self.dead_time / self.carrier_period,
+            )
         values.append(1.0 if on else 0.0)
         return tuple(values)
 
-    def reset(self, d_abc: NDArray[np.float64], on: bool = False) -> None:
+    def reset(self, d_abc: NDArray[np.float64], on: bool = False, *,
+              sampled_current: complex | float) -> None:
         """Put commands and enable in both register banks; the default is blocked."""
-        word = self._word(d_abc, on)
+        word = self._word(d_abc, on, sampled_current)
         self.active = self.shadow = self.completed = word
 
     def tick(self, t: float, theta: float | None = None, omega: float | None = None) -> None:
@@ -478,11 +522,14 @@ class PWM:
 
     def write(self, t: float, d_abc: NDArray[np.float64], on: bool = True,
               theta: float | None = None,
-              omega: float | None = None) -> None:
-        """Advance an interrupt and write its computed commands and enable to shadow."""
+              omega: float | None = None, *,
+              sampled_current: complex | float) -> None:
+        """Advance an interrupt and write its command with the corresponding ADC sample."""
         self.tick(t, theta, omega)
         # computation < period: the replaced word's computation has completed.
-        self.completed, self.shadow = self.shadow, self._word(d_abc, on)
+        self.completed, self.shadow = self.shadow, self._word(
+            d_abc, on, sampled_current,
+        )
 
     @property
     def duty(self) -> NDArray[np.float64]:
@@ -909,6 +956,7 @@ class PhaseShiftModulator:
     config_fields = frozenset()
     pulse_groups = ((0, 1),)
     supported_models = frozenset(("switching",))
+    duty_ratio_commands = False
     switching_legs = 2
     phase_register = "phase"
 
@@ -1017,6 +1065,10 @@ def validate_modulator(unit, topology, where):
     legs = getattr(cls, "switching_legs", None)
     if legs is not None and len(topology.voltage_factors) != legs:
         raise ConfigError(f"{where}.bridge: {cls.__name__} requires {legs} switching legs")
+    if unit.pwm.dead_time_compensation and not getattr(cls, "duty_ratio_commands", False):
+        raise ConfigError(
+            f"{where}.pwm.dead_time_compensation: {cls.__name__} does not use duty-ratio commands"
+        )
     for item in fields(unit.pwm):
         if (item.metadata.get("modulator") and item.name not in cls.config_fields
                 and getattr(unit.pwm, item.name) != item.default):

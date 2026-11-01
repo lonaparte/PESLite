@@ -65,7 +65,7 @@ def _averaged_bridge(duties, currents, *, compensated=False):
         dead_time_compensation=compensated,
     )
     bridge.inp.i_c = abc2complex(currents)
-    bridge.reset(np.asarray(duties), on=True)
+    bridge.reset(np.asarray(duties), on=True, sampled_current=motulator_abc2complex(currents))
     return bridge
 
 
@@ -140,7 +140,7 @@ def test_averaged_dead_time_matches_motulator(
     (-80.0 + 140.0j, [-1.0, 2.0, -1.0]),
     (500.0 + 0.0j, [2.0, -1.0, -1.0]),
 ])
-def test_ideal_dead_time_compensation_matches_motulator(
+def test_dead_time_feedforward_compensation_matches_motulator(
         voltage_reference, currents, record_property):
     assert importlib.metadata.version("motulator") == MOTULATOR_VERSION
     u_dc = 650.0
@@ -160,6 +160,7 @@ def test_ideal_dead_time_compensation_matches_motulator(
     peslite_seconds = perf_counter() - started
     started = perf_counter()
     compensated, _ = reference.compute_output(PERIOD, voltage_reference, u_dc, 0.0)
+    np.testing.assert_allclose(bridge.duty, compensated, rtol=0.0, atol=1e-15)
     realized = np.asarray(compensated) - nonlinearity(
         currents, np.asarray(compensated), u_dc, PERIOD / 2.0,
     )

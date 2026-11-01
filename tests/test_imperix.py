@@ -14,6 +14,7 @@ import peslite
 from peslite.assembly import imperix
 from peslite.assembly.imperix_build import build_project
 from peslite.components.converter import make_topology
+from peslite.components.pwm import _dead_time_compensated_duties
 from peslite.control.blocks import phases
 from peslite.control.controller import Measurement, VSCController
 from peslite.solver.simulation import convert_main, main
@@ -126,6 +127,53 @@ def test_generated_controller_matches_python_loops_states_and_duties(name, varia
         np.testing.assert_allclose(a, b, rtol=5e-6, atol=3e-6)
     header = (tmp_path / "peslite_control.hpp").read_text()
     assert not any(text in header for text in ("std::vector", "std::string ", "new ", "rhs("))
+
+
+def test_imperix_dead_time_compensation_preconditions_the_pwm_command(tmp_path):
+    base = _simulation("gfl")
+    sim = peslite.Simulation(base.p.replace(**{
+        "units.vsc.pwm.dead_time_compensation": True,
+    }))
+    _export(sim, tmp_path)
+    unit = sim.units["vsc"]
+    unit.ctrl.command(True, 0.0)
+    values = {
+        "u_g": complex(unit.cfg.base.v_phase_peak, 0.0),
+        "i_c": complex(0.05 * unit.cfg.base.i_phase_peak, 0.0),
+        "u_dc": unit.cfg.dc_base.v,
+    }
+    measurement = Measurement(0.0, **values, i_abc=np.array(phases(values["i_c"])))
+    output = unit.ctrl(0.0, measurement)
+    duties = tuple(unit.bridge.topology.command_duties(output))
+    expected = _dead_time_compensated_duties(
+        duties,
+        unit.bridge.topology.pole_currents(values["i_c"]),
+        unit.cfg.pwm.dead_time * unit.cfg.pwm.f_sw,
+    )
+    assert expected != pytest.approx(duties)
+
+    source = tmp_path / "check.cpp"
+    source.write_text("\n".join([
+        '#include "peslite_control.hpp"',
+        "#include <iomanip>",
+        "#include <iostream>",
+        "int main() {",
+        "    peslite_generated::Controller_vsc control;",
+        "    control.command(true);",
+        "    peslite_generated::Controller_vsc::Measurements measured;",
+        f"    measured.u_g = peslite_generated::Complex{{{values['u_g'].real!r}, 0.0}};",
+        f"    measured.i_c = peslite_generated::Complex{{{values['i_c'].real!r}, 0.0}};",
+        f"    measured.u_dc = {values['u_dc']!r};",
+        "    if (!control.sample(0.0, measured)) return 1;",
+        "    std::cout << std::setprecision(17);",
+        "    for (double value : control.duty) std::cout << value << ' ';",
+        "}",
+    ]), encoding="utf-8")
+    binary = tmp_path / "check"
+    _compile(source, binary)
+    result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+    actual = tuple(map(float, result.stdout.split()))
+    np.testing.assert_allclose(actual, expected, rtol=5e-6, atol=3e-6)
 
 
 def _sdk_double(directory):

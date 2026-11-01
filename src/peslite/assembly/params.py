@@ -363,8 +363,8 @@ class PWMParams:
     ``pattern_sync``: ``"interval"`` applies newly loaded waveform commands
     at the load; ``"pulse"`` lets a pulse in progress finish and starts the new
     pattern at its next pulse.
-    ``dead_time`` delays complementary-device turn-on; ``dead_time_compensation`` applies the
-    ideal current-polarity correction.
+    ``dead_time`` delays complementary-device turn-on; ``dead_time_compensation`` adds
+    current-polarity duty-ratio feedforward before the physical dead time.
     """
 
     f_sw: float  # carrier frequency, Hz
