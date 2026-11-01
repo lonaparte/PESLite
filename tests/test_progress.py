@@ -46,6 +46,7 @@ def test_watch_values_match_result_columns_and_states(gfl, monkeypatch, tmp_path
     params = gfl(**{
         "simulation.output.signals": 1,
         "simulation.output.period": 1e-3,
+        "simulation.output.precision": 17,
         "simulation.t_end": 0.002,
         "simulation.progress.enable": 1,
         "simulation.progress.period": 1e-3,

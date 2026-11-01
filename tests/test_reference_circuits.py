@@ -29,7 +29,8 @@ def _case(bridge, model, duty, t_end=2.0e-3, period=1.0e-6):
         }},
         "simulation": {"t_end": t_end,
                        "solver": {"dt": 2.5e-6, "linearisations": 0},
-                       "output": {"period": period, "signals": True, "states": False}},
+                       "output": {"period": period, "precision": 17,
+                                  "signals": True, "states": False}},
     }
 
 

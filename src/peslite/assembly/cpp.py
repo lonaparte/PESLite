@@ -5363,6 +5363,7 @@ class _CppGenerator:
         times = ", ".join(_number(value) for value in action_times)
         snapshot_values = "\n            ".join(f"states << ',' << ({value});" for value in state_values)
         output = self.p.simulation.output
+        output_precision = self.runtime.value("simulation.output.precision", output.precision)
         resolved_template, resolved_replacements = self.runtime.resolved_template()
         resolved_text = _cpp_string(resolved_template)
         resolved_replace = "\n    ".join(
@@ -5379,7 +5380,7 @@ class _CppGenerator:
         if output.signals:
             signal_declarations += ["std::ofstream plant(out / \"plant.csv\");",
                                     "if (!plant) throw std::runtime_error(\"cannot open plant.csv\");",
-                                    "plant << std::setprecision(17); "]
+                                    "plant << std::setprecision(csv_precision); "]
             signal_headers.append(f"plant << {self._csv_header(plant_names)};")
             for name in unit_names:
                 generator = generators[name]
@@ -5389,7 +5390,7 @@ class _CppGenerator:
                 log_names = list(generator.ctrl.log_names())
                 signal_declarations += [f"std::ofstream {stream}(out / {_cpp_string('ctrl.' + name + '.csv')});",
                                         f"if (!{stream}) throw std::runtime_error(\"cannot open ctrl.{name}.csv\");",
-                                        f"{stream} << std::setprecision(17);"]
+                                        f"{stream} << std::setprecision(csv_precision);"]
                 signal_headers.append(f"{stream} << {self._csv_header(log_names)};")
                 expressions = [generator.m("log_" + key) for key in log_names]
                 row = self._csv_values(stream, expressions, "                ")
@@ -5422,7 +5423,7 @@ class _CppGenerator:
             energy_declarations = [
                 'std::ofstream energy(out / "energy.csv");',
                 'if (!energy) throw std::runtime_error("cannot open energy.csv");',
-                'energy << std::setprecision(17);',
+                'energy << std::setprecision(csv_precision);',
             ]
             energy_header = f"energy << {self._csv_header(energy_columns)};"
             energy_row = self._csv_values(
@@ -5853,11 +5854,14 @@ public:
     int run(const std::filesystem::path& out) {{
         const auto wall_start = std::chrono::steady_clock::now();
         std::filesystem::create_directories(out);
+        const int csv_precision = static_cast<int>({output_precision});
+        if (csv_precision < 1 || csv_precision > 17)
+            throw std::runtime_error("simulation.output.precision must be between 1 and 17");
         std::ofstream states;
         if constexpr ({'true' if output.states else 'false'}) {{
             states.open(out / "states.csv");
             if (!states) throw std::runtime_error("cannot open states.csv");
-            states << std::setprecision(17) << "t";
+            states << "t";
             for (const auto name : state_names) states << ',' << name;
             states << '\\n';
         }}
@@ -5886,6 +5890,7 @@ public:
                 {plant_snapshot}
             }}
             if constexpr ({'true' if output.states else 'false'}) {{
+                states << std::setprecision(final ? 17 : csv_precision);
                 states << t;
                 {snapshot_values}
                 states << '\\n';

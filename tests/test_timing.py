@@ -308,7 +308,8 @@ def test_duty_registers_are_states_and_loop_clocks_are_not(gfl):
      0.003000),  # a load took the previous word during the computation
 ])
 def test_a_run_continues_exactly_from_any_output_row(gfl, tmp_path, over, t0):
-    params = gfl(**{"simulation.t_end": 0.004, "simulation.output.period": 5e-6, **over})
+    params = gfl(**{"simulation.t_end": 0.004, "simulation.output.period": 5e-6,
+                    "simulation.output.precision": 17, **over})
     whole_dir = tmp_path / "whole"
     whole = peslite.Simulation(params).run(out_dir=whole_dir)
 

@@ -325,6 +325,7 @@ def test_wpt_restart_derives_both_child_clock_positions(tmp_path):
     tree["simulation"]["t_end"] = 20.0e-6
     tree["simulation"]["output"].update({
         "period": 0.5e-6,
+        "precision": 17,
         "states": 1,
         "signals": 0,
         "energy": 0,
@@ -421,6 +422,7 @@ def test_wpt_power_feedback_restart_preserves_filter_pi_and_adc_window(mode, tmp
         "units.charger.secondary.bridge.model": mode,
         "simulation.t_end": 80.0e-6,
         "simulation.output.period": 0.5e-6,
+        "simulation.output.precision": 17,
         "simulation.output.signals": False,
         "simulation.output.energy": False,
         "simulation.energy_check": "off",

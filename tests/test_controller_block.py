@@ -273,6 +273,7 @@ def test_startup_and_registers_continue_from_a_saved_row(gfl, tmp_path):
         "events.connect_vsc.ramp": 0.001,
         "simulation.t_end": 0.002,
         "simulation.output.period": 1e-5,
+        "simulation.output.precision": 17,
     })
     whole_dir = tmp_path / "whole"
     whole = _run(params, whole_dir)

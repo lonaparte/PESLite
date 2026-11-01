@@ -897,6 +897,7 @@ class OutputParams:
 
     period: float = 5e-4  # plant snapshot interval, s
     record_every: int = 1  # keep every n-th controller sample
+    precision: int = 5  # significant digits in CSV history rows
     states: bool = True  # states.csv
     signals: bool = False  # plant.csv and ctrl.<unit>.csv
     energy: bool = False  # energy.csv

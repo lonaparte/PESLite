@@ -370,6 +370,7 @@ def test_ideal_averaging_continues_exactly_with_its_continuous_control_states(gf
     params = gfl(**{"units.vsc.bridge.model": "averaging",
                     "simulation.t_end": 0.004,
                     "simulation.output.period": 5e-6,
+                    "simulation.output.precision": 17,
                     **solver})
     whole_dir = tmp_path / "whole"
     whole = peslite.Simulation(params).run(out_dir=whole_dir)

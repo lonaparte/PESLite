@@ -549,6 +549,8 @@ def _initial(p: Params) -> None:
     t0 = p.simulation.initial.t
     if not math.isfinite(p.simulation.output.period) or p.simulation.output.period <= 0.0:
         raise ConfigError("simulation.output.period must be finite and positive")
+    if not 1 <= p.simulation.output.precision <= 17:
+        raise ConfigError("simulation.output.precision must be between 1 and 17")
     if t0 < 0.0:
         raise ConfigError("simulation.initial.t must be >= 0")
     for name, u in _unit_items(p.units):

@@ -144,8 +144,8 @@ Depending on the selected model, named state includes:
 - controller integrators, filters, startup progress and protection timers;
 - PWM active and shadow registers and enable bits;
 - ADC averaging-window accumulators;
-- multirate window anchors, slopes and input integrals, so a row inside a window also continues
-  exactly;
+- multirate window anchors, slopes and input integrals, so a row inside a window retains the
+  required solver state;
 - unit trip/fault latches.
 
 Timer indices and the next ADC/PWM instants are reconstructed from the saved time; a continuous

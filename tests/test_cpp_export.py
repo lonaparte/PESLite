@@ -1249,7 +1249,8 @@ def test_generated_cpp_runtime_parameters(tmp_path):
     params = _quick("pwm_averaging")
     project = tmp_path / "runtime-parameters"
     peslite.export(params, "cpp", project, variables=[
-        "simulation.t_end", "units.vsc.ctrl.references.p_ref_pu",
+        "simulation.t_end", "simulation.output.precision",
+        "units.vsc.ctrl.references.p_ref_pu",
     ])
     executable = project / "peslite"
     subprocess.run([compiler, "-O3", "-DNDEBUG", "-std=c++17",
@@ -1258,15 +1259,18 @@ def test_generated_cpp_runtime_parameters(tmp_path):
     listed = subprocess.run([executable, "--list-params"], check=True,
                             capture_output=True, text=True).stdout
     assert "simulation.t_end" in listed
+    assert "simulation.output.precision" in listed
     assert "units.vsc.ctrl.references.p_ref_pu" in listed
 
     output = project / "changed-output"
     subprocess.run([executable,
                     "--set", "simulation.t_end=0.204",
+                    "--set", "simulation.output.precision=7",
                     "--set", "units.vsc.ctrl.references.p_ref_pu=0.25",
                     "--out", output], check=True)
     resolved = peslite.load(output / "simulation.pes")
     assert resolved.simulation.t_end == pytest.approx(0.204)
+    assert resolved.simulation.output.precision == 7
     assert resolved.unit("vsc").ctrl.references.p_ref_pu == pytest.approx(0.25)
 
     config = project / "runtime.pes"

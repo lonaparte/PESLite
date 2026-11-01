@@ -78,6 +78,7 @@ def test_bundled_examples_restate_no_defaults(name):
 
 
 def _bus_start(params, bus, out):
+    params = params.replace(**{"simulation.output.precision": 17})
     result = peslite.Simulation(params).run(out_dir=out)
     voltage = complex(result.states[f"{bus}.u_C.re"][0],
                       result.states[f"{bus}.u_C.im"][0])
