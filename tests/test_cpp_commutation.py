@@ -159,12 +159,12 @@ class _Reset:
     outputs_need_inputs = False
 
     def __init__(self):
-        self.state, self.inp, self.out = _ResetState(x=0j), Empty(), _ResetOutput(x=0j)
+        self.state, self.input, self.output = _ResetState(x=0j), Empty(), _ResetOutput(x=0j)
         self.located, self.scheduled = False, 0
         self.time, self.next = 0.0, .3333333
 
     def set_outputs(self, t):
-        self.time, self.out.x = t, self.state.x
+        self.time, self.output.x = t, self.state.x
 
     def rhs(self, t):
         return (1.0 + 2.0j,)

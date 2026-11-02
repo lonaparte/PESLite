@@ -16,7 +16,7 @@ import yaml
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import from_dict
-from peslite.components import Bag, Element, Terminal, register_element_type
+from peslite.components import Bag, Element, Port, register_element_type
 from peslite.solver import BlackBoxSubsystem
 from peslite.solver.simulation import convert_main
 from test_measurement_network import load_case
@@ -46,17 +46,19 @@ class _ConditionalModel:
         self.resistance_high = resistance_high
         self.threshold = threshold
         self.state = _ConditionalState(i=0j)
-        self.inp = _ConditionalInput(u=0j)
-        self.out = _ConditionalOutput(i=0j)
-        self.terminal = Terminal(self, "u", "i", 1)
+        self.input = _ConditionalInput(u=0j)
+        self.output = _ConditionalOutput(i=0j)
+        self.port = Port(
+            self, "power", effort="input.u", flow="output.i"
+        )
 
     def set_outputs(self, t):
-        self.out.i = self.state.i
+        self.output.i = self.state.i
 
     def rhs(self, t):
         resistance = (self.resistance_high
                       if abs(self.state.i) > self.threshold else self.resistance_low)
-        return ((self.inp.u - resistance * self.state.i) / self.inductance,)
+        return ((self.input.u - resistance * self.state.i) / self.inductance,)
 
 
 @register_element_type
@@ -84,12 +86,12 @@ class _ConditionalElement(Element):
     def connections(self):
         return {}
 
-    def terminals(self):
-        return ((self.cfg.bus, self.model.terminal),)
+    def port_bindings(self):
+        return ((self.cfg.bus, self.model.port),)
 
     def signals(self):
-        return {f"{self.name}.i": self.model.out.i,
-                f"{self.name}.i_mag": abs(self.model.out.i)}
+        return {f"{self.name}.i": self.model.output.i,
+                f"{self.name}.i_mag": abs(self.model.output.i)}
 
 
 @register_element_type
@@ -120,11 +122,11 @@ class _BlackBoxElement(Element):
     def connections(self):
         return {}
 
-    def terminals(self):
+    def port_bindings(self):
         return ()
 
     def signals(self):
-        return {f"{self.name}.y": self.model.out.y}
+        return {f"{self.name}.y": self.model.output.y}
 
 
 @register_element_type
@@ -166,11 +168,11 @@ class _DiscreteBlackBoxElement(Element):
     def connections(self):
         return {(self.lag, "y"): (self.model, "y")}
 
-    def terminals(self):
+    def port_bindings(self):
         return ()
 
     def signals(self):
-        return {f"{self.name}.y": self.model.out.y}
+        return {f"{self.name}.y": self.model.output.y}
 
 
 def _compiler() -> str | None:

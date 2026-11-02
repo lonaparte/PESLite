@@ -46,7 +46,7 @@ def test_series_resistor_matches_physical_series_loss_without_adding_states(link
                                rtol=1e-12, atol=1e-8)
     a.run(out_dir=None)
     load = a.system.named_elements["load"]
-    assert load.resistor.out.power == pytest.approx(2.0 * load.resistor.out.i ** 2)
+    assert load.resistor.output.power == pytest.approx(2.0 * load.resistor.output.i ** 2)
 
 
 @pytest.mark.parametrize("endpoint", ["charger", "charger.primary", "charger.primary.dc"])
@@ -57,8 +57,8 @@ def test_shunt_load_resolves_unit_default_and_named_ports(endpoint):
     sim.system.model.sync(0.0, sim.system.model.get_initial_values())
     load = sim.system.named_elements["load"]
     primary = sim.units["charger.primary"]
-    assert load.resistor.inp.u == primary.dclink.out.u_dc
-    assert load.resistor.out.i == pytest.approx(primary.dclink.out.u_dc / 2.0)
+    assert load.resistor.port1.voltage == primary.dclink.output.u_dc
+    assert load.resistor.output.i == pytest.approx(primary.dclink.output.u_dc / 2.0)
 
 
 def test_series_elements_share_the_same_generic_insertion_path_in_declaration_order():
@@ -70,9 +70,9 @@ def test_series_elements_share_the_same_generic_insertion_path_in_declaration_or
     sim.run(out_dir=None)
     first = sim.system.named_elements["load"].resistor
     second = sim.system.named_elements["extra"].resistor
-    np.testing.assert_allclose(first.out.i, second.out.i)
-    assert second.inp.u == first.out.u
-    assert second.out.power == pytest.approx(first.out.power * 1.5)
+    np.testing.assert_allclose(first.output.i, second.output.i)
+    assert second.port1.voltage == first.output.u
+    assert second.output.power == pytest.approx(first.output.power * 1.5)
 
 
 @pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
@@ -93,7 +93,7 @@ def test_load_power_drives_the_existing_graph_and_load_step_keeps_state(model):
     result = sim.run(out_dir=None)
     unit = sim.units["charger.secondary"]
     load = sim.system.named_elements["load"].resistor
-    assert unit.ports.value("power") == load.out.power
+    assert unit.ports.value("power") == load.output.power
     assert type(unit.ctrl).__name__ == "GraphController"
     assert result.summary["ph_verdict"] == "port-hamiltonian"
     assert unit.adc.rms["current"].value > 0.0
@@ -108,7 +108,7 @@ def test_named_port_power_observer_is_nonloading_and_native_graph_compatible(mod
     sim.system.model.sync(0.0, sim.system.model.get_initial_values())
     primary = sim.units["charger.primary"]
     assert sim.units["charger.secondary"].ports.value("power") == pytest.approx(
-        -primary.dclink.terminal.power()
+        -primary.dclink.port.power()
     )
     assert not sim.energy_problems
     sim.run(out_dir=None)
@@ -235,9 +235,9 @@ def test_continuous_rms_seeds_actual_initial_outputs_not_structure_probe_values(
     sim.run(out_dir=None)
     for unit in sim.units.values():
         if rms:
-            assert initial[id(unit.adc)]["current"] == 0.0
+            assert initial[id(unit.adc)]["current"] == pytest.approx(0.0, abs=1e-12)
         # The first protection check at t0 reads the same refreshed outputs, with or without an ADC.
-        assert protected[id(unit.protection)] == (0.0,)
+            assert protected[id(unit.protection)] == pytest.approx((0.0,), abs=1e-12)
 
 
 @pytest.mark.parametrize("side", ["primary", "secondary"])

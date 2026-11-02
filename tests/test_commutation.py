@@ -17,15 +17,15 @@ class _Ramp:
 
     def __init__(self, scheduled=(), zeno=False):
         self.state = type("_S", (Bag,), {"__slots__": ("x",)})()
-        self.inp = type("_I", (Bag,), {"__slots__": ()})()
-        self.out = type("_O", (Bag,), {"__slots__": ("x",)})()
+        self.input = type("_I", (Bag,), {"__slots__": ()})()
+        self.output = type("_O", (Bag,), {"__slots__": ("x",)})()
         self.flag = 0
         self.at = []
         self.scheduled = list(scheduled)
         self.zeno = zeno
 
     def set_outputs(self, t):
-        self.out.x = self.state.x
+        self.output.x = self.state.x
 
     def rhs(self, t):
         return (1.0,)
@@ -160,7 +160,7 @@ def test_bounded_current_and_margin_event_use_the_same_advance():
     from peslite.solver.integrators import FixedStepSolver
 
     branch = RLBranch(1.0, 0.0, i0=0.5, phases=1, unilateral=True)
-    branch.inp.u1 = -1.0
+    branch.port1.voltage = -1.0
     ramp = _Ramp()
     model = Model({"branch": branch, "ramp": ramp}, {})
     handler = DiodeConduction(model, FixedStepSolver(0.1, "RK4"))
@@ -180,7 +180,7 @@ def test_current_zero_locator_preserves_plain_float_solver_times():
             return super().advance(rhs, t0, t1, state, **kwargs)
 
     branch = RLBranch(1.0, 0.0, i0=0.5, phases=1, unilateral=True)
-    branch.inp.u1 = -1.0
+    branch.port1.voltage = -1.0
     model = Model({"branch": branch}, {})
     handler = DiodeConduction(model, CheckingSolver(1.0, "RK4"))
     state = handler.advance(0.0, 1.0, model.get_initial_values())

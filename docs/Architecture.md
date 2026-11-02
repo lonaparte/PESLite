@@ -54,10 +54,9 @@ converter peripherals.
 Physical component state and parameters are SI quantities. Components declare ports, state,
 derivatives and energy/storage relationships without knowing the global system order.
 
-Every physical network attachment uses the construction-time `Terminal` contract. A terminal names
-its voltage and current, declares whether positive current enters or leaves the component and
-identifies whether it drives or follows voltage; assembly lowers those declarations to direct
-model connections. See
+Every physical network attachment uses the same acausal `Port` contract. A port stores its voltage
+and the current entering its component; assembly joins ports by bus name and compiles their netlist
+equations. Directed `input` and `output` records are reserved for control and signal flow. See
 [Extending PESLite](Extending-PESLite.md#custom-circuit-elements).
 
 ## Control
@@ -92,7 +91,7 @@ The assembly layer:
 6. builds event scenarios and validated parameter changes.
 
 `Unit` is the common converter lifecycle and runtime interface. Both `VSC` and `DCConverter` expose
-their electrical side through the same named-bus `Terminal` contract; `VSC` supplies a three-phase
+their electrical side through the same named-bus `Port` contract; `VSC` supplies a three-phase
 bridge and `DCConverter` a selectable scalar half or full bridge. The same
 `DCConverter` also serves as each full-bridge port of a resonant link. Each assembled specialization
 owns its power stage, controller, sensing, startup interface, breakers and gates.
@@ -105,10 +104,10 @@ use the same loop `track()` callbacks in Python and generated C++, including cus
 Parameter selection does not change this initialization sequence.
 
 The contract also assembles two internal power boundaries. `<unit>.bus.dc` connects a DCLink
-voltage driver to the bridge DC terminal. `<unit>.bus.power` always denotes the bridge power-side
+voltage driver to the bridge DC port. `<unit>.bus.power` always denotes the bridge power-side
 bus: it connects the bridge to a series filter or, for an unfiltered nested converter, directly to
-a WPT link. Normally, a filter's other terminal connects to the public bus selected by the unit's
-`bus` parameter. For a half bridge with `external_terminal: lower_rail`, that public bus instead
+a WPT link. Normally, a filter's other port connects to the public bus selected by the unit's
+`bus` parameter. For a half bridge with `external_port: lower_rail`, that public bus instead
 connects to the lower rail, while the filter connects the midpoint power bus to the common point.
 This is the single-inductor Buck-Boost connection. The scoped internal names disappear into direct
 connections; there is no runtime bus lookup or WPT-specific solver path. Every Unit exposes named
@@ -118,8 +117,8 @@ Composite ports forward existing child ports without copying their electrical ba
 `primary` and `secondary` and selects `primary` by default, so common assembly, event scaling and
 solver ratings never interpret those WPT-specific names.
 
-A source needs no internal bus. Its `<source>.emf` is wired directly to `<source>.branch`, whose
-second terminal attaches to the configured public bus.
+A source needs no public internal bus. Its emf and series branch share one internal node, and the
+branch's second port attaches to the configured public bus.
 
 Every entry in `Params.units` is a `UnitParams`. Its `type` selects `vsc`, `dc_converter` or the
 composite `wpt`; type-specific schema selection and runtime construction happen once while the
@@ -128,9 +127,6 @@ shared compensated link. `Params.units` is the only stored configuration tree. A
 and places its leaf converters in `System.units` beside the shared link subsystem; it does not keep
 a second flattened parameter mapping or a group table. The solver therefore sees ordinary
 converter units without WPT-specific scheduling.
-
-For compatibility with version 0.3.0 files, an omitted type means `vsc`; DC converters always use
-the explicit `dc_converter` type.
 
 Parameter ownership is explicit: all converter units share common fields; `unit.type` adds
 electrical fields, `bridge.type` topology fields, `ctrl.type` reference/default-wiring fields, and

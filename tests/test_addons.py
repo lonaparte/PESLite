@@ -95,8 +95,8 @@ def test_cable_model_has_two_inward_ports_and_closes_its_power_balance():
         sections=2,
         voltage0=0j,
     )
-    cable.inp.u1 = 8000.0 + 200.0j
-    cable.inp.u2 = 7600.0 - 100.0j
+    cable.port1.voltage = 8000.0 + 200.0j
+    cable.port2.voltage = 7600.0 - 100.0j
     cable.state.iL1 = 20.0 + 3.0j
     cable.state.iL2 = 18.0 + 2.0j
     cable.state.iL3 = 16.0 + 1.0j
@@ -109,14 +109,11 @@ def test_cable_model_has_two_inward_ports_and_closes_its_power_balance():
     for storage, derivative in zip(cable.storage, derivatives):
         value = getattr(cable.state, storage.state)
         stored_rate += storage.scale * storage.value * (value * derivative.conjugate()).real
-    power_in = 1.5 * (
-        (cable.inp.u1 * cable.out.i1.conjugate()).real
-        + (cable.inp.u2 * cable.out.i2.conjugate()).real
-    )
+    power_in = cable.port1.power() + cable.port2.power()
 
-    assert cable.terminal1.direction == cable.terminal2.direction == 1
-    assert cable.out.i1 == cable.state.iL1
-    assert cable.out.i2 == -cable.state.iL3
+    assert cable.port1.component is cable and cable.port2.component is cable
+    assert cable.output.i1 == cable.state.iL1
+    assert cable.output.i2 == -cable.state.iL3
     assert sum(cable.series_r) == pytest.approx(0.16)
     assert sum(cable.series_l) == pytest.approx(1.2e-3)
     assert power_in == pytest.approx(stored_rate + cable.dissipated_power())

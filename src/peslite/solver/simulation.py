@@ -614,7 +614,7 @@ class Simulation:
                 return cfg.base.v_phase_peak, cfg.base.i_phase_peak
             raise ConfigError(f"unit port has unsupported phase count {port.phases!r}")
 
-        port_bindings = self.system._port_bindings
+        port_bindings = self.system._unit_port_bindings
         subsystems = dict(zip(self.system.model.names, self.system.model.subsystems))
 
         def rating(name: str, storage: Any) -> Optional[tuple[float, float]]:
@@ -830,6 +830,10 @@ class Simulation:
             if not values.keys().isdisjoint(self._states.read([name])):
                 self._continued.add(name)
         self._states.load(values, ["solver"])
+        # All initial connection commands are simultaneous.  Project their assembled circuit
+        # modes once, after every physical state has been restored.
+        for circuit in system.circuits:
+            circuit.consistent_state(t0)
         return system.model.get_initial_values()
 
     # ------------------------------------------------------------ the loop
@@ -900,7 +904,8 @@ class Simulation:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         t_final = t_end
         plant = Plant(mdl, self._apply_initial(t_start), project=project,
-                      synchronize=diode_conduction.synchronize if diode_conduction.commutating else None)
+                      synchronize=diode_conduction.synchronize if diode_conduction.commutating else None,
+                      reconcile=system.reconcile_circuits)
         if project is not None:
             # Establish natural modes before projecting: an initial inductor current may
             # turn a previously blocked port on and must not be erased by its old mode.

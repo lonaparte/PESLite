@@ -76,9 +76,9 @@ units:                     # converters, one entry each
     #   upper_controlled: 1        # half bridge: device placement; full bridge: both 0 = diode
     #   lower_controlled: 1        # rectifier (no ctrl/pwm); half/full bridge only
     #   on_resistance: 0           # conducting-device resistance [ohm]; positive for nonzero capacitance
-    #   parallel_capacitance: 0    # capacitance across the power terminals [F]
+    #   parallel_capacitance: 0    # capacitance across the power ports [F]
     #   reverse_port: 0            # half-bridge scalar-port orientation
-    #   external_terminal: midpoint # half bridge: midpoint | lower_rail
+    #   external_port: midpoint # half bridge: midpoint | lower_rail
     #                              # CLI: --averaging | --pwm-averaging | --switching
 
     ctrl:

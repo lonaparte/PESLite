@@ -46,8 +46,9 @@ from scipy.sparse.linalg import splu
 __all__ = ["Node", "Element", "Resistor", "Inductor", "CoupledInductors", "Capacitor", "VoltageSource",
            "CurrentSource", "Transformer", "Switch", "Diode", "Netlist", "Mode", "Topology", "StateSpace",
            "Grouping", "ConductionError", "FORMS", "QUANTITIES", "device_rhs", "device_outputs",
-           "device_dissipated_power", "device_supplied_power", "device_equilibrium_input",
-           "device_commutation_margin", "device_commutate", "register_device_runtime"]
+           "device_dissipated_power", "device_supplied_power",
+           "device_commutation_margin", "device_commutate", "prepare_device",
+           "register_device_runtime"]
 
 
 _DEVICE_RUNTIME: dict[str, Callable] = {}
@@ -84,12 +85,6 @@ def device_supplied_power(component: Any) -> float:
     return _device_operation("supplied_power")(component)
 
 
-def device_equilibrium_input(component: Any, field: str,
-                             state_weights: dict[str, float], t: float = 0.0) -> float:
-    """Input value making a declared linear combination of state derivatives zero."""
-    return _device_operation("equilibrium_input")(component, field, state_weights, t)
-
-
 def device_commutation_margin(component: Any) -> float:
     """Return the consistency margin of a component's declared diode network."""
     return _device_operation("commutation_margin")(component)
@@ -99,7 +94,12 @@ def device_commutate(component: Any, t: float) -> None:
     """Commutate a component's declared diode network at ``t``."""
     _device_operation("commutate")(component, t)
 
-Terminal = Optional["Node"]
+
+def prepare_device(component: Any) -> None:
+    """Compile a standalone component's physical netlist before model planning."""
+    _device_operation("prepare")(component)
+
+Port = Optional["Node"]
 Value = Callable[[float], ArrayLike]
 
 FORMS = ("device", "statewise", "mna")
@@ -115,6 +115,169 @@ _DENSE_ENTRIES = 1 << 14  # coupling matrices up to this size multiply as dense 
 _GROUP_PARTS = 256  # factorized group blocks kept (least recently used first out)
 _DENSE_GROUP = 96  # systems and group blocks up to this size are factorized by LAPACK (faster than SuperLU)
 _DENSE_REUSE = 2  # direct solves before a repeated dense mode is expanded into state-space equations
+
+
+@dataclass(frozen=True)
+class _Symbolic:
+    """One scalar node in a generated arithmetic expression DAG."""
+
+    operation: str
+    arguments: tuple[Any, ...]
+
+    @classmethod
+    def value(cls, code: str) -> "_Symbolic":
+        return cls("value", (code,))
+
+    def __add__(self, other):
+        return _symbolic_binary("+", self, other)
+
+    def __radd__(self, other):
+        return _symbolic_binary("+", other, self)
+
+    def __sub__(self, other):
+        return _symbolic_binary("-", self, other)
+
+    def __rsub__(self, other):
+        return _symbolic_binary("-", other, self)
+
+    def __mul__(self, other):
+        return _symbolic_binary("*", self, other)
+
+    def __rmul__(self, other):
+        return _symbolic_binary("*", other, self)
+
+    def __truediv__(self, other):
+        return _symbolic_binary("/", self, other)
+
+    def __rtruediv__(self, other):
+        return _symbolic_binary("/", other, self)
+
+    def __neg__(self):
+        return _Symbolic("neg", (self,))
+
+    @property
+    def real(self):
+        return _Symbolic("real", (self,))
+
+    @property
+    def imag(self):
+        return _Symbolic("imag", (self,))
+
+
+def _zero(value: Any) -> bool:
+    return isinstance(value, numbers.Number) and value == 0.0
+
+
+def _one(value: Any) -> bool:
+    return isinstance(value, numbers.Number) and value == 1.0
+
+
+def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
+    if isinstance(left, numbers.Number) and isinstance(right, numbers.Number):
+        return {"+": lambda: left + right, "-": lambda: left - right,
+                "*": lambda: left * right, "/": lambda: left / right}[operation]()
+    if operation == "+":
+        if _zero(left):
+            return right
+        if _zero(right):
+            return left
+    elif operation == "-":
+        if _zero(right):
+            return left
+        if left == right:
+            return 0.0
+    elif operation == "*":
+        if _zero(left) or _zero(right):
+            return 0.0
+        if _one(left):
+            return right
+        if _one(right):
+            return left
+    elif operation == "/":
+        if _zero(left):
+            return 0.0
+        if _one(right):
+            return left
+    return _Symbolic(operation, (left, right))
+
+
+def _symbolic_solve(matrix: list[list[Any]], right: list[Any],
+                    reference: NDArray[np.float64]) -> list[Any]:
+    """Eliminate a generated linear system using one valid numerical pivot pattern."""
+    n = len(right)
+    matrix = [list(row) for row in matrix]
+    right = list(right)
+    reference = np.array(reference, dtype=float, copy=True)
+    for column in range(n):
+        constants = [row for row in range(column, n)
+                     if isinstance(matrix[row][column], numbers.Number)
+                     and matrix[row][column] != 0.0]
+        pivot = (max(constants, key=lambda row: abs(reference[row, column]))
+                 if constants else column + int(np.argmax(np.abs(reference[column:, column]))))
+        if reference[pivot, column] == 0.0:
+            raise ValueError("the generated netlist equations are singular")
+        if pivot != column:
+            matrix[column], matrix[pivot] = matrix[pivot], matrix[column]
+            right[column], right[pivot] = right[pivot], right[column]
+            reference[[column, pivot]] = reference[[pivot, column]]
+        for row in range(column + 1, n):
+            if _zero(matrix[row][column]):
+                continue
+            factor = matrix[row][column] / matrix[column][column]
+            numeric_factor = reference[row, column] / reference[column, column]
+            matrix[row][column] = 0.0
+            reference[row, column] = 0.0
+            for entry in range(column + 1, n):
+                matrix[row][entry] -= factor * matrix[column][entry]
+                reference[row, entry] -= numeric_factor * reference[column, entry]
+            right[row] -= factor * right[column]
+    solution: list[Any] = [0.0] * n
+    for row in range(n - 1, -1, -1):
+        residual = right[row] - sum(
+            matrix[row][column] * solution[column] for column in range(row + 1, n)
+        )
+        solution[row] = residual / matrix[row][row]
+    return solution
+
+
+def _symbolic_source(expressions: Sequence[Any]) -> tuple[list[str], tuple[str, ...]]:
+    """Render expression DAGs with shared non-leaf nodes evaluated once."""
+    uses: dict[_Symbolic, int] = {}
+
+    def count(value: Any) -> None:
+        if not isinstance(value, _Symbolic) or value.operation == "value":
+            return
+        uses[value] = uses.get(value, 0) + 1
+        for argument in value.arguments:
+            count(argument)
+
+    for expression in expressions:
+        count(expression)
+    shared = {node for node, n in uses.items() if n > 1}
+    names: dict[_Symbolic, str] = {}
+    lines: list[str] = []
+
+    def render(value: Any, defining: Optional[_Symbolic] = None) -> str:
+        if not isinstance(value, _Symbolic):
+            return repr(float(value)) if isinstance(value, np.floating) else repr(value)
+        if value in names and value is not defining:
+            return names[value]
+        if value.operation == "value":
+            return value.arguments[0]
+        for argument in value.arguments:
+            if isinstance(argument, _Symbolic) and argument in shared and argument not in names:
+                name = f"v{len(names)}"
+                names[argument] = name
+                lines.append(f"{name} = {render(argument, argument)}")
+        arguments = tuple(render(argument) for argument in value.arguments)
+        if value.operation == "neg":
+            return f"(-{arguments[0]})"
+        if value.operation in ("real", "imag"):
+            return f"({arguments[0]}).{value.operation}"
+        return f"({arguments[0]} {value.operation} {arguments[1]})"
+
+    results = tuple(render(expression) for expression in expressions)
+    return lines, results
 
 
 def _maximum(left: Any, right: Any) -> Any:
@@ -186,14 +349,14 @@ class Node:
         return f"Node({self.name!r}, dim={self.dim})"
 
 
-def _port(a: Terminal, b: Terminal) -> tuple[int, float]:
+def _port(a: Port, b: Port) -> tuple[int, float]:
     nodes = [n for n in (a, b) if n is not None]
     if any(not isinstance(n, Node) for n in nodes):
-        raise TypeError("terminals must be Node objects or None (ground)")
+        raise TypeError("branch ports must be Node objects or None (ground)")
     if not nodes or a is b:
-        raise ValueError("a branch needs two distinct terminals, at most one of them ground")
+        raise ValueError("a branch needs two distinct ports, at most one of them ground")
     if len(nodes) == 2 and (a.dim, a.scale) != (b.dim, b.scale):
-        raise ValueError(f"terminals {a!r} and {b!r} differ in dimension or power scale")
+        raise ValueError(f"branch ports {a!r} and {b!r} differ in dimension or power scale")
     return nodes[0].dim, nodes[0].scale
 
 
@@ -230,10 +393,10 @@ def _vector(value: ArrayLike, d: int, what: str) -> NDArray[np.float64]:
 
 
 class Element:
-    """A netlist primitive. ``ports``: its (a, b) terminal pairs; positive current flows a -> b
+    """A netlist primitive. ``ports``: its (a, b) port pairs; positive current flows a -> b
     through the element and its voltage is ``v_a - v_b``."""
 
-    ports: tuple[tuple[Terminal, Terminal], ...] = ()
+    ports: tuple[tuple[Port, Port], ...] = ()
     name: str = ""
 
     def __repr__(self) -> str:
@@ -243,7 +406,7 @@ class Element:
 class Resistor(Element):
     """``v = R i``; ``R`` a scalar or d x d matrix (positive semidefinite), ``R = 0`` an ideal short."""
 
-    def __init__(self, a: Terminal, b: Terminal, R: ArrayLike, name: str = "") -> None:
+    def __init__(self, a: Port, b: Port, R: ArrayLike, name: str = "") -> None:
         d, _ = _port(a, b)
         self.ports, self.name, self.R = ((a, b),), name, _matrix(R, d, "resistance")
         if np.linalg.eigvalsh(0.5 * (self.R + self.R.T)).min() < -1e-12 * np.abs(self.R).max():
@@ -253,7 +416,7 @@ class Resistor(Element):
 class Inductor(Element):
     """``v = L di/dt``; the current is the state at the ``d`` indices ``state``."""
 
-    def __init__(self, a: Terminal, b: Terminal, L: ArrayLike, state: ArrayLike, name: str = "") -> None:
+    def __init__(self, a: Port, b: Port, L: ArrayLike, state: ArrayLike, name: str = "") -> None:
         d, _ = _port(a, b)
         self.ports, self.name = ((a, b),), name
         self.L = _definite(_matrix(L, d, "inductance"), "inductance")
@@ -264,7 +427,7 @@ class CoupledInductors(Element):
     """``v_k = sum_j L_kj di_j/dt`` over ``branches`` ``[(a_k, b_k), ...]``. ``L`` is (k d) x (k d), or
     k x k applied to every component; ``state``: the k d current indices, branch by branch."""
 
-    def __init__(self, branches: Sequence[tuple[Terminal, Terminal]], L: ArrayLike, state: ArrayLike,
+    def __init__(self, branches: Sequence[tuple[Port, Port]], L: ArrayLike, state: ArrayLike,
                  name: str = "") -> None:
         self.ports, self.name = tuple((a, b) for a, b in branches), name
         kinds = {_port(a, b) for a, b in self.ports}
@@ -281,7 +444,7 @@ class CoupledInductors(Element):
 class Capacitor(Element):
     """``i = C dv/dt``; the voltage is the state at the ``d`` indices ``state``."""
 
-    def __init__(self, a: Terminal, b: Terminal, C: ArrayLike, state: ArrayLike, name: str = "") -> None:
+    def __init__(self, a: Port, b: Port, C: ArrayLike, state: ArrayLike, name: str = "") -> None:
         d, _ = _port(a, b)
         self.ports, self.name = ((a, b),), name
         self.C = _definite(_matrix(C, d, "capacitance"), "capacitance")
@@ -292,7 +455,7 @@ class VoltageSource(Element):
     """``v = value(t)``; ``derivative(t)`` is dv/dt, else a central difference in ``t`` (used only
     where a C/V loop needs it)."""
 
-    def __init__(self, a: Terminal, b: Terminal, value: Value, derivative: Optional[Value] = None,
+    def __init__(self, a: Port, b: Port, value: Value, derivative: Optional[Value] = None,
                  name: str = "") -> None:
         _port(a, b)
         self.ports, self.name, self.value, self.derivative = ((a, b),), name, value, derivative
@@ -301,7 +464,7 @@ class VoltageSource(Element):
 class CurrentSource(Element):
     """``i = value(t)``; ``derivative(t)`` as for :class:`VoltageSource` (used in L/I cutsets)."""
 
-    def __init__(self, a: Terminal, b: Terminal, value: Value, derivative: Optional[Value] = None,
+    def __init__(self, a: Port, b: Port, value: Value, derivative: Optional[Value] = None,
                  name: str = "") -> None:
         _port(a, b)
         self.ports, self.name, self.value, self.derivative = ((a, b),), name, value, derivative
@@ -315,7 +478,7 @@ class Transformer(Element):
     current-type in the normal tree.
     """
 
-    def __init__(self, p_a: Terminal, p_b: Terminal, s_a: Terminal, s_b: Terminal,
+    def __init__(self, p_a: Port, p_b: Port, s_a: Port, s_b: Port,
                  N: Callable[[], ArrayLike] | ArrayLike, name: str = "") -> None:
         (dp, scale_p), (ds, scale_s) = _port(p_a, p_b), _port(s_a, s_b)
         self.ports, self.name, self.N = ((p_a, p_b), (s_a, s_b)), name, N
@@ -356,7 +519,7 @@ class Transformer(Element):
 class Switch(Element):
     """``R_on`` while ``closed()``, else ``R_off``; 0 is an ideal short and ``inf`` an open circuit."""
 
-    def __init__(self, a: Terminal, b: Terminal, closed: Callable[[], bool], R_on: float = 0.0,
+    def __init__(self, a: Port, b: Port, closed: Callable[[], bool], R_on: float = 0.0,
                  R_off: float = math.inf, name: str = "") -> None:
         _port(a, b)
         if not (0.0 <= R_on <= R_off) or math.isinf(R_on):
@@ -365,14 +528,14 @@ class Switch(Element):
 
 
 class Diode(Element):
-    """A diode on dimension-1 terminals: ``R_on`` while conducting (current a -> b nonnegative), else
+    """A diode on dimension-1 ports: ``R_on`` while conducting (current a -> b nonnegative), else
     ``R_off`` (voltage nonpositive). ``conducting`` and ``residual`` are its discrete equation state.
 
     ``gate()``, if given, makes it a semiconductor device position (a controlled switch with this
     antiparallel diode): while the gate is on it conducts in both directions with ``R_on`` and is not
     commutated; when it turns off the diode takes over from its own (blocking) conduction state."""
 
-    def __init__(self, a: Terminal, b: Terminal, R_on: float = 0.0, R_off: float = math.inf,
+    def __init__(self, a: Port, b: Port, R_on: float = 0.0, R_off: float = math.inf,
                  name: str = "", gate: Optional[Callable[[], bool]] = None) -> None:
         if _port(a, b)[0] != 1:
             raise ValueError("a diode connects dimension-1 nodes")
@@ -435,12 +598,12 @@ class Grouping:
 
 
 class _Branch:
-    __slots__ = ("element", "port", "a", "b", "dim", "scale", "out", "x", "label")
+    __slots__ = ("element", "port", "a", "b", "dim", "scale", "output", "x", "label")
 
     def __init__(self, element: Element, port: int, a: int, b: int, dim: int, scale: float, out: int,
                  label: str) -> None:
         self.element, self.port, self.a, self.b, self.dim, self.scale = element, port, a, b, dim, scale
-        self.out, self.x, self.label = out, -1, label
+        self.output, self.x, self.label = out, -1, label
 
 
 class _UnionFind:
@@ -487,7 +650,7 @@ class _Triplets:
 
     def incidence(self, r: int, br: _Branch, offsets: NDArray[np.intp], m: Optional[NDArray] = None,
                   s: float = 1.0) -> None:
-        """``s (m) (x_a - x_b)`` for the variables of the branch's terminals at ``offsets``."""
+        """``s (m) (x_a - x_b)`` for the variables at the branch ports in ``offsets``."""
         for v, sign in ((br.a, s), (br.b, -s)):
             if offsets[v] >= 0:
                 if m is None:
@@ -522,7 +685,7 @@ class _RatioSlots:
                 self.coef.append(coef)
 
     def incidence(self, r: int, br: _Branch, offsets: NDArray[np.intp], j: int, coef: float) -> None:
-        """``coef * N_j (x_a - x_b)`` for the variables of the branch's terminals at ``offsets``."""
+        """``coef * N_j (x_a - x_b)`` for the variables at the branch ports in ``offsets``."""
         for v, sign in ((br.a, coef), (br.b, -coef)):
             if offsets[v] >= 0:
                 self.ratio(r, int(offsets[v]), j, sign)
@@ -1014,9 +1177,9 @@ class Topology:
         for k, br in enumerate(brs):
             if br.x >= 0:
                 xd_index[br.x:br.x + br.dim] = xd_off[k] + np.arange(br.dim)
-            out.incidence(net.n_e + br.out, br, e_off)
+            out.incidence(net.n_e + br.output, br, e_off)
             if i_off[k] >= 0:
-                out.eye(net.n_e + net.n_bd + br.out, int(i_off[k]), br.dim)
+                out.eye(net.n_e + net.n_bd + br.output, int(i_off[k]), br.dim)
         out.eye(0, 0, net.n_e)
         self.xd_index = xd_index
         self.S_out = sp.csr_matrix(out.matrix((net.n_out, n_z)))
@@ -1306,7 +1469,7 @@ def _roles(net: "Netlist", mode: Mode) -> tuple[list[Optional[str]], dict[int, N
 
 
 def _paths(brs: list[_Branch], tree: list[int], nv: int) -> Callable[[int], list[int]]:
-    """``path(k)``: the tree branches between the terminals of branch ``k`` (its fundamental loop)."""
+    """``path(k)``: the tree branches between the ports of branch ``k`` (its fundamental loop)."""
     adjacent: list[list[tuple[int, int]]] = [[] for _ in range(nv)]
     for k in tree:
         adjacent[brs[k].a].append((brs[k].b, k))
@@ -1366,7 +1529,7 @@ def _is_device(el: Element) -> bool:
 def _partition(net: "Netlist") -> tuple[Grouping, NDArray[np.intp], NDArray[np.intp]]:
     """The state-space-nodal groups of ``net``, with the group of every vertex and branch (-1: interface).
 
-    Switches, diodes and transformers joined at their terminals form clusters; a cluster with a diode or a
+    Switches, diodes and transformers joined at their ports form clusters; a cluster with a diode or a
     mode-dependent transformer (a converter's legs or bridge, not a lone breaker) seeds a region. Regions
     grow breadth-first over the other elements, one element per round, never through ground: a node
     reached by two regions in one round, or the busier end of an element joining two regions, is an
@@ -1464,7 +1627,7 @@ class _Evaluation:
     u: NDArray[np.float64]
     du: NDArray[np.float64]
     z: Optional[NDArray[np.float64]]
-    out: Optional[NDArray[np.float64]] = None
+    output: Optional[NDArray[np.float64]] = None
 
 
 class Netlist:
@@ -1508,9 +1671,11 @@ class Netlist:
         self._cache: "OrderedDict[tuple, Topology]" = OrderedDict()
         self._structures: "OrderedDict[tuple, Topology]" = OrderedDict()  # by switch and diode pattern
         self._scalar_functions: "OrderedDict[tuple[tuple, str, Optional[tuple[int, ...]]], Callable]" = OrderedDict()
+        self._dynamic_scalar_functions: "OrderedDict[tuple, Callable]" = OrderedDict()
         self._scalar_topology: Optional[Topology] = None
         self._last: Optional[_Evaluation] = None
         self._mode: Optional[Mode] = None
+        self._ratio_override: Optional[tuple[NDArray[np.float64], ...]] = None
         self._frozen_mode: Optional[Mode] = None
         self._frozen_topology: Optional[Topology] = None
         self._frozen_scalar: Optional[Callable] = None
@@ -1538,7 +1703,7 @@ class Netlist:
         """The sources in the order of the input vector ``u``."""
         return [src for src, _ in self._sources]
 
-    def _vertex_of(self, node: Terminal) -> int:
+    def _vertex_of(self, node: Port) -> int:
         if node is None:
             return 0
         v = self._vertex.get(id(node))
@@ -1600,6 +1765,7 @@ class Netlist:
         self._structures.clear()
         self._parts.clear()
         self._scalar_functions.clear()
+        self._dynamic_scalar_functions.clear()
         self._scalar_topology = None
         self._last = None
         self._frozen_mode = self._frozen_topology = self._frozen_scalar = None
@@ -1649,7 +1815,8 @@ class Netlist:
         """The current switch positions, diode conduction and transformer ratios."""
         if self._frozen_mode is not None:
             return self._frozen_mode
-        ratios = [tr.ratio() for tr in self._transformers]
+        ratios = (list(self._ratio_override) if self._ratio_override is not None else
+                  [tr.ratio() for tr in self._transformers])
         conducting = self.conducting
         if self._gates:  # a gated device position conducts whatever its diode does
             conducting = list(conducting)
@@ -1719,8 +1886,11 @@ class Netlist:
         if self._frozen_topology is None:
             topology = self.topology()
             self._frozen_mode, self._frozen_topology = topology.mode, topology
-            if self.form == "device":
-                self._frozen_scalar = self._scalar_function(topology, "all")
+            if (self.form == "device"
+                    and all(transformer.constant is not None for transformer in self._transformers)):
+                key = topology.mode.key, "all", None
+                if key in self._scalar_functions:
+                    self._frozen_scalar = self._scalar_function(topology, "all")
 
     def release_topology(self) -> None:
         """Allow topology callbacks to be read at the next model-changing boundary."""
@@ -1921,7 +2091,7 @@ class Netlist:
         }
         for branch in self._branches:
             if branch.dim == 2:
-                output_rows.update((self.n_e + branch.out, self.n_e + self.n_bd + branch.out))
+                output_rows.update((self.n_e + branch.output, self.n_e + self.n_bd + branch.output))
         return complex_variables, derivative_rows, output_rows
 
     def _causal_series_evaluators(self) -> Optional[tuple[Callable, Callable, Callable]]:
@@ -1965,7 +2135,7 @@ class Netlist:
         without_inductor[id(a)].remove(id(b))
         without_inductor[id(b)].remove(id(a))
 
-        def reaches(start: Terminal, target: Terminal) -> bool:
+        def reaches(start: Port, target: Port) -> bool:
             if start is target:
                 return True
             if start is None or target is None:
@@ -2348,7 +2518,9 @@ class Netlist:
     def evaluate_scalar_derivatives(self, t: float, y: Sequence[float]) -> tuple:
         """Evaluate the generated state equations in the caller's state layout."""
         top = self._scalar_topology_at()
-        derivative = self._scalar_function(top, "derivatives")(t, y)
+        derivative = (self._dynamic_scalar_function(top)(t, y)[0]
+                      if any(transformer.constant is None for transformer in self._transformers)
+                      else self._scalar_function(top, "derivatives")(t, y))
         return self._place_scalar_derivatives(derivative, len(y))
 
     def scalar_evaluators(self) -> tuple[Callable, Callable, Callable]:
@@ -2381,7 +2553,11 @@ class Netlist:
         rows = tuple(sorted(set(map(int, selected))))
 
         def evaluate(t: float, y: Sequence[float]) -> tuple:
-            return self._scalar_function(self._scalar_topology_at(), "outputs", rows)(t, y)
+            top = self._scalar_topology_at()
+            if any(transformer.constant is None for transformer in self._transformers):
+                outputs = self._dynamic_scalar_function(top)(t, y)[1]
+                return tuple(outputs[row] for row in rows)
+            return self._scalar_function(top, "outputs", rows)(t, y)
 
         return evaluate
 
@@ -2392,10 +2568,138 @@ class Netlist:
     def evaluate_scalar_outputs(self, t: float, y: Sequence[float]) -> tuple:
         """Evaluate only the generated electrical outputs of the present topology."""
         top = self._scalar_topology_at()
+        if any(transformer.constant is None for transformer in self._transformers):
+            return self._dynamic_scalar_function(top)(t, y)[1]
         return self._scalar_function(top, "outputs")(t, y)
+
+    def _compile_dynamic_scalar(self, top: Topology) -> Callable:
+        """Compile scalar equations whose transformer ratios remain run-time values."""
+        env: dict[str, Any] = {}
+        preamble: list[str] = []
+        flat_ratios: list[Any] = []
+        for index, transformer in enumerate(self._transformers):
+            if transformer.constant is not None:
+                flat_ratios.extend(transformer.constant.ravel())
+                continue
+            callback, value = f"_ratio_{index}", f"_ratio_value_{index}"
+            env[callback] = transformer.N
+            preamble.append(f"    {value} = {callback}()")
+            compact = transformer._cached_scalar is not None
+            if compact and transformer.shape == (1, 1):
+                flat_ratios.append(_Symbolic.value(value))
+            elif compact and transformer.shape == (2, 1):
+                scalar = _Symbolic.value(value)
+                flat_ratios.extend((scalar.real, scalar.imag))
+            else:
+                flat_ratios.extend(
+                    _Symbolic.value(f"{value}[{row}][{column}]")
+                    for row in range(transformer.shape[0])
+                    for column in range(transformer.shape[1])
+                )
+
+        pattern = top._pattern
+        columns = np.repeat(np.arange(pattern.n), np.diff(pattern.indptr))
+        entries: list[Any] = pattern.base.tolist()
+        for position, flat, coefficient in zip(
+                pattern.slot_pos, pattern.slot_flat, pattern.slot_coef):
+            entries[int(position)] += coefficient * flat_ratios[int(flat)]
+        matrix: list[list[Any]] = [[0.0] * pattern.n for _ in range(pattern.n)]
+        for value, row, column in zip(entries, pattern.indices, columns):
+            matrix[int(row)][int(column)] = value
+
+        inputs: list[Any] = [0.0] * self.n_u
+        rates: list[Any] = [0.0] * self.n_u
+        for index, (source, offset) in enumerate(self._sources):
+            branch = self._branch(source)
+            callback, value = f"_source_{index}", f"_source_value_{index}"
+            env[callback] = source.value
+            preamble.append(f"    {value} = {callback}(t)")
+            if branch.dim == 1:
+                inputs[offset] = _Symbolic.value(value)
+            elif branch.dim == 2:
+                scalar = _Symbolic.value(value)
+                inputs[offset:offset + 2] = (scalar.real, scalar.imag)
+            else:
+                inputs[offset:offset + branch.dim] = (
+                    _Symbolic.value(f"{value}[{part}]") for part in range(branch.dim)
+                )
+            if not top.needs_rate[index]:
+                continue
+            if source.derivative is not None:
+                derivative = f"_source_rate_{index}"
+                rate_value = f"_source_rate_value_{index}"
+                env[derivative] = source.derivative
+                preamble.append(f"    {rate_value} = {derivative}(t)")
+            else:
+                before, after = f"_source_before_{index}", f"_source_after_{index}"
+                preamble.extend((
+                    f"    {before} = {callback}(t - {_DELTA_T!r})",
+                    f"    {after} = {callback}(t + {_DELTA_T!r})",
+                    f"    _source_rate_value_{index} = "
+                    f"({after} - {before}) / {2.0 * _DELTA_T!r}",
+                ))
+                rate_value = f"_source_rate_value_{index}"
+            if branch.dim == 1:
+                rates[offset] = _Symbolic.value(rate_value)
+            elif branch.dim == 2:
+                scalar = _Symbolic.value(rate_value)
+                rates[offset:offset + 2] = (scalar.real, scalar.imag)
+            else:
+                rates[offset:offset + branch.dim] = (
+                    _Symbolic.value(f"{rate_value}[{part}]") for part in range(branch.dim)
+                )
+
+        states = [_Symbolic.value(f"y[{int(index)}]") for index in self.states]
+        variables = [*states, *inputs, *(rates if top.any_rate else ())]
+        coefficients = top._K.toarray() if hasattr(top._K, "toarray") else top._K
+        right = [sum((coefficient * value for coefficient, value in zip(row, variables)
+                      if coefficient != 0.0), 0.0) for row in coefficients]
+        solution = (_symbolic_solve(matrix, right, pattern.dense(top.mode.ratios))
+                    if pattern.n else [])
+        derivatives = [solution[int(index)] for index in top.xd_index]
+        output_matrix = top.S_out.toarray()
+        outputs = [sum((coefficient * value for coefficient, value in zip(row, solution)
+                        if coefficient != 0.0), 0.0) for row in output_matrix]
+        expressions = [*derivatives, *outputs, *inputs, *rates]
+        shared, rendered = _symbolic_source(expressions)
+        n_d, n_o, n_u = len(derivatives), len(outputs), len(inputs)
+        derivative_text = rendered[:n_d]
+        output_text = rendered[n_d:n_d + n_o]
+        input_text = rendered[n_d + n_o:n_d + n_o + n_u]
+        rate_text = rendered[n_d + n_o + n_u:]
+
+        def tuple_expression(items: Sequence[str]) -> str:
+            return "(" + ", ".join(items) + ("," if len(items) == 1 else "") + ")"
+
+        result = ", ".join(tuple_expression(items) for items in (
+            derivative_text, output_text, input_text, rate_text,
+        ))
+        lines = ["def evaluate(t, y):", *preamble,
+                 *(f"    {line}" for line in shared), f"    return {result}"]
+        exec(compile("\n".join(lines) + "\n", "<peslite dynamic circuit equations>", "exec"), env)
+        return env["evaluate"]
+
+    def _dynamic_scalar_function(self, top: Topology) -> Callable:
+        key = top.mode.key[:2]
+        evaluate = self._dynamic_scalar_functions.get(key)
+        if evaluate is None:
+            evaluate = self._dynamic_scalar_functions[key] = self._compile_dynamic_scalar(top)
+            while len(self._dynamic_scalar_functions) > self.cache_size:
+                self._dynamic_scalar_functions.popitem(last=False)
+        else:
+            self._dynamic_scalar_functions.move_to_end(key)
+        return evaluate
 
     def evaluate_scalar_raw(self, t: float, y: Sequence[float], *, record: bool = True) -> tuple[tuple, tuple]:
         """Evaluate generated scalar equations without allocating solver-facing arrays."""
+        if any(transformer.constant is None for transformer in self._transformers):
+            top = self._frozen_topology or self._scalar_topology_at()
+            evaluate = self._dynamic_scalar_function(top)
+            derivative, output, inputs, rates = evaluate(t, y)
+            if record:
+                x = tuple(y[int(index)] for index in self.states)
+                self._last = _Evaluation(top, t, x, inputs, rates, None, output)
+            return self._place_scalar_derivatives(derivative, len(y)), output
         top = self._frozen_topology or self._scalar_topology_at()
         evaluate = self._frozen_scalar or self._scalar_function(top, "all")
         derivative, output, inputs, rates = evaluate(t, y)
@@ -2460,21 +2764,21 @@ class Netlist:
         ev = self._last
         if ev is None:
             raise RuntimeError("the netlist has not been evaluated")
-        if ev.out is not None and not isinstance(ev.out, np.ndarray):
-            ev.out = np.asarray(ev.out, dtype=float)
+        if ev.output is not None and not isinstance(ev.output, np.ndarray):
+            ev.output = np.asarray(ev.output, dtype=float)
         if not isinstance(ev.x, np.ndarray):
             ev.x = np.asarray(ev.x, dtype=float)
         if not isinstance(ev.u, np.ndarray):
             ev.u = np.asarray(ev.u, dtype=float)
         if not isinstance(ev.du, np.ndarray):
             ev.du = np.asarray(ev.du, dtype=float)
-        if ev.out is None:
+        if ev.output is None:
             if ev.z is not None:
-                ev.out = ev.topology._S @ ev.z
+                ev.output = ev.topology._S @ ev.z
             else:
                 ss = ev.topology.state_space
-                ev.out = ss.C @ ev.x + ss.D @ ev.u + ss.D1 @ ev.du
-        return ev.out
+                ev.output = ss.C @ ev.x + ss.D @ ev.u + ss.D1 @ ev.du
+        return ev.output
 
     def output_slice(self, quantity: str, target: object, port: int = 0) -> slice:
         """Where ``quantity`` (``"node_voltage"`` of a node, ``"branch_voltage"`` or ``"branch_current"``
@@ -2488,7 +2792,7 @@ class Netlist:
             raise ValueError(f"unknown quantity {quantity!r}; expected one of {QUANTITIES}")
         br = self._branch(target, port)
         base = self.n_e + (self.n_bd if quantity == "branch_current" else 0)
-        return slice(base + br.out, base + br.out + br.dim)
+        return slice(base + br.output, base + br.output + br.dim)
 
     def node_voltage(self, node: Node) -> NDArray[np.float64]:
         return self.outputs()[self.output_slice("node_voltage", node)]
@@ -2617,7 +2921,9 @@ class Netlist:
         exporters can lower the same mode, source and projection laws without a second device model.
         """
         top = self.topology()
-        out = self._scalar_function(top, "outputs")(t, y)
+        out = (self._dynamic_scalar_function(top)(t, y)[1]
+               if any(transformer.constant is None for transformer in self._transformers)
+               else self._scalar_function(top, "outputs")(t, y))
         return self._diode_margins(top, out), self._margin_tolerances(out)
 
     def _output_scales(self, out: Sequence[Any]) -> tuple[Any, Any]:
@@ -2628,7 +2934,7 @@ class Netlist:
     def _diode_margins(self, top: Topology, out: Sequence[Any]) -> tuple[Any, ...]:
         """Interpret diode branch outputs in the current conduction state."""
         branches = [self._ports[id(diode)][0] for diode in self._diodes]
-        base = [self.n_e + self._branches[k].out for k in branches]
+        base = [self.n_e + self._branches[k].output for k in branches]
         voltage = [out[index] for index in base]
         if top.blocking:
             potential: list[Any] = [0.0] * self.n_vertices

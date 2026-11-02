@@ -13,14 +13,10 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, ClassVar
 
-from . import (Bag, ConfigError, Element, PowerPort, StoragePort, Terminal,
+from . import (Bag, ConfigError, Element, Empty, Port, StoragePort,
                register_element_type)
 
 __all__ = ["Cable", "CableModel"]
-
-
-class _CableInput(Bag):
-    __slots__ = ("u1", "u2")
 
 
 class _CableOutput(Bag):
@@ -36,7 +32,7 @@ def _state_record(sections: int) -> type[Bag]:
 
 
 class CableModel:
-    """Two-terminal R-L/G-C cable; both terminal currents are positive into the cable."""
+    """Two-port R-L/G-C cable; both port currents are positive into the cable."""
 
     outputs_need_inputs: ClassVar[bool] = False
 
@@ -56,26 +52,29 @@ class CableModel:
         initial = {name: 0j for name in self.state_names}
         initial.update({f"uC{k}": complex(voltage0) for k in range(1, sections + 1)})
         self.state = _state_record(sections)(**initial)
-        self.inp = _CableInput(u1=complex(voltage0), u2=complex(voltage0))
-        self.out = _CableOutput(i1=0j, i2=0j)
+        self.input = Empty()
+        self.output = _CableOutput(i1=0j, i2=0j)
+        self.port1 = Port(
+            self, "1", voltage=complex(voltage0), current=0j, scale=1.5,
+            electrical_domain="ac", standalone="voltage"
+        )
+        self.port2 = Port(
+            self, "2", voltage=complex(voltage0), current=0j, scale=1.5,
+            electrical_domain="ac", standalone="voltage"
+        )
+        self.ports = (self.port1, self.port2)
         self.storage = tuple(
             StoragePort(
                 f"iL{k + 1}", inductance, 1.5,
-                (("inp.u1", 1.0),) if k == 0 else
-                (("inp.u2", -1.0),) if k == sections else (),
+                ((self.port1, "voltage", 1.0),) if k == 0 else
+                ((self.port2, "voltage", -1.0),) if k == sections else (),
                 "inductor",
             )
             for k, inductance in enumerate(self.series_l)
         ) + tuple(
-            StoragePort(f"uC{k + 1}", self.shunt_c, 1.5, (), "capacitor")
+            StoragePort(f"uC{k + 1}", self.shunt_c, 1.5, kind="capacitor")
             for k in range(sections)
         )
-        self.ports = (
-            PowerPort("inp.u1", "out.i1", 1.5, 1.0),
-            PowerPort("inp.u2", "out.i2", 1.5, 1.0),
-        )
-        self.terminal1 = Terminal(self, "u1", "i1", 1)
-        self.terminal2 = Terminal(self, "u2", "i2", 1)
 
     def set_outputs(self, t: float) -> None:
         from ...solver.netlist import device_outputs
@@ -97,10 +96,12 @@ class CableModel:
         from ...solver import netlist as nl
 
         nodes = [
-            nb.node(self.terminal1),
+            nb.node(self.port1),
             *(nb.internal(2, 1.5) for _ in range(self.sections)),
-            nb.node(self.terminal2),
+            nb.node(self.port2),
         ]
+        nb.port_output(self, "i1", self.port1, "current")
+        nb.port_output(self, "i2", self.port2, "current")
         for index, (resistance, inductance) in enumerate(
                 zip(self.series_r, self.series_l)):
             start = nodes[index]
@@ -179,10 +180,10 @@ class Cable(Element):
     def connections() -> dict:
         return {}
 
-    def terminals(self) -> tuple[tuple[str, Terminal], ...]:
-        return ((self.cfg.bus1, self.model.terminal1),
-                (self.cfg.bus2, self.model.terminal2))
+    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
+        return ((self.cfg.bus1, self.model.port1),
+                (self.cfg.bus2, self.model.port2))
 
     def signals(self) -> dict[str, complex]:
-        return {f"{self.name}.i1": self.model.out.i1,
-                f"{self.name}.i2": self.model.out.i2}
+        return {f"{self.name}.i1": self.model.output.i1,
+                f"{self.name}.i2": self.model.output.i2}

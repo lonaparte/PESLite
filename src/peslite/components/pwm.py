@@ -562,7 +562,7 @@ class PWM:
         self.next_switch = math.inf
         values = np.asarray(d[:self.modulation_width], dtype=float)
         if self.dead_time > 0.0:
-            values = self._dead_time_average(values, self._pole_currents(self.inp.i_c))
+            values = self._dead_time_average(values, self._pole_currents(self.input.i_c))
         return self._held_state(values)
 
     def _dead_time_average(self, duties, currents):
@@ -597,7 +597,7 @@ class PWM:
         seq = self._sequence(t_l, self.load_period, values, theta, omega)
         if self._dead_time_sequence is not None:
             seq = self._dead_time_sequence(
-                t_l, self.load_period, seq, self._pole_currents(self.inp.i_c),
+                t_l, self.load_period, seq, self._pole_currents(self.input.i_c),
                 enabled=self.on,
             )
         dt = np.asarray(seq.dt, dtype=float).tolist()

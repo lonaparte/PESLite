@@ -54,11 +54,11 @@ def test_onnx_stateless_model_uses_the_plain_array_callable_boundary():
         inputs=("u0", "u1"),
         outputs=("y0", "y1"),
     )
-    block.inp.u0, block.inp.u1 = 1.5, -2.0
+    block.input.u0, block.input.u1 = 1.5, -2.0
 
     Model({"onnx": block}, {}).evaluate_outputs(0.0)
 
-    assert (block.out.y0, block.out.y1) == pytest.approx((3.5, 7.0))
+    assert (block.output.y0, block.output.y1) == pytest.approx((3.5, 7.0))
 
 
 def test_onnx_continuous_model_receives_peslite_owned_state():
@@ -82,13 +82,13 @@ def test_onnx_continuous_model_receives_peslite_owned_state():
         outputs=("y0", "y1"),
         state={"hidden_0": 1.0, "hidden_1": -2.0},
     )
-    block.inp.u0, block.inp.u1 = 4.0, 3.0
+    block.input.u0, block.input.u1 = 4.0, 3.0
     model = Model({"onnx": block}, {})
 
     model.evaluate_outputs(0.0)
 
     assert model.state_labels() == ["onnx.hidden_0", "onnx.hidden_1"]
-    assert (block.out.y0, block.out.y1) == pytest.approx((5.0, 1.0))
+    assert (block.output.y0, block.output.y1) == pytest.approx((5.0, 1.0))
     assert model.rhs(0.0, np.array([1.0, -2.0])) == pytest.approx((3.0, 5.0))
 
 
@@ -113,7 +113,7 @@ def test_onnx_recurrent_update_is_committed_as_discrete_peslite_state():
         state={"hidden_0": 2.0, "hidden_1": -4.0},
         feedthrough=(),
     )
-    block.inp.u0, block.inp.u1 = 3.0, 1.0
+    block.input.u0, block.input.u1 = 3.0, 1.0
 
     pending = block.next_state(0.0)
     assert block.get_state() == {"hidden_0": 2.0, "hidden_1": -4.0}
@@ -121,7 +121,7 @@ def test_onnx_recurrent_update_is_committed_as_discrete_peslite_state():
     block.set_outputs(0.0)
 
     assert block.get_state() == pytest.approx({"hidden_0": 4.0, "hidden_1": -1.0})
-    assert (block.out.y0, block.out.y1) == pytest.approx((4.0, -1.0))
+    assert (block.output.y0, block.output.y1) == pytest.approx((4.0, -1.0))
 
 
 def test_configured_onnx_model_resolves_its_file_and_physical_input(tmp_path):
@@ -218,4 +218,4 @@ def test_configured_recurrent_onnx_model_uses_registered_sampled_state(tmp_path)
         "output_1": -1.0,
     })
     assert result.states["onnx_model.state_0"][-1] == pytest.approx(0.5)
-    assert (block.out.y0, block.out.y1) == pytest.approx((0.5, -1.0))
+    assert (block.output.y0, block.output.y1) == pytest.approx((0.5, -1.0))

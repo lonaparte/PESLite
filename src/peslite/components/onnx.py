@@ -312,11 +312,11 @@ class ONNXModel(Element):
         return {(self.model, name): source for name, source in self._sources.items()}
 
     @staticmethod
-    def terminals() -> tuple:
+    def port_bindings() -> tuple:
         return ()
 
     def signals(self) -> dict[str, Any]:
         return {
-            f"{self.name}.{name}": getattr(self.model.out, name)
+            f"{self.name}.{name}": getattr(self.model.output, name)
             for name in self.model.output_names
         }

@@ -32,7 +32,7 @@ units:
 | Field | Required | Default | Meaning |
 |---|---:|---|---|
 | `type` | no | `vsc` | Unit type |
-| `bus` | yes | — | three-phase terminal bus |
+| `bus` | yes | — | connected three-phase bus |
 | `s_base` | no | `base.s_base` | converter rating in VA |
 | `connected` | no | event-derived | initial connection command |
 | `ac_filter` | yes | — | series converter-side R-L filter |

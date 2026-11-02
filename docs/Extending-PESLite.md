@@ -21,7 +21,7 @@ as the built-in current and DC-voltage loops.
 
 The bundled `cable-gfl-example` similarly keeps its case in `examples/`, while
 `peslite.addons.components.cable` implements its own distributed R-L/G-C state equations. It is a
-two-terminal custom element rather than a renamed built-in branch: both terminal currents are
+two-port custom element rather than a renamed built-in branch: both port currents are
 positive into the cable, and its internal inductor currents and capacitor voltages are ordinary
 restartable PESLite states.
 
@@ -125,13 +125,13 @@ An element class registered by `register_element_type` owns:
 - a frozen `Params` dataclass including its `type` and `bus` or `busN` fields;
 - `subsystems()` for its physical model objects;
 - `connections()` for its internal and auxiliary signal wiring;
-- `terminals()` binding each configured bus to an electrical `Terminal`;
+- `port_bindings()` binding each configured bus to an electrical `Port`;
 - optional `signals()` returning namespaced scalar or complex values for `plant.csv`;
 - optional `breakers` or `connect(on, t, ramp)` for connection events, plus `retune(cfg)` for
   `set` events.
 
 ```python
-from peslite.addons.components import Element, Terminal, register_element_type
+from peslite.addons.components import Element, Port, register_element_type
 
 @register_element_type
 class MyElement(Element):
@@ -150,30 +150,16 @@ Modules under `peslite/addons/components/` are discovered automatically. Built-i
 elements follow the same registry mechanism. Public names are namespaced by the element instance,
 so two instances do not share state paths.
 
-An electrical `Terminal` names a subsystem voltage and current once. Its direction is `+1` when
-positive current enters the subsystem and `-1` when it leaves. The default terminal receives
-voltage through `inp` and publishes current through `out`; `drives_voltage=True` reverses those
-roles. A one-terminal element uses `bus` and returns one binding; a multi-terminal element uses
-`bus1`, `bus2`, and so on. Each bus needs exactly one voltage driver. System assembly converts the
-voltage fan-out and signed current sum to direct model connections, so terminal metadata adds no
-work to the integration loop.
-
-Terminals can also declare circuit constraints. A voltage-driving terminal with
-`hold_voltage_input="u_hold"` receives the voltage that keeps its connected current constant
-while it is blocked. Its current-owning peer implements
-`hold_voltage_source(terminal, *, current_constraint=None)` and
-returns the ordinary model output `(subsystem, output_name)` carrying that voltage. Its owner
-may also supply `current_constraint()`, returning its constrained current or `None` when free.
-The current-owning peer receives this callback and installs `project_state()` to enforce active
-constraints on its own states; coupled constraints must be projected together.
-Assembly checks these capabilities after resolving default and named Unit ports; they apply to
-ordinary branches, composite links and add-on elements alike.
+An electrical `Port` stores voltage and current once; current is positive into its component.
+Ports are acausal, while a component's `input` and `output` records contain directed control or
+signal-flow values. A one-port element normally uses `bus`; a multi-port element uses `bus1`,
+`bus2`, and so on. `netlist(nb)` declares the electrical primitives between `nb.node(port)` values,
+and assembly compiles every connected component into the selected circuit model.
 
 Configured element buses may also name an assembled Unit default or named port. An optional
-`series_connections()` mapping `{downstream_bus: inlet_bus}` inserts an element after the original
-voltage driver; its ordinary `terminals()` still declares both electrical boundaries. This is a
-construction-time operation, not a new network solver. The built-in `Resistor(series=True)` is a
-stateless reference implementation.
+`series_connections()` mapping `{bus: inlet_bus}` cuts a node that joins exactly two ports and
+places the element between them. Repeated declarations form a series chain in declaration order.
+The built-in `Resistor(series=True)` is a stateless reference implementation.
 
 An optional `parameter_bindings()` mapping `{field: (subsystem, attribute)}` exposes retunable
 scalar parameters to C++ event lowering. Implement `retune()` using the same bindings so Python
@@ -187,7 +173,7 @@ Every entry returned by `signals()` follows the same output path. Complex values
 phase columns with `_a`, `_b` and `_c` suffixes, while scalar values retain their declared name;
 custom signal names do not require recorder-specific code.
 
-The cable add-on is a complete multi-terminal reference implementation:
+The cable add-on is a complete multi-port reference implementation:
 
 ```yaml
 elements:

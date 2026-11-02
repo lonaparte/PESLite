@@ -63,23 +63,25 @@ class DiodeConduction:
             subsystem for subsystem in model.subsystems
             if callable(getattr(subsystem, "commutation_margin", None))
             and callable(getattr(subsystem, "commutate", None))
+            and getattr(subsystem, "commutation_active", True)
         )
         self.located = tuple(
             subsystem for subsystem in self.commutating
             if getattr(subsystem, "locate_commutations", True)
         )
         self._topology_owners = tuple(
-            subsystem for subsystem in self.commutating
+            subsystem for subsystem in model.subsystems
+            if (subsystem in self.commutating or getattr(subsystem, "topology_held", False))
             if callable(getattr(subsystem, "freeze_topology", None))
         )
         self._scheduled = tuple(
             subsystem for subsystem in self.commutating
             if callable(getattr(subsystem, "next_commutation_time", None))
         )
-        if self.commutating and getattr(solver, "outer", None) is not None:
+        if self.located and getattr(solver, "outer", None) is not None:
             raise ConfigError(
                 "simulation.solver.subsystems: commutating subsystems "
-                f"{sorted(model.name_of(sub) for sub in self.commutating)} need a single-rate "
+                f"{sorted(model.name_of(sub) for sub in self.located)} need a single-rate "
                 "solver; a windowed subsystem group cannot locate their commutation instants"
             )
         self._probe = None
@@ -98,7 +100,8 @@ class DiodeConduction:
             validate(self.resolution_subsystems)
 
     def __bool__(self) -> bool:
-        return bool(self.current_states or self.resolution_subsystems or self.commutating)
+        return bool(self.current_states or self.resolution_subsystems
+                    or self.commutating or self._topology_owners)
 
     def synchronize(self, t: float, state: NDArray[np.float64]) -> None:
         """Resolve boundary modes before measurements, controls or observations read them."""
@@ -113,7 +116,7 @@ class DiodeConduction:
         if self.commutating:
             state = self._settle(t0, state)
         if not self.current_states and not self.located and not self._scheduled:
-            return self._advance_with_resolution(t0, t1, state)
+            return self._smooth(t0, t1, state)
         t = t0
         end = t1 - commutation_tolerance(t1)
         stalled = 0

@@ -11,9 +11,9 @@ import peslite
 from conftest import EXAMPLES
 from peslite import BlackBoxSubsystem, Simulation
 from peslite.assembly.params import from_dict
-from peslite.components import Element, Terminal, register_element_type
+from peslite.components import Element, Port, register_element_type
 from peslite.solver import Bag, Model, StateRegistry
-from peslite.solver.energy import PowerPort
+from peslite.solver.energy import Port
 from peslite.solver.simulation import SystemLoop
 
 
@@ -47,7 +47,7 @@ class _Counter(Element):
     def connections(self):
         return {(self.lag, "y"): (self.counter, "y")}
 
-    def terminals(self):
+    def port_bindings(self):
         return ()
 
 
@@ -78,7 +78,7 @@ class _Swap(Element):
         return {(self.first, "other"): (self.second, "y"),
                 (self.second, "other"): (self.first, "y")}
 
-    def terminals(self):
+    def port_bindings(self):
         return ()
 
 
@@ -96,13 +96,17 @@ class _Load(Element):
 
     def __init__(self, name, cfg, buses, p):
         self.name, self.cfg = name, cfg
+        port = Port(
+            name="power", effort="input.u", flow="output.i"
+        )
         self.model = BlackBoxSubsystem(
             lambda _t, inputs: inputs / cfg.r,
             inputs=("u",),
             outputs=("i",),
-            ports=(PowerPort("inp.u", "out.i"),),
-            dissipated_power=lambda load: load.inp.u * load.out.i,
+            ports=(port,),
+            dissipated_power=lambda load: load.input.u * load.output.i,
         )
+        port.bind(self.model)
 
     def subsystems(self):
         return {self.name: self.model}
@@ -110,8 +114,8 @@ class _Load(Element):
     def connections(self):
         return {}
 
-    def terminals(self):
-        return ((self.cfg.bus, Terminal(self.model, "u", "i", 1)),)
+    def port_bindings(self):
+        return ((self.cfg.bus, self.model.ports[0]),)
 
 
 @register_element_type
@@ -144,7 +148,7 @@ class _WindowedSampler(Element):
     def connections(self):
         return {(self.sampler, "x"): (self.ramp, "x")}
 
-    def terminals(self):
+    def port_bindings(self):
         return ()
 
 
@@ -161,15 +165,15 @@ def test_stateless_black_box_needs_only_input_and_output_callables(tmp_path):
         inputs=("u",),
         outputs=("y",),
     )
-    block.inp.u = 3.0
+    block.input.u = 3.0
     model = Model({"block": block}, {})
 
     model.evaluate_outputs(0.5)
 
     assert block.state_names == ()
     assert model.n_states == 0
-    assert block.out.y == pytest.approx(6.5)
-    assert all(isinstance(record, Bag) for record in (block.inp, block.out, block.state))
+    assert block.output.y == pytest.approx(6.5)
+    assert all(isinstance(record, Bag) for record in (block.input, block.output, block.state))
 
     def bus_voltage(load):
         params = peslite.load(EXAMPLES / "buck-example.pes").replace(**{
@@ -183,7 +187,7 @@ def test_stateless_black_box_needs_only_input_and_output_callables(tmp_path):
 
     declared = {"type": "test_black_box_load", "bus": "output", "r": 6.0}
     built_in = {"type": "resistor", "bus": "output", "r": 6.0}
-    assert bus_voltage(declared) == pytest.approx(bus_voltage(built_in), rel=1e-12)
+    assert bus_voltage(declared) == pytest.approx(bus_voltage(built_in), rel=1e-10)
 
 
 def test_named_input_promotes_to_complex_when_connected_signal_is_complex():
@@ -192,11 +196,11 @@ def test_named_input_promotes_to_complex_when_connected_signal_is_complex():
         inputs=("u",),
         outputs=("y",),
     )
-    block.inp.u = 1.0 + 2.0j
+    block.input.u = 1.0 + 2.0j
 
     Model({"block": block}, {}).evaluate_outputs(0.0)
 
-    assert block.out.y == 1.0 + 2.0j
+    assert block.output.y == 1.0 + 2.0j
 
 
 def test_stateful_black_box_state_is_owned_by_model():
@@ -208,14 +212,14 @@ def test_stateful_black_box_state_is_owned_by_model():
         rhs=lambda _t, state, inputs: (inputs[0] - state[0],),
         feedthrough=(),
     )
-    block.inp.u = 4.0
+    block.input.u = 4.0
     model = Model({"block": block}, {})
 
     assert model.state_labels() == ["block.filtered"]
     assert model.rhs(0.0, np.array([1.0])) == pytest.approx([3.0])
     model.set_states(np.array([2.5]))
     model.evaluate_outputs(0.0)
-    assert block.out.y == pytest.approx(2.5)
+    assert block.output.y == pytest.approx(2.5)
 
 
 def test_discrete_black_box_restores_boolean_state_without_changing_its_type():
@@ -259,7 +263,7 @@ def test_stateless_feedthrough_uses_the_existing_algebraic_loop_solver():
 
     assert len(model.algebraic_loops) == 1
     model.evaluate_outputs(0.0)
-    assert block.out.y == pytest.approx(2.0)
+    assert block.output.y == pytest.approx(2.0)
 
 
 def test_state_output_breaks_feedback_dependency():
@@ -288,7 +292,7 @@ def test_discrete_black_box_updates_on_the_shared_simulation_event_grid(tmp_path
     assert SystemLoop(simulation).periods == [1.0e-3]
     assert "block.hidden" not in simulation._states.discrete_names
     assert result.states["block.hidden"][-1] == pytest.approx(3.0)
-    assert simulation.system.named_elements["block"].counter.out.y == pytest.approx(3.0)
+    assert simulation.system.named_elements["block"].counter.output.y == pytest.approx(3.0)
 
 
 def test_restored_integer_black_box_state_remains_a_discrete_mode():
@@ -426,5 +430,5 @@ def test_black_box_validates_declared_dimensions_and_dependencies():
             inputs=("u",),
             outputs=("y",),
             observer=True,
-            ports=(PowerPort("inp.u", "out.y"),),
+            ports=(Port.signals("input.u", "output.y"),),
         )

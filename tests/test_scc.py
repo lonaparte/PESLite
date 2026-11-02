@@ -359,7 +359,7 @@ def _capacitor(current, *, angle=1.2, drive="alternating", voltage=0.0):
     class Capacitor(RCNode):
         def set_outputs(self, t):
             self.t = t
-            self.inp.i = 0.0 if switch.on else current(t)
+            self.input.i = 0.0 if switch.on else current(t)
             super().set_outputs(t)
 
         def commutation_margin(self):

@@ -1,7 +1,7 @@
 """Continuous-time model: what a subsystem is, subsystems connected by signals into one model, and
 named states and automatically solved algebraic signal loops.
 
-A subsystem has ``state``, ``inp`` and ``out`` records (:class:`Bag`) and state derivatives; the
+A subsystem has ``state``, ``input`` and ``output`` records (:class:`Bag`) and state derivatives; the
 :class:`Model` packs the states of its subsystems into a flat real vector (two entries per complex
 state) named ``<subsystem>.<state>`` and evaluates their outputs and connections in signal order.
 Strongly connected output/input dependencies are detected during assembly and reduced to
@@ -103,7 +103,7 @@ def _integer(value):
 
 
 class Bag:
-    """Record whose ``__slots__`` fields default to ``0.0`` unless given as keywords (``state``, ``inp``, ``out``)."""
+    """Record whose fields default to ``0.0`` unless supplied as keywords."""
 
     __slots__ = ()
 
@@ -122,10 +122,11 @@ class Empty(Bag):
 class OutputMethod:
     """One output method of a subsystem and its direct input dependencies.
 
-    ``method``: name of a method taking ``t``; ``inputs``: ``inp`` fields it reads;
-    ``outputs``: ``out`` fields it writes. Every output field needs exactly one producer.
+    ``method``: name of a method taking ``t``; ``inputs``: ``input`` fields it reads;
+    ``outputs``: ``output`` fields it writes. Every output field needs exactly one producer.
     ``rhs`` may be false when no state derivative of the owning subsystem reads the stage.  The
-    model still includes it when an RHS-required downstream signal depends on its outputs.
+    model still includes it when an RHS-required downstream signal depends on its outputs. A
+    state-derivative preparation stage may have no outputs when ``rhs`` is true.
     """
 
     method: str
@@ -151,26 +152,26 @@ class _InlineProgram:
 
 @runtime_checkable
 class Subsystem(Protocol):
-    """Continuous block with ``state``, ``inp`` and ``out`` records and state derivatives.
+    """Continuous block with ``state``, ``input`` and ``output`` records and state derivatives.
 
     ``state_names``: packing order (a complex state takes two real entries);
-    ``outputs_need_inputs``: whether ``set_outputs`` reads ``inp``; optional ``output_stages``
+    ``outputs_need_inputs``: whether ``set_outputs`` reads ``input``; optional ``output_stages``
     (tuple of :class:`OutputMethod`) replaces ``set_outputs``. A subsystem may declare real-state
     unilateral constraints as ``state_bounds = {name: (lower, upper)}``, using ``None`` for an
     open side. An optional ``project_state()`` enforces coupled constraints on the component's
     own state. The host applies projections after integration and when preparing audit states;
     they must be idempotent and must not change other components or discrete modes.
-    ``out`` and connected ``inp`` fields are current when ``rhs`` runs.
+    ``output`` and connected ``input`` fields are current when ``rhs`` runs.
     """
 
     state: Any
-    inp: Any
-    out: Any
+    input: Any
+    output: Any
     state_names: ClassVar[tuple[str, ...]]
     outputs_need_inputs: ClassVar[bool]
 
     def set_outputs(self, t: float) -> None:
-        """Update ``out`` from ``state`` (and ``inp`` if ``outputs_need_inputs``)."""
+        """Update ``output`` from ``state`` (and ``input`` if ``outputs_need_inputs``)."""
 
     def rhs(self, t: float) -> Sequence[complex | float]:
         """Time derivatives of the states, in ``state_names`` order."""
@@ -248,15 +249,15 @@ class BlackBoxSubsystem:
         offset: float = 0.0,
         feedthrough: Sequence[str] | None = None,
         observer: bool = False,
-        ports: Sequence[_energy.PowerPort] | None = None,
+        ports: Sequence[_energy.Port] | None = None,
         storage: Sequence[_energy.StoragePort] | None = None,
         dissipated_power: Callable[[Any], float] | None = None,
         supplied_power: Callable[[Any], float] | None = None,
     ) -> None:
         if not callable(output):
             raise TypeError("output must be callable")
-        self.input_names, self.inp = _black_box_record(inputs, "inputs")
-        self.output_names, self.out = _black_box_record(outputs, "outputs")
+        self.input_names, self.input = _black_box_record(inputs, "inputs")
+        self.output_names, self.output = _black_box_record(outputs, "outputs")
         if not self.output_names:
             raise ValueError("outputs must contain at least one name")
 
@@ -324,7 +325,7 @@ class BlackBoxSubsystem:
         self.outputs_need_inputs = bool(dependencies)
         self.output_stages = (OutputMethod("set_outputs", tuple(dependencies), self.output_names),)
 
-        self._input_values = _black_box_values(self.inp, self.input_names)
+        self._input_values = _black_box_values(self.input, self.input_names)
         self._state_values = _black_box_values(self.state, self._state_names)
 
     @staticmethod
@@ -352,14 +353,14 @@ class BlackBoxSubsystem:
 
     def _arguments(self) -> tuple[NDArray, NDArray]:
         self._state_values = self._read(self.state, self._state_names, self._state_values)
-        self._input_values = self._read(self.inp, self.input_names, self._input_values)
+        self._input_values = self._read(self.input, self.input_names, self._input_values)
         return self._state_values, self._input_values
 
     def set_outputs(self, t: float) -> None:
         state, inputs = self._arguments()
         values = self._result(self._call_output(t, state, inputs), len(self.output_names), "output")
         for name, value in zip(self.output_names, values):
-            setattr(self.out, name, self._scalar(value))
+            setattr(self.output, name, self._scalar(value))
 
     def rhs(self, t: float) -> Sequence[complex | float]:
         if self._call_rhs is None:
@@ -404,7 +405,7 @@ class BlackBoxSubsystem:
     def actuate(self, t: float, plant: Any) -> bool:
         """Commit a sampled update as a plant change; a model subsystem never trips."""
         if self._pending is not None:
-            with plant.change():
+            with plant.change(t):
                 for name, value, scalar_type in zip(
                         self._state_names, self._pending, self._state_types):
                     setattr(self.state, name, scalar_type(value))
@@ -890,7 +891,7 @@ class _AlgebraicLoop:
 
     def __init__(self, operations: tuple, tears: tuple, owners: tuple,
                  labels: tuple[str, ...],
-                 max_sweeps: int = 16, rtol: float = 1e-8, atol: float = 1e-10) -> None:
+                 max_sweeps: int = 16, rtol: float = 1e-14, atol: float = 1e-16) -> None:
         self.tears = tears
         torn = {id(item) for item in tears}
         self.operations = tuple(operation for operation in operations
@@ -1127,13 +1128,17 @@ class Model:
             if not isinstance(sub, Subsystem):
                 raise TypeError(
                     f"{type(sub).__name__} does not satisfy the Subsystem protocol "
-                    "(needs state/inp/out, state_names, outputs_need_inputs, set_outputs, rhs)")
+                    "(needs state/input/output, state_names, outputs_need_inputs, set_outputs, rhs)")
+        from .netlist import prepare_device
+        for sub in subsystems:
+            if callable(getattr(sub, "netlist", None)) and not hasattr(sub, "_circuit"):
+                prepare_device(sub)
         self.subsystems: list[Subsystem] = list(subsystems)
         self.connections = dict(connections)
         self.zoh_connections = dict(zoh_connections or {})
         self._zoh_targets: dict[str, list[tuple[Any, str]]] = {}
         for (dst, name), label in self.zoh_connections.items():
-            self._zoh_targets.setdefault(label, []).append((dst.inp, name))
+            self._zoh_targets.setdefault(label, []).append((dst.input, name))
         self._check_connections()
         self._build_state_layout()
         self._build_evaluation_plan()
@@ -1147,18 +1152,18 @@ class Model:
         for (dst, dst_name), src in self.connections.items():
             if id(dst) not in known:
                 raise ValueError(f"connection target {type(dst).__name__} is not in the subsystem list")
-            if not hasattr(dst.inp, dst_name):
-                raise ValueError(f"{type(dst).__name__}.inp has no field {dst_name!r}")
+            if not hasattr(dst.input, dst_name):
+                raise ValueError(f"{type(dst).__name__}.input has no field {dst_name!r}")
             sources = src if isinstance(src, list) else [src]
             for entry in sources:
                 s_obj, s_name = entry[0], entry[1]
                 if id(s_obj) not in known:
                     raise ValueError(f"connection source {type(s_obj).__name__} is not in the subsystem list")
-                if not hasattr(s_obj.out, s_name):
-                    raise ValueError(f"{type(s_obj).__name__}.out has no field {s_name!r}")
+                if not hasattr(s_obj.output, s_name):
+                    raise ValueError(f"{type(s_obj).__name__}.output has no field {s_name!r}")
         for (dst, dst_name) in self.zoh_connections:
-            if not hasattr(dst.inp, dst_name):
-                raise ValueError(f"{type(dst).__name__}.inp has no field {dst_name!r}")
+            if not hasattr(dst.input, dst_name):
+                raise ValueError(f"{type(dst).__name__}.input has no field {dst_name!r}")
 
     def _build_state_layout(self) -> None:
         """Map every state field to a slice of the flat real vector."""
@@ -1241,7 +1246,7 @@ class Model:
             if stage.method in methods:
                 raise ValueError(f"{where}: duplicate stage method")
             methods.add(stage.method)
-            for label, fields, record in (("inputs", stage.inputs, sub.inp), ("outputs", stage.outputs, sub.out)):
+            for label, fields, record in (("inputs", stage.inputs, sub.input), ("outputs", stage.outputs, sub.output)):
                 if not isinstance(fields, (tuple, list)) or any(not isinstance(f, str) for f in fields):
                     raise ValueError(f"{where}.{label}: expected a sequence of field names")
                 if len(set(fields)) != len(fields):
@@ -1249,12 +1254,12 @@ class Model:
                 for field in fields:
                     if not hasattr(record, field):
                         raise ValueError(f"{where}.{label}: unknown field {field!r}")
-            if not stage.outputs:
-                raise ValueError(f"{where}: at least one output is required")
+            if not stage.outputs and not stage.rhs:
+                raise ValueError(f"{where}: an output-free stage must be required by rhs")
             if produced.intersection(stage.outputs):
                 raise ValueError(f"{where}: an output has more than one producer")
             produced.update(stage.outputs)
-        outputs = {f for f in dir(sub.out) if not f.startswith("_") and not callable(getattr(sub.out, f))}
+        outputs = {f for f in dir(sub.output) if not f.startswith("_") and not callable(getattr(sub.output, f))}
         missing = outputs - produced
         if missing:
             raise ValueError(f"{name}.output_stages: outputs without a producer: {sorted(missing)}")
@@ -1278,22 +1283,29 @@ class Model:
             rhs_required.append(rhs)
             return index
 
-        producers, legacy, stages = {}, {}, []
+        producers, legacy, stages, stage_nodes = {}, {}, [], {}
         for name, sub in zip(self.names, self.subsystems):
             declared = self._output_stages(sub, name)
             if declared is None:
                 node = None
-                if sub.outputs_need_inputs or sub.out is not sub.state:
-                    node = add(("out", sub.set_outputs), sub, (), f"{name}.set_outputs")
+                if sub.outputs_need_inputs or sub.output is not sub.state:
+                    node = add(("output", sub.set_outputs), sub, (), f"{name}.set_outputs")
                     stages.append((node, sub, connected[id(sub)] if sub.outputs_need_inputs else ()))
                 legacy[id(sub)] = node  # state aliases need no output evaluation
             else:
                 for stage in declared:
-                    node = add(("out", getattr(sub, stage.method)), sub, (),
+                    node = add(("output", getattr(sub, stage.method)), sub, (),
                                f"{name}.{stage.method}", stage.rhs)
+                    stage_nodes[id(sub), stage.method] = node
                     stages.append((node, sub, stage.inputs))
                     for field in stage.outputs:
                         producers[id(sub), field] = node
+
+        for sub in self.subsystems:
+            for method, requirements in getattr(sub, "_output_dependencies", {}).items():
+                node = stage_nodes[id(sub), method]
+                for source, source_method in requirements:
+                    dependencies[node].add(stage_nodes[id(source), source_method])
 
         def producer(sub, field):
             key = (id(sub), field)
@@ -1301,7 +1313,7 @@ class Model:
                 return producers[key]
             if id(sub) in legacy:
                 return legacy[id(sub)]
-            raise ValueError(f"{names[id(sub)]}.out.{field}: no output stage produces this signal")
+            raise ValueError(f"{names[id(sub)]}.output.{field}: no output stage produces this signal")
 
         copies = {}
         for (dst, field), spec in self.connections.items():
@@ -1309,12 +1321,12 @@ class Model:
             sources = tuple(entry[0] for entry in entries)
             if len(entries) == 1 and (len(entries[0]) < 3 or entries[0][2] == 1.0):
                 src, src_field = entries[0][:2]
-                operation = (dst.inp, field, src.out, src_field, None)
+                operation = (dst.input, field, src.output, src_field, None)
             else:
-                terms = tuple((entry[0].out, entry[1], float(entry[2]) if len(entry) > 2 else 1.0)
+                terms = tuple((entry[0].output, entry[1], float(entry[2]) if len(entry) > 2 else 1.0)
                               for entry in entries)
-                operation = (dst.inp, field, None, None, terms)
-            node = add(("copy", operation), dst, sources, f"{names[id(dst)]}.inp.{field}")
+                operation = (dst.input, field, None, None, terms)
+            node = add(("copy", operation), dst, sources, f"{names[id(dst)]}.input.{field}")
             copies[id(dst), field] = node
             for entry in entries:
                 source = producer(entry[0], entry[1])
@@ -1436,8 +1448,8 @@ class Model:
                 return None
             records = {
                 "self.state": getattr(owner, "state", None),
-                "self.inp": getattr(owner, "inp", None),
-                "self.out": getattr(owner, "out", None),
+                "self.input": getattr(owner, "input", None),
+                "self.output": getattr(owner, "output", None),
             }
             records = {name: ref(value) for name, value in records.items() if value is not None}
             replacements = {"self": ref(owner)}
@@ -1457,7 +1469,7 @@ class Model:
 
         def operation_lines(operation: tuple) -> list[str]:
             kind, method = operation
-            program = inline(method) if kind == "out" else None
+            program = inline(method) if kind == "output" else None
             return program[0] if program is not None and not program[1] else [step(operation)]
 
         plan_by_operation, derivative_by_operation = [], []
@@ -1545,7 +1557,7 @@ class Model:
         plan = closure(member_ops)
         own = tuple(item for item, (owners, srcs) in zip(self._plan, self._plan_owners)
                     if any(id(owner) in member_ids for owner in owners)
-                    and (item[0] in ("out", "algebraic")
+                    and (item[0] in ("output", "algebraic")
                          or all(id(x) in member_ids for x in srcs)))
         boundary = [i for i, ((kind, _), (owners, srcs))
                     in enumerate(zip(self._plan, self._plan_owners))
@@ -1670,8 +1682,8 @@ class Model:
     # --------------------------------------------------------- evaluation
     def set_zoh_input(self, label: str, value: Any) -> None:
         """Set a held external input (e.g. the switching state) by label."""
-        for inp, name in self._zoh_targets[label]:
-            setattr(inp, name, value)
+        for input, name in self._zoh_targets[label]:
+            setattr(input, name, value)
 
     def evaluate_outputs(self, t: float) -> None:
         """Run the ordered output-method / input-copy plan for the current states."""

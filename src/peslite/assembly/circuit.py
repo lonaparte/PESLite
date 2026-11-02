@@ -5,18 +5,17 @@ Under ``simulation.solver.circuit_model`` ``statewise`` (dense per-mode state sp
 assembled. Components declaring ``netlist(nb)`` become primitives of one
 :class:`~peslite.solver.netlist.Netlist` between bus nodes; ``netlist(nb)`` returns
 ``NotImplemented`` when a component's present configuration has no netlist form. Every other
-subsystem attached to such a bus is a *behavioral port*: a voltage-following terminal is a current
-source driven by its output current, a voltage-driving terminal a voltage source driven by its
-output voltage, and its inputs read the netlist solution.
+subsystem attached to such a bus is adapted through the signal paths declared by its physical
+port: an output current becomes a current source, or an output voltage becomes a voltage source,
+while the conjugate input reads the netlist solution.
 
 The stateless :class:`Circuit` solves the netlist once per model evaluation. Each component is
-replaced in the Model by a :class:`NetworkView` with the same name and the same ``state``, ``inp``
-and ``out`` records: the Circuit fills the terminal inputs (bus voltages of followers, terminal
-currents of drivers) through ordinary connections, the view's outputs come from the component's
+replaced in the Model by a :class:`NetworkView` with the same name and the same ``state``, ``input``
+and ``output`` records. The view's outputs come from the component's
 own output equations and its derivatives from the netlist. Connections between components are
 dropped; connections from other producers into component inputs are retargeted to Circuit inputs,
-copied into the components' ``inp`` before solving. Zero-order-hold inputs keep writing into the
-components' ``inp``; the Circuit also receives each such label, so a held change refreshes it.
+copied into the components' ``input`` before solving. Zero-order-hold inputs keep writing into the
+components' ``input``; the Circuit also receives each such label, so a held change refreshes it.
 
 Mode changes (breakers, gates, transformer ratios, diodes, set events) are boundaries of the
 commutation protocol of :class:`~peslite.assembly.conduction.DiodeConduction`: the Circuit's margin is
@@ -42,24 +41,24 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
 
-from ..components.network import Terminal
+from ..components.network import Port
 from ..solver.energy import Energetic, spec_of
 from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _InlineProgram
 from ..solver.netlist import (QUANTITIES, CurrentSource, Diode, Element, Netlist, Node,
                               VoltageSource, _Degenerate)
 
 __all__ = ["NetlistBuilder", "Circuit", "NetworkView", "lower", "lower_devices",
-           "bind_device", "declare_netlist", "device_equilibrium_input"]
+           "bind_device", "declare_netlist"]
 
 
-def _kind(terminal: Terminal) -> tuple[int, float]:
-    """Node dimension and power scale of a terminal: alpha-beta (complex) or scalar."""
-    record = terminal.subsystem.out if terminal.drives_voltage else terminal.subsystem.inp
-    return (2 if isinstance(getattr(record, terminal.voltage), complex) else 1), terminal.power_port.scale
+def _kind(port: Port) -> tuple[int, float]:
+    """Node dimension and power scale of a port: alpha-beta (complex) or scalar."""
+    return (2 if isinstance(port.voltage, complex) else 1), port.scale
 
 
-def _terminals(sub: Any) -> list[Terminal]:
-    return [value for value in vars(sub).values() if isinstance(value, Terminal) and value.subsystem is sub]
+def _ports(sub: Any) -> list[Port]:
+    return [port for port in getattr(sub, "ports", ())
+            if isinstance(port, Port) and port.physical and port.component is sub]
 
 
 def _fields(record: Any) -> tuple[str, ...]:
@@ -101,14 +100,14 @@ class _CallableValue:
 class NetlistBuilder:
     """What a component's ``netlist(nb)`` declares its primitives with.
 
-    ``node(terminal)``: the bus node of a terminal (ground for an unattached voltage-following
-    terminal, a floating node for an unattached driving one); ``internal(dim, scale)``: a new node;
+    ``node(port)``: the bus node of a port (ground for an unattached voltage-following
+    port, a floating node for an unattached driving one); ``internal(dim, scale)``: a new node;
     ``value(record, field, factor=1, invert=False)``: a primitive callback bound directly to a field;
     ``add(*primitives)``; ``state(component, names, transform=None)``: the indices of one state or of
     several (concatenated); with an invertible ``transform`` ``T`` the netlist sees ``T x`` there (for
     example coil currents of stored modal currents) and the component's derivatives are ``T^-1`` of the
     netlist's; ``output(component, field, quantity)``: publish ``quantity`` = ``(kind, target[, port])``,
-    ``kind`` one of :data:`~peslite.solver.netlist.QUANTITIES`, as ``component.out.<field>`` in place of
+    ``kind`` one of :data:`~peslite.solver.netlist.QUANTITIES`, as ``component.output.<field>`` in place of
     the component's own output equation for it; ``losses(component)`` and ``supplies(component)``
     derive its dissipated and supplied power from its primitives.
 
@@ -123,15 +122,16 @@ class NetlistBuilder:
     def __init__(self, netlist: Netlist, nodes: Optional[dict[int, Optional[Node]]] = None,
                  states: Optional[dict[tuple[int, str], np.ndarray]] = None) -> None:
         self.netlist = netlist
-        self.probe = nodes is None  # a declaration: every terminal gets its own placeholder node
+        self.probe = nodes is None  # a declaration: every port gets its own placeholder node
         self._nodes: dict[int, Optional[Node]] = {} if nodes is None else nodes
-        self._terminals: dict[int, Terminal] = {}
+        self._ports: dict[int, Port] = {}
         self._states = {} if states is None else states
         self._state_owners: dict[tuple[int, str], tuple[Any, str]] = {}
         self.owner: Any = None
         self.owners: dict[int, Any] = {}
         self.owned: dict[int, list[Element]] = {}
         self.outputs: list[tuple[Any, str, tuple[tuple[float, tuple], ...]]] = []
+        self.port_outputs: list[tuple[Any, str, Port, str, float]] = []
         self.lossy: set[int] = set()
         self.supplying: set[int] = set()
         self.transforms: list[tuple[np.ndarray, np.ndarray]] = []
@@ -142,12 +142,13 @@ class NetlistBuilder:
         self.value_outputs: dict[tuple[int, str], tuple[Any, str]] = {}
         self.value_bindings: dict[tuple[int, str], _BoundValue] = {}
 
-    def node(self, terminal: Terminal) -> Optional[Node]:
-        key = id(terminal)
-        self._terminals[key] = terminal
-        if key not in self._nodes:
-            self._nodes[key] = (Node(*_kind(terminal), name=terminal.voltage)
-                                if self.probe or terminal.drives_voltage else None)
+    def node(self, port: Port) -> Optional[Node]:
+        key = id(port)
+        self._ports[key] = port
+        if port.grounded:
+            self._nodes[key] = None
+        elif key not in self._nodes:
+            self._nodes[key] = Node(*_kind(port), name=port.name)
         return self._nodes[key]
 
     @staticmethod
@@ -158,7 +159,7 @@ class NetlistBuilder:
               invert: bool = False) -> Callable:
         """A callback that reads ``record.field`` when a primitive evaluates it."""
         value = _BoundValue(record, field, factor, invert)
-        if self.owner is not None and record is getattr(self.owner, "out", None):
+        if self.owner is not None and record is getattr(self.owner, "output", None):
             self.value_outputs[id(record), field] = self.owner, field
         return value
 
@@ -167,7 +168,7 @@ class NetlistBuilder:
         if not callable(callback):
             raise TypeError("a netlist function value must be callable")
         if self.owner is not None:
-            known = set(_fields(self.owner.inp))
+            known = set(_fields(self.owner.input))
             unknown = set(inputs) - known
             if unknown:
                 raise ValueError(f"unknown netlist function input fields {sorted(unknown)}")
@@ -240,6 +241,15 @@ class NetlistBuilder:
                     terms.append((1.0, ("branch_current", element, port)))
         self.linear_output(component, field, terms)
 
+    def port_output(self, component: Any, field: str, port: Port,
+                    quantity: str, factor: float = 1.0) -> None:
+        """Publish one acausal port voltage or entering current as a component output."""
+        if quantity not in ("voltage", "current"):
+            raise ValueError("a port output quantity must be 'voltage' or 'current'")
+        if port.component is not component:
+            raise ValueError("a published port must belong to its component")
+        self.port_outputs.append((component, field, port, quantity, float(factor)))
+
     def losses(self, component: Any) -> None:
         self.lossy.add(id(component))
 
@@ -269,7 +279,7 @@ class _NetlistDeclaration:
         source = self.builder
         node_map: dict[int, Optional[Node]] = {id(None): None}
         for key, node in source._nodes.items():
-            node_map[id(node)] = target.node(source._terminals[key])
+            node_map[id(node)] = target.node(source._ports[key])
         for element in source.netlist.elements:
             for node in (item for port in element.ports for item in port if item is not None):
                 node_map.setdefault(id(node), Node(node.dim, node.scale, node.name))
@@ -323,6 +333,7 @@ class _NetlistDeclaration:
                    for factor, (kind, value, *rest) in terms))
             for component, field, terms in source.outputs
         )
+        target.port_outputs.extend(source.port_outputs)
         target.lossy.update(source.lossy)
         target.supplying.update(source.supplying)
         target.mixtures.extend(source.mixtures)
@@ -347,23 +358,22 @@ def declare_netlist(sub: Any) -> Optional[_NetlistDeclaration]:
 
 
 class _Group:
-    """One netlist node: the terminals a bus (or a terminal-to-terminal connection) joins."""
+    """One netlist node: the ports a bus (or a port-to-port connection) joins."""
 
-    __slots__ = ("label", "terminals", "dim", "scale")
+    __slots__ = ("label", "ports", "dim", "scale")
 
-    def __init__(self, label: str, terminals: list[Terminal]) -> None:
-        self.label, self.terminals = label, terminals
-        if len({_kind(t)[0] for t in terminals}) != 1:
-            raise ConfigError(f"bus {label!r}: its terminals differ in phase representation")
-        driver = next((t for t in terminals if t.drives_voltage), terminals[0])
-        self.dim, self.scale = _kind(driver)  # the power scale of the driver's energy port
+    def __init__(self, label: str, ports: list[Port]) -> None:
+        self.label, self.ports = label, ports
+        if len({_kind(t)[0] for t in ports}) != 1:
+            raise ConfigError(f"bus {label!r}: its ports differ in phase representation")
+        self.dim, self.scale = _kind(ports[0])
 
 
 class Circuit:
     """Stateless subsystem solving the netlist once per model evaluation.
 
     ``solve`` copies retargeted inputs into the components, gathers their states, evaluates the
-    netlist and publishes terminal voltages and currents; the views return its ``derivatives``.
+    netlist and publishes port voltages and currents; the views return its ``derivatives``.
     ``build()`` recompiles the netlist after a parameter change and keeps the record layout.
     """
 
@@ -380,22 +390,23 @@ class Circuit:
         self.components: list[Any] = []
         self.declarations: dict[int, _NetlistDeclaration] = {}
         self.groups: list[_Group] = []
-        self.ports: list[tuple[Terminal, _Group, str, Optional[str]]] = []  # terminal, node, inp key, out key
-        self.local_ports: list[tuple[Terminal, _Group]] = []  # component terminal and its local node
-        self.fills: list[tuple[Any, Terminal, _Group, str]] = []  # terminal currents of driving components
-        self.voltage_keys: dict[int, str] = {}  # id(group) -> out key of its node voltage
-        self.copies: list[tuple[Any, str, str]] = []  # (component, inp field, inp key)
+        self.port_values: list[tuple[Port, Optional[_Group], str, str]] = []
+        self.standalone_ports: tuple[Port, ...] = ()
+        self.behavioral_sources: list[tuple[Port, _Group, str, str]] = []
+        self.copies: list[tuple[Any, str, str]] = []  # (component, input field, input key)
         self.published: dict[tuple[int, str], str] = {}  # (id(component), out field) -> out key
-        self.inputs: dict[str, Any] = {}  # inp key -> initial value
+        self.inputs: dict[str, Any] = {}  # input key -> initial value
         self.outputs: dict[str, Any] = {}  # out key -> initial value
         self.passthrough: list[tuple[str, str]] = []  # input key -> output key
-        self.value_inputs: dict[tuple[int, str], str] = {}  # bound component outputs -> inp key
+        self.value_inputs: dict[tuple[int, str], str] = {}  # bound component outputs -> input key
         self.netlist: Optional[Netlist] = None
         self.derivatives: list[float] = []
         self.t = 0.0
         self.impulsive_dissipated_energy = 0.0  # J, dissipated by state jumps at mode changes
         self.impulsive_supplied_energy = 0.0  # J, delivered by sources during those jumps
         self.locate_commutations = False  # only diodes commutate between boundaries
+        self.commutation_active = False
+        self.topology_held = False
         self._consistent: Optional[tuple] = None  # the mode the states were last made consistent with
         self._consistent_constraints: Optional[tuple] = None
         self._loss_elements: dict[int, list[Element]] = {}
@@ -410,6 +421,7 @@ class Circuit:
         self._hooks: tuple[tuple[Any, Any], ...] = ()  # (component, after) mirroring the netlist's conduction
         self._watched: tuple[int, ...] = ()  # diodes whose conduction the hooks mirror
         self._mirrored: Optional[tuple[bool, ...]] = None  # their conduction when the hooks last ran
+        self._boundary_signature: Optional[tuple] = None
         self._stored: Optional[tuple[list[float], np.ndarray]] = None  # (component states, netlist vector) last stored
 
     # ---------------------------------------------------------------- assembly
@@ -427,10 +439,14 @@ class Circuit:
 
     def finalize(self) -> None:
         """Create the records, compile the state transfers and the netlist."""
-        self.inp = type("_CircuitInp", (Bag,), {"__slots__": tuple(self.inputs)})(**self.inputs)
-        self.out = type("_CircuitOut", (Bag,), {"__slots__": tuple(self.outputs)})(**self.outputs)
+        self.input = type("_CircuitInput", (Bag,), {"__slots__": tuple(self.inputs)})(**self.inputs)
+        self.output = type("_CircuitOutput", (Bag,), {"__slots__": tuple(self.outputs)})(**self.outputs)
         if self.outputs:
-            self.output_stages = (OutputMethod("solve", tuple(self.inputs), tuple(self.outputs)),)
+            self.output_stages = (
+                OutputMethod("solve", tuple(self.inputs), ()),
+                OutputMethod("publish_outputs", (), tuple(self.outputs), rhs=False),
+            )
+            self._output_dependencies = {"publish_outputs": ((self, "solve"),)}
         layout, index = [], 0
         self._state_index: dict[tuple[int, str], np.ndarray] = {}
         for comp in self.components:
@@ -440,7 +456,7 @@ class Circuit:
                 layout.append((comp, name, is_complex, index))
                 index += 2 if is_complex else 1
         self.layout, self.n_states = tuple(layout), index
-        env: dict[str, Any] = {"inp": self.inp}
+        env: dict[str, Any] = {"input": self.input}
         refs: dict[int, str] = {}
 
         def ref(obj: Any) -> str:
@@ -453,7 +469,7 @@ class Circuit:
                   for c, n, z, _i in layout]
         writes = [f"{ref(c.state)}.{n} = v[{i}] + 1j * v[{i + 1}]" if z else f"{ref(c.state)}.{n} = v[{i}]"
                   for c, n, z, i in layout]
-        copies = [f"setattr({ref(c.inp)}, {f!r}, inp.{k})" for c, f, k in self.copies]
+        copies = [f"setattr({ref(c.input)}, {f!r}, input.{k})" for c, f, k in self.copies]
         source = "\n".join(["def gather():", f"    return [{', '.join(values)}]",
                             "def scatter(v):", *("    " + w for w in writes or ["pass"]),
                             "def receive():", *("    " + c for c in copies or ["pass"])]) + "\n"
@@ -476,35 +492,35 @@ class Circuit:
         node_of: dict[int, Node] = {}
         for group in self.groups:
             node_of[id(group)] = node = Node(group.dim, group.scale, group.label)
-            for terminal in group.terminals:
-                nodes[id(terminal)] = node
+            for port in group.ports:
+                nodes[id(port)] = node
+        for port, group, _voltage_key, _current_key in self.port_values:
+            if group is None:
+                nodes[id(port)] = None
         nb = NetlistBuilder(net, nodes, self._state_index)
         nb.value_bindings = {
-            token: _BoundValue(self.inp, key) for token, key in self.value_inputs.items()
+            token: _BoundValue(self.input, key) for token, key in self.value_inputs.items()
         }
         for comp in self.components:
             self.declarations[id(comp)].materialize(nb)
-        sources = []
-        for terminal, group, inp_key, _out in self.ports:
-            label = f"{group.label}.{type(terminal.subsystem).__name__}.{terminal.voltage}"
-            if terminal.drives_voltage:
-                value = _BoundValue(self.inp, inp_key)
-                sources.append(net.add(VoltageSource(node_of[id(group)], None, value, name=label)))
-            else:  # the current entering the port's subsystem leaves the node
-                value = _BoundValue(self.inp, inp_key, float(terminal.direction))
-                sources.append(net.add(CurrentSource(node_of[id(group)], None, value, name=label)))
-        local_sources = []
-        for terminal, group in self.local_ports:
-            label = f"{group.label}.{type(terminal.subsystem).__name__}.{terminal.voltage}"
-            node = node_of[id(group)]
-            if terminal.drives_voltage:
-                value = _BoundValue(
-                    terminal.subsystem.inp, terminal.current, -float(terminal.direction)
-                )
-                local_sources.append(net.add(CurrentSource(node, None, value, name=label)))
-            else:
-                value = _BoundValue(terminal.subsystem.inp, terminal.voltage)
-                local_sources.append(net.add(VoltageSource(node, None, value, name=label)))
+        for port, group, key, kind in self.behavioral_sources:
+            nb.owner = port.component
+            source = _BoundValue(self.input, key)
+            primitive = (
+                CurrentSource(node_of[id(group)], None, source)
+                if kind == "current" else
+                VoltageSource(node_of[id(group)], None, source)
+            )
+            nb.add(primitive)
+        for port in self.standalone_ports:
+            if port.standalone == "voltage":
+                net.add(VoltageSource(
+                    nodes[id(port)], None, lambda _t, port=port: port.voltage
+                ))
+            elif port.standalone == "current":
+                net.add(CurrentSource(
+                    None, nodes[id(port)], lambda _t, port=port: port.current
+                ))
         declared = set(net.states.tolist())
         missing = sorted(f"{type(c).__name__}.{n}" for c, n, _z, i in self.layout if i not in declared)
         if missing:
@@ -513,14 +529,9 @@ class Circuit:
         if old is not None and len(old.conducting) == len(net.conducting):  # a rebuild keeps diode memory
             for diode, previous in zip(net._diodes, old._diodes):
                 net.set_conducting(diode, previous.conducting, previous.residual)
-        self._nodes, self._port_sources = nodes, sources  # terminal nodes and port sources: read by the C++ export
-        self._local_sources = local_sources
-        self._compile_publish(nb, node_of, sources)
+        self._nodes = nodes
+        self._compile_publish(nb, node_of)
         self._owners = {id(el): self.names.get(key, "?") for key, elements in nb.owned.items() for el in elements}
-        self._owners.update((id(src), self.names.get(id(terminal.subsystem), type(terminal.subsystem).__name__))
-                            for (terminal, *_rest), src in zip(self.ports, sources))
-        self._owners.update((id(src), self.names.get(id(terminal.subsystem), type(terminal.subsystem).__name__))
-                            for (terminal, _group), src in zip(self.local_ports, local_sources))
         self._loss_elements = {key: nb.owned.get(key, []) for key in nb.lossy}
         self._supply_elements = {key: nb.owned.get(key, []) for key in nb.supplying}
         self._energy_uses_time = any(
@@ -543,12 +554,14 @@ class Circuit:
         self._hooks = tuple((comp, hook["after"]) for comp, hook in hooks if hook["after"] is not None)
         self._watched = tuple(sorted({net._diodes.index(d) for _c, hook in hooks if hook["after"] is not None
                                       for d in hook["diodes"]}))
+        self.commutation_active = self.locate_commutations or bool(self._hooks)
         self._mirrored = None
+        self._boundary_signature = None
         if self.form == "device":
             (self.scalar_derivatives, self.scalar_outputs,
              self.scalar_output_evaluator) = net.scalar_evaluators()
 
-    def _compile_publish(self, nb: NetlistBuilder, node_of: dict[int, Node], sources: list[Element]) -> None:
+    def _compile_publish(self, nb: NetlistBuilder, node_of: dict[int, Node]) -> None:
         net = self.netlist
 
         def slot(kind: str, target: Any, port: int = 0) -> Optional[slice]:
@@ -563,29 +576,27 @@ class Circuit:
             terms = [(s, sl) for s, sl in terms if sl is not None]
             publications.append((key, dim, terms))
 
-        for group in self.groups:
-            if id(group) in self.voltage_keys:
-                terms = [(1.0, slot("node_voltage", node_of[id(group)]))]
-                value(self.voltage_keys[id(group)], terms, group.dim)
-        for comp, terminal, group, key in self.fills:
-            node, terms = node_of[id(group)], []
-            for el in nb.owned.get(id(comp), ()):
-                for port, (a, b) in enumerate(el.ports):
-                    terms += [(terminal.direction * sign, slot("branch_current", el, port))
-                              for end, sign in ((a, 1.0), (b, -1.0)) if end is node]
-            value(key, terms, group.dim)
-        for (terminal, group, _inp, out_key), src in zip(self.ports, sources):
-            if terminal.drives_voltage:
-                terms = [(float(terminal.direction), slot("branch_current", src))]
-                value(out_key, terms, group.dim)
-        for (terminal, group), src in zip(self.local_ports, self._local_sources):
-            field = terminal.voltage if terminal.drives_voltage else terminal.current
-            key = self.published[id(terminal.subsystem), field]
-            if terminal.drives_voltage:
-                terms = [(1.0, slot("node_voltage", node_of[id(group)]))]
-            else:
-                terms = [(-float(terminal.direction), slot("branch_current", src))]
-            value(key, terms, group.dim)
+        port_terms: dict[int, tuple[Optional[slice], list[tuple[float, Optional[slice]]], int]] = {}
+        for port, group, voltage_key, current_key in self.port_values:
+            node = None if group is None else node_of[id(group)]
+            dimension = _kind(port)[0]
+            voltage = slot("node_voltage", node)
+            value(voltage_key, [(1.0, voltage)], dimension)
+            terms = []
+            for element in nb.owned.get(id(port.component), ()):
+                for branch_port, (start, end) in enumerate(element.ports):
+                    if start is node:
+                        terms.append((1.0, slot("branch_current", element, branch_port)))
+                    if end is node:
+                        terms.append((-1.0, slot("branch_current", element, branch_port)))
+            value(current_key, terms, dimension)
+            port_terms[id(port)] = voltage, terms, dimension
+        for component, field, port, quantity, factor in nb.port_outputs:
+            voltage, current, dimension = port_terms[id(port)]
+            terms = [(factor, voltage)] if quantity == "voltage" else [
+                (factor * coefficient, output) for coefficient, output in current
+            ]
+            value(self.published[id(component), field], terms, dimension)
         for comp, field, declared in nb.outputs:
             terms = [(factor, slot(kind, target, *port))
                      for factor, (kind, target, *port) in declared]
@@ -613,9 +624,22 @@ class Circuit:
                 for k in range(dimension)
             ]
             expression = (f"({parts[0]}) + 1j * ({parts[1]})" if dimension == 2 else parts[0])
-            lines.append(f"out.{key} = {expression}")
-        lines.extend(f"out.{output} = inp.{input_}" for input_, output in self.passthrough)
-        env = {"inp": self.inp, "out": self.out}
+            lines.append(f"output.{key} = {expression}")
+        lines.extend(f"output.{output} = input.{input_}" for input_, output in self.passthrough)
+        env = {"input": self.input, "output": self.output}
+        for index, (port, _group, voltage_key, current_key) in enumerate(self.port_values):
+            env[f"_port_{index}"] = port
+            lines.extend((
+                f"_port_{index}.voltage = output.{voltage_key}",
+                f"_port_{index}.current = output.{current_key}",
+            ))
+        components = {id(component): component for component in self.components}
+        for index, ((owner, field), key) in enumerate(self.published.items()):
+            component = components.get(owner)
+            if component is None:
+                continue
+            env[f"_output_{index}"] = component.output
+            lines.append(f"_output_{index}.{field} = output.{key}")
         exec(compile("def publish(o):\n" + "\n".join("    " + line for line in lines or ["pass"]) + "\n",
                      "<peslite circuit outputs>", "exec"), env)
         self.publish = env["publish"]
@@ -670,8 +694,12 @@ class Circuit:
             self.derivatives = d.tolist()
         else:
             self.derivatives = list(d)
-        self.publish(outputs)
+        self._solved_outputs = outputs
         self.t = t
+
+    def publish_outputs(self, _t: float) -> None:
+        """Publish electrical observations from the most recent circuit evaluation."""
+        self.publish(self._solved_outputs)
 
     def _evaluate_mixture(self, t: float, states: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Average one local netlist over the product of its declared discrete cases."""
@@ -730,6 +758,10 @@ class Circuit:
     def cpp_outputs(self, generator: Any) -> list[str]:
         """Lower the same netlist equations through the standalone C++ backend."""
         return generator.trace_circuit_outputs(self)
+
+    def cpp_output_stage(self, generator: Any, method: Any) -> list[str]:
+        """Evaluate once in generated code; its trace already assigns every public output."""
+        return self.cpp_outputs(generator) if method.__name__ == "solve" else []
 
     def cpp_commutation_margin(self, generator: Any) -> str:
         """Lower the netlist's diode guard through the standalone C++ backend."""
@@ -816,11 +848,30 @@ class Circuit:
                       for c, n, z, i in self.layout if c is comp})
         if self._hooks:
             self._mirrored = self._pattern()
+        self._boundary_signature = self._boundary_mode()
+
+    def _boundary_mode(self) -> tuple:
+        """Discrete commands that can change the netlist constraints at an outer boundary."""
+        return (
+            tuple(bool(switch.closed()) for switch in self.netlist._switches),
+            tuple(None if diode.gate is None else bool(diode.gate())
+                  for diode in self.netlist._diodes),
+        )
+
+    def reconcile(self, t: float) -> None:
+        """Apply one atomic projection after outer events changed electrical device commands."""
+        mode = self._boundary_mode()
+        if mode != self._boundary_signature:
+            self.commutate(t)
 
     def consistent_state(self, t: float) -> None:
         """Project the states onto the present mode without recording a jump (audit states)."""
         y, _loss = self.netlist.project(t, self._states())
         self._store(y)
+        topology = self.netlist.topology()
+        self._consistent = topology.mode.key
+        self._consistent_constraints = topology.constraint_key()
+        self._boundary_signature = self._boundary_mode()
 
     def dissipated_power_of(self, component: Any) -> float:
         """The power dissipated in ``component``'s resistive primitives at the last evaluation."""
@@ -886,18 +937,18 @@ class NetworkView:
                  inputs: Sequence[str] = ()) -> None:
         self.component = component
         self._loss = self._supply = None
-        self.state, self.inp, self.out = component.state, component.inp, component.out
+        self.state, self.input, self.output = component.state, component.input, component.output
         self.state_names = tuple(component.state_names)
         stages = getattr(component, "output_stages", None)
-        if stages is None and (component.outputs_need_inputs or component.out is not component.state):
-            stages = (OutputMethod("set_outputs", _fields(component.inp) if component.outputs_need_inputs else (),
-                                   _fields(component.out)),)
+        if stages is None and (component.outputs_need_inputs or component.output is not component.state):
+            stages = (OutputMethod("set_outputs", _fields(component.input) if component.outputs_need_inputs else (),
+                                   _fields(component.output)),)
         kept = []
         for stage in stages or ():
             replaced = set(stage.outputs) & set(outputs)
             if set(stage.outputs) - replaced:
-                # Preserve outputs not supplied by the netlist. The appended netlist stage writes
-                # its authoritative fields afterwards if this equation also computes them.
+                # Preserve outputs not supplied by the netlist. The netlist stage publishes its
+                # authoritative fields before these derived outputs are evaluated.
                 remaining = tuple(field for field in stage.outputs if field not in replaced)
                 kept.append(OutputMethod(
                     stage.method, tuple(stage.inputs), remaining,
@@ -906,6 +957,7 @@ class NetworkView:
                 setattr(self, stage.method, getattr(component, stage.method))
         self.declared = tuple(outputs)
         self.output_stages = tuple(kept) if kept or outputs else None
+        self._output_dependencies: dict[str, tuple[tuple[Any, str], ...]] = {}
         self.outputs_need_inputs = component.outputs_need_inputs if stages is None else True
 
     def bind(self, circuit: Circuit, fed: Sequence[str]) -> None:
@@ -920,24 +972,32 @@ class NetworkView:
         env: dict[str, Any] = {}
         exec(compile(f"def rhs(self, t):\n    d = self._circuit.derivatives\n    return ({items})\n",
                      "<peslite netlist view>", "exec"), env)
+        results = tuple(
+            f"self._circuit.derivatives[{i}] + 1j * self._circuit.derivatives[{i + 1}]"
+            if complex_state else f"self._circuit.derivatives[{i}]"
+            for i, complex_state in entries
+        )
+        env["rhs"]._peslite_inline_program = _InlineProgram((), results, {})
         env["rhs"]._peslite_netlist_rhs = (circuit, tuple(entries))
         self.rhs = MethodType(env["rhs"], self)
         if self.declared:
-            if not fed:
-                raise ConfigError(f"{type(self.component).__name__}: netlist outputs need a terminal on a bus")
+            derived = tuple(stage.method for stage in self.output_stages or ())
             env = {}
             body = "".join(
-                f"    self.out.{field} = self._circuit.out.{circuit.published[id(self.component), field]}\n"
+                f"    self.output.{field} = self._circuit.output."
+                f"{circuit.published[id(self.component), field]}\n"
                 for field in self.declared
             )
             exec(compile(f"def netlist_outputs(self, t):\n{body}",
                          "<peslite netlist outputs>", "exec"), env)
-            env["netlist_outputs"]._peslite_netlist_passthrough = tuple(
-                (field, circuit.published[id(self.component), field]) for field in self.declared
-            )
             self.netlist_outputs = MethodType(env["netlist_outputs"], self)
-            self.output_stages = (*(self.output_stages or ()),
-                                  OutputMethod("netlist_outputs", tuple(fed), self.declared, rhs=False))
+            self.output_stages = (OutputMethod(
+                "netlist_outputs", (), self.declared, rhs=False
+            ), *(self.output_stages or ()))
+            self._output_dependencies = {
+                "netlist_outputs": ((circuit, "publish_outputs"),),
+                **{method: ((self, "netlist_outputs"),) for method in derived},
+            }
 
     def expose(self, margin: Any, commutate: Any, next_time: Any = None) -> None:
         """Expose the component's own commutation hooks for its netlist form (a gate clock)."""
@@ -1001,11 +1061,11 @@ class _DeviceRuntime:
         declared = tuple(dict.fromkeys(outputs))
 
         stages = getattr(component, "output_stages", None)
-        if stages is None and (component.outputs_need_inputs or component.out is not component.state):
+        if stages is None and (component.outputs_need_inputs or component.output is not component.state):
             stages = (OutputMethod(
                 "set_outputs",
-                _fields(component.inp) if component.outputs_need_inputs else (),
-                _fields(component.out),
+                _fields(component.input) if component.outputs_need_inputs else (),
+                _fields(component.output),
             ),)
         direct_inputs = {
             field: tuple(stage.inputs)
@@ -1037,8 +1097,8 @@ class _DeviceRuntime:
                 code = code.replace(f"y[{index}]", f"({values[index]})")
             for name, value in namespace.items():
                 if isinstance(value, _BoundValue):
-                    records = ((component, "self"), (component.inp, "self.inp"),
-                               (component.state, "self.state"), (component.out, "self.out"))
+                    records = ((component, "self"), (component.input, "self.input"),
+                               (component.state, "self.state"), (component.output, "self.output"))
                     prefix = next((label for record, label in records if value.record is record), None)
                     if prefix is not None:
                         expression = f"{prefix}.{value.field}"
@@ -1108,7 +1168,7 @@ class _DeviceRuntime:
         def generated_inputs(field: str) -> tuple[str, ...]:
             """Direct component inputs used by one compiled netlist output."""
             fallback = direct_inputs.get(field, all_inputs)
-            if circuit._transforms or circuit._mixtures:
+            if circuit._transforms or circuit._mixtures or circuit.standalone_ports:
                 return fallback
             _dimension, terms = publications[publish[field]]
             selected = sorted(
@@ -1128,7 +1188,7 @@ class _DeviceRuntime:
                 if re.search(rf"\b{re.escape(name)}\b", active) is None:
                     continue
                 if isinstance(value, _BoundValue):
-                    if value.record is component.inp:
+                    if value.record is component.input:
                         dependencies.add(value.field)
                 elif isinstance(value, _CallableValue):
                     dependencies.update(value.inputs)
@@ -1189,10 +1249,13 @@ class _DeviceRuntime:
             body = []
             inline_values = None
             calculation = []
-            if circuit._transforms or circuit._mixtures:
-                body.append("    self._device_circuit.solve(t)")
+            if circuit._transforms or circuit._mixtures or circuit.standalone_ports:
+                body.extend((
+                    "    self._device_circuit.solve(t)",
+                    "    self._device_circuit.publish_outputs(t)",
+                ))
                 body.extend(
-                    f"    self.out.{field} = self._device_circuit.out.{publish[field]}"
+                    f"    self.output.{field} = self._device_circuit.output.{publish[field]}"
                     for field in fields
                 )
             else:
@@ -1226,7 +1289,9 @@ class _DeviceRuntime:
                     calculation = bound_statements
             assignments = []
             aliases = set()
-            for field in fields if not (circuit._transforms or circuit._mixtures) else ():
+            for field in fields if not (
+                    circuit._transforms or circuit._mixtures or circuit.standalone_ports
+            ) else ():
                 key = publish[field]
                 dimension, terms = publications[key]
                 paired = None
@@ -1241,7 +1306,7 @@ class _DeviceRuntime:
                     value = inline_values[position[output.start]]
                     direct = re.fullmatch(r"\(*\s*([A-Za-z_]\w*)\s*\)*", value)
                     if factor == 1.0 and direct is not None:
-                        direct_values.setdefault(direct.group(1), f"self.out.{field}")
+                        direct_values.setdefault(direct.group(1), f"self.output.{field}")
                 parts = [
                     " + ".join(
                         scaled(factor, inline_values[position[output.start + k]])
@@ -1253,12 +1318,12 @@ class _DeviceRuntime:
                 expression = (scaled(terms[0][0], paired) if paired is not None else
                               f"({parts[0]}) + 1j * ({parts[1]})" if dimension == 2 else parts[0])
                 direct = re.fullmatch(
-                    rf"\(*\s*self\.out\.{re.escape(field)}\s*\)*", expression
+                    rf"\(*\s*self\.output\.{re.escape(field)}\s*\)*", expression
                 )
                 if direct is not None:
                     aliases.add(field)
                 else:
-                    assignments.append(f"    self.out.{field} = {expression}")
+                    assignments.append(f"    self.output.{field} = {expression}")
             actual = tuple(field for field in fields if field not in aliases)
             if actual:
                 body.extend(calculation)
@@ -1280,7 +1345,7 @@ class _DeviceRuntime:
             return MethodType(env[name], component), actual, aliases
 
         dependencies: dict[tuple[str, ...], list[str]] = {}
-        all_inputs = _fields(component.inp)
+        all_inputs = _fields(component.input)
         for field in declared:
             dependencies.setdefault(generated_inputs(field), []).append(field)
         generated = []
@@ -1319,7 +1384,7 @@ class _DeviceRuntime:
         rhs_lines = []
         if not entries:
             rhs_lines.append("    return ()")
-        elif circuit._transforms or circuit._mixtures:
+        elif circuit._transforms or circuit._mixtures or circuit.standalone_ports:
             rhs_lines.extend(("    self._device_circuit.solve(t)",
                               "    d = self._device_circuit.derivatives"))
         else:
@@ -1376,9 +1441,11 @@ class _DeviceRuntime:
             component.dissipated_power = lambda: circuit.dissipated_power_of(component)
         if id(component) in circuit._supply_elements:
             component.supplied_power = lambda: circuit.supplied_power_of(component)
-        if circuit.locate_commutations:
+        if circuit.commutation_active:
             component.commutation_margin = circuit.commutation_margin
             component.commutate = circuit.commutate
+            component.commutation_active = True
+            component.locate_commutations = circuit.locate_commutations
 
 
 def bind_device(name: str, component: Any, declaration: _NetlistDeclaration,
@@ -1390,16 +1457,36 @@ def bind_device(name: str, component: Any, declaration: _NetlistDeclaration,
     circuit.declarations = {id(component): declaration}
     probe = declaration.builder
     output_fields = [field for owner, field, _quantity in probe.outputs if owner is component]
-    for terminal in _terminals(component):
-        field = terminal.voltage if terminal.drives_voltage else terminal.current
-        output_fields.append(field)
-        group = _Group(f"{name}.{terminal.voltage}", [terminal])
+    output_fields.extend(
+        field for owner, field, _port, _quantity, _factor in probe.port_outputs
+        if owner is component
+    )
+    for port in _ports(component):
+        if port.grounded:
+            voltage_key = circuit.key(
+                f"{name}.{port.name}.voltage", 0.0, output=True
+            )
+            current_key = circuit.key(
+                f"{name}.{port.name}.current", port.current, output=True
+            )
+            circuit.port_values.append((port, None, voltage_key, current_key))
+            continue
+        group = _Group(f"{name}.{port.name}", [port])
         circuit.groups.append(group)
-        circuit.local_ports.append((terminal, group))
+        voltage_key = circuit.key(
+            f"{name}.{port.name}.voltage", port.voltage, output=True
+        )
+        current_key = circuit.key(
+            f"{name}.{port.name}.current", port.current, output=True
+        )
+        circuit.port_values.append((port, group, voltage_key, current_key))
+    circuit.standalone_ports = tuple(
+        port for port in _ports(component) if port.standalone is not None
+    )
     output_fields = list(dict.fromkeys(output_fields))
     for field in output_fields:
         circuit.published[id(component), field] = circuit.key(
-            f"{name}.{field}", getattr(component.out, field), output=True
+            f"{name}.{field}", getattr(component.output, field), output=True
         )
     circuit.finalize()
     _DeviceRuntime(component, circuit, output_fields)
@@ -1440,35 +1527,6 @@ def device_supplied_power(component: Any) -> float:
     return component.supplied_power()
 
 
-def device_equilibrium_input(component: Any, field: str,
-                             state_weights: Mapping[str, float], t: float = 0.0) -> float:
-    """Input value which makes one linear combination of state derivatives zero.
-
-    The result comes from two evaluations of the component's compiled netlist equations. It is
-    used only by blocking-port assembly, where a behavioral neighbour asks for the voltage that
-    holds an electrical current constant.
-    """
-    _standalone_device(component)
-    weights = tuple(float(state_weights.get(name, 0.0)) for name in component.state_names)
-    previous = getattr(component.inp, field)
-
-    def rate(value: float) -> float:
-        setattr(component.inp, field, value)
-        return float(sum(weight * derivative
-                         for weight, derivative in zip(weights, component.rhs(t))))
-
-    try:
-        zero = rate(0.0)
-        gain = rate(1.0) - zero
-    finally:
-        setattr(component.inp, field, previous)
-    if not math.isfinite(gain) or gain == 0.0:
-        raise ConfigError(
-            f"{type(component).__name__}.{field} cannot control the requested state derivative"
-        )
-    return -zero / gain
-
-
 def device_commutation_margin(component: Any) -> float:
     return _standalone_device(component).commutation_margin()
 
@@ -1480,11 +1538,11 @@ def device_commutate(component: Any, t: float) -> None:
 from ..solver.netlist import register_device_runtime
 
 register_device_runtime(
+    prepare=_standalone_device,
     rhs=device_rhs,
     outputs=device_outputs,
     dissipated_power=device_dissipated_power,
     supplied_power=device_supplied_power,
-    equilibrium_input=device_equilibrium_input,
     commutation_margin=device_commutation_margin,
     commutate=device_commutate,
 )
@@ -1499,115 +1557,59 @@ def _find(parent: dict[int, int], a: int) -> int:
 
 
 def lower_devices(subsystems: Mapping[str, Any], connections: Mapping, zoh: Mapping,
-                  buses: Mapping[str, Sequence[Terminal]],
+                  buses: Mapping[str, Sequence[Port]],
                   declarations: Mapping[int, Optional[_NetlistDeclaration]]) -> tuple[
         dict, dict, dict, tuple[Circuit, ...]]:
-    """Generate each component's device equations from its netlist declaration.
-
-    Components remain in the assembled signal graph.  This keeps the device strategy's ordinary
-    scheduling and multirate boundaries without maintaining a second set of electrical equations.
-    """
-    names = {id(subsystem): name for name, subsystem in subsystems.items()}
-    probes = {key: declaration.builder for key, declaration in declarations.items()
-              if declaration is not None}
-    if not probes:
-        return dict(subsystems), dict(connections), dict(zoh), ()
-    grouped = {
-        id(subsystem)
-        for subsystem in subsystems.values()
-        if (probe := probes.get(id(subsystem))) is not None
-        and not probe.local
-        and any(terminal.hold_voltage_input is not None
-                or (probe.netlist._diodes and terminal.drives_voltage)
-                for terminal in _terminals(subsystem))
-    }
-    pending = [subsystem for subsystem in subsystems.values() if id(subsystem) in grouped]
-    while pending:
-        subsystem = pending.pop()
-        driven = {terminal.voltage for terminal in _terminals(subsystem) if terminal.drives_voltage}
-        for (target, _field), specification in connections.items():
-            entries = specification if isinstance(specification, list) else [specification]
-            target_id = id(target)
-            if (target_id in probes and target_id not in grouped
-                    and any(entry[0] is subsystem and entry[1] in driven for entry in entries)):
-                grouped.add(target_id)
-                pending.append(target)
-
-    circuits: dict[int, Circuit] = {}
-    for name, component in subsystems.items():
-        probe = probes.get(id(component))
-        if probe is None or id(component) in grouped:
-            continue
-        circuits[id(component)] = bind_device(
-            name, component, declarations[id(component)], names
-        )
-
-    out, lowered, held = dict(subsystems), dict(connections), dict(zoh)
-    grouped_circuit = None
-    if grouped:
-        out, lowered, held, grouped_circuit = lower(
-            "device", out, lowered, held, buses, declarations, native=grouped
-        )
-    compiled = [*circuits.values()]
-    if grouped_circuit is not None:
-        compiled.append(grouped_circuit)
-    return out, lowered, held, tuple(compiled)
+    """Compile the complete acausal electrical network into direct scalar equations."""
+    out, lowered, held, circuit = lower(
+        "device", subsystems, connections, zoh, buses, declarations
+    )
+    return out, lowered, held, (() if circuit is None else (circuit,))
 
 
 def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mapping, zoh: Mapping,
-          buses: Mapping[str, Sequence[Terminal]],
+          buses: Mapping[str, Sequence[Port]],
           declarations: Mapping[int, Optional[_NetlistDeclaration]], *,
           native: Optional[set[int]] = None
           ) -> tuple[dict, dict, dict, Optional[Circuit]]:
     """Rewrite an assembled connection graph for a netlist circuit model.
 
-    ``buses``: the terminals of every lowered bus. Returns the subsystems (components replaced by
+    ``buses``: the ports of every lowered bus. Returns the subsystems (components replaced by
     views, the Circuit appended), the connections, the zero-order-hold connections and the Circuit
     (``None``, and the graph unchanged, when no component has a netlist form).
     """
     names = {id(sub): name for name, sub in subsystems.items()}
     subs = list(subsystems.values())
-    terminals = {id(sub): _terminals(sub) for sub in subs}
+    ports = {id(sub): _ports(sub) for sub in subs}
     bus_of: dict[int, str] = {}
+    members: list[list[Port]] = []
     for bus, group in buses.items():
-        for terminal in group:
-            bus_of.setdefault(id(terminal), bus)
-            owned = terminals.setdefault(id(terminal.subsystem), [])
-            if terminal not in owned:
-                owned.append(terminal)
-    by_field: dict[tuple[int, str], Terminal] = {}  # terminal inputs: follower voltage, driver current
-    by_voltage: dict[tuple[int, str], Terminal] = {}  # driving terminals by their output voltage
-    for key, owned in terminals.items():
-        for terminal in owned:
-            by_field[key, terminal.current if terminal.drives_voltage else terminal.voltage] = terminal
-            if terminal.drives_voltage:
-                by_voltage[key, terminal.voltage] = terminal
-
-    # ---------------------------------------------------------------- nodes
-    parent: dict[int, int] = {}
-    terminal_of = {id(t): t for owned in terminals.values() for t in owned}
-    for group in buses.values():
-        for terminal in group:
-            parent[_find(parent, id(terminal))] = _find(parent, id(group[0]))
-    for (dst, field), spec in connections.items():  # a connection from a driving to a following terminal
-        follower = by_field.get((id(dst), field))
-        entry = spec[0] if isinstance(spec, list) and len(spec) == 1 else spec
-        if follower is None or follower.drives_voltage or isinstance(entry, list):
-            continue
-        driver = by_voltage.get((id(entry[0]), entry[1]))
-        if driver is not None and (len(entry) < 3 or entry[2] == 1.0):
-            parent[_find(parent, id(follower))] = _find(parent, id(driver))
-    members: dict[int, list[Terminal]] = {}
-    for key in list(parent):
-        members.setdefault(_find(parent, key), []).append(terminal_of[key])
+        connected = list(dict.fromkeys(group))
+        if connected:
+            members.append(connected)
+        for port in group:
+            previous = bus_of.setdefault(id(port), bus)
+            if previous != bus:
+                raise ConfigError(
+                    f"port {type(port.component).__name__}.{port.name} is connected to "
+                    f"both {previous!r} and {bus!r}"
+                )
+            owned = ports.setdefault(id(port.component), [])
+            if port not in owned:
+                owned.append(port)
 
     probes = {id(sub): declaration.builder for sub in subs
               if (native is None or id(sub) in native)
               and (declaration := declarations.get(id(sub))) is not None}
-    for group in members.values():  # a blocking driver wired to its follower's zero-current voltage law
-        if any(t.drives_voltage and (t.subsystem, t.hold_voltage_input) in connections for t in group):
-            for t in group:
-                probes.pop(id(t.subsystem), None)
+    missing = sorted(
+        names.get(id(port.component), type(port.component).__name__)
+        for group in members for port in group
+        if id(port.component) not in probes and not port.behavioral
+    )
+    if missing:
+        raise ConfigError(
+            f"electrical components need netlist declarations: {sorted(set(missing))}"
+        )
     if not probes:  # nothing to assemble: the circuit model only selects the implicit linear algebra
         return dict(subsystems), dict(connections), dict(zoh), None
     circuit = Circuit(circuit_model)
@@ -1621,25 +1623,48 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
     }
     for token, (component, field) in value_outputs.items():
         circuit.value_inputs[token] = circuit.key(
-            f"{names[id(component)]}.{field}", getattr(component.out, field), output=False
+            f"{names[id(component)]}.{field}", getattr(component.output, field), output=False
         )
     for sub in circuit.components:
         if hasattr(sub, "netlist_jumps"):
             sub.netlist_jumps = True  # its states jump by the netlist's projection, not by its own reset
-    in_group: dict[int, _Group] = {}
-    for group in members.values():
-        if any(id(t.subsystem) in probes for t in group):
-            first = sorted(group, key=lambda t: not t.drives_voltage)[0]
+    for group in members:
+        if any(id(t.component) in probes for t in group):
+            first = group[0]
             label = next((bus_of[id(t)] for t in group if id(t) in bus_of), None) \
-                or f"{names.get(id(first.subsystem), type(first.subsystem).__name__)}.{first.voltage}"
+                or f"{names.get(id(first.component), type(first.component).__name__)}.{first.name}"
             node = _Group(label, group)
             circuit.groups.append(node)
-            in_group.update((id(t), node) for t in group)
+            for port in group:
+                owner = names.get(id(port.component), type(port.component).__name__)
+                voltage_key = circuit.key(
+                    f"{owner}.{port.name}.voltage", port.voltage, output=True
+                )
+                current_key = circuit.key(
+                    f"{owner}.{port.name}.current", port.current, output=True
+                )
+                circuit.port_values.append((port, node, voltage_key, current_key))
+    for sub in circuit.components:
+        grounded = [port for port in ports[id(sub)] if port.grounded]
+        if len(grounded) > 1:
+            raise ConfigError(
+                f"{names[id(sub)]}: a component cannot distinguish multiple grounded ports"
+            )
+        for port in grounded:
+            owner = names[id(sub)]
+            voltage_key = circuit.key(
+                f"{owner}.{port.name}.voltage", 0.0, output=True
+            )
+            current_key = circuit.key(
+                f"{owner}.{port.name}.current", port.current, output=True
+            )
+            circuit.port_values.append((port, None, voltage_key, current_key))
     views = {
         id(sub): NetworkView.of(
             sub,
-            [field for c, field, _q in probes[id(sub)].outputs
-             if c is sub and (id(c.out), field) not in value_outputs],
+            list(dict.fromkeys(field for c, field, *_rest in (
+                *probes[id(sub)].outputs, *probes[id(sub)].port_outputs
+            ) if c is sub and (id(c.output), field) not in value_outputs)),
             [field for component, field in value_outputs.values() if component is sub],
         )
         for sub in circuit.components
@@ -1649,19 +1674,29 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
         if hook is not None and hook["margin"] is not None:
             views[id(sub)].expose(hook["margin"], hook["commutate"], hook["next_time"])
     for sub in circuit.components:
-        for c, field, _q in probes[id(sub)].outputs:
-            initial = getattr(c.out, field)
+        declarations_out = (
+            *((c, field) for c, field, _q in probes[id(sub)].outputs),
+            *((c, field) for c, field, *_rest in probes[id(sub)].port_outputs),
+        )
+        for c, field in declarations_out:
+            initial = getattr(c.output, field)
             circuit.published[id(c), field] = circuit.key(f"{names[id(c)]}.{field}", initial, output=True)
-    zero = {1: 0.0, 2: 0j}
-
     def mapped(spec):
-        entries = [(views[id(e[0])], *e[1:]) if id(e[0]) in views else e
-                   for e in (spec if isinstance(spec, list) else [spec])]
+        def entry(source):
+            component, field, *gain = source
+            published = circuit.published.get((id(component), field))
+            if published is not None:
+                return circuit, published, *gain
+            if id(component) in views:
+                return views[id(component)], field, *gain
+            return source
+
+        entries = [entry(source) for source in (
+            spec if isinstance(spec, list) else [spec]
+        )]
         return entries if isinstance(spec, list) else entries[0]
 
-    # ---------------------------------------------------------------- connections
-    # Copies into the Circuit come first: the Model tears an algebraic loop at its first copy, and the
-    # network boundary is where the behavioral assembly tears a loop through a bus as well.
+    # ---------------------------------------------------------------- signal connections
     boundary: dict = {
         (circuit, circuit.value_inputs[token]): (views[id(component)], field)
         for token, (component, field) in value_outputs.items()
@@ -1669,54 +1704,61 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
     retargeted: dict = {}
     lowered: dict = {}
     for (dst, field), spec in connections.items():
-        terminal = by_field.get((id(dst), field))
-        if terminal is not None and id(terminal) in in_group:
-            continue  # the netlist solves this terminal
         if id(dst) in views:
-            if terminal is not None:
-                raise ConfigError(f"{names[id(dst)]}.{field}: a terminal of a netlist component is connected "
-                                  "to a signal; attach it to a bus")
-            key = circuit.key(f"{names[id(dst)]}.{field}", getattr(dst.inp, field), output=False)
+            key = circuit.key(f"{names[id(dst)]}.{field}", getattr(dst.input, field), output=False)
             retargeted[(circuit, key)] = mapped(spec)
             circuit.copies.append((dst, field, key))
         else:
             lowered[(dst, field)] = mapped(spec)
-    fed: dict[int, list[str]] = {}
-    for group in circuit.groups:
-        behavioral_driver = next(
-            (terminal for terminal in group.terminals
-             if terminal.drives_voltage and id(terminal.subsystem) not in views),
-            None,
-        )
-        if any(not t.drives_voltage for t in group.terminals):
-            circuit.voltage_keys[id(group)] = vkey = circuit.key(f"{group.label}.u", zero[group.dim], output=True)
-        for terminal in group.terminals:
-            sub = terminal.subsystem
-            owner = names.get(id(sub), type(sub).__name__)
-            if id(sub) in views:
-                field = terminal.current if terminal.drives_voltage else terminal.voltage
-                if terminal.drives_voltage:
-                    key = circuit.key(f"{owner}.{terminal.current}", zero[group.dim], output=True)
-                    circuit.fills.append((sub, terminal, group, key))
-                lowered[(views[id(sub)], field)] = (circuit, key if terminal.drives_voltage else vkey)
-                fed.setdefault(id(sub), []).append(field)
-            elif terminal.drives_voltage:  # behavioral port: a voltage source driven by its voltage
-                inp_key = circuit.key(f"{owner}.{terminal.voltage}", zero[group.dim], output=False)
-                out_key = circuit.key(f"{owner}.{terminal.current}", zero[group.dim], output=True)
-                boundary[(circuit, inp_key)] = (sub, terminal.voltage)
-                lowered[(sub, terminal.current)] = (circuit, out_key)
-                circuit.ports.append((terminal, group, inp_key, out_key))
-            else:  # a current source driven by its current
-                inp_key = circuit.key(f"{owner}.{terminal.current}", zero[group.dim], output=False)
-                boundary[(circuit, inp_key)] = (sub, terminal.current)
-                lowered[(sub, terminal.voltage)] = (
-                    (behavioral_driver.subsystem, behavioral_driver.voltage)
-                    if behavioral_driver is not None else (circuit, vkey)
+    port_sources = {
+        id(port): (voltage_key, current_key)
+        for port, _group, voltage_key, current_key in circuit.port_values
+    }
+    group_of = {
+        id(port): group
+        for port, group, _voltage_key, _current_key in circuit.port_values
+    }
+    for group in members:
+        for port in group:
+            if id(port.component) in probes:
+                continue
+            effort_record, _, effort_field = port.effort.partition(".")
+            flow_record, _, flow_field = port.flow.partition(".")
+            owner = names.get(id(port.component), type(port.component).__name__)
+            voltage_key, current_key = port_sources[id(port)]
+            if (effort_record, flow_record) == ("input", "output"):
+                source_field, target_field = flow_field, effort_field
+                source_key, target_key, kind = current_key, voltage_key, "current"
+            elif (effort_record, flow_record) == ("output", "input"):
+                source_field, target_field = effort_field, flow_field
+                source_key, target_key, kind = voltage_key, current_key, "voltage"
+            else:
+                raise ConfigError(
+                    f"{owner}.{port.name}: a behavioral electrical port needs either "
+                    "input effort/output flow or output effort/input flow"
                 )
-                circuit.ports.append((terminal, group, inp_key, None))
+            key = circuit.key(
+                f"{owner}.{port.name}.{kind}",
+                getattr(port.component.output, source_field),
+                output=False,
+            )
+            boundary[(circuit, key)] = (port.component, source_field)
+            lowered[(port.component, target_field)] = (circuit, target_key)
+            circuit.behavioral_sources.append((port, group_of[id(port)], key, kind))
+    if any(
+        spec_of(port.component).kind == "default"
+        for group in members for port in group
+        if id(port.component) not in probes
+    ):
+        circuit.observer = False
+    for subsystem in subs:
+        observed = getattr(subsystem, "port", None)
+        source = port_sources.get(id(observed))
+        if source is not None and hasattr(subsystem.input, "voltage") \
+                and hasattr(subsystem.input, "current"):
+            lowered[(subsystem, "voltage")] = (circuit, source[0])
+            lowered[(subsystem, "current")] = (circuit, source[1])
     lowered = {**boundary, **retargeted, **lowered}
-    if any(spec_of(terminal.subsystem).kind == "default" for terminal, *_ in circuit.ports):
-        circuit.observer = False  # a black box's injection is then inferred, as the Circuit's, from its neighbours
 
     # ---------------------------------------------------------------- held inputs
     held: dict = {}
@@ -1725,7 +1767,7 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
         if id(dst) in views:
             held[(views[id(dst)], field)] = label
             if label not in held_keys:
-                held_keys[label] = circuit.key(f"held.{label}", getattr(dst.inp, field), output=False)
+                held_keys[label] = circuit.key(f"held.{label}", getattr(dst.input, field), output=False)
         else:
             held[(dst, field)] = label
     held.update(((circuit, key), label) for label, key in held_keys.items())
@@ -1737,6 +1779,16 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
         name = f"circuit_{k}"
     out[name] = circuit
     circuit.finalize()
+    held_targets = {(id(dst.input), field) for dst, field in zoh}
+    dynamic_ratios = [
+        transformer.N for transformer in circuit.netlist._transformers
+        if transformer.constant is None
+    ]
+    circuit.topology_held = bool(dynamic_ratios) and all(
+        isinstance(value, _BoundValue)
+        and (id(value.record), value.field) in held_targets
+        for value in dynamic_ratios
+    )
     for sub in circuit.components:
-        views[id(sub)].bind(circuit, fed.get(id(sub), ()))
+        views[id(sub)].bind(circuit, ())
     return out, lowered, held, circuit

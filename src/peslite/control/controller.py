@@ -21,7 +21,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..solver.model import Bag, ConfigError, _complex, _real, gather, scatter
-from ..solver.energy import PowerPort, port_power
+from ..solver.energy import Port, port_power
 from ..solver.timing import control_clock_offset
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,
@@ -1070,11 +1070,11 @@ class _ContinuousControlState:
     """Dynamic attributes named ``<loop>.<state>`` for Model's packed ODE state."""
 
 
-class _ContinuousControlInp(Bag):
+class _ContinuousControlInput(Bag):
     __slots__ = ("u_g", "i_c", "u_dc")
 
 
-class _ContinuousControlOut(Bag):
+class _ContinuousControlOutput(Bag):
     __slots__ = ("q",)
 
 
@@ -1106,7 +1106,7 @@ class _GraphRuntime:
         """The effective typed boundary of the active control graph."""
         return self.graph.interface
 
-    def _install_flow_state(self, inp: Any, out: Any) -> None:
+    def _install_flow_state(self, input: Any, out: Any) -> None:
         """Check each loop's continuous implementation, then create one fixed ODE layout from
         the graph's declared loop states."""
         state = _ContinuousControlState()
@@ -1134,7 +1134,7 @@ class _GraphRuntime:
         self.state, self.state_names = state, tuple(names)
         if self.state_names != self.graph.flow_state_names:
             raise RuntimeError("continuous controller state and derivative layouts differ")
-        self.inp, self.out = inp, out
+        self.input, self.output = input, out
         self._derivatives = [
             0j if isinstance(getattr(state, name), complex) else 0.0
             for name in self.state_names
@@ -1351,8 +1351,8 @@ class VSCController(_GraphRuntime):
     def _build_flow_state(self):
         """Create the fixed ODE state layout and the reused continuous measurement."""
         self._install_flow_state(
-            _ContinuousControlInp(u_g=0j, i_c=0j, u_dc=self.p.dclink.vdc_ref),
-            _ContinuousControlOut(q=0j),
+            _ContinuousControlInput(u_g=0j, i_c=0j, u_dc=self.p.dclink.vdc_ref),
+            _ContinuousControlOutput(q=0j),
         )
         self._continuous_meas = ControlMeasurement(0.0, 0j, 0j, 1.0, np.zeros(3))
         self._last_control_meas = self._continuous_meas
@@ -1507,9 +1507,9 @@ class VSCController(_GraphRuntime):
         self.startup.at(t)
         meas = self._continuous_meas
         meas.t = t
-        meas.u_g = self.inp.u_g / self.v_base
-        meas.i_c = self.inp.i_c / self.i_base
-        meas.u_dc = self.inp.u_dc / self.v_dc_base
+        meas.u_g = self.input.u_g / self.v_base
+        meas.i_c = self.input.i_c / self.i_base
+        meas.u_dc = self.input.u_dc / self.v_dc_base
         only = None
         if self._in_algebraic_solve and not self._algebraic_first:
             only = self.graph.dc_affected
@@ -1535,11 +1535,11 @@ class VSCController(_GraphRuntime):
             # Express the ideal three-leg average on the common bridge-ratio port. The common
             # 0.5 term cancels from the space vector; retaining this operation order also keeps
             # saved-state continuation bit-level stable across solver restarts.
-            self.out.q = abc2complex((0.5 * (1.0 + gain * a),
+            self.output.q = abc2complex((0.5 * (1.0 + gain * a),
                                       0.5 * (1.0 + gain * b),
                                       0.5 * (1.0 + gain * c)))
         else:
-            self.out.q = 0j
+            self.output.q = 0j
         self._last_control_meas = meas
 
     def continuous_log(self, t):
@@ -1755,8 +1755,8 @@ class ConverterMeasurement:
     samples: tuple["ConverterMeasurement", ...] = ()
 
 
-class _ConverterControlInp(Bag):
-    __slots__ = ("current", "voltage", "vin", "power_voltage", "power_current", "power")
+class _ConverterControlInput(Bag):
+    __slots__ = ("current", "voltage", "vin", "power")
 
 
 class GraphController(_GraphRuntime):
@@ -1818,9 +1818,9 @@ class GraphController(_GraphRuntime):
                               for port in self._command_ports}
         if self.continuous:
             self._install_flow_state(
-                _ConverterControlInp(current=0.0, voltage=0.0, vin=cfg.dclink.vdc_ref,
-                                     power_voltage=0.0, power_current=0.0, power=0.0),
-                _ContinuousControlOut(q=topology.zero),
+                _ConverterControlInput(current=0.0, voltage=0.0, vin=cfg.dclink.vdc_ref,
+                                       power=0.0),
+                _ContinuousControlOutput(q=topology.zero),
             )
 
     def control_inputs(self, current, voltage, vin, power=None) -> dict[str, Any]:
@@ -1845,17 +1845,14 @@ class GraphController(_GraphRuntime):
             measurement.power = power
         return measurement
 
-    def bind_power_port(self, port: PowerPort) -> None:
-        """Observe outward power with the connected terminal's sign and scale."""
-        self._power_port = PowerPort(
-            "inp.power_voltage", "inp.power_current", port.scale, -port.sign,
-        )
+    def bind_power_port(self, port: Port) -> None:
+        """Receive the power measured at the converter's external electrical port."""
+        self._bound_power = True
 
     def _flow_measurement(self) -> ConverterMeasurement:
-        power = ((self.inp.power if self._bound_power else port_power(self, self._power_port))
-                 if self._needs_power else None)
+        power = self.input.power if self._needs_power else None
         return self._measurement(
-            self.inp.current, self.inp.voltage, self.inp.vin, self._last_measurement,
+            self.input.current, self.input.voltage, self.input.vin, self._last_measurement,
             power=power,
         )
 
@@ -1889,7 +1886,7 @@ class GraphController(_GraphRuntime):
         measurement = self._flow_measurement()
         self.graph.flow(t, measurement, derivatives=self._derivatives)
         duty = float(self.graph.output("duty", measurement))
-        self.out.q = self.topology.state_from_duty(duty) if self.startup.active else self.topology.zero
+        self.output.q = self.topology.state_from_duty(duty) if self.startup.active else self.topology.zero
         self._last_measurement = measurement
         self._last_outputs["duty"] = duty
 

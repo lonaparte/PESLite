@@ -373,23 +373,23 @@ class _ParallelNetwork(common_model.Subsystem):
     def __init__(self, grid_scale: float):
         self.L_grid = grid_scale * L_GRID
         self.R_grid = grid_scale * R_GRID
-        self.inp = _NetworkInputs()
+        self.input = _NetworkInputs()
         self.state = _NetworkStates()
-        self.out = _NetworkOutputs()
+        self.output = _NetworkOutputs()
 
     def set_outputs(self, t):
         del t
         for name in ("i_1", "i_2", "u_bus", "i_grid"):
-            setattr(self.out, name, getattr(self.state, name))
+            setattr(self.output, name, getattr(self.state, name))
 
     def rhs(self, t):
         del t
-        state, inp = self.state, self.inp
+        state, input = self.state, self.input
         return [
-            (inp.u_1 - state.u_bus - R_FILTER * state.i_1) / L_FILTER,
-            (inp.u_2 - state.u_bus - R_FILTER * state.i_2) / L_FILTER,
+            (input.u_1 - state.u_bus - R_FILTER * state.i_1) / L_FILTER,
+            (input.u_2 - state.u_bus - R_FILTER * state.i_2) / L_FILTER,
             (state.i_1 + state.i_2 - state.i_grid) / C_BUS,
-            (state.u_bus - inp.e_g - self.R_grid * state.i_grid) / self.L_grid,
+            (state.u_bus - input.e_g - self.R_grid * state.i_grid) / self.L_grid,
         ]
 
     def create_time_series(self, t):

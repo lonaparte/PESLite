@@ -14,7 +14,7 @@ from typing import Any, Mapping, Optional
 import numpy as np
 from numpy.typing import NDArray
 
-from .energy import re_product, signal
+from .energy import re_product
 from .integrators import (CIRCUIT_MODELS, EXPLICIT_FIXED_METHODS, RHS, TABLEAUS, SolverStep, combine,
                           canonical_method, integrator, stage_state, subintervals)
 from .model import ConfigError
@@ -184,9 +184,9 @@ class MultirateSolver:
         self._mask_moving = ~self._mask_outer  # what the system step advances (system and inner states)
         self._outer_labels = [lab for lab, m in zip(model.state_labels(), self._mask_outer) if m]
         # windowed-group inputs whose window sums are restart state: (label, input record, field), plan order
-        owner = {id(sub.inp): model.name_of(sub) for sub in self.outer.members} if self.outer is not None else {}
-        self._input_labels = [(f"{owner[id(inp)]}.{field}", inp, field)
-                              for _kind, (inp, field, *_rest) in (self.outer.inputs if self.outer is not None else ())]
+        owner = {id(sub.input): model.name_of(sub) for sub in self.outer.members} if self.outer is not None else {}
+        self._input_labels = [(f"{owner[id(input)]}.{field}", input, field)
+                              for _kind, (input, field, *_rest) in (self.outer.inputs if self.outer is not None else ())]
         self.window = self.window_steps * self.dt
         self.outer_method = outer_method or method
         self._outer_solver = (integrator(self.outer_method, self.window, rtol, atol)
@@ -270,6 +270,15 @@ class MultirateSolver:
         for provider in providers:
             owner = getattr(provider, "local_step_state", provider)
             if owner not in self.model.subsystems:
+                owner = next(
+                    (
+                        subsystem
+                        for subsystem in self.model.subsystems
+                        if getattr(subsystem, "component", None) is owner
+                    ),
+                    None,
+                )
+            if owner is None:
                 continue
             mask = np.zeros(self.model.n_states, dtype=bool)
             for state in getattr(owner, "state_names", ()):
@@ -417,8 +426,8 @@ class MultirateSolver:
             for lab, a, sl in zip(self._outer_labels, self._anchor, self._slope):
                 s[f"anchor.{lab}"] = float(a)
                 s[f"slope.{lab}"] = float(sl)
-        for lab, inp, field in self._input_labels:
-            s[f"acc.{lab}"] = self._acc.get((id(inp), field), 0.0 * getattr(inp, field))
+        for lab, input, field in self._input_labels:
+            s[f"acc.{lab}"] = self._acc.get((id(input), field), 0.0 * getattr(input, field))
         return s
 
     def set_state(self, values: Mapping[str, Any]) -> None:
@@ -441,8 +450,8 @@ class MultirateSolver:
             self._anchor = self._slope = None
             return
         self._open_window(float(t_anchor), anchor, slope)
-        self._acc = {(id(inp), field): values[f"acc.{lab}"]
-                     for lab, inp, field in self._input_labels if f"acc.{lab}" in values}
+        self._acc = {(id(input), field): values[f"acc.{lab}"]
+                     for lab, input, field in self._input_labels if f"acc.{lab}" in values}
         end = float(values.get("window_end", math.nan))
         self._window_end = end if end > t_anchor else t_anchor + self.window
         self._last_returned = None  # a loaded anchor is trusted on the next call
@@ -490,9 +499,10 @@ class MultirateSolver:
                 if not self._mask_outer[idx]:
                     continue
                 e_seen = getattr(sub.state, st.state)  # extrapolated effort
-                flow = 0.0
-                for name, sign in st.flows:
-                    flow += sign * signal(sub, name)
+                flow = sum(
+                    sign * getattr(port, quantity)
+                    for port, quantity, sign in st.power_terms
+                )
                 self._acc_energy[idx] = self._acc_energy.get(idx, 0.0) + weight * st.scale * re_product(e_seen, flow)
                 # running flow integral
                 run = self._acc_flow.get(idx, 0.0) + weight * flow
@@ -661,10 +671,7 @@ class MultirateSolver:
             is_c = sl.stop - sl.start == 2
             e_old = complex(y_start[sl.start], y_start[sl.start + 1]) if is_c else y_start[sl.start]
             e_new = complex(full_new[sl.start], full_new[sl.start + 1]) if is_c else full_new[sl.start]
-            flow = 0.0
-            for name, sign in st.flows:
-                where, _, attr = name.partition(".")
-                flow += sign * self._acc.get((id(getattr(sub, where)), attr), 0.0)
+            flow = self._acc_flow.get(idx, 0.0)
             # energy residual: delivered minus accepted by the storage
             r = self._acc_energy.get(idx, 0.0) - st.scale * re_product(0.5 * (e_old + e_new), flow)
             residual += r

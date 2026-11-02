@@ -138,7 +138,7 @@ class DCCase:
             buses[bus] = {"phases": 1, "c": self.capacitance}
             elements["load"] = {"type": "resistor", "bus": bus, "r": self.load}
             if self.topology == "buck_boost":
-                bridge["external_terminal"] = "lower_rail"
+                bridge["external_port"] = "lower_rail"
         return from_dict({
             "base": {"s_base": 500.0},
             "buses": buses,

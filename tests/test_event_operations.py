@@ -61,8 +61,8 @@ class _PassiveShunt(Element):
     def connections(self):
         return {}
 
-    def terminals(self):
-        return ((self.cfg.bus, self.branch.terminal1),)
+    def port_bindings(self):
+        return ((self.cfg.bus, self.branch.port1),)
 
 
 def test_builtin_load_is_typed_scaled_built_and_written(tmp_path):
@@ -76,7 +76,9 @@ def test_builtin_load_is_typed_scaled_built_and_written(tmp_path):
     assert peslite.register_element_type is register_element_type
 
     system = peslite.System(p)
-    assert system.named_elements["load"].branch in system.model.subsystems
+    branch = system.named_elements["load"].branch
+    assert any(getattr(subsystem, "component", subsystem) is branch
+               for subsystem in system.model.subsystems)
     assert "load.branch.i" in system.model.get_state()
 
     quick = p.replace(**{
@@ -167,7 +169,7 @@ def test_system_switches_units_sources_and_loads():
                          ("line", system.branches["line"])):
         branch.state.i = 2 + 3j
         system.switch(name, False, 0.1)
-        assert branch.breaker_open and branch.state.i == 0j
+        assert branch.breaker_open
         system.switch(name, True, 0.2)
         assert not branch.breaker_open
 

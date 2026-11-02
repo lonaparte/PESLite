@@ -309,7 +309,7 @@ class SourceParams:
 
 @dataclass(frozen=True)
 class FilterParams:
-    """Series R-L branch at a converter terminal (``l_f`` H, ``r_f`` ohm).
+    """Series R-L branch at a converter port (``l_f`` H, ``r_f`` ohm).
 
     The shunt capacitor is set on the connected bus (:class:`BusParams`).
     """
@@ -516,13 +516,13 @@ class BridgeParams:
     upper_controlled: bool = True
     lower_controlled: bool = True
     reverse_port: bool = False
-    external_terminal: str = "midpoint"
+    external_port: str = "midpoint"
     on_resistance: float = 0.0  # ohm, per conducting switch or diode
     parallel_capacitance: float = 0.0  # F, across the power port (per phase for three phases)
 
     _choices = {
         "model": ("switching", "pwm_averaging", "averaging"),
-        "external_terminal": ("midpoint", "lower_rail"),
+        "external_port": ("midpoint", "lower_rail"),
     }
 
     @property

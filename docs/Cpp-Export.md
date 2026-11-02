@@ -195,8 +195,8 @@ fixed choice, update the source `.pes` file and run `peslite-convert` again.
 
 Discrete switching, protection and scheduling have native execution adapters. Numerical component
 outputs, derivatives and energy equations reuse the assembled Python equations, including those of
-R-L branches, capacitor nodes and DC links. PESLite traces each component's fixed `state`, `inp`,
-`out`, `set_outputs()` and `rhs()` scalar equations while exporting,
+R-L branches, capacitor nodes and DC links. PESLite traces each component's fixed `state`, `input`,
+`output`, `set_outputs()` and `rhs()` scalar equations while exporting,
 specialises configuration-dependent branches and loops, and emits ordinary static C++. Common
 arithmetic, complex operations, state-dependent branches and NumPy scalar ufuncs are lowered. The
 generated binary does not contain an expression interpreter or Python runtime, so using the

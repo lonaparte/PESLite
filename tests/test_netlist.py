@@ -137,14 +137,14 @@ def test_causal_transformer_reduction_supports_a_shared_voltage_reference():
 def test_custom_ac_waveform_remains_the_source_of_its_declared_netlist():
     class CustomSource(ACVoltageSource):
         def set_outputs(self, t):
-            self.out.e_g = 40.0 + t
+            self.output.e_g = 40.0 + t
 
     source = CustomSource(2.0 * np.pi * 50.0, 325.0, phases=1)
     declaration = declare_netlist(source)
     assert declaration is not None
     bind_device("source", source, declaration)
     source.set_outputs(2.0)
-    assert source.out.e_g == 42.0
+    assert source.output.e_g == 42.0
 
 
 @pytest.mark.parametrize("form", FORMS)

@@ -370,8 +370,8 @@ def test_blocked_coupled_ports_project_their_currents_jointly_without_internal_s
     model.project_states(y)
     model.sync(0.0, y)
     coupled = dict(zip(model.names, model.subsystems))["charger.link"]
-    assert coupled.out.i_primary == pytest.approx(0.0, abs=1e-13)
-    assert coupled.out.i_secondary == pytest.approx(0.0, abs=1e-13)
+    assert coupled.output.i_primary == pytest.approx(0.0, abs=1e-13)
+    assert coupled.output.i_secondary == pytest.approx(0.0, abs=1e-13)
     for unit in simulation.units.values():
         assert unit.bridge.supplied_power() == 0.0
     assert not simulation.ph_report.problems
@@ -387,7 +387,7 @@ def test_nonzero_initial_current_establishes_conduction_before_state_projection(
     simulation.run(out_dir=None)
     model = simulation.system.model
     link = dict(zip(model.names, model.subsystems))["charger.link"]
-    assert abs(link.out.i_secondary) > 0.5
+    assert abs(link.output.i_secondary) > 0.5
     assert simulation.unit("charger.secondary").bridge.get_state()["direction"] != 0.0
 
 
@@ -449,7 +449,7 @@ def test_shunt_load_does_not_make_a_prescribed_dc_voltage_nonstiff():
     tree["simulation"]["output"]["signals"] = False
     sim = peslite.Simulation(from_dict(tree))
     sim.run(out_dir=None)
-    assert sim.unit("charger.primary").dclink.out.u_dc == 400.0
+    assert sim.unit("charger.primary").dclink.output.u_dc == 400.0
 
 
 @pytest.mark.parametrize("local_filter", [True, False])
@@ -507,7 +507,7 @@ def test_diode_full_bridge_converter_reuses_adc_sources_means_rms_and_restart(tm
     assert f"charger.secondary.meas.{signal}" in whole.columns()
     model = sim.system.model
     link = dict(zip(model.names, model.subsystems))["charger.link"]
-    assert unit.ports.value("voltage") == link.out.u_secondary_cap
+    assert unit.ports.value("voltage") == link.output.u_secondary_cap
     first = copy.deepcopy(tree)
     first["simulation"]["t_end"] = 8e-6
     peslite.Simulation(from_dict(first)).run(out_dir=tmp_path / "first")
@@ -580,7 +580,7 @@ def test_capacitor_voltage_stays_continuous_when_the_dc_clamp_increases():
 
         def observe(t, states, read_values, *, final, stop_reason):
             trace[round(t, 12)] = bridge.state.u_C
-            assert bridge.out.u_c == bridge.state.u_C
+            assert bridge.output.u_c == bridge.state.u_C
 
         sim.run(out_dir=None, observe=observe)
         traces.append(trace)

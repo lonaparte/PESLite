@@ -85,13 +85,13 @@ class _RepeatedEquation:
 
     def __init__(self):
         self.state = _Input(x=0.0)
-        self.inp = Empty()
-        self.out = _Output()
+        self.input = Empty()
+        self.output = _Output()
 
     def set_outputs(self, t):
         x = self.state.x
         common = (x + 1.25) * (x + 2.5) * (x + 3.75)
-        self.out.value = common + common * (1.0 / x + np.sqrt(x)) if x > 0.0 else common
+        self.output.value = common + common * (1.0 / x + np.sqrt(x)) if x > 0.0 else common
 
     def rhs(self, t):
         return (0.0,)
@@ -103,9 +103,9 @@ def test_shared_expressions_preserve_guarded_division_and_square_root(value, tmp
     component.state.x = value
     model = Model({"component": component}, {})
     component.set_outputs(0.0)
-    actual, = _run_model(model, [(component.out, "value")], tmp_path,
+    actual, = _run_model(model, [(component.output, "value")], tmp_path,
                          initial_state=value, check_floating_exceptions=True)
-    assert actual == pytest.approx(component.out.value)
+    assert actual == pytest.approx(component.output.value)
 
 
 class _Feedback:
@@ -115,11 +115,11 @@ class _Feedback:
     def __init__(self, gain, offset):
         self.gain, self.offset = gain, offset
         self.state = Empty()
-        self.inp = _Input(x=0j if isinstance(gain, complex) else 0.0)
-        self.out = _Output(value=self.inp.x)
+        self.input = _Input(x=0j if isinstance(gain, complex) else 0.0)
+        self.output = _Output(value=self.input.x)
 
     def set_outputs(self, t):
-        self.out.value = self.gain * self.inp.x + self.offset
+        self.output.value = self.gain * self.input.x + self.offset
 
     def rhs(self, t):
         return ()
@@ -131,9 +131,9 @@ def test_native_algebraic_scalar_uses_the_same_secant_solve(gain, tmp_path):
     model = Model({"feedback": component}, {(component, "x"): (component, "value")})
     loop, = model.algebraic_loops
     loop.max_sweeps, loop.atol, loop.rtol = 25, 1e-13, 1e-12
-    actual, = _run_model(model, [(component.out, "value")], tmp_path)
+    actual, = _run_model(model, [(component.output, "value")], tmp_path)
     model.sync(0.0, model.get_initial_values())
-    assert actual == pytest.approx(component.out.value, rel=1e-12, abs=1e-12)
+    assert actual == pytest.approx(component.output.value, rel=1e-12, abs=1e-12)
     assert actual == pytest.approx(1.0 / (1.0 - gain), rel=1e-12, abs=1e-12)
 
 
@@ -145,7 +145,7 @@ def test_native_export_keeps_the_shared_plan_for_zero_and_nonzero_feedback(gain,
     assert len(model.algebraic_loops) == 1
     assert any('solve_algebraic(' in line for line in generator.body(derivatives=False)) == bool(gain)
     assert not any('algebraic_value_' in line for line in generator.members())
-    actual, = _run_model(model, [(component.out, "value")], tmp_path)
+    actual, = _run_model(model, [(component.output, "value")], tmp_path)
     assert actual == pytest.approx(3.0 / (1.0 - gain))
 
 
@@ -155,14 +155,14 @@ def test_static_dependencies_can_order_an_existing_native_execution_block():
         (fixed, 'x'): (adapter, 'value'), (adapter, 'x'): (fixed, 'value'),
     })
     generator = _generator(model)
-    statement = (f'{generator.value(adapter.out, "value")} = '
-                 f'0.5 * {generator.value(adapter.inp, "x")};')
+    statement = (f'{generator.value(adapter.output, "value")} = '
+                 f'0.5 * {generator.value(adapter.input, "x")};')
     generator.continuous_units[id(adapter)] = SimpleNamespace(output_lines=lambda: [statement])
     generator._algebraic_plans.clear()
     plan = generator._algebraic_plan(model.algebraic_loops[0])
     assert plan is not None and plan.count(statement) == 1
-    copy = (f'{generator.value(adapter.inp, "x")} = '
-            f'{generator.value(fixed.out, "value")};')
+    copy = (f'{generator.value(adapter.input, "x")} = '
+            f'{generator.value(fixed.output, "value")};')
     assert plan.index(copy) < plan.index(statement)
 
 
@@ -173,7 +173,7 @@ def test_native_algebraic_nonconvergence_is_an_error(tmp_path):
     with pytest.raises(FloatingPointError, match="did not converge"):
         model.sync(0.0, model.get_initial_values())
     with pytest.raises(RuntimeError, match="did not converge"):
-        _run_model(model, [(component.out, "value")], tmp_path)
+        _run_model(model, [(component.output, "value")], tmp_path)
 
 
 def test_native_multivariable_algebraic_loop_uses_its_configured_limit(tmp_path):
@@ -186,11 +186,11 @@ def test_native_multivariable_algebraic_loop_uses_its_configured_limit(tmp_path)
 
         def __init__(self):
             self.state = Empty()
-            self.inp, self.out = Pair(), Pair()
+            self.input, self.output = Pair(), Pair()
 
         def set_outputs(self, t):
-            self.out.x = 0.4 * self.inp.x + 0.2 * self.inp.y + 1.0
-            self.out.y = 0.1 * self.inp.x + 0.5 * self.inp.y + 1.0
+            self.output.x = 0.4 * self.input.x + 0.2 * self.input.y + 1.0
+            self.output.y = 0.1 * self.input.x + 0.5 * self.input.y + 1.0
 
         def rhs(self, t):
             return ()
@@ -202,10 +202,10 @@ def test_native_multivariable_algebraic_loop_uses_its_configured_limit(tmp_path)
     loop, = model.algebraic_loops
     assert len(loop.tears) == 2
     loop.max_sweeps, loop.rtol, loop.atol = 80, 1e-13, 1e-14
-    readings = [(component.out, name) for name in ("x", "y")]
+    readings = [(component.output, name) for name in ("x", "y")]
     actual = _run_model(model, readings, tmp_path)
     model.sync(0.0, model.get_initial_values())
-    np.testing.assert_allclose(actual, [component.out.x, component.out.y], rtol=1e-12)
+    np.testing.assert_allclose(actual, [component.output.x, component.output.y], rtol=1e-12)
 
 
 def test_native_multivariable_feedback_keeps_the_previous_output_between_calls(tmp_path):
@@ -218,11 +218,11 @@ def test_native_multivariable_feedback_keeps_the_previous_output_between_calls(t
 
         def __init__(self):
             self.state = Empty()
-            self.inp, self.out = Pair(x=1.0, y=1.0), Pair(x=1.0, y=1.0)
+            self.input, self.output = Pair(x=1.0, y=1.0), Pair(x=1.0, y=1.0)
 
         def set_outputs(self, t):
-            self.out.x = 0.8 * self.inp.x + 0.05 * self.inp.y + 0.15 * (1.0 + t)
-            self.out.y = 0.05 * self.inp.x + 0.8 * self.inp.y + 0.15 * (1.0 + t)
+            self.output.x = 0.8 * self.input.x + 0.05 * self.input.y + 0.15 * (1.0 + t)
+            self.output.y = 0.05 * self.input.x + 0.8 * self.input.y + 0.15 * (1.0 + t)
 
         def rhs(self, t):
             return ()
@@ -232,12 +232,12 @@ def test_native_multivariable_feedback_keeps_the_previous_output_between_calls(t
         (component, name): (component, name) for name in ('x', 'y')
     })
     times = tuple(index * 1e-7 for index in range(101))
-    readings = [(component.out, name) for name in ('x', 'y')]
+    readings = [(component.output, name) for name in ('x', 'y')]
     actual = _run_model(model, readings, tmp_path, times=times).reshape(-1, 2)
     expected = []
     for t in times:
         model.sync(t, model.get_initial_values())
-        expected.append((component.out.x, component.out.y))
+        expected.append((component.output.x, component.output.y))
     np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-14)
 
 
@@ -255,17 +255,17 @@ def test_native_ac_source_preserves_the_connected_phase_representation(phases, t
     source = ACVoltageSource(2.0 * np.pi * 50.0, 325.0, phases=phases)
     model = Model({"source": source}, {})
     times = (0.0, 1.0e-3, 2.5e-3)
-    actual = _run_model(model, [(source.out, "e_g")], tmp_path, times=times)
+    actual = _run_model(model, [(source.output, "e_g")], tmp_path, times=times)
     expected = []
     for time in times:
         source.set_outputs(time)
-        expected.append(source.out.e_g)
+        expected.append(source.output.e_g)
     np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
 
 
 class _ModifiedBranch(RLBranch):
     def set_outputs(self, t):
-        self.out.i = 2.0 * self.state.i
+        self.output.i = 2.0 * self.state.i
 
     def rhs(self, t):
         return (7.0,)
@@ -281,16 +281,16 @@ def test_native_branch_keeps_its_own_output_and_rhs(instance_override, tmp_path)
     model = Model({"branch": branch}, {})
     generator = _generator(model)
     assert generator._rhs(branch) == ["7.0"]
-    actual, = _run_model(model, [(branch.out, "i")], tmp_path)
+    actual, = _run_model(model, [(branch.output, "i")], tmp_path)
     assert actual == 6.0
 
 
 def test_native_unilateral_output_clamps_a_negative_trial_state(tmp_path):
     branch = RLBranch(1.0, 0.0, i0=-1.0, phases=1, unilateral=True)
     model = Model({"branch": branch}, {})
-    actual, = _run_model(model, [(branch.out, "i")], tmp_path)
+    actual, = _run_model(model, [(branch.output, "i")], tmp_path)
     model.sync(0.0, model.get_initial_values())
-    assert actual == branch.out.i == 0.0
+    assert actual == branch.output.i == 0.0
 
 
 def test_builtin_subclass_export_hooks_take_precedence():
@@ -311,9 +311,9 @@ def test_builtin_subclass_export_hooks_take_precedence():
 def test_dclink_lowering_traces_the_shared_capacitor_state(capacitance, tmp_path):
     cap = DCCapacitor(12.0, capacitance, 0.25) if capacitance is not None else None
     link = DCLink(cap, DCVoltageSource(24.0, 2.0))
-    link.inp.i_dc = 3.0
+    link.port.current = -3.0
     model = Model({"link": link}, {})
-    readings = [(link.out, name) for name in ("u_dc", "u_C", "i_src")]
+    readings = [(link.output, name) for name in ("u_dc", "u_C", "i_src")]
     actual = _run_model(model, readings, tmp_path)
     model.sync(0.0, model.get_initial_values())
     np.testing.assert_allclose(actual, [getattr(record, name) for record, name in readings],

@@ -73,9 +73,9 @@ peslite wpt-lcc-example --averaging
 the [scalar feedback loops](Bridge-and-PWM.md#scalar-feedback-loops). Set phase
 limits and gain polarity for a monotonic circuit branch; the controller does not infer them.
 
-The power channel uses the paired voltage and current of the converter's external `power` terminal,
+The power channel uses the paired voltage and current of the converter's external `power` port,
 including its direction and power convention, independently of control feedback coordinates. In
-these unfiltered full bridges that is the local magnetic-link terminal. Positive power leaves the
+these unfiltered full bridges that is the local magnetic-link port. Positive power leaves the
 converter, so negative
 secondary power means power is delivered to its ideal DC voltage source. These examples demonstrate
 power-transfer regulation between stiff DC rails, not battery dynamics or output-voltage regulation.

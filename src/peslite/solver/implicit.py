@@ -452,76 +452,68 @@ class ModeJacobian:
 
 
 def circuit_structure(model: Any) -> Structure:
-    """The automatic state-space-nodal grouping of ``model``.
+    """Map the compiled electrical partition onto the model's flat state vector.
 
-    Network buses are the subsystems that drive their terminal voltage from a state (a shunt
-    capacitor). Removing them splits the remaining subsystems into connected groups. A bus
-    attached to one group only belongs to it; a bus between groups is an interface node. The
-    interface holds the interface nodes' states and every state a group reads from another group
-    (for example the branch currents that set a damped bus voltage); the rest of each group is
-    its interior.
+    Netlist switching groups become interior state blocks. States on interface elements, in
+    multiple blocks, or outside the electrical netlist remain in the joint interface.
     """
-    subs = list(model.subsystems)
     n = model.n_states
-    index = {id(s): np.array(sorted(i for name in s.state_names
-                                    for i in range(*model.state_slice(s, name).indices(n))), dtype=np.intp)
-             for s in subs}
-    candidates = {id(s) for s in subs
-                  if getattr(getattr(s, "terminal", None), "drives_voltage", False) and index[id(s)].size}
-    adjacent: dict[int, set[int]] = {id(s): set() for s in subs}
-    for (dst, _field), spec in model.connections.items():
-        for entry in (spec if isinstance(spec, list) else [spec]):
-            src = entry[0]
-            if src is not dst:
-                adjacent[id(dst)].add(id(src))
-                adjacent[id(src)].add(id(dst))
-    component: dict[int, int] = {}
-    count = 0
-    for s in subs:
-        if id(s) in candidates or id(s) in component:
+    component_subsystem = {
+        id(getattr(subsystem, "component", subsystem)): subsystem
+        for subsystem in model.subsystems
+    }
+    group_states: list[set[int]] = []
+    group_labels: list[str] = []
+    interface: set[int] = set()
+
+    for circuit in (subsystem for subsystem in model.subsystems
+                    if hasattr(subsystem, "netlist") and hasattr(subsystem, "layout")):
+        if circuit.netlist is None:
             continue
-        stack = [id(s)]
-        component[id(s)] = count
-        while stack:
-            for other in adjacent[stack.pop()]:
-                if other not in candidates and other not in component:
-                    component[other] = count
-                    stack.append(other)
-        count += 1
-    nodes = []
-    for s in subs:
-        if id(s) not in candidates:
-            continue
-        near = {component[x] for x in adjacent[id(s)] if x in component}
-        if len(near) == 1 and not (adjacent[id(s)] & candidates):
-            component[id(s)] = near.pop()
-        else:
-            nodes.append(s)
-    members: dict[int, list[Any]] = {}
-    for s in subs:
-        if id(s) in component:
-            members.setdefault(component[id(s)], []).append(s)
-    interface = set()
-    for s in nodes:
-        interface.update(index[id(s)].tolist())
-    names = {id(s): model.name_of(s) for s in subs}
-    plans = model.groups({names[id(m)]: f"g{k}" for k, group in members.items() for m in group})
-    owners = {id(op): info for op, info in zip(model._plan, model._plan_owners)}
-    for k, group in members.items():
-        inside = {id(m) for m in group}
-        for op in plans[f"g{k}"].plan:
-            kind = op[0]
-            op_owners, srcs = owners[id(op)]
-            outside = [o for o in (op_owners if kind in ("out", "algebraic") else srcs if kind == "copy" else ())
-                       if id(o) not in inside]
-            for other in outside:
-                interface.update(index[id(other)].tolist())
+        local_to_model: dict[int, int] = {}
+        for component, name, complex_state, local in circuit.layout:
+            subsystem = component_subsystem[id(component)]
+            positions = tuple(range(*model.state_slice(subsystem, name).indices(n)))
+            if len(positions) != (2 if complex_state else 1):
+                raise RuntimeError("circuit and model state layouts differ")
+            local_to_model.update(
+                (local + offset, position) for offset, position in enumerate(positions)
+            )
+
+        def states(elements) -> set[int]:
+            return {
+                local_to_model[int(local)]
+                for element in elements
+                for local in np.asarray(getattr(element, "state", ()), dtype=np.intp).reshape(-1)
+                if int(local) in local_to_model
+            }
+
+        plan = circuit.netlist.grouping()
+        for elements in plan.elements:
+            group_states.append(states(elements))
+            group_labels.append(", ".join(dict.fromkeys(
+                circuit._owners.get(id(element), "?") for element in elements
+            )))
+        interface.update(states(plan.interface_elements))
+        interface_nodes = {id(node) for node in plan.interface}
+        interface.update(states(
+            element for element in circuit.netlist.elements
+            if any(id(node) in interface_nodes for port in element.ports for node in port if node is not None)
+        ))
+
+    occurrences: dict[int, int] = {}
+    for group in group_states:
+        for position in group:
+            occurrences[position] = occurrences.get(position, 0) + 1
+    interface.update(position for position, count in occurrences.items() if count > 1)
+    grouped = set().union(*group_states) if group_states else set()
+    interface.update(set(range(n)) - grouped)
     groups, labels = [], []
-    for k, group in sorted(members.items()):
-        cols = sorted(set(i for m in group for i in index[id(m)].tolist()) - interface)
-        if cols:
-            groups.append(np.array(cols, dtype=np.intp))
-            labels.append(", ".join(names[id(m)] for m in group))
+    for group, label in zip(group_states, group_labels):
+        interior = np.array(sorted(group - interface), dtype=np.intp)
+        if interior.size:
+            groups.append(interior)
+            labels.append(label)
     return Structure(groups, np.array(sorted(interface), dtype=np.intp), labels)
 
 

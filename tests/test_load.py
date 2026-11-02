@@ -63,24 +63,24 @@ def test_branch_source_and_load_switch_during_a_run(case, tmp_path):
     assert np.max(grid[t < 0.003]) > 0.0
 
 
-def test_every_network_component_uses_the_same_terminal_assembly(case):
+def test_every_network_component_uses_the_same_port_assembly(case):
     params = _two_buses(case, {})
     system = peslite.System(params)
     line = system.branches["line"]
 
-    assert system.model.connections[(line, "u1")] == (system.buses["pcc"], "u")
-    assert system.model.connections[(line, "u2")] == (system.buses["b2"], "u")
     source = system.sources["grid"]
-    assert source.terminals() == (("pcc", source.branch.terminal2),)
-    assert system.model.connections[(source.branch, "u1")] == (source.emf, "e_g")
-    assert system.model.connections[(source.emf, "i")] == [(source.branch, "i", 1.0)]
+    assert source.port_bindings() == (
+        ("grid.source", source.emf.port),
+        ("grid.source", source.branch.port1),
+        ("pcc", source.branch.port2),
+    )
     unit = system.units["vsc"]
-    assert ("vsc.bus.dc", unit.dclink.terminal) in unit.terminals()
-    assert ("vsc.bus.dc", unit.bridge.dc_terminal) in unit.terminals()
-    assert ("vsc.bus.power", unit.bridge.power_terminal) in unit.terminals()
-    assert ("pcc", unit.branch_f.terminal2) in unit.terminals()
-    assert system.named_elements["load"].terminals() == (
-        ("b2", system.named_elements["load"].branch.terminal1),
+    assert ("vsc.bus.dc", unit.dclink.port) in unit.port_bindings()
+    assert ("vsc.bus.dc", unit.bridge.dc_port) in unit.port_bindings()
+    assert ("vsc.bus.power", unit.bridge.power_port) in unit.port_bindings()
+    assert ("pcc", unit.branch_f.port2) in unit.port_bindings()
+    assert system.named_elements["load"].port_bindings() == (
+        ("b2", system.named_elements["load"].branch.port1),
     )
 
 
@@ -90,8 +90,7 @@ def test_public_bus_may_have_no_attached_component(case):
     system = peslite.System(from_dict(tree))
     node = system.buses["unused"]
 
-    assert node.terminal.current_sources == []
-    assert (node, "i") not in system.model.connections
+    assert node.port.current == 0j
 
 
 def test_assembly_rejects_a_subsystem_name_collision(case):
@@ -107,7 +106,8 @@ def test_assembly_rejects_a_subsystem_name_collision(case):
 def test_assembly_rejects_a_continuous_and_held_target_collision(case):
     params = from_dict(case())
     unit = peslite.System(params).units["vsc"]
-    unit.zoh_connections = lambda: {(unit.branch_f, "u1"): "duplicate"}
+    unit.connections = lambda: {(unit.bridge, "q"): (unit.branch_f, "i")}
+    unit.zoh_connections = lambda: {(unit.bridge, "q"): "duplicate"}
 
     with pytest.raises(ConfigError, match="input target is already driven"):
         peslite.System(params, parts={"vsc": unit})
@@ -145,7 +145,7 @@ def test_signal_collection_allows_the_same_producer_to_be_reused(case):
     system.composite_signal_sources += (source,)
 
     signals = system.signals(0.0)
-    assert signals["grid.i"] == source.branch.out.i
+    assert signals["grid.i"] == source.branch.output.i
 
 
 def test_small_load_can_model_a_switched_fault(case, tmp_path):

@@ -34,7 +34,7 @@ units:
 
     bridge:
       lower_controlled: false
-      external_terminal: lower_rail
+      external_port: lower_rail
       # model: switching  # pwm_averaging (default) | averaging | switching
 
     ctrl:

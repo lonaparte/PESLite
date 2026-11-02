@@ -44,7 +44,7 @@ def test_zero_and_nonzero_defaults_identify_the_same_parameter_and_edge(gain):
     diagnostic, = generator.diagnostics
     assert diagnostic["parameters"] == ("gain",)
     assert diagnostic["condition"] == "((parameters.param_gain) == 0.0)"
-    assert diagnostic["dependencies"] == (("custom.inp.x", "custom.out.value"),)
+    assert diagnostic["dependencies"] == (("custom.input.x", "custom.output.value"),)
     assert "offset" not in diagnostic["parameters"]
     expected = list(generator.diagnostics)
     for _ in range(3):
@@ -56,7 +56,7 @@ def test_zero_and_nonzero_defaults_identify_the_same_parameter_and_edge(gain):
 def test_arithmetic_coefficients_resolve_all_participating_parameters():
     class Difference(_Feedback):
         def set_outputs(self, _t):
-            self.out.value = (self.gain - self.offset) * self.inp.x + 1.0
+            self.output.value = (self.gain - self.offset) * self.input.x + 1.0
 
     diagnostic, = _generator(Difference, gain=1.5).diagnostics
     assert diagnostic["parameters"] == ("gain", "offset")
@@ -71,7 +71,7 @@ def test_derived_coefficient_uses_existing_initializer_dependencies():
             self.coefficient = np.sin(gain) ** 2
 
         def set_outputs(self, _t):
-            self.out.value = self.coefficient * self.inp.x + self.offset
+            self.output.value = self.coefficient * self.input.x + self.offset
 
     diagnostic, = _generator(Derived, gain=0.4).diagnostics
     assert diagnostic["parameters"] == ("gain",)
@@ -82,18 +82,18 @@ def test_derived_coefficient_uses_existing_initializer_dependencies():
 def test_parameter_conditions_are_not_limited_to_zero_coefficients(gain):
     class Switched(_Feedback):
         def set_outputs(self, _t):
-            self.out.value = self.inp.x if self.gain > 0.25 else self.offset
+            self.output.value = self.input.x if self.gain > 0.25 else self.offset
 
     diagnostic, = _generator(Switched, gain=gain).diagnostics
     assert diagnostic["parameters"] == ("gain",)
     assert "0.25" in diagnostic["condition"]
-    assert diagnostic["dependencies"] == (("custom.inp.x", "custom.out.value"),)
+    assert diagnostic["dependencies"] == (("custom.input.x", "custom.output.value"),)
 
 
 def test_unconditional_read_prevents_a_false_conditional_edge():
     class AlwaysDependent(_Feedback):
         def set_outputs(self, _t):
-            self.out.value = self.gain * self.inp.x + self.inp.x + self.offset
+            self.output.value = self.gain * self.input.x + self.input.x + self.offset
 
     assert not _generator(AlwaysDependent).diagnostics
 
@@ -101,8 +101,8 @@ def test_unconditional_read_prevents_a_false_conditional_edge():
 def test_shared_branch_reads_are_not_parameter_sensitive():
     class AlwaysDependent(_Feedback):
         def set_outputs(self, _t):
-            self.out.value = (0.5 * self.inp.x + self.offset if self.gain > 0.25
-                              else 0.25 * self.inp.x + self.offset)
+            self.output.value = (0.5 * self.input.x + self.offset if self.gain > 0.25
+                              else 0.25 * self.input.x + self.offset)
 
     assert not _generator(AlwaysDependent).diagnostics
 
@@ -114,11 +114,11 @@ def test_conditional_downstream_output_is_not_a_feedback_parameter():
     class Observation(_Feedback):
         def __init__(self, gain, offset):
             super().__init__(gain, offset)
-            self.out = Output()
+            self.output = Output()
 
         def set_outputs(self, _t):
-            self.out.value = 0.5 * self.inp.x + self.offset
-            self.out.downstream = self.gain * self.inp.x
+            self.output.value = 0.5 * self.input.x + self.offset
+            self.output.downstream = self.gain * self.input.x
 
     assert not _generator(Observation).diagnostics
 

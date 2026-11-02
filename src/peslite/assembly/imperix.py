@@ -134,7 +134,7 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
                                         for port in self.graph.interface.outputs})
             voltage = f"std::abs(meas_voltage) / {_number(self.cfg.dc_base.v)}"
             frequency = "0.0"
-            dc_value = self.model.value(self.unit.dclink.out, "u_dc")
+            dc_value = self.model.value(self.unit.dclink.output, "u_dc")
             dc_channel = next((key for key, value in channels.items() if value.code == dc_value), None)
             if dc_channel is None and self.cfg.protection.dc_voltage.enable:
                 raise ValueError(f"{self.name}: DC-link protection has no mapped DC-link measurement")

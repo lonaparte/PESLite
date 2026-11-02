@@ -11,110 +11,13 @@ from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import Any, Callable, ClassVar, Optional
 
 
-from ..solver.energy import PowerPort, StoragePort, port_power
+from ..solver.energy import Port, StoragePort
 from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _complex, _real
 
 __all__ = [
-    "Terminal", "ACVoltageSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
+    "Port", "ACVoltageSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
     "register_element_type", "element_buses", "Load", "Resistor", "VoltageSource",
 ]
-
-
-@dataclass(frozen=True, eq=False)
-class Terminal:
-    """One electrical terminal of a subsystem.
-
-    ``direction`` is +1 when positive current enters the subsystem and -1 when it leaves.
-    A voltage-following terminal receives voltage through ``inp`` and publishes current through
-    ``out``. A voltage-driving terminal does the reverse. These are construction-time references;
-    System lowers a named bus directly to ordinary Model connections.
-    """
-
-    subsystem: Any
-    voltage: str
-    current: str
-    direction: int
-    drives_voltage: bool = False
-    hold_voltage_input: Optional[str] = None
-    electrical_domain: Optional[str] = None
-    current_sources: Any = field(init=False, repr=False, compare=False, default=None)
-    voltage_source: Any = field(init=False, repr=False, compare=False, default=None)
-    power_port: PowerPort = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        if type(self.drives_voltage) is not bool:
-            raise TypeError(
-                f"terminal drives_voltage must be bool, got {type(self.drives_voltage).__name__}"
-            )
-        if self.direction not in (-1, 1) or isinstance(self.direction, bool):
-            raise ValueError(f"terminal direction must be +1 or -1, got {self.direction!r}")
-        if self.electrical_domain not in (None, "ac", "dc"):
-            raise ValueError(
-                "terminal electrical_domain must be 'ac', 'dc' or None, got "
-                f"{self.electrical_domain!r}"
-            )
-        voltage_record = self.subsystem.out if self.drives_voltage else self.subsystem.inp
-        current_record = self.subsystem.inp if self.drives_voltage else self.subsystem.out
-        voltage_scope = "out" if self.drives_voltage else "inp"
-        current_scope = "inp" if self.drives_voltage else "out"
-        if not hasattr(voltage_record, self.voltage):
-            raise ValueError(
-                f"{type(self.subsystem).__name__}.{voltage_scope} has no terminal voltage "
-                f"{self.voltage!r}"
-            )
-        if not hasattr(current_record, self.current):
-            raise ValueError(
-                f"{type(self.subsystem).__name__}.{current_scope} has no terminal current "
-                f"{self.current!r}"
-            )
-        effort = f"{voltage_scope}.{self.voltage}"
-        flow = f"{current_scope}.{self.current}"
-        for port in getattr(self.subsystem, "ports", ()):
-            if (port.effort, port.flow) == (effort, flow):
-                if port.sign != self.direction:
-                    raise ValueError(
-                        f"terminal direction {self.direction:+d} does not match the energy-port "
-                        f"direction {port.sign:+g}"
-                    )
-                break
-        else:
-            port = PowerPort(effort, flow, sign=self.direction)
-        object.__setattr__(self, "power_port", port)
-
-    def power(self):
-        """Instantaneous power entering this terminal, using its energy-port convention."""
-        return port_power(self.subsystem, self.power_port)
-
-    def bind_voltage_source(self, source: tuple) -> None:
-        """Remember the already-lowered voltage source for follower-side observers."""
-        if self.drives_voltage:
-            raise ValueError("only a voltage-following terminal receives a bus voltage")
-        object.__setattr__(self, "voltage_source", source)
-
-    def signal_sources(self) -> tuple[Any, Any]:
-        """Ordinary output connections for observing the paired voltage and current."""
-        voltage = ((self.subsystem, self.voltage) if self.drives_voltage
-                   else self.voltage_source)
-        current = (self.current_sources if self.drives_voltage
-                   else (self.subsystem, self.current))
-        if voltage is None or current is None:
-            raise RuntimeError("the terminal's bus has not been assembled")
-        return voltage, current
-
-    def bind_current_sources(self, sources: list[tuple]) -> None:
-        """Remember the already-lowered current fan-in for driver-side observers."""
-        if not self.drives_voltage:
-            raise ValueError("only a voltage-driving terminal owns the bus current target")
-        object.__setattr__(self, "current_sources", sources)
-
-    def hold_voltage_source(self) -> tuple:
-        """Ask this current-owning component for its zero-current voltage law."""
-        provider = getattr(self.subsystem, "hold_voltage_source", None)
-        if self.drives_voltage or provider is None:
-            raise ConfigError(
-                f"{type(self.subsystem).__name__}.{self.voltage}: no zero-current voltage law")
-        return provider(self)
-
 
 def _phase_convention(phases: int, initial: complex | float = 0.0):
     """Power scale, zero and ``initial`` of peak complex space vectors (3) or real scalars (1)."""
@@ -140,17 +43,17 @@ def _extend_record(record: Bag, *names: str) -> Bag:
 class _BranchState(Bag):
     __slots__ = ("i",)
 
-class _BranchInp(Bag):
-    __slots__ = ("u1", "u2", "di_dt", "loss_factor")
+class _BranchInput(Bag):
+    __slots__ = ("di_dt", "loss_factor")
 
-class _BranchOut(Bag):
+class _BranchOutput(Bag):
     __slots__ = ("i",)
 
 class RLBranch:
-    """Series R-L branch with positive current from terminal 1 to terminal 2.
+    """Series R-L branch with positive current from port 1 to port 2.
 
     ``phases=3`` uses the peak-scaled complex space-vector convention. ``phases=1`` uses a real
-    scalar and the same terminal contract, so converter units do not need a second network API.
+    scalar and the same port contract, so converter units do not need a second network API.
     """
 
     state_names: ClassVar[tuple[str, ...]] = ("i",)
@@ -164,18 +67,23 @@ class RLBranch:
         self.L, self.R = L, R
         self.phases = phases
         self.unilateral = bool(unilateral)
-        self.ports = (PowerPort("inp.u1", "out.i", self.power_scale, 1.0),
-                      PowerPort("inp.u2", "out.i", self.power_scale, -1.0))
-        self.storage = (StoragePort(
-            "i", L, self.power_scale, (("inp.u1", 1.0), ("inp.u2", -1.0)), "inductor",
-        ),)
         self.state = _BranchState(i=initial)
-        self.inp = _BranchInp(
-            u1=self.zero, u2=self.zero, di_dt=self.zero, loss_factor=1.0,
+        self.input = _BranchInput(di_dt=self.zero, loss_factor=1.0)
+        self.output = _BranchOutput(i=initial)
+        self.port1 = Port(
+            self, "1", voltage=self.zero, current=initial,
+            scale=self.power_scale, standalone="voltage"
         )
-        self.out = _BranchOut(i=initial)
-        self.terminal1 = Terminal(self, "u1", "i", 1)
-        self.terminal2 = Terminal(self, "u2", "i", -1)
+        self.port2 = Port(
+            self, "2", voltage=self.zero, current=-initial,
+            scale=self.power_scale, standalone="voltage"
+        )
+        self.ports = (self.port1, self.port2)
+        self.storage = (StoragePort(
+            "i", L, self.power_scale,
+            ((self.port1, "voltage", 1.0), (self.port2, "voltage", -1.0)),
+            "inductor",
+        ),)
         self.breaker_open = False
         self.external_conduction = False
         if self.unilateral:
@@ -227,28 +135,6 @@ class RLBranch:
         from ..solver.netlist import device_commutate
         device_commutate(self, t)
 
-    def hold_voltage_source(self, terminal: Terminal) -> tuple:
-        """Publish the terminal voltage at which this branch's current is constant."""
-        if self.phases != 1 or self.unilateral or not callable(getattr(self, "netlist", None)):
-            raise ConfigError("a blocking port needs an ordinary scalar R-L branch")
-        name = f"hold_{terminal.voltage}"
-        other = "u2" if terminal.voltage == "u1" else "u1"
-        if not hasattr(self.out, name):
-            self.out = _extend_record(self.out, name)
-            stages = getattr(self, "output_stages", (
-                OutputMethod("set_outputs", inputs=(), outputs=("i",)),))
-            self.output_stages = (*stages, OutputMethod(
-                f"set_{name}", inputs=(other,), outputs=(name,)))
-        return self, name
-
-    def set_hold_u1(self, t: float) -> None:
-        from ..solver.netlist import device_equilibrium_input
-        self.out.hold_u1 = device_equilibrium_input(self, "u1", {"i": 1.0}, t)
-
-    def set_hold_u2(self, t: float) -> None:
-        from ..solver.netlist import device_equilibrium_input
-        self.out.hold_u2 = device_equilibrium_input(self, "u2", {"i": 1.0}, t)
-
     def dissipated_power(self) -> float:
         from ..solver.netlist import device_dissipated_power
         return device_dissipated_power(self)
@@ -266,21 +152,21 @@ class RLBranch:
                 lambda _t: max(0.0, self.state.i) if self.unilateral else self.state.i
             )
             branch = nb.add(nl.CurrentSource(
-                nb.node(self.terminal1), nb.node(self.terminal2), current
+                nb.node(self.port1), nb.node(self.port2), current
             ))
             nb.output(self, "i", ("branch_current", branch))
             dynamic = nb.internal(*_node_kind(self.phases))
             nb.add(
                 nl.VoltageSource(
                     dynamic, None,
-                    nb.function(lambda _t: self.L * self.inp.di_dt, ("di_dt",)),
+                    nb.function(lambda _t: self.L * self.input.di_dt, ("di_dt",)),
                 ),
                 nl.Inductor(dynamic, None, self.L, nb.state(self, "i")),
             )
             if self.R:
                 loss = nb.internal(1, self.power_scale)
                 loss_current = nb.function(
-                    lambda _t: max(0.0, self.inp.loss_factor) ** 0.5
+                    lambda _t: max(0.0, self.input.loss_factor) ** 0.5
                     * abs(self.state.i),
                     ("loss_factor",),
                 )
@@ -294,44 +180,47 @@ class RLBranch:
         kind = _node_kind(self.phases)
         inductor = nb.internal(*kind)
         resistor = nb.internal(*kind) if self.R else inductor
-        start = nb.node(self.terminal1)
+        start = nb.node(self.port1)
         if self.unilateral:
             start = nb.add(nl.Diode(start, nb.internal(*kind))).ports[0][1]
         nb.add(nl.Switch(start, resistor, nb.value(self, "breaker_open", invert=True)))
         if self.R:
             nb.add(nl.Resistor(resistor, inductor, self.R))
         nb.add(nl.Inductor(
-            inductor, nb.node(self.terminal2), self.L, nb.state(self, "i")
+            inductor, nb.node(self.port2), self.L, nb.state(self, "i")
         ))
+        nb.port_output(self, "i", self.port1, "current")
         nb.losses(self)
 
 class _NodeState(Bag):
     __slots__ = ("u_C",)
 
-class _NodeInp(Bag):
-    __slots__ = ("i",)
-
-class _NodeOut(Bag):
+class _NodeOutput(Bag):
     __slots__ = ("u",)
 
 class RCNode:
     """Node with a shunt capacitor ``C`` (F) in series with ``R_d`` (ohm) to ground.
 
-    Input ``i`` is the net current into the node. Output ``u = u_C + R_d i``.
+    Port current is positive into the node. Output ``u = u_C + R_d i``.
     """
 
     state_names: ClassVar[tuple[str, ...]] = ("u_C",)
-    outputs_need_inputs: ClassVar[bool] = True
+    outputs_need_inputs: ClassVar[bool] = False
     def __init__(self, C: float, R_d: float, u0: complex | float = 0j, *, phases: int = 3) -> None:
         self.power_scale, zero, initial = _phase_convention(phases, u0)
         self.C, self.R_d = C, R_d
         self.phases = phases
-        self.ports = (PowerPort("out.u", "inp.i", self.power_scale),)
-        self.storage = (StoragePort("u_C", C, self.power_scale, (("inp.i", 1.0),)),)
         self.state = _NodeState(u_C=initial)
-        self.inp = _NodeInp(i=zero)
-        self.out = _NodeOut(u=initial)
-        self.terminal = Terminal(self, "u", "i", 1, drives_voltage=True)
+        self.input = Empty()
+        self.output = _NodeOutput(u=initial)
+        self.port = Port(
+            self, "power", voltage=initial, current=zero,
+            scale=self.power_scale, standalone="current"
+        )
+        self.ports = (self.port,)
+        self.storage = (StoragePort(
+            "u_C", C, self.power_scale, ((self.port, "current", 1.0),)
+        ),)
 
     def set_outputs(self, t: float) -> None:
         from ..solver.netlist import device_outputs
@@ -357,22 +246,19 @@ class RCNode:
         """Declare the damping resistance and shunt capacitor."""
         from ..solver import netlist as nl
 
-        node = nb.node(self.terminal)
+        node = nb.node(self.port)
         capacitor = nb.internal(*_node_kind(self.phases)) if self.R_d else node
         if self.R_d:
             nb.add(nl.Resistor(node, capacitor, self.R_d))
         nb.add(nl.Capacitor(
             capacitor, None, self.C, nb.state(self, "u_C")
         ))
+        nb.port_output(self, "u", self.port, "voltage")
         nb.losses(self)
 
 
-class _SourceOut(Bag):
+class _SourceOutput(Bag):
     __slots__ = ("e_g", "phi", "theta")
-
-
-class _SourceInp(Bag):
-    __slots__ = ("i",)
 
 
 class ACVoltageSource:
@@ -393,13 +279,14 @@ class ACVoltageSource:
         self.w0, self.e_peak, self.phases = w0, e_peak, phases
         self.phi = phi
         self.state = Empty()
-        self.inp = _SourceInp(i=zero)
-        self.out = _SourceOut()
-        self.out.e_g = zero
-        self.ports = (PowerPort("out.e_g", "inp.i", self.power_scale, -1.0),)
-        self.terminal = Terminal(
-            self, "e_g", "i", -1, drives_voltage=True, electrical_domain="ac"
+        self.input = Empty()
+        self.output = _SourceOutput()
+        self.output.e_g = zero
+        self.port = Port(
+            self, "power", voltage=zero, current=zero,
+            scale=self.power_scale, electrical_domain="ac",
         )
+        self.ports = (self.port,)
         self._output_equation = (self._set_three_phase_outputs if phases == 3
                                  else self._set_single_phase_outputs)
         if type(self).set_outputs is ACVoltageSource.set_outputs:
@@ -412,7 +299,7 @@ class ACVoltageSource:
     def _set_single_phase_outputs(self, t: float) -> None:
         phi = self.phi(t) if self.phi is not None else 0.0
         theta = self.w0 * t + phi
-        out = self.out
+        out = self.output
         out.phi = phi
         out.theta = theta
         out.e_g = self.e_peak * math.cos(theta)
@@ -420,7 +307,7 @@ class ACVoltageSource:
     def _set_three_phase_outputs(self, t: float) -> None:
         phi = self.phi(t) if self.phi is not None else 0.0
         theta = self.w0 * t + phi
-        out = self.out
+        out = self.output
         out.phi = phi
         out.theta = theta
         out.e_g = complex(self.e_peak * math.cos(theta), self.e_peak * math.sin(theta))
@@ -445,14 +332,14 @@ class ACVoltageSource:
     def voltage(self, t: float) -> complex | float:
         """Evaluate and return the source's selected output equation."""
         self._output_equation(t)
-        return self.out.e_g
+        return self.output.e_g
 
     def netlist(self, nb):
-        """Declare an ideal voltage source from the terminal to ground."""
+        """Declare an ideal voltage source from the port to ground."""
         from ..solver import netlist as nl
 
         nb.add(nl.VoltageSource(
-            nb.node(self.terminal), None, nb.value(self.out, "e_g")
+            nb.node(self.port), None, nb.value(self.output, "e_g")
         ))
         nb.supplies(self)
 
@@ -463,9 +350,9 @@ class Element:
     """Base of a registered ``elements`` entry, built as ``cls(name, cfg, buses, p)``.
 
     A type defines ``type`` and a frozen ``Params`` dataclass with a matching ``type`` field.
-    An instance supplies ``subsystems()``, ``connections()`` and ``terminals()``. A connection
+    An instance supplies ``subsystems()``, ``connections()`` and ``port_bindings()``. A connection
     source is another subsystem output or a configured physical-output path resolved by assembly.
-    Each terminal binds a configured bus name to a :class:`Terminal`; one- and multi-terminal
+    Each binding joins a configured bus name to a :class:`Port`; one- and multi-port
     elements use the same interface. Optional ``breakers`` or ``connect()`` enable switching;
     optional ``retune()`` enables runtime parameter changes. Optional ``series_connections()`` maps
     a bus to an inlet bus: assembly moves the original voltage driver to that inlet, inserting a
@@ -531,6 +418,7 @@ class Load(Element):
     def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
         self.name, self.cfg = name, cfg
         self.branch = RLBranch(cfg.l, cfg.r, phases=buses[cfg.bus].phases)
+        self.branch.port2.grounded = True
         self.breakers = [self.branch]
 
     def subsystems(self) -> dict[str, Any]:
@@ -539,11 +427,11 @@ class Load(Element):
     def connections(self) -> dict:
         return {}
 
-    def terminals(self) -> tuple[tuple[str, Terminal], ...]:
-        return ((self.cfg.bus, self.branch.terminal1),)
+    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
+        return ((self.cfg.bus, self.branch.port1),)
 
     def signals(self) -> dict[str, complex]:
-        return {f"{self.name}.i": self.branch.out.i}
+        return {f"{self.name}.i": self.branch.output.i}
 
     def retune(self, cfg: Any) -> None:
         """Take new load parameters while preserving branch current."""
@@ -551,11 +439,7 @@ class Load(Element):
         self.branch.retune(cfg.l, cfg.r)
 
 
-class _ResistorInp(Bag):
-    __slots__ = ("u", "i")
-
-
-class _ResistorOut(Bag):
+class _ResistorOutput(Bag):
     __slots__ = ("i", "u", "power")
 
 
@@ -563,7 +447,7 @@ class _ResistorModel:
     """One resistance, in shunt admittance or series voltage-drop form."""
 
     state_names: ClassVar[tuple[str, ...]] = ()
-    outputs_need_inputs: ClassVar[bool] = True
+    outputs_need_inputs: ClassVar[bool] = False
     storage: ClassVar[tuple[StoragePort, ...]] = ()
 
     def __init__(self, resistance: float, phases: int, series: bool = False) -> None:
@@ -571,32 +455,28 @@ class _ResistorModel:
         self.series = series
         self.power_scale, zero, _ = _phase_convention(phases)
         self.state = Empty()
-        self.inp = _ResistorInp(u=zero, i=zero)
-        self.out = _ResistorOut(i=zero, u=zero, power=0.0)
-        self.ports = (PowerPort("inp.u", "out.i", self.power_scale),)
-        self.terminal = Terminal(self, "u", "i", 1)
-        if series:
-            self.ports += (PowerPort("out.u", "inp.i", self.power_scale, -1.0),)
-            self.output_terminal = Terminal(self, "u", "i", -1, drives_voltage=True)
-        self.output_stages = (
-            OutputMethod("set_current", ("i",) if series else ("u",), ("i",)),
-            OutputMethod("set_voltage", ("u", "i") if series else (), ("u",), rhs=series),
-            OutputMethod("set_power", ("i",) if series else ("u",), ("power",), rhs=False),
+        self.input = Empty()
+        self.output = _ResistorOutput(i=zero, u=zero, power=0.0)
+        self.port1 = Port(
+            self, "1", voltage=zero, current=zero,
+            scale=self.power_scale, standalone="voltage"
         )
+        self.ports = (self.port1,)
+        if series:
+            self.port2 = Port(
+                self, "2", voltage=zero, current=zero,
+                scale=self.power_scale, standalone="voltage"
+            )
+            self.ports += (self.port2,)
+        self.output_stages = (OutputMethod(
+            "set_power", (), ("power",), rhs=False
+        ),)
     def set_outputs(self, t: float) -> None:
         from ..solver.netlist import device_outputs
         device_outputs(self, t)
 
-    def set_current(self, t: float) -> None:
-        from ..solver.netlist import device_outputs
-        device_outputs(self, t)
-
-    def set_voltage(self, t: float) -> None:
-        from ..solver.netlist import device_outputs
-        device_outputs(self, t)
-
     def set_power(self, t: float) -> None:
-        self.out.power = self.dissipated_power()
+        self.output.power = self.power_scale * self.resistance * abs(self.output.i) ** 2
 
     def rhs(self, t: float):
         return ()
@@ -612,10 +492,12 @@ class _ResistorModel:
         """Declare the shunt or series resistance."""
         from ..solver import netlist as nl
 
-        other = nb.node(self.output_terminal) if self.series else None
-        nb.add(nl.Resistor(nb.node(self.terminal), other, self.resistance))
-        if not self.series:
-            nb.linear_output(self, "u", ())
+        other = nb.node(self.port2) if self.series else None
+        nb.add(nl.Resistor(nb.node(self.port1), other, self.resistance))
+        nb.port_output(self, "i", self.port1, "current")
+        nb.port_output(
+            self, "u", self.port2 if self.series else self.port1, "voltage"
+        )
         nb.losses(self)
 
 
@@ -652,11 +534,11 @@ class Resistor(Element):
     def connections() -> dict:
         return {}
 
-    def terminals(self) -> tuple[tuple[str, Terminal], ...]:
+    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         if self.cfg.series:
-            return ((f"{self.name}.bus.in", self.resistor.terminal),
-                    (self.cfg.bus, self.resistor.output_terminal))
-        return ((self.cfg.bus, self.resistor.terminal),)
+            return ((f"{self.name}.bus.in", self.resistor.port1),
+                    (self.cfg.bus, self.resistor.port2))
+        return ((self.cfg.bus, self.resistor.port1),)
 
     def series_connections(self) -> dict[str, str]:
         return {self.cfg.bus: f"{self.name}.bus.in"} if self.cfg.series else {}
@@ -666,8 +548,8 @@ class Resistor(Element):
         return {"r": (self.resistor, "resistance")}
 
     def signals(self) -> dict[str, complex | float]:
-        return {f"{self.name}.i": self.resistor.out.i,
-                f"{self.name}.power": self.resistor.out.power}
+        return {f"{self.name}.i": self.resistor.output.i,
+                f"{self.name}.power": self.resistor.output.power}
 
     def retune(self, cfg: Any) -> None:
         self.cfg = cfg
@@ -675,11 +557,7 @@ class Resistor(Element):
             setattr(subsystem, attribute, getattr(cfg, name))
 
 
-class _VoltageSourceInp(Bag):
-    __slots__ = ("u",)
-
-
-class _VoltageSourceOut(Bag):
+class _VoltageSourceOutput(Bag):
     __slots__ = ("i",)
 
 
@@ -687,16 +565,19 @@ class _VoltageSourceModel:
     """Scalar voltage source behind a series resistance."""
 
     state_names: ClassVar[tuple[str, ...]] = ()
-    outputs_need_inputs: ClassVar[bool] = True
+    outputs_need_inputs: ClassVar[bool] = False
     storage: ClassVar[tuple[StoragePort, ...]] = ()
 
     def __init__(self, voltage: float, resistance: float) -> None:
         self.voltage, self.resistance = voltage, resistance
         self.state = Empty()
-        self.inp = _VoltageSourceInp(u=0.0)
-        self.out = _VoltageSourceOut(i=0.0)
-        self.ports = (PowerPort("inp.u", "out.i", 1.0),)
-        self.terminal = Terminal(self, "u", "i", 1, electrical_domain="dc")
+        self.input = Empty()
+        self.output = _VoltageSourceOutput(i=0.0)
+        self.port = Port(
+            self, "power", voltage=0.0, current=0.0,
+            electrical_domain="dc"
+        )
+        self.ports = (self.port,)
 
     def set_outputs(self, t: float) -> None:
         from ..solver.netlist import device_outputs
@@ -718,10 +599,11 @@ class _VoltageSourceModel:
         from ..solver import netlist as nl
 
         inner = nb.internal()
-        nb.add(nl.Resistor(nb.node(self.terminal), inner, self.resistance))
+        nb.add(nl.Resistor(nb.node(self.port), inner, self.resistance))
         nb.add(nl.VoltageSource(
             inner, None, nb.function(lambda _t: self.voltage)
         ))
+        nb.port_output(self, "i", self.port, "current")
         nb.losses(self)
         nb.supplies(self)
 
@@ -760,11 +642,11 @@ class VoltageSource(Element):
     def connections() -> dict:
         return {}
 
-    def terminals(self) -> tuple[tuple[str, Terminal], ...]:
-        return ((self.cfg.bus, self.source.terminal),)
+    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
+        return ((self.cfg.bus, self.source.port),)
 
     def signals(self) -> dict[str, float]:
-        return {f"{self.name}.i": self.source.out.i}
+        return {f"{self.name}.i": self.source.output.i}
 
     def retune(self, cfg: Any) -> None:
         self.cfg = cfg

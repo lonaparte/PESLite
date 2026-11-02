@@ -110,7 +110,7 @@ def test_without_the_flag_the_addon_is_not_imported(tmp_path, monkeypatch, capsy
 
     capsys.readouterr()
     assert peslite.main(_args(tmp_path, "--ph-report")) == 0
-    assert "port-hamiltonian" in capsys.readouterr().out
+    assert "port-hamiltonian" in capsys.readouterr().out.lower()
 
 
 @pytest.mark.parametrize("options", [["--list-states"], ["--ph-report"], ["--resolved"],

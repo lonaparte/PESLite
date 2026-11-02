@@ -103,7 +103,7 @@ def test_model_automatically_solves_an_algebraic_output_loop():
     class In(Bag):
         __slots__ = ("x",)
 
-    class Out(Bag):
+    class Output(Bag):
         __slots__ = ("y",)
 
     class Feedback:
@@ -111,10 +111,10 @@ def test_model_automatically_solves_an_algebraic_output_loop():
         outputs_need_inputs = True
 
         def __init__(self):
-            self.state, self.inp, self.out = Empty(), In(), Out()
+            self.state, self.input, self.output = Empty(), In(), Output()
 
         def set_outputs(self, _t):
-            self.out.y = 1.0 + 0.5 * self.inp.x
+            self.output.y = 1.0 + 0.5 * self.input.x
 
         def rhs(self, _t):
             return ()
@@ -124,8 +124,8 @@ def test_model_automatically_solves_an_algebraic_output_loop():
     model.sync(0.0, np.empty(0))
 
     assert len(model.algebraic_loops) == 1
-    assert block.inp.x == pytest.approx(2.0)
-    assert block.out.y == pytest.approx(2.0)
+    assert block.input.x == pytest.approx(2.0)
+    assert block.output.y == pytest.approx(2.0)
 
 
 def test_observational_output_stage_is_pruned_or_promoted_by_rhs_dependencies():
@@ -144,12 +144,12 @@ def test_observational_output_stage_is_pruned_or_promoted_by_rhs_dependencies():
         output_stages = (OutputMethod("observe", (), ("x",), rhs=False),)
 
         def __init__(self):
-            self.state, self.inp, self.out = State(x=2.0), Empty(), Output()
+            self.state, self.input, self.output = State(x=2.0), Empty(), Output()
             self.observations = 0
 
         def observe(self, _t):
             self.observations += 1
-            self.out.x = self.state.x
+            self.output.x = self.state.x
 
         def set_outputs(self, t):
             self.observe(t)
@@ -162,13 +162,13 @@ def test_observational_output_stage_is_pruned_or_promoted_by_rhs_dependencies():
         outputs_need_inputs = False
 
         def __init__(self):
-            self.state, self.inp, self.out = State(), Input(), State()
+            self.state, self.input, self.output = State(), Input(), State()
 
         def set_outputs(self, _t):
-            self.out.x = self.state.x
+            self.output.x = self.state.x
 
         def rhs(self, _t):
-            return (self.inp.x,)
+            return (self.input.x,)
 
     unconnected = Producer()
     isolated = Model({"producer": unconnected}, {})

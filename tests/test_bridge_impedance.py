@@ -18,8 +18,9 @@ def _model(topology, mode="switching", *, capacitance=1e-4, resistance=0.5):
     cfg.bridge.on_resistance = resistance
     bridge = make_bridge(cfg, topology=topology)
     bridge.enabled = True
-    bridge.inp.u_dc = 48.0
-    bridge.inp.q = topology.switching_state((1,) + (0,) * (len(topology.duty_names) - 1))
+    bridge.dc_port.voltage = 48.0
+    bridge.power_port.current = topology.zero
+    bridge.input.q = topology.switching_state((1,) + (0,) * (len(topology.duty_names) - 1))
     return bridge, Model({"bridge": bridge}, {})
 
 
@@ -42,9 +43,9 @@ def test_capacitive_switching_step_matches_the_analytic_rc_response(topology):
     end = 100e-6
     y = solver(model.rhs, 0.0, end, model.get_initial_values()).y
     model.sync(end, y)
-    expected = bridge.inp.q * bridge.inp.u_dc * (
+    expected = bridge.input.q * bridge.dc_port.voltage * (
         1.0 - math.exp(-end / (topology.series_devices * resistance * capacitance)))
-    assert bridge.out.u_c == pytest.approx(expected, rel=1e-9, abs=1e-10)
+    assert bridge.output.u_c == pytest.approx(expected, rel=1e-9, abs=1e-10)
     report = model.energy_balance(end, y)
     part, = report.subsystems
     assert abs(part.residual) < 1e-8
@@ -59,7 +60,9 @@ def test_capacitor_and_device_energy_balance_for_every_form(topology, mode):
         bridge.enabled = enabled
         for voltage in (0.0, 25.0, -130.0):
             bridge.state.u_C = voltage + (12.0j if isinstance(topology.zero, complex) else 0.0)
-            bridge.inp.i_c = 1.3 + (0.7j if isinstance(topology.zero, complex) else 0.0)
+            bridge.power_port.current = -(
+                1.3 + (0.7j if isinstance(topology.zero, complex) else 0.0)
+            )
             y = model.get_initial_values()
             report = model.energy_balance(0.0, y)
             part, = report.subsystems
@@ -70,23 +73,23 @@ def test_capacitor_and_device_energy_balance_for_every_form(topology, mode):
 def test_controlled_voltage_reversal_has_finite_current_and_continuous_capacitor_voltage():
     bridge, model = _model(FullBridge())
     bridge.state.u_C = 48.0
-    bridge.inp.q = -1.0
+    bridge.input.q = -1.0
     y = model.get_initial_values()
     model.sync(0.0, y)
-    assert bridge.out.u_c == 48.0
-    assert bridge.out.i_device == pytest.approx(-96.0)
+    assert bridge.output.u_c == 48.0
+    assert bridge.output.i_device == pytest.approx(-96.0)
     assert model.rhs(0.0, y)[0] == pytest.approx(-96.0 / 1e-4)
 
 
 def test_diode_leg_blocks_device_current_without_clamping_its_capacitor_port_current():
     bridge, model = _model(HalfBridge(lower_controlled=False))
-    bridge.inp.q = 0.0
+    bridge.input.q = 0.0
     bridge.state.u_C = 10.0
-    bridge.inp.i_c = -2.0
+    bridge.power_port.current = 2.0
     y = model.get_initial_values()
     model.sync(0.0, y)
     assert not bridge.diode_blocks_reverse_current()
-    assert bridge.out.i_device == 0.0
+    assert bridge.output.i_device == pytest.approx(0.0, abs=1e-15)
     assert model.rhs(0.0, y)[0] == pytest.approx(2.0 / 1e-4)
 
 
@@ -101,15 +104,15 @@ def test_full_bridge_diodes_do_not_become_gated_devices_when_the_unit_is_enabled
         state = model.get_initial_values()
         model.sync(0.0, state)
     assert bridge.enabled
-    assert bridge.out.i_device == pytest.approx(-12.0)
-    assert bridge.out.i_dc == pytest.approx(-12.0)
+    assert bridge.output.i_device == pytest.approx(-12.0)
+    assert bridge.output.i_dc == pytest.approx(-12.0)
     assert bridge.dissipated_power() == pytest.approx(144.0)
 
 
 @pytest.mark.parametrize("voltage", [-200.0, -25.0, 0.0, 25.0, 200.0])
 def test_full_bridge_zero_vector_eliminates_the_common_voltage_without_a_loop(voltage):
     bridge, model = _model(FullBridge())
-    bridge.inp.q = 0.0
+    bridge.input.q = 0.0
     bridge.state.u_C = voltage
     y = model.get_initial_values()
     part, = model.energy_balance(0.0, y).subsystems
@@ -122,21 +125,21 @@ def test_full_bridge_zero_vector_eliminates_the_common_voltage_without_a_loop(vo
 @pytest.mark.parametrize("mode", ["pwm_averaging", "averaging"])
 def test_averaged_zero_vector_does_not_invent_capacitor_charging_loss(topology, mode):
     bridge, model = _model(topology, mode)
-    bridge.inp.q = topology.zero
+    bridge.input.q = topology.zero
     model.sync(0.0, model.get_initial_values())
-    assert bridge.out.i_device == pytest.approx(0.0, abs=1e-10)
-    assert bridge.out.i_dc == pytest.approx(0.0, abs=1e-10)
+    assert bridge.output.i_device == pytest.approx(0.0, abs=1e-10)
+    assert bridge.output.i_dc == pytest.approx(0.0, abs=1e-10)
     assert bridge.dissipated_power() == pytest.approx(0.0, abs=1e-10)
 
 
 @pytest.mark.parametrize("mode", ["pwm_averaging", "averaging"])
 def test_half_bridge_averages_actual_charging_current_and_loss(mode):
     bridge, model = _model(HalfBridge(), mode)
-    bridge.inp.q = 0.5
+    bridge.input.q = 0.5
     bridge.state.u_C = 24.0
     model.sync(0.0, model.get_initial_values())
-    assert bridge.out.i_device == pytest.approx(0.0)
-    assert bridge.out.i_dc == pytest.approx(24.0)
+    assert bridge.output.i_device == pytest.approx(0.0)
+    assert bridge.output.i_dc == pytest.approx(24.0)
     assert bridge.dissipated_power() == pytest.approx(1152.0)
 
 
@@ -158,17 +161,30 @@ def test_averaged_state_fractions_match_the_existing_exact_carrier(width):
 
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
 @pytest.mark.parametrize("resistance", [1.0, 75.0])
-def test_three_phase_device_equations_leave_one_dc_port_feedback(mode, resistance):
+def test_three_phase_device_equations_solve_the_dc_network_directly(mode, resistance):
+    from peslite.assembly.circuit import declare_netlist, lower
     from peslite.components.converter import DCLink, DCVoltageSource
 
     bridge, _ = _model(ThreePhaseBridge(), mode)
     link = DCLink(None, DCVoltageSource(48.0, resistance))
-    model = Model({"bridge": bridge, "link": link}, {
-        (bridge, "u_dc"): (link, "u_dc"), (link, "i_dc"): (bridge, "i_dc")})
+    subsystems = {"bridge": bridge, "link": link}
+    declarations = {id(value): declare_netlist(value) for value in subsystems.values()}
+    subsystems, connections, zoh, _circuit = lower(
+        "device",
+        subsystems,
+        {},
+        {},
+        {
+            "dc": (bridge.dc_port, link.port),
+            "power": (bridge.power_port,),
+        },
+        declarations,
+    )
+    model = Model(subsystems, connections, zoh)
     model.sync(0.0, model.get_initial_values())
     expected = 48.0 / (1.0 + resistance * (2.0 / 3.0) / bridge.device_on_resistance)
-    assert link.out.u_dc == pytest.approx(expected, rel=1e-8)
-    assert [len(loop.tears) for loop in model.algebraic_loops] == [1]
+    assert link.output.u_dc == pytest.approx(expected, rel=1e-8)
+    assert not model.algebraic_loops
 
 
 def test_floating_three_phase_netlist_matches_an_independent_nodal_solution():
@@ -195,9 +211,9 @@ def test_floating_three_phase_netlist_matches_an_independent_nodal_solution():
                     return np.array(result)
 
                 bound = max(map(abs, offsets)) + 100.0
-                bridge.inp.q = bridge.topology.switching_state(gates)
+                bridge.input.q = bridge.topology.switching_state(gates)
                 gates = tuple(
-                    gate > 0.5 for gate in bridge.topology.pole_gates(bridge.inp.q, True)
+                    gate > 0.5 for gate in bridge.topology.pole_gates(bridge.input.q, True)
                 )
                 expected = brentq(lambda value: sum(currents(value)), -bound, bound)
                 state = model.get_initial_values()
@@ -212,16 +228,17 @@ def test_floating_three_phase_netlist_matches_an_independent_nodal_solution():
                     factor.conjugate() * current
                     for factor, current in zip(bridge.topology.voltage_factors, device)
                 ) / bridge.topology.power_scale
-                assert bridge.out.i_device == pytest.approx(expected_current)
+                assert bridge.output.i_device == pytest.approx(expected_current)
 
 
 @pytest.mark.parametrize("topology", [HalfBridge(), FullBridge(), ThreePhaseBridge()])
 def test_resistance_without_capacitance_uses_the_same_conduction_path(topology):
     bridge, model = _model(topology, capacitance=0.0)
-    bridge.inp.i_c = 2.0 + 0j if isinstance(topology.zero, complex) else 2.0
+    bridge.input.i_c = 2.0 + 0j if isinstance(topology.zero, complex) else 2.0
+    bridge.power_port.current = -bridge.input.i_c
     model.sync(0.0, model.get_initial_values())
-    expected = bridge.inp.q * 48.0 - topology.series_devices * 0.5 * bridge.inp.i_c
-    assert bridge.out.u_c == pytest.approx(expected)
+    expected = bridge.input.q * 48.0 - topology.series_devices * 0.5 * bridge.input.i_c
+    assert bridge.output.u_c == pytest.approx(expected)
     assert bridge.dissipated_power() == pytest.approx(topology.power_scale * topology.series_devices * 2.0)
 
 

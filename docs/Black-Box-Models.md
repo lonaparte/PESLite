@@ -2,7 +2,7 @@
 
 `BlackBoxSubsystem` connects an array-valued Python callable to the normal model graph without
 requiring a model base class or file format. A registered element places it through the ordinary
-`subsystems()`, `connections()` and `terminals()` interfaces.
+`subsystems()`, `connections()` and `port_bindings()` interfaces.
 
 ## Stateless models
 
@@ -77,16 +77,23 @@ members `ports`, `storage`, `dissipated_power` and `supplied_power`; without a d
 energy check applies its default black-box accounting.
 
 ```python
-from peslite.solver.energy import PowerPort
+from peslite.solver.energy import Port
+
+port = Port(name="power", effort="input.u", flow="output.i")
 
 load = BlackBoxSubsystem(
     lambda _t, inputs: inputs / resistance,
     inputs=("u",),
     outputs=("i",),
-    ports=(PowerPort("inp.u", "out.i"),),
-    dissipated_power=lambda model: model.inp.u * model.out.i,
+    ports=(port,),
+    dissipated_power=lambda model: model.input.u * model.output.i,
 )
+port.bind(load)
 ```
+
+The physical port remains acausal; `effort` and `flow` only adapt the causal callable to the
+electrical network. Use `Port.signals(effort, flow)` for an energy pair that is not a physical
+connection.
 
 ## Callable boundary
 

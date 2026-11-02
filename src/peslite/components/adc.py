@@ -9,39 +9,41 @@ from typing import Any, Callable, Mapping, Optional
 import numpy as np
 
 from ..control.blocks import MovingWindow
-from ..solver.energy import PowerPort, port_power, re_product
+from ..solver.energy import Port, port_power, re_product
 from ..solver.model import Bag, Empty, _real
 from ..solver.timing import TIME_EPS, PeriodicClock
 
 __all__ = ["ADCSample", "MeasurementPorts", "ADC"]
 
 
-class _PortMeasurementInp(Bag):
+class _PortMeasurementInput(Bag):
     __slots__ = ("voltage", "current")
 
 
-class _PortMeasurementOut(Bag):
+class _PortMeasurementOutput(Bag):
     __slots__ = ("voltage", "current", "power")
 
 
 class _PortMeasurement:
-    """Non-loading observation of an already assembled electrical terminal."""
+    """Non-loading observation of an already assembled electrical port."""
 
     observer = True
     outputs_need_inputs = True
     state_names = ()
 
-    def __init__(self, terminal) -> None:
-        port = terminal.power_port
-        self.ports = (PowerPort("inp.voltage", "inp.current", port.scale, -port.sign),)
+    def __init__(self, port: Port) -> None:
+        self.port = port
         self.state = Empty()
-        self.inp = _PortMeasurementInp()
-        self.out = _PortMeasurementOut()
+        self.input = _PortMeasurementInput()
+        self.output = _PortMeasurementOutput()
+        self.ports = (Port.signals(
+            "input.voltage", "input.current", port.scale, -1.0
+        ),)
 
     def set_outputs(self, t: float) -> None:
-        self.out.voltage = self.inp.voltage
-        self.out.current = self.inp.current
-        self.out.power = port_power(self, self.ports[0])
+        self.output.voltage = self.input.voltage
+        self.output.current = self.input.current
+        self.output.power = port_power(self, self.ports[0])
 
     def rhs(self, t: float):
         return ()

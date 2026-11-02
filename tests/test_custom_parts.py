@@ -114,8 +114,8 @@ class _ShuntRL(Element):
     def connections(self):
         return {}
 
-    def terminals(self):
-        return ((self.cfg.bus, self.branch.terminal1),)
+    def port_bindings(self):
+        return ((self.cfg.bus, self.branch.port1),)
 
     def retune(self, cfg):
         self.cfg = cfg

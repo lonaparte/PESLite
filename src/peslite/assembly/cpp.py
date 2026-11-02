@@ -31,10 +31,10 @@ from ..components.pwm import (_EPS, _SNAP, CarrierComparison, SynchronousCarrier
 from ..control.profiles import PHASE_SHIFT_MODES
 from ..control.blocks import OutputLimit
 from ..control.controller import GraphController, VSCController
-from ..solver.energy import re_product
+from ..solver.energy import Port, re_product
 from ..solver.integrators import DormandPrince45, FixedStepSolver, TABLEAUS
 from ..solver.model import _strong_components, commutation_tolerance
-from ..solver.netlist import _MAX_PATTERNS
+from ..solver.netlist import Mode, _DELTA_T, _MAX_PATTERNS, _symbolic_solve
 from ..solver.timing import TIME_EPS
 from .conduction import DiodeConduction, _LOCATOR_ITERATIONS, _MAX_COMMUTATIONS
 from .protection import ProtectionStats
@@ -1049,7 +1049,7 @@ class _RuntimeParameters:
         self.object_copies[id(original)] = clone
         updates = self.object_updates[id(original)]
         for name in _fields(original):
-            if name not in {"state", "inp", "out"}:
+            if name not in {"state", "input", "output"}:
                 value = updates.get(name, getattr(original, name))
                 object.__setattr__(clone, name, self.object(value))
         for name in _fields(original):
@@ -1279,6 +1279,11 @@ class _ModelGenerator:
             for record, field in targets:
                 self.zoh_fields[id(record), field] = member
         self._discover_records()
+        self.physical_port_fields = {
+            id(port): (subsystem.output, voltage, subsystem.output, current)
+            for subsystem in self.model.subsystems
+            for port, _group, voltage, current in getattr(subsystem, "port_values", ())
+        }
         self.enabled_by = {
             id(subsystem): f"u_{_identifier(name)}_gates"
             for name, unit in self.system.units.items()
@@ -1341,7 +1346,7 @@ class _ModelGenerator:
     def _discover_records(self) -> None:
         for sub in self.model.subsystems:
             tag = self.prefix[id(sub)]
-            for role in ("state", "inp", "out"):
+            for role in ("state", "input", "output"):
                 record = getattr(sub, role)
                 mapped = self.record_fields.setdefault(id(record), {})
                 for field in _fields(record):
@@ -1494,7 +1499,7 @@ class _ModelGenerator:
         for name, value in (vars(owner).items() if hasattr(owner, "__dict__") else ()):
             if getattr(value, "__self__", None) is owner:
                 setattr(clone, name, self._rebind(value, clone))
-        for role in ("state", "inp", "out"):
+        for role in ("state", "input", "output"):
             original = getattr(owner, role)
             record = copy.copy(original)
             for field in _fields(original):
@@ -1502,6 +1507,13 @@ class _ModelGenerator:
                                                    self.record_types[id(original), field]))
             setattr(clone, role, record)
             records[id(original)] = record
+        ports = {}
+        for name, value in (vars(owner).items() if hasattr(owner, "__dict__") else ()):
+            if isinstance(value, Port) and value.component is owner:
+                port = copy.copy(value)
+                port.component = clone
+                setattr(clone, name, port)
+                ports[id(value)] = port
         # Composite parts may alias a parent's state record (for example a DC capacitor).
         # Preserve that alias in the equation copy without cloning the connected model graph.
         for name, value in (list(vars(clone).items()) if hasattr(clone, "__dict__") else ()):
@@ -1509,7 +1521,7 @@ class _ModelGenerator:
             if record is not None:
                 part = copy.copy(value)
                 part.state = record
-                for role in ("inp", "out"):
+                for role in ("input", "output"):
                     inner = getattr(value, role, None)
                     if inner is not None:
                         setattr(part, role, records.get(id(inner), copy.copy(inner)))
@@ -1519,7 +1531,7 @@ class _ModelGenerator:
         for part, _attribute in bindings.values():
             if id(part) not in copies:
                 copies[id(part)] = copy.copy(self.runtime.object(part))
-        references = {**self.equation_references, **copies, **records}
+        references = {**self.equation_references, **copies, **records, **ports}
 
         def rebind(original, value):
             if id(original) in references:
@@ -1639,13 +1651,13 @@ class _ModelGenerator:
     def trace_outputs(self, method: Any,
                       attributes: dict[str, _Expression] | None = None) -> list[str]:
         owner = method.__self__
-        fields = _fields(owner.out)
+        fields = _fields(owner.output)
 
         def run():
             bound = {}
             clone = self._equation_clone(owner, attributes, bound=bound)
             self._rebind(method, clone)(_Expression("t", "real"))
-            return (tuple(getattr(clone.out, field) for field in fields),
+            return (tuple(getattr(clone.output, field) for field in fields),
                     tuple(getattr(bound[id(part)], attribute)
                           for part, attribute in self.equation_bindings.get(id(owner), {}).values()))
 
@@ -1655,7 +1667,7 @@ class _ModelGenerator:
             values, memory = self._trace(run)
         lines: list[str] = []
         for field, value in zip(fields, values):
-            original = self.value(owner.out, field)
+            original = self.value(owner.output, field)
             if value.code != original:
                 lines.append(f"{original} = {value.code};")
         for (part, attribute), value in zip(self.equation_bindings.get(id(owner), {}).values(), memory):
@@ -1707,7 +1719,7 @@ class _ModelGenerator:
             code = code.replace(self.record_fields[record_id][field], held)
         for subsystem in self.model.subsystems:
             subsystem_name = self.subsystem_name[id(subsystem)]
-            for role in ("inp", "out"):
+            for role in ("input", "output"):
                 record = getattr(subsystem, role)
                 for field in _fields(record):
                     local = self.record_fields[id(record)][field]
@@ -1785,13 +1797,13 @@ class _ModelGenerator:
             if subsystem_name is None or role is None:
                 owner = next(
                     (sub for sub in self.model.subsystems
-                     if record is getattr(sub, "inp") or record is getattr(sub, "out")),
+                     if record is getattr(sub, "input") or record is getattr(sub, "output")),
                     None,
                 )
                 if owner is None:
                     raise RuntimeError("solver observation record has no subsystem owner")
                 subsystem_name = self.subsystem_name[id(owner)]
-                role = "inp" if record is owner.inp else "out"
+                role = "input" if record is owner.input else "output"
             observation_name = f"solver.{subsystem_name}.{role}.{field}"
             self._solver_observations[key] = (observation_name, record, field)
         return "obs_" + _identifier(self._solver_observations[key][0])
@@ -1810,7 +1822,7 @@ class _ModelGenerator:
             saved: list[tuple[Any, str, Any]] = []
             try:
                 for sub in subsystems:
-                    for role in ("state", "inp", "out"):
+                    for role in ("state", "input", "output"):
                         record = getattr(sub, role)
                         for field in _fields(record):
                             value = getattr(record, field)
@@ -1838,7 +1850,7 @@ class _ModelGenerator:
         lines: list[str] = []
         declared: set[str] = set()
         for sub in self.model.subsystems:
-            for record in (sub.state, sub.inp, sub.out):
+            for record in (sub.state, sub.input, sub.output):
                 for field in _fields(record):
                     name = self.value(record, field)
                     if name in declared:
@@ -1904,17 +1916,20 @@ class _ModelGenerator:
 
     def _output(self, method: Any) -> list[str]:
         owner = method.__self__
-        out = owner.out
+        out = owner.output
         function = getattr(method, "__func__", method)
         passthrough = getattr(function, "_peslite_netlist_passthrough", None)
         if passthrough is not None:
             circuit = owner._circuit
-            return [f"{self.value(out, field)} = {self.value(circuit.out, source)};"
+            return [f"{self.value(out, field)} = {self.value(circuit.output, source)};"
                     for field, source in passthrough]
         generated = getattr(function, "_peslite_netlist_outputs", None)
         if generated is not None:
             circuit, fields = generated
             return self.trace_netlist_outputs(owner, method, circuit, fields)
+        stage_hook = getattr(owner, "cpp_output_stage", None)
+        if stage_hook is not None:
+            return list(stage_hook(self, method))
         hook = getattr(owner, "cpp_outputs", None)
         if hook is not None:
             return list(hook(self))
@@ -1955,16 +1970,31 @@ class _ModelGenerator:
     @contextmanager
     def _netlist_symbols(self, circuit: Any):
         """Expose registered model values to one netlist trace without changing its equations."""
+        ratio_samples = tuple(transformer.ratio().copy() for transformer in circuit.netlist._transformers)
         restored = []
         records = []
         for owner in (*circuit.components, circuit):
-            for role in ("state", "inp", "out"):
+            for role in ("state", "input", "output"):
                 record = getattr(owner, role, None)
                 if record is not None and id(record) in self.record_fields:
                     records.append(record)
             for name, value in self._equation_attributes(owner).items():
                 restored.append((owner, name, getattr(owner, name)))
                 setattr(owner, name, value)
+        seen_ports = set()
+        for port, _group, _voltage, _current in circuit.port_values:
+            if id(port) in seen_ports:
+                continue
+            seen_ports.add(id(port))
+            restored.extend((
+                (port, "voltage", port.voltage),
+                (port, "current", port.current),
+            ))
+        if id(circuit.output) not in self.record_fields:
+            restored.extend(
+                (circuit.output, field, getattr(circuit.output, field))
+                for field in _fields(circuit.output)
+            )
         seen = set()
         for record in records:
             if id(record) in seen:
@@ -1983,25 +2013,109 @@ class _ModelGenerator:
         net = circuit.netlist
         transient = (circuit.derivatives, circuit.t, circuit._stored,
                      net._last, net._mode, net._frozen_mode, net._frozen_topology,
-                     net._scalar_functions, net._scalar_topology)
+                     net._scalar_functions, net._scalar_topology, net._ratio_override)
         circuit._stored = None
+        circuit._cpp_ratio_samples = ratio_samples
         net._scalar_functions = type(net._scalar_functions)()
         net._scalar_topology = None
+        net._ratio_override = ratio_samples
         try:
             yield
         finally:
             (circuit.derivatives, circuit.t, circuit._stored,
              net._last, net._mode, net._frozen_mode, net._frozen_topology,
-             net._scalar_functions, net._scalar_topology) = transient
+             net._scalar_functions, net._scalar_topology, net._ratio_override) = transient
+            del circuit._cpp_ratio_samples
             for owner, name, value in reversed(restored):
                 setattr(owner, name, value)
 
     @staticmethod
-    def _trace_circuit_solve(circuit: Any, t: Any) -> None:
+    def _ratio_matrix(transformer: Any) -> np.ndarray:
+        """Read a transformer ratio without coercing generated expressions to floats."""
+        if transformer.constant is not None:
+            return transformer.constant
+        value = transformer.N()
+        if isinstance(value, (numbers.Number, _Expression)):
+            if transformer.shape == (1, 1):
+                return np.asarray(((value,),), dtype=object)
+            if transformer.shape == (2, 1) and (
+                    isinstance(value, complex)
+                    or isinstance(value, _Expression) and value.kind == "complex"):
+                return np.asarray(((value.real,), (value.imag,)), dtype=object)
+        array = np.asarray(value, dtype=object)
+        if array.size != math.prod(transformer.shape):
+            raise ValueError(
+                f"{transformer.name}: the ratio must be "
+                f"{transformer.shape[0]} x {transformer.shape[1]}"
+            )
+        return array.reshape(transformer.shape)
+
+    @classmethod
+    def _trace_dynamic_netlist(cls, circuit: Any, t: Any,
+                               states: list[Any]) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        """Eliminate a netlist whose transformer ratios are run-time expressions."""
+        net = circuit.netlist
+        ratios = tuple(cls._ratio_matrix(transformer) for transformer in net._transformers)
+        conducting = list(net.conducting)
+        gated = [False] * len(net._diodes)
+        for index, gate in net._gates:
+            gated[index] = bool(gate())
+            if gated[index]:
+                conducting[index] = True
+        net._gated_state = tuple(gated)
+        closed = tuple(bool(switch.closed()) for switch in net._switches)
+        samples = circuit._cpp_ratio_samples
+        topology = net._compiled(Mode(closed, tuple(conducting), samples))
+
+        pattern = topology._pattern
+        columns = np.repeat(np.arange(pattern.n), np.diff(pattern.indptr))
+        entries: list[Any] = pattern.base.tolist()
+        flat_ratios = tuple(value for ratio in ratios for value in ratio.reshape(-1))
+        for position, flat, coefficient in zip(
+                pattern.slot_pos, pattern.slot_flat, pattern.slot_coef):
+            entries[int(position)] += coefficient * flat_ratios[int(flat)]
+        matrix = [[0.0] * pattern.n for _ in range(pattern.n)]
+        for value, row, column in zip(entries, pattern.indices, columns):
+            matrix[int(row)][int(column)] = value
+
+        inputs = net.source_values(t)
+        rates: list[Any] = [0.0] * net.n_u
+        for needed, (source, offset) in zip(topology.needs_rate, net._sources):
+            if not needed:
+                continue
+            dimension = net._branch(source).dim
+            value = (source.derivative(t) if source.derivative is not None else
+                     (source.value(t + _DELTA_T) - source.value(t - _DELTA_T))
+                     / (2.0 * _DELTA_T))
+            if dimension == 1:
+                rates[offset] = value
+            elif dimension == 2:
+                rates[offset:offset + 2] = (value.real, value.imag)
+            else:
+                rates[offset:offset + dimension] = value
+        state_values = tuple(states[int(index)] for index in net.states)
+        values = (*state_values, *inputs, *(rates if topology.any_rate else ()))
+        coefficients = topology._K.toarray() if hasattr(topology._K, "toarray") else topology._K
+        right = [sum(coefficient * value for coefficient, value in zip(row, values)
+                     if coefficient != 0.0) for row in coefficients]
+        solution = _symbolic_solve(
+            matrix, right, topology._pattern.dense(samples)
+        ) if pattern.n else []
+        derivative = tuple(solution[int(index)] for index in topology.xd_index)
+        output = tuple(sum(coefficient * value for coefficient, value in zip(row, solution)
+                           if coefficient != 0.0)
+                       for row in topology.S_out.toarray())
+        return net._place_scalar_derivatives(derivative, len(states)), output
+
+    @classmethod
+    def _trace_circuit_solve(cls, circuit: Any, t: Any) -> None:
         """Evaluate the circuit's selected netlist execution form with symbolic values."""
         circuit.receive()
         states = circuit._states() if circuit._transforms else circuit.gather()
-        if circuit.form == "device":
+        if any(transformer.constant is None for transformer in circuit.netlist._transformers):
+            derivatives, all_outputs = cls._trace_dynamic_netlist(circuit, t, states)
+            outputs = tuple(all_outputs[index] for index in circuit.output_indices)
+        elif circuit.form == "device":
             derivatives = circuit.scalar_derivatives(t, states)
             outputs = circuit.scalar_outputs(t, states)
         else:
@@ -2019,18 +2133,18 @@ class _ModelGenerator:
 
     def trace_circuit_outputs(self, circuit: Any) -> list[str]:
         """Emit a whole-circuit netlist evaluation and retain its derivative expressions."""
-        fields = _fields(circuit.out)
+        fields = _fields(circuit.output)
 
         def run():
             with self._netlist_symbols(circuit):
                 self._trace_circuit_solve(circuit, _Expression("t", "real"))
-                return tuple(getattr(circuit.out, field) for field in fields)
+                return tuple(getattr(circuit.output, field) for field in fields)
 
         with self._shared_terms() as (prefix, terms):
             values = self._trace(run)
-        lines = [f"{self.value(circuit.out, field)} = {value.code};"
+        lines = [f"{self.value(circuit.output, field)} = {value.code};"
                  for field, value in zip(fields, values)
-                 if value.code != self.value(circuit.out, field)]
+                 if value.code != self.value(circuit.output, field)]
         return self._term_declarations(prefix, terms, lines)
 
     def trace_netlist_outputs(self, owner: Any, method: Any, circuit: Any,
@@ -2040,14 +2154,14 @@ class _ModelGenerator:
             with self._netlist_symbols(circuit):
                 self._trace_circuit_solve(circuit, _Expression("t", "real"))
                 for field in fields:
-                    setattr(owner.out, field, getattr(circuit.out, circuit.published[id(owner), field]))
-                return tuple(getattr(owner.out, field) for field in fields)
+                    setattr(owner.output, field, getattr(circuit.output, circuit.published[id(owner), field]))
+                return tuple(getattr(owner.output, field) for field in fields)
 
         with self._shared_terms() as (prefix, terms):
             values = self._trace(run)
-        lines = [f"{self.value(owner.out, field)} = {value.code};"
+        lines = [f"{self.value(owner.output, field)} = {value.code};"
                  for field, value in zip(fields, values)
-                 if value.code != self.value(owner.out, field)]
+                 if value.code != self.value(owner.output, field)]
         return self._term_declarations(prefix, terms, lines)
 
     def trace_netlist_rhs(self, sub: Any, method: Any, circuit: Any,
@@ -2164,7 +2278,7 @@ class _ModelGenerator:
     def _operation(self, operation: tuple, indent: str = "",
                    direct_guards: dict[int, str] | None = None) -> list[str]:
         kind, item = operation
-        if kind == "out":
+        if kind == "output":
             return [indent + line for line in self._output(item)]
         if kind == "copy":
             return [indent + f"{self.value(item[0], item[1])} = {self._copy_expression(item)};"]
@@ -2260,7 +2374,7 @@ class _ModelGenerator:
         for kind, item in loop.operations:
             if kind == "algebraic":
                 return None
-            if kind == "out":
+            if kind == "output":
                 owner = item.__self__
                 if getattr(owner, "cpp_outputs", None) is not None:
                     return None
@@ -2324,7 +2438,7 @@ class _ModelGenerator:
                         for node in component}
         public = {self.value(getattr(owner, role), field):
                   f"{self.subsystem_name[id(owner)]}.{role}.{field}"
-                  for owner in loop.owners for role in ("state", "inp", "out")
+                  for owner in loop.owners for role in ("state", "input", "output")
                   for field in _fields(getattr(owner, role))}
         affected = {}
         for target, (rhs, fragments) in conditional_by_target.items():
@@ -2485,11 +2599,11 @@ class _ModelGenerator:
         self._add_observation = add
 
         for name, node in self.system.buses.items():
-            add(f"{name}.u", self.value(node.out, "u"),
-                self.record_types[id(node.out), "u"])
+            add(f"{name}.u", self.value(node.output, "u"),
+                self.record_types[id(node.output), "u"])
         for name, branch in self.system.branches.items():
-            add(f"{name}.i", self.value(branch.out, "i"),
-                self.record_types[id(branch.out), "i"])
+            add(f"{name}.i", self.value(branch.output, "i"),
+                self.record_types[id(branch.output), "i"])
         for source in self.system.sources.values():
             for signal, value in self.trace_element_signals(source).items():
                 add(signal, value.code, value.kind)
@@ -3990,8 +4104,8 @@ class _ControlGenerator:
         if self.bridge.dead_time <= 0.0:
             return ()
         bridge = self.bridge
-        current = self.model.solver_observation(bridge.inp, "i_c")
-        kind = self.model.record_types[id(bridge.inp), "i_c"]
+        current = self.model.solver_observation(bridge.input, "i_c")
+        kind = self.model.record_types[id(bridge.input), "i_c"]
         values = self.model._trace(
             lambda: bridge.topology.pole_currents(_Expression(current, kind))
         )
@@ -4197,7 +4311,7 @@ class _ControlGenerator:
                 f"C++ export: sampled unit {self.name!r} needs one shared held bridge command"
             )
         subsystem, field = target
-        record = subsystem.inp
+        record = subsystem.input
         return self.model.zoh_fields[id(record), field]
 
     def event_methods(self) -> str:
@@ -4681,23 +4795,23 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
 
     def output_lines(self) -> list[str]:
         lines: list[str] = [
-            f"{self.m('meas_u_g')} = {self.model.value(self.ctrl.inp, 'u_g')} / {_number(self.cfg.base.v_phase_peak)};",
-            f"{self.m('meas_i_c')} = {self.model.value(self.ctrl.inp, 'i_c')} / {_number(self.cfg.base.i_phase_peak)};",
-            f"{self.m('meas_u_dc')} = {self.model.value(self.ctrl.inp, 'u_dc')} / {_number(self.cfg.dc_base.v)};",
+            f"{self.m('meas_u_g')} = {self.model.value(self.ctrl.input, 'u_g')} / {_number(self.cfg.base.v_phase_peak)};",
+            f"{self.m('meas_i_c')} = {self.model.value(self.ctrl.input, 'i_c')} / {_number(self.cfg.base.i_phase_peak)};",
+            f"{self.m('meas_u_dc')} = {self.model.value(self.ctrl.input, 'u_dc')} / {_number(self.cfg.dc_base.v)};",
             self._startup_value_line(),
         ]
         lines += self._flow_lines()
         theta = self.source(self.graph.outputs["theta"])
         omega = self.source(self.graph.outputs["omega"])
         command = self.source(self.graph.outputs["u_dq"])
-        q = self.model.value(self.ctrl.out, "q")
+        q = self.model.value(self.ctrl.output, "q")
         lines += [
             f"{self.m('theta')} = {theta};",
             f"{self.m('omega')} = {omega};",
             f"{self.m('u_cmd')} = {command};",
-            f"if ({self.m('startup_run')} && {self.model.value(self.ctrl.inp, 'u_dc')} != 0.0) {{",
+            f"if ({self.m('startup_run')} && {self.model.value(self.ctrl.input, 'u_dc')} != 0.0) {{",
             f"    {q} = {command} * Complex{{std::cos({theta}), std::sin({theta})}} * "
-            f"{_number(self.cfg.base.v_phase_peak)} / {self.model.value(self.ctrl.inp, 'u_dc')};",
+            f"{_number(self.cfg.base.v_phase_peak)} / {self.model.value(self.ctrl.input, 'u_dc')};",
             "} else {",
             f"    {q} = Complex{{0.0, 0.0}};",
             "}",
@@ -4974,7 +5088,7 @@ class _GraphUnitGenerator(_ElectricalUnitGenerator):
             )
         command = _Expression(self.source(outputs[0]), "real")
         state = self.model._trace(lambda: self.topology.state_from_duty(command))
-        q = self.model.value(self.ctrl.out, "q")
+        q = self.model.value(self.ctrl.output, "q")
         lines.append(
             f"{q} = {self.m('startup_run')} ? {state.code} : {_literal(self.topology.zero)};"
         )
@@ -5123,9 +5237,9 @@ class _CppGenerator:
                 def read():
                     clone = model._equation_clone(source.emf)
                     clone.set_outputs(_Expression(_number(t0), "real"))
-                    return clone.out.e_g
+                    return clone.output.e_g
                 expression = model._trace(read)
-            value = _InitializationExpression.make(expression, source.emf.out.e_g, self.runtime)
+            value = _InitializationExpression.make(expression, source.emf.output.e_g, self.runtime)
             # The normal preset resolver asks the source for its value once. Its AOT source
             # adapter has already evaluated that same expression at the initial instant.
             view.emf = SimpleNamespace(set_outputs=lambda _t: None,
@@ -5141,9 +5255,16 @@ class _CppGenerator:
         columns: list[str] = []
         expressions: list[str] = []
         ode = {name: f"y[{index}]" for index, name in enumerate(self.model.state_labels())}
-        equation_states = {id(group.part): model.named_equation_state(group.part)
-                           for group in self.simulation._states._groups
-                           if id(group.part) in model.equation_bindings}
+        equation_states = {}
+        for subsystem in self.model.subsystems:
+            if (id(subsystem) not in model.equation_bindings
+                    or not callable(getattr(subsystem, "get_state", None))):
+                continue
+            states = model.named_equation_state(subsystem)
+            equation_states[id(subsystem)] = states
+            component = getattr(subsystem, "component", None)
+            if component is not None:
+                equation_states[id(component)] = states
         for group in self.simulation._states._groups:
             part = group.part
             for state in group.states:
@@ -5351,7 +5472,11 @@ class _CppGenerator:
                 energy_terms.append(f"0.5 * {_number(coefficient)} * ({norm})")
                 rate_terms.append(f"{_number(coefficient)} * ({rate})")
             port_terms = [
-                f"{_number(port.coefficient)} * ({product(port.effort_record, port.effort_field, port.flow_record, port.flow_field)})"
+                f"{_number(port.coefficient)} * ({product(*(
+                    model.physical_port_fields[id(port.port)] if port.port is not None else
+                    (port.effort_record, port.effort_field,
+                     port.flow_record, port.flow_field)
+                ))})"
                 for port in check.ports
             ]
             supplied, dissipated = powers(check)

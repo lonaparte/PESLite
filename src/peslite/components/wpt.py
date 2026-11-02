@@ -13,9 +13,6 @@ currents with the diagonal :class:`StoragePort` energy representation; there is 
 inversion and no special solver path. A two-coil link uses the closed-form diagonalization, so its
 arithmetic stays scalar for parameterized standalone backends.
 
-A diode bridge which blocks on one port needs the port voltage that keeps the port current
-constant (its *hold voltage*). The link evaluates it from its own equations through the output
-``u_hold_<side>``, published when terminal assembly requests that capability.
 """
 
 from __future__ import annotations
@@ -25,9 +22,8 @@ from typing import Any, ClassVar, Mapping
 
 import numpy as np
 
-from ..solver.energy import PowerPort, StoragePort
-from ..solver.model import Bag, LocatedZero, OutputMethod, _real, commutation_tolerance
-from .network import Terminal, _extend_record
+from ..solver.energy import Port, StoragePort
+from ..solver.model import Bag, Empty, LocatedZero, OutputMethod, _real, commutation_tolerance
 from .pwm import PhaseClock
 
 __all__ = ["CompensatedLink", "SwitchedCompensatedLink", "SwitchControlledCapacitor",
@@ -71,11 +67,6 @@ class CompensatedLink:
     """Coupled coils with per-coil series capacitors and per-side series or LCC compensation."""
 
     outputs_need_inputs: ClassVar[bool] = False
-    ports: ClassVar[tuple[PowerPort, ...]] = (
-        PowerPort("inp.u_primary", "out.i_primary"),
-        PowerPort("inp.u_secondary", "out.i_secondary"),
-    )
-
     def __init__(self, *, inductance, coil_sides: tuple[str, ...], capacitance, resistance,
                  sides: dict[str, _Side],
                  switched: tuple["SwitchControlledCapacitor", ...] = ()) -> None:
@@ -127,30 +118,16 @@ class CompensatedLink:
         outputs = ("i_primary", "i_secondary", "i_primary_coil", "i_secondary_coil",
                    *self._coil_outputs, *capacitor_outputs,
                    *(f"{scc.side}_scc_on" for scc in switched))
-        self.hold_sides = ()
-        self.out = type("_LinkOut", (Bag,), {"__slots__": outputs})()
+        self.output = type("_LinkOutput", (Bag,), {"__slots__": outputs})()
         self.output_stages = (OutputMethod("set_outputs", inputs=(), outputs=outputs),)
-        self.inp = type("_LinkInp", (Bag,), {"__slots__": ("u_primary", "u_secondary")})()
-        self.primary_terminal = Terminal(
-            self, "u_primary", "i_primary", 1, electrical_domain="ac"
+        self.input = Empty()
+        self.primary_port = Port(
+            self, "primary", electrical_domain="ac", standalone="voltage",
         )
-        self.secondary_terminal = Terminal(
-            self, "u_secondary", "i_secondary", 1, electrical_domain="ac"
+        self.secondary_port = Port(
+            self, "secondary", electrical_domain="ac", standalone="voltage",
         )
-
-    def hold_voltage_source(self, terminal: Terminal) -> tuple:
-        """Declare a blocking-voltage output for the actual connected terminal."""
-        side = terminal.voltage.removeprefix("u_")
-        if side not in self.sides:
-            raise ValueError(f"unknown link terminal {terminal.voltage!r}")
-        if side not in self.hold_sides:
-            self.hold_sides = (*self.hold_sides, side)
-            self.out = _extend_record(self.out, f"u_hold_{side}")
-            other = SIDES[1 - SIDES.index(side)]
-            inputs = () if self.sides[side].lcc or self.sides[other].lcc else (f"u_{other}",)
-            self.output_stages = (*self.output_stages, OutputMethod(
-                f"set_hold_{side}", inputs=inputs, outputs=(f"u_hold_{side}",)))
-        return self, f"u_hold_{side}"
+        self.ports = (self.primary_port, self.secondary_port)
 
     def _module(self, coil: int) -> int:
         return self.sides[self.coil_sides[coil]].coils.index(coil)
@@ -174,7 +151,7 @@ class CompensatedLink:
     def set_outputs(self, t: float) -> None:
         self._t = t
         for scc in self.switched:
-            setattr(self.out, f"{scc.side}_scc_on", _real(scc.on))
+            setattr(self.output, f"{scc.side}_scc_on", _real(scc.on))
 
     def coil_currents(self) -> tuple[float, ...]:
         """Coil currents obtained from the stored modal coordinates."""
@@ -186,6 +163,8 @@ class CompensatedLink:
         """Declare the compensated coupled-coil network in coil coordinates."""
         from ..solver import netlist as nl
 
+        nb.port_output(self, "i_primary", self.primary_port, "current")
+        nb.port_output(self, "i_secondary", self.secondary_port, "current")
         count = len(self.coil_sides)
         shapes = np.array(self._shapes, dtype=float).reshape(count, count)
         inductance = shapes @ np.diag(np.asarray(self._inductance, dtype=float)) @ shapes.T
@@ -216,7 +195,7 @@ class CompensatedLink:
         devices = []
         for side in SIDES:
             spec = self.sides[side]
-            node = nb.node(getattr(self, f"{side}_terminal"))
+            node = nb.node(getattr(self, f"{side}_port"))
             if spec.lcc:
                 parallel = nb.internal()
                 parallel_capacitor = nl.Capacitor(
@@ -275,27 +254,6 @@ class CompensatedLink:
 
     def _bind_netlist_devices(self, netlist, devices) -> None:
         self._netlist_devices = netlist, tuple(devices)
-
-    # ------------------------------------------------------------------ blocking ports
-    def set_hold_primary(self, t: float) -> None:
-        self.out.u_hold_primary = self._hold_voltage("primary", t)
-
-    def set_hold_secondary(self, t: float) -> None:
-        self.out.u_hold_secondary = self._hold_voltage("secondary", t)
-
-    def _hold_voltage(self, side: str, t: float) -> float:
-        from ..solver.netlist import device_equilibrium_input
-
-        spec = self.sides[side]
-        if spec.lcc:
-            weights = {f"i_{side}_comp": 1.0}
-        else:
-            weights = {
-                name: sum(self._shapes[index][mode] for index in spec.coils)
-                for mode, name in enumerate(self._mode_names)
-            }
-        return device_equilibrium_input(self, f"u_{side}", weights, t)
-
 
 def _link_spec(cfg: Any) -> dict[str, Any]:
     """Normalize one link type into coil/side form; a compensation inductor marks an LCC side."""
