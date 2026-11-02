@@ -134,6 +134,8 @@ class SubsystemEnergy:
     kind: str = "declared"
     # J, cumulative energy dissipated at state jumps (switch closings); None: none declared
     impulsive: Optional[float] = None
+    # J, cumulative energy sources delivered during those jumps; None: none declared
+    impulsive_supply: Optional[float] = None
 
 
 @dataclass
@@ -183,10 +185,12 @@ class EnergyReport:
         for s in self.subsystems:
             if s.kind == "default":
                 cols[f"{s.name}.power_supplied_W"] = s.supplied  # inferred net injection
-            else:
+            elif s.kind != "observer":
                 cols[f"{s.name}.energy_J"] = s.energy
             if s.impulsive is not None:
                 cols[f"{s.name}.dissipated_impulsive_J"] = s.impulsive
+            if s.impulsive_supply is not None:
+                cols[f"{s.name}.supplied_impulsive_J"] = s.impulsive_supply
         return cols
 
 
@@ -260,6 +264,13 @@ class _BalancePlan:
         for check in self.subsystems:
             spec = check.spec
             if spec.kind == "observer":
+                impulsive = getattr(check.subsystem, "impulsive_dissipated_energy", None)
+                if impulsive is not None:
+                    report.subsystems.append(SubsystemEnergy(
+                        check.name, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                        "observer", float(impulsive),
+                        float(getattr(check.subsystem, "impulsive_supplied_energy", 0.0)),
+                    ))
                 continue
             if spec.kind == "dirac":
                 report.dirac.append(check.name)
@@ -297,6 +308,9 @@ class _BalancePlan:
             impulsive = getattr(check.subsystem, "impulsive_dissipated_energy", None)
             if impulsive is not None:
                 entry.impulsive = float(impulsive)
+            supply = getattr(check.subsystem, "impulsive_supplied_energy", None)
+            if supply is not None:
+                entry.impulsive_supply = float(supply)
             report.subsystems.append(entry)
         return report
 
@@ -529,6 +543,8 @@ def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e
         statuses[name] = SubsystemStatus(name, kind, states, storages, ports, None, role)
     problems: list[str] = []
     tellegen_worst: Optional[float] = None
+    consistent = [project for sub in model.subsystems
+                  if callable(project := getattr(sub, "consistent_state", None))]
     try:
         for label, value in (zoh or {}).items():
             model.set_zoh_input(label, value)
@@ -536,11 +552,17 @@ def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e
             y = rng.normal(size=model.n_states) * 100.0
             if getattr(model, "has_state_bounds", False):
                 y = model.project_states(y)
+            if consistent:
+                t = 0.01 * (k + 1)
+                model.sync(t, y)
+                for project in consistent:
+                    project(t)
+                y = model.get_initial_values()
             rep = balance(model, 0.01 * (k + 1), y)
             scale = rep.scale
             for s in rep.subsystems:
                 st = statuses[s.name]
-                if s.kind == "default":
+                if s.kind in ("default", "observer"):
                     continue  # closes by construction
                 rel = abs(s.residual) / scale
                 st.balance_residual_rel = rel if st.balance_residual_rel is None else max(st.balance_residual_rel, rel)

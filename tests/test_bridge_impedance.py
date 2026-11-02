@@ -94,7 +94,12 @@ def test_full_bridge_diodes_do_not_become_gated_devices_when_the_unit_is_enabled
     topology = FullBridge(upper_controlled=False, lower_controlled=False)
     bridge, model = _model(topology)
     bridge.state.u_C = 60.0
-    model.sync(0.0, model.get_initial_values())
+    state = model.get_initial_values()
+    model.sync(0.0, state)
+    if bridge.commutation_margin() < 0.0:
+        bridge.commutate(0.0)
+        state = model.get_initial_values()
+        model.sync(0.0, state)
     assert bridge.enabled
     assert bridge.out.i_device == pytest.approx(-12.0)
     assert bridge.out.i_dc == pytest.approx(-12.0)
@@ -161,17 +166,17 @@ def test_three_phase_device_equations_leave_one_dc_port_feedback(mode, resistanc
     model = Model({"bridge": bridge, "link": link}, {
         (bridge, "u_dc"): (link, "u_dc"), (link, "i_dc"): (bridge, "i_dc")})
     model.sync(0.0, model.get_initial_values())
-    expected = 48.0 / (1.0 + resistance * (2.0 / 3.0) / bridge.on_resistance)
+    expected = 48.0 / (1.0 + resistance * (2.0 / 3.0) / bridge.device_on_resistance)
     assert link.out.u_dc == pytest.approx(expected, rel=1e-8)
     assert [len(loop.tears) for loop in model.algebraic_loops] == [1]
 
 
-def test_floating_three_phase_reference_matches_an_independent_nodal_solution():
+def test_floating_three_phase_netlist_matches_an_independent_nodal_solution():
     from itertools import product
     from scipy.optimize import brentq
     from peslite.control.blocks import phases
 
-    bridge, _ = _model(ThreePhaseBridge())
+    bridge, model = _model(ThreePhaseBridge())
     voltages = np.random.default_rng(15).normal(size=(10, 2)) * 200.0
     for enabled in (False, True):
         bridge.enabled = enabled
@@ -190,9 +195,24 @@ def test_floating_three_phase_reference_matches_an_independent_nodal_solution():
                     return np.array(result)
 
                 bound = max(map(abs, offsets)) + 100.0
+                bridge.inp.q = bridge.topology.switching_state(gates)
+                gates = tuple(
+                    gate > 0.5 for gate in bridge.topology.pole_gates(bridge.inp.q, True)
+                )
                 expected = brentq(lambda value: sum(currents(value)), -bound, bound)
-                actual = bridge._pole_reference(gates)
-                np.testing.assert_allclose(currents(actual), currents(expected), rtol=1e-10, atol=1e-10)
+                state = model.get_initial_values()
+                for _ in range(4):
+                    model.sync(0.0, state)
+                    if bridge.commutation_margin() >= 0.0:
+                        break
+                    bridge.commutate(0.0)
+                    state = model.get_initial_values()
+                device = currents(expected).reshape(3, 2).sum(axis=1) / bridge.device_on_resistance
+                expected_current = sum(
+                    factor.conjugate() * current
+                    for factor, current in zip(bridge.topology.voltage_factors, device)
+                ) / bridge.topology.power_scale
+                assert bridge.out.i_device == pytest.approx(expected_current)
 
 
 @pytest.mark.parametrize("topology", [HalfBridge(), FullBridge(), ThreePhaseBridge()])

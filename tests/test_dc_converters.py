@@ -284,6 +284,7 @@ def test_buck_boost_uses_the_three_physical_half_bridge_terminals():
     assert all(terminal is not unit.branch_f.terminal2 for _bus, terminal in terminals)
 
     bridge = unit.bridge
+    bridge.enabled = True
     bridge.inp.u_dc = 24.0
     bridge.inp.u_lower = -36.0
     bridge.inp.i_c = 2.0
@@ -292,6 +293,9 @@ def test_buck_boost_uses_the_three_physical_half_bridge_terminals():
     assert (bridge.out.u_c, bridge.out.i_dc, bridge.out.i_lower) == (24.0, 2.0, 0.0)
     bridge.inp.q = 0.0
     bridge.set_outputs(0.0)
+    if bridge.commutation_margin() < 0.0:
+        bridge.commutate(0.0)
+        bridge.set_outputs(0.0)
     assert (bridge.out.u_c, bridge.out.i_dc, bridge.out.i_lower) == (-36.0, 0.0, 2.0)
 
 
@@ -440,6 +444,8 @@ def test_averaged_dcm_relation_drives_branch_current_loss_and_bridge_dc_current(
     connections = simulation.system.model.connections
 
     assert law is not None
+    assert unit.branch_f._device_circuit.netlist.elements
+    assert unit.bridge._device_circuit.netlist.elements
     assert connections[(unit.branch_f, "di_dt")] == (law, "derivative")
     assert connections[(unit.branch_f, "loss_factor")] == (
         law, "resistance_factor",

@@ -64,6 +64,14 @@ class DiodeConduction:
             if callable(getattr(subsystem, "commutation_margin", None))
             and callable(getattr(subsystem, "commutate", None))
         )
+        self.located = tuple(
+            subsystem for subsystem in self.commutating
+            if getattr(subsystem, "locate_commutations", True)
+        )
+        self._topology_owners = tuple(
+            subsystem for subsystem in self.commutating
+            if callable(getattr(subsystem, "freeze_topology", None))
+        )
         self._scheduled = tuple(
             subsystem for subsystem in self.commutating
             if callable(getattr(subsystem, "next_commutation_time", None))
@@ -75,7 +83,7 @@ class DiodeConduction:
                 "solver; a windowed subsystem group cannot locate their commutation instants"
             )
         self._probe = None
-        if self.commutating and solver is not None:
+        if self.located and solver is not None:
             dt = getattr(solver, "dt", None)
             probe = dt if dt is not None and dt > 0.0 else getattr(solver, "max_step", math.inf)
             if not math.isfinite(probe) or probe <= 0.0:
@@ -102,26 +110,38 @@ class DiodeConduction:
         """Advance all conduction guards through one locator and one boundary dispatcher."""
         if self.solver is None:
             raise RuntimeError("diode conduction cannot advance without a solver")
-        if not self.current_states and not self.commutating:
-            return self._advance_with_resolution(t0, t1, state)
         if self.commutating:
             state = self._settle(t0, state)
+        if not self.current_states and not self.located and not self._scheduled:
+            return self._advance_with_resolution(t0, t1, state)
         t = t0
         end = t1 - commutation_tolerance(t1)
         stalled = 0
         while t < end:
-            target = min(t1, t + self._probe) if self._probe is not None else t1
+            guarded_advance = getattr(self.solver, "advance_guarded", None)
+            observe_steps = guarded_advance is not None and bool(self.current_states or self.located)
+            target = t1 if observe_steps or self._probe is None else min(t1, t + self._probe)
             scheduled = math.inf
             if self._scheduled:
                 scheduled = min(float(sub.next_commutation_time()) for sub in self._scheduled)
                 target = min(target, scheduled)
             guarded = tuple(index for sub, index in self.current_states
                             if sub.diode_blocks_reverse_current() and state[index] > 0.0)
-            trial = self._advance_with_resolution(t, target, state.copy())
-            upper_margin = self._margin(target, trial, guarded)
+            origin_t, origin_state = t, state
+            lower_margin = None
+            if observe_steps:
+                step = self._guarded(t, target, state.copy(), guarded)
+                trial, upper_margin = step.y, step.margin
+                if step.crossed:
+                    origin_t, origin_state = step.previous_t, step.previous_y
+                    lower_margin = step.previous_margin
+                    target = step.t
+            else:
+                trial, upper_margin = self._trial(t, target, state.copy(), guarded)
             if upper_margin < 0.0:
-                lower, upper = t, target
-                lower_margin = self._margin(t, state, guarded)
+                lower, upper = origin_t, target
+                if lower_margin is None:
+                    lower_margin = self._margin(lower, origin_state, guarded, self.located)
                 bisect_next = False
                 for _ in range(_LOCATOR_ITERATIONS):
                     tolerance = commutation_tolerance(upper)
@@ -138,8 +158,7 @@ class DiodeConduction:
                             interpolated = True
                     # Alternation guarantees bracket contraction even if a secant hugs an end.
                     bisect_next = interpolated
-                    value = self._advance_with_resolution(t, middle, state.copy())
-                    margin = self._margin(middle, value, guarded)
+                    value, margin = self._trial(origin_t, middle, origin_state.copy(), guarded)
                     invalid = margin < 0.0
                     if invalid:
                         upper, upper_margin, trial = middle, margin, value
@@ -150,8 +169,9 @@ class DiodeConduction:
                         # accepting a small residual (a valid guard may have a zero plateau).
                         adjacent = middle - tolerance if invalid else middle + tolerance
                         if lower < adjacent < upper:
-                            value = self._advance_with_resolution(t, adjacent, state.copy())
-                            margin = self._margin(adjacent, value, guarded)
+                            value, margin = self._trial(
+                                origin_t, adjacent, origin_state.copy(), guarded
+                            )
                             if margin < 0.0:
                                 upper, upper_margin, trial = adjacent, margin, value
                             else:
@@ -171,12 +191,54 @@ class DiodeConduction:
             t = target
         return state
 
-    def _margin(self, t: float, state: NDArray[np.float64], guarded=()) -> float:
+    def _guarded(self, t0: float, t1: float, state: NDArray[np.float64], guarded):
+        """Observe margins inside one solver call while reusing a fixed topology."""
+        maximum_step = self._probe if self._probe is not None else math.inf
+        if self.resolution_subsystems:
+            self.model.sync(t0, state)
+            maximum_step = min(
+                maximum_step,
+                *(subsystem.diode_maximum_step() for subsystem in self.resolution_subsystems),
+            )
+        for subsystem in self._topology_owners:
+            subsystem.freeze_topology()
+        try:
+            return self.solver.advance_guarded(
+                self.model.rhs, t0, t1, state,
+                lambda t, y: self._margin(t, y, guarded, self.located),
+                max_step=maximum_step,
+                synchronized_guard=lambda t, y: self._margin(
+                    t, y, guarded, self.located, synchronized=True
+                ),
+            )
+        finally:
+            for subsystem in self._topology_owners:
+                subsystem.release_topology()
+
+    def _trial(self, t0: float, t1: float, state: NDArray[np.float64], guarded
+               ) -> tuple[NDArray[np.float64], float]:
+        """Integrate and test one smooth interval while reusing its compiled topology."""
+        value = self._smooth(t0, t1, state)
+        return value, self._margin(t1, value, guarded, self.located)
+
+    def _smooth(self, t0: float, t1: float, state: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Integrate one interval while every topology owner reuses its boundary mode."""
+        for subsystem in self._topology_owners:
+            subsystem.freeze_topology()
+        try:
+            return self._advance_with_resolution(t0, t1, state)
+        finally:
+            for subsystem in self._topology_owners:
+                subsystem.release_topology()
+
+    def _margin(self, t: float, state: NDArray[np.float64], guarded=(), subsystems=None, *,
+                synchronized: bool = False) -> float:
         """Minimum guard margin; no owner lists are needed to bracket a boundary."""
-        if self.commutating:
+        subsystems = self.commutating if subsystems is None else subsystems
+        if subsystems and not synchronized:
             self.model.sync(t, state)
         margin = math.inf
-        for sub in self.commutating:
+        for sub in subsystems:
             margin = min(margin, sub.commutation_margin())
         for index in guarded:
             if state[index] < margin:

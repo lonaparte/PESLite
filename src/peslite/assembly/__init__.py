@@ -20,6 +20,7 @@ from .system import _assemble_dc_converter, _assemble_vsc, _assemble_wpt
 from .types import register_unit_type
 from .validate import _dc_converter, _unit, _wpt
 from ..control.profiles import control_type
+from . import circuit as _circuit
 
 register_unit_type(
     "vsc",

@@ -34,6 +34,7 @@ from ..control.controller import GraphController, VSCController
 from ..solver.energy import re_product
 from ..solver.integrators import DormandPrince45, FixedStepSolver, TABLEAUS
 from ..solver.model import _strong_components, commutation_tolerance
+from ..solver.netlist import _MAX_PATTERNS
 from ..solver.timing import TIME_EPS
 from .conduction import DiodeConduction, _LOCATOR_ITERATIONS, _MAX_COMMUTATIONS
 from .protection import ProtectionStats
@@ -509,6 +510,22 @@ class _Expression:
     def __ge__(self, other: Any): return self._compare(other, ">=")
     def __eq__(self, other: Any): return self._compare(other, "==")
     def __ne__(self, other: Any): return self._compare(other, "!=")
+
+    def __and__(self, other: Any):
+        right = self.of(other)
+        if self.kind != "bool" or right.kind != "bool":
+            return NotImplemented
+        return _Expression(f"(({self.code}) && ({right.code}))", "bool")
+
+    def __rand__(self, other: Any): return self.of(other).__and__(self)
+
+    def __or__(self, other: Any):
+        right = self.of(other)
+        if self.kind != "bool" or right.kind != "bool":
+            return NotImplemented
+        return _Expression(f"(({self.code}) || ({right.code}))", "bool")
+
+    def __ror__(self, other: Any): return self.of(other).__or__(self)
 
     def __bool__(self) -> bool:
         if self.kind == "bool" and self.code in ("true", "false"):
@@ -1203,6 +1220,11 @@ class _ModelGenerator:
         self.model = self.system.model
         self.subsystem_name = {id(sub): name for name, sub in zip(self.model.names, self.model.subsystems)}
         self.prefix = {id(sub): f"s{index}" for index, sub in enumerate(self.model.subsystems)}
+        for sub in self.model.subsystems:
+            component = getattr(sub, "component", None)
+            if component is not None:
+                self.subsystem_name.setdefault(id(component), self.subsystem_name[id(sub)])
+                self.prefix.setdefault(id(component), self.prefix[id(sub)])
         self.record_fields: dict[int, dict[str, str]] = {}
         self.record_types: dict[tuple[int, str], str] = {}
         self._unit_control_inputs: dict[int, dict[str, _Expression]] = {}
@@ -1670,6 +1692,9 @@ class _ModelGenerator:
     def trace_solver_method(self, sub: Any, name: str,
                             attributes: dict[str, _Expression] | None = None) -> str:
         """Trace a scalar capability for solver scope, where states are read from ``y``."""
+        hook = getattr(sub, f"cpp_{name}", None)
+        if hook is not None:
+            return hook(self)
         return self.solver_expression(self.trace_scalar_method(sub, name, attributes))
 
     def solver_expression(self, code):
@@ -1696,6 +1721,9 @@ class _ModelGenerator:
 
     def trace_transition(self, sub, name, *, timed=True):
         """Trace the ordinary state-changing callback, including ODE-state resets."""
+        hook = getattr(sub, f"cpp_{name}", None)
+        if hook is not None:
+            return hook(self)
         bindings = self.equation_bindings.get(id(sub), {})
 
         def run():
@@ -1877,6 +1905,16 @@ class _ModelGenerator:
     def _output(self, method: Any) -> list[str]:
         owner = method.__self__
         out = owner.out
+        function = getattr(method, "__func__", method)
+        passthrough = getattr(function, "_peslite_netlist_passthrough", None)
+        if passthrough is not None:
+            circuit = owner._circuit
+            return [f"{self.value(out, field)} = {self.value(circuit.out, source)};"
+                    for field, source in passthrough]
+        generated = getattr(function, "_peslite_netlist_outputs", None)
+        if generated is not None:
+            circuit, fields = generated
+            return self.trace_netlist_outputs(owner, method, circuit, fields)
         hook = getattr(owner, "cpp_outputs", None)
         if hook is not None:
             return list(hook(self))
@@ -1913,6 +1951,215 @@ class _ModelGenerator:
                 source.ramp = lambda t: _Expression(f"{ramp[2]}({t.code})", "real")
                 attributes["source"] = source
         return attributes
+
+    @contextmanager
+    def _netlist_symbols(self, circuit: Any):
+        """Expose registered model values to one netlist trace without changing its equations."""
+        restored = []
+        records = []
+        for owner in (*circuit.components, circuit):
+            for role in ("state", "inp", "out"):
+                record = getattr(owner, role, None)
+                if record is not None and id(record) in self.record_fields:
+                    records.append(record)
+            for name, value in self._equation_attributes(owner).items():
+                restored.append((owner, name, getattr(owner, name)))
+                setattr(owner, name, value)
+        seen = set()
+        for record in records:
+            if id(record) in seen:
+                continue
+            seen.add(id(record))
+            for field in _fields(record):
+                key = id(record), field
+                if key not in self.record_types:
+                    continue
+                restored.append((record, field, getattr(record, field)))
+                setattr(record, field, _Expression(self.value(record, field), self.record_types[key]))
+        for owner, attribute in self.equation_bindings.get(id(circuit), {}).values():
+            member, kind, _owner, _attribute = self.equation_members[id(owner), attribute]
+            restored.append((owner, attribute, getattr(owner, attribute)))
+            setattr(owner, attribute, _Expression(member, kind))
+        net = circuit.netlist
+        transient = (circuit.derivatives, circuit.t, circuit._stored,
+                     net._last, net._mode, net._frozen_mode, net._frozen_topology,
+                     net._scalar_functions, net._scalar_topology)
+        circuit._stored = None
+        net._scalar_functions = type(net._scalar_functions)()
+        net._scalar_topology = None
+        try:
+            yield
+        finally:
+            (circuit.derivatives, circuit.t, circuit._stored,
+             net._last, net._mode, net._frozen_mode, net._frozen_topology,
+             net._scalar_functions, net._scalar_topology) = transient
+            for owner, name, value in reversed(restored):
+                setattr(owner, name, value)
+
+    @staticmethod
+    def _trace_circuit_solve(circuit: Any, t: Any) -> None:
+        """Evaluate the circuit's selected netlist execution form with symbolic values."""
+        circuit.receive()
+        states = circuit._states() if circuit._transforms else circuit.gather()
+        if circuit.form == "device":
+            derivatives = circuit.scalar_derivatives(t, states)
+            outputs = circuit.scalar_outputs(t, states)
+        else:
+            derivatives, all_outputs = circuit.netlist.evaluate_scalar_raw(t, states, record=False)
+            outputs = tuple(all_outputs[index] for index in circuit.output_indices)
+        if circuit._transforms:
+            derivatives = np.asarray(derivatives)
+            for index, _transform, inverse in circuit._transforms:
+                derivatives[index] = inverse @ derivatives[index]
+            circuit.derivatives = derivatives.tolist()
+        else:
+            circuit.derivatives = list(derivatives)
+        circuit.publish(outputs)
+        circuit.t = t
+
+    def trace_circuit_outputs(self, circuit: Any) -> list[str]:
+        """Emit a whole-circuit netlist evaluation and retain its derivative expressions."""
+        fields = _fields(circuit.out)
+
+        def run():
+            with self._netlist_symbols(circuit):
+                self._trace_circuit_solve(circuit, _Expression("t", "real"))
+                return tuple(getattr(circuit.out, field) for field in fields)
+
+        with self._shared_terms() as (prefix, terms):
+            values = self._trace(run)
+        lines = [f"{self.value(circuit.out, field)} = {value.code};"
+                 for field, value in zip(fields, values)
+                 if value.code != self.value(circuit.out, field)]
+        return self._term_declarations(prefix, terms, lines)
+
+    def trace_netlist_outputs(self, owner: Any, method: Any, circuit: Any,
+                              fields: tuple[str, ...]) -> list[str]:
+        """Trace one dependency stage generated from a component's local netlist."""
+        def run():
+            with self._netlist_symbols(circuit):
+                self._trace_circuit_solve(circuit, _Expression("t", "real"))
+                for field in fields:
+                    setattr(owner.out, field, getattr(circuit.out, circuit.published[id(owner), field]))
+                return tuple(getattr(owner.out, field) for field in fields)
+
+        with self._shared_terms() as (prefix, terms):
+            values = self._trace(run)
+        lines = [f"{self.value(owner.out, field)} = {value.code};"
+                 for field, value in zip(fields, values)
+                 if value.code != self.value(owner.out, field)]
+        return self._term_declarations(prefix, terms, lines)
+
+    def trace_netlist_rhs(self, sub: Any, method: Any, circuit: Any,
+                          entries: tuple[tuple[int, bool], ...]) -> list[str]:
+        """Trace state derivatives generated from the same component or circuit netlist."""
+        def run():
+            with self._netlist_symbols(circuit):
+                self._trace_circuit_solve(circuit, _Expression("t", "real"))
+                d = circuit.derivatives
+                return tuple(d[index] + 1j * d[index + 1] if complex_state else d[index]
+                             for index, complex_state in entries)
+
+        return [value.code for value in self._trace(run)]
+
+    def trace_circuit_commutation_margin(self, circuit: Any) -> str:
+        """Trace the minimum diode guard from the circuit's own netlist primitives."""
+        diodes = circuit.cpp_commutating_diodes
+
+        def run():
+            with self._netlist_symbols(circuit):
+                states = circuit._states()
+                margins, _tolerances = circuit.netlist.scalar_margins(
+                    _Expression("t", "real"), states
+                )
+                margin = min((margins[circuit.netlist._diodes.index(diode)] - diode.residual
+                              for diode in diodes),
+                             default=math.inf)
+                return -math.inf if circuit.netlist.projection_inconsistent(
+                    _Expression("t", "real"), states
+                ) else margin
+
+        with self._shared_terms() as (prefix, terms):
+            value = self._trace(run)
+        lines = self._term_declarations(prefix, terms, [f"return {value.code};"])
+        code = value.code if len(lines) == 1 else f"([&]() {{ {' '.join(lines)} }}())"
+        return self.solver_expression(code)
+
+    def trace_circuit_commutation(self, circuit: Any) -> list[str]:
+        """Emit one topology-independent diode-pattern transition from netlist equations."""
+        net = circuit.netlist
+        diodes = circuit.cpp_commutating_diodes
+        indices = tuple(net._diodes.index(diode) for diode in diodes)
+
+        def run():
+            with self._netlist_symbols(circuit):
+                states = circuit._states()
+                impulses = net.impulse_flags(_Expression("t", "real"), states)
+                projected = list(net.projected_values(_Expression("t", "real"), states))
+                margins, tolerances = net.scalar_margins(_Expression("t", "real"), projected)
+                if circuit._transforms:
+                    component = np.asarray(projected, dtype=object)
+                    for index, _transform, inverse in circuit._transforms:
+                        component[index] = inverse @ component[index]
+                    projected = component.tolist()
+                return tuple(projected), margins, tolerances, impulses
+
+        with self._shared_terms() as (prefix, terms):
+            projected, margins, tolerances, impulses = self._trace(run)
+        tag = self.prefix[id(circuit)]
+        state_assignments = []
+        for component, name, complex_value, index in circuit.layout:
+            target, _declared_complex = self.state_index[id(component.state), name]
+            if complex_value:
+                state_assignments.extend(((f"y[{target}]", projected[index]),
+                                          (f"y[{target + 1}]", projected[index + 1])))
+            else:
+                state_assignments.append((f"y[{target}]", projected[index]))
+        state_assignments = [(target, value) for target, value in state_assignments
+                             if target != value.code]
+        projected_lines = _assign_values(f"commutation_{tag}_state", state_assignments)
+        bad = [f"commutation_{tag}_bad_{index}" for index in range(len(diodes))]
+        any_impulse = " || ".join(impulses[index].code for index in indices) or "false"
+        declarations = [
+            f"const bool {name} = (commutation_attempt == 0) ? "
+            f"(({impulse.code}) || (!({any_impulse}) && "
+            f"({margin.code}) - ({self.equation_members[id(diode), 'residual'][0]}) < 0.0)) : "
+            f"(({impulse.code}) || (!({any_impulse}) && "
+            f"({margin.code}) < -({tolerance.code})));"
+            for name, diode, index in zip(bad, diodes, indices)
+            for margin, tolerance, impulse in ((margins[index], tolerances[index], impulses[index]),)
+        ]
+        invalid = " || ".join(bad) or "false"
+        residuals = [
+            f"{self.equation_members[id(diode), 'residual'][0]} = std::min({margin.code}, 0.0);"
+            for diode, index in zip(diodes, indices)
+            for margin in (margins[index],)
+        ]
+        flips = [
+            f"if ({name}) {self.equation_members[id(diode), 'conducting'][0]} = "
+            f"!{self.equation_members[id(diode), 'conducting'][0]};"
+            for name, diode in zip(bad, diodes)
+        ]
+        inner = self._term_declarations(prefix, terms, [
+            *declarations,
+            f"if (!({invalid})) {{",
+            *projected_lines,
+            "if (commutation_attempt != 0) {",
+            *residuals,
+            "}",
+            "return;",
+            "}",
+            *flips,
+        ])
+        return [self.solver_expression(line) for line in [
+            "[&]() {",
+            f"for (int commutation_attempt = 0; commutation_attempt < {_MAX_PATTERNS}; "
+            "++commutation_attempt) {",
+            *inner,
+            "}",
+            f"throw std::runtime_error({_cpp_string('netlist diode conduction did not settle')});",
+            "}()",
+        ]]
 
     def _operation(self, operation: tuple, indent: str = "",
                    direct_guards: dict[int, str] | None = None) -> list[str]:
@@ -2116,6 +2363,11 @@ class _ModelGenerator:
             })
 
     def _rhs(self, sub: Any) -> list[str]:
+        method = sub.rhs
+        generated = getattr(getattr(method, "__func__", method), "_peslite_netlist_rhs", None)
+        if generated is not None:
+            circuit, entries = generated
+            return self.trace_netlist_rhs(sub, method, circuit, entries)
         hook = getattr(sub, "cpp_rhs", None)
         if hook is not None:
             return list(hook(self))
@@ -2128,11 +2380,6 @@ class _ModelGenerator:
             raise TypeError(f"C++ export: continuous controller {label!r} is not yet lowered")
         label = self.subsystem_name.get(id(sub), type(sub).__name__)
         try:
-            method = sub.rhs
-            if (isinstance(sub, RLBranch) and getattr(method, "__func__", None) in
-                    (RLBranch._rhs_bilateral, RLBranch._rhs_unilateral,
-                     RLBranch._rhs_open, RLBranch._rhs_conduction)):
-                method = RLBranch.rhs.__get__(sub)
             return self.trace_rhs(sub, method, self._equation_attributes(sub))
         except Exception as exc:
             raise TypeError(
@@ -2199,12 +2446,13 @@ class _ModelGenerator:
                 f"{_CPP_TYPES[self.record_types[id(record), field]]} hold_{_identifier(label)} = {_literal(value)};"
             )
         for sub in self.model.subsystems:
-            attributes = self._equation_attributes(sub)
+            owner = getattr(sub, "component", sub)
+            attributes = self._equation_attributes(owner)
             for name in ("breaker_open", "tripped"):
                 if name in attributes:
-                    lines.append(f"bool {attributes[name].code} = {_literal(bool(getattr(sub, name)))};")
+                    lines.append(f"bool {attributes[name].code} = {_literal(bool(getattr(owner, name)))};")
             if "source" in attributes:
-                start, duration, law = self.source_ramp_members(sub)
+                start, duration, law = self.source_ramp_members(owner)
                 control = next((control for control in controllers
                                 if control.unit.dclink is sub), None)
                 expression = "1.0"

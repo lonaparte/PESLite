@@ -134,6 +134,21 @@ class OutputMethod:
     rhs: bool = True
 
 
+@dataclass(frozen=True)
+class _InlineProgram:
+    """Straight-line implementation of a generated subsystem method.
+
+    Generated physical models may expose their already compiled statements to :class:`Model`.
+    The model scheduler then places those statements directly in its evaluation program instead
+    of calling through one Python method per component. ``results`` contains the expressions
+    returned by an RHS method; output methods leave it empty.
+    """
+
+    statements: tuple[str, ...]
+    results: tuple[str, ...]
+    namespace: Mapping[str, Any]
+
+
 @runtime_checkable
 class Subsystem(Protocol):
     """Continuous block with ``state``, ``inp`` and ``out`` records and state derivatives.
@@ -1413,24 +1428,68 @@ class Model:
         load = [put(st, name, f"complex(v[{idx}], v[{idx + 1}])" if is_c else f"v[{idx}]")
                 for st, name, idx, is_c in self._state_ops]
 
-        plan, derivative_plan = [], []
+        def inline(method: Callable) -> tuple[list[str], tuple[str, ...]] | None:
+            function = getattr(method, "__func__", method)
+            program = getattr(function, "_peslite_inline_program", None)
+            owner = getattr(method, "__self__", None)
+            if not isinstance(program, _InlineProgram) or owner is None:
+                return None
+            records = {
+                "self.state": getattr(owner, "state", None),
+                "self.inp": getattr(owner, "inp", None),
+                "self.out": getattr(owner, "out", None),
+            }
+            records = {name: ref(value) for name, value in records.items() if value is not None}
+            replacements = {"self": ref(owner)}
+            replacements.update({name: ref(value) for name, value in program.namespace.items()})
+            pattern = re.compile(
+                r"\b(" + "|".join(map(re.escape, sorted(replacements, key=len, reverse=True)))
+                + r")\b"
+            )
+
+            def substitute(source: str) -> str:
+                for name, replacement in records.items():
+                    source = source.replace(name, replacement)
+                return pattern.sub(lambda match: replacements[match.group(1)], source)
+
+            return ([substitute(line) for line in program.statements],
+                    tuple(substitute(result) for result in program.results))
+
+        def operation_lines(operation: tuple) -> list[str]:
+            kind, method = operation
+            program = inline(method) if kind == "out" else None
+            return program[0] if program is not None and not program[1] else [step(operation)]
+
+        plan_by_operation, derivative_by_operation = [], []
         for operation, (op_owners, _srcs), rhs_required in zip(
                 self._plan, self._plan_owners, self._plan_rhs):
             comment = ", ".join(owners[id(owner)] for owner in op_owners)
-            line = f"{step(operation)}  # {comment}"
-            plan.append(line)
-            if rhs_required:
-                derivative_plan.append(line)
+            lines = operation_lines(operation)
+            if lines:
+                lines[-1] += f"  # {comment}"
+            plan_by_operation.append(lines)
+            derivative_by_operation.append(lines if rhs_required else [])
+
+        plan = [line for lines in plan_by_operation for line in lines]
+        derivative_plan = [line for lines in derivative_by_operation for line in lines]
+        zoh_plan = [line for index in self._zoh_plan for line in plan_by_operation[index]]
 
         derive, packed = [], []
         for j, (sub, flags, _all_complex) in enumerate(self._rhs_plan):
             got = [f"d{j}_{q}" for q in range(len(flags))]
-            derive.append(f"{', '.join(got)}, = {ref(sub)}.rhs(t)  # {owners[id(sub)]}")
+            program = inline(sub.rhs)
+            if program is None or len(program[1]) != len(got):
+                derive.append(f"{', '.join(got)}, = {ref(sub)}.rhs(t)  # {owners[id(sub)]}")
+            else:
+                statements, results = program
+                derive.extend(statements)
+                derive.extend(f"{name} = {result}" for name, result in zip(got, results))
+                derive[-1] += f"  # {owners[id(sub)]}"
             for d, is_c in zip(got, flags):
                 packed += [f"{d}.real", f"{d}.imag"] if is_c else [d]
 
         source = "\n".join(_function("_load(v)", load) + _function("_outputs(t)", plan)
-                           + _function("_zoh_outputs(t)", [plan[i] for i in self._zoh_plan])
+                           + _function("_zoh_outputs(t)", zoh_plan)
                            + _function("rhs_list(t, v)", load + derivative_plan + derive
                                        + [f"return [{', '.join(packed)}]"])) + "\n"
         filename = f"<peslite model {id(self):#x}>"
@@ -1628,7 +1687,7 @@ class Model:
 
     def sync(self, t: float, y: NDArray[np.float64]) -> None:
         """Load ``y`` into the subsystems and refresh all outputs (for sampling/logging)."""
-        self._load(y.tolist())
+        self._load(y.tolist() if hasattr(y, "tolist") else y)
         self._outputs(t)
 
     # ---------------------------------------------------------------- energy

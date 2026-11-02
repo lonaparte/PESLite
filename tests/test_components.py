@@ -53,22 +53,26 @@ def test_electrical_terminals_use_the_energy_direction_and_numbered_voltage_port
         Terminal(branch, "u1", "i", -1)
 
 
-def test_inherited_branch_behavior_uses_the_preselected_equations():
+def test_inherited_branch_behavior_uses_the_declared_netlist_equations():
     class DerivedBranch(RLBranch):
         pass
 
-    branch = DerivedBranch(1.0, 0.0, i0=-1.0, phases=1, unilateral=True)
+    branch = DerivedBranch(1.0, 0.0, i0=1.0, phases=1, unilateral=True)
     branch.inp.u1, branch.inp.u2 = 0.0, 1.0
     branch.set_outputs(0.0)
 
-    assert branch.set_outputs.__func__ is RLBranch._set_outputs_unilateral
-    assert branch.rhs.__func__ is RLBranch._rhs_unilateral
-    assert branch.out.i == 0.0
-    assert branch.rhs(0.0) == (0.0,)
+    assert any(type(element).__name__ == "Inductor"
+               for element in branch._device_circuit.netlist.elements)
+    if branch.commutation_margin() < 0.0:
+        branch.commutate(0.0)
+        branch.set_outputs(0.0)
+    assert branch.out.i == 1.0
+    assert branch.rhs(0.0) == (-1.0,)
     branch.open_breaker()
-    assert branch.rhs.__func__ is RLBranch._rhs_open
+    assert branch.rhs(0.0) == (0.0,)
     branch.close_breaker()
-    assert branch.rhs.__func__ is RLBranch._rhs_unilateral
+    branch.state.i = 1.0
+    assert branch.rhs(0.0) == (-1.0,)
 
 
 def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():

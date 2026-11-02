@@ -61,6 +61,35 @@ def test_margin_commutation_is_located_and_its_state_written_back():
     assert y[0] == pytest.approx(2.0, abs=1e-12)  # reset to 0 at t = 1, then 2 s of ramp
 
 
+def test_margin_observation_reuses_rhs_synchronization(monkeypatch):
+    part = _Ramp()
+    model, handler = _handler(part)
+    synchronize = model.sync
+    calls = 0
+
+    def counted(t, y):
+        nonlocal calls
+        calls += 1
+        synchronize(t, y)
+
+    monkeypatch.setattr(model, "sync", counted)
+    handler.advance(0.0, 0.9, np.zeros(1))
+
+    # One initial boundary synchronization and one final endpoint synchronization suffice;
+    # interior guards reuse the already synchronized first RK stage.
+    assert calls == 2
+
+
+def test_boundary_only_commutation_settles_without_interval_location():
+    part = _Ramp()
+    part.locate_commutations = False
+    part.state.x = 2.0
+    _model, handler = _handler(part)
+    y = handler.advance(0.0, 0.5, np.array([2.0]))
+    assert part.at == [0.0]
+    assert y[0] == pytest.approx(0.5, abs=1e-12)
+
+
 def test_zero_margin_plateau_does_not_move_the_commutation_to_its_start():
     part = _Ramp()
     part.commutation_margin = lambda: (

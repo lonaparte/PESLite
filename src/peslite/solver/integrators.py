@@ -37,6 +37,25 @@ class SolverStep:
     n_rhs: int = 0
 
 
+@dataclass
+class _GuardedStep:
+    """First internal solver step that makes a scalar guard negative.
+
+    ``(previous_t, previous_y, previous_margin)`` is the last accepted nonnegative point and
+    ``(t, y, margin)`` the first negative point. If no crossing occurs, both points are the final
+    state and ``crossed`` is false. A missing ``previous_margin`` means the first step crossed.
+    """
+
+    t: float
+    y: NDArray[np.float64]
+    margin: float
+    previous_t: float
+    previous_y: NDArray[np.float64]
+    previous_margin: float | None
+    crossed: bool
+    n_rhs: int = 0
+
+
 @runtime_checkable
 class Solver(Protocol):
     """Integrate ``y' = f(t, y)`` from ``t0`` to ``t1`` and return ``SolverStep``.
@@ -106,13 +125,10 @@ def integrator(method: str, dt: float, rtol: float = 1e-6, atol: float = 1e-9,
     """Return the single-rate integrator of ``method``: fixed-step with maximum step ``dt`` (s),
     the built-in ``"DP45"`` or a SciPy method.
 
-    ``circuit_model`` selects the Jacobian and linear-system implementation of an implicit method.
+    ``circuit_model`` selects electrical assembly and, for an implicit method, its linear system.
     """
     if circuit_model not in CIRCUIT_MODELS:
         raise ValueError(f"unknown circuit model {circuit_model!r}")
-    implicit = method in IMPLICIT_FIXED_METHODS or method in IMPLICIT_ADAPTIVE_METHODS
-    if circuit_model != "device" and not implicit:
-        raise ValueError(f"circuit model {circuit_model!r} needs an implicit method")
     adaptive = isinstance(solver_type, str) and solver_type.casefold() == "adaptive"
     if method in EXPLICIT_FIXED_METHODS and not adaptive:
         return FixedStepSolver(dt, method)
@@ -179,25 +195,142 @@ class FixedStepSolver:
             t += h
         return SolverStep(t1, y, self.n_rhs)
 
+    def advance_guarded(
+        self,
+        f: RHS,
+        t0: float,
+        t1: float,
+        y0: NDArray[np.float64],
+        guard: Callable[[float, NDArray[np.float64] | list[float]], float],
+        *,
+        max_step: float = math.inf,
+        synchronized_guard: Callable[[float, NDArray[np.float64] | list[float]], float] | None = None,
+    ) -> _GuardedStep:
+        """Advance through internal steps and stop at the first negative ``guard(t, y)``.
 
-@functools.lru_cache(maxsize=None)
+        This is the fixed-step solver's generic boundary-observation interface. It retains the
+        last valid state, so a caller can locate a boundary only inside the crossing step instead
+        of repeatedly invoking the solver for every ordinary step. ``synchronized_guard`` may be
+        supplied when an RHS evaluation also refreshes everything read by the guard; interior
+        observations then reuse the first RHS stage of the following step.
+        """
+        span = t1 - t0
+        if span <= 0.0:
+            margin = float(guard(t1, y0))
+            return _GuardedStep(t1, y0, margin, t1, y0, margin, margin < 0.0, self.n_rhs)
+        step = min(self.dt, max_step)
+        if step <= 0.0:
+            raise ValueError("max_step must be positive")
+        n = subintervals(span, step)
+        h = span / n
+        lists = getattr(getattr(f, "__self__", None), "rhs_list", None)
+        if self.method == "RK4" and lists is not None:
+            result = _rk4_on_floats_guarded(len(y0), synchronized_guard is not None)(
+                lists, guard, synchronized_guard, t0, y0.tolist(), n, h
+            )
+            if result is not None:
+                previous_t, previous_y, previous_margin, t, y, margin, calls = result
+                self.n_rhs += calls
+                crossed = margin < 0.0
+                if not crossed:
+                    previous_t, previous_y, previous_margin, t = t1, y, margin, t1
+                return _GuardedStep(
+                    t, np.asarray(y), margin, previous_t, np.asarray(previous_y),
+                    previous_margin, crossed, self.n_rhs,
+                )
+
+        c, a, _b = TABLEAUS[self.method]
+        y, t = np.asarray(y0, dtype=float), t0
+        previous_margin = None
+        calls = 0
+        for completed in range(1, n + 1):
+            previous_t, previous_y = t, y
+            ks = []
+            ks.append(f(t, y))
+            calls += 1
+            if synchronized_guard is not None and completed > 1:
+                margin = float(synchronized_guard(t, y))
+                if margin < 0.0:
+                    self.n_rhs += calls
+                    return _GuardedStep(
+                        t, y, margin, last_t, last_y, previous_margin, True, self.n_rhs,
+                    )
+                previous_margin = margin
+            last_t, last_y = previous_t, previous_y
+            for j in range(1, len(c)):
+                ks.append(f(t + c[j] * h, stage_state(y, h, a[j - 1], ks)))
+                calls += 1
+            y = combine(self.method, y, h, ks)
+            t += h
+            if synchronized_guard is None:
+                margin = float(guard(t, y))
+                if margin < 0.0:
+                    self.n_rhs += calls
+                    return _GuardedStep(
+                        t, y, margin, previous_t, previous_y, previous_margin, True, self.n_rhs,
+                    )
+                previous_margin = margin
+        if synchronized_guard is not None:
+            margin = float(guard(t, y))
+            if margin < 0.0:
+                self.n_rhs += calls
+                return _GuardedStep(
+                    t, y, margin, previous_t, previous_y, previous_margin, True, self.n_rhs,
+                )
+        self.n_rhs += calls
+        return _GuardedStep(t1, y, margin, t1, y, margin, False, self.n_rhs)
+
+
 def _rk4_on_floats(size: int):
     """Build an RK4 stepper on ``size`` floats that returns ``None`` on a non-finite value."""
-    ys = [f"y{i}" for i in range(size)]
-    y = "[" + ", ".join(ys) + "]"
+    return _rk4_float_program(size, "plain")
 
-    def stage(k: str) -> str:  # stage derivative names: [a0, a1, ...]
+
+def _rk4_on_floats_guarded(size: int, synchronized: bool):
+    """Build an RK4 loop which observes a scalar guard after every completed step."""
+    return _rk4_float_program(size, "synchronized" if synchronized else "guarded")
+
+
+@functools.lru_cache(maxsize=None)
+def _rk4_float_program(size: int, observation: str):
+    """Compile the shared scalar RK4 equations with an optional boundary observer."""
+    guarded = observation != "plain"
+    synchronized = observation == "synchronized"
+    ys = [f"y{i}" for i in range(size)]
+    ps = [f"p{i}" for i in range(size)]
+    y = "[" + ", ".join(ys) + "]"
+    p = "[" + ", ".join(ps) + "]"
+
+    def stage(k: str) -> str:
         return "[" + ", ".join(f"{k}{i}" for i in range(size)) + "]"
 
-    def args(k: str, h: str) -> str:  # stage state: [y0 + h * a0, ...]
+    def args(k: str, h: str) -> str:
         return "[" + ", ".join(f"y{i} + {h} * {k}{i}" for i in range(size)) + "]"
 
-    lines = ["def rk4(g, t, y, steps, h):",
+    signature = ("g, guard, synchronized_guard, t, y, steps, h" if guarded
+                 else "g, t, y, steps, h")
+    lines = [f"def rk4({signature}):",
              "    h2 = 0.5 * h",
              "    h6 = h / 6.0",
-             f"    {y} = y",
-             "    for _ in range(steps):",
-             f"        {stage('a')} = g(t, {y})",
+             f"    {y} = y"]
+    if guarded:
+        lines.insert(3, "    previous_margin = None")
+    if synchronized:
+        lines += [f"    {p} = {y}", "    previous_t = t"]
+    loop = "completed in range(1, steps + 1)" if guarded else "_ in range(steps)"
+    lines += [f"    for {loop}:"]
+    if guarded and not synchronized:
+        lines += [f"        {p} = {y}", "        previous_t = t"]
+    lines += [f"        {stage('a')} = g(t, {y})"]
+    if synchronized:
+        lines += ["        if completed > 1:",
+                  f"            margin = float(synchronized_guard(t, {y}))",
+                  "            if margin < 0.0:",
+                  f"                return previous_t, {p}, previous_margin, t, {y}, margin, 4 * completed - 3",
+                  "            previous_margin = margin",
+                  f"            {p} = {y}",
+                  "            previous_t = t"]
+    lines += [
              f"        x = {args('a', 'h2')}",
              "        if not isfinite(sum(x)):",
              "            return None",
@@ -210,12 +343,27 @@ def _rk4_on_floats(size: int):
              "        if not isfinite(sum(x)):",
              "            return None",
              f"        {stage('d')} = g(t + h, x)"]
-    lines += [f"        y{i} = y{i} + h6 * ((a{i} + 2.0 * (b{i} + c{i})) + d{i})" for i in range(size)]
+    lines += [f"        y{i} = y{i} + h6 * ((a{i} + 2.0 * (b{i} + c{i})) + d{i})"
+              for i in range(size)]
     lines += [f"        if not isfinite({' + '.join(['0.0'] + ys)}):",
               "            return None",
               "        t += h",
-              f"    return {y}"]
-    source, filename = "\n".join(lines) + "\n", f"<peslite RK4, {size} floats>"
+    ]
+    if synchronized:
+        lines += [f"    margin = float(guard(t, {y}))",
+                  "    if margin < 0.0:",
+                  f"        return previous_t, {p}, previous_margin, t, {y}, margin, 4 * steps",
+                  f"    return t, {y}, margin, t, {y}, margin, 4 * steps"]
+    elif guarded:
+        lines += [f"        margin = float(guard(t, {y}))",
+                  "        if margin < 0.0:",
+                  f"            return previous_t, {p}, previous_margin, t, {y}, margin, 4 * completed",
+                  "        previous_margin = margin",
+                  f"    return t, {y}, previous_margin, t, {y}, previous_margin, 4 * steps"]
+    else:
+        lines += [f"    return {y}"]
+    label = "RK4" if not guarded else f"{observation} RK4"
+    source, filename = "\n".join(lines) + "\n", f"<peslite {label}, {size} floats>"
     env = {"isfinite": math.isfinite}
     exec(compile(source, filename, "exec"), env)
     linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)

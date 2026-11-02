@@ -8,14 +8,13 @@ stages never cross a model-changing boundary.
 
 ## Circuit model
 
-`circuit_model` selects how an implicit solver stores the circuit Jacobian and solves its Newton
-linear systems:
+`circuit_model` selects the electrical circuit representation independently of the time integrator:
 
 | Value | Implementation |
 |---|---|
-| `device` | one dense Jacobian, refreshed when Newton iteration stops contracting |
-| `statewise` | dense Jacobians cached and reused when an equation mode returns |
-| `mna` | state-space groups eliminated onto their shared interface |
+| `device` | netlist primitives compiled into direct scalar device equations |
+| `statewise` | the same netlist compiled to a dense state equation for each circuit mode |
+| `mna` | the same netlist solved as a sparse, factorized modified nodal system |
 
 ```yaml
 simulation:
@@ -25,8 +24,12 @@ simulation:
     circuit_model: statewise
 ```
 
-The default is `device`. `statewise` and `mna` require an implicit method; PESLite rejects
-them with an explicit method instead of accepting an ineffective setting.
+The default is `device`. Electrical components declare R, L, C, source, transformer and switching
+primitives; controls remain in the sampled control graph. A component law without an instantaneous
+primitive representation connects to the same network through a behavioral voltage or current port.
+All three circuit models work with explicit and implicit time integrators.
+For explicit integration of small circuits, `device` usually has the lowest per-stage overhead;
+`statewise` and `mna` are selected for their network formulation rather than assumed speedups.
 
 ## Fixed-step solvers
 

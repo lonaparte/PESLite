@@ -2,9 +2,10 @@
 
 ## 0.4.0
 
-- Added fixed-step trapezoidal and fifth-order Radau IIA integration. Implicit solvers can use
-  device, statewise or MNA circuit models through one shared Newton and
-  finite-difference Jacobian implementation.
+- Added fixed-step trapezoidal and fifth-order Radau IIA integration. Electrical components now
+  declare one netlist source compiled as direct scalar device equations, dense per-mode state
+  equations or a sparse factorized modified nodal system. Time integrators consume all three
+  representations through the same model interface.
 - Added single-phase AC network sources through ordinary scalar power ports and assembly-time
   electrical-domain constraints on inherently AC or DC terminals. Also made ADC window integration
   follow the configured physical sampling grid, and added open-loop duty control, the traceable

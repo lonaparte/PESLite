@@ -11,7 +11,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from functools import lru_cache
-from types import FunctionType
 from typing import Any, ClassVar
 
 from . import (Bag, ConfigError, Element, PowerPort, StoragePort, Terminal,
@@ -36,28 +35,6 @@ def _state_record(sections: int) -> type[Bag]:
     return type(f"_CableState{sections}", (Bag,), {"__slots__": names})
 
 
-@lru_cache(maxsize=None)
-def _rhs_function(sections: int) -> FunctionType:
-    """Build a straight-line RHS once; no section loop or mode branch remains at run time."""
-    lines = ["def rhs(self, t):", "    s = self.state", "    inp = self.inp", "    return ("]
-    for k in range(sections + 1):
-        left = "inp.u1" if k == 0 else f"s.uC{k}"
-        right = "inp.u2" if k == sections else f"s.uC{k + 1}"
-        lines.append(
-            f"        ({left} - {right} - self.series_r[{k}] * s.iL{k + 1}) "
-            f"/ self.series_l[{k}],"
-        )
-    for k in range(sections):
-        lines.append(
-            f"        (s.iL{k + 1} - s.iL{k + 2} - self.shunt_g * s.uC{k + 1}) "
-            "/ self.shunt_c,"
-        )
-    lines.append("    )")
-    namespace: dict[str, Any] = {}
-    exec(compile("\n".join(lines) + "\n", "<peslite cable rhs>", "exec"), namespace)
-    return namespace["rhs"]
-
-
 class CableModel:
     """Two-terminal R-L/G-C cable; both terminal currents are positive into the cable."""
 
@@ -75,6 +52,7 @@ class CableModel:
         self.shunt_g = g_per_km * cell
         self.shunt_c = c_per_km * cell
         self.state_names = _state_record(sections).__slots__
+        self.state_dimensions = dict.fromkeys(self.state_names, 2)
         initial = {name: 0j for name in self.state_names}
         initial.update({f"uC{k}": complex(voltage0) for k in range(1, sections + 1)})
         self.state = _state_record(sections)(**initial)
@@ -98,27 +76,51 @@ class CableModel:
         )
         self.terminal1 = Terminal(self, "u1", "i1", 1)
         self.terminal2 = Terminal(self, "u2", "i2", 1)
-        # Specialise the short ladder equation once, rather than looping over dynamic records on
-        # every solver stage.  The generated function is shared by every cable with this size.
-        self.rhs = _rhs_function(sections).__get__(self, type(self))
 
     def set_outputs(self, t: float) -> None:
-        self.out.i1 = self.state.iL1
-        self.out.i2 = -getattr(self.state, f"iL{self.sections + 1}")
+        from ...solver.netlist import device_outputs
+        device_outputs(self, t)
 
-    def rhs(self, t: float):  # replaced by the size-specialised method during construction
-        raise RuntimeError("cable RHS was not initialised")
+    def rhs(self, t: float):
+        from ...solver.netlist import device_rhs
+        return device_rhs(self, t)
 
     def dissipated_power(self) -> float:
-        state = self.state
-        series = sum(r * abs(getattr(state, f"iL{k + 1}")) ** 2
-                     for k, r in enumerate(self.series_r))
-        shunt = self.shunt_g * sum(abs(getattr(state, f"uC{k + 1}")) ** 2
-                                  for k in range(self.sections))
-        return 1.5 * (series + shunt)
+        from ...solver.netlist import device_dissipated_power
+        return device_dissipated_power(self)
 
     def supplied_power(self) -> float:
         return 0.0
+
+    def netlist(self, nb):
+        """Declare the cable's distributed R-L and G-C ladder."""
+        from ...solver import netlist as nl
+
+        nodes = [
+            nb.node(self.terminal1),
+            *(nb.internal(2, 1.5) for _ in range(self.sections)),
+            nb.node(self.terminal2),
+        ]
+        for index, (resistance, inductance) in enumerate(
+                zip(self.series_r, self.series_l)):
+            start = nodes[index]
+            if resistance:
+                inner = nb.internal(2, 1.5)
+                nb.add(nl.Resistor(start, inner, resistance))
+                start = inner
+            nb.add(nl.Inductor(
+                start,
+                nodes[index + 1],
+                inductance,
+                nb.state(self, f"iL{index + 1}"),
+            ))
+        for index in range(1, self.sections + 1):
+            nb.add(nl.Capacitor(
+                nodes[index], None, self.shunt_c, nb.state(self, f"uC{index}")
+            ))
+            if self.shunt_g:
+                nb.add(nl.Resistor(nodes[index], None, 1.0 / self.shunt_g))
+        nb.losses(self)
 
 
 @register_element_type

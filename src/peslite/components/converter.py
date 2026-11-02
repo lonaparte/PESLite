@@ -49,72 +49,29 @@ class _HalfBridgeOut(Bag):
     __slots__ = ("u_c", "i_dc", "i_lower")
 
 
-def _set_three_phase_dc_current(bridge, _t: float) -> None:
-    bridge.out.i_dc = 1.5 * (bridge.inp.q * bridge.inp.i_c.conjugate()).real
+class _LegGates:
+    """Read complementary leg gates from the held switching state."""
 
+    __slots__ = ("model", "q", "gates")
 
-def _set_scalar_dc_current(bridge, _t: float) -> None:
-    bridge.out.i_dc = (bridge.inp.q * bridge.inp.i_c).real
+    def __init__(self, model) -> None:
+        self.model, self.q, self.gates = model, None, ()
 
-
-def _set_half_bridge_currents(bridge, _t: float) -> None:
-    q, current = bridge.inp.q, bridge.inp.i_c
-    bridge.out.i_dc = (q * current).real
-    bridge.out.i_lower = ((1.0 - q) * current).real
-
-
-def _set_half_bridge_transferred_currents(bridge, _t: float) -> None:
-    current = bridge.inp.i_c
-    bridge.out.i_dc = (bridge.inp.upper_current_ratio * current).real
-    bridge.out.i_lower = (bridge.inp.lower_current_ratio * current).real
-
-
-def _set_half_bridge_voltage(bridge, _t: float) -> None:
-    q = bridge.inp.q
-    bridge.out.u_c = q * bridge.inp.u_dc + (1.0 - q) * bridge.inp.u_lower
-
-
-def _leg_conduction(upper_drop, lower_drop, upper_gate, lower_gate):
-    """Return R_on times each device current; equal device resistance factors out of KCL."""
-    upper_positive = 0.5 * (upper_drop + abs(upper_drop))
-    lower_negative = 0.5 * (lower_drop - abs(lower_drop))
-    return (upper_drop - upper_positive + upper_gate * upper_positive,
-            lower_drop - lower_negative + lower_gate * lower_negative)
-
-
-def _common_reference(model, gates):
-    """Eliminate a floating pole reference using the exact piecewise-linear device law.
-
-    Each of n legs contributes two breakpoints. Their current sums bracket zero; interpolation
-    between the nearest bracketing points is exact. No iterative solve or tolerance is needed.
-    """
-    offsets = tuple((factor * model.state.u_C).real for factor in model._voltage_factors)
-    lower = model.inp.u_lower if model.lower_terminal is not None else 0.0
-    upper = model.inp.u_dc
-    upper_on = model.enabled * model._upper_controlled
-    lower_on = model.enabled * model._lower_controlled
-
-    def balance(reference):
-        total = 0.0
-        for offset, gate in zip(offsets, gates):
-            first, second = _leg_conduction(upper - reference - offset, lower - reference - offset,
-                                            upper_on * gate, lower_on * (1.0 - gate))
-            total += first + second
-        return total
-
-    points = tuple(rail - offset for rail in (lower, upper) for offset in offsets)
-    lo = hi = points[0]
-    for point in points[1:]:
-        lo = np.minimum(lo, point).item()
-        hi = np.maximum(hi, point).item()
-    minimum, maximum = lo, hi
-    for point in points:
-        value = balance(point)
-        lo = np.maximum(lo, np.where(value >= 0.0, point, minimum).item()).item()
-        hi = np.minimum(hi, np.where(value <= 0.0, point, maximum).item()).item()
-    first, second = balance(lo), balance(hi)
-    denominator = first - second
-    return lo + first * (hi - lo) / denominator if denominator > 0.0 else 0.5 * (lo + hi)
+    def __call__(self, leg: int) -> bool:
+        selected = getattr(self.model, "_netlist_gate_pattern", None)
+        if selected is not None:
+            return bool(selected[leg])
+        q = self.model.inp.q
+        if not isinstance(q, (int, float, complex, np.number)):
+            return tuple(
+                gate > 0.5 for gate in self.model.topology.pole_gates(q, True)
+            )[leg]
+        if self.q is None or q != self.q:
+            self.q = q
+            self.gates = tuple(
+                gate > 0.5 for gate in self.model.topology.pole_gates(q, True)
+            )
+        return self.gates[leg]
 
 
 class ThreePhaseBridge:
@@ -130,7 +87,6 @@ class ThreePhaseBridge:
     unilateral = False
     upper_controlled = lower_controlled = True
     config_fields = frozenset()
-    set_dc_current = staticmethod(_set_three_phase_dc_current)
     voltage_factors = (1.0, A120.conjugate(), A120)
     series_devices = 1
 
@@ -208,9 +164,6 @@ class _BridgeModel:
             q=zero, u_dc=0.0, i_c=zero)
         self.out = getattr(self.topology, "output_type", _BridgeOut)(u_c=zero, i_dc=0.0)
         self.output_stages = getattr(self.topology, "output_stages", type(self).output_stages)
-        voltage = getattr(self.topology, "set_ac_voltage", None)
-        if voltage is not None:
-            self.set_ac_voltage = voltage.__get__(self, type(self))
         self.ports = (
             PowerPort("inp.u_dc", "out.i_dc"),
             PowerPort("out.u_c", "inp.i_c", self.topology.power_scale, -1.0),
@@ -218,27 +171,26 @@ class _BridgeModel:
         self.dc_terminal = Terminal(self, "u_dc", "i_dc", 1, electrical_domain="dc")
         self.power_terminal = Terminal(self, "u_c", "i_c", -1, drives_voltage=True)
         self.lower_terminal = None
-        self.set_dc_current = self.topology.set_dc_current.__get__(self, type(self))
         self.modulator = None
         self.state_owner = self
         self.continuous = True
         self.enabled = False
+        self._current_transfer = False
         initialize = getattr(self.topology, "initialize_model", None)
         if initialize is not None:
             initialize(self, parallel_capacitance)
+        self.set_dc_current = self._device_outputs
+        self.set_ac_voltage = self._device_outputs
         if (not math.isfinite(parallel_capacitance) or parallel_capacitance < 0.0
                 or not math.isfinite(on_resistance) or on_resistance < 0.0):
             raise ConfigError("bridge capacitance and on_resistance must be finite and >= 0")
+        self.device_on_resistance = _real(on_resistance)
         if parallel_capacitance > 0.0:
             if on_resistance <= 0.0:
                 raise ConfigError("bridge.parallel_capacitance requires positive on_resistance")
             self._capacitive_devices(parallel_capacitance, on_resistance, switching)
         elif on_resistance > 0.0:
             self.resistance = self.topology.series_devices * _real(on_resistance)
-            self._source_voltage = self.set_ac_voltage
-            self.set_ac_voltage = self._resistive_voltage
-            self.dissipated_power = self._resistive_loss
-            self.supplied_power = self._zero_power
             self.dirac = False
             self.output_stages = tuple(
                 replace(stage, inputs=tuple(dict.fromkeys((*stage.inputs, "i_c"))))
@@ -248,93 +200,188 @@ class _BridgeModel:
         """Whether the bridge also constrains its external branch current."""
         return self.topology.unilateral and not self.state_names
 
-    def _resistive_voltage(self, t: float) -> None:
-        self._source_voltage(t)
-        self.out.u_c -= self.resistance * self.inp.i_c
+    def netlist(self, nb):
+        """Declare the bridge as explicit legs or a lossless conversion ratio."""
+        from ..solver import netlist as nl
 
-    def _resistive_loss(self) -> float:
-        return (self.topology.power_scale * self.resistance
-                * getattr(self.inp, "loss_factor", 1.0) * abs(self.inp.i_c) ** 2)
+        topology = self.topology
+        if self._current_transfer:
+            nb.local_model()
+            ac = nb.node(self.power_terminal)
+            dc = nb.node(self.dc_terminal)
+            lower = nb.node(self.lower_terminal)
 
-    def _zero_power(self) -> float:
-        return 0.0
+            def voltage(_t):
+                q = topology.switching_state((self.inp.q,))
+                return q * self.inp.u_dc + (1.0 - q) * self.inp.u_lower
+
+            nb.add(
+                nl.VoltageSource(
+                    ac, None,
+                    nb.function(voltage, ("q", "u_dc", "u_lower")),
+                ),
+                nl.CurrentSource(
+                    dc, None,
+                    nb.function(
+                        lambda _t: self.inp.upper_current_ratio * self.inp.i_c,
+                        ("upper_current_ratio", "i_c"),
+                    ),
+                ),
+                nl.CurrentSource(
+                    lower, None,
+                    nb.function(
+                        lambda _t: self.inp.lower_current_ratio * self.inp.i_c,
+                        ("lower_current_ratio", "i_c"),
+                    ),
+                ),
+            )
+            resistance = getattr(self, "resistance", 0.0)
+            if resistance:
+                loss = nb.internal(1, topology.power_scale)
+                loss_current = nb.function(
+                    lambda _t: max(0.0, self.inp.loss_factor) ** 0.5
+                    * abs(self.inp.i_c),
+                    ("loss_factor", "i_c"),
+                )
+                nb.add(
+                    nl.CurrentSource(None, loss, loss_current),
+                    nl.Resistor(loss, None, resistance),
+                )
+            nb.losses(self)
+            return None
+        if self.state_names:
+            capacitor = nb.add(nl.Capacitor(
+                nb.node(self.power_terminal), None, self.capacitor.C,
+                nb.state(self, "u_C"),
+            ))
+            if not self._switching_poles:
+                nb.mixture(self._gate_patterns, self._select_gate_pattern)
+            self._netlist_legs(nb)
+            nb.node_current_output(
+                self, "i_device", nb.node(self.power_terminal), exclude=(capacitor,)
+            )
+            return None
+        if (not getattr(topology, "controlled", True)
+                or not (topology.upper_controlled and topology.lower_controlled)
+                or self.power_terminal.hold_voltage_input is not None):
+            return self._netlist_legs(nb)
+
+        three_phase = isinstance(topology.zero, complex)
+        ac = nb.node(self.power_terminal)
+        resistance = getattr(self, "resistance", 0.0)
+        pole = nb.internal(*((2, 1.5) if three_phase else (1, 1.0))) if resistance else ac
+        if resistance:
+            nb.add(nl.Resistor(pole, ac, resistance))
+        lower = nb.node(self.lower_terminal) if self.lower_terminal is not None else None
+        nb.add(nl.Transformer(
+            pole, lower, nb.node(self.dc_terminal), lower, nb.value(self.inp, "q")
+        ))
+        nb.losses(self)
+
+    def _netlist_legs(self, nb) -> None:
+        """Declare one pair of controlled-device/diode positions per bridge leg."""
+        from ..solver import netlist as nl
+
+        topology = self.topology
+        on = self.device_on_resistance
+        gate = _LegGates(self)
+        upper = topology.upper_controlled and getattr(topology, "controlled", True)
+        lower = topology.lower_controlled and getattr(topology, "controlled", True)
+
+        def leg(midpoint, high, low, index):
+            pair = (
+                nl.Diode(
+                    midpoint,
+                    high,
+                    on,
+                    gate=(lambda: self.enabled and gate(index)) if upper else None,
+                ),
+                nl.Diode(
+                    low,
+                    midpoint,
+                    on,
+                    gate=(lambda: self.enabled and not gate(index)) if lower else None,
+                ),
+            )
+            nb.add(*pair)
+            return pair
+
+        ac, dc = nb.node(self.power_terminal), nb.node(self.dc_terminal)
+        if self.lower_terminal is None and not isinstance(topology.zero, complex):
+            high, low = nb.internal(), nb.internal()
+            supply = nb.add(nl.Transformer(high, low, dc, None, ((1.0,),)))
+            devices = (*leg(ac, high, low, 0), *leg(None, high, low, 1))
+            nb.output(self, "i_dc", ("branch_current", supply, 1))
+            if getattr(self, "_current", None) is not None:
+                nb.bind(self._bind_netlist_devices, devices)
+                nb.commutation(self, after=self._mirror_netlist_conduction, diodes=devices)
+        else:
+            high = nb.internal()
+            upper_feed = nb.add(nl.Resistor(dc, high, 0.0))
+            nb.output(self, "i_dc", ("branch_current", upper_feed))
+            if self.lower_terminal is not None:
+                low = nb.internal()
+                lower_node = nb.node(self.lower_terminal)
+                lower_feed = nb.add(nl.Resistor(lower_node, low, 0.0))
+                nb.output(self, "i_lower", ("branch_current", lower_feed))
+                leg(ac, high, low, 0)
+            else:
+                count = len(topology.voltage_factors)
+                chain = [ac, *(nb.internal(2, 1.5) for _ in range(count - 1)), None]
+                basis = tuple(tuple(float(row == column) for column in range(count))
+                              for row in range(count))
+                for index, state in enumerate(basis):
+                    factor = topology.switching_state(state)
+                    column = (factor.real, factor.imag)
+                    midpoint = nb.internal()
+                    leg(midpoint, high, None, index)
+                    nb.add(nl.Transformer(
+                        chain[index], chain[index + 1], midpoint, None,
+                        ((column[0],), (column[1],)),
+                    ))
+        nb.output(self, "u_c", ("node_voltage", ac))
+        nb.losses(self)
 
     def _capacitive_devices(self, capacitance, resistance, switching) -> None:
         """Compose finite device conductances with the existing capacitor and algebraic solver."""
-        self.on_resistance = _real(resistance)
         self._switching_poles = switching
-        self._voltage_factors = self.topology.voltage_factors
-        reference = getattr(self.topology, "pole_reference", _common_reference)
-        self._pole_reference = reference.__get__(self, type(self)) if len(self._voltage_factors) > 1 else None
-        self._upper_controlled = self.topology.upper_controlled
-        self._lower_controlled = self.topology.lower_controlled
+        self._netlist_gate_pattern = None
         self.capacitor = RCNode(capacitance, 0.0, phases=3 if isinstance(self.topology.zero, complex) else 1)
         self.state, self.state_names = self.capacitor.state, self.capacitor.state_names
         self.storage = tuple(replace(port, flows=()) for port in self.capacitor.storage)
         self.out = _extend_record(self.out, "i_device", "power_loss")
         self.out.i_device = self.topology.zero
         inputs = ("q", "u_dc") + (("u_lower",) if self.lower_terminal else ())
-        currents = ("i_dc", "i_device", "power_loss")
+        currents = ("i_dc", "i_device")
         if self.lower_terminal is not None:
             currents += ("i_lower",)
         self.output_stages = (
             OutputMethod("set_ac_voltage", (), ("u_c",)),
             OutputMethod("set_dc_current", inputs, currents),
+            OutputMethod("set_power_loss", (), ("power_loss",), rhs=False),
         )
-        self.set_ac_voltage = self._capacitor_voltage
-        self.set_dc_current = self._device_currents
-        self.rhs = self._capacitor_rhs
-        self.dissipated_power = self._device_loss
-        self.supplied_power = self._zero_power
         self.dirac = False
         self.models_blocked_diodes = True
 
-    def _capacitor_voltage(self, t: float) -> None:
-        self.out.u_c = self.state.u_C
-
-    def _device_currents(self, t: float) -> None:
-        """One leg law for gated devices and their anti-parallel diodes in every topology."""
-        voltage = self.state.u_C
-        lower = self.inp.u_lower if self.lower_terminal is not None else 0.0
-        gates = self.topology.pole_gates(self.inp.q, self._switching_poles)
-        gates = tuple(np.minimum(1.0, np.maximum(0.0, gate)).item() for gate in gates)
-        intervals = ((1.0, gates),) if self._switching_poles else CarrierComparison.state_fractions(gates)
-        upper_on = self.enabled * self._upper_controlled
-        lower_on = self.enabled * self._lower_controlled
-        current, upper_current, lower_current, loss = self.topology.zero, 0.0, 0.0, 0.0
-        for weight, states in intervals:
-            neutral = self._pole_reference(states) if self._pole_reference is not None else 0.0
-            for factor, gate in zip(self._voltage_factors, states):
-                pole = neutral + (factor * voltage).real
-                upper_drop, lower_drop = self.inp.u_dc - pole, lower - pole
-                upper, lower_i = _leg_conduction(upper_drop, lower_drop,
-                                                 upper_on * gate, lower_on * (1.0 - gate))
-                upper /= self.on_resistance
-                lower_i /= self.on_resistance
-                current += weight * factor.conjugate() * (upper + lower_i)
-                upper_current += weight * upper
-                lower_current += weight * lower_i
-                loss += weight * (upper_drop * upper + lower_drop * lower_i)
-        self.out.i_device = current / self.topology.power_scale
-        self.out.i_dc = upper_current
-        if self.lower_terminal is not None:
-            self.out.i_lower = lower_current
-        self.out.power_loss = loss
-
-    def _capacitor_rhs(self, t: float):
-        self.capacitor.inp.i = self.out.i_device - self.inp.i_c
-        return self.capacitor.rhs(t)
-
-    def _device_loss(self) -> float:
-        return self.out.power_loss
+    def _device_outputs(self, t: float) -> None:
+        from ..solver.netlist import device_outputs
+        device_outputs(self, t)
 
     def set_ac_voltage(self, t: float) -> None:
-        self.out.u_c = self.inp.q * self.inp.u_dc
+        self._device_outputs(t)
 
     def set_outputs(self, t: float) -> None:
-        """Evaluate dc current and ac voltage from the current inputs."""
-        self.set_dc_current(t)
-        self.set_ac_voltage(t)
+        self._device_outputs(t)
+
+    def set_power_loss(self, _t: float) -> None:
+        self.out.power_loss = self.dissipated_power()
+
+    def _gate_patterns(self):
+        duties = self.topology.pole_gates(self.inp.q, False)
+        return CarrierComparison.state_fractions(duties)
+
+    def _select_gate_pattern(self, pattern) -> None:
+        self._netlist_gate_pattern = pattern
 
     def use_current_transfer_ratios(self) -> None:
         """Drive both half-bridge rail currents from explicit conduction ratios."""
@@ -343,8 +390,27 @@ class _BridgeModel:
             raise TypeError("the selected topology has no independent rail-current transfer ratios")
         configure(self)
 
+    def _bind_netlist_devices(self, netlist, devices) -> None:
+        self._netlist_devices = netlist, tuple(devices)
+
+    def _device_commutation_margin(self) -> float:
+        from ..solver.netlist import device_commutation_margin
+        return device_commutation_margin(self)
+
+    def _device_commutate(self, t: float) -> None:
+        from ..solver.netlist import device_commutate
+        device_commutate(self, t)
+
     def rhs(self, t: float):
-        return ()
+        from ..solver.netlist import device_rhs
+        return device_rhs(self, t)
+
+    def dissipated_power(self) -> float:
+        from ..solver.netlist import device_dissipated_power
+        return device_dissipated_power(self)
+
+    def supplied_power(self) -> float:
+        return 0.0
 
     def zoh_connections(self, label: str) -> dict:
         """An unclocked model has no held modulation input."""
@@ -586,7 +652,6 @@ class HalfBridge:
 
     input_type = _HalfBridgeInp
     output_type = _HalfBridgeOut
-    set_ac_voltage = staticmethod(_set_half_bridge_voltage)
     output_stages: ClassVar[tuple[OutputMethod, ...]] = (
         OutputMethod(
             "set_dc_current", inputs=("q", "i_c"), outputs=("i_dc", "i_lower")
@@ -595,26 +660,13 @@ class HalfBridge:
             "set_ac_voltage", inputs=("q", "u_dc", "u_lower"), outputs=("u_c",)
         ),
     )
-    _transferred_current_stages: ClassVar[tuple[OutputMethod, ...]] = (
-        OutputMethod(
-            "set_dc_current",
-            inputs=("upper_current_ratio", "lower_current_ratio", "i_c"),
-            outputs=("i_dc", "i_lower"),
-        ),
-        OutputMethod(
-            "set_ac_voltage", inputs=("q", "u_dc", "u_lower"), outputs=("u_c",)
-        ),
-    )
-
-
     def initialize_model(self, model, parallel_capacitance: float) -> None:
         model.inp.loss_factor = 1.0
         model.ports += (PowerPort("inp.u_lower", "out.i_lower"),)
         model.lower_terminal = Terminal(model, "u_lower", "i_lower", 1)
 
     def use_current_transfer_ratios(self, model) -> None:
-        model.set_dc_current = _set_half_bridge_transferred_currents.__get__(model, type(model))
-        model.output_stages = self._transferred_current_stages
+        model._current_transfer = True
 
     type = "half_bridge"
     duty_names = ("d",)
@@ -624,7 +676,6 @@ class HalfBridge:
     config_fields = frozenset((
         "upper_controlled", "lower_controlled", "reverse_port", "external_terminal",
     ))
-    set_dc_current = staticmethod(_set_half_bridge_currents)
     voltage_factors = (1.0,)
     series_devices = 1
 
@@ -827,15 +878,12 @@ class FullBridge:
     ``parallel_capacitance`` across its AC terminals.
     """
 
-    zero_current_tolerance = 1e-6  # A, a blocked pair's located-current tolerance
-
     type = "full_bridge"
     duty_names = ("d_left", "d_right")
     zero = 0.0
     power_scale = 1.0
     neutral_duty = 0.5
     config_fields = frozenset(("upper_controlled", "lower_controlled"))
-    set_dc_current = staticmethod(_set_scalar_dc_current)
     voltage_factors = (0.5, -0.5)
     series_devices = 2
 
@@ -845,18 +893,6 @@ class FullBridge:
             return np.maximum(q, 0.0).item(), np.maximum(-q, 0.0).item()
         return 0.5 * (1.0 + q), 0.5 * (1.0 - q)
 
-    @staticmethod
-    def pole_reference(model, gates):
-        """Eliminate the common voltage of two identical legs from their symmetry."""
-        reference = 0.5 * model.inp.u_dc
-        if not model.topology.controlled:
-            return reference
-        # Equal gate states connect two devices to the same rail. At high differential
-        # voltage one opposite diode also conducts, adding a third equal conductance.
-        zero_vector = model.enabled * np.where(gates[0] == gates[1], 1.0, 0.0).item()
-        excess = np.maximum(0.5 * abs(model.state.u_C) - model.inp.u_dc, 0.0).item() / 3.0
-        zero_reference = gates[0] * model.inp.u_dc + (2.0 * gates[0] - 1.0) * excess
-        return reference + zero_vector * (zero_reference - reference)
     __slots__ = ("controlled",)
 
     @property
@@ -925,64 +961,18 @@ class FullBridge:
         model.commutations = 0
         model.discrete_state_names = ("direction",)
         model.linearization_state_names = ()
-        model.dissipated_power = model._zero_power
-        model.supplied_power = model._zero_power
         methods = (
-            ("set_dc_current", "_diode_current"),
-            ("set_ac_voltage", "_diode_voltage"),
-            ("current_constraint", "_diode_current_constraint"),
-            ("commutation_margin", "_commutation_margin"),
-            ("commutate", "_commutate"),
             ("describe", "_diode_description"),
             ("get_state", "_conduction_state"),
             ("set_state", "_restore_conduction_state"),
             ("equation_state_bindings", "_conduction_bindings"),
+            ("_mirror_netlist_conduction", "_mirror_netlist_conduction"),
         )
+        model._netlist_devices = None
         for name, method in methods:
             setattr(model, name, getattr(type(self), method).__get__(model, type(model)))
-
-    @staticmethod
-    def _diode_current(model, t: float) -> None:
-        model.out.i_dc = -model._current.sign * model.inp.i_c.real
-
-    @staticmethod
-    def _diode_voltage(model, t: float) -> None:
-        if model._current.sign != 0.0:
-            model.out.u_c = -model._current.sign * model.inp.u_dc
-        else:
-            model.out.u_c = model.inp.u_hold
-
-    @staticmethod
-    def _diode_current_constraint(model):
-        return 0.0 if model._current.sign == 0.0 else None
-
-    @staticmethod
-    def _commutation_margin(model) -> float:
-        """Nonnegative while the present conduction state is valid."""
-        current = model.inp.i_c.real
-        u_dc = model.inp.u_dc.real
-        if model._current.sign != 0.0:
-            return model._current.margin(current)
-        # blocked: valid while |u_hold| < u_dc and the port current keeps its zero value
-        return min(u_dc - abs(model.inp.u_hold.real),
-                   model._current.margin(current, model.topology.zero_current_tolerance))
-
-    @staticmethod
-    def _commutate(model, t: float) -> None:
-        """Switch the conducting pair at a located current zero, or end a blocking interval."""
-        current = model.inp.i_c.real
-        u_dc = model.inp.u_dc.real
-        if model._current.sign == 0.0:
-            if abs(model._current.offset(current)) > model.topology.zero_current_tolerance:
-                # current through blocked diodes (an initial state): conduct in its direction
-                model._current.sign = _real(np.copysign(1.0, model._current.offset(current)))
-            else:
-                model._current.locate(current, -1.0 if model.inp.u_hold.real > 0.0
-                                     else 1.0)
-        else:
-            reverse = abs(model.inp.u_hold.real) > u_dc
-            model._current.locate(current, -model._current.sign if reverse else 0.0)
-        model.commutations += 1
+        model.commutation_margin = model._device_commutation_margin
+        model.commutate = model._device_commutate
 
     @staticmethod
     def _diode_description(model) -> str:
@@ -1010,6 +1000,26 @@ class FullBridge:
             model._current.sign = direction
         if "i_ref" in values:
             model._current.residual = float(values["i_ref"])
+        if model._netlist_devices is not None:
+            netlist, devices = model._netlist_devices
+            sign, residual = model._current.sign, model._current.residual
+            states = (sign < 0.0, sign > 0.0, sign > 0.0, sign < 0.0)
+            currents = (-residual, residual, residual, -residual)
+            for device, conducting, current in zip(devices, states, currents):
+                netlist.set_conducting(device, conducting, current if conducting else 0.0)
+
+    @staticmethod
+    def _mirror_netlist_conduction(model, t: float, before: Mapping[str, Any]) -> None:
+        """Mirror the netlist diode pair into the rectifier's public discrete state."""
+        netlist, devices = model._netlist_devices
+        (c1, r1), (c2, r2), (c3, _), (c4, _) = (
+            netlist.conduction(device) for device in devices
+        )
+        positive, negative = c2 and c3, c1 and c4
+        sign = 1.0 if positive and not negative else -1.0 if negative and not positive else 0.0
+        if sign != model._current.sign:
+            model.commutations += 1
+        model._current.locate(r2 if sign > 0.0 else -r1 if sign < 0.0 else 0.0, sign)
 
 class _DCState(Bag):
     __slots__ = ("u_C",)
@@ -1029,10 +1039,6 @@ class DCCapacitor:
     def __init__(self, u0: float, C: float, R_esr: float = 0.0) -> None:
         self.C, self.R_esr = _real(C), _real(R_esr)
         self.state = _DCState(u_C=_real(u0))
-
-    def dissipated_power(self, i: float) -> float:
-        return self.R_esr * i ** 2
-
 
 def _zero(t: float) -> float:
     return 0.0
@@ -1071,10 +1077,6 @@ class DCVoltageSource:
     def __init__(self, u_dc: float, R: float = 0.0) -> None:
         self.u_dc, self.R = _real(u_dc), _real(R)
 
-    def dissipated_power(self, i: float) -> float:
-        return self.R * i ** 2
-
-
 class DCLink:
     """DC link made of an optional capacitor and a current source, voltage source or no source.
 
@@ -1112,20 +1114,6 @@ class DCLink:
             self, "u_dc", "i_dc", -1, drives_voltage=True, electrical_domain="dc"
         )
         self.tripped = False
-        # The circuit topology cannot change after assembly. Bind its equations once instead of
-        # rediscovering the capacitor/source combination at every Runge--Kutta stage.
-        if capacitor is None:
-            self.set_outputs = self._set_voltage_source_without_capacitor
-            self.rhs = self._rhs_without_capacitor
-        elif source is None:
-            self.set_outputs = self._set_capacitor_without_source
-            self.rhs = self._rhs_with_capacitor
-        elif isinstance(source, DCVoltageSource):
-            self.set_outputs = self._set_capacitor_with_voltage_source
-            self.rhs = self._rhs_with_capacitor
-        else:
-            self.set_outputs = self._set_capacitor_with_current_source
-            self.rhs = self._rhs_with_capacitor
 
     def open_breaker(self) -> None:
         """Disconnect the source from the capacitor; a link without capacitor is unchanged."""
@@ -1145,56 +1133,66 @@ class DCLink:
             source.u_dc, source.R = float(v), float(r)
 
     def set_stored_voltage(self, t: float) -> None:
-        """Expose the capacitor voltage (or stiff source emf) without a dc-current dependency."""
-        self.out.u_C = (self.capacitor.state.u_C if self.capacitor is not None
-                        else self.source.u_dc)
+        from ..solver.netlist import device_outputs
+        device_outputs(self, t)
 
-    def _set_voltage_source_without_capacitor(self, t: float) -> None:
-        source, i_dc, out = self.source, self.inp.i_dc, self.out
-        out.u_dc = out.u_C = source.u_dc - source.R * i_dc
-        out.i_src = i_dc
+    def set_outputs(self, t: float) -> None:
+        from ..solver.netlist import device_outputs
+        device_outputs(self, t)
 
-    def _set_capacitor_without_source(self, t: float) -> None:
-        cap, i_dc, out = self.capacitor, self.inp.i_dc, self.out
-        out.i_src = 0.0
-        out.u_C = cap.state.u_C
-        out.u_dc = cap.state.u_C - cap.R_esr * i_dc
+    def rhs(self, t: float):
+        from ..solver.netlist import device_rhs
+        return device_rhs(self, t)
 
-    def _set_capacitor_with_voltage_source(self, t: float) -> None:
-        cap, source, i_dc, out = self.capacitor, self.source, self.inp.i_dc, self.out
-        i_src = (0.0 if self.tripped else
-                 (source.u_dc - cap.state.u_C + cap.R_esr * i_dc) /
-                 (source.R + cap.R_esr))
-        out.i_src = i_src
-        out.u_C = cap.state.u_C
-        out.u_dc = cap.state.u_C + cap.R_esr * (i_src - i_dc)
+    def netlist(self, nb):
+        """Declare the DC-link capacitor, source and source breaker."""
+        from ..solver import netlist as nl
 
-    def _set_capacitor_with_current_source(self, t: float) -> None:
-        cap, source, i_dc, out = self.capacitor, self.source, self.inp.i_dc, self.out
-        i_src = 0.0 if self.tripped else source(t, cap.state.u_C)
-        out.i_src = i_src
-        out.u_C = cap.state.u_C
-        out.u_dc = cap.state.u_C + cap.R_esr * (i_src - i_dc)
-
-    def _rhs_without_capacitor(self, t: float):
-        return ()
-
-    def _rhs_with_capacitor(self, t: float):
-        return ((self.out.i_src - self.inp.i_dc) / self.capacitor.C,)
+        node, capacitor, source = nb.node(self.terminal), self.capacitor, self.source
+        if capacitor is not None:
+            inner = nb.internal() if capacitor.R_esr else node
+            if capacitor.R_esr:
+                nb.add(nl.Resistor(node, inner, capacitor.R_esr))
+            capacitor_element = nb.add(nl.Capacitor(
+                inner, None, capacitor.C, nb.state(self, "u_C")
+            ))
+            nb.output(self, "u_C", ("branch_voltage", capacitor_element))
+        if isinstance(source, DCCurrentSource):
+            supply = nb.add(nl.CurrentSource(
+                None,
+                node,
+                nb.function(
+                    lambda t: 0.0 if self.tripped
+                    else self.source(t, self.capacitor.state.u_C)
+                ),
+            ))
+            nb.output(self, "i_src", ("branch_current", supply))
+        elif isinstance(source, DCVoltageSource):
+            emf = nb.internal() if source.R or capacitor is not None else node
+            supply = nb.add(nl.VoltageSource(
+                emf, None, nb.function(lambda _t: self.source.u_dc)
+            ))
+            nb.linear_output(self, "i_src", ((-1.0, ("branch_current", supply)),))
+            if capacitor is None:
+                nb.output(self, "u_C", ("branch_voltage", supply))
+            if capacitor is not None:
+                connected = nb.internal() if source.R else node
+                nb.add(nl.Switch(emf, connected, nb.value(self, "tripped", invert=True)))
+                emf = connected
+            if source.R:
+                nb.add(nl.Resistor(emf, node, source.R))
+        else:
+            nb.linear_output(self, "i_src", ())
+        nb.losses(self)
+        nb.supplies(self)
 
     def dissipated_power(self) -> float:
-        loss = (self.capacitor.dissipated_power(self.out.i_src - self.inp.i_dc)
-                if self.capacitor is not None else 0.0)
-        if isinstance(self.source, DCVoltageSource):
-            i_src = self.inp.i_dc if self.capacitor is None else self.out.i_src
-            loss += self.source.dissipated_power(i_src)
-        return loss
+        from ..solver.netlist import device_dissipated_power
+        return device_dissipated_power(self)
 
     def supplied_power(self) -> float:
-        if isinstance(self.source, DCVoltageSource):
-            i_src = self.inp.i_dc if self.capacitor is None else self.out.i_src
-            return self.source.u_dc * i_src
-        return self.out.u_dc * self.out.i_src
+        from ..solver.netlist import device_supplied_power
+        return device_supplied_power(self)
 
 
 def make_dclink(cfg: Any) -> DCLink:

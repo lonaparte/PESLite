@@ -151,7 +151,9 @@ def test_circuit_models_preserve_the_same_simulation_equations(method, tmp_path)
     scale = np.maximum(np.abs(reference), 1e-3 * np.max(np.abs(reference)))
     results = [
         run(**{"simulation.solver.method": method,
-               "simulation.solver.circuit_model": circuit_model})
+               "simulation.solver.circuit_model": circuit_model,
+               "simulation.solver.rtol": 1e-10,
+               "simulation.solver.atol": 1e-11})
         for circuit_model in ("device", "statewise", "mna")
     ]
     for result in results[1:]:
@@ -163,9 +165,6 @@ def test_circuit_models_preserve_the_same_simulation_equations(method, tmp_path)
 
 @pytest.mark.parametrize("changes, message", [
     ({"simulation.solver.circuit_model": "nodal"}, "not in"),
-    ({"simulation.solver.circuit_model": "statewise"}, "needs an implicit method"),
-    ({"simulation.solver.type": "adaptive", "simulation.solver.method": "RK45",
-      "simulation.solver.circuit_model": "mna"}, "needs an implicit method"),
     ({"simulation.solver.method": "radau",
       "simulation.solver.subsystems": {"vsc.dclink": 4}}, "explicit system method"),
     ({"simulation.solver.method": "trapezoidal", "simulation.solver.rtol": 0.0},

@@ -494,10 +494,6 @@ def _solver(s) -> None:
         raise ConfigError(f"simulation.solver.method {s.method!r} is not one of {ADAPTIVE_METHODS}")
     fixed = s.type == "fixed"
     implicit = s.method in (IMPLICIT_FIXED_METHODS if fixed else IMPLICIT_ADAPTIVE_METHODS)
-    if s.circuit_model != "device" and not implicit:
-        raise ConfigError(
-            f"simulation.solver.circuit_model {s.circuit_model!r} needs an implicit method"
-        )
     if fixed:
         names = ("dt", "rtol", "atol") if implicit else ("dt",)
     else:

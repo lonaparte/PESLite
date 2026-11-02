@@ -156,7 +156,7 @@ simulation:                # how the model is simulated
   t_end: 3.0
   solver:
     dt: 25e-6              # fixed: maximum step
-    # circuit_model: device      # device | statewise | mna; implicit methods only
+    # circuit_model: device      # device | statewise | mna
     # type: fixed          # fixed | adaptive; presets: --averaging adaptive, the other two fixed
     # method: RK4          # fixed: euler | heun | RK4 | trapezoidal | radau
     #                      # adaptive: DP45 | RK23 | RK45 | DOP853 | radau | BDF | LSODA

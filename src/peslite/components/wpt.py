@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import math
 from typing import Any, ClassVar, Mapping
-from functools import lru_cache
 
 import numpy as np
 
@@ -50,90 +49,6 @@ def _two_coil_modes(primary: float, secondary: float, mutual: float):
     shapes = ((_real(-sine * first_sign), _real(cosine * second_sign)),
               (_real(cosine * first_sign), _real(sine * second_sign)))
     return inductance, shapes
-
-
-@lru_cache(maxsize=32)
-def _equation_methods(coil_sides, lcc_sides, cap_names, coil_outputs, capacitor_outputs, switched):
-    """Compile a bounded set of structural layouts, never numerical values or model instances."""
-    n = len(coil_sides)
-    mode_names = tuple(f"i_mode_{m + 1}" for m in range(n))
-    side_coils = {side: tuple(j for j, owner in enumerate(coil_sides) if owner == side)
-                  for side in SIDES}
-    coil_lines = ["s = self.state"]
-    for j in range(n):
-        coefficients = ", ".join(f"a{j}_{m}" for m in range(n))
-        coil_lines.append(f"{coefficients}, = self._shapes[{j}]")
-        expression = " + ".join(f"a{j}_{m} * s.{name}"
-                                for m, name in enumerate(mode_names))
-        coil_lines.append(f"i{j} = {expression}")
-    sums = {side: " + ".join(f"i{j}" for j in side_coils[side]) for side in SIDES}
-    output_lines = [*coil_lines, "out = self.out"]
-    if switched:
-        output_lines.append("self._t = t")
-    output_lines.extend(f"out.{side}_scc_on = _real(self.switched[{k}].on)"
-                        for k, (coil, name, side) in enumerate(switched))
-    for side in SIDES:
-        output_lines.append(f"out.i_{side}_coil = {sums[side]}")
-        current = f"s.i_{side}_comp" if side in lcc_sides else f"out.i_{side}_coil"
-        output_lines.append(f"out.i_{side} = {current}")
-    output_lines.extend(f"out.{name} = i{j}" for j, name in enumerate(coil_outputs))
-    output_lines.extend(f"out.{name} = s.{name}" for name in capacitor_outputs)
-    specs = [f"p_{side} = self.sides[{side!r}]" for side in SIDES if side in lcc_sides]
-    nodes = {}
-    front_currents, front_voltages = [], []
-    losses = [f"self.resistance[{j}] * i{j} * i{j}" for j in range(n)]
-    for side in SIDES:
-        if side in lcc_sides:
-            spec = f"p_{side}"
-            shunt = f"(s.i_{side}_comp - ({sums[side]}))"
-            nodes[side] = f"s.u_{side}_parallel + {spec}.parallel_resistance * {shunt}"
-            front_currents.append(f"(inp.u_{side} - node_{side} - "
-                                  f"{spec}.compensation_resistance * s.i_{side}_comp) "
-                                  f"/ {spec}.compensation_inductance")
-            front_voltages.append(f"{shunt} / {spec}.parallel_capacitance")
-            losses.extend((f"{spec}.compensation_resistance * s.i_{side}_comp * s.i_{side}_comp",
-                           f"{spec}.parallel_resistance * {shunt} * {shunt}"))
-        else:
-            nodes[side] = f"inp.u_{side}"
-    voltages = [f"v{j} = node_{side} - s.{cap_names[j]} - self.resistance[{j}] * i{j}"
-                for j, side in enumerate(coil_sides)]
-    for coil, name, side in switched:
-        voltages[coil] += f" - s.{name}"
-    rhs_lines = [*coil_lines, "inp = self.inp", *specs,
-                 *(f"node_{side} = {value}" for side, value in nodes.items()), *voltages]
-    modes = ["(" + " + ".join(f"a{j}_{m} * v{j}" for j in range(n))
-             + f") / self._inductance[{m}]" for m in range(n)]
-    derivatives = [*front_currents, *front_voltages, *modes,
-                   *(f"i{j} / self.capacitance[{j}]" for j in range(n)),
-                   *(f"0.0 if self.switched[{k}].on else i{coil} / self.switched[{k}].capacitance"
-                     for k, (coil, name, side) in enumerate(switched))]
-    rhs_lines.append("return (" + ", ".join(derivatives) + ",)")
-    coil_result = [*coil_lines, "return (" + ", ".join(f"i{j}" for j in range(n)) + ",)"]
-    functions = [("rhs", "self, t", rhs_lines),
-                 ("set_outputs", "self, t", output_lines),
-                 ("coil_currents", "self", coil_result),
-                 ("_losses", "self", [*coil_lines, *specs,
-                                       "return " + " + ".join(losses)])]
-    for side in SIDES:
-        lines = [*coil_lines, "inp = self.inp", *specs]
-        if (side in lcc_sides):
-            lines.append(f"return ({nodes[side]}) + "
-                         f"p_{side}.compensation_resistance * s.i_{side}_comp")
-        else:
-            lines.extend(f"node_{key} = {value if key != side else '0.0'}"
-                         for key, value in nodes.items())
-            lines.extend(voltages)
-            rate = " + ".join(f"self._hold_weights[{side!r}][{j}] * v{j}" for j in range(n))
-            lines.append(f"return -({rate}) / self._port_gain[{side!r}]")
-        functions.append((f"_hold_{side}", "self", lines))
-    namespace = {"_real": _real}
-    methods = []
-    for name, signature, lines in functions:
-        source = f"def {name}({signature}):\n" + "\n".join("    " + line for line in lines)
-        exec(compile(source + "\n", "<peslite compensated link>", "exec"), namespace)
-        methods.append((name, namespace[name]))
-    return tuple(methods)
-
 
 
 class _Side:
@@ -209,7 +124,6 @@ class CompensatedLink:
                                     for j in range(n)) if multi else ())
         capacitor_outputs = (tuple(f"u_{side}_parallel" for side in front)
                              + self._cap_names + self._scc_names)
-        self._capacitor_outputs = capacitor_outputs
         outputs = ("i_primary", "i_secondary", "i_primary_coil", "i_secondary_coil",
                    *self._coil_outputs, *capacitor_outputs,
                    *(f"{scc.side}_scc_on" for scc in switched))
@@ -223,20 +137,12 @@ class CompensatedLink:
         self.secondary_terminal = Terminal(
             self, "u_secondary", "i_secondary", 1, electrical_domain="ac"
         )
-        self._compile_equations()
 
-    def hold_voltage_source(self, terminal: Terminal, *, current_constraint=None) -> tuple:
+    def hold_voltage_source(self, terminal: Terminal) -> tuple:
         """Declare a blocking-voltage output for the actual connected terminal."""
         side = terminal.voltage.removeprefix("u_")
         if side not in self.sides:
             raise ValueError(f"unknown link terminal {terminal.voltage!r}")
-        if current_constraint is not None:
-            if not hasattr(self, "_current_constraints"):
-                self._current_constraints = {}
-                self._current_projections = {}
-                self.project_state = self._project_currents
-            self._current_constraints[side] = current_constraint
-        self._prepare_holds()
         if side not in self.hold_sides:
             self.hold_sides = (*self.hold_sides, side)
             self.out = _extend_record(self.out, f"u_hold_{side}")
@@ -246,72 +152,6 @@ class CompensatedLink:
                 f"set_hold_{side}", inputs=inputs, outputs=(f"u_hold_{side}",)))
         return self, f"u_hold_{side}"
 
-    def __copy__(self):
-        result = object.__new__(type(self))
-        result.__dict__.update(self.__dict__)
-        if hasattr(result, "_current_projections"):
-            result._current_projections = {}
-        if hasattr(result, "_hold_weights"):
-            del result._hold_weights
-            result._prepare_holds()
-        return result
-
-    def _project_currents(self) -> None:
-        """Enforce active port constraints jointly in the stored modal coordinates."""
-        targets = {}
-        for side, read in self._current_constraints.items():
-            value = read()
-            if value is None:
-                continue
-            if self.sides[side].lcc:
-                setattr(self.state, f"i_{side}_comp", value)
-            else:
-                targets[side] = value
-        if not targets:
-            return
-        active = tuple(targets)
-        if active not in self._current_projections:
-            # Weighted orthogonal rows implement the same minimum-energy projection without
-            # a numerical matrix solve. Coefficients are cached; scalar parameter expressions
-            # retain their arithmetic through construction and standalone export.
-            basis = []
-            for index, side in enumerate(active):
-                row = [sum(self._shapes[j][m] for j in self.sides[side].coils)
-                       for m in range(len(self._mode_names))]
-                weights = [1.0 if k == index else 0.0 for k in range(len(active))]
-                for orthogonal, direction, previous in basis:
-                    overlap = sum(a * b for a, b in zip(row, direction))
-                    row = [a - overlap * b for a, b in zip(row, orthogonal)]
-                    weights = [a - overlap * b for a, b in zip(weights, previous)]
-                inverse = [a / inductance for a, inductance in zip(row, self._inductance)]
-                norm = sum(a * b for a, b in zip(row, inverse))
-                basis.append((tuple(row), tuple(a / norm for a in inverse), tuple(weights)))
-            self._current_projections[active] = tuple(basis)
-        basis = self._current_projections[active]
-        old = tuple(getattr(self.state, name) for name in self._mode_names)
-        currents = [0.0] * len(old) if len(active) == len(old) else list(old)
-        values = tuple(targets.values())
-        for row, direction, weights in basis:
-            requested = sum(a * b for a, b in zip(weights, values))
-            if len(active) != len(old):
-                requested -= sum(a * b for a, b in zip(row, old))
-            currents = [value + gain * requested for value, gain in zip(currents, direction)]
-        for name, value in zip(self._mode_names, currents):
-            setattr(self.state, name, _real(value))
-
-    def _compile_equations(self) -> None:
-        """Bind the shared structural template to this instance's live coefficients.
-
-        The same equations serve Python, parameter tracing and C++ export. Only layout is cached;
-        no numerical coefficients, physical state or bound instance escapes into the cache.
-        """
-        methods = _equation_methods(
-            self.coil_sides, tuple(side for side in SIDES if self.sides[side].lcc),
-            self._cap_names, self._coil_outputs, self._capacitor_outputs,
-            tuple((scc.coil, scc.state_name, scc.side) for scc in self.switched))
-        for name, method in methods:
-            setattr(self, name, method.__get__(self, type(self)))
-
     def _module(self, coil: int) -> int:
         return self.sides[self.coil_sides[coil]].coils.index(coil)
 
@@ -320,32 +160,141 @@ class CompensatedLink:
         name = f"u_{side}_series" if self.sides[side].lcc else f"u_{side}_cap"
         return f"{name}_{self._module(coil) + 1}" if multi else name
 
-    def _prepare_holds(self) -> None:
-        """Build inverse-port coefficients only when a connected port needs blocking."""
-        if hasattr(self, "_hold_weights"):
-            return
-        n, shapes = len(self._mode_names), self._shapes
-        inverse = tuple(tuple(sum(shapes[j][m] * shapes[k][m] / self._inductance[m]
-                                  for m in range(n)) for k in range(n)) for j in range(n))
-        self._hold_weights = {
-            side: tuple(sum(inverse[j][k] for j in self.sides[side].coils) for k in range(n))
-            for side in SIDES}
-        self._port_gain = {
-            side: sum(self._hold_weights[side][k] for k in self.sides[side].coils)
-            for side in SIDES}
-
     def supplied_power(self) -> float:
         return 0.0
 
     def dissipated_power(self) -> float:
-        return self._losses()
+        from ..solver.netlist import device_dissipated_power
+        return device_dissipated_power(self)
+
+    def rhs(self, t: float):
+        from ..solver.netlist import device_rhs
+        return device_rhs(self, t)
+
+    def set_outputs(self, t: float) -> None:
+        self._t = t
+        for scc in self.switched:
+            setattr(self.out, f"{scc.side}_scc_on", _real(scc.on))
+
+    def coil_currents(self) -> tuple[float, ...]:
+        """Coil currents obtained from the stored modal coordinates."""
+        modal = tuple(getattr(self.state, name) for name in self._mode_names)
+        return tuple(sum(coefficient * current for coefficient, current in zip(row, modal))
+                     for row in self._shapes)
+
+    def netlist(self, nb):
+        """Declare the compensated coupled-coil network in coil coordinates."""
+        from ..solver import netlist as nl
+
+        count = len(self.coil_sides)
+        shapes = np.array(self._shapes, dtype=float).reshape(count, count)
+        inductance = shapes @ np.diag(np.asarray(self._inductance, dtype=float)) @ shapes.T
+        coils = [nb.internal() for _ in range(count)]
+        coupled = nb.add(nl.CoupledInductors(
+            [(coil, None) for coil in coils],
+            0.5 * (inductance + inductance.T),
+            nb.state(self, self._mode_names, transform=shapes),
+        ))
+        for side in SIDES:
+            nb.linear_output(
+                self,
+                f"i_{side}_coil",
+                [(1.0, ("branch_current", coupled, index))
+                 for index in self.sides[side].coils],
+            )
+        for index, name in enumerate(self._coil_outputs):
+            nb.output(self, name, ("branch_current", coupled, index))
+
+        def series(node, resistance):
+            if not resistance:
+                return node
+            inner = nb.internal()
+            nb.add(nl.Resistor(node, inner, resistance))
+            return inner
+
+        switched = {scc.coil: scc for scc in self.switched}
+        devices = []
+        for side in SIDES:
+            spec = self.sides[side]
+            node = nb.node(getattr(self, f"{side}_terminal"))
+            if spec.lcc:
+                parallel = nb.internal()
+                parallel_capacitor = nl.Capacitor(
+                    series(parallel, spec.parallel_resistance),
+                    None,
+                    spec.parallel_capacitance,
+                    nb.state(self, f"u_{side}_parallel"),
+                )
+                nb.add(
+                    nl.Inductor(
+                        series(node, spec.compensation_resistance),
+                        parallel,
+                        spec.compensation_inductance,
+                        nb.state(self, f"i_{side}_comp"),
+                    ),
+                    parallel_capacitor,
+                )
+                nb.output(self, f"u_{side}_parallel", ("branch_voltage", parallel_capacitor))
+                node = parallel
+            for index in spec.coils:
+                scc = switched.get(index)
+                terminal = nb.internal() if scc is not None else coils[index]
+                capacitor = nb.add(nl.Capacitor(
+                    series(node, self.resistance[index]),
+                    terminal,
+                    self.capacitance[index],
+                    nb.state(self, self._cap_names[index]),
+                ))
+                nb.output(self, self._cap_names[index], ("branch_voltage", capacitor))
+                if scc is not None:
+                    middle = nb.internal()
+                    pair = (
+                        nl.Diode(middle, terminal, gate=lambda s=scc: s.positive_gate),
+                        nl.Diode(middle, coils[index], gate=lambda s=scc: s.negative_gate),
+                    )
+                    switched_capacitor = nl.Capacitor(
+                            terminal,
+                            coils[index],
+                            scc.capacitance,
+                            nb.state(self, scc.state_name),
+                    )
+                    nb.add(switched_capacitor, *pair)
+                    nb.output(self, scc.state_name, ("branch_voltage", switched_capacitor))
+                    devices.append((scc, pair))
+        nb.losses(self)
+        if devices:
+            nb.bind(self._bind_netlist_devices, tuple(devices))
+            nb.commutation(
+                self,
+                margin=self._schedule_margin,
+                commutate=self._clock_commutate,
+                next_time=self.next_commutation_time,
+                after=self._mirror_conduction,
+                diodes=[device for _scc, pair in devices for device in pair],
+            )
+
+    def _bind_netlist_devices(self, netlist, devices) -> None:
+        self._netlist_devices = netlist, tuple(devices)
 
     # ------------------------------------------------------------------ blocking ports
     def set_hold_primary(self, t: float) -> None:
-        self.out.u_hold_primary = self._hold_primary()
+        self.out.u_hold_primary = self._hold_voltage("primary", t)
 
     def set_hold_secondary(self, t: float) -> None:
-        self.out.u_hold_secondary = self._hold_secondary()
+        self.out.u_hold_secondary = self._hold_voltage("secondary", t)
+
+    def _hold_voltage(self, side: str, t: float) -> float:
+        from ..solver.netlist import device_equilibrium_input
+
+        spec = self.sides[side]
+        if spec.lcc:
+            weights = {f"i_{side}_comp": 1.0}
+        else:
+            weights = {
+                name: sum(self._shapes[index][mode] for index in spec.coils)
+                for mode, name in enumerate(self._mode_names)
+            }
+        return device_equilibrium_input(self, f"u_{side}", weights, t)
 
 
 def _link_spec(cfg: Any) -> dict[str, Any]:
@@ -448,6 +397,7 @@ class SwitchControlledCapacitor:
         self._since = None
         self.switchings = self.hard_turn_ons = 0
         self.max_turn_on_voltage = self.impulsive_energy = 0.0
+        self._edge = -math.inf
 
     def __copy__(self):
         result = object.__new__(type(self))
@@ -468,7 +418,7 @@ class SwitchControlledCapacitor:
                 **{name: (self, name) for name in (
                     "started", "referenced", "on", "positive_gate", "negative_gate", "theta",
                     "half", "_reference", "switchings", "hard_turn_ons", "max_turn_on_voltage",
-                    "impulsive_energy")}}
+                    "impulsive_energy", "_edge")}}
 
     def bind_bridge(self, bridge: Any) -> None:
         self.bridge = bridge
@@ -572,6 +522,35 @@ class SwitchControlledCapacitor:
         self.gates = self._gate_state(t)
         self._set_conduction(link, current, voltage)
 
+    def clock(self, t: float, current: float) -> None:
+        """Advance the gate clock while the netlist owns conduction."""
+        self._synchronize_current(t, current)
+        before, self.gates = self.gates, self._gate_state(t)
+        if self.gates != before:
+            self._edge = t
+
+    def schedule_margin(self, t: float, current: float) -> float:
+        """Return the validity margin of the gate schedule and current clock."""
+        if not self.started or self.gates != self._gate_state(t):
+            return -1.0
+        return self.zero.margin(current, _CURRENT_TOL) if self.sync == "current" else math.inf
+
+    def mirror(self, t: float, conducting: bool, voltage: float) -> None:
+        """Mirror netlist conduction into the public SCC state and diagnostics."""
+        positive, negative = self.gates
+        if conducting:
+            if positive != negative and self.zero.sign == 0.0:
+                self.zero.sign = 1.0 if positive else -1.0
+            if not self.on:
+                self.switchings += 1
+                if abs(voltage) > _VOLTAGE_TOL and t == self._edge:
+                    self.hard_turn_ons += 1
+                self.max_turn_on_voltage = max(self.max_turn_on_voltage, abs(voltage))
+                self.impulsive_energy += 0.5 * self.capacitance * voltage * voltage
+        elif self.on:
+            self.switchings += 1
+        self.on = bool(conducting)
+
     def _synchronize_current(self, t: float, current: float) -> None:
         if not self.started:
             self.started = True
@@ -653,6 +632,7 @@ class SwitchedCompensatedLink(CompensatedLink):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._t = 0.0
+        self._netlist_devices = None
 
     def _scc_values(self):
         coils = self.coil_currents()
@@ -669,6 +649,41 @@ class SwitchedCompensatedLink(CompensatedLink):
 
     def next_commutation_time(self) -> float:
         return min(scc.next_time(self._t) for scc in self.switched)
+
+    def _schedule_margin(self) -> float:
+        coils = self.coil_currents()
+        return min(
+            scc.schedule_margin(self._t, coils[scc.coil]) for scc in self.switched
+        )
+
+    def _clock_commutate(self, t: float) -> None:
+        coils = self.coil_currents()
+        netlist, devices = self._netlist_devices
+        for scc, pair in devices:
+            before = scc.gates
+            scc.clock(t, coils[scc.coil])
+            flow = scc._flow(coils[scc.coil])
+            for index, (device, direction) in enumerate(zip(pair, (-1.0, 1.0))):
+                if (scc.on and before[index] and not scc.gates[index]
+                        and scc.gates[1 - index] and direction * flow > 0.0):
+                    netlist.set_conducting(device, True)
+
+    def _mirror_conduction(self, t: float, before: Mapping[str, float]) -> None:
+        netlist, devices = self._netlist_devices
+        for scc, (positive, negative) in devices:
+            conducting = (
+                (scc.positive_gate or netlist.conduction(positive)[0])
+                and (scc.negative_gate or netlist.conduction(negative)[0])
+            )
+            scc.mirror(t, conducting, _real(before[scc.state_name]))
+
+    def _restore_conduction(self) -> None:
+        if self._netlist_devices is None:
+            return
+        netlist, devices = self._netlist_devices
+        for scc, (positive, negative) in devices:
+            netlist.set_conducting(positive, scc.on and not scc.positive_gate)
+            netlist.set_conducting(negative, scc.on and not scc.negative_gate)
 
     def equation_state_bindings(self):
         return {"time": (self, "_t"),
@@ -700,6 +715,7 @@ class SwitchedCompensatedLink(CompensatedLink):
                    if not any(key.startswith(f"{scc.side}_scc.") for scc in self.switched)]
         if unknown:
             raise KeyError(f"switched link: no state(s) {sorted(unknown)}")
+        self._restore_conduction()
 
     @property
     def discrete_state_names(self) -> tuple[str, ...]:

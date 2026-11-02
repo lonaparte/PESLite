@@ -207,6 +207,28 @@ def _source_scenario(p: Params, path: str, select: Callable[[Params], Any]) -> S
     return SourceScenario(select(p), p.base.f0, steps)
 
 
+def _check_netlist_steps(p: Params, subsystems: Mapping[str, Any]) -> None:
+    """Reject an independent multirate step inside one coupled electrical netlist."""
+    from ..solver.multirate import parse_step
+    from .circuit import NetworkView
+
+    for key, value in p.simulation.solver.subsystems.items():
+        try:
+            ratio = parse_step(value)[0]
+        except ValueError:
+            continue
+        selected = [
+            name for name, subsystem in subsystems.items()
+            if isinstance(subsystem, NetworkView)
+            and (name == key or name.startswith(key + "."))
+        ]
+        if ratio != 1.0 and selected:
+            raise ConfigError(
+                f"simulation.solver.subsystems.{key}: netlist components {selected} "
+                "cannot use an independent step"
+            )
+
+
 class _Source:
     """Voltage source (emf) behind a series R-L branch."""
 
@@ -486,6 +508,7 @@ class System:
                     )
                 bus_terminals.setdefault(resolve_bus(bus_name), []).append(terminal)
         lowered_buses: dict[str, dict] = {}
+        circuit_model = p.simulation.solver.circuit_model
         for bus_name, terminals in bus_terminals.items():
             drivers = [terminal for terminal in terminals if terminal.drives_voltage]
             if len(drivers) != 1:
@@ -522,7 +545,9 @@ class System:
             ]
             driver.bind_current_sources(current_sources)
             lowered = lowered_buses.setdefault(bus_name, {})
-            if driver.hold_voltage_input is not None:
+            if driver.hold_voltage_input is not None and not (
+                    all(callable(getattr(terminal.subsystem, "netlist", None))
+                            for terminal in terminals)):
                 if len(followers) != 1:
                     raise ConfigError(
                         f"bus {bus_name!r}: blocking needs one current-owning terminal "
@@ -530,9 +555,7 @@ class System:
                 hold_target = (driver.subsystem, driver.hold_voltage_input)
                 claim_connections((hold_target,),
                                   f"{type(driver.subsystem).__name__}.{driver.hold_voltage_input}")
-                lowered[hold_target] = (
-                    followers[0].hold_voltage_source(
-                        getattr(driver.subsystem, "current_constraint", None)))
+                lowered[hold_target] = followers[0].hold_voltage_source()
             if bus_name not in self.buses:
                 lowered[current_target] = current_sources
                 lowered.update(voltage_connections)
@@ -623,6 +646,34 @@ class System:
                     target = (unit.ctrl, channel)
                     claim_connections((target,), where)
                     connections[target] = (subsystem, output)
+        from .circuit import declare_netlist
+        declarations = {id(subsystem): declare_netlist(subsystem)
+                        for subsystem in subsystems.values()}
+        if circuit_model == "device":
+            from .circuit import lower_devices
+
+            subsystems, connections, zoh, self.circuits = lower_devices(
+                subsystems, connections, zoh, bus_terminals, declarations
+            )
+            _check_netlist_steps(p, subsystems)
+        else:
+            from .circuit import bind_device, lower
+
+            local_circuits = []
+            for name, subsystem in subsystems.items():
+                declaration = declarations[id(subsystem)]
+                if declaration is not None and (
+                        declaration.builder.local or declaration.builder.mixtures):
+                    local_circuits.append(bind_device(
+                        name, subsystem, declaration,
+                        {id(item): item_name for item_name, item in subsystems.items()},
+                    ))
+                    declarations[id(subsystem)] = None
+            subsystems, connections, zoh, circuit = lower(
+                circuit_model, subsystems, connections, zoh, bus_terminals, declarations
+            )
+            self.circuits = (*local_circuits, *((circuit,) if circuit is not None else ()))
+            _check_netlist_steps(p, subsystems)
         self.model = Model(subsystems, connections, zoh)
         self.event_subsystems = tuple(
             (name, subsystem)
@@ -648,7 +699,16 @@ class System:
         for unit in self.units.values():
             parts.extend(unit.state_parts())
         registered = {id(part) for _name, part in parts}
-        parts.extend((name, sub) for name, sub in zip(self.model.names, self.model.subsystems)
+        if not self.circuits:
+            subsystems = iter(self.model.subsystems)
+        else:
+            from .circuit import NetworkView
+
+            subsystems = (
+                subsystem.component if isinstance(subsystem, NetworkView) else subsystem
+                for subsystem in self.model.subsystems
+            )
+        parts.extend((name, sub) for name, sub in zip(self.model.names, subsystems)
                      if id(sub) not in registered and callable(getattr(sub, "get_state", None)))
         return parts
 
@@ -752,6 +812,8 @@ class System:
             elif section == "elements":
                 self.named_elements[name].retune(p.elements[name])
         if done:
+            for circuit in self.circuits:
+                circuit.build()
             model = self.model
             model.energy_specs = {name: spec_of(subsystem)
                                   for name, subsystem in zip(model.names, model.subsystems)}

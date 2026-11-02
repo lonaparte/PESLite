@@ -71,6 +71,34 @@ def test_dp45_float_model_path_matches_the_array_path():
     np.testing.assert_allclose(fast.y, array.y, rtol=1e-13, atol=1e-14)
 
 
+def test_fixed_solver_observes_a_guard_inside_its_internal_step_loop():
+    class Ramp:
+        calls = 0
+
+        def rhs_list(self, _t, _y):
+            self.calls += 1
+            return [1.0]
+
+        def rhs(self, t, y):
+            return np.asarray(self.rhs_list(t, y))
+
+    ramp = Ramp()
+    solver = FixedStepSolver(0.1, "RK4")
+    result = solver.advance_guarded(
+        ramp.rhs, 0.0, 1.0, np.zeros(1),
+        lambda _t, y: 0.55 - y[0],
+        synchronized_guard=lambda _t, y: 0.55 - y[0],
+    )
+
+    assert result.crossed
+    assert result.previous_t == pytest.approx(0.5)
+    assert result.previous_y[0] == pytest.approx(0.5)
+    assert result.t == pytest.approx(0.6)
+    assert result.y[0] == pytest.approx(0.6)
+    # Six complete RK4 steps and only the first stage of the next step are needed.
+    assert ramp.calls == result.n_rhs == 25
+
+
 def test_model_automatically_solves_an_algebraic_output_loop():
     class In(Bag):
         __slots__ = ("x",)
