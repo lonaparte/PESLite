@@ -58,7 +58,7 @@ def test_bridge_flag_keeps_an_incompatible_unit_with_a_warning(flag):
 
     assert resolved["units"]["charger"]["primary"]["bridge"]["model"] == "switching"
     assert (resolved["simulation"]["solver"]["type"],
-            resolved["simulation"]["solver"]["method"]) == ("fixed", "rk4")
+            resolved["simulation"]["solver"]["method"]) == ("fixed", "RK4")
 
 
 @pytest.mark.parametrize("flag", ["--switching", "--pwm-averaging"])
@@ -75,13 +75,13 @@ def test_bridge_flag_warns_and_keeps_a_model_whose_dormant_config_is_incompatibl
 
     assert resolved["units"]["vsc"]["bridge"]["model"] == "averaging"
     assert (resolved["simulation"]["solver"]["type"],
-            resolved["simulation"]["solver"]["method"]) == ("fixed", "rk4")
+            resolved["simulation"]["solver"]["method"]) == ("fixed", "RK4")
 
 
 @pytest.mark.parametrize(("flag", "expected"), [
-    (None, ("fixed", "rk4")),
-    ("--switching", ("fixed", "rk4")),
-    ("--pwm-averaging", ("fixed", "rk4")),
+    (None, ("fixed", "RK4")),
+    ("--switching", ("fixed", "RK4")),
+    ("--pwm-averaging", ("fixed", "RK4")),
     ("--averaging", ("adaptive", "DP45")),
 ])
 def test_bridge_flags_are_solver_presets(flag, expected):

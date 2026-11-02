@@ -1635,7 +1635,8 @@ def main(argv=None) -> int:
                                                    for name in value.split(",") if name]
     p = load(config, initial=args.initial,
                     initial_time=args.initial_time, **overrides)
-    presets = {"switching": ("fixed", "rk4"), "pwm_averaging": ("fixed", "rk4"), "averaging": ("adaptive", "DP45")}
+    presets = {"switching": ("fixed", "RK4"), "pwm_averaging": ("fixed", "RK4"),
+               "averaging": ("adaptive", "DP45")}
     model = next((flag for flag in presets if getattr(args, flag)), None)  # each flag names its bridge model
     if model is not None:
         effective_models = []

@@ -17,7 +17,8 @@ from ..components.converter import make_topology
 from ..components.pwm import validate_modulator
 from ..components.network import element_buses
 from ..control.profiles import control_type
-from ..solver.integrators import ADAPTIVE_METHODS, FIXED_METHODS
+from ..solver.integrators import (ADAPTIVE_METHODS, EXPLICIT_FIXED_METHODS, FIXED_METHODS,
+                                  IMPLICIT_ADAPTIVE_METHODS, IMPLICIT_FIXED_METHODS)
 from ..solver.model import ConfigError
 from ..solver.multirate import parse_step
 from ..solver.timing import TIME_EPS, PeriodicClock, control_clock_offset
@@ -491,7 +492,16 @@ def _solver(s) -> None:
         raise ConfigError(f"simulation.solver.method {s.method!r} is not one of {FIXED_METHODS}")
     if s.type == "adaptive" and s.method not in ADAPTIVE_METHODS:
         raise ConfigError(f"simulation.solver.method {s.method!r} is not one of {ADAPTIVE_METHODS}")
-    names = ("dt",) if s.type == "fixed" else ("rtol", "atol", "max_step")
+    fixed = s.type == "fixed"
+    implicit = s.method in (IMPLICIT_FIXED_METHODS if fixed else IMPLICIT_ADAPTIVE_METHODS)
+    if s.circuit_model != "device" and not implicit:
+        raise ConfigError(
+            f"simulation.solver.circuit_model {s.circuit_model!r} needs an implicit method"
+        )
+    if fixed:
+        names = ("dt", "rtol", "atol") if implicit else ("dt",)
+    else:
+        names = ("rtol", "atol", "max_step")
     for name in names:
         value = getattr(s, name)
         if value <= 0.0 or math.isnan(value) or (name != "max_step" and not math.isfinite(value)):
@@ -511,9 +521,14 @@ def _solver(s) -> None:
         if isinstance(value, dict) and (set(value) - {"step", "method"} or "step" not in value):
             raise ConfigError(f"{where}: expected {{step, method}} (step required), got {sorted(value)}")
         try:
-            _ratio, method = parse_step(value)
+            ratio, method = parse_step(value)
         except ValueError as exc:
             raise ConfigError(f"{where}: {exc}") from None
+        if ratio != 1.0 and s.method not in EXPLICIT_FIXED_METHODS:
+            raise ConfigError(
+                f"{where}: a subsystem on its own step needs an explicit system method "
+                f"{EXPLICIT_FIXED_METHODS}, got {s.method!r}"
+            )
         if method is not None and method not in FIXED_METHODS + ADAPTIVE_METHODS:
             raise ConfigError(f"{where}.method: {method!r} is not one of {FIXED_METHODS + ADAPTIVE_METHODS}")
 

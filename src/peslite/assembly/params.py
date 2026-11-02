@@ -31,6 +31,7 @@ from typing import Any, Callable, Optional, Union, get_args, get_origin, get_typ
 from ..components.network import ELEMENT_TYPES, element_buses
 from ..control.loops import LOOP_TYPES, loop_key_type, loop_type
 from ..control.profiles import ReferenceParams, control_type
+from ..solver.integrators import CIRCUIT_MODELS, canonical_method
 from ..solver.model import ConfigError
 from .events import EVENT_TYPES, NAMED, SWITCHABLE, events_for
 from .types import unit_type
@@ -866,11 +867,13 @@ class SolverParams:
     (integer N, or 1/N) or to ``{step, method}``, e.g. ``{dclink: 10, network: 0.1}``.
     """
 
+    circuit_model: str = "device"  # "device" | "statewise" | "mna"
     type: str = "fixed"  # "fixed" | "adaptive"
-    method: str = "rk4"  # fixed: euler|heun|rk4 ; adaptive: RK45|DOP853|Radau|BDF|LSODA|RK23|DP45
+    method: str = "RK4"  # fixed: euler|heun|RK4|trapezoidal|radau
+    #                      adaptive: RK23|RK45|DOP853|radau|BDF|LSODA|DP45
     dt: float = 1e-6  # s; fixed: maximum system step
-    rtol: float = 1e-6
-    atol: float = 1e-9
+    rtol: float = 1e-6  # adaptive error; fixed implicit Newton convergence
+    atol: float = 1e-9  # adaptive error; fixed implicit Newton convergence
     max_step: float = math.inf
     warm_start: bool = True  # adaptive: reuse the last step size across intervals
     subsystems: dict = field(default_factory=dict)  # fixed only: {name: step relative to dt | {step, method}}
@@ -878,7 +881,15 @@ class SolverParams:
     linearisations: int = 3  # linearisation points for the split error bound (0: none)
     write_length: int = 1000  # streamed CSV rows per write batch (>= 1)
     phs_check_step: int = 1000  # snapshots between port-Hamiltonian energy audits (>= 1)
-    _choices = {"type": ("fixed", "adaptive")}
+    _choices = {"circuit_model": CIRCUIT_MODELS, "type": ("fixed", "adaptive")}
+
+    def __post_init__(self) -> None:
+        solver_type = self.type.casefold() if isinstance(self.type, str) else self.type
+        circuit_model = (self.circuit_model.casefold()
+                         if isinstance(self.circuit_model, str) else self.circuit_model)
+        object.__setattr__(self, "type", solver_type)
+        object.__setattr__(self, "circuit_model", circuit_model)
+        object.__setattr__(self, "method", canonical_method(self.method, solver_type))
 
 
 @dataclass(frozen=True)

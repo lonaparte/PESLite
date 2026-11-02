@@ -17,7 +17,7 @@ events: {}
 
 simulation:
   t_end: 1.0
-  solver: {type: fixed, method: rk4, dt: 1e-6}
+  solver: {type: fixed, method: RK4, dt: 1e-6}
   output: {}
 
 meta: {}

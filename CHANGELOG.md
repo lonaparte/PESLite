@@ -2,6 +2,9 @@
 
 ## 0.4.0
 
+- Added fixed-step trapezoidal and fifth-order Radau IIA integration. Implicit solvers can use
+  device, statewise or MNA circuit models through one shared Newton and
+  finite-difference Jacobian implementation.
 - Added single-phase AC network sources through ordinary scalar power ports and assembly-time
   electrical-domain constraints on inherently AC or DC terminals. Also made ADC window integration
   follow the configured physical sampling grid, and added open-loop duty control, the traceable
@@ -140,7 +143,7 @@
 ## 0.2.0
 
 - The default per-unit bridge model is now `pwm_averaging`. The mutually exclusive run presets
-  select `switching + fixed/rk4`, `pwm_averaging + fixed/rk4` or
+  select `switching + fixed/RK4`, `pwm_averaging + fixed/RK4` or
   `averaging + adaptive/DP45`; `--set` overrides a preset, and a preset overrides the file.
 - Ideal `averaging` now integrates controller states and instantaneous measurements with the plant
   ODE and directly drives the controlled voltage-source bridge. ADC, control-interrupt,

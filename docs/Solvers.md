@@ -1,7 +1,32 @@
 # Solvers
 
-PESLite integrates every interval up to the next exact boundary: an event, output point, sampled
-hardware instant or requested end time. Solver stages never cross a model-changing boundary.
+PESLite provides several time-integration and circuit-solution methods, some of which draw on ideas
+used by established commercial simulators such as PLECS, PSCAD and SIMBA while being implemented
+independently. Regardless of the selected time integrator, PESLite advances only to the next exact
+boundary, such as an event, output point, sampled hardware instant or requested end time. Solver
+stages never cross a model-changing boundary.
+
+## Circuit model
+
+`circuit_model` selects how an implicit solver stores the circuit Jacobian and solves its Newton
+linear systems:
+
+| Value | Implementation |
+|---|---|
+| `device` | one dense Jacobian, refreshed when Newton iteration stops contracting |
+| `statewise` | dense Jacobians cached and reused when an equation mode returns |
+| `mna` | state-space groups eliminated onto their shared interface |
+
+```yaml
+simulation:
+  solver:
+    type: fixed
+    method: radau
+    circuit_model: statewise
+```
+
+The default is `device`. `statewise` and `mna` require an implicit method; PESLite rejects
+them with an explicit method instead of accepting an ineffective setting.
 
 ## Fixed-step solvers
 
@@ -9,12 +34,14 @@ hardware instant or requested end time. Solver stages never cross a model-changi
 simulation:
   solver:
     type: fixed
-    method: rk4
+    method: RK4
     dt: 25e-6
 ```
 
-Available fixed methods are `euler`, `heun` and `rk4`. `dt` (default `1e-6` s) is the maximum step;
-PESLite divides intervals as needed to end exactly at scheduled boundaries.
+Available fixed methods are `euler`, `heun`, `RK4`, `trapezoidal` and `radau`. `trapezoidal` is the
+second-order A-stable trapezoidal rule; `radau` is the fifth-order, L-stable three-stage Radau IIA
+method. `dt` (default `1e-6` s) is the maximum step; PESLite divides intervals as needed to end
+exactly at scheduled boundaries. Fixed implicit methods use `rtol` and `atol` for Newton convergence.
 
 RK4 is the normal starting point for `switching` and `pwm_averaging`. Reduce `dt` until important
 outputs and event responses are insensitive to further reduction.
@@ -32,7 +59,9 @@ simulation:
 ```
 
 `DP45` is PESLite's built-in Dormand-Prince 4(5) implementation. SciPy methods `RK23`, `RK45`,
-`DOP853`, `Radau`, `BDF` and `LSODA` are also available in Python simulations.
+`DOP853`, `radau`, `BDF` and `LSODA` are also available in Python simulations. `LSODA` selects
+between nonstiff and stiff integration internally. With `statewise` or `mna`, SciPy's implicit
+methods receive the circuit model's cached Jacobian.
 
 `rtol` controls error relative to the current state scale, while `atol` supplies an absolute floor
 near zero. Smaller tolerances generally increase accepted steps and RHS evaluations. `max_step`

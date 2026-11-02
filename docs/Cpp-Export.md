@@ -243,7 +243,8 @@ common trip path, not a WPT phase override.
 
 ## Current limitations
 
-- Supported solvers are fixed `euler`, `heun` and `rk4`, plus adaptive `DP45`.
+- Supported solvers are fixed `euler`, `heun` and `RK4`, plus adaptive `DP45`; fixed implicit
+  `trapezoidal` and `radau` remain Python-only.
 - Multirate subsystem schedules are not currently lowered to C++.
 - Arbitrary Python behavior is not embedded in the standalone executable. File or network I/O,
   reflection, run-time type/layout changes and unsupported library calls in a custom equation are

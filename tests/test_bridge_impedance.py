@@ -38,7 +38,7 @@ def test_zero_impedance_keeps_the_original_state_and_equation_layout(topology, m
 def test_capacitive_switching_step_matches_the_analytic_rc_response(topology):
     capacitance, resistance = 1e-4, 0.5
     bridge, model = _model(topology, capacitance=capacitance, resistance=resistance)
-    solver = FixedStepSolver(0.25e-6, "rk4")
+    solver = FixedStepSolver(0.25e-6, "RK4")
     end = 100e-6
     y = solver(model.rhs, 0.0, end, model.get_initial_values()).y
     model.sync(end, y)

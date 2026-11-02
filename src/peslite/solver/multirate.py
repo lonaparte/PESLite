@@ -15,7 +15,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .energy import re_product, signal
-from .integrators import RHS, TABLEAUS, SolverStep, combine, integrator, stage_state, subintervals
+from .integrators import (CIRCUIT_MODELS, EXPLICIT_FIXED_METHODS, RHS, TABLEAUS, SolverStep, combine,
+                          canonical_method, integrator, stage_state, subintervals)
 from .model import ConfigError
 
 __all__ = ["MultirateSolver", "HeldStorage", "make_solver", "parse_step"]
@@ -30,20 +31,33 @@ def make_solver(cfg: Any, model: Optional[Any] = None, ratings: Any = None):
     ``ratings``: mapping storage scale -> (rated effort, rated flow), or a callable
     ``(subsystem_name, storage) -> (effort, flow)``.
     """
-    if cfg.type == "fixed" and cfg.subsystems:
+    solver_type = cfg.type
+    method = cfg.method
+    circuit_model = getattr(cfg, "circuit_model", "device")
+    if circuit_model not in CIRCUIT_MODELS:
+        raise ConfigError(
+            f"simulation.solver.circuit_model {circuit_model!r} is not one of {CIRCUIT_MODELS}"
+        )
+    if solver_type == "fixed" and cfg.subsystems:
         if model is None:
             raise ConfigError("simulation.solver.subsystems needs the model whose subsystems it names")
         try:
             parsed = {name: parse_step(value)[0] for name, value in cfg.subsystems.items()}
             if any(ratio != 1.0 for ratio in parsed.values()):
-                return MultirateSolver(model, cfg.subsystems, cfg.dt, cfg.method, cfg.sweeps, cfg.rtol, cfg.atol,
+                if method not in EXPLICIT_FIXED_METHODS:
+                    raise ConfigError(
+                        "simulation.solver.subsystems needs an explicit system method, got "
+                        f"{method!r}"
+                    )
+                return MultirateSolver(model, cfg.subsystems, cfg.dt, method, cfg.sweeps, cfg.rtol, cfg.atol,
                                        ratings)
             unknown = [name for name in parsed if not model.select(name)]  # every step is dt: single-rate
             if unknown:
                 raise KeyError(f"unknown subsystem(s) or namespace(s) {unknown}; this model has {model.names}")
         except (KeyError, ValueError) as exc:
             raise ConfigError(f"simulation.solver.subsystems: {exc.args[0]}") from None
-    return integrator(cfg.method, cfg.dt, cfg.rtol, cfg.atol, cfg.max_step, cfg.warm_start)
+    return integrator(method, cfg.dt, cfg.rtol, cfg.atol, cfg.max_step, cfg.warm_start,
+                      circuit_model=circuit_model, model=model, solver_type=solver_type)
 
 
 def parse_step(value: Any) -> tuple[float, Optional[str]]:
@@ -52,7 +66,7 @@ def parse_step(value: Any) -> tuple[float, Optional[str]]:
     if isinstance(value, Mapping):
         if "step" not in value:
             raise ValueError("a mapping needs a 'step'")
-        method = value.get("method")
+        method = canonical_method(value.get("method"))
         value = value["step"]
     if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
             or value <= 0.0):
@@ -107,15 +121,16 @@ class MultirateSolver:
     """Explicit RK with system step ``dt`` (s) and, per named subsystem, a step relative to it.
 
     ``steps``: ``{name: ratio}`` or ``{name: {"step": ratio, "method": ...}}``, ratio ``1/N`` or an
-    integer ``M``; ``method``: ``"euler"``, ``"heun"`` or ``"rk4"``; ``sweeps``: coupling sweeps
+    integer ``M``; ``method``: ``"euler"``, ``"heun"`` or ``"RK4"``; ``sweeps``: coupling sweeps
     for ``1/N`` steps (>= 1); ``rtol`` / ``atol``: for an adaptive windowed method; ``ratings``:
     as in :func:`make_solver`. ``n_system``, ``n_inner`` and ``n_outer`` count RHS evaluations;
     ``groups``: the ``{label: GroupPlan}`` of the split (see :meth:`~peslite.solver.model.Model.groups`).
     """
 
-    def __init__(self, model: Any, steps: Mapping[str, Any], dt: float, method: str = "rk4",
+    def __init__(self, model: Any, steps: Mapping[str, Any], dt: float, method: str = "RK4",
                  sweeps: int = 2, rtol: float = 1e-6, atol: float = 1e-9,
                  ratings: Any = None) -> None:
+        method = canonical_method(method, "fixed")
         if method not in TABLEAUS:
             raise ValueError(f"unknown fixed-step method {method!r}")
         if int(sweeps) < 1:

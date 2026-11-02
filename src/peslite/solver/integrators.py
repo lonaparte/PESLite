@@ -1,7 +1,8 @@
 """The solver interface ``solver(f, t0, t1, y0) -> SolverStep`` and the single-rate integrators.
 
 Fixed-step explicit Runge-Kutta (Euler, Heun, RK4) landing exactly on the interval end, SciPy's
-adaptive methods and a built-in Dormand-Prince RK5(4). RK4 runs on Python floats when ``f``'s
+adaptive methods and a built-in Dormand-Prince RK5(4); :mod:`.implicit` adds fixed-step implicit
+methods. RK4 runs on Python floats when ``f``'s
 object offers ``rhs_list(t, v)``, with the same result as on arrays; on a non-finite value the
 interval is recomputed on arrays.
 """
@@ -19,8 +20,10 @@ from numpy.typing import NDArray
 
 from .model import commutation_tolerance
 
-__all__ = ["RHS", "SolverStep", "Solver", "FIXED_METHODS", "ADAPTIVE_METHODS", "TABLEAUS", "combine", "integrator",
-           "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "subintervals"]
+__all__ = ["RHS", "SolverStep", "Solver", "FIXED_METHODS", "ADAPTIVE_METHODS", "EXPLICIT_FIXED_METHODS",
+           "IMPLICIT_FIXED_METHODS", "IMPLICIT_ADAPTIVE_METHODS", "CIRCUIT_MODELS", "TABLEAUS", "combine",
+           "canonical_method", "integrator", "FixedStepSolver", "AdaptiveSolver", "DormandPrince45",
+           "subintervals"]
 
 RHS = Callable[[float, NDArray[np.float64]], NDArray[np.float64]]
 
@@ -48,20 +51,39 @@ class Solver(Protocol):
     def __call__(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64]) -> SolverStep: ...
 
 
-FIXED_METHODS = ("euler", "heun", "rk4")
-ADAPTIVE_METHODS = ("RK45", "DOP853", "Radau", "BDF", "LSODA", "RK23", "DP45")
+EXPLICIT_FIXED_METHODS = ("euler", "heun", "RK4")
+IMPLICIT_FIXED_METHODS = ("trapezoidal", "radau")
+FIXED_METHODS = EXPLICIT_FIXED_METHODS + IMPLICIT_FIXED_METHODS
+ADAPTIVE_METHODS = ("RK23", "RK45", "DOP853", "radau", "BDF", "LSODA", "DP45")
+CIRCUIT_MODELS = ("device", "statewise", "mna")
+IMPLICIT_ADAPTIVE_METHODS = ("radau", "BDF", "LSODA")
+
+
+def canonical_method(method: str, solver_type: str | None = None) -> str:
+    """Return the canonical spelling of a solver method, leaving an unknown value unchanged."""
+    if not isinstance(method, str):
+        return method
+    if isinstance(solver_type, str) and solver_type.casefold() == "fixed":
+        methods = FIXED_METHODS
+    elif isinstance(solver_type, str) and solver_type.casefold() == "adaptive":
+        methods = ADAPTIVE_METHODS
+    else:
+        methods = FIXED_METHODS + ADAPTIVE_METHODS
+    folded = method.casefold()
+    return next((name for name in methods if name.casefold() == folded), method)
+
 
 # explicit Runge-Kutta tableaus: (c, a_rows, b); a_rows[j - 1] holds the coefficients of stage j
 TABLEAUS: dict[str, tuple[tuple[float, ...], tuple[tuple[float, ...], ...], tuple[float, ...]]] = {
     "euler": ((0.0,), (), (1.0,)),
     "heun": ((0.0, 1.0), ((1.0,),), (0.5, 0.5)),
-    "rk4": ((0.0, 0.5, 0.5, 1.0), ((0.5,), (0.0, 0.5), (0.0, 0.0, 1.0)), (1 / 6, 1 / 3, 1 / 3, 1 / 6)),
+    "RK4": ((0.0, 0.5, 0.5, 1.0), ((0.5,), (0.0, 0.5), (0.0, 0.0, 1.0)), (1 / 6, 1 / 3, 1 / 3, 1 / 6)),
 }
 
 
 def combine(method: str, y: NDArray[np.float64], h: float, ks: list) -> NDArray[np.float64]:
     """The final combination of an explicit RK step of ``method`` from its stage derivatives ``ks``."""
-    if method == "rk4":
+    if method == "RK4":
         return y + (h / 6.0) * (ks[0] + 2.0 * (ks[1] + ks[2]) + ks[3])
     if method == "heun":
         return y + 0.5 * h * (ks[0] + ks[1])
@@ -79,14 +101,33 @@ def stage_state(y: NDArray[np.float64], h: float, row: tuple[float, ...], ks: li
 
 
 def integrator(method: str, dt: float, rtol: float = 1e-6, atol: float = 1e-9,
-               max_step: float = math.inf, warm_start: bool = True) -> Solver:
+               max_step: float = math.inf, warm_start: bool = True, *,
+               circuit_model: str = "device", model=None, solver_type: str | None = None) -> Solver:
     """Return the single-rate integrator of ``method``: fixed-step with maximum step ``dt`` (s),
-    the built-in ``"DP45"`` or a SciPy method."""
-    if method in FIXED_METHODS:
+    the built-in ``"DP45"`` or a SciPy method.
+
+    ``circuit_model`` selects the Jacobian and linear-system implementation of an implicit method.
+    """
+    if circuit_model not in CIRCUIT_MODELS:
+        raise ValueError(f"unknown circuit model {circuit_model!r}")
+    implicit = method in IMPLICIT_FIXED_METHODS or method in IMPLICIT_ADAPTIVE_METHODS
+    if circuit_model != "device" and not implicit:
+        raise ValueError(f"circuit model {circuit_model!r} needs an implicit method")
+    adaptive = isinstance(solver_type, str) and solver_type.casefold() == "adaptive"
+    if method in EXPLICIT_FIXED_METHODS and not adaptive:
         return FixedStepSolver(dt, method)
     if method == "DP45":
         return DormandPrince45(rtol, atol, max_step)
-    return AdaptiveSolver(method, rtol, atol, max_step, warm_start)
+    from .implicit import ImplicitSolver, ModeJacobian, linear_system
+
+    if method in IMPLICIT_FIXED_METHODS and not adaptive:
+        return ImplicitSolver(dt, method, rtol, atol, linear_system(circuit_model, model))
+    jac = None
+    if circuit_model != "device":
+        if model is None:
+            raise ValueError(f"circuit model {circuit_model!r} needs a model")
+        jac = ModeJacobian(model.rhs, linear_system(circuit_model, model))
+    return AdaptiveSolver(method, rtol, atol, max_step, warm_start, jac=jac)
 
 
 def subintervals(span: float, step: float) -> int:
@@ -97,10 +138,10 @@ def subintervals(span: float, step: float) -> int:
 class FixedStepSolver:
     """Explicit RK with a maximum step ``dt`` (s); sub-steps are equal within an interval.
 
-    ``method``: ``"euler"``, ``"heun"`` or ``"rk4"``.
+    ``method``: ``"euler"``, ``"heun"`` or ``"RK4"``.
     """
 
-    def __init__(self, dt: float, method: str = "rk4") -> None:
+    def __init__(self, dt: float, method: str = "RK4") -> None:
         if method not in TABLEAUS:
             raise ValueError(f"unknown fixed-step method {method!r}")
         self.dt = float(dt)
@@ -123,7 +164,7 @@ class FixedStepSolver:
         h = span / n
         c, a, _b = TABLEAUS[self.method]
         self.n_rhs += len(c) * n
-        if self.method == "rk4":
+        if self.method == "RK4":
             lists = getattr(getattr(f, "__self__", None), "rhs_list", None)
             if lists is not None:
                 v = _rk4_on_floats(len(y0))(lists, t0, y0.tolist(), n, h)
@@ -174,7 +215,7 @@ def _rk4_on_floats(size: int):
               "            return None",
               "        t += h",
               f"    return {y}"]
-    source, filename = "\n".join(lines) + "\n", f"<peslite rk4, {size} floats>"
+    source, filename = "\n".join(lines) + "\n", f"<peslite RK4, {size} floats>"
     env = {"isfinite": math.isfinite}
     exec(compile(source, filename, "exec"), env)
     linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
@@ -191,17 +232,26 @@ class AdaptiveSolver:
         atol: float = 1e-9,
         max_step: float = math.inf,
         warm_start: bool = True,
+        jac: Callable | None = None,
     ) -> None:
         from scipy.integrate import solve_ivp  # Load SciPy only when this solver is selected.
 
         self._solve_ivp = solve_ivp
-        self.method, self.rtol, self.atol, self.max_step = method, rtol, atol, max_step
+        self.method = method
+        self.rtol, self.atol, self.max_step = rtol, atol, max_step
         self.warm_start = warm_start
+        self.jac = jac if self.method in IMPLICIT_ADAPTIVE_METHODS else None
         self._h_last: float | None = None
         self.n_rhs = 0
 
     def __call__(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64]) -> SolverStep:
         return self.advance(f, t0, t1, y0)
+
+    def parameters_changed(self) -> None:
+        """Discard a circuit model's Jacobians after an event changes parameters."""
+        linear = getattr(self.jac, "linear", None)
+        if linear is not None:
+            linear.invalidate()
 
     def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
                 max_step: float = math.inf) -> SolverStep:
@@ -209,7 +259,8 @@ class AdaptiveSolver:
         span = t1 - t0
         if span <= 0.0:
             return SolverStep(t1, y0, 0)
-        kwargs = dict(method=self.method, rtol=self.rtol, atol=self.atol)
+        scipy_method = "Radau" if self.method == "radau" else self.method
+        kwargs = dict(method=scipy_method, rtol=self.rtol, atol=self.atol)
         step = min(self.max_step, max_step)
         if step <= 0.0:
             raise ValueError("max_step must be positive")
@@ -217,12 +268,15 @@ class AdaptiveSolver:
             kwargs["max_step"] = step
         if self.warm_start and self._h_last is not None:
             kwargs["first_step"] = min(self._h_last, span, step)
+        jac_rhs = getattr(self.jac, "n_rhs", 0)
+        if self.jac is not None:
+            kwargs["jac"] = self.jac
         sol = self._solve_ivp(f, (t0, t1), y0, **kwargs)
         if not sol.success:
             raise RuntimeError(f"solve_ivp failed on [{t0}, {t1}]: {sol.message}")
         if sol.t.size >= 2:
             self._h_last = float(sol.t[-1] - sol.t[-2])
-        self.n_rhs += int(sol.nfev)
+        self.n_rhs += int(sol.nfev) + getattr(self.jac, "n_rhs", 0) - jac_rhs
         return SolverStep(t1, sol.y[:, -1].copy(), self.n_rhs)
 
 
