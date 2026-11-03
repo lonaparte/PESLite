@@ -2,6 +2,9 @@
 
 ## 0.4.0
 
+- Unified physical components on assembly-time `NetworkPlan` translation. Custom electrical
+  components can now register one frozen parameter dataclass whose `network()` declaration creates
+  ports, zero-initialized states and the primitives shared by every circuit model.
 - Added fixed-step trapezoidal and fifth-order Radau IIA integration. Electrical components now
   declare one netlist source compiled as direct scalar device equations, dense per-mode state
   equations or a sparse factorized modified nodal system. Time integrators consume all three

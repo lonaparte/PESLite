@@ -560,8 +560,8 @@ class System:
                     target = (unit.ctrl, channel)
                     claim_connections((target,), where)
                     connections[target] = (subsystem, output)
-        from .circuit import declare_netlist
-        declarations = {id(subsystem): declare_netlist(subsystem)
+        from .circuit import compile_network
+        declarations = {id(subsystem): compile_network(subsystem)
                         for subsystem in subsystems.values()}
         if circuit_model == "device":
             from .circuit import lower_devices

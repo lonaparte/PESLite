@@ -117,6 +117,7 @@ def test_auxiliary_registers_follow_the_existing_converter_transport(example, un
 
 def test_nonzero_rectifier_current_is_preserved_before_projection(tmp_path):
     tree = _short(_tree(SS, 200., 1e-6), 1e-6)
+    tree['simulation']['energy_check'] = 'off'
     tree['simulation']['initial'] = {'states': {'charger.link.i_mode_1': 1.0}}
     params = from_dict(tree)
     binary = _compile(params, tmp_path / 'model', ())

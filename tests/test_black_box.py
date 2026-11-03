@@ -11,13 +11,13 @@ import peslite
 from conftest import EXAMPLES
 from peslite import BlackBoxSubsystem, Simulation
 from peslite.assembly.params import from_dict
-from peslite.components import Element, Port, register_element_type
+from peslite.components import Element, Port, register_component_type
 from peslite.solver import Bag, Model, StateRegistry
 from peslite.solver.energy import Port
 from peslite.solver.simulation import SystemLoop
 
 
-@register_element_type
+@register_component_type
 class _Counter(Element):
     """A discrete model ``name`` counting its updates and a continuous lag ``name.lag``."""
 
@@ -51,7 +51,7 @@ class _Counter(Element):
         return ()
 
 
-@register_element_type
+@register_component_type
 class _Swap(Element):
     """Two discrete models taking each other's output at the same instants."""
 
@@ -82,7 +82,7 @@ class _Swap(Element):
         return ()
 
 
-@register_element_type
+@register_component_type
 class _Load(Element):
     """A stateless black-box resistor declaring its port and dissipation."""
 
@@ -118,7 +118,7 @@ class _Load(Element):
         return ((self.cfg.bus, self.model.ports[0]),)
 
 
-@register_element_type
+@register_component_type
 class _WindowedSampler(Element):
     """A clocked model sampling a continuous neighbour inside its solver window."""
 

@@ -120,54 +120,64 @@ the trapezoidal (Tustin) method. The complete bundled example is
 
 ## Custom circuit elements
 
-An element class registered by `register_element_type` owns:
-
-- a frozen `Params` dataclass including its `type` and `bus` or `busN` fields;
-- `subsystems()` for its physical model objects;
-- `connections()` for its internal and auxiliary signal wiring;
-- `port_bindings()` binding each configured bus to an electrical `Port`;
-- optional `signals()` returning namespaced scalar or complex values for `plant.csv`;
-- optional `breakers` or `connect(on, t, ramp)` for connection events, plus `retune(cfg)` for
-  `set` events.
+A custom electrical component is a frozen parameter dataclass registered by
+`register_component_type`. Its `network()` method declares the physical primitives used by every
+circuit model.
 
 ```python
-from peslite.addons.components import Element, Port, register_element_type
+from dataclasses import dataclass
+from typing import ClassVar
 
-@register_element_type
-class MyElement(Element):
-    type = "my_element"
-    # Params and assembly methods...
+from peslite.addons.components import register_component_type
+from peslite.solver import netlist as nl
+
+@register_component_type
+@dataclass(frozen=True, kw_only=True)
+class SeriesRL:
+    bus: str
+    r: float
+    l: float
+    type: str = "series_rl"
+    domain_transparent: ClassVar[bool] = True
+
+    def network(self, n):
+        middle = n.internal()
+        n.add(
+            nl.Resistor(n.bus, middle, self.r),
+            nl.Inductor(middle, n.ground, self.l, n.state("i")),
+        )
+        n.port_output("i", "bus", "current")
+        n.losses()
 ```
 
 The file can then use:
 
 ```yaml
 elements:
-  device: {type: my_element, bus: pcc}
+  load: {type: series_rl, bus: pcc, r: 1.0, l: 2e-3}
 ```
 
 Modules under `peslite/addons/components/` are discovered automatically. Built-in and add-on
-elements follow the same registry mechanism. Public names are namespaced by the element instance,
-so two instances do not share state paths.
+components use the same registry and assembly-time translation. A `bus` field creates one port;
+`bus1`, `bus2` and later numbered fields create multiple ports. Each port starts with zero voltage
+and current, with current positive into the component. `n.bus` or `n.busN` is its network node,
+`n.ground` is the reference node, and `n.internal()` inherits the component's electrical dimension.
+`n.state("name")` registers a zero initial state; pass `initial=` only for a nonzero initial value.
+Scalar ports create real states and three-phase ports create complex space-vector states.
 
-An electrical `Port` stores voltage and current once; current is positive into its component.
-Ports are acausal, while a component's `input` and `output` records contain directed control or
-signal-flow values. A one-port element normally uses `bus`; a multi-port element uses `bus1`,
-`bus2`, and so on. `netlist(nb)` declares the electrical primitives between `nb.node(port)` values,
-and assembly compiles every connected component into the selected circuit model.
+Use `n.output`, `n.linear_output` or `n.port_output` to publish values. Ordinary scalar inductor and
+capacitor storage is inferred from the declared primitives; `n.losses()` and `n.supplies()` select
+the primitives used for energy accounting. Public names are namespaced by the configured component
+name, so instances do not share state or output paths.
 
 Configured element buses may also name an assembled Unit default or named port. An optional
 `series_connections()` mapping `{bus: inlet_bus}` cuts a node that joins exactly two ports and
 places the element between them. Repeated declarations form a series chain in declaration order.
 The built-in `Resistor(series=True)` is a stateless reference implementation.
 
-An optional `parameter_bindings()` mapping `{field: (subsystem, attribute)}` exposes retunable
-scalar parameters to C++ event lowering. Implement `retune()` using the same bindings so Python
-and native output/energy equations share one parameter definition. Structural changes, such as
-changing the element's series connection, remain assembly-time configuration. Mark structural
-parameter fields with dataclass metadata `{"runtime": False}` to reject their `set` events. A
-numerical field marked `{"structural": True}` is also fixed during a run and excluded from native
-runtime parameters.
+Structural changes remain assembly-time configuration. Mark a field with dataclass metadata
+`{"runtime": False}` to reject its `set` events; `{"structural": True}` also excludes a numerical
+field from native runtime parameters.
 
 Every entry returned by `signals()` follows the same output path. Complex values become three
 phase columns with `_a`, `_b` and `_c` suffixes, while scalar values retain their declared name;

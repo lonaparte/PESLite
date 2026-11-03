@@ -156,6 +156,31 @@ def test_wpt_runs_with_each_bridge_form(model):
     assert np.isfinite(simulation.system.model.get_initial_values()).all()
 
 
+def test_restored_current_selects_the_rectifier_mode_before_projection(tmp_path):
+    tree = _tree()
+    secondary = tree["units"]["charger"]["secondary"]
+    secondary.pop("pwm")
+    secondary.pop("ctrl")
+    secondary["bridge"] = {
+        "type": "full_bridge",
+        "upper_controlled": False,
+        "lower_controlled": False,
+        "model": "switching",
+    }
+    tree["simulation"].update(t_end=1e-6, energy_check="off")
+    tree["simulation"]["output"].update(
+        period=1e-7, record_every=1, states=True, signals=False
+    )
+    tree["simulation"]["initial"] = {
+        "states": {"charger.link.i_mode_1": 1.0},
+    }
+
+    result = peslite.Simulation(from_dict(tree)).run(out_dir=tmp_path)
+
+    assert result.states["charger.link.i_mode_1"][0] == 1.0
+    assert result.states["charger.secondary.bridge.direction"][0] != 0.0
+
+
 def test_nested_reverse_half_bridge_uses_the_scoped_power_bus_voltage():
     tree = _tree()
     tree["units"]["charger"]["primary"]["bridge"] = {

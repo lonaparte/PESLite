@@ -1,6 +1,7 @@
 """Custom loop, element and event example code lives in tests, not examples/."""
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
@@ -9,9 +10,65 @@ import pytest
 import peslite
 from peslite.assembly import Event, register_event_type
 from peslite.assembly.params import ConfigError, from_dict
-from peslite.components import Element, RLBranch, register_element_type
+from peslite.components import ELEMENT_TYPES, Element, RLBranch, register_component_type
 from peslite.control import ANGLE, FREQUENCY, V_AB, V_DQ, Loop, SyncLaw, register_loop_type
 from peslite.solver import SolverStep
+
+
+def test_declarative_component_builds_ports_states_and_network_plan(case, tmp_path):
+    from peslite.assembly.circuit import compile_network
+    from peslite.solver import netlist as nl
+
+    @register_component_type
+    @dataclass(frozen=True, kw_only=True)
+    class DeclarativeRC:
+        bus: str
+        r: float
+        c: float
+        type: str = "test_declarative_rc"
+
+        def network(self, n):
+            capacitor = n.internal()
+            n.add(
+                nl.Resistor(n.bus, capacitor, self.r),
+                nl.Capacitor(capacitor, n.ground, self.c, n.state("u")),
+            )
+            n.port_output("voltage", "bus", "voltage")
+            n.losses()
+
+    cfg = DeclarativeRC(bus="dc", r=2.0, c=1e-3)
+    definition = ELEMENT_TYPES[cfg.type]
+    element = definition(
+        "rc", cfg,
+        {"dc": SimpleNamespace(phases=1, electrical_domain="dc")},
+        None,
+    )
+    component = element.model
+    plan = compile_network(component)
+
+    assert plan is not None
+    assert component.state_names == ("u",)
+    assert component.state.u == 0.0
+    assert component.port_bus.voltage == 0.0
+    assert component.port_bus.current == 0.0
+    assert [(item.state, item.value, item.kind) for item in component.storage] == [
+        ("u", pytest.approx(1e-3), "capacitor")
+    ]
+    assert element.port_bindings() == (("dc", component.port_bus),)
+
+    tree = case()
+    tree["elements"] = {
+        "rc": {"type": cfg.type, "bus": "pcc", "r": 2.0, "c": 1e-3}
+    }
+    tree["events"] = {
+        "retune": {"type": "set", "t": 1e-4, "set": {"elements.rc.r": 4.0}}
+    }
+    simulation = peslite.Simulation(from_dict(tree))
+    assembled = simulation.system.named_elements["rc"].model
+    assert assembled.state_names == ("u",)
+    assert assembled.state.u == 0j
+    simulation.run(out_dir=tmp_path / "declarative")
+    assert simulation.system.named_elements["rc"].cfg.r == 4.0
 
 
 @register_loop_type
@@ -86,7 +143,7 @@ class _TrackingOscillator(Loop):
         return self.phase, self.unit.base.w0, 1.0 + 0j, self.unit.base.w0, 0.0
 
 
-@register_element_type
+@register_component_type
 class _ShuntRL(Element):
     @dataclass(frozen=True, kw_only=True)
     class Params:

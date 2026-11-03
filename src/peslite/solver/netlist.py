@@ -441,6 +441,13 @@ def _logical_and(left: Any, right: Any) -> Any:
     return left & right
 
 
+def _select(condition: Any, when_true: Any, when_false: Any) -> Any:
+    """Select a scalar value without branching while lowering symbolic equations."""
+    if isinstance(condition, (bool, np.bool_)):
+        return when_true if condition else when_false
+    return np.where(condition, when_true, when_false)
+
+
 def _complex(real: Any, imag: Any) -> Any:
     """Compose a complex scalar without coercing equation values to Python floats."""
     return real + 1j * imag
@@ -673,6 +680,7 @@ class Diode(Element):
         self.gate = gate
         self.conducting = False
         self.residual = 0.0
+        self.mirrored = False
 
 
 class Mode:
@@ -2422,7 +2430,7 @@ class Netlist:
         """A diode's conduction state (its own, whatever its gate) and margin residual."""
         if diode not in self._diodes:
             raise ValueError("the diode does not belong to this netlist")
-        return bool(diode.conducting), float(diode.residual)
+        return diode.conducting, diode.residual
 
     # ---------------------------------------------------------------- evaluation
     def inputs(self, t: float) -> NDArray[np.float64]:
@@ -3466,17 +3474,59 @@ class Netlist:
                     fixed[c] = hi[c] - scale
         return {k: v + fixed.get(ca, 0.0) - fixed.get(cb, 0.0) for k, ca, cb, v in edges}
 
-    def scalar_margins(self, t: Any, y: Sequence[Any]) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
-        """Diode margins and tolerances from the scalar form of the current netlist topology.
+    def scalar_margins(
+        self, t: Any, y: Sequence[Any]
+    ) -> tuple[tuple[Any, ...], tuple[Any, ...], tuple[Any, ...]]:
+        """Diode margins, tolerances and scales from the current scalar topology.
 
         This is the equation-level counterpart of :meth:`_margins`: it avoids numeric coercion so
         exporters can lower the same mode, source and projection laws without a second device model.
         """
         top = self.topology()
-        out = (self._dynamic_scalar_function(top)(t, y)[1]
-               if any(transformer.constant is None for transformer in self._transformers)
-               else self._scalar_function(top, "outputs")(t, y))
-        return self._diode_margins(top, out), self._margin_tolerances(out)
+        out = self.scalar_output_values(t, y, topology=top)
+        scales = self._margin_scales(out)
+        return (self._diode_margins(top, out),
+                tuple(_MARGIN_RTOL * scale for scale in scales), scales)
+
+    def scalar_output_values(
+        self, t: Any, y: Sequence[Any], *, topology: Optional[Topology] = None
+    ) -> tuple[Any, ...]:
+        """All electrical outputs without coercing numeric or equation-valued scalars."""
+        top = self.topology() if topology is None else topology
+        return (self._dynamic_scalar_function(top)(t, y)[1]
+                if any(transformer.constant is None for transformer in self._transformers)
+                else self._scalar_function(top, "outputs")(t, y))
+
+    def _scalar_port_power(self, out: Sequence[Any], element: Element, port: int) -> Any:
+        """Power absorbed at one element port from a scalar output vector."""
+        branch = self._branch(element, port)
+        voltage = self.n_e + branch.output
+        current = voltage + self.n_bd
+        return branch.scale * sum(
+            out[voltage + index] * out[current + index]
+            for index in range(branch.dim)
+        )
+
+    def scalar_power(self, out: Sequence[Any], elements: Sequence[Element]) -> Any:
+        """Power absorbed by netlist elements from one scalar output vector."""
+        total: Any = 0.0
+        for element in elements:
+            for port in range(len(element.ports)):
+                total += self._scalar_port_power(out, element, port)
+        return total
+
+    def scalar_dissipated_power(
+        self, out: Sequence[Any], elements: Sequence[Element], *,
+        topology: Optional[Topology] = None,
+    ) -> Any:
+        """Resistive power of selected elements from one scalar output vector."""
+        roles = (self.topology() if topology is None else topology).roles
+        return sum(
+            self._scalar_port_power(out, element, port)
+            for element in elements
+            for port, branch in enumerate(self._ports[id(element)])
+            if roles[branch] == "res"
+        )
 
     def _output_scales(self, out: Sequence[Any]) -> tuple[Any, Any]:
         """Voltage and current scales of one electrical output vector."""
@@ -3499,8 +3549,9 @@ class Netlist:
         gated = self._gated()
         if not top.blocking:
             return tuple(
-                math.inf if gated[k] else (
-                    out[index + self.n_bd] if bool(diode.conducting) else -out[index]
+                _select(
+                    gated[k], math.inf,
+                    _select(diode.conducting, out[index + self.n_bd], -out[index]),
                 )
                 for k, (diode, index) in enumerate(zip(self._diodes, base))
             )
@@ -3511,16 +3562,16 @@ class Netlist:
         blocking = self._blocking_voltages(top, potential)
         voltage = [blocking.get(k, value) for k, value in zip(branches, voltage)]
         current = [out[index + self.n_bd] for index in base]
-        margins = [current[k] if bool(diode.conducting) else -voltage[k]
+        margins = [_select(diode.conducting, current[k], -voltage[k])
                    for k, diode in enumerate(self._diodes)]
-        return tuple(math.inf if gated[k] else value for k, value in enumerate(margins))
+        return tuple(_select(gated[k], math.inf, value) for k, value in enumerate(margins))
 
     def _margin_scales(self, out: Sequence[Any]) -> tuple[Any, ...]:
         """Physical scale of each diode margin in its present conduction state."""
         voltage_scale, current_scale = self._output_scales(out)
         gated = self._gated()
-        return tuple(0.0 if gated[k] else (
-            current_scale if bool(diode.conducting) else voltage_scale
+        return tuple(_select(
+            gated[k], 0.0, _select(diode.conducting, current_scale, voltage_scale)
         ) for k, diode in enumerate(self._diodes))
 
     def _margin_tolerances(self, out: Sequence[Any]) -> tuple[Any, ...]:
@@ -3529,12 +3580,43 @@ class Netlist:
 
     def projected_values(self, t: Any, y: Sequence[Any]) -> tuple[Any, ...]:
         """State values after the current mode's charge and flux projection."""
+        return self.projected_jump(t, y)[0]
+
+    @staticmethod
+    def _quadratic(values: Sequence[Any], matrix: Any) -> Any:
+        """Return ``values.T @ matrix @ values`` without coercing equation scalars."""
+        dense = matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
+        return sum(
+            coefficient * values[row] * values[column]
+            for row in range(len(values))
+            for column in range(len(values))
+            if (coefficient := dense[row, column]) != 0.0
+        )
+
+    def _scalar_energy(self, y: Sequence[Any]) -> Any:
+        """Stored energy for numeric or equation-valued states."""
+        total: Any = 0.0
+        for element in self._capacitors + self._inductors:
+            branch = self._branch(element)
+            values = [y[int(index)] for index in element.state]
+            matrix = element.C if isinstance(element, Capacitor) else element.L
+            total += 0.5 * branch.scale * self._quadratic(values, matrix)
+        return total
+
+    def projected_jump(self, t: Any, y: Sequence[Any]) -> tuple[tuple[Any, ...], Any, Any]:
+        """Projected states, dissipated jump energy and impulsive source supply."""
         out = list(y)
         inputs = self.source_values(t)
+        loss: Any = 0.0
         for projector in (item for item in self.topology().projectors() if item is not None):
-            for index, value in zip(projector.index, projector.values(y, inputs)[0]):
+            projected = projector.values(y, inputs)[0]
+            before = [y[int(index)] for index in projector.index]
+            delta = [value - previous for value, previous in zip(projected, before)]
+            loss += 0.5 * self._quadratic(delta, projector.W)
+            for index, value in zip(projector.index, projected):
                 out[int(index)] = value
-        return tuple(out)
+        supply = self._scalar_energy(out) - self._scalar_energy(y) + loss
+        return tuple(out), loss, supply
 
     def projection_inconsistent(self, t: Any, y: Sequence[Any]) -> Any:
         """Whether the present topology requires a charge- or flux-conserving state jump."""

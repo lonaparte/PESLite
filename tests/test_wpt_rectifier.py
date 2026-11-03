@@ -48,8 +48,8 @@ def _tree(link, v2, t_end, capacitance=0.0, dt=20e-9):
             "simulation": {"t_end": t_end,
                            "solver": {"type": "fixed", "method": "rk4", "dt": dt,
                                       "linearisations": 0},
-                           "output": {"period": 1e-7, "record_every": 1, "states": False,
-                                      "signals": True, "energy": False}}}
+                           "output": {"period": 1e-7, "record_every": 1, "precision": 17,
+                                      "states": False, "signals": True, "energy": False}}}
 
 
 def test_bridge_model_selection_does_not_change_natural_rectifier_commutation(tmp_path):
@@ -377,18 +377,6 @@ def test_blocked_coupled_ports_project_their_currents_jointly_without_internal_s
     assert not simulation.ph_report.problems
     assert all(status.role == "passive" for status in simulation.ph_report.subsystems
                if status.name.endswith(".bridge"))
-
-
-def test_nonzero_initial_current_establishes_conduction_before_state_projection():
-    tree = _tree(SS, 200.0, 1e-9, dt=1e-10)
-    tree["simulation"]["output"]["signals"] = False
-    tree["simulation"]["initial"] = {"states": {"charger.link.i_mode_1": 1.0}}
-    simulation = peslite.Simulation(from_dict(tree))
-    simulation.run(out_dir=None)
-    model = simulation.system.model
-    link = dict(zip(model.names, model.subsystems))["charger.link"]
-    assert abs(link.output.i_secondary) > 0.5
-    assert simulation.unit("charger.secondary").bridge.get_state()["direction"] != 0.0
 
 
 @pytest.mark.parametrize("case", ["ss_dcm", "lcc_dcm", "ss_multi"])

@@ -13,8 +13,8 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, ClassVar
 
-from . import (Bag, ConfigError, Element, Empty, Port, StoragePort,
-               register_element_type)
+from . import (Bag, ConfigError, Element, Empty, NetworkComponent, Port, StoragePort,
+               register_component_type)
 
 __all__ = ["Cable", "CableModel"]
 
@@ -31,7 +31,7 @@ def _state_record(sections: int) -> type[Bag]:
     return type(f"_CableState{sections}", (Bag,), {"__slots__": names})
 
 
-class CableModel:
+class CableModel(NetworkComponent):
     """Two-port R-L/G-C cable; both port currents are positive into the cable."""
 
     outputs_need_inputs: ClassVar[bool] = False
@@ -76,22 +76,7 @@ class CableModel:
             for k in range(sections)
         )
 
-    def set_outputs(self, t: float) -> None:
-        from ...solver.netlist import device_outputs
-        device_outputs(self, t)
-
-    def rhs(self, t: float):
-        from ...solver.netlist import device_rhs
-        return device_rhs(self, t)
-
-    def dissipated_power(self) -> float:
-        from ...solver.netlist import device_dissipated_power
-        return device_dissipated_power(self)
-
-    def supplied_power(self) -> float:
-        return 0.0
-
-    def netlist(self, nb):
+    def network(self, nb):
         """Declare the cable's distributed R-L and G-C ladder."""
         from ...solver import netlist as nl
 
@@ -124,7 +109,7 @@ class CableModel:
         nb.losses(self)
 
 
-@register_element_type
+@register_component_type
 class Cable(Element):
     """Registered long-cable element using SI per-kilometre parameters."""
 

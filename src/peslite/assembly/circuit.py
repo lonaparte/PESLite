@@ -2,8 +2,8 @@
 
 Under ``simulation.solver.circuit_model`` ``statewise`` (dense per-mode state space) or ``mna``
 (sparse factorized derivative MNA), :func:`lower` rewrites the connection graph the System
-assembled. Components declaring ``netlist(nb)`` become primitives of one
-:class:`~peslite.solver.netlist.Netlist` between bus nodes; ``netlist(nb)`` returns
+assembled. Components declaring ``network(nb)`` become primitives of one
+:class:`~peslite.solver.netlist.Netlist` between bus nodes; ``network(nb)`` returns
 ``NotImplemented`` when a component's present configuration has no netlist form. Every other
 subsystem attached to such a bus is adapted through the signal paths declared by its physical
 port: an output current becomes a current source, or an output voltage becomes a voltage source,
@@ -47,8 +47,8 @@ from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _InlineProgram
 from ..solver.netlist import (QUANTITIES, CurrentSource, Diode, Element, Netlist, Node, Topology,
                               VoltageSource, _Degenerate, _Evaluation, _linear_expression)
 
-__all__ = ["NetlistBuilder", "Circuit", "NetworkView", "lower", "lower_devices",
-           "bind_device", "declare_netlist"]
+__all__ = ["NetlistBuilder", "NetworkPlan", "Circuit", "NetworkView", "lower", "lower_devices",
+           "bind_device", "compile_network"]
 
 
 def _kind(port: Port) -> tuple[int, float]:
@@ -107,7 +107,7 @@ def _record_dependencies(value: Any) -> Optional[tuple[Any, tuple[str, ...]]]:
 
 
 class NetlistBuilder:
-    """What a component's ``netlist(nb)`` declares its primitives with.
+    """What a component's ``network(nb)`` declares its primitives with.
 
     ``node(port)``: the bus node of a port (ground for an unattached voltage-following
     port, a floating node for an unattached driving one); ``internal(dim, scale)``: a new node;
@@ -280,24 +280,56 @@ class NetlistBuilder:
         self.local = True
 
 
-class _NetlistDeclaration:
-    """One pure component declaration, replayed into a local or assembled netlist."""
+class NetworkPlan:
+    """A component's assembly-time electrical plan, materialized by every circuit model."""
 
-    def __init__(self, component: Any, builder: NetlistBuilder) -> None:
-        self.component, self.builder = component, builder
+    __slots__ = ("builder", "port_nodes", "internal_nodes", "states", "elements")
+
+    def __init__(self, builder: NetlistBuilder) -> None:
+        self.builder = builder
+        self.port_nodes = tuple(
+            (node, builder._ports[key]) for key, node in builder._nodes.items()
+        )
+        port_node_ids = {id(node) for node, _port in self.port_nodes}
+        self.internal_nodes = tuple(dict.fromkeys(
+            node
+            for element in builder.netlist.elements
+            for branch in element.ports
+            for node in branch
+            if node is not None and id(node) not in port_node_ids
+        ))
+        self.states = tuple(
+            (*builder._state_owners[key], indices)
+            for key, indices in builder._states.items()
+        )
+        owner_of = {
+            id(element): builder.owners[key]
+            for key, owned in builder.owned.items()
+            for element in owned
+        }
+        self.elements = tuple(
+            (
+                element,
+                owner_of[id(element)],
+                tuple(
+                    (attribute, value)
+                    for attribute, value in vars(element).items()
+                    if isinstance(value, _BoundValue)
+                ),
+            )
+            for element in builder.netlist.elements
+        )
 
     def materialize(self, target: NetlistBuilder) -> None:
         source = self.builder
         node_map: dict[int, Optional[Node]] = {id(None): None}
-        for key, node in source._nodes.items():
-            node_map[id(node)] = target.node(source._ports[key])
-        for element in source.netlist.elements:
-            for node in (item for port in element.ports for item in port if item is not None):
-                node_map.setdefault(id(node), Node(node.dim, node.scale, node.name))
+        for node, port in self.port_nodes:
+            node_map[id(node)] = target.node(port)
+        for node in self.internal_nodes:
+            node_map[id(node)] = Node(node.dim, node.scale, node.name)
 
         state_map: dict[int, int] = {}
-        for key, indices in source._states.items():
-            owner, name = source._state_owners[key]
+        for owner, name, indices in self.states:
             actual = target.state(owner, name)
             state_map.update((int(old), int(new)) for old, new in zip(indices, actual))
         for indices, transform in source.transforms:
@@ -307,24 +339,21 @@ class _NetlistDeclaration:
             ))
 
         elements: dict[int, Element] = {}
-        owner_of = {id(element): source.owners[key]
-                    for key, owned in source.owned.items() for element in owned}
-        for element in source.netlist.elements:
+        for element, owner, bound_values in self.elements:
             cloned = copy.copy(element)
             cloned.ports = tuple(tuple(node_map[id(node)] for node in port) for port in element.ports)
-            for attribute, value in vars(cloned).items():
-                if isinstance(value, _BoundValue):
-                    replacement = target.value_bindings.get((id(value.record), value.field))
-                    if replacement is not None:
-                        setattr(cloned, attribute, _BoundValue(
-                            replacement.record, replacement.field, value.factor, value.invert
-                        ))
+            for attribute, value in bound_values:
+                replacement = target.value_bindings.get((id(value.record), value.field))
+                if replacement is not None:
+                    setattr(cloned, attribute, _BoundValue(
+                        replacement.record, replacement.field, value.factor, value.invert
+                    ))
             if hasattr(element, "state"):
                 cloned.state = np.asarray(
                     [state_map[int(index)] for index in element.state], dtype=np.intp
                 )
             elements[id(element)] = cloned
-            target.owner = owner_of[id(element)]
+            target.owner = owner
             target.add(cloned)
 
         def mapped(value: Any) -> Any:
@@ -358,14 +387,18 @@ class _NetlistDeclaration:
             callback(target.netlist, *(mapped(item) for item in objects))
 
 
-def declare_netlist(sub: Any) -> Optional[_NetlistDeclaration]:
-    """Declare ``sub`` once without changing it, or return ``None`` without a netlist form."""
-    declare = getattr(sub, "netlist", None)
+def compile_network(sub: Any) -> Optional[NetworkPlan]:
+    """Translate ``sub.network`` once into its assembly plan, or return ``None``."""
+    declare = getattr(sub, "network", None)
     if not callable(declare):
         return None
     probe = NetlistBuilder(Netlist("device"))
     probe.owner = sub
-    return None if declare(probe) is NotImplemented else _NetlistDeclaration(sub, probe)
+    if declare(probe) is NotImplemented:
+        return None
+    sub._network_has_losses = id(sub) in probe.lossy
+    sub._network_has_supplies = id(sub) in probe.supplying
+    return NetworkPlan(probe)
 
 
 class _Group:
@@ -399,7 +432,7 @@ class Circuit:
         self._owners: dict[int, str] = {}  # id(element) -> the subsystem that declared it
         self.state = Empty()
         self.components: list[Any] = []
-        self.declarations: dict[int, _NetlistDeclaration] = {}
+        self.declarations: dict[int, NetworkPlan] = {}
         self.groups: list[_Group] = []
         self.port_values: list[tuple[Port, Optional[_Group], str, str]] = []
         self.standalone_ports: tuple[Port, ...] = ()
@@ -432,7 +465,7 @@ class Circuit:
         self._transforms: tuple[tuple[np.ndarray, np.ndarray, np.ndarray], ...] = ()  # (indices, T, T^-1)
         self._hooks: tuple[tuple[Any, Any], ...] = ()  # (component, after) mirroring the netlist's conduction
         self._watched: tuple[int, ...] = ()  # diodes whose conduction the hooks mirror
-        self._mirrored: Optional[tuple[bool, ...]] = None  # their conduction when the hooks last ran
+        self._mirrored_valid = False  # whether watched diode modes were reported to their hooks
         self._boundary_signature: Optional[tuple] = None
         self._stored: Optional[tuple[list[float], np.ndarray]] = None  # (component states, netlist vector) last stored
         self._margin_evaluator_key: Optional[tuple] = None
@@ -506,7 +539,7 @@ class Circuit:
         """Compile the netlist from the components' present parameters (also after a ``set`` event)."""
         rebuilding = self.netlist is not None
         if self.netlist is not None:
-            refreshed = {id(component): declare_netlist(component) for component in self.components}
+            refreshed = {id(component): compile_network(component) for component in self.components}
             if any(declaration is None for declaration in refreshed.values()):
                 changed = [type(component).__name__ for component in self.components
                            if refreshed[id(component)] is None]
@@ -584,7 +617,7 @@ class Circuit:
         self._watched = tuple(sorted({net._diodes.index(d) for _c, hook in hooks if hook["after"] is not None
                                       for d in hook["diodes"]}))
         self.commutation_active = self.locate_commutations or bool(self._hooks)
-        self._mirrored = None
+        self._mirrored_valid = False
         self._boundary_signature = None
         self._mode_targets, self._discrete_mode_targets, held_ratios = (
             self._mode_input_targets(net)
@@ -1292,27 +1325,35 @@ class Circuit:
 
     def cpp_commutation_margin(self, generator: Any) -> str:
         """Lower the netlist's diode guard through the standalone C++ backend."""
-        if not self.cpp_commutating_diodes:
+        if not self.commutating_diodes:
             return "std::numeric_limits<double>::infinity()"
         return generator.trace_circuit_commutation_margin(self)
 
     def cpp_commutate(self, generator: Any) -> list[str]:
         """Lower the netlist's diode transition through the standalone C++ backend."""
-        if not self.cpp_commutating_diodes:
+        if not self.commutating_diodes:
             return []
         return generator.trace_circuit_commutation(self)
 
     @property
-    def cpp_commutating_diodes(self) -> tuple[Diode, ...]:
-        """Diodes whose conduction state is independent of a controlled device gate."""
-        return tuple(diode for diode in self.netlist._diodes if diode.gate is None)
+    def commutating_diodes(self) -> tuple[Diode, ...]:
+        """Diodes whose own conduction state applies whenever their gate is inactive."""
+        return tuple(self.netlist._diodes)
 
     def equation_state_bindings(self) -> dict[str, tuple[Any, str]]:
         """Persistent discrete state owned by the circuit's netlist primitives."""
         return {
             f"diode_{index}_{attribute}": (diode, attribute)
-            for index, diode in enumerate(self.cpp_commutating_diodes)
+            for index, diode in enumerate(self.commutating_diodes)
             for attribute in ("conducting", "residual")
+        } | {
+            f"mirrored_{index}": (self.netlist._diodes[index], "mirrored")
+            for index in self._watched
+        } | {
+            attribute: (self, attribute)
+            for attribute in (
+                "_mirrored_valid", "impulsive_dissipated_energy", "impulsive_supplied_energy"
+            )
         }
 
     def rhs(self, t: float):
@@ -1396,7 +1437,11 @@ class Circuit:
         evaluation = net._last
         topology = evaluation.topology if evaluation is not None and evaluation.t == self.t else net.topology()
         mode = topology.mode
-        if self._hooks and self._pattern(mode) != self._mirrored:
+        if self._hooks and (
+            not self._mirrored_valid
+            or self._pattern(mode) != tuple(self.netlist._diodes[index].mirrored
+                                            for index in self._watched)
+        ):
             return -math.inf
         key, last = mode.key, self._consistent
         if key != last:
@@ -1471,7 +1516,9 @@ class Circuit:
             after(t, {n: complex(before[i], before[i + 1]) if z else before[i]
                       for c, n, z, i in self.layout if c is comp})
         if self._hooks:
-            self._mirrored = self._pattern()
+            for index, conducting in zip(self._watched, self._pattern()):
+                self.netlist._diodes[index].mirrored = conducting
+            self._mirrored_valid = True
         self._boundary_signature = boundary
         self._refresh_device_mode()
 
@@ -1655,6 +1702,18 @@ class NetworkView:
                 for method in self._derived_output_methods
             },
         }
+
+    def equation_state_bindings(self) -> dict[str, tuple[Any, str]]:
+        """State writable by the component and its registered netlist callbacks."""
+        component = getattr(self.component, "equation_state_bindings", None)
+        bindings = {} if component is None else dict(component())
+        circuit = getattr(self, "_circuit", None)
+        if circuit is not None and "commutate" in vars(self):
+            bindings.update(
+                (f"circuit.{name}", binding)
+                for name, binding in circuit.equation_state_bindings().items()
+            )
+        return bindings
 
     def expose(self, margin: Any, commutate: Any, next_time: Any = None) -> None:
         """Expose the component's own commutation hooks for its netlist form (a gate clock)."""
@@ -2109,7 +2168,7 @@ class _DeviceRuntime:
             component.locate_commutations = circuit.locate_commutations
 
 
-def bind_device(name: str, component: Any, declaration: _NetlistDeclaration,
+def bind_device(name: str, component: Any, declaration: NetworkPlan,
                 names: Optional[dict[int, str]] = None) -> Circuit:
     """Compile one component directly from its declaration, preserving its Model identity."""
     circuit = Circuit("device")
@@ -2159,7 +2218,7 @@ def _standalone_device(component: Any) -> Circuit:
     circuit = getattr(component, "_device_circuit", None)
     if circuit is not None:
         return circuit
-    declaration = declare_netlist(component)
+    declaration = compile_network(component)
     if declaration is None:
         raise TypeError(f"{type(component).__name__} has no device netlist equations")
     return bind_device(type(component).__name__, component, declaration)
@@ -2181,13 +2240,15 @@ def device_outputs(component: Any, t: float) -> None:
 
 
 def device_dissipated_power(component: Any) -> float:
-    _standalone_device(component)
-    return component.dissipated_power()
+    circuit = _standalone_device(component)
+    return (circuit.dissipated_power_of(component)
+            if id(component) in circuit._loss_elements else 0.0)
 
 
 def device_supplied_power(component: Any) -> float:
-    _standalone_device(component)
-    return component.supplied_power()
+    circuit = _standalone_device(component)
+    return (circuit.supplied_power_of(component)
+            if id(component) in circuit._supply_elements else 0.0)
 
 
 def device_commutation_margin(component: Any) -> float:
@@ -2221,7 +2282,7 @@ def _find(parent: dict[int, int], a: int) -> int:
 
 def lower_devices(subsystems: Mapping[str, Any], connections: Mapping, zoh: Mapping,
                   buses: Mapping[str, Sequence[Port]],
-                  declarations: Mapping[int, Optional[_NetlistDeclaration]]) -> tuple[
+                  declarations: Mapping[int, Optional[NetworkPlan]]) -> tuple[
         dict, dict, dict, tuple[Circuit, ...]]:
     """Compile the complete acausal electrical network into direct scalar equations."""
     out, lowered, held, circuit = lower(
@@ -2232,7 +2293,7 @@ def lower_devices(subsystems: Mapping[str, Any], connections: Mapping, zoh: Mapp
 
 def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mapping, zoh: Mapping,
           buses: Mapping[str, Sequence[Port]],
-          declarations: Mapping[int, Optional[_NetlistDeclaration]], *,
+          declarations: Mapping[int, Optional[NetworkPlan]], *,
           native: Optional[set[int]] = None
           ) -> tuple[dict, dict, dict, Optional[Circuit]]:
     """Rewrite an assembled connection graph for a netlist circuit model.

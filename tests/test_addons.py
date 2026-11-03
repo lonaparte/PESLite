@@ -48,16 +48,18 @@ def test_component_addon_path_registers_elements(tmp_path, monkeypatch):
     path.mkdir()
     (path / "test_component_addon.py").write_text(
         """from dataclasses import dataclass
-from peslite.addons.components import Element, register_element_type
+from peslite.addons.components import register_component_type
+from peslite.solver import netlist as nl
 
-@register_element_type
-class AddonElement(Element):
-    @dataclass(frozen=True, kw_only=True)
-    class Params:
-        type: str = "addon_test_element"
-        bus: str
+@register_component_type
+@dataclass(frozen=True, kw_only=True)
+class AddonElement:
+    bus: str
+    type: str = "addon_test_element"
 
-    type = "addon_test_element"
+    def network(self, n):
+        n.add(nl.Resistor(n.bus, n.ground, 1.0))
+        n.losses()
 """,
         encoding="utf-8",
     )
@@ -69,7 +71,7 @@ class AddonElement(Element):
     assert [module.__name__ for module in imported] == [
         "peslite.addons.components.test_component_addon"
     ]
-    assert ELEMENT_TYPES["addon_test_element"].__module__ == imported[0].__name__
+    assert ELEMENT_TYPES["addon_test_element"].params.__module__ == imported[0].__name__
 
 
 def test_functions_hold_the_plotting_addon():
@@ -169,9 +171,9 @@ class ProjectLocalPLL(Loop):
     )
     (components / "project_local_element.py").write_text(
         """from dataclasses import dataclass
-from peslite.addons.components import Load, register_element_type
+from peslite.addons.components import Load, register_component_type
 
-@register_element_type
+@register_component_type
 class ProjectLocalElement(Load):
     @dataclass(frozen=True, kw_only=True)
     class Params(Load.Params):

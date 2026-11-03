@@ -16,7 +16,7 @@ from ..control.blocks import A120, phases, smoothstep
 from ..solver.energy import Port, StoragePort
 from ..solver.model import Bag, ConfigError, Empty, LocatedZero, OutputMethod, _real
 from ..solver.timing import TIME_EPS, control_clock_offset
-from .network import RCNode, _extend_record
+from .network import NetworkComponent, RCNode, _extend_record
 from .pwm import CarrierComparison, Modulator, PWM, ZOH, make_unit_modulator
 
 __all__ = ["ThreePhaseBridge", "SwitchingModel", "PWMAveragingModel", "AveragingModel",
@@ -131,7 +131,7 @@ def _register_topology(cls: type) -> type:
 _register_topology(ThreePhaseBridge)
 
 
-class _BridgeModel:
+class _BridgeModel(NetworkComponent):
     """One bridge topology composed with one simulation form.
 
     Topology selection binds its power equation once during construction.  The
@@ -204,7 +204,7 @@ class _BridgeModel:
             and not self.has_switching_events
         )
 
-    def netlist(self, nb):
+    def network(self, nb):
         """Declare the bridge as explicit legs or a lossless conversion ratio."""
         from ..solver import netlist as nl
 
@@ -408,17 +408,6 @@ class _BridgeModel:
     def _device_commutate(self, t: float) -> None:
         from ..solver.netlist import device_commutate
         device_commutate(self, t)
-
-    def rhs(self, t: float):
-        from ..solver.netlist import device_rhs
-        return device_rhs(self, t)
-
-    def dissipated_power(self) -> float:
-        from ..solver.netlist import device_dissipated_power
-        return device_dissipated_power(self)
-
-    def supplied_power(self) -> float:
-        return 0.0
 
     def zoh_connections(self, label: str) -> dict:
         """An unclocked model has no held modulation input."""
@@ -1078,7 +1067,7 @@ class DCVoltageSource:
     def __init__(self, u_dc: float, R: float = 0.0) -> None:
         self.u_dc, self.R = _real(u_dc), _real(R)
 
-class DCLink:
+class DCLink(NetworkComponent):
     """DC link made of an optional capacitor and a current source, voltage source or no source.
 
     Without a capacitor a voltage source is required; a voltage source with a
@@ -1143,11 +1132,7 @@ class DCLink:
         from ..solver.netlist import device_outputs
         device_outputs(self, t)
 
-    def rhs(self, t: float):
-        from ..solver.netlist import device_rhs
-        return device_rhs(self, t)
-
-    def netlist(self, nb):
+    def network(self, nb):
         """Declare the DC-link capacitor, source and source breaker."""
         from ..solver import netlist as nl
 
@@ -1189,14 +1174,6 @@ class DCLink:
             nb.linear_output(self, "i_src", ())
         nb.losses(self)
         nb.supplies(self)
-
-    def dissipated_power(self) -> float:
-        from ..solver.netlist import device_dissipated_power
-        return device_dissipated_power(self)
-
-    def supplied_power(self) -> float:
-        from ..solver.netlist import device_supplied_power
-        return device_supplied_power(self)
 
 
 def make_dclink(cfg: Any) -> DCLink:

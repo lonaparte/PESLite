@@ -829,10 +829,11 @@ class Simulation:
         for name, _subsystem in system.event_subsystems:
             if not values.keys().isdisjoint(self._states.read([name])):
                 self._continued.add(name)
-        # All initial connection commands are simultaneous.  Project their assembled circuit
-        # modes once, after every physical state has been restored.
+        # A commutating circuit must select its mode from the restored state before projection.
+        # Circuits without a commutation owner already have a defined initial topology.
         for circuit in system.circuits:
-            circuit.consistent_state(t0)
+            if not circuit.commutation_active:
+                circuit.consistent_state(t0)
         system.refresh_circuit_plan()
         model_plan_changed = getattr(self.solver, "model_plan_changed", None)
         if model_plan_changed is not None:
@@ -910,10 +911,9 @@ class Simulation:
         plant = Plant(mdl, self._apply_initial(t_start), project=project,
                       synchronize=diode_conduction.synchronize if diode_conduction.commutating else None,
                       reconcile=system.reconcile_circuits)
-        if project is not None:
-            # Establish natural modes before projecting: an initial inductor current may
-            # turn a previously blocked port on and must not be erased by its old mode.
+        if diode_conduction.commutating:
             plant.outputs(t_start)
+        if project is not None:
             plant.state = project(plant.state)
             plant.invalidate()
         if parameters_changed is not None:

@@ -1170,8 +1170,8 @@ def _is_optional(tp) -> tuple[bool, Any]:
 
 _TYPED = {
     "loop": (LOOP_TYPES, ""),
-    "element": (ELEMENT_TYPES, ". Register a custom element type with "
-                               "peslite.register_element_type before loading the file"),
+    "element": (ELEMENT_TYPES, ". Register a custom component type with "
+                               "peslite.register_component_type before loading the file"),
     "event": (EVENT_TYPES, ". Register a custom event type with peslite.register_event_type before loading the file"),
 }
 
@@ -1266,7 +1266,7 @@ def _typed_class(what: str, data: Any, path: str) -> type:
         return loop_type(kind, f"{path}.type").Params
     if not isinstance(kind, str) or kind not in registry:
         raise ConfigError(f"{path}.type: unknown {what} type {kind!r}; known: {sorted(registry)}{hint}")
-    return registry[kind].Params
+    return registry[kind].params if what == "element" else registry[kind].Params
 
 
 def _loop_entry(name: str, item: Any, path: str) -> Any:

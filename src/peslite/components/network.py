@@ -8,16 +8,44 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, fields, is_dataclass, replace
+from types import SimpleNamespace
 from typing import Any, Callable, ClassVar, Optional
 
+import numpy as np
 
 from ..solver.energy import Port, StoragePort
 from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _complex, _real
 
 __all__ = [
-    "Port", "ACVoltageSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
-    "register_element_type", "element_buses", "Load", "Resistor", "VoltageSource",
+    "Port", "NetworkComponent", "ComponentDefinition", "ACVoltageSource", "RLBranch", "RCNode",
+    "Element", "ELEMENT_TYPES", "register_component_type",
+    "element_buses", "Load", "Resistor", "VoltageSource",
 ]
+
+
+class NetworkComponent:
+    """Common runtime adapter for a physical component declared by ``network(builder)``."""
+
+    def set_outputs(self, t: float) -> None:
+        from ..solver.netlist import device_outputs
+        device_outputs(self, t)
+
+    def rhs(self, t: float):
+        from ..solver.netlist import device_rhs
+        return device_rhs(self, t)
+
+    def dissipated_power(self) -> float:
+        if getattr(self, "_network_has_losses", None) is False:
+            return 0.0
+        from ..solver.netlist import device_dissipated_power
+        return device_dissipated_power(self)
+
+    def supplied_power(self) -> float:
+        if getattr(self, "_network_has_supplies", None) is False:
+            return 0.0
+        from ..solver.netlist import device_supplied_power
+        return device_supplied_power(self)
+
 
 def _phase_convention(phases: int, initial: complex | float = 0.0):
     """Power scale, zero and ``initial`` of peak complex space vectors (3) or real scalars (1)."""
@@ -49,7 +77,7 @@ class _BranchInput(Bag):
 class _BranchOutput(Bag):
     __slots__ = ("i",)
 
-class RLBranch:
+class RLBranch(NetworkComponent):
     """Series R-L branch with positive current from port 1 to port 2.
 
     ``phases=3`` uses the peak-scaled complex space-vector convention. ``phases=1`` uses a real
@@ -105,14 +133,6 @@ class RLBranch:
         self.L, self.R = L, R
         self.storage = (replace(self.storage[0], value=L),)
 
-    def set_outputs(self, t: float) -> None:
-        from ..solver.netlist import device_outputs
-        device_outputs(self, t)
-
-    def rhs(self, t: float):
-        from ..solver.netlist import device_rhs
-        return device_rhs(self, t)
-
     def use_external_conduction(self) -> None:
         """Take derivative and copper-loss factor from a connected constitutive subsystem."""
         self.external_conduction = True
@@ -135,14 +155,7 @@ class RLBranch:
         from ..solver.netlist import device_commutate
         device_commutate(self, t)
 
-    def dissipated_power(self) -> float:
-        from ..solver.netlist import device_dissipated_power
-        return device_dissipated_power(self)
-
-    def supplied_power(self) -> float:
-        return 0.0
-
-    def netlist(self, nb):
+    def network(self, nb):
         """Declare the series breaker, resistance, inductance and optional diode."""
         from ..solver import netlist as nl
 
@@ -198,7 +211,7 @@ class _NodeState(Bag):
 class _NodeOutput(Bag):
     __slots__ = ("u",)
 
-class RCNode:
+class RCNode(NetworkComponent):
     """Node with a shunt capacitor ``C`` (F) in series with ``R_d`` (ohm) to ground.
 
     Port current is positive into the node. Output ``u = u_C + R_d i``.
@@ -222,27 +235,12 @@ class RCNode:
             "u_C", C, self.power_scale, ((self.port, "current", 1.0),)
         ),)
 
-    def set_outputs(self, t: float) -> None:
-        from ..solver.netlist import device_outputs
-        device_outputs(self, t)
-
-    def rhs(self, t: float):
-        from ..solver.netlist import device_rhs
-        return device_rhs(self, t)
-
     def retune(self, C: float, R_d: float) -> None:
         """Change capacitance and damping resistance without changing voltage."""
         self.C, self.R_d = C, R_d
         self.storage = (replace(self.storage[0], value=C),)
 
-    def dissipated_power(self) -> float:
-        from ..solver.netlist import device_dissipated_power
-        return device_dissipated_power(self)
-
-    def supplied_power(self) -> float:
-        return 0.0
-
-    def netlist(self, nb):
+    def network(self, nb):
         """Declare the damping resistance and shunt capacitor."""
         from ..solver import netlist as nl
 
@@ -261,7 +259,7 @@ class _SourceOutput(Bag):
     __slots__ = ("e_g", "phi", "theta")
 
 
-class ACVoltageSource:
+class ACVoltageSource(NetworkComponent):
     """Ideal single- or three-phase AC voltage source.
 
     Three phases use ``E exp(j (w0 t + phi(t)))``; one phase uses its real cosine.
@@ -322,19 +320,12 @@ class ACVoltageSource:
     def rhs(self, t: float):
         return ()
 
-    def dissipated_power(self) -> float:
-        return 0.0
-
-    def supplied_power(self) -> float:
-        from ..solver.netlist import device_supplied_power
-        return device_supplied_power(self)
-
     def voltage(self, t: float) -> complex | float:
         """Evaluate and return the source's selected output equation."""
         self._output_equation(t)
         return self.output.e_g
 
-    def netlist(self, nb):
+    def network(self, nb):
         """Declare an ideal voltage source from the port to ground."""
         from ..solver import netlist as nl
 
@@ -366,23 +357,39 @@ class Element:
     domain_transparent: ClassVar[bool] = False
 
 
-ELEMENT_TYPES: dict[str, type] = {}
+@dataclass(frozen=True)
+class ComponentDefinition:
+    """One normalized configuration type and its assembly-time constructor."""
+
+    type: str
+    params: type
+    constructor: Callable[[str, Any, dict, Any], Element]
+
+    def __call__(self, name: str, cfg: Any, buses: dict, p: Any) -> Element:
+        return self.constructor(name, cfg, buses, p)
 
 
-def register_element_type(cls: type) -> type:
-    """Register an :class:`Element` class under ``cls.type`` and return it."""
+ELEMENT_TYPES: dict[str, ComponentDefinition] = {}
+
+
+def _register_definition(cls: type, params: type, constructor: Callable) -> type:
+    """Store one normalized component definition and return its public class."""
     name = getattr(cls, "type", None)
     if not isinstance(name, str) or not name:
-        raise TypeError("an element type needs a name: the class attribute 'type'")
+        raise TypeError("a component type needs a name: the class attribute 'type'")
     if name in ELEMENT_TYPES:
-        raise ValueError(f"element type {name!r} is already registered")
-    params = getattr(cls, "Params", None)
+        raise ValueError(f"component type {name!r} is already registered")
     if not is_dataclass(params) or "type" not in params.__dataclass_fields__:
-        raise TypeError(f"element type {name!r}: Params must be a dataclass with a type field")
+        raise TypeError(f"component type {name!r}: parameters need a dataclass type field")
     if params.__dataclass_fields__["type"].default != name:
-        raise TypeError(f"element type {name!r}: Params.type must default to {name!r}")
-    ELEMENT_TYPES[name] = cls
+        raise TypeError(f"component type {name!r}: type must default to {name!r}")
+    ELEMENT_TYPES[name] = ComponentDefinition(name, params, constructor)
     return cls
+
+
+def _register_assembled_type(cls: type) -> type:
+    """Register an assembly-aware :class:`Element` class."""
+    return _register_definition(cls, getattr(cls, "Params", None), cls)
 
 
 def element_buses(cfg: Any) -> dict[str, str]:
@@ -393,7 +400,257 @@ def element_buses(cfg: Any) -> dict[str, str]:
                                and int(f.name[3:]) > 0))}
 
 
-@register_element_type
+_DEFAULT_STATE = object()
+
+
+class _ComponentNetwork:
+    """Owner-bound façade used while a declarative component becomes a ``NetworkPlan``."""
+
+    def __init__(self, component: "_DeclaredComponent", builder: Any) -> None:
+        self.component, self.builder = component, builder
+        self.ground = None
+
+    def _port(self, value: str | Port) -> Port:
+        if isinstance(value, Port):
+            return value
+        try:
+            return self.component.port_by_field[value]
+        except KeyError:
+            raise ValueError(f"unknown component port {value!r}") from None
+
+    def _kind(self, like: Any = None) -> tuple[int, float]:
+        if isinstance(like, str):
+            like = self.builder.node(self._port(like))
+        if isinstance(like, Port):
+            like = self.builder.node(like)
+        if like is not None:
+            return like.dim, like.scale
+        kinds = {
+            (2 if isinstance(port.voltage, complex) else 1, port.scale)
+            for port in self.component.port_by_field.values()
+        }
+        if len(kinds) != 1:
+            raise ValueError("a mixed-dimension component must specify a reference port")
+        return next(iter(kinds))
+
+    def node(self, port: str | Port):
+        return self.builder.node(self._port(port))
+
+    def internal(self, like: Any = None):
+        return self.builder.internal(*self._kind(like))
+
+    def state(self, name: str, initial: Any = _DEFAULT_STATE, *, like: Any = None):
+        if not isinstance(name, str) or not name.isidentifier():
+            raise ValueError(f"state name must be an identifier, got {name!r}")
+        dimension, _scale = self._kind(like)
+        if name not in self.component.state_names:
+            value = (0j if dimension == 2 else 0.0) if initial is _DEFAULT_STATE else initial
+            if dimension == 2:
+                value = complex(value)
+            elif isinstance(value, complex) and value.imag:
+                raise ValueError(f"scalar state {name!r} cannot have a complex initial value")
+            else:
+                value = float(value.real if isinstance(value, complex) else value)
+            setattr(self.component.state, name, value)
+            self.component.state_names += (name,)
+            self.component.state_dimensions[name] = dimension
+        elif self.component.state_dimensions[name] != dimension:
+            raise ValueError(f"state {name!r} was declared with different dimensions")
+        return self.builder.state(self.component, name)
+
+    @staticmethod
+    def _quantity_zero(quantity: tuple) -> complex | float:
+        target = quantity[1]
+        nodes = [node for port in getattr(target, "ports", ()) for node in port if node is not None]
+        return 0j if nodes and nodes[0].dim == 2 else 0.0
+
+    def _output(self, name: str, initial: complex | float) -> None:
+        if not isinstance(name, str) or not name.isidentifier():
+            raise ValueError(f"output name must be an identifier, got {name!r}")
+        if not hasattr(self.component.output, name):
+            setattr(self.component.output, name, initial)
+
+    def output(self, name: str, quantity: tuple) -> None:
+        self._output(name, self._quantity_zero(quantity))
+        self.builder.output(self.component, name, quantity)
+
+    def linear_output(self, name: str, terms) -> None:
+        terms = tuple(terms)
+        initial = self._quantity_zero(terms[0][1]) if terms else 0.0
+        self._output(name, initial)
+        self.builder.linear_output(self.component, name, terms)
+
+    def port_output(self, name: str, port: str | Port, quantity: str,
+                    factor: float = 1.0) -> None:
+        physical = self._port(port)
+        initial = physical.voltage if quantity == "voltage" else physical.current
+        self._output(name, initial)
+        self.builder.port_output(self.component, name, physical, quantity, factor)
+
+    def node_current_output(self, name: str, node: Any, *, exclude=()) -> None:
+        self._output(name, 0j if node is not None and node.dim == 2 else 0.0)
+        self.builder.node_current_output(
+            self.component, name, node, exclude=exclude
+        )
+
+    def value(self, record: Any, field: str, factor: float = 1.0, *, invert: bool = False):
+        return self.builder.value(record, field, factor, invert=invert)
+
+    def function(self, callback: Callable, inputs=()):
+        return self.builder.function(callback, inputs)
+
+    def add(self, *elements):
+        return self.builder.add(*elements)
+
+    def losses(self) -> None:
+        self.builder.losses(self.component)
+
+    def supplies(self) -> None:
+        self.component.has_source = True
+        self.builder.supplies(self.component)
+
+    def bind(self, callback: Callable, *objects: Any) -> None:
+        self.builder.bind(callback, *objects)
+
+    def mixture(self, cases: Callable, select: Callable) -> None:
+        self.builder.mixture(cases, select)
+
+    def local_model(self) -> None:
+        self.builder.local_model()
+
+    def commutation(self, **kwargs: Any) -> None:
+        self.builder.commutation(self.component, **kwargs)
+
+    def finish(self) -> None:
+        """Infer ordinary scalar storage declarations from the primitives just emitted."""
+        from ..solver import netlist as nl
+
+        storage = []
+        state_indices = {
+            name: tuple(int(index) for index in indices)
+            for (owner, name), indices in self.builder._states.items()
+            if owner == id(self.component)
+        }
+        for primitive in self.builder.owned.get(id(self.component), ()):
+            attribute = "L" if isinstance(primitive, nl.Inductor) else (
+                "C" if isinstance(primitive, nl.Capacitor) else None
+            )
+            if attribute is None:
+                continue
+            indices = tuple(int(index) for index in primitive.state)
+            names = [name for name, state in state_indices.items() if state == indices]
+            matrix = getattr(primitive, attribute)
+            diagonal = np.diag(matrix)
+            if (len(names) != 1 or not np.allclose(matrix, np.diag(diagonal))
+                    or not np.allclose(diagonal, diagonal[0])):
+                continue
+            nodes = [node for port in primitive.ports for node in port if node is not None]
+            storage.append(StoragePort(
+                names[0], float(diagonal[0]), nodes[0].scale if nodes else 1.0,
+                kind="inductor" if attribute == "L" else "capacitor",
+            ))
+        self.component.storage = tuple(storage)
+
+    def __getattr__(self, name: str):
+        if name in self.component.port_by_field:
+            return self.node(name)
+        raise AttributeError(name)
+
+
+class _DeclaredComponent(NetworkComponent):
+    """Runtime physical component generated from one declarative parameter object."""
+
+    outputs_need_inputs = False
+
+    def __init__(self, element: "_ConfiguredComponent", buses: dict[str, Any]) -> None:
+        self.element = element
+        config = element.cfg
+        self.state = SimpleNamespace()
+        self.input = Empty()
+        self.output = SimpleNamespace()
+        self.state_names: tuple[str, ...] = ()
+        self.state_dimensions: dict[str, int] = {}
+        self.storage: tuple[StoragePort, ...] = ()
+        self.has_source = False
+        self.port_by_field: dict[str, Port] = {}
+        for field_name, bus_name in element_buses(config).items():
+            bus = buses[bus_name]
+            phases = int(bus.phases)
+            scale, zero, _initial = _phase_convention(phases)
+            name = "power" if field_name == "bus" else field_name[3:]
+            port = Port(
+                self, name, voltage=zero, current=zero, scale=scale,
+                electrical_domain=getattr(bus, "electrical_domain", None),
+                standalone="voltage",
+            )
+            self.port_by_field[field_name] = port
+            setattr(self, f"port_{field_name}", port)
+        if not self.port_by_field:
+            raise TypeError(f"{type(config).__name__} needs a bus or busN parameter")
+        self.ports = tuple(self.port_by_field.values())
+
+    def network(self, builder):
+        network = _ComponentNetwork(self, builder)
+        result = self.element.cfg.network(network)
+        network.finish()
+        return result
+
+
+class _ConfiguredComponent(Element):
+    """Assembly shell shared by every directly declared electrical component."""
+
+    def __init__(self, name: str, cfg: Any, buses: dict, _params: Any) -> None:
+        self.name, self.cfg = name, cfg
+        self.domain_transparent = bool(getattr(type(cfg), "domain_transparent", False))
+        self.model = _DeclaredComponent(self, buses)
+
+    def subsystems(self) -> dict[str, Any]:
+        return {self.name: self.model}
+
+    @staticmethod
+    def connections() -> dict:
+        return {}
+
+    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
+        return tuple(
+            (bus, self.model.port_by_field[field])
+            for field, bus in element_buses(self.cfg).items()
+        )
+
+    def signals(self) -> dict[str, complex | float]:
+        outputs = {
+            f"{self.name}.{field}": value
+            for field, value in vars(self.model.output).items()
+        }
+        one = len(self.model.port_by_field) == 1
+        for field, port in self.model.port_by_field.items():
+            prefix = self.name if one else f"{self.name}.{field}"
+            outputs[f"{prefix}.voltage"] = port.voltage
+            outputs[f"{prefix}.current"] = port.current
+        return outputs
+
+    def retune(self, cfg: Any) -> None:
+        self.cfg = cfg
+
+
+def register_component_type(cls: type) -> type:
+    """Register a direct electrical dataclass or an assembly-aware :class:`Element`."""
+    if isinstance(cls, type) and issubclass(cls, Element):
+        return _register_assembled_type(cls)
+    if not is_dataclass(cls):
+        raise TypeError("a declarative component type must be a dataclass")
+    if not cls.__dataclass_params__.frozen:
+        raise TypeError("a declarative component parameter dataclass must be frozen")
+    if not callable(getattr(cls, "network", None)):
+        raise TypeError("a declarative component type needs network(builder)")
+    return _register_definition(
+        cls,
+        cls,
+        lambda name, cfg, buses, _params: _ConfiguredComponent(name, cfg, buses, _params),
+    )
+
+
+@register_component_type
 class Load(Element):
     """Built-in series R-L load from ``bus`` to ground; a small impedance models a fault."""
 
@@ -443,7 +700,7 @@ class _ResistorOutput(Bag):
     __slots__ = ("i", "u", "power")
 
 
-class _ResistorModel:
+class _ResistorModel(NetworkComponent):
     """One resistance, in shunt admittance or series voltage-drop form."""
 
     state_names: ClassVar[tuple[str, ...]] = ()
@@ -471,24 +728,10 @@ class _ResistorModel:
         self.output_stages = (OutputMethod(
             "set_power", (), ("power",), rhs=False
         ),)
-    def set_outputs(self, t: float) -> None:
-        from ..solver.netlist import device_outputs
-        device_outputs(self, t)
-
     def set_power(self, t: float) -> None:
         self.output.power = self.power_scale * self.resistance * abs(self.output.i) ** 2
 
-    def rhs(self, t: float):
-        return ()
-
-    def dissipated_power(self) -> float:
-        from ..solver.netlist import device_dissipated_power
-        return device_dissipated_power(self)
-
-    def supplied_power(self) -> float:
-        return 0.0
-
-    def netlist(self, nb):
+    def network(self, nb):
         """Declare the shunt or series resistance."""
         from ..solver import netlist as nl
 
@@ -501,7 +744,7 @@ class _ResistorModel:
         nb.losses(self)
 
 
-@register_element_type
+@register_component_type
 class Resistor(Element):
     """Shunt resistance, or a series resistance inserted after a bus's voltage driver."""
 
@@ -561,7 +804,7 @@ class _VoltageSourceOutput(Bag):
     __slots__ = ("i",)
 
 
-class _VoltageSourceModel:
+class _VoltageSourceModel(NetworkComponent):
     """Scalar voltage source behind a series resistance."""
 
     state_names: ClassVar[tuple[str, ...]] = ()
@@ -579,22 +822,7 @@ class _VoltageSourceModel:
         )
         self.ports = (self.port,)
 
-    def set_outputs(self, t: float) -> None:
-        from ..solver.netlist import device_outputs
-        device_outputs(self, t)
-
-    def rhs(self, t: float):
-        return ()
-
-    def dissipated_power(self) -> float:
-        from ..solver.netlist import device_dissipated_power
-        return device_dissipated_power(self)
-
-    def supplied_power(self) -> float:
-        from ..solver.netlist import device_supplied_power
-        return device_supplied_power(self)
-
-    def netlist(self, nb):
+    def network(self, nb):
         """Declare the source and its series resistance."""
         from ..solver import netlist as nl
 
@@ -608,7 +836,7 @@ class _VoltageSourceModel:
         nb.supplies(self)
 
 
-@register_element_type
+@register_component_type
 class VoltageSource(Element):
     """Scalar named-bus voltage source behind a positive series resistance."""
 

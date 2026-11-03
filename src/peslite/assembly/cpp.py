@@ -34,9 +34,10 @@ from ..control.controller import GraphController, VSCController
 from ..solver.energy import Port, re_product
 from ..solver.integrators import DormandPrince45, FixedStepSolver, TABLEAUS
 from ..solver.model import _strong_components, commutation_tolerance
-from ..solver.netlist import Mode, _DELTA_T, _MAX_PATTERNS, _symbolic_solve
+from ..solver.netlist import Mode, _DELTA_T, _FLOAT_RTOL, _MAX_PATTERNS, _symbolic_solve
 from ..solver.timing import TIME_EPS
 from .conduction import DiodeConduction, _LOCATOR_ITERATIONS, _MAX_COMMUTATIONS
+from .circuit import NetworkView
 from .protection import ProtectionStats
 from .params import (BaseValues, SourceParams, UnitParams, _PARAMETER_RECORDER, _event_assignments,
                      _written_out, connection_defaults, dumps, parameter_leaves)
@@ -1220,9 +1221,11 @@ class _ModelGenerator:
         self.model = self.system.model
         self.subsystem_name = {id(sub): name for name, sub in zip(self.model.names, self.model.subsystems)}
         self.prefix = {id(sub): f"s{index}" for index, sub in enumerate(self.model.subsystems)}
+        self.component_subsystem = {}
         for sub in self.model.subsystems:
             component = getattr(sub, "component", None)
             if component is not None:
+                self.component_subsystem[id(component)] = sub
                 self.subsystem_name.setdefault(id(component), self.subsystem_name[id(sub)])
                 self.prefix.setdefault(id(component), self.prefix[id(sub)])
         self.record_fields: dict[int, dict[str, str]] = {}
@@ -1249,7 +1252,19 @@ class _ModelGenerator:
             read = getattr(sub, "equation_state_bindings", None)
             if read is None:
                 continue
-            bindings = self.equation_bindings[id(sub)] = read()
+            bindings = read()
+            if not bindings:
+                continue
+            self.equation_bindings[id(sub)] = bindings
+            component = getattr(sub, "component", None)
+            if component is not None:
+                if isinstance(sub, NetworkView):
+                    component_read = getattr(component, "equation_state_bindings", None)
+                    self.equation_bindings[id(component)] = (
+                        {} if component_read is None else component_read()
+                    )
+                else:
+                    self.equation_bindings[id(component)] = bindings
             for owner, attribute in bindings.values():
                 key = id(owner), attribute
                 value = getattr(owner, attribute)
@@ -1279,11 +1294,16 @@ class _ModelGenerator:
             for record, field in targets:
                 self.zoh_fields[id(record), field] = member
         self._discover_records()
-        self.physical_port_fields = {
-            id(port): (subsystem.output, voltage, subsystem.output, current)
+        physical_ports = tuple(
+            (subsystem, port, voltage, current)
             for subsystem in self.model.subsystems
             for port, _group, voltage, current in getattr(subsystem, "port_values", ())
+        )
+        self.physical_port_fields = {
+            id(port): (subsystem.output, voltage, subsystem.output, current)
+            for subsystem, port, voltage, current in physical_ports
         }
+        self.physical_ports = {id(port): port for _subsystem, port, _voltage, _current in physical_ports}
         self.enabled_by = {
             id(subsystem): f"u_{_identifier(name)}_gates"
             for name, unit in self.system.units.items()
@@ -1493,7 +1513,8 @@ class _ModelGenerator:
         return self._equation_method_plans[id(owner)]
 
     def _equation_clone(self, owner: Any,
-                        attributes: dict[str, _Expression] | None = None, *, bound=None) -> Any:
+                        attributes: dict[str, _Expression] | None = None, *, bound=None,
+                        bind_aliased_parts: bool = False) -> Any:
         clone = copy.copy(self.runtime.object(owner))
         records = {}
         for name, value in (vars(owner).items() if hasattr(owner, "__dict__") else ()):
@@ -1516,6 +1537,7 @@ class _ModelGenerator:
                 ports[id(value)] = port
         # Composite parts may alias a parent's state record (for example a DC capacitor).
         # Preserve that alias in the equation copy without cloning the connected model graph.
+        aliased_parts = {}
         for name, value in (list(vars(clone).items()) if hasattr(clone, "__dict__") else ()):
             record = records.get(id(getattr(value, "state", None)))
             if record is not None:
@@ -1526,12 +1548,21 @@ class _ModelGenerator:
                     if inner is not None:
                         setattr(part, role, records.get(id(inner), copy.copy(inner)))
                 setattr(clone, name, part)
+                aliased_parts[id(value)] = part
         bindings = self.equation_bindings.get(id(owner), {})
         copies = {id(owner): clone}
+        if bind_aliased_parts:
+            copies.update(aliased_parts)
         for part, _attribute in bindings.values():
             if id(part) not in copies:
                 copies[id(part)] = copy.copy(self.runtime.object(part))
         references = {**self.equation_references, **copies, **records, **ports}
+        circuit = getattr(owner, "_circuit", None)
+        netlist = getattr(circuit, "netlist", None)
+        if netlist is not None:
+            netlist_copy = copy.copy(netlist)
+            netlist_copy._diodes = [copies.get(id(diode), diode) for diode in netlist._diodes]
+            references[id(netlist)] = netlist_copy
 
         def rebind(original, value):
             if id(original) in references:
@@ -1731,17 +1762,20 @@ class _ModelGenerator:
                     )
         return code
 
-    def trace_transition(self, sub, name, *, timed=True):
-        """Trace the ordinary state-changing callback, including ODE-state resets."""
-        hook = getattr(sub, f"cpp_{name}", None)
-        if hook is not None:
-            return hook(self)
+    def _trace_transition_call(self, sub, callback, arguments, label, *, bind_callback_owner=False):
+        """Trace one state-changing callback with its explicit arguments."""
         bindings = self.equation_bindings.get(id(sub), {})
 
         def run():
             bound = {}
-            clone = self._equation_clone(sub, bound=bound)
-            self._rebind(getattr(sub, name), clone)(*([_Expression("t", "real")] if timed else []))
+            clone = self._equation_clone(
+                sub,
+                bound=bound,
+                bind_aliased_parts=bind_callback_owner,
+            )
+            target = (bound.get(id(getattr(callback, "__self__", None)), clone)
+                      if bind_callback_owner else clone)
+            self._rebind(callback, target)(*arguments)
             return (*[getattr(bound[id(part)], attribute) for part, attribute in bindings.values()],
                     *[getattr(clone.state, field) for field in sub.state_names])
 
@@ -1759,9 +1793,53 @@ class _ModelGenerator:
                 assignments.append((f"y[{index}]", value))
         assignments = [(target, value) for target, value in assignments
                        if target != self.solver_expression(value.code)]
-        lines = _assign_values(f"transition_{self.prefix[id(sub)]}", assignments)
+        lines = _assign_values(label, assignments)
         return [self.solver_expression(line) for line in
                 self._term_declarations(prefix, terms, lines)]
+
+    def trace_transition(self, sub, name, *, timed=True):
+        """Trace the ordinary state-changing callback, including ODE-state resets."""
+        hook = getattr(sub, f"cpp_{name}", None)
+        if hook is not None:
+            return hook(self)
+        arguments = (_Expression("t", "real"),) if timed else ()
+        callback = getattr(sub, name)
+        return self._trace_transition_call(
+            sub,
+            callback,
+            arguments,
+            f"transition_{self.prefix[id(sub)]}",
+            bind_callback_owner=(
+                isinstance(sub, NetworkView)
+                and getattr(callback, "__self__", sub) is not sub
+            ),
+        )
+
+    def trace_circuit_hooks(self, circuit: Any, tag: str) -> tuple[list[str], list[str]]:
+        """Lower component state mirrors that run after a netlist commutation."""
+        declarations, transitions = [], []
+        for hook_index, (component, callback) in enumerate(circuit._hooks):
+            subsystem = self.component_subsystem.get(id(component), component)
+            before = {}
+            for state_index, (owner, name, complex_value, index) in enumerate(circuit.layout):
+                if owner is not component:
+                    continue
+                local = f"commutation_{tag}_before_{hook_index}_{state_index}"
+                value = (f"Complex{{y[{self.state_index[id(owner.state), name][0]}], "
+                         f"y[{self.state_index[id(owner.state), name][0] + 1}]}}"
+                         if complex_value else
+                         f"y[{self.state_index[id(owner.state), name][0]}]")
+                declarations.append(f"const auto {local} = {value};")
+                before[name] = _Expression(local, "complex" if complex_value else "real")
+            with self._netlist_symbols(circuit):
+                transitions.extend(self._trace_transition_call(
+                    subsystem,
+                    callback,
+                    (_Expression("t", "real"), before),
+                    f"commutation_{tag}_hook_{hook_index}",
+                    bind_callback_owner=True,
+                ))
+        return declarations, transitions
 
     def discrete_update_assignments(self, sub) -> list[tuple[str, _Expression]]:
         """Trace one pure discrete-state sample without committing it."""
@@ -1813,9 +1891,8 @@ class _ModelGenerator:
 
     def trace_element_values(self, element: Any, read: Any) -> dict[str, _Expression]:
         """Trace values returned by an assembly object from its subsystem records."""
-        # An assembly object's public boundary may read a connected network subsystem which it
-        # does not own (for example a converter reads its terminal bus voltage). Rebind every
-        # assembled record so this generic tracing path follows those references as well.
+        # An assembly object's public boundary may read a connected subsystem record or physical
+        # port which it does not own. Rebind both so the generic trace follows those references.
         subsystems = tuple(self.model.subsystems)
 
         def run():
@@ -1829,6 +1906,16 @@ class _ModelGenerator:
                             saved.append((record, field, value))
                             setattr(record, field, _Expression(
                                 self.value(record, field), self.record_types[id(record), field]))
+                for key, fields in self.physical_port_fields.items():
+                    port = self.physical_ports[key]
+                    for quantity, record, field in (
+                        ("voltage", fields[0], fields[1]),
+                        ("current", fields[2], fields[3]),
+                    ):
+                        saved.append((port, quantity, getattr(port, quantity)))
+                        setattr(port, quantity, _Expression(
+                            self.value(record, field), self.record_types[id(record), field]
+                        ))
                 return read()
             finally:
                 for record, field, value in reversed(saved):
@@ -2006,10 +2093,16 @@ class _ModelGenerator:
                     continue
                 restored.append((record, field, getattr(record, field)))
                 setattr(record, field, _Expression(self.value(record, field), self.record_types[key]))
-        for owner, attribute in self.equation_bindings.get(id(circuit), {}).values():
-            member, kind, _owner, _attribute = self.equation_members[id(owner), attribute]
-            restored.append((owner, attribute, getattr(owner, attribute)))
-            setattr(owner, attribute, _Expression(member, kind))
+        bound = set()
+        for component in (*circuit.components, circuit):
+            for owner, attribute in self.equation_bindings.get(id(component), {}).values():
+                key = id(owner), attribute
+                if key in bound:
+                    continue
+                bound.add(key)
+                member, kind, _owner, _attribute = self.equation_members[key]
+                restored.append((owner, attribute, getattr(owner, attribute)))
+                setattr(owner, attribute, _Expression(member, kind))
         net = circuit.netlist
         transient = (circuit.derivatives, circuit.t, circuit._stored,
                      net._last, net._mode, net._frozen_mode, net._frozen_topology,
@@ -2147,6 +2240,34 @@ class _ModelGenerator:
                  if value.code != self.value(circuit.output, field)]
         return self._term_declarations(prefix, terms, lines)
 
+    def trace_circuit_component_power(
+        self, circuit: Any, component: Any, *, supplied: bool
+    ) -> str:
+        """Lower one component's source or loss power from the circuit's netlist outputs."""
+        def run():
+            with self._netlist_symbols(circuit):
+                circuit.receive()
+                states = circuit._states()
+                outputs = circuit.netlist.scalar_output_values(
+                    _Expression("t", "real"), states
+                )
+                elements = (circuit._supply_elements if supplied else circuit._loss_elements).get(
+                    id(component), ()
+                )
+                if supplied:
+                    sources = {id(element) for element, _offset in circuit.netlist._sources}
+                    elements = tuple(element for element in elements if id(element) in sources)
+                    power = circuit.netlist.scalar_power(outputs, elements)
+                else:
+                    power = circuit.netlist.scalar_dissipated_power(outputs, elements)
+                return -power if supplied else power
+
+        with self._shared_terms() as (prefix, terms):
+            value = self._trace(run)
+        lines = self._term_declarations(prefix, terms, [f"return {value.code};"])
+        code = value.code if len(lines) == 1 else f"([&]() {{ {' '.join(lines)} }}())"
+        return self.solver_expression(code)
+
     def trace_netlist_outputs(self, owner: Any, method: Any, circuit: Any,
                               fields: tuple[str, ...]) -> list[str]:
         """Trace one dependency stage generated from a component's local netlist."""
@@ -2178,20 +2299,36 @@ class _ModelGenerator:
 
     def trace_circuit_commutation_margin(self, circuit: Any) -> str:
         """Trace the minimum diode guard from the circuit's own netlist primitives."""
-        diodes = circuit.cpp_commutating_diodes
+        net = circuit.netlist
+        diodes = circuit.commutating_diodes
 
         def run():
             with self._netlist_symbols(circuit):
+                circuit.receive()
                 states = circuit._states()
-                margins, _tolerances = circuit.netlist.scalar_margins(
-                    _Expression("t", "real"), states
+                t = _Expression("t", "real")
+                topology = net.topology()
+                outputs = net.scalar_output_values(t, states, topology=topology)
+                margins = net._diode_margins(topology, outputs)
+                margin = min(
+                    (margins[index] - diode.residual
+                     for index, diode in enumerate(diodes)),
+                    default=math.inf,
                 )
-                margin = min((margins[circuit.netlist._diodes.index(diode)] - diode.residual
-                              for diode in diodes),
-                             default=math.inf)
-                return -math.inf if circuit.netlist.projection_inconsistent(
-                    _Expression("t", "real"), states
-                ) else margin
+                mirror_changed = circuit._hooks and (
+                    not circuit._mirrored_valid
+                    or any(topology.mode.conducting[index] != net._diodes[index].mirrored
+                           for index in circuit._watched)
+                )
+                externally_switched = bool(
+                    net._switches or net._gates
+                    or any(transformer.constant is None for transformer in net._transformers)
+                )
+                inconsistent = (
+                    net.projection_inconsistent(t, states)
+                    if externally_switched and not circuit._hooks else False
+                )
+                return -math.inf if mirror_changed or inconsistent else margin
 
         with self._shared_terms() as (prefix, terms):
             value = self._trace(run)
@@ -2202,24 +2339,33 @@ class _ModelGenerator:
     def trace_circuit_commutation(self, circuit: Any) -> list[str]:
         """Emit one topology-independent diode-pattern transition from netlist equations."""
         net = circuit.netlist
-        diodes = circuit.cpp_commutating_diodes
+        diodes = circuit.commutating_diodes
         indices = tuple(net._diodes.index(diode) for diode in diodes)
 
         def run():
             with self._netlist_symbols(circuit):
+                circuit.receive()
                 states = circuit._states()
                 impulses = net.impulse_flags(_Expression("t", "real"), states)
-                projected = list(net.projected_values(_Expression("t", "real"), states))
-                margins, tolerances = net.scalar_margins(_Expression("t", "real"), projected)
+                projected, jump_loss, jump_supply = net.projected_jump(
+                    _Expression("t", "real"), states
+                )
+                projected = list(projected)
+                margins, tolerances, scales = net.scalar_margins(
+                    _Expression("t", "real"), projected
+                )
+                effective = tuple(net.mode().conducting)
                 if circuit._transforms:
                     component = np.asarray(projected, dtype=object)
                     for index, _transform, inverse in circuit._transforms:
                         component[index] = inverse @ component[index]
                     projected = component.tolist()
-                return tuple(projected), margins, tolerances, impulses
+                return (tuple(projected), margins, tolerances, scales, impulses,
+                        effective, jump_loss, jump_supply)
 
         with self._shared_terms() as (prefix, terms):
-            projected, margins, tolerances, impulses = self._trace(run)
+            (projected, margins, tolerances, scales, impulses,
+             effective, jump_loss, jump_supply) = self._trace(run)
         tag = self.prefix[id(circuit)]
         state_assignments = []
         for component, name, complex_value, index in circuit.layout:
@@ -2232,6 +2378,13 @@ class _ModelGenerator:
         state_assignments = [(target, value) for target, value in state_assignments
                              if target != value.code]
         projected_lines = _assign_values(f"commutation_{tag}_state", state_assignments)
+        before_lines, hook_lines = self.trace_circuit_hooks(circuit, tag)
+        jump_lines = [
+            f"{self.equation_members[id(circuit), 'impulsive_dissipated_energy'][0]} += "
+            f"{jump_loss.code};",
+            f"{self.equation_members[id(circuit), 'impulsive_supplied_energy'][0]} += "
+            f"{jump_supply.code};",
+        ]
         bad = [f"commutation_{tag}_bad_{index}" for index in range(len(diodes))]
         any_impulse = " || ".join(impulses[index].code for index in indices) or "false"
         declarations = [
@@ -2241,26 +2394,42 @@ class _ModelGenerator:
             f"(({impulse.code}) || (!({any_impulse}) && "
             f"({margin.code}) < -({tolerance.code})));"
             for name, diode, index in zip(bad, diodes, indices)
-            for margin, tolerance, impulse in ((margins[index], tolerances[index], impulses[index]),)
+            for margin, tolerance, impulse in (
+                (margins[index], tolerances[index], impulses[index]),
+            )
         ]
         invalid = " || ".join(bad) or "false"
         residuals = [
-            f"{self.equation_members[id(diode), 'residual'][0]} = std::min({margin.code}, 0.0);"
+            f"{self.equation_members[id(diode), 'residual'][0]} = "
+            f"std::min({margin.code}, 0.0) - {_number(_FLOAT_RTOL)} * ({scale.code});"
             for diode, index in zip(diodes, indices)
-            for margin in (margins[index],)
+            for margin, scale in ((margins[index], scales[index]),)
         ]
         flips = [
             f"if ({name}) {self.equation_members[id(diode), 'conducting'][0]} = "
             f"!{self.equation_members[id(diode), 'conducting'][0]};"
             for name, diode in zip(bad, diodes)
         ]
+        mirrors = [
+            f"{self.equation_members[id(net._diodes[index]), 'mirrored'][0]} = "
+            f"{effective[index].code};"
+            for index in circuit._watched
+        ]
+        if circuit._hooks:
+            mirrors.append(
+                f"{self.equation_members[id(circuit), '_mirrored_valid'][0]} = true;"
+            )
         inner = self._term_declarations(prefix, terms, [
             *declarations,
             f"if (!({invalid})) {{",
+            *before_lines,
+            *jump_lines,
             *projected_lines,
             "if (commutation_attempt != 0) {",
             *residuals,
             "}",
+            *hook_lines,
+            *mirrors,
             "return;",
             "}",
             *flips,
@@ -5431,6 +5600,13 @@ class _CppGenerator:
         def powers(check: Any) -> tuple[str, str]:
             sub = check.subsystem
             try:
+                circuit = getattr(sub, "_circuit", None)
+                component = getattr(sub, "component", None)
+                if circuit is not None and component is not None:
+                    return (
+                        model.trace_circuit_component_power(circuit, component, supplied=True),
+                        model.trace_circuit_component_power(circuit, component, supplied=False),
+                    )
                 attributes = model._equation_attributes(sub)
                 return (model.trace_scalar_method(sub, "supplied_power", attributes),
                         model.trace_scalar_method(sub, "dissipated_power", attributes))
@@ -5443,7 +5619,16 @@ class _CppGenerator:
         declared_index = 0
         for check in plan.subsystems:
             kind = check.spec.kind
-            if kind in ("observer", "dirac"):
+            if kind == "observer":
+                if hasattr(check.subsystem, "impulsive_dissipated_energy"):
+                    for attribute, suffix in (
+                        ("impulsive_dissipated_energy", "dissipated_impulsive_J"),
+                        ("impulsive_supplied_energy", "supplied_impulsive_J"),
+                    ):
+                        columns.append(f"{check.name}.{suffix}")
+                        values.append(model.equation_members[id(check.subsystem), attribute][0])
+                continue
+            if kind == "dirac":
                 continue
             tag = f"energy_{declared_index}"
             declared_index += 1
@@ -5494,10 +5679,12 @@ class _CppGenerator:
             columns.append(f"{check.name}.energy_J")
             values.append(f"{tag}_energy")
             if hasattr(check.subsystem, "impulsive_dissipated_energy"):
-                impulse = model._trace(lambda: model._equation_clone(
-                    check.subsystem).impulsive_dissipated_energy)
-                columns.append(f"{check.name}.dissipated_impulsive_J")
-                values.append(impulse.code)
+                for attribute, suffix in (
+                    ("impulsive_dissipated_energy", "dissipated_impulsive_J"),
+                    ("impulsive_supplied_energy", "supplied_impulsive_J"),
+                ):
+                    columns.append(f"{check.name}.{suffix}")
+                    values.append(model.equation_members[id(check.subsystem), attribute][0])
         all_values = ["total_energy", "total_supplied", "total_dissipated", "tellegen",
                       "max_residual", *values, "std::abs(tellegen) / scale", "max_residual / scale"]
         lines += [f"    return std::array<double, {len(all_values)}>{{{{{', '.join(all_values)}}}}};", "}"]

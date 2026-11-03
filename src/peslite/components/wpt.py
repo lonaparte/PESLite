@@ -24,6 +24,7 @@ import numpy as np
 
 from ..solver.energy import Port, StoragePort
 from ..solver.model import Bag, Empty, LocatedZero, OutputMethod, _real, commutation_tolerance
+from .network import NetworkComponent
 from .pwm import PhaseClock
 
 __all__ = ["CompensatedLink", "SwitchedCompensatedLink", "SwitchControlledCapacitor",
@@ -63,7 +64,7 @@ class _Side:
         self.parallel_resistance = parallel_resistance
 
 
-class CompensatedLink:
+class CompensatedLink(NetworkComponent):
     """Coupled coils with per-coil series capacitors and per-side series or LCC compensation."""
 
     outputs_need_inputs: ClassVar[bool] = False
@@ -137,17 +138,6 @@ class CompensatedLink:
         name = f"u_{side}_series" if self.sides[side].lcc else f"u_{side}_cap"
         return f"{name}_{self._module(coil) + 1}" if multi else name
 
-    def supplied_power(self) -> float:
-        return 0.0
-
-    def dissipated_power(self) -> float:
-        from ..solver.netlist import device_dissipated_power
-        return device_dissipated_power(self)
-
-    def rhs(self, t: float):
-        from ..solver.netlist import device_rhs
-        return device_rhs(self, t)
-
     def set_outputs(self, t: float) -> None:
         self._t = t
         for scc in self.switched:
@@ -159,7 +149,7 @@ class CompensatedLink:
         return tuple(sum(coefficient * current for coefficient, current in zip(row, modal))
                      for row in self._shapes)
 
-    def netlist(self, nb):
+    def network(self, nb):
         """Declare the compensated coupled-coil network in coil coordinates."""
         from ..solver import netlist as nl
 
@@ -501,7 +491,8 @@ class SwitchControlledCapacitor:
                 self.zero.sign = 1.0 if positive else -1.0
             if not self.on:
                 self.switchings += 1
-                if abs(voltage) > _VOLTAGE_TOL and t == self._edge:
+                if (abs(voltage) > _VOLTAGE_TOL
+                        and abs(t - self._edge) <= commutation_tolerance(t)):
                     self.hard_turn_ons += 1
                 self.max_turn_on_voltage = max(self.max_turn_on_voltage, abs(voltage))
                 self.impulsive_energy += 0.5 * self.capacitance * voltage * voltage

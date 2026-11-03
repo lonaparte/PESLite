@@ -10,7 +10,7 @@ from scipy.linalg import expm
 
 import peslite
 from conftest import EXAMPLES, QUIET
-from peslite.assembly.circuit import Circuit, NetworkView, bind_device, declare_netlist
+from peslite.assembly.circuit import Circuit, NetworkView, bind_device, compile_network
 from peslite.components.network import ACVoltageSource
 from peslite.solver import FixedStepSolver
 from peslite.solver.netlist import (Capacitor, CurrentSource, Diode, Inductor, Netlist, Node,
@@ -163,7 +163,7 @@ def test_custom_ac_waveform_remains_the_source_of_its_declared_netlist():
             self.output.e_g = 40.0 + t
 
     source = CustomSource(2.0 * np.pi * 50.0, 325.0, phases=1)
-    declaration = declare_netlist(source)
+    declaration = compile_network(source)
     assert declaration is not None
     bind_device("source", source, declaration)
     source.set_outputs(2.0)
