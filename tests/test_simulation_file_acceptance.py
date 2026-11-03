@@ -10,6 +10,7 @@ from contextlib import redirect_stdout
 import numpy as np
 import pytest
 import yaml
+from packaging.version import Version
 
 import peslite
 from conftest import EXAMPLES
@@ -23,7 +24,7 @@ BUNDLED = sorted(path.name for path in EXAMPLES.glob("*-example.pes"))
 @pytest.mark.parametrize("name", BUNDLED)
 def test_bundled_examples_declare_the_current_interface_version(name):
     first_line = (EXAMPLES / name).read_text(encoding="utf-8").splitlines()[0]
-    assert first_line == f"# PESLite {peslite.__version__}"
+    assert first_line == f"# PESLite {Version(peslite.__version__).base_version}"
 
 
 @pytest.mark.parametrize("name", BUNDLED)
