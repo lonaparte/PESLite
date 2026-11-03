@@ -1,10 +1,14 @@
 """Bundled simulation-file discovery and packaging."""
 
+import pytest
 import yaml
 
 from conftest import EXAMPLES, ROOT
 from peslite.solver import simulation
 from peslite.solver.simulation import _config_path
+
+pytestmark = pytest.mark.static
+
 
 def test_bundled_examples_are_named_pes_files_containing_yaml():
     paths = {path.name: path for path in EXAMPLES.iterdir()}

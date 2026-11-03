@@ -42,6 +42,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
+    "static: configuration, interface and packaging checks run before numerical tests",
     "full: compiler, external-reference or long numerical integration tests",
     "motulator: cross-checks PESLite against the pinned motulator reference simulator",
     "pyspice: optional DC-converter and WPT cross-checks against PySpice and ngspice",

@@ -3,7 +3,11 @@
 import ast
 from pathlib import Path
 
+import pytest
+
 import peslite
+
+pytestmark = pytest.mark.static
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "src" / "peslite"
