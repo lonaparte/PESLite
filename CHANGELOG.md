@@ -239,14 +239,14 @@
   `--averaging` uses the `-averaging` result suffix and is mutually exclusive with
   `--pwm-averaging`.
 
-### Progress lines and watched quantities (#3)
+### Progress bar and watched quantities (#3)
 
-- `simulation.progress: {enable, period, watch}` replaces `simulation.progress_every`.
-  `--progress SECONDS` enables the lines; repeatable `--watch NAME` arguments, including
+- `simulation.progress: {enable, watch}` replaces `simulation.progress_every`.
+  `--progress` enables the display; repeatable `--watch NAME` arguments, including
   comma-separated names, replace the file's watch list.
 - Watched names may be state-table columns, plant/controller result columns, state aliases, or a
   complex state without `.re`/`.im` to report its magnitude. State paths are entity-first, with no
-  `plant.*` domain. Unknown names report the known set at the first progress line, and observing
+  `plant.*` domain. Unknown names report the known set at the first progress update, and observing
   values does not change the simulation trajectory.
 
 ### Packaging and verification

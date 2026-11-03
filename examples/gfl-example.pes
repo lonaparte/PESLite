@@ -180,9 +180,8 @@ simulation:                # how the model is simulated
     # signals: 0           # plant.csv and ctrl.<unit>.csv
     # energy: 0            # energy.csv
   # stop_on_trip: 1
-  # progress:              # console lines (--progress SECONDS, --watch NAME)
+  # progress:              # terminal progress bar (--progress, --watch NAME)
   #   enable: 0
-  #   period: 0.1          # simulated seconds between lines
   #   watch: [vsc.vdc_pu, vsc.i_c]  # states/outputs; complex state -> magnitude
   # energy_check: warn     # warn | strict | off
 

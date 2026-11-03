@@ -919,15 +919,13 @@ class OutputParams:
 
 @dataclass(frozen=True)
 class ProgressParams:
-    """Progress lines, controlled by ``enable``.
+    """Progress bar, controlled by ``enable``.
 
-    ``period`` is simulated seconds between lines. ``watch`` names state-table or plant-table
-    quantities to append to each line; a complex state may be named without ``.re``/``.im`` to
-    report its magnitude.
+    ``watch`` names state-table or plant-table quantities to append to the bar; a complex state
+    may be named without ``.re``/``.im`` to report its magnitude.
     """
 
     enable: bool = False
-    period: Optional[float] = None
     watch: list = field(default_factory=list)
 
 

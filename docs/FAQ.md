@@ -50,7 +50,7 @@ that are rejected.
 
 The entity prefix distinguishes the same quantity on different devices. For example,
 `vsc_1.vdc_pu` and `vsc_2.vdc_pu` are different values. Run `--list-states` to inspect state names,
-and use `--progress` together with `--watch` because watched values are printed on progress lines.
+and use `--progress` together with `--watch` because watched values appear on the progress bar.
 
 ## Does output remain in memory until the run ends?
 

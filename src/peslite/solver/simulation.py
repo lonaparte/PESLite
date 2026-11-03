@@ -54,6 +54,41 @@ _UNAVAILABLE = object()
 _RESTART_PRECISION = 17
 
 
+class _ProgressBar:
+    """A compact progress display which overwrites one terminal line when possible."""
+
+    __slots__ = ("label", "start", "stop", "stream", "inline", "line_width")
+
+    def __init__(self, label: str, start: float, stop: float, stream=None) -> None:
+        self.label = label
+        self.start, self.stop = start, stop
+        self.stream = sys.stdout if stream is None else stream
+        self.inline = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.line_width = 0
+
+    def update(self, t: float, elapsed: float, suffix: str = "") -> None:
+        fraction = min(1.0, max(0.0, (t - self.start) / (self.stop - self.start)))
+        width = 24
+        complete = min(width, int(fraction * width))
+        bar = "=" * complete + (">" if complete < width else "")
+        bar = bar.ljust(width, "-")
+        line = (
+            f"Simulating {self.label} [{bar}] {fraction:6.1%}  "
+            f"t = {t:.6g}/{self.stop:.6g} s  wall = {elapsed:.1f} s{suffix}"
+        )
+        if self.inline:
+            self.line_width = max(self.line_width, len(line))
+            self.stream.write("\r" + line.ljust(self.line_width))
+            self.stream.flush()
+        else:
+            print(line, file=self.stream, flush=True)
+
+    def close(self) -> None:
+        if self.inline:
+            self.stream.write("\n")
+            self.stream.flush()
+
+
 def _optional_output(t: float, name: str, read: Callable, *args):
     """Isolate numerical observation failures without hiding programming or I/O errors."""
     try:
@@ -896,7 +931,6 @@ class Simulation:
         record_every = max(1, output.record_every)
         stop_on_trip = p.simulation.stop_on_trip
         progress = p.simulation.progress
-        progress_every = progress.period if progress.enable else 0.0
         watch = list(progress.watch) if progress.enable else []
         output_dir = Path(out_dir) if out_dir is not None else None
         if output_dir is None and (output.states or output.signals or output.energy):
@@ -908,6 +942,7 @@ class Simulation:
         if t_end <= t_start + TIME_EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         t_final = t_end
+        progress_every = (t_final - t_start) / 100.0 if progress.enable else 0.0
         plant = Plant(mdl, self._apply_initial(t_start), project=project,
                       synchronize=diode_conduction.synchronize if diode_conduction.commutating else None,
                       reconcile=system.reconcile_circuits)
@@ -946,6 +981,9 @@ class Simulation:
         n_log = max(0, math.ceil(t_start / log_period - 1e-9))
         actions = deque(action for action in self._actions() if action[0] > t_start + TIME_EPS)
         next_report = t_start + progress_every if progress_every > 0 else math.inf
+        progress_bar = (
+            _ProgressBar(name, t_start, t_final) if progress_every > 0 else None
+        )
         t_local = t_start
         n_rhs0 = getattr(solver, "n_rhs", 0)
 
@@ -1039,7 +1077,7 @@ class Simulation:
                         pending_observations.add(next_observation)
 
         def watched(t_now: float) -> str:
-            """Format the quantities appended to a progress line."""
+            """Format the quantities appended to the progress bar."""
             sync_if_needed(t_now)
             values = self.watch_values(t_now, rec.last_ctrl_log)
             unknown = [name for name in watch if name not in values]
@@ -1106,6 +1144,10 @@ class Simulation:
         # ---------------------------------------------------------------- the event grid
         self._begin_event_owners(t_start, plant)
         plant.settle = settle_now
+        if progress_bar is not None:
+            # Controller observations become valid at their first scheduled event. The 0% bar
+            # therefore reports progress only instead of manufacturing pre-sample watch values.
+            progress_bar.update(t_start, time.time() - wall0)
         while True:
             plant.inputs_changed = False
             t_log = n_log * log_period
@@ -1188,9 +1230,15 @@ class Simulation:
                 snapshot(t_local, record=False)
             if t_local >= next_report:
                 suffix = watched(t_local) if watch else ""
-                print(f"  t = {t_local:8.4f} s   wall {time.time() - wall0:8.1f} s{suffix}",
-                      flush=True)
-                next_report += progress_every
+                progress_bar.update(t_local, time.time() - wall0, suffix)
+                while next_report <= t_local:
+                    next_report += progress_every
+
+        if progress_bar is not None:
+            progress_bar.update(
+                t_local, time.time() - wall0, watched(t_local) if watch else ""
+            )
+            progress_bar.close()
 
         snapshot(t_local, final=True)
         if stop_reason:
@@ -1570,10 +1618,10 @@ def main(argv=None) -> int:
     ap.add_argument("--imperix-config", metavar="FILE", help="ADC/PWM bindings; default: PESFILE.imperix.json")
     ap.add_argument("--imperix-sdk", metavar="DIRECTORY", help="installed official Imperix SDK")
     ap.add_argument("--imperix-source-only", action="store_true", help="generate Imperix sources without building an ELF")
-    ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
-                    help="print a progress line every SECONDS of simulated time")
+    ap.add_argument("--progress", action=argparse.BooleanOptionalAction, default=None,
+                    help="show or hide the terminal progress bar")
     ap.add_argument("--watch", action="append", default=None, metavar="NAME",
-                    help="append a state or plant/control value to each progress line; repeatable, "
+                    help="append a state or plant/control value to the progress bar; repeatable, "
                          "or use NAME,NAME")
     ap.add_argument("--list-states", action="store_true",
                     help="print the state names generated for this configuration and exit")
@@ -1637,8 +1685,7 @@ def main(argv=None) -> int:
     set_overrides = dict(args.set)
     overrides = dict(set_overrides)
     if args.progress is not None:
-        overrides["simulation.progress.enable"] = 1
-        overrides["simulation.progress.period"] = args.progress
+        overrides["simulation.progress.enable"] = args.progress
     if args.watch is not None:
         overrides["simulation.progress.watch"] = [name for value in args.watch
                                                    for name in value.split(",") if name]
@@ -1680,8 +1727,15 @@ def main(argv=None) -> int:
                 changes["simulation.solver.subsystems"] = {}
         if changes:
             p = p.replace(**changes)
+
+    simulation_command = not (
+        args.export or args.list_states or args.ph_report or args.resolved
+    )
+    if (simulation_command and args.progress is None and not p.simulation.progress.enable
+            and bool(getattr(sys.stdout, "isatty", lambda: False)())):
+        p = p.replace(**{"simulation.progress.enable": True})
     if args.watch and not p.simulation.progress.enable:
-        ap.error("--watch prints on the progress lines: add --progress SECONDS")
+        ap.error("--watch prints on the progress bar: add --progress")
     if args.initial_time is not None and args.initial is None:
         ap.error("--initial-time selects a row of a states.csv: add --initial FILE")
     if args.resolved:
@@ -1713,17 +1767,6 @@ def main(argv=None) -> int:
             print("warning:", diagnostic["message"], file=sys.stderr)
         print("wrote", ", ".join(str(path) for path in result.files))
         return 0
-    units = ", ".join(f"{n} ({u.ctrl.type if u.ctrl is not None else 'diode full-bridge rectifier'}, "
-                      f"{u.bridge.model.replace('_', ' ')}, "
-                      f"{sim.units[n].bridge.describe()})"
-                      for n, u in _unit_items(p.units))
-    print(f"peslite: {config}  units={units}  "
-          f"solver={p.simulation.solver.type}/{p.simulation.solver.method}  "
-          f"t = {p.simulation.initial.t} .. {p.simulation.t_end} s  "
-          f"({len(p.simulation.initial.states)} initial values given)")
-    if sim.ph_report is not None:
-        print(f"structure: {sim.ph_report.verdict} (state coverage {sim.ph_report.coverage:.0%}"
-              f"{'; ' + '; '.join(sim.energy_problems) if sim.energy_problems else ''})")
     out = Path(args.out) if args.out else _RESULTS / f"{config.stem}{suffix}"
     reporter = None
     if args.report:
@@ -1745,21 +1788,12 @@ def main(argv=None) -> int:
     else:
         r = sim.run(out_dir=out, info={"config": str(config)}, name=config.stem)
     s = r.summary
-    print(f"done: wall {r.wall_time:.1f} s, rhs evaluations {r.n_rhs}, stop at {s.get('t_stop', 0):.4f} s, "
-          f"tripped={bool(s.get('tripped'))}")
-    for name, _cfg in _unit_items(p.units):
-        print(f"  {name}: max |i| = {s.get(f'{name}.max_current_pu', 0):.4f} pu, "
-              f"trip: {s.get(f'{name}.trip_cause') or 'none'}, "
-              f"alarms: {', '.join(s.get(f'{name}.alarms') or []) or 'none'}")
-    if "stop_reason" in s:
-        print(f"stopped: {s['stop_reason']}")
-    if "interface_kappa" in s:
-        print(f"split: measured hold error {s.get('interface_max_error_rated', s['interface_max_rel_error']):.2e}, "
-              f"bound kappa {s['interface_kappa']:.2e} of rating, within bound: {bool(s['interface_within_bound'])}"
-              + (f"; coarse window: {s['interface_coarse_hold']}" if "interface_coarse_hold" in s else ""))
-    if "split_error_bound_rated" in s:
-        print(f"split error, from the linearised closed loop: <= {s['split_error_bound_rated']:.2e} of rating "
-              f"({s['split_bound']})")
+    for unit_name, _cfg in _unit_items(p.units):
+        trip_cause = s.get(f"{unit_name}.trip_cause")
+        alarms = s.get(f"{unit_name}.alarms") or []
+        messages = ([f"tripped: {trip_cause}"] if trip_cause else []) + list(alarms)
+        if messages:
+            print(f"warning: {unit_name}: {', '.join(messages)}", file=sys.stderr)
     if args.plot:
         output, plot_options["output"] = plot_options["output"], None
         if output:
@@ -1769,14 +1803,13 @@ def main(argv=None) -> int:
             r.plot(args.plot, **plot_options)
         except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:
             ap.error(str(exc))
-    print("wrote", ", ".join(str(w) for w in r.files))
-    final = r.final_states()
-    if final:
-        width = max(map(len, final))
-        print(f"final values (last row of states.csv, t = {final['t']:.6g} s):")
-        for name, value in final.items():
-            if name != "t":
-                print(f"  {name:<{width}}  {value: .10g}")
+    t_stop = s.get("t_stop", 0)
+    status = "Completed" if t_stop >= p.simulation.t_end - TIME_EPS else "Stopped"
+    trip = ", tripped" if s.get("tripped") else ""
+    print(
+        f"{status}: t = {t_stop:.6g} s, wall = {r.wall_time:.1f} s, "
+        f"RHS = {r.n_rhs}{trip}, output = {out}"
+    )
     return 0
 
 

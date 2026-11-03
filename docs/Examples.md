@@ -135,11 +135,11 @@ peslite gfm-psc-example \
   --out output/psc-short
 ```
 
-For progress lines with selected live values:
+For a progress bar with selected live values:
 
 ```bash
 peslite two-converters-example \
-  --progress 0.05 \
+  --progress \
   --watch vsc_1.vdc_pu,vsc_2.vdc_pu
 ```
 

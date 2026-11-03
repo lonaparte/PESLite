@@ -605,7 +605,7 @@ def _initial(p: Params) -> None:
 
 
 def _progress(progress) -> None:
-    """Check progress settings; watched names are resolved at the first progress line."""
+    """Check progress settings; watched names are resolved at the first bar update."""
     _switched(progress, "simulation.progress")
     watch = progress.watch
     if not isinstance(watch, list) or not all(isinstance(name, str) and name for name in watch):

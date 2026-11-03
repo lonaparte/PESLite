@@ -84,10 +84,11 @@ peslite gfl-example \
 `--set` values take priority over presets and file values
 ([CLI Reference](CLI-Reference.md#override-parameters)).
 
-Use `--progress SECONDS` to print progress and `--watch NAME` to include a state or output value:
+Interactive runs show a progress bar. Use `--progress` to enable it explicitly and `--watch NAME`
+to include a state or output value:
 
 ```bash
-peslite gfl-example --progress 0.1 --watch vsc.vdc_pu
+peslite gfl-example --progress --watch vsc.vdc_pu
 ```
 
 ## Create a simulation file

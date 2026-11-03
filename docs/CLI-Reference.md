@@ -75,13 +75,17 @@ settings are documented in [Output and Results](Output-and-Results.md).
 
 ## Progress and watched values
 
+Interactive simulations show a single updating progress bar by default:
+
 ```bash
-peslite case.pes --progress 0.1 --watch vsc.vdc_pu
-peslite case.pes --progress 0.1 --watch vsc.i_c,vsc.u_dc
+peslite case.pes --progress --watch vsc.vdc_pu
+peslite case.pes --progress --watch vsc.i_c,vsc.u_dc
+peslite case.pes --no-progress
 ```
 
-`--progress SECONDS` uses simulated time. `--watch` may be repeated or contain comma-separated
-names; see [Progress and watch](Output-and-Results.md#progress-and-watch).
+`--watch` may be repeated or contain comma-separated names. Redirected runs remain quiet unless
+progress is explicitly enabled; see
+[Progress and watch](Output-and-Results.md#progress-and-watch).
 
 ## Optional simulation report
 
@@ -161,7 +165,7 @@ Print a short run with live values:
 
 ```bash
 peslite case.pes --set simulation.t_end=0.5 \
-  --progress 0.05 --watch vsc.vdc_pu,vsc.i_c
+  --progress --watch vsc.vdc_pu,vsc.i_c
 ```
 
 Compare bridge presets without editing the file:
