@@ -9,6 +9,7 @@ import warnings
 from contextlib import redirect_stdout
 from dataclasses import fields, is_dataclass
 from typing import get_args, get_type_hints
+from packaging.version import Version
 
 import numpy as np
 import pytest
