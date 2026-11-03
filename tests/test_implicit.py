@@ -1,6 +1,7 @@
 """Fixed-step implicit integration and circuit-model linear systems."""
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -8,9 +9,10 @@ from scipy.linalg import expm
 
 import peslite
 from conftest import EXAMPLES
-from peslite.solver import AdaptiveSolver, ConfigError, FixedStepSolver, make_solver
+from peslite.solver import AdaptiveSolver, AutoSolver, ConfigError, DormandPrince45, FixedStepSolver, make_solver
+from peslite.solver.integrators import integrator
 from peslite.solver.implicit import (ImplicitSolver, LinearSystem, ModeJacobian, Structure,
-                                     circuit_structure)
+                                     linear_system)
 
 
 A_OSCILLATOR = np.array([[-1.0, 10.0], [-10.0, -1.0]])
@@ -21,6 +23,7 @@ QUIET = {"simulation.progress.enable": 0, "simulation.solver.linearisations": 0}
     ("FiXeD", "rK4", "RK4", FixedStepSolver),
     ("FIXED", "RaDaU", "radau", ImplicitSolver),
     ("AdApTiVe", "rAdAu", "radau", AdaptiveSolver),
+    ("AdApTiVe", "AuTo", "auto", AutoSolver),
 ])
 def test_solver_method_values_are_normalized(solver_type, method, canonical, expected):
     params = peslite.load(
@@ -47,6 +50,49 @@ def test_implicit_methods_have_their_design_order(method, order):
     assert math.log2(errors[0] / errors[1]) == pytest.approx(order, abs=0.15)
 
 
+@pytest.mark.parametrize("lists", [False, True])
+def test_auto_reuses_dp45_without_constructing_an_unused_implicit_solver(lists):
+    class Oscillator:
+        def rhs_list(self, t, y):
+            return [y[1], -4.0 * y[0]]
+
+        def rhs(self, t, y):
+            return np.asarray(self.rhs_list(t, y))
+
+    model = Oscillator()
+    rhs = model.rhs if lists else lambda t, y: model.rhs(t, y)
+    y0 = np.array([1.0, 0.0])
+    solver = AutoSolver(rtol=1e-8, atol=1e-11)
+    actual = solver(rhs, 0.0, 0.5, y0)
+    expected = DormandPrince45(rtol=1e-8, atol=1e-11)(rhs, 0.0, 0.5, y0)
+    np.testing.assert_array_equal(actual.y, expected.y)
+    assert actual.n_rhs == expected.n_rhs
+    assert solver.switches == 0 and "_implicit" not in vars(solver)
+
+
+def test_auto_switches_for_stiffness_and_returns_when_the_dynamics_change():
+    rate = 1e5
+    calls = 0
+
+    def rhs(t, y):
+        nonlocal calls
+        calls += 1
+        return -rate * (y - math.cos(t)) - math.sin(t)
+
+    solver = AutoSolver(rtol=1e-8, atol=1e-11)
+    result = solver(rhs, 0.0, 0.05, np.array([2.0]))
+    assert solver.stiff and solver.switches == 1
+    assert result.n_rhs == calls < 3000
+    np.testing.assert_allclose(result.y, [math.cos(0.05)], rtol=1e-8, atol=1e-10)
+    rate = 1.0
+    solver.parameters_changed()
+    for k in range(6):
+        result = solver(rhs, 0.05 + k * 0.02, 0.05 + (k + 1) * 0.02, result.y)
+    assert not solver.stiff and solver.switches == 2
+    assert result.n_rhs == calls
+    np.testing.assert_allclose(result.y, [math.cos(0.17)], rtol=1e-8, atol=1e-10)
+
+
 def test_radau_damps_a_stiff_mode_while_trapezoidal_keeps_it_bounded():
     def f(t, y):
         return np.array([-1e7 * (y[0] - math.cos(t)) - math.sin(t)])
@@ -58,7 +104,7 @@ def test_radau_damps_a_stiff_mode_while_trapezoidal_keeps_it_bounded():
     assert abs(trapezoidal) < 3.0
 
 
-def test_statewise_linear_system_reuses_returning_modes():
+def test_linear_system_reuses_returning_jacobians():
     modes = [np.array([[-1.0, 2.0], [-2.0, -1.0]]),
              np.array([[-2e4, 0.0], [1e3, -3e4]])]
     selected = {"mode": 0}
@@ -74,18 +120,130 @@ def test_statewise_linear_system_reuses_returning_modes():
         y = solver(f, 0.01 * k, 0.01 * (k + 1), y).y
     assert cached.n_jacobians == 4
 
-    device = LinearSystem()
-    solver = ImplicitSolver(1e-3, "trapezoidal", linear=device)
+    uncached = LinearSystem()
+    solver = ImplicitSolver(1e-3, "trapezoidal", linear=uncached)
     y = np.array([1.0, 1.0])
     for k in range(6):
         selected["mode"] = k % 2
         y = solver(f, 0.01 * k, 0.01 * (k + 1), y).y
-    assert device.n_jacobians == 12
+    assert uncached.n_jacobians == 12
 
 
-def test_mna_group_solve_matches_the_dense_newton_system():
+@pytest.mark.parametrize("method", ["trapezoidal", "radau"])
+def test_returning_jacobian_reuses_its_newton_factorization(method):
+    matrices = (A_OSCILLATOR, 100.0 * A_OSCILLATOR)
+    selected = 0
+
+    def rhs(_t, y):
+        return matrices[selected] @ y
+
+    linear = LinearSystem(cache=True)
+    y = np.array([1.0, 2.0])
+    h = 2.0**-10
+    for selected in (0, 1, 0, 1, 0, 1):
+        f0 = rhs(0.0, y)
+        if linear.J is None:
+            linear.ensure(rhs, 0.0, y, f0)
+        else:
+            linear.lookup(rhs, 0.0, y, f0)
+        factor = linear.factor(h, method)
+        residual = np.ones((factor.s, y.size))
+        actual = factor.solve(residual)
+        fresh = LinearSystem()
+        fresh.J = linear.J.copy()
+        fresh._setup(y.size)
+        np.testing.assert_allclose(
+            actual, fresh.factor(h, method).solve(residual), rtol=1e-12, atol=1e-12
+        )
+    assert linear.n_jacobians == 4
+    assert linear.n_factorizations == 2
+
+    matrices = tuple(2.0 * matrix for matrix in matrices)
+    linear.invalidate()
+    linear.ensure(rhs, 0.0, y, rhs(0.0, y))
+    assert linear.factor(h, method) is not factor
+    assert linear.n_factorizations == 3
+
+
+def test_new_state_layout_discards_old_newton_factors():
+    linear = LinearSystem(cache=True)
+    for n in (1, 2):
+        y = np.ones(n)
+        rhs = lambda _t, state: -state
+        linear.ensure(rhs, 0.0, y, rhs(0.0, y))
+        actual = linear.factor(0.25, "trapezoidal").solve(np.ones((1, n)))
+        np.testing.assert_allclose(actual, np.full((1, n), 1.0 / 1.125))
+
+
+def test_a_single_interior_block_uses_one_dense_factorization():
+    partition = Structure([np.array([0])], np.array([1]))
+    linear = LinearSystem(partition, cache=True)
+    y = np.ones(2)
+    rhs = lambda _t, state: A_OSCILLATOR @ state
+    linear.ensure(rhs, 0.0, y, rhs(0.0, y))
+    actual = linear.factor(0.01, "trapezoidal").solve(np.ones((1, 2)))
+    expected = np.linalg.solve(np.eye(2) - 0.005 * A_OSCILLATOR, np.ones(2))
+    np.testing.assert_allclose(actual[0], expected, rtol=1e-8)
+    assert linear.n_factorizations == 1
+
+
+@pytest.mark.parametrize("method", ["RK45", "radau", "BDF", "LSODA", "RaDaU", "bdf"])
+def test_adaptive_rhs_count_includes_numerical_jacobians(method):
+    calls = 0
+
+    def rhs(_t, y):
+        nonlocal calls
+        calls += 1
+        return A_OSCILLATOR @ y
+
+    result = AdaptiveSolver(method, rtol=1e-8, atol=1e-10)(
+        rhs, 0.0, 0.01, np.array([1.0, 0.0])
+    )
+    assert result.n_rhs == calls
+
+
+def test_adaptive_jacobian_uses_the_actual_integrated_rhs():
+    def unused_rhs(_t, _y):
+        raise AssertionError("the Jacobian evaluated a different RHS")
+
+    calls = 0
+
+    def rhs(_t, y):
+        nonlocal calls
+        calls += 1
+        return A_OSCILLATOR @ y
+
+    solver = integrator("BDF", 1e-3, 1e-10, 1e-12,
+                        model=SimpleNamespace(rhs=unused_rhs), solver_type="adaptive")
+    y0 = np.array([1.0, 0.0])
+    result = solver(rhs, 0.0, 0.01, y0)
+    np.testing.assert_allclose(result.y, expm(0.01 * A_OSCILLATOR) @ y0,
+                               rtol=1e-8, atol=1e-10)
+    assert result.n_rhs == calls
+
+
+@pytest.mark.parametrize("form", ["device", "statewise", "nodal"])
+def test_jacobian_includes_state_feedback_inside_a_source(form):
+    params = peslite.load(
+        EXAMPLES / "gfl-example.pes",
+        **{"simulation.solver.circuit_model": form, "units.vsc.dclink.source.k": 10.0},
+    )
+    system = peslite.System(params)
+    model = system.model
+    dclink = system.units["vsc"].dclink
+    state_owner = next(sub for sub in model.subsystems if sub.state is dclink.state)
+    index = model.state_slice(state_owner, "u_C").start
+    y = model.get_initial_values()
+    linear = linear_system(model)
+    linear.ensure(model.rhs, 0.0, y, model.rhs(0.0, y))
+    assert linear.J[index, index] == pytest.approx(
+        -dclink.source.k_dc / dclink.capacitor.C, rel=2e-6
+    )
+
+
+def test_nodal_group_solve_matches_the_dense_newton_system():
     model = peslite.System(peslite.load(EXAMPLES / "two-converters-example.pes")).model
-    structure = circuit_structure(model)
+    structure = model.linear_structure()
     assert structure.groups and structure.interface.size
     y = model.get_initial_values() + 1.0
     grouped = LinearSystem(structure, cache=True)
@@ -113,24 +271,24 @@ def test_make_solver_uses_each_configured_circuit_model():
     statewise = make_solver(settings.__class__(
         **{**vars(settings), "method": "radau", "circuit_model": "statewise"}
     ), model)
-    mna = make_solver(settings.__class__(
-        **{**vars(settings), "method": "radau", "circuit_model": "mna"}
+    nodal = make_solver(settings.__class__(
+        **{**vars(settings), "method": "radau", "circuit_model": "nodal"}
     ), model)
     adaptive = make_solver(settings.__class__(
         **{**vars(settings), "type": "adaptive", "method": "Radau",
            "circuit_model": "statewise"}
     ), model)
 
-    assert type(device) is ImplicitSolver and not device.linear.cache
+    assert type(device) is ImplicitSolver and device.linear.cache
     assert type(statewise) is ImplicitSolver and statewise.linear.cache
-    assert type(mna) is ImplicitSolver and mna.linear.structure.interface.size
+    assert type(nodal) is ImplicitSolver and nodal.linear.structure.interface.size
     assert type(adaptive) is AdaptiveSolver and type(adaptive.jac) is ModeJacobian
     step = adaptive(model.rhs, 0.0, 1e-6, model.get_initial_values())
     assert np.all(np.isfinite(step.y)) and adaptive.jac.linear.n_jacobians > 0
 
 
 @pytest.mark.full
-@pytest.mark.parametrize("method", ["trapezoidal", "radau"])
+@pytest.mark.parametrize("method", ["trapezoidal", "radau", "auto"])
 def test_circuit_models_preserve_the_same_simulation_equations(method, tmp_path):
     runs = 0
 
@@ -151,10 +309,11 @@ def test_circuit_models_preserve_the_same_simulation_equations(method, tmp_path)
     scale = np.maximum(np.abs(reference), 1e-3 * np.max(np.abs(reference)))
     results = [
         run(**{"simulation.solver.method": method,
+               "simulation.solver.type": "adaptive" if method == "auto" else "fixed",
                "simulation.solver.circuit_model": circuit_model,
                "simulation.solver.rtol": 1e-10,
                "simulation.solver.atol": 1e-11})
-        for circuit_model in ("device", "statewise", "mna")
+        for circuit_model in ("device", "statewise", "nodal")
     ]
     for result in results[1:]:
         np.testing.assert_allclose(result, results[0], rtol=1e-9, atol=1e-9)
@@ -164,7 +323,7 @@ def test_circuit_models_preserve_the_same_simulation_equations(method, tmp_path)
 
 
 @pytest.mark.parametrize("changes, message", [
-    ({"simulation.solver.circuit_model": "nodal"}, "not in"),
+    ({"simulation.solver.circuit_model": "unknown"}, "not in"),
     ({"simulation.solver.method": "radau",
       "simulation.solver.subsystems": {"vsc.dclink": 4}}, "explicit system method"),
     ({"simulation.solver.method": "trapezoidal", "simulation.solver.rtol": 0.0},

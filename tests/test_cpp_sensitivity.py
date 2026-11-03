@@ -10,10 +10,10 @@ import pytest
 import peslite
 from peslite.assembly import cpp
 from peslite.assembly.cpp import _ModelGenerator, _RuntimeParameters
+from peslite.components import Element, register_component_type
 from peslite.solver import Bag, Model
 from test_cpp_equations import _Feedback
-from test_cpp_parameters import _case, _compare_run, _compile
-from conftest import EXAMPLES
+from test_cpp_parameters import _case, _compare_run, _compile, _table
 
 pytestmark = pytest.mark.full
 
@@ -23,6 +23,40 @@ class _Parameters:
     gain: float
     offset: float = 1.0
     changes: tuple = ()
+
+
+@register_component_type
+class _FeedbackElement(Element):
+    type = "test_sensitive_feedback"
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        gain: float = 0.0
+        type: str = "test_sensitive_feedback"
+
+    def __init__(self, name, cfg, buses, p):
+        self.name = name
+        self.model = _Feedback(cfg.gain, 1.0)
+
+    def subsystems(self):
+        return {self.name: self.model}
+
+    def connections(self):
+        return {(self.model, "x"): (self.model, "value")}
+
+    def port_bindings(self):
+        return ()
+
+    def signals(self):
+        return {f"{self.name}.value": self.model.output.value}
+
+
+def _feedback_case(mode="pwm_averaging", gain=0.0):
+    return _case("buck", mode).replace(**{
+        "elements.feedback": {"type": _FeedbackElement.type, "gain": gain},
+        "simulation.output.signals": True,
+        "simulation.output.precision": 17,
+    })
 
 
 def _generator(factory=_Feedback, *, gain=0.0, offset=1.0, variable=("all",), feedback=True):
@@ -132,25 +166,22 @@ def test_dag_and_additive_parameters_do_not_request_scc_analysis(monkeypatch):
     assert not _generator(gain=0.5, variable=()).diagnostics
 
 
-@pytest.mark.parametrize("resistance", [0.0, 0.1])
-def test_export_finds_the_original_resistances_without_a_name_list(resistance, tmp_path):
-    p = _case("buck", "pwm_averaging").replace(**{
-        "buses.output.r_d": resistance,
-        "units.converter.dclink.source.r": resistance,
-    })
+@pytest.mark.parametrize("gain", [0.0, 0.1])
+def test_export_finds_feedback_parameters_without_a_name_list(gain, tmp_path):
+    p = _feedback_case(gain=gain)
     result = peslite.export(p, "cpp", tmp_path, variables=("all",))
     assert {path for item in result.diagnostics for path in item["parameters"]} == {
-        "buses.output.r_d", "units.converter.dclink.source.r"}
+        "elements.feedback.gain"}
     assert all(item["dependencies"] for item in result.diagnostics)
     assert tuple(path.name for path in result.files) == ("peslite.cpp",)
 
 
 def test_cli_prints_the_same_export_diagnostics(tmp_path, capsys):
-    assert peslite.main(["export", str(EXAMPLES / "buck-example.pes"), "all",
-                         "--out", str(tmp_path)]) == 0
+    path = tmp_path / "feedback.pes"
+    path.write_text(cpp.dumps(_feedback_case()), encoding="utf-8")
+    assert peslite.main(["export", str(path), "all", "--out", str(tmp_path / "model")]) == 0
     captured = capsys.readouterr()
-    assert "buses.output.r_d" in captured.err
-    assert "units.converter.dclink.source.r" in captured.err
+    assert "elements.feedback.gain" in captured.err
     assert "not a timing prediction" in captured.err
 
 
@@ -171,24 +202,25 @@ def test_common_is_exactly_all_minus_the_existing_diagnostics(name, mode, tmp_pa
         assert common.files[0].read_bytes() == all_result.files[0].read_bytes()
 
 
-@pytest.mark.parametrize("name, expected", [("buck", 2), ("gfl", 1)])
-def test_common_does_not_repeat_analysis_without_exclusions(name, expected, tmp_path, monkeypatch):
+@pytest.mark.parametrize("feedback", [False, True])
+def test_common_does_not_repeat_analysis_without_exclusions(feedback, tmp_path, monkeypatch):
     original = cpp._ModelGenerator
     calls = []
 
     class Counted(original):
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             calls.append(self)
-            super().__init__(*args)
+            super().__init__(*args, **kwargs)
 
     monkeypatch.setattr(cpp, "_ModelGenerator", Counted)
-    peslite.export(_case(name, "pwm_averaging"), "cpp", tmp_path, variables=("common",))
-    assert len(calls) == expected
+    p = _feedback_case() if feedback else _case("buck", "pwm_averaging")
+    peslite.export(p, "cpp", tmp_path, variables=("common",))
+    assert len(calls) == 1 + int(feedback)
 
 
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
 def test_common_native_keeps_ordinary_set_and_rejects_only_detected_parameters(mode, tmp_path):
-    p = _case("buck", mode)
+    p = _feedback_case(mode)
     detected = peslite.export(p, "cpp", tmp_path / "all", variables=("all",))
     sensitive = {path for item in detected.diagnostics for path in item["parameters"]}
     expected = {item.path for item in _RuntimeParameters(p, ("all",)).selected} - sensitive
@@ -207,16 +239,34 @@ def test_common_native_keeps_ordinary_set_and_rejects_only_detected_parameters(m
 
 
 def test_common_preserves_nonzero_sensitive_values(tmp_path):
-    p = _case("buck", "pwm_averaging").replace(**{
-        "buses.output.r_d": 0.1, "units.converter.dclink.source.r": 0.1})
+    p = _feedback_case(gain=0.1)
     binary = _compile(p, tmp_path / "model", variables=("common",))
     _compare_run(p, binary, {"elements.load.r": 8.0}, tmp_path / "run")
+    keys, values = _table(tmp_path / "run/native/plant.csv")
+    assert values[-1, keys.index("feedback.value")] == pytest.approx(1.0 / 0.9)
 
 
 def test_common_cli_reports_the_constants_and_preserves_path_validation(tmp_path, capsys):
-    assert peslite.main(["export", str(EXAMPLES / "buck-example.pes"), "common",
-                         "--out", str(tmp_path)]) == 0
+    path = tmp_path / "feedback.pes"
+    path.write_text(cpp.dumps(_feedback_case()), encoding="utf-8")
+    assert peslite.main(["export", str(path), "common", "--out", str(tmp_path / "model")]) == 0
     assert "common keeps detected structure-sensitive parameters constant" in capsys.readouterr().err
     with pytest.raises(ValueError, match="not variable"):
         peslite.export(_case("buck", "pwm_averaging"), "cpp", tmp_path / "invalid",
                        variables=("common", "missing.parameter"))
+
+
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
+def test_zero_coefficient_fast_path_keeps_real_feedback_when_parameters_change(mode, tmp_path):
+    p = _feedback_case(mode)
+    binary = _compile(p, tmp_path / "model")
+    source = (tmp_path / "model/peslite.cpp").read_text(encoding="utf-8")
+    direct = source.split("inline void evaluate(", 1)[1].split(
+        "PESLITE_NOINLINE void evaluate_feedback(", 1)[0]
+    assert "solve_algebraic(" not in direct
+    assert direct.index("evaluate_feedback(t, y, dy)") < direct.index("= y[")
+    for index, gain in enumerate((0.0, 0.25, -0.5)):
+        directory = tmp_path / str(index)
+        _compare_run(p, binary, {"elements.feedback.gain": gain}, directory)
+        keys, values = _table(directory / "native/plant.csv")
+        assert values[-1, keys.index("feedback.value")] == pytest.approx(1.0 / (1.0 - gain))

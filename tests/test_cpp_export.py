@@ -48,7 +48,8 @@ class _ConditionalModel:
         self.input = _ConditionalInput(u=0j)
         self.output = _ConditionalOutput(i=0j)
         self.port = Port(
-            self, "power", effort="input.u", flow="output.i"
+            self, "power", voltage=self.input.u, current=self.output.i, scale=1.5,
+            effort="input.u", flow="output.i"
         )
 
     def set_outputs(self, t):

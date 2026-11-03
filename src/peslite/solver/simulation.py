@@ -1978,23 +1978,25 @@ def _validate_main(argv=None) -> int | _CommandOutcome:
 
 
 def _inspect_main(argv=None) -> int | _CommandOutcome:
-    """Inspect resolved parameters, states and the port-Hamiltonian structure without running."""
+    """Inspect parameters, states, electrical groups and the port-Hamiltonian structure without running."""
     ap = argparse.ArgumentParser(prog="peslite inspect", description=_inspect_main.__doc__)
     _add_configuration_arguments(ap)
     ap.add_argument("--resolved", action="store_true", help="show the complete resolved configuration")
     ap.add_argument("--states", action="store_true", help="show the generated state names")
     ap.add_argument("--ph-report", action="store_true", help="show the port-Hamiltonian structure report")
+    ap.add_argument("--groups", action="store_true", help="show the automatic electrical partition")
     ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
     args = _parse_command_args(ap, argv)
     try:
         config, p, _model = _load_command_params(args)
     except FileNotFoundError as exc:
         ap.error(str(exc))
-    selected = {"resolved": args.resolved, "states": args.states, "ph_report": args.ph_report}
+    selected = {"resolved": args.resolved, "states": args.states,
+                "ph_report": args.ph_report, "groups": args.groups}
     if not any(selected.values()):
         selected = dict.fromkeys(selected, True)
     simulation = None
-    if selected["states"] or selected["ph_report"]:
+    if selected["states"] or selected["ph_report"] or selected["groups"]:
         assembly_p = p
         if selected["ph_report"] and p.simulation.energy_check == "off":
             assembly_p = p.replace(**{"simulation.energy_check": "warn"})
@@ -2007,24 +2009,19 @@ def _inspect_main(argv=None) -> int | _CommandOutcome:
         values["state_count"] = len(values["states"])
     if selected["ph_report"]:
         values["ph_report"] = simulation.ph_report.to_dict()
+    if selected["groups"]:
+        values["groups"] = [circuit.grouping_report() for circuit in simulation.system.circuits]
     if args.json:
         return _CommandOutcome(0, _payload("inspect", config=config, **values))
-    enabled = [name for name, value in selected.items() if value]
-    if enabled == ["resolved"]:
-        print(dumps(p), end="")
-    elif enabled == ["states"]:
-        print("\n".join(values["states"]))
-    elif enabled == ["ph_report"]:
-        print(simulation.ph_report)
-    else:
-        sections = []
-        if selected["resolved"]:
-            sections.append("Resolved configuration:\n" + dumps(p).rstrip())
-        if selected["states"]:
-            sections.append("States:\n" + "\n".join(values["states"]))
-        if selected["ph_report"]:
-            sections.append("Port-Hamiltonian report:\n" + str(simulation.ph_report))
-        print("\n\n".join(sections))
+    views = {
+        "resolved": ("Resolved configuration", lambda: dumps(p).rstrip()),
+        "states": ("States", lambda: "\n".join(values["states"])),
+        "ph_report": ("Port-Hamiltonian report", lambda: str(simulation.ph_report)),
+        "groups": ("Electrical groups", lambda: json.dumps(values["groups"], indent=2)),
+    }
+    sections = [(title, render()) for name, (title, render) in views.items() if selected[name]]
+    print(sections[0][1] if len(sections) == 1 else
+          "\n\n".join(title + ":\n" + body for title, body in sections))
     return 0
 
 

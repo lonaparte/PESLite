@@ -124,6 +124,8 @@ def test_compiled_parameters_reinitialize_physics_control_and_energy(name, mode,
             "units.charger.primary.dclink.source.v": 420.0,
         }
         if name == "wpt-lcc":
+            # Retune an existing resistor without inserting a previously omitted branch.
+            p = p.replace(**{"units.charger.link.primary_parallel_resistance": 0.02})
             changes["units.charger.link.primary_parallel_resistance"] = 0.05
             changes["units.charger.secondary.ctrl.loops.PhasePowerControl.ki"] = 0.1
             changes["units.charger.secondary.ctrl.loops.PhasePowerControl.power_filter.bandwidth"] = 1500.0
@@ -212,6 +214,15 @@ def test_explicit_connection_variable_events_match_python(name, target, mode, tm
                       for side in ("native", "python"))
     key = f"{target}.modulation_saturation_fraction"
     assert native.get(key) == pytest.approx(python.get(key))
+
+
+def test_event_written_source_breaker_remains_dynamic(tmp_path):
+    p = _case("gfl", "pwm_averaging").replace(events={
+        "open": {"type": "set", "t": 0.001, "set": {"sources.grid.connected": False}},
+        "close": {"type": "set", "t": 0.002, "set": {"sources.grid.connected": True}},
+    })
+    binary = _compile(p, tmp_path / "model")
+    _compare_run(p, binary, {}, tmp_path / "run")
 
 
 @pytest.mark.parametrize("name, target", [("buck", "converter"), ("gfl", "vsc"), ("gfm-dvoc", "vsc"),
@@ -408,14 +419,17 @@ def test_runtime_reuses_parameter_validation_instead_of_a_cpp_device_whitelist(t
 
 
 @pytest.mark.parametrize("selection", ["all", "common"])
-def test_zero_parallel_capacitance_keeps_the_compiled_structure(selection, tmp_path):
-    params = _case("wpt", "averaging")
+@pytest.mark.parametrize("name,path,changed_value", [
+    ("wpt", "units.charger.primary.bridge.parallel_capacitance", 1e-9),
+    ("wpt-lcc", "units.charger.link.primary_parallel_resistance", 0.05),
+])
+def test_omitted_primitive_keeps_the_compiled_structure(name, path, changed_value, selection, tmp_path):
+    params = _case(name, "averaging")
     binary = _compile(params, tmp_path / "model", (selection,))
-    path = "units.charger.primary.bridge.parallel_capacitance"
     baseline = subprocess.run([binary, "--set", f"{path}=0", "--out", tmp_path / "zero"],
                               capture_output=True, text=True)
     assert baseline.returncode == 0
-    changed = subprocess.run([binary, "--set", f"{path}=1e-9", "--out", tmp_path / "changed"],
+    changed = subprocess.run([binary, "--set", f"{path}={changed_value}", "--out", tmp_path / "changed"],
                              capture_output=True, text=True)
     assert changed.returncode == 1
     assert "changed structural specialization" in changed.stderr
@@ -650,22 +664,6 @@ def test_dc_current_supply_shares_retained_values_with_its_runtime_ramp(tmp_path
     _compare_run(p, binary, {"units.vsc.dclink.source.i": 0.8 * p.unit().dclink.source.i,
                              "units.vsc.dclink.source.k": 0.1}, tmp_path / "run")
 
-
-@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
-def test_zero_coefficient_fast_path_keeps_real_feedback_when_parameters_change(mode, tmp_path):
-    p = _case("buck", mode)
-    binary = _compile(p, tmp_path / "model")
-    source = (tmp_path / "model/peslite.cpp").read_text(encoding="utf-8")
-    direct = source.split("inline void evaluate(", 1)[1].split(
-        "PESLITE_NOINLINE void evaluate_feedback(", 1)[0]
-    assert "solve_algebraic(" not in direct
-    assert direct.index("evaluate_feedback(t, y, dy)") < direct.index("= y[")
-    # Every independent combination must retain the shared iterative path when needed.
-    for index, changes in enumerate(({}, {"buses.output.r_d": 0.05},
-                                     {"units.converter.dclink.source.r": 0.1},
-                                     {"buses.output.r_d": 0.05,
-                                      "units.converter.dclink.source.r": 0.1})):
-        _compare_run(p, binary, changes, tmp_path / str(index))
 
 
 def test_retained_recording_intervals_do_not_fix_the_export_time_maximum_branch(tmp_path):

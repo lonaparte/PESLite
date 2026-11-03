@@ -11,7 +11,7 @@ solution holds the node voltages, the branch currents and the derivatives of all
 capacitors (C/V loops) and tree inductors (L/I cutsets) are dependent states. Their derivatives
 follow from derivative potentials on the V/C forest and from derivative KCL at the super-nodes of
 the L/I forest, so effective capacitances and inductances arise from the extra unknowns.
-``form="mna"`` factorizes ``M`` once per mode and back-substitutes per evaluation;
+``form="nodal"`` factorizes ``M`` once per mode and back-substitutes per evaluation;
 ``form="statewise"`` forms ``dx = A x + B u + B1 du/dt``,
 ``out = C x + D u + D1 du/dt`` once per mode.
 Transformer ratios enter ``M`` only, so modes with the same switches and diodes share one structure.
@@ -102,7 +102,7 @@ def prepare_device(component: Any) -> None:
 Port = Optional["Node"]
 Value = Callable[[float], ArrayLike]
 
-FORMS = ("device", "statewise", "mna")
+FORMS = ("device", "statewise", "nodal")
 QUANTITIES = ("node_voltage", "branch_voltage", "branch_current")
 _V, _C, _R, _L, _I = range(5)  # tree priority classes
 _PRIORITY = {"vsrc": _V, "short": _V, "p": _V, "cap": _C, "res": _R, "ind": _L, "isrc": _I, "s": _I}
@@ -167,7 +167,9 @@ class _Symbolic:
         return _Symbolic("imag", (self,))
 
 
-_SCALAR_NUMBER = (int, float, complex, np.number)
+def _constant(value: Any) -> bool:
+    """Only literal numerical types can be folded; scalar subclasses may carry equations."""
+    return type(value) in (bool, int, float, complex) or isinstance(value, np.number)
 
 
 def _literal(value: Any) -> str:
@@ -195,15 +197,15 @@ def _linear_expression(coefficients: Sequence[float], variables: Sequence[str]) 
 
 
 def _zero(value: Any) -> bool:
-    return isinstance(value, _SCALAR_NUMBER) and value == 0.0
+    return _constant(value) and value == 0.0
 
 
 def _one(value: Any) -> bool:
-    return isinstance(value, _SCALAR_NUMBER) and value == 1.0
+    return _constant(value) and value == 1.0
 
 
 def _minus_one(value: Any) -> bool:
-    return isinstance(value, _SCALAR_NUMBER) and value == -1.0
+    return _constant(value) and value == -1.0
 
 
 def _negative_of(left: Any, right: Any) -> bool:
@@ -212,7 +214,7 @@ def _negative_of(left: Any, right: Any) -> bool:
 
 def _linear_form(value: Any) -> tuple[Any, dict[Any, Any]]:
     """Return the constant and ordered terms of an additive scalar expression."""
-    if isinstance(value, _SCALAR_NUMBER):
+    if _constant(value):
         return value, {}
     if isinstance(value, _Symbolic) and value.operation == "linear":
         constant, terms = value.arguments
@@ -250,7 +252,7 @@ def _linear_scaled(value: Any, factor: Any) -> Any:
 
 
 def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
-    if isinstance(left, _SCALAR_NUMBER) and isinstance(right, _SCALAR_NUMBER):
+    if _constant(left) and _constant(right):
         return {"+": lambda: left + right, "-": lambda: left - right,
                 "*": lambda: left * right, "/": lambda: left / right}[operation]()
     if operation == "+":
@@ -282,9 +284,9 @@ def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
             return -right
         if _minus_one(right):
             return -left
-        if isinstance(left, _SCALAR_NUMBER):
+        if _constant(left):
             return _linear_scaled(right, left)
-        if isinstance(right, _SCALAR_NUMBER):
+        if _constant(right):
             return _linear_scaled(left, right)
     elif operation == "/":
         if _zero(left):
@@ -293,7 +295,7 @@ def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
             return left
         if _minus_one(right):
             return -left
-        if isinstance(right, _SCALAR_NUMBER):
+        if _constant(right):
             return _linear_scaled(left, 1.0 / right)
     return _Symbolic(operation, (left, right))
 
@@ -314,7 +316,7 @@ def _symbolic_solve(matrix: Sequence[Sequence[Any] | Mapping[int, Any]], right: 
         if not active:
             raise ValueError("the generated netlist equations are singular")
         constants = [row for row in active
-                     if isinstance(rows[row][column], _SCALAR_NUMBER)]
+                     if _constant(rows[row][column])]
         pivot = (max(constants, key=lambda row: abs(reference[row, column]))
                  if constants else max(active, key=lambda row: abs(reference[row, column])))
         if reference[pivot, column] == 0.0:
@@ -495,13 +497,46 @@ def _port(a: Port, b: Port) -> tuple[int, float]:
     return nodes[0].dim, nodes[0].scale
 
 
+def _coefficient_array(value: Any) -> NDArray:
+    """Preserve expression scalars while keeping ordinary coefficient arithmetic numerical."""
+    if isinstance(value, np.ndarray) and value.dtype.kind != "O":
+        return np.asarray(value, dtype=float)
+    values = np.asarray(value, dtype=object)
+    return np.asarray(values, dtype=float) if all(_constant(item) for item in values.flat) else values
+
+
+def _numeric_values(value: Any) -> NDArray[np.float64]:
+    """Read numerical coefficients while retaining their optional lowering expressions."""
+    if isinstance(value, np.ndarray) and value.dtype.kind != "O":
+        return np.asarray(value, dtype=float)
+    values = np.asarray(value, dtype=object)
+    return np.asarray([
+        float(getattr(item, "_peslite_numeric_value", item))
+        for item in values.flat
+    ]).reshape(values.shape)
+
+
 def _matrix(value: ArrayLike, d: int, what: str) -> NDArray[np.float64]:
-    m = np.asarray(value, dtype=float)
+    m = _numeric_values(value)
     if m.ndim == 0:
         m = float(m) * np.eye(d)
     if m.shape != (d, d) or not np.all(np.isfinite(m)):
         raise ValueError(f"{what} must be a finite scalar or {d} x {d} matrix, got shape {m.shape}")
     return m.copy()
+
+
+def _block_weights(blocks: Sequence[tuple[float, NDArray]]) -> sp.csc_matrix:
+    """The same block-diagonal storage weights, retaining equation-valued coefficients."""
+    result = sp.block_diag([scale * _numeric_values(matrix) for scale, matrix in blocks], format="csc")
+    if any(matrix.dtype.kind == "O" for _scale, matrix in blocks):
+        expressions = np.zeros(result.shape, dtype=object)
+        offset = 0
+        for scale, matrix in blocks:
+            size = matrix.shape[0]
+            expressions[offset:offset + size, offset:offset + size] = scale * matrix
+            offset += size
+        result._expressions = expressions
+    return result
 
 
 def _definite(m: NDArray[np.float64], what: str) -> NDArray[np.float64]:
@@ -534,6 +569,12 @@ class Element:
     ports: tuple[tuple[Port, Port], ...] = ()
     name: str = ""
 
+    def _coefficient(self, name: str, value: ArrayLike, dimension: Optional[int] = None,
+                     what: str = "coefficient"):
+        """Keep the declared coefficient beside its normalized numerical value for lowering."""
+        self.__dict__.setdefault("_coefficients", {})[name] = value
+        return _numeric_values(value).item() if dimension is None else _matrix(value, dimension, what)
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.name!r})"
 
@@ -543,7 +584,7 @@ class Resistor(Element):
 
     def __init__(self, a: Port, b: Port, R: ArrayLike, name: str = "") -> None:
         d, _ = _port(a, b)
-        self.ports, self.name, self.R = ((a, b),), name, _matrix(R, d, "resistance")
+        self.ports, self.name, self.R = ((a, b),), name, self._coefficient("R", R, d, "resistance")
         if np.linalg.eigvalsh(0.5 * (self.R + self.R.T)).min() < -1e-12 * np.abs(self.R).max():
             raise ValueError("resistance must be positive semidefinite")
 
@@ -554,7 +595,7 @@ class Inductor(Element):
     def __init__(self, a: Port, b: Port, L: ArrayLike, state: ArrayLike, name: str = "") -> None:
         d, _ = _port(a, b)
         self.ports, self.name = ((a, b),), name
-        self.L = _definite(_matrix(L, d, "inductance"), "inductance")
+        self.L = _definite(self._coefficient("L", L, d, "inductance"), "inductance")
         self.state = _indices(state, d, "an inductor")
 
 
@@ -569,10 +610,10 @@ class CoupledInductors(Element):
         if len(kinds) != 1:
             raise ValueError("coupled inductors need at least one branch, all of one dimension and scale")
         d, k = kinds.pop()[0], len(self.ports)
-        m = np.asarray(L, dtype=float)
+        m = _coefficient_array(L)
         if m.shape == (k, k) and d > 1:
             m = np.kron(m, np.eye(d))
-        self.L = _definite(_matrix(m, k * d, "coupled inductance"), "coupled inductance")
+        self.L = _definite(self._coefficient("L", m, k * d, "coupled inductance"), "coupled inductance")
         self.state = _indices(state, k * d, "coupled inductors")
 
 
@@ -582,7 +623,7 @@ class Capacitor(Element):
     def __init__(self, a: Port, b: Port, C: ArrayLike, state: ArrayLike, name: str = "") -> None:
         d, _ = _port(a, b)
         self.ports, self.name = ((a, b),), name
-        self.C = _definite(_matrix(C, d, "capacitance"), "capacitance")
+        self.C = _definite(self._coefficient("C", C, d, "capacitance"), "capacitance")
         self.state = _indices(state, d, "a capacitor")
 
 
@@ -657,9 +698,11 @@ class Switch(Element):
     def __init__(self, a: Port, b: Port, closed: Callable[[], bool], R_on: float = 0.0,
                  R_off: float = math.inf, name: str = "") -> None:
         _port(a, b)
-        if not (0.0 <= R_on <= R_off) or math.isinf(R_on):
+        if not (0.0 <= R_on <= R_off) or R_on == math.inf:
             raise ValueError("a switch needs 0 <= R_on <= R_off and a finite R_on")
-        self.ports, self.name, self.closed, self.R_on, self.R_off = ((a, b),), name, closed, float(R_on), float(R_off)
+        self.ports, self.name, self.closed = ((a, b),), name, closed
+        self.R_on = self._coefficient("R_on", R_on)
+        self.R_off = self._coefficient("R_off", R_off)
 
 
 class Diode(Element):
@@ -674,9 +717,11 @@ class Diode(Element):
                  name: str = "", gate: Optional[Callable[[], bool]] = None) -> None:
         if _port(a, b)[0] != 1:
             raise ValueError("a diode connects dimension-1 nodes")
-        if not (0.0 <= R_on <= R_off) or math.isinf(R_on):
+        if not (0.0 <= R_on <= R_off) or R_on == math.inf:
             raise ValueError("a diode needs 0 <= R_on <= R_off and a finite R_on")
-        self.ports, self.name, self.R_on, self.R_off = ((a, b),), name, float(R_on), float(R_off)
+        self.ports, self.name = ((a, b),), name
+        self.R_on = self._coefficient("R_on", R_on)
+        self.R_off = self._coefficient("R_off", R_off)
         self.gate = gate
         self.conducting = False
         self.residual = 0.0
@@ -795,7 +840,7 @@ class _Triplets:
                     self.block(r, int(offsets[v]), sign * m)
 
     def matrix(self, shape: tuple[int, int]) -> sp.csc_matrix:
-        return sp.csc_matrix((self.v, (self.r, self.c)), shape=shape)
+        return sp.csc_matrix((_numeric_values(self.v), (self.r, self.c)), shape=shape)
 
 
 class _RatioSlots:
@@ -844,7 +889,7 @@ class _Pattern:
         self.indices = rs[first].astype(np.int32)
         self.indptr = np.searchsorted(cs[first], np.arange(n + 1)).astype(np.int32)
         nb = len(base.v)
-        self.base = np.bincount(pos[:nb], weights=np.asarray(base.v, dtype=float), minlength=self.nnz)
+        self.base = np.bincount(pos[:nb], weights=_numeric_values(base.v), minlength=self.nnz)
         self.slot_pos, self.slot_flat = pos[nb:], np.array(slots.flat, dtype=np.intp)
         self.slot_coef = np.array(slots.coef, dtype=float)
 
@@ -1047,6 +1092,11 @@ class _Projector:
         kkt = sp.bmat([[W, None, G_x.T], [None, sp.csc_matrix((self.n_free, self.n_free)), G_f.T],
                        [G_x, G_f, None]], format="csc")
         self.lu = _factor(kkt, "projection")
+        expressions = getattr(W, "_expressions", None)
+        if expressions is not None:
+            self.W._expressions = expressions
+            self._equations = kkt.toarray().astype(object)
+            self._equations[:self.n, :self.n] = expressions
         self._affine: Optional[tuple[NDArray[np.float64], ...]] = None
         self._numeric_projection: Optional[Callable] = None
 
@@ -1127,6 +1177,17 @@ class _Projector:
     def expression_solution(self, y: Sequence[Any], u: Sequence[Any]
                             ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
         """Projected states and multipliers from the KKT factorization used by :meth:`__call__`."""
+        if hasattr(self, "_equations"):
+            weights = self.W._expressions
+            x = np.asarray([y[int(index)] for index in self.index], dtype=object)
+            right = [*(weights @ x), *([0.0] * self.n_free),
+                     *(self.G_u.toarray() @ np.asarray(u, dtype=object))]
+            matrix = self._equations.tolist()
+            # The reference supplies pivot choices, while elimination retains each coefficient.
+            reference = self._equations.copy()
+            reference[:self.n, :self.n] = self.W.toarray()
+            solution = _symbolic_solve(matrix, right, np.asarray(reference, dtype=float))
+            return tuple(solution[:self.n]), tuple(solution[self.n + self.n_free:])
         px, pu, mx, mu = self._affine_maps()
         x = np.asarray([y[int(index)] for index in self.index], dtype=object)
         inputs = np.asarray(u, dtype=object)
@@ -1150,7 +1211,7 @@ class Topology:
     ``tree``: whether each branch is a tree branch; ``dependent``: per netlist state.
     """
 
-    def __init__(self, net: "Netlist", mode: Mode) -> None:
+    def __init__(self, net: "Netlist", mode: Mode, *, matrices: Optional[dict] = None) -> None:
         self.mode = mode
         brs, nv = net._branches, net.n_vertices
         nb = len(brs)
@@ -1367,7 +1428,7 @@ class Topology:
         for j, (src, o) in enumerate(net._sources):
             self._rate_columns[o:o + brs[net._ports[id(src)][0]].dim] = needs[j]
         self._pattern = _Pattern(M, MN, n_z)
-        self._dense = net.form != "mna"  # device and statewise both form state space with LAPACK
+        self._dense = net.form != "nodal"  # device and statewise both form state space with LAPACK
         self._layout: Optional[_Layout] = None
         if not self._dense and n_z and net._grouping_used():
             row_group, col_group = self._labels(net, active, spans, (i_off, xd_off, zd_off, w_off, kcl),
@@ -1398,6 +1459,8 @@ class Topology:
         out.eye(0, 0, net.n_e)
         self.xd_index = xd_index
         self.S_out = sp.csr_matrix(out.matrix((net.n_out, n_z)))
+        if matrices is not None:
+            matrices.update(M=M, y=Ky, u=Ku, du=Kdu)
         self._net_shape = (net.n_x, net.n_u)
         self._couplings()
         self._state_space: Optional[StateSpace] = None
@@ -1630,10 +1693,7 @@ class Topology:
         caps = [k for k, br in enumerate(brs) if self.roles[k] == "cap"]
         cx = {k: o for k, o in zip(caps, np.cumsum([0] + [brs[k].dim for k in caps]).tolist())}
         n_c = sum(brs[k].dim for k in caps)
-        W = sp.block_diag(
-            [sp.csc_matrix(brs[k].scale * brs[k].element.C) for k in caps],
-            format="csc",
-        )
+        W = _block_weights([(brs[k].scale, brs[k].element.C) for k in caps])
         n_w = int(np.sum([net._vertex_dim[v] for v in np.flatnonzero(w_off >= 0)]))
         f_off = np.where(w_off >= 0, w_off - self._w_base, -1)
         Gx, Gf, Gu = _Triplets(), _Triplets(), _Triplets()
@@ -1658,11 +1718,7 @@ class Topology:
         inds = [k for k, br in enumerate(brs) if self.roles[k] == "ind"]
         lx = {k: o for k, o in zip(inds, np.cumsum([0] + [brs[k].dim for k in inds]).tolist())}
         n_l = sum(brs[k].dim for k in inds)
-        W = sp.block_diag(
-            [sp.csc_matrix(brs[net._ports[id(el)][0]].scale * el.L)
-             for el in net._inductors],
-            format="csc",
-        )
+        W = _block_weights([(brs[net._ports[id(el)][0]].scale, el.L) for el in net._inductors])
         prims = sorted(cd)
         po = {p: o for p, o in zip(prims, np.cumsum([0] + [brs[p].dim for p in prims]).tolist())}
         n_p = sum(brs[p].dim for p in prims)
@@ -1696,9 +1752,9 @@ def _roles(net: "Netlist", mode: Mode) -> tuple[list[Optional[str]], dict[int, N
         elif isinstance(el, (Switch, Diode)):
             on = closed[id(el)] if isinstance(el, Switch) else conducting[id(el)]
             r = el.R_on if on else el.R_off
-            role = "short" if r == 0.0 else None if math.isinf(r) else "res"
+            role = "short" if r == 0.0 else None if r == math.inf else "res"
             if role == "res":
-                resistance[k] = r * np.eye(br.dim)
+                resistance[k] = np.diag(np.asarray([r] * br.dim, dtype=float if _constant(r) else object))
         elif isinstance(el, Transformer):
             role = "p" if br.port == 0 else "s"
         else:
@@ -1874,13 +1930,13 @@ class Netlist:
     """Primitives between nodes, evaluated as ``dy = evaluate(t, y)`` in the current mode.
 
     ``form``: ``"device"`` (straight-line scalar equations generated per component), ``"statewise"``
-    (whole-circuit per-mode state space) or ``"mna"`` (factorized derivative MNA, one
+    (whole-circuit per-mode state space) or ``"nodal"`` (factorized derivative MNA, one
     back-substitution per evaluation); all give the same result to round-off.
     ``cache``: compiled modes kept (least recently used first out). ``grouped``: let the sparse form
     eliminate the automatic groups (:meth:`grouping`) onto their interface when that helps.
     """
 
-    def __init__(self, form: str = "mna", cache: int = _CACHE, grouped: bool = True) -> None:
+    def __init__(self, form: str = "nodal", cache: int = _CACHE, grouped: bool = True) -> None:
         if form not in FORMS:
             raise ValueError(f"unknown netlist form {form!r}; expected one of {FORMS}")
         self.form, self.cache_size, self.grouped = form, int(cache), bool(grouped)
@@ -2048,7 +2104,7 @@ class Netlist:
         return self._plan[1], self._plan[2]
 
     def _grouping_used(self) -> bool:
-        return self.grouped and self.form == "mna" and self.grouping().used
+        return self.grouped and self.form == "nodal" and self.grouping().used
 
     @property
     def factorizations(self) -> dict[str, Any]:
@@ -3277,7 +3333,7 @@ class Netlist:
         affine = (
             self.form == "statewise"
             and (top._evaluations >= _DENSE_REUSE or top._state_space is not None)
-        ) or (self.form == "mna" and not derivatives)
+        ) or (self.form == "nodal" and not derivatives)
         if affine:
             equations = top.affine_equations(selected, derivatives=derivatives)
             values = equations[0] @ x + equations[1] @ u
@@ -3482,6 +3538,8 @@ class Netlist:
         This is the equation-level counterpart of :meth:`_margins`: it avoids numeric coercion so
         exporters can lower the same mode, source and projection laws without a second device model.
         """
+        if not self._diodes:
+            return (), (), ()
         top = self.topology()
         out = self.scalar_output_values(t, y, topology=top)
         scales = self._margin_scales(out)
@@ -3585,12 +3643,13 @@ class Netlist:
     @staticmethod
     def _quadratic(values: Sequence[Any], matrix: Any) -> Any:
         """Return ``values.T @ matrix @ values`` without coercing equation scalars."""
+        matrix = getattr(matrix, "_expressions", matrix)
         dense = matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
         return sum(
             coefficient * values[row] * values[column]
             for row in range(len(values))
             for column in range(len(values))
-            if (coefficient := dense[row, column]) != 0.0
+            if not _zero(coefficient := dense[row, column])
         )
 
     def _scalar_energy(self, y: Sequence[Any]) -> Any:

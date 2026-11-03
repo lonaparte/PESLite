@@ -15,7 +15,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .energy import re_product
-from .integrators import (CIRCUIT_MODELS, EXPLICIT_FIXED_METHODS, RHS, TABLEAUS, SolverStep, combine,
+from .integrators import (EXPLICIT_FIXED_METHODS, RHS, TABLEAUS, SolverStep, combine,
                           canonical_method, integrator, stage_state, subintervals)
 from .model import ConfigError
 
@@ -33,11 +33,6 @@ def make_solver(cfg: Any, model: Optional[Any] = None, ratings: Any = None):
     """
     solver_type = cfg.type
     method = cfg.method
-    circuit_model = getattr(cfg, "circuit_model", "device")
-    if circuit_model not in CIRCUIT_MODELS:
-        raise ConfigError(
-            f"simulation.solver.circuit_model {circuit_model!r} is not one of {CIRCUIT_MODELS}"
-        )
     if solver_type == "fixed" and cfg.subsystems:
         if model is None:
             raise ConfigError("simulation.solver.subsystems needs the model whose subsystems it names")
@@ -57,7 +52,7 @@ def make_solver(cfg: Any, model: Optional[Any] = None, ratings: Any = None):
         except (KeyError, ValueError) as exc:
             raise ConfigError(f"simulation.solver.subsystems: {exc.args[0]}") from None
     return integrator(method, cfg.dt, cfg.rtol, cfg.atol, cfg.max_step, cfg.warm_start,
-                      circuit_model=circuit_model, model=model, solver_type=solver_type)
+                      model=model, solver_type=solver_type)
 
 
 def parse_step(value: Any) -> tuple[float, Optional[str]]:

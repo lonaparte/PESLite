@@ -17,8 +17,8 @@ from peslite.solver.netlist import (Capacitor, CurrentSource, Diode, Inductor, N
                                     Resistor, StateSpace, Switch, Transformer, VoltageSource)
 
 
-FORMS = ("statewise", "mna")
-CIRCUIT_MODELS = ("statewise", "mna")
+FORMS = ("statewise", "nodal")
+CIRCUIT_MODELS = ("statewise", "nodal")
 
 
 def _affine(A, b, initial, t):
@@ -101,11 +101,11 @@ def test_selected_netlist_outputs_match_the_full_equations(form):
     )
 
 
-def test_grouped_mna_selected_outputs_reuse_the_network_factorization():
+def test_grouped_nodal_selected_outputs_reuse_the_network_factorization():
     simulation = peslite.Simulation(peslite.load(
         EXAMPLES / "wpt-ss-example.pes",
         **QUIET,
-        **{"simulation.solver.circuit_model": "mna"},
+        **{"simulation.solver.circuit_model": "nodal"},
     ))
     circuit, = simulation.system.circuits
     circuit.receive()

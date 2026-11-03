@@ -14,7 +14,7 @@ stages never cross a model-changing boundary.
 |---|---|
 | `device` | netlist primitives compiled into direct scalar device equations |
 | `statewise` | the same netlist compiled to a dense state equation for each circuit mode |
-| `mna` | the same netlist solved as a sparse, factorized modified nodal system |
+| `nodal` | the same netlist solved as a sparse, factorized modified nodal system |
 
 ```yaml
 simulation:
@@ -29,7 +29,9 @@ primitives; controls remain in the sampled control graph. A component law withou
 primitive representation connects to the same network through a behavioral voltage or current port.
 All three circuit models work with explicit and implicit time integrators.
 For explicit integration of small circuits, `device` usually has the lowest per-stage overhead;
-`statewise` and `mna` are selected for their network formulation rather than assumed speedups.
+`statewise` and `nodal` are selected for their network formulation rather than assumed speedups.
+
+Export the automatic electrical partition with `peslite inspect case.pes --groups --json > groups.json`.
 
 ## Fixed-step solvers
 
@@ -62,9 +64,11 @@ simulation:
 ```
 
 `DP45` is PESLite's built-in Dormand-Prince 4(5) implementation. SciPy methods `RK23`, `RK45`,
-`DOP853`, `radau`, `BDF` and `LSODA` are also available in Python simulations. `LSODA` selects
-between nonstiff and stiff integration internally. With `statewise` or `mna`, SciPy's implicit
-methods receive the circuit model's cached Jacobian.
+`DOP853`, `radau`, `BDF` and `LSODA` are also available in Python simulations. `auto` starts with DP45
+and switches to adaptive Radau when stiffness limits its steps, using existing stage values and
+Jacobians for the switching decisions. `LSODA` selects
+between nonstiff and stiff integration internally. Implicit methods share the assembled state
+partition and cache Jacobians of the complete continuous model across all circuit representations.
 
 `rtol` controls error relative to the current state scale, while `atol` supplies an absolute floor
 near zero. Smaller tolerances generally increase accepted steps and RHS evaluations. `max_step`

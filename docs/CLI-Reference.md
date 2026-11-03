@@ -120,13 +120,14 @@ peslite validate case.pes
 peslite inspect case.pes
 ```
 
-With no view option, `inspect` prints the resolved configuration, generated state names and
-port-Hamiltonian structure report. Select any subset by combining these options:
+With no view option, `inspect` prints the resolved configuration, generated state names, electrical
+groups and port-Hamiltonian structure report. Select any subset by combining these options:
 
 ```bash
 peslite inspect case.pes --resolved
 peslite inspect case.pes --states
 peslite inspect case.pes --ph-report
+peslite inspect case.pes --groups
 peslite inspect case.pes --resolved --states
 ```
 

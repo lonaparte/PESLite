@@ -42,7 +42,7 @@ def test_inspect_states_returns_the_registered_names(capsys):
 def test_inspect_defaults_to_every_view_and_accepts_combinations(capsys):
     code, payload = _command(capsys, "inspect", "gfl-example")
     assert code == 0
-    assert {"resolved", "states", "ph_report"} <= payload.keys()
+    assert {"resolved", "states", "ph_report", "groups"} <= payload.keys()
 
     code, payload = _command(capsys, "inspect", "gfl-example", "--resolved", "--states")
     assert code == 0
@@ -55,6 +55,21 @@ def test_inspect_human_output_defaults_to_every_view(capsys):
     assert "Resolved configuration:" in output
     assert "States:" in output
     assert "Port-Hamiltonian report:" in output
+    assert "Electrical groups:" in output
+
+
+def test_inspect_exports_the_existing_electrical_groups_without_running(capsys, monkeypatch):
+    def unexpected_run(*_args, **_kwargs):
+        raise AssertionError("inspection started a simulation")
+
+    monkeypatch.setattr(peslite.Simulation, "run", unexpected_run)
+    code, payload = _command(capsys, "inspect", "two-converters-example", "--groups", "--states",
+                             "--set", "simulation.solver.circuit_model=nodal")
+    assert code == 0 and payload["groups"]
+    report = payload["groups"][0]
+    assert report["circuit_model"] == "nodal"
+    assert report["groups"] and report["interface"]["nodes"]
+    assert "states" in payload and "resolved" not in payload and "ph_report" not in payload
 
 
 def test_run_json_is_the_only_stdout_and_uses_absolute_result_paths(capsys, tmp_path):

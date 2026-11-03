@@ -112,8 +112,7 @@ Scheduled connection events retain their normal precedence and timing; see
 `common` means `all` minus the parameters identified by the existing structural sensitivity
 check. It keeps those detected parameters constant at their configured values; every other
 available numerical parameter remains adjustable. No separate parameter list is maintained.
-For the default Buck model this freezes `buses.output.r_d` and
-`units.converter.dclink.source.r`. The export diagnostic lists the actual exclusions, and
+The export diagnostic lists the actual exclusions, and
 `--list-params` lists the parameters still adjustable with `--set`. Use
 `variables=["common"]` for the same selection through the Python API.
 
@@ -140,6 +139,7 @@ So do represented history dimensions: numerical periods/windows can change toget
 ADC oversample count or RMS/ROCOF history size requires a new export. Parameter validation and
 checked initialization branches come from the ordinary schemas and constructors. Invalid values
 and changes outside the compiled specialization fail before simulation output is created.
+Adding a branch that was omitted at zero requires a new export.
 Clock changes that would alter an already initialized switching-edge sequence also require a new export.
 So do clock changes that would alter the start-up interrupt count of a unit connected at or before
 the initial time.
@@ -193,19 +193,17 @@ These choices are fixed when `peslite.cpp` is generated:
 Specialization lets the compiler inline the configured RHS and remove generic dispatch. To change a
 fixed choice, update the source `.pes` file and run `peslite export` again.
 
-Discrete switching, protection and scheduling have native execution adapters. Numerical component
-outputs, derivatives and energy equations reuse the assembled Python equations, including those of
-R-L branches, capacitor nodes and DC links. PESLite traces each component's fixed `state`, `input`,
-`output`, `set_outputs()` and `rhs()` scalar equations while exporting,
-specialises configuration-dependent branches and loops, and emits ordinary static C++. Common
-arithmetic, complex operations, state-dependent branches and NumPy scalar ufuncs are lowered. The
-generated binary does not contain an expression interpreter or Python runtime, so using the
-fallback does not add a generic dispatch layer to each solver stage.
+Discrete switching, protection and scheduling have native execution adapters. Electrical outputs,
+derivatives and energy calculations reuse the same netlist declarations and matrix assembly as
+Python. Control equations use scalar tracing, including arithmetic, complex operations,
+state-dependent branches and NumPy scalar ufuncs. Both paths emit static C++ without a Python
+runtime or expression interpreter.
 
 Subclass overrides and explicit component export hooks are respected. Runtime event state is bound
 during tracing rather than by maintaining another copy of the physical formula. RK coefficients
-come from the shared fixed-step tables or the actual DP45 solver object's coefficients, including
-factory-supplied instance and subclass values. Algebraic loops use matching tolerances and
+come from the configured integrator's tables, including factory-supplied instance and subclass
+values. Implicit methods use simplified Newton iteration with a cached dense Jacobian and
+partial-pivoting LU. Algebraic loops use matching tolerances and
 iteration limits, and nonconvergence is an error rather than an accepted approximate result.
 Dependencies eliminated by fixed parameter values are reduced to straight-line assignments by a
 conservative assignment analysis and standard topological sorting. Unrecognized code keeps the
@@ -230,7 +228,7 @@ ODE states are read and written directly in the solver vector rather than duplic
 
 Composite WPT configurations are expanded before export exactly as they are for Python execution.
 Their primary and secondary remain ordinary `DCConverter` units with independent clocks, while the
-shared compensated link is lowered through its fixed scalar state equations.
+shared compensated link uses the same netlist lowering as other electrical components.
 
 Named measurement bindings, independent series/shunt resistors and configured RMS windows use
 the same assembly as Python. `set` events may change an element scalar declared by its
@@ -243,14 +241,14 @@ common trip path, not a WPT phase override.
 
 ## Current limitations
 
-- Supported solvers are fixed `euler`, `heun` and `RK4`, plus adaptive `DP45`; fixed implicit
-  `trapezoidal` and `radau` remain Python-only.
+- Supported solvers are fixed `euler`, `heun`, `RK4`, `trapezoidal` and `radau`, plus adaptive `DP45`.
+  Adaptive `auto` and SciPy methods run in Python.
 - Multirate subsystem schedules are not currently lowered to C++.
 - Arbitrary Python behavior is not embedded in the standalone executable. File or network I/O,
   reflection, run-time type/layout changes and unsupported library calls in a custom equation are
   rejected during export rather than silently approximated.
-- Symbolic branch exploration is bounded; deeply state-dependent iterative control flow needs
-  dedicated backend support instead of an exponentially large generated expression.
+- Symbolic branch exploration is bounded; large combinations of independent switching modes or
+  deeply state-dependent iterative code can exceed the export budget.
 - Custom controller loops with non-traceable Python behavior, events and modulators still need
   backend support because they alter the discrete schedule rather than only contributing
   continuous scalar equations.

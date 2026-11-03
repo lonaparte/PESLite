@@ -1,21 +1,13 @@
-"""Implicit fixed-step integrators and circuit-model linear algebra.
+"""Implicit fixed-step integrators and shared Jacobian linear algebra.
 
 ``trapezoidal`` (Tustin) and ``radau`` (three-stage Radau IIA, order 5) solve their stage equations
 with a simplified Newton iteration. Its matrix ``I - h (A x J)`` is factorized once per Jacobian and
 step and reused while the iteration contracts. The Jacobian ``J`` of ``f`` is formed by finite
 differences of ``f`` itself, so these methods need no model-specific derivative code.
 
-The circuit model decides how ``J`` is stored and the linear equations are solved:
-
-* ``device``: one dense ``J``, recomputed when the iteration stops contracting;
-* ``statewise``: one dense ``J`` per equation mode, cached and found again by a directional
-  probe (the topology is recognized from the equations, not from component internals);
-* ``mna``: state-space nodal. The states split automatically into groups coupled only through
-  interface variables at the network buses; each group caches its own Jacobian columns per
-  topology and is eliminated onto the interface (Schur complement), whose small equation is
-  solved jointly.
-
-All three solve the same equations to the same Newton tolerance; they differ in work, not result.
+The assembled model may supply state groups coupled through interface states. Each group caches
+Jacobian columns and Newton factorizations; without a partition the same code uses one dense block.
+Derivatives include all continuous feedback in ``f``, independently of the circuit representation.
 """
 
 from __future__ import annotations
@@ -29,7 +21,7 @@ from numpy.typing import NDArray
 
 from .integrators import IMPLICIT_FIXED_METHODS, RHS, SolverStep, subintervals
 
-__all__ = ["ImplicitSolver", "LinearSystem", "Structure", "circuit_structure", "linear_system",
+__all__ = ["ImplicitSolver", "LinearSystem", "Structure", "linear_system",
            "ModeJacobian"]
 
 _S6 = math.sqrt(6.0)
@@ -51,6 +43,7 @@ _NEWTON_SCALE = 1e-3  # Newton error target relative to atol + rtol |y|
 _MAX_SPLITS = 12
 _MODE_CACHE = 64  # topologies kept per group
 _PROBE_RTOL = 1e-6
+_JACOBIAN_STEP = 1.5e-8
 _LU = None
 
 
@@ -65,11 +58,11 @@ def _lu_backend():
 
 
 def _increment(y: NDArray[np.float64]) -> NDArray[np.float64]:
-    return 1.5e-8 * np.maximum(np.abs(y), 1.0)
+    return _JACOBIAN_STEP * np.maximum(np.abs(y), 1.0)
 
 
 class Structure:
-    """State groups of the state-space nodal method: ``groups`` interior index arrays and
+    """State partition for block elimination: ``groups`` interior index arrays and
     ``interface`` indices. Interior states of different groups never appear in each other's
     derivatives; each group couples to the others only through ``interface``."""
 
@@ -104,15 +97,16 @@ class _Block:
 
     def store(self, columns: NDArray[np.float64], signature: NDArray[np.float64]) -> None:
         self._keys += 1
+        self.version = self._keys
         self.cache[self._keys] = (columns.copy(), signature.copy())
         while len(self.cache) > _MODE_CACHE:
             self.cache.popitem(last=False)
 
-    def find(self, probe: NDArray[np.float64]) -> Optional[NDArray[np.float64]]:
+    def find(self, probe: NDArray[np.float64]) -> Optional[tuple[int, NDArray[np.float64]]]:
         for key, (columns, signature) in reversed(self.cache.items()):
             if _same(probe, signature):
                 self.cache.move_to_end(key)
-                return columns
+                return key, columns
         return None
 
 
@@ -128,7 +122,7 @@ def _same(a: NDArray[np.float64], b: NDArray[np.float64]) -> bool:
 
 
 class LinearSystem:
-    """Jacobian storage and the Newton-matrix solves of one circuit model.
+    """Jacobian storage and Newton-matrix solves, independent of circuit representation.
 
     ``structure``: the groups (``Structure.single`` for one dense block); ``cache``: keep each
     block's columns per topology and recognize a topology again by a directional probe.
@@ -156,7 +150,10 @@ class LinearSystem:
             block.version += 1
 
     def _setup(self, n: int) -> None:
-        if self.structure is None or sum(g.size for g in self.structure.groups) + self.structure.interface.size != n:
+        self._factors.clear()
+        self._parts.clear()
+        if (self.structure is None or len(self.structure.groups) < 2
+                or sum(g.size for g in self.structure.groups) + self.structure.interface.size != n):
             self.structure = Structure.single(n)
         parts = list(self.structure.groups)
         if self.structure.interface.size:
@@ -205,8 +202,8 @@ class LinearSystem:
                 continue
             found = block.find(probe)
             if found is not None:
-                self.J[:, block.cols] = found
-                block.version += 1
+                block.version, columns = found
+                self.J[:, block.cols] = columns
             else:
                 self._refresh_block(f, t, y, f0, block, probe)
             changed = True
@@ -222,9 +219,10 @@ class LinearSystem:
                        block: _Block, probe: Optional[NDArray[np.float64]] = None) -> None:
         columns = self._columns(f, t, y, f0, block.cols)
         self.J[:, block.cols] = columns
-        block.version += 1
         if self.cache:
             block.store(columns, columns @ block.direction[block.cols] if probe is None else probe)
+        else:
+            block.version += 1
 
     def _check_structure(self) -> None:
         """Merge groups whose interior states turn out to be coupled directly."""
@@ -244,10 +242,7 @@ class LinearSystem:
                     b += 1
             a += 1
         if merged:
-            parts = list(s.groups) + ([s.interface] if s.interface.size else [])
-            self._blocks = [_Block(cols, self.J.shape[0], seed) for seed, cols in enumerate(parts)]
-            self._factors.clear()
-            self._parts.clear()
+            self._setup(self.J.shape[0])
             if self.cache:
                 for block in self._blocks:
                     block.store(self.J[:, block.cols], self.J[:, block.cols] @ block.direction[block.cols])
@@ -347,7 +342,7 @@ class ImplicitSolver:
         self.dt = float(dt)
         self.method = method
         self.rtol, self.atol = float(rtol), float(atol)
-        self.linear = linear if linear is not None else LinearSystem()
+        self.linear = linear if linear is not None else linear_system()
         self._A, self._c, self._e0 = _TABLEAUX[method]
         self.n_rhs = 0
         self.n_newton = 0
@@ -428,12 +423,18 @@ class ImplicitSolver:
 
 
 class ModeJacobian:
-    """``jac(t, y)`` for SciPy's implicit methods from a circuit model's cached Jacobians."""
+    """``jac(t, y)`` for SciPy's implicit methods from the shared Jacobian cache."""
 
-    def __init__(self, f: RHS, linear: LinearSystem) -> None:
+    def __init__(self, f: Optional[RHS], linear: LinearSystem) -> None:
         self.f = f
         self.linear = linear
         self._calls = 0
+
+    def bind(self, f: RHS) -> None:
+        """Use the actual integrated RHS, discarding caches if the callable changed."""
+        if f != self.f:
+            self.linear.invalidate()
+            self.f = f
 
     @property
     def n_rhs(self) -> int:
@@ -451,83 +452,7 @@ class ModeJacobian:
         return self.linear.J.copy()
 
 
-def circuit_structure(model: Any) -> Structure:
-    """Map the compiled electrical partition onto the model's flat state vector.
-
-    Netlist switching groups become interior state blocks. States on interface elements, in
-    multiple blocks, or outside the electrical netlist remain in the joint interface.
-    """
-    n = model.n_states
-    component_subsystem = {
-        id(getattr(subsystem, "component", subsystem)): subsystem
-        for subsystem in model.subsystems
-    }
-    group_states: list[set[int]] = []
-    group_labels: list[str] = []
-    interface: set[int] = set()
-
-    for circuit in (subsystem for subsystem in model.subsystems
-                    if hasattr(subsystem, "netlist") and hasattr(subsystem, "layout")):
-        if circuit.netlist is None:
-            continue
-        local_to_model: dict[int, int] = {}
-        for component, name, complex_state, local in circuit.layout:
-            subsystem = component_subsystem[id(component)]
-            positions = tuple(range(*model.state_slice(subsystem, name).indices(n)))
-            if len(positions) != (2 if complex_state else 1):
-                raise RuntimeError("circuit and model state layouts differ")
-            local_to_model.update(
-                (local + offset, position) for offset, position in enumerate(positions)
-            )
-
-        def states(elements) -> set[int]:
-            return {
-                local_to_model[int(local)]
-                for element in elements
-                for local in np.asarray(getattr(element, "state", ()), dtype=np.intp).reshape(-1)
-                if int(local) in local_to_model
-            }
-
-        plan = circuit.netlist.grouping()
-        for elements in plan.elements:
-            group_states.append(states(elements))
-            group_labels.append(", ".join(dict.fromkeys(
-                circuit._owners.get(id(element), "?") for element in elements
-            )))
-        interface.update(states(plan.interface_elements))
-        interface_nodes = {id(node) for node in plan.interface}
-        interface.update(states(
-            element for element in circuit.netlist.elements
-            if any(id(node) in interface_nodes for port in element.ports for node in port if node is not None)
-        ))
-
-    occurrences: dict[int, int] = {}
-    for group in group_states:
-        for position in group:
-            occurrences[position] = occurrences.get(position, 0) + 1
-    interface.update(position for position, count in occurrences.items() if count > 1)
-    grouped = set().union(*group_states) if group_states else set()
-    interface.update(set(range(n)) - grouped)
-    groups, labels = [], []
-    for group, label in zip(group_states, group_labels):
-        interior = np.array(sorted(group - interface), dtype=np.intp)
-        if interior.size:
-            groups.append(interior)
-            labels.append(label)
-    return Structure(groups, np.array(sorted(interface), dtype=np.intp), labels)
-
-
-def linear_system(circuit_model: str, model: Any = None) -> LinearSystem:
-    """The Jacobian storage and solves of ``circuit_model``."""
-    if circuit_model == "device":
-        return LinearSystem()
-    if circuit_model == "statewise":
-        return LinearSystem(cache=True)
-    if circuit_model == "mna":
-        if model is None:
-            raise ValueError("the mna circuit model needs an assembled model")
-        return LinearSystem(circuit_structure(model), cache=True)
-    raise ValueError(f"unknown circuit model {circuit_model!r}")
-
-
-
+def linear_system(model: Any = None) -> LinearSystem:
+    """Use the assembled state partition when supplied, otherwise one dense block."""
+    structure = getattr(model, "linear_structure", None)
+    return LinearSystem(structure() if structure is not None else None, cache=True)

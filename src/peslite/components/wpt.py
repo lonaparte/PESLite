@@ -156,8 +156,8 @@ class CompensatedLink(NetworkComponent):
         nb.port_output(self, "i_primary", self.primary_port, "current")
         nb.port_output(self, "i_secondary", self.secondary_port, "current")
         count = len(self.coil_sides)
-        shapes = np.array(self._shapes, dtype=float).reshape(count, count)
-        inductance = shapes @ np.diag(np.asarray(self._inductance, dtype=float)) @ shapes.T
+        shapes = nl._coefficient_array(self._shapes).reshape(count, count)
+        inductance = shapes @ np.diag(nl._coefficient_array(self._inductance)) @ shapes.T
         coils = [nb.internal() for _ in range(count)]
         coupled = nb.add(nl.CoupledInductors(
             [(coil, None) for coil in coils],

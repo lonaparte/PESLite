@@ -22,7 +22,7 @@ from .model import commutation_tolerance
 
 __all__ = ["RHS", "SolverStep", "Solver", "FIXED_METHODS", "ADAPTIVE_METHODS", "EXPLICIT_FIXED_METHODS",
            "IMPLICIT_FIXED_METHODS", "IMPLICIT_ADAPTIVE_METHODS", "CIRCUIT_MODELS", "TABLEAUS", "combine",
-           "canonical_method", "integrator", "FixedStepSolver", "AdaptiveSolver", "DormandPrince45",
+           "canonical_method", "integrator", "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "AutoSolver",
            "subintervals"]
 
 RHS = Callable[[float, NDArray[np.float64]], NDArray[np.float64]]
@@ -73,8 +73,8 @@ class Solver(Protocol):
 EXPLICIT_FIXED_METHODS = ("euler", "heun", "RK4")
 IMPLICIT_FIXED_METHODS = ("trapezoidal", "radau")
 FIXED_METHODS = EXPLICIT_FIXED_METHODS + IMPLICIT_FIXED_METHODS
-ADAPTIVE_METHODS = ("RK23", "RK45", "DOP853", "radau", "BDF", "LSODA", "DP45")
-CIRCUIT_MODELS = ("device", "statewise", "mna")
+ADAPTIVE_METHODS = ("RK23", "RK45", "DOP853", "radau", "BDF", "LSODA", "DP45", "auto")
+CIRCUIT_MODELS = ("device", "statewise", "nodal")
 IMPLICIT_ADAPTIVE_METHODS = ("radau", "BDF", "LSODA")
 
 
@@ -121,29 +121,24 @@ def stage_state(y: NDArray[np.float64], h: float, row: tuple[float, ...], ks: li
 
 def integrator(method: str, dt: float, rtol: float = 1e-6, atol: float = 1e-9,
                max_step: float = math.inf, warm_start: bool = True, *,
-               circuit_model: str = "device", model=None, solver_type: str | None = None) -> Solver:
+               model=None, solver_type: str | None = None) -> Solver:
     """Return the single-rate integrator of ``method``: fixed-step with maximum step ``dt`` (s),
     the built-in ``"DP45"`` or a SciPy method.
 
-    ``circuit_model`` selects electrical assembly and, for an implicit method, its linear system.
+    Implicit methods use the state partition supplied by the assembled model.
     """
-    if circuit_model not in CIRCUIT_MODELS:
-        raise ValueError(f"unknown circuit model {circuit_model!r}")
     adaptive = isinstance(solver_type, str) and solver_type.casefold() == "adaptive"
     if method in EXPLICIT_FIXED_METHODS and not adaptive:
         return FixedStepSolver(dt, method)
     if method == "DP45":
         return DormandPrince45(rtol, atol, max_step)
-    from .implicit import ImplicitSolver, ModeJacobian, linear_system
-
+    if method == "auto":
+        return AutoSolver(rtol, atol, max_step, warm_start, model=model)
     if method in IMPLICIT_FIXED_METHODS and not adaptive:
-        return ImplicitSolver(dt, method, rtol, atol, linear_system(circuit_model, model))
-    jac = None
-    if circuit_model != "device":
-        if model is None:
-            raise ValueError(f"circuit model {circuit_model!r} needs a model")
-        jac = ModeJacobian(model.rhs, linear_system(circuit_model, model))
-    return AdaptiveSolver(method, rtol, atol, max_step, warm_start, jac=jac)
+        from .implicit import ImplicitSolver, linear_system
+
+        return ImplicitSolver(dt, method, rtol, atol, linear_system(model))
+    return AdaptiveSolver(method, rtol, atol, max_step, warm_start, model=model)
 
 
 def subintervals(span: float, step: float) -> int:
@@ -381,13 +376,18 @@ class AdaptiveSolver:
         max_step: float = math.inf,
         warm_start: bool = True,
         jac: Callable | None = None,
+        *, model=None,
     ) -> None:
         from scipy.integrate import solve_ivp  # Load SciPy only when this solver is selected.
 
         self._solve_ivp = solve_ivp
-        self.method = method
+        self.method = canonical_method(method, "adaptive")
         self.rtol, self.atol, self.max_step = rtol, atol, max_step
         self.warm_start = warm_start
+        if self.method in IMPLICIT_ADAPTIVE_METHODS and jac is None:
+            from .implicit import ModeJacobian, linear_system
+
+            jac = ModeJacobian(getattr(model, "rhs", None), linear_system(model))
         self.jac = jac if self.method in IMPLICIT_ADAPTIVE_METHODS else None
         self._h_last: float | None = None
         self.n_rhs = 0
@@ -418,6 +418,9 @@ class AdaptiveSolver:
             kwargs["first_step"] = min(self._h_last, span, step)
         jac_rhs = getattr(self.jac, "n_rhs", 0)
         if self.jac is not None:
+            bind = getattr(self.jac, "bind", None)
+            if bind is not None:
+                bind(f)
             kwargs["jac"] = self.jac
         sol = self._solve_ivp(f, (t0, t1), y0, **kwargs)
         if not sol.success:
@@ -459,8 +462,11 @@ class DormandPrince45:
         return self.advance(f, t0, t1, y0)
 
     def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
-                max_step: float = math.inf) -> SolverStep:
-        """Integrate with an optional per-call maximum step without changing configuration."""
+                max_step: float = math.inf, step_callback: Callable | None = None) -> SolverStep:
+        """Integrate, optionally stopping when an accepted-step callback returns true.
+
+        The callback receives ``(h, y6, y1, k6, k7)`` from the existing final two stages.
+        """
         span = t1 - t0
         if span <= 0.0:
             return SolverStep(t1, y0, 0)
@@ -469,7 +475,7 @@ class DormandPrince45:
             raise ValueError("max_step must be positive")
         lists = getattr(getattr(f, "__self__", None), "rhs_list", None)
         if lists is not None:
-            return self._call_lists(lists, t0, t1, y0, step)
+            return self._call_lists(lists, t0, t1, y0, step, step_callback)
         a, b, c, e = self._a, self._b, self._c, self._e
         t, y = t0, np.asarray(y0, dtype=float)
         h = self._h if self._h is not None else span
@@ -483,7 +489,8 @@ class DormandPrince45:
             k3 = f(t + c[2] * h, y + h * (a[2][0] * k1 + a[2][1] * k2))
             k4 = f(t + c[3] * h, y + h * (a[3][0] * k1 + a[3][1] * k2 + a[3][2] * k3))
             k5 = f(t + c[4] * h, y + h * (a[4][0] * k1 + a[4][1] * k2 + a[4][2] * k3 + a[4][3] * k4))
-            k6 = f(t + h, y + h * (a[5][0] * k1 + a[5][1] * k2 + a[5][2] * k3 + a[5][3] * k4 + a[5][4] * k5))
+            y6 = y + h * (a[5][0] * k1 + a[5][1] * k2 + a[5][2] * k3 + a[5][3] * k4 + a[5][4] * k5)
+            k6 = f(t + h, y6)
             y1 = y + h * (b[0] * k1 + b[2] * k3 + b[3] * k4 + b[4] * k5 + b[5] * k6)
             k7 = f(t + h, y1)
             self.n_rhs += 6
@@ -493,6 +500,9 @@ class DormandPrince45:
             accepted, h_next = self._control(h, err, step)
             if accepted:
                 t, y, k1 = t + h, y1, k7
+                if step_callback is not None and step_callback(h, y6, y1, k6, k7):
+                    self._h = h_next
+                    return SolverStep(t, y, self.n_rhs)
             h = h_next
         self._h = h
         return SolverStep(t1, y, self.n_rhs)
@@ -511,7 +521,8 @@ class DormandPrince45:
         return False, h * max(0.1, self.safety * err ** -0.25)
 
     def _call_lists(self, f, t0: float, t1: float,
-                    y0: NDArray[np.float64], max_step: float) -> SolverStep:
+                    y0: NDArray[np.float64], max_step: float,
+                    step_callback: Callable | None = None) -> SolverStep:
         """The same DP5(4) pair on Python floats when the model provides ``rhs_list``."""
         span = t1 - t0
         a, b, c, e = self._a, self._b, self._c, self._e
@@ -543,9 +554,9 @@ class DormandPrince45:
             k5 = f(t + c5 * h,
                    [v + h * (a51 * q1 + a52 * q2 + a53 * q3 + a54 * q4)
                     for v, q1, q2, q3, q4 in zip(y, k1, k2, k3, k4)])
-            k6 = f(t + h,
-                   [v + h * (a61 * q1 + a62 * q2 + a63 * q3 + a64 * q4 + a65 * q5)
-                    for v, q1, q2, q3, q4, q5 in zip(y, k1, k2, k3, k4, k5)])
+            y6 = [v + h * (a61 * q1 + a62 * q2 + a63 * q3 + a64 * q4 + a65 * q5)
+                  for v, q1, q2, q3, q4, q5 in zip(y, k1, k2, k3, k4, k5)]
+            k6 = f(t + h, y6)
             y1 = [v + h * (b1 * q1 + b3 * q3 + b4 * q4 + b5 * q5 + b6 * q6)
                   for v, q1, q3, q4, q5, q6 in zip(y, k1, k3, k4, k5, k6)]
             k7 = f(t + h, y1)
@@ -560,8 +571,111 @@ class DormandPrince45:
             accepted, h_next = self._control(h, err, max_step)
             if accepted:
                 t, y, k1 = t + h, y1, k7
+                if step_callback is not None and step_callback(h, y6, y1, k6, k7):
+                    self._h = h_next
+                    return SolverStep(t, np.asarray(y), self.n_rhs)
             h = h_next
         self._h = h
         return SolverStep(t1, np.asarray(y), self.n_rhs)
+
+
+class AutoSolver:
+    """Use DP45 until its stage estimates detect stiffness, then use adaptive Radau.
+
+    The existing DP45 stages supply the stiffness estimate. Returning to DP45 uses the Jacobian
+    already computed by Radau; neither decision runs a second model or probes extra RHS values.
+    """
+
+    def __init__(self, rtol: float = 1e-6, atol: float = 1e-9, max_step: float = math.inf,
+                 warm_start: bool = True, *, model=None) -> None:
+        self._dp = DormandPrince45(rtol, atol, max_step)
+        self._warm_start, self._model = warm_start, model
+        self.stiff = False
+        self.switches = 0
+        self._backoff = 1
+        self._stiff_steps = self._nonstiff_steps = self._nonstiff_intervals = 0
+        self._direction = None
+
+    @functools.cached_property
+    def _implicit(self):
+        return AdaptiveSolver("radau", self._dp.rtol, self._dp.atol, self._dp.max_step,
+                              self._warm_start, model=self._model)
+
+    @property
+    def max_step(self) -> float:
+        return self._dp.max_step
+
+    @property
+    def n_rhs(self) -> int:
+        implicit = self.__dict__.get("_implicit")
+        return self._dp.n_rhs + (implicit.n_rhs if implicit is not None else 0)
+
+    def parameters_changed(self) -> None:
+        implicit = self.__dict__.get("_implicit")
+        if implicit is not None:
+            implicit.parameters_changed()
+        self._stiff_steps = self._nonstiff_steps = self._nonstiff_intervals = 0
+
+    def _accepted_step(self, h, y6, y1, k6, k7) -> bool:
+        denominator = sum((a - b)**2 for a, b in zip(y1, y6))
+        if denominator > 0.0:
+            stiffness = h * h * sum((a - b)**2 for a, b in zip(k7, k6)) / denominator
+            if stiffness > 3.25**2:
+                self._nonstiff_steps = 0
+                self._stiff_steps += 1
+                if self._stiff_steps >= 15 * self._backoff:
+                    self.stiff = True
+                    self.switches += 1
+                    self._implicit._h_last = h
+                    return True
+            else:
+                self._nonstiff_steps += 1
+                if self._nonstiff_steps >= 6:
+                    self._stiff_steps = 0
+        return False
+
+    def _spectral_radius(self) -> float:
+        matrix = self._implicit.jac.linear.J
+        if matrix is None or not matrix.size:
+            return 0.0
+        if self._direction is None or self._direction.size != matrix.shape[0]:
+            self._direction = np.random.default_rng(matrix.shape[0]).uniform(-1.0, 1.0, matrix.shape[0])
+        vector, radius = self._direction, 0.0
+        for _ in range(4):
+            norm = float(np.linalg.norm(vector))
+            if norm == 0.0:
+                return 0.0
+            product = matrix @ vector
+            radius = float(np.linalg.norm(product)) / norm
+            vector = product
+        return radius
+
+    def __call__(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64]) -> SolverStep:
+        return self.advance(f, t0, t1, y0)
+
+    def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
+                max_step: float = math.inf) -> SolverStep:
+        if t1 <= t0:
+            return SolverStep(t1, y0, self.n_rhs)
+        if not self.stiff:
+            result = self._dp.advance(f, t0, t1, y0, max_step=max_step,
+                                      step_callback=self._accepted_step)
+            if not self.stiff or result.t >= t1 - commutation_tolerance(t1):
+                return SolverStep(t1, result.y, self.n_rhs)
+            t0, y0 = result.t, result.y
+        result = self._implicit.advance(f, t0, t1, y0, max_step=max_step)
+        h = self._implicit._h_last
+        if h is not None and h * self._spectral_radius() <= 3.25:
+            self._nonstiff_intervals += 1
+            if self._nonstiff_intervals >= 6 * self._backoff:
+                self.stiff = False
+                self.switches += 1
+                self._backoff = min(2 * self._backoff, 64)
+                self._stiff_steps = self._nonstiff_steps = self._nonstiff_intervals = 0
+                self._dp._h = h
+                self._dp._err_prev = 1.0
+        else:
+            self._nonstiff_intervals = 0
+        return SolverStep(t1, result.y, self.n_rhs)
 
 

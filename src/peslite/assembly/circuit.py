@@ -1,6 +1,6 @@
 """The electrical network of a netlist circuit model: one Circuit subsystem and a view per component.
 
-Under ``simulation.solver.circuit_model`` ``statewise`` (dense per-mode state space) or ``mna``
+Under ``simulation.solver.circuit_model`` ``statewise`` (dense per-mode state space) or ``nodal``
 (sparse factorized derivative MNA), :func:`lower` rewrites the connection graph the System
 assembled. Components declaring ``network(nb)`` become primitives of one
 :class:`~peslite.solver.netlist.Netlist` between bus nodes; ``network(nb)`` returns
@@ -25,7 +25,7 @@ may keep a commutation of its own beside it (a gate clock) and mirror the netlis
 its discrete states (:meth:`NetlistBuilder.commutation`); its states may be stored in other coordinates than
 the netlist's (``NetlistBuilder.state(..., transform=T)``).
 
-Under ``mna`` the sparse solve eliminates the netlist's automatic switch-cluster groups onto the buses
+Under ``nodal`` the sparse solve eliminates the netlist's automatic switch-cluster groups onto the buses
 between them (:meth:`~peslite.solver.netlist.Netlist.grouping`); :meth:`Circuit.grouping_report`
 describes the groups by subsystem.
 """
@@ -45,10 +45,10 @@ from ..components.network import Port
 from ..solver.energy import Energetic, spec_of
 from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _InlineProgram
 from ..solver.netlist import (QUANTITIES, CurrentSource, Diode, Element, Netlist, Node, Topology,
-                              VoltageSource, _Degenerate, _Evaluation, _linear_expression)
+                              VoltageSource, _Degenerate, _Evaluation, _linear_expression, _numeric_values)
 
 __all__ = ["NetlistBuilder", "NetworkPlan", "Circuit", "NetworkView", "lower", "lower_devices",
-           "bind_device", "compile_network"]
+           "bind_device", "compile_network", "circuit_structure"]
 
 
 def _kind(port: Port) -> tuple[int, float]:
@@ -205,12 +205,12 @@ class NetlistBuilder:
             index.append(self._states[key])
         index = np.concatenate(index) if index else np.zeros(0, dtype=np.intp)
         if transform is not None:
-            T = np.asarray(transform, dtype=float)
+            T = _numeric_values(transform)
             if T.shape != (index.size, index.size) or not np.all(np.isfinite(T)) or (
                     index.size and np.linalg.cond(T) > 1e12):
                 raise ConfigError(f"{type(component).__name__}: a state transform must be an invertible "
                                   f"{index.size} x {index.size} matrix, got shape {T.shape}")
-            self.transforms.append((index, T))
+            self.transforms.append((index, transform))
         return index
 
     def commutation(self, component: Any, *, margin: Any = None, commutate: Any = None, next_time: Any = None,
@@ -424,7 +424,7 @@ class Circuit:
     state_names: tuple[str, ...] = ()
     outputs_need_inputs = True
     observer = True  # a calculation: the components keep their energy ports
-    grouped = True  # mna: eliminate the automatic switch-cluster groups onto their interface (Netlist.grouping)
+    grouped = True  # nodal: eliminate the automatic switch-cluster groups onto their interface (Netlist.grouping)
 
     def __init__(self, form: str) -> None:
         self.form = form
@@ -610,7 +610,11 @@ class Circuit:
         self._device_bindings.clear()
         self._consistent = None  # new parameters (a set event) may move the loops' and cutsets' constraints
         self._consistent_constraints = None
-        self._transforms = tuple((index, T, np.linalg.inv(T)) for index, T in nb.transforms)
+        transforms = []
+        for index, value in nb.transforms:
+            matrix = _numeric_values(value)
+            transforms.append((index, matrix, np.linalg.inv(matrix)))
+        self._transforms = tuple(transforms)
         self._stored = None
         hooks = [(comp, nb.hooks[id(comp)]) for comp in self.components if id(comp) in nb.hooks]
         self._hooks = tuple((comp, hook["after"]) for comp, hook in hooks if hook["after"] is not None)
@@ -1320,8 +1324,10 @@ class Circuit:
         return generator.trace_circuit_outputs(self)
 
     def cpp_output_stage(self, generator: Any, method: Any) -> list[str]:
-        """Evaluate once in generated code; its trace already assigns every public output."""
-        return self.cpp_outputs(generator) if method.__name__ == "solve" else []
+        """Publish the outputs declared by the same dependency stage used in Python."""
+        fields = next(stage.outputs for stage in self.output_stages
+                      if stage.method == method.__name__)
+        return generator.trace_circuit_outputs(self, fields) if fields else []
 
     def cpp_commutation_margin(self, generator: Any) -> str:
         """Lower the netlist's diode guard through the standalone C++ backend."""
@@ -2510,3 +2516,63 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
     for sub in circuit.components:
         views[id(sub)].bind(circuit, ())
     return out, lowered, held, circuit
+
+
+def circuit_structure(model: Any, circuits: Sequence[Circuit]):
+    """Map electrical groups to model states; keep shared and non-electrical states on the interface."""
+    from ..solver.implicit import Structure
+
+    n = model.n_states
+    component_subsystem = {
+        id(subsystem.component if isinstance(subsystem, NetworkView) else subsystem): subsystem
+        for subsystem in model.subsystems
+    }
+    group_states: list[set[int]] = []
+    group_labels: list[str] = []
+    interface: set[int] = set()
+    for circuit in circuits:
+        local_to_model: dict[int, int] = {}
+        for component, name, complex_state, local in circuit.layout:
+            subsystem = component_subsystem[id(component)]
+            positions = tuple(range(*model.state_slice(subsystem, name).indices(n)))
+            if len(positions) != (2 if complex_state else 1):
+                raise RuntimeError("circuit and model state layouts differ")
+            local_to_model.update(
+                (local + offset, position) for offset, position in enumerate(positions)
+            )
+
+        def states(elements) -> set[int]:
+            return {
+                local_to_model[int(local)]
+                for element in elements
+                for local in np.asarray(getattr(element, "state", ()), dtype=np.intp).reshape(-1)
+                if int(local) in local_to_model
+            }
+
+        plan = circuit.netlist.grouping()
+        for elements in plan.elements:
+            group_states.append(states(elements))
+            group_labels.append(", ".join(dict.fromkeys(
+                circuit._owners.get(id(element), "?") for element in elements
+            )))
+        interface.update(states(plan.interface_elements))
+        interface_nodes = {id(node) for node in plan.interface}
+        interface.update(states(
+            element for element in circuit.netlist.elements
+            if any(id(node) in interface_nodes for port in element.ports for node in port if node is not None)
+        ))
+
+    occurrences: dict[int, int] = {}
+    for group in group_states:
+        for position in group:
+            occurrences[position] = occurrences.get(position, 0) + 1
+    interface.update(position for position, count in occurrences.items() if count > 1)
+    grouped = set().union(*group_states) if group_states else set()
+    interface.update(set(range(n)) - grouped)
+    groups, labels = [], []
+    for group, label in zip(group_states, group_labels):
+        interior = np.array(sorted(group - interface), dtype=np.intp)
+        if interior.size:
+            groups.append(interior)
+            labels.append(label)
+    return Structure(groups, np.array(sorted(interface), dtype=np.intp), labels)

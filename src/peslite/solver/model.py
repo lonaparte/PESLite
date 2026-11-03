@@ -1101,6 +1101,7 @@ class Model:
     dots in names form namespaces.
     ``connections``: ``(dst, input) -> (src, output[, gain])`` or a list of these (summed).
     ``zoh_connections``: ``(dst, input) -> label`` for held inputs set by :meth:`set_zoh_input`.
+    ``linear_structure``: optional state-partition provider for implicit linear solves.
     """
 
     def __init__(
@@ -1108,7 +1109,9 @@ class Model:
         subsystems: Sequence[Subsystem] | Mapping[str, Subsystem],
         connections: Mapping[Connection, Connection | Sequence[Connection]],
         zoh_connections: Mapping[Connection, str] | None = None,
+        *, linear_structure: Callable[[Model], Any] | None = None,
     ) -> None:
+        self._linear_structure = linear_structure
         if isinstance(subsystems, Mapping):
             names = [str(n) for n in subsystems]
             subsystems = list(subsystems.values())
@@ -1157,6 +1160,10 @@ class Model:
         self._compile()
         self._energy_balance_plan = None
         self.plan_revision += 1
+
+    def linear_structure(self):
+        """Return the state partition supplied by assembly, or use the solver's dense default."""
+        return self._linear_structure(self) if self._linear_structure is not None else None
 
     # ---------------------------------------------------------------- setup
     def _check_connections(self) -> None:

@@ -867,10 +867,10 @@ class SolverParams:
     (integer N, or 1/N) or to ``{step, method}``, e.g. ``{dclink: 10, network: 0.1}``.
     """
 
-    circuit_model: str = "device"  # "device" | "statewise" | "mna"
+    circuit_model: str = "device"  # "device" | "statewise" | "nodal"
     type: str = "fixed"  # "fixed" | "adaptive"
     method: str = "RK4"  # fixed: euler|heun|RK4|trapezoidal|radau
-    #                      adaptive: RK23|RK45|DOP853|radau|BDF|LSODA|DP45
+    #                      adaptive: RK23|RK45|DOP853|radau|BDF|LSODA|DP45|auto
     dt: float = 1e-6  # s; fixed: maximum system step
     rtol: float = 1e-6  # adaptive error; fixed implicit Newton convergence
     atol: float = 1e-9  # adaptive error; fixed implicit Newton convergence
