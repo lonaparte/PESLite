@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "peslite"
-version = "0.4.0"
+version = "0.4.0.post1"
 description = "Open-source, lightweight, multirate, and extensible power electronics simulator in Python. Designed as a deterministic simulation backend for LLM reasoning."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10.1"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 dependencies = [

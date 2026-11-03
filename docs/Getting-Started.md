@@ -21,7 +21,7 @@ Check the command-line interface:
 peslite --help
 ```
 
-PESLite requires Python 3.10 or newer.
+PESLite requires Python 3.10.1 or newer.
 
 ## Run the first case
 

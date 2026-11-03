@@ -30,7 +30,7 @@ pip install peslite
 
 Use `pip install "peslite[all]"` to include every optional runtime add-on.
 
-PESLite requires Python 3.10 or newer.
+PESLite requires Python 3.10.1 or newer.
 
 ## Quick start
 
