@@ -11,7 +11,6 @@ import peslite
 from peslite.assembly import cpp
 from peslite.assembly.cpp import _ModelGenerator, _RuntimeParameters
 from peslite.solver import Bag, Model
-from peslite.solver.simulation import convert_main
 from test_cpp_equations import _Feedback
 from test_cpp_parameters import _case, _compare_run, _compile
 from conftest import EXAMPLES
@@ -147,7 +146,8 @@ def test_export_finds_the_original_resistances_without_a_name_list(resistance, t
 
 
 def test_cli_prints_the_same_export_diagnostics(tmp_path, capsys):
-    assert convert_main([str(EXAMPLES / "buck-example.pes"), "all", "--out", str(tmp_path)]) == 0
+    assert peslite.main(["export", str(EXAMPLES / "buck-example.pes"), "all",
+                         "--out", str(tmp_path)]) == 0
     captured = capsys.readouterr()
     assert "buses.output.r_d" in captured.err
     assert "units.converter.dclink.source.r" in captured.err
@@ -214,7 +214,8 @@ def test_common_preserves_nonzero_sensitive_values(tmp_path):
 
 
 def test_common_cli_reports_the_constants_and_preserves_path_validation(tmp_path, capsys):
-    assert convert_main([str(EXAMPLES / "buck-example.pes"), "common", "--out", str(tmp_path)]) == 0
+    assert peslite.main(["export", str(EXAMPLES / "buck-example.pes"), "common",
+                         "--out", str(tmp_path)]) == 0
     assert "common keeps detected structure-sensitive parameters constant" in capsys.readouterr().err
     with pytest.raises(ValueError, match="not variable"):
         peslite.export(_case("buck", "pwm_averaging"), "cpp", tmp_path / "invalid",

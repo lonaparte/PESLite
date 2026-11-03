@@ -89,12 +89,13 @@ Scalar signals keep their names. Python CSV output and standalone C++ share this
 States retain their `.re` / `.im` representation.
 
 Aliases such as `<unit>.i_c` and `<unit>.u_dc` may resolve to the underlying physical state. Use
-`--list-states` to print the exact state columns for one configuration.
+`peslite inspect case.pes --states` to print the exact state columns for one configuration.
 
 ## Summary conventions
 
 `summary.json` uses stable machine-readable values:
 
+- `status` is `completed`, `stopped`, `diverged` or `timed_out`;
 - switches are `0` or `1`;
 - a time or result that did not occur is `null`;
 - alarms, energy problems and port-Hamiltonian defaults are lists;

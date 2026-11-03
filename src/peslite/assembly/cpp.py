@@ -5412,7 +5412,7 @@ class _CppGenerator:
             # The normal preset resolver asks the source for its value once. Its AOT source
             # adapter has already evaluated that same expression at the initial instant.
             view.emf = SimpleNamespace(set_outputs=lambda _t: None,
-                                       out=SimpleNamespace(e_g=value))
+                                       output=SimpleNamespace(e_g=value))
             system.sources[name] = view
         simulation = copy.copy(self.simulation)
         simulation.system, simulation.p = system, self.p
@@ -6487,6 +6487,7 @@ public:
                 << "\\n  \\"n_rhs\\": " << n_rhs
                 << ",\\n  \\"t_start\\": {_number(self.p.simulation.initial.t)},"
                 << "\\n  \\"t_stop\\": " << t
+                << ",\\n  \\"status\\": \\"" << (t >= end - time_eps ? "completed" : "stopped") << '\"'
                 << ",\\n  \\"tripped\\": " << ({global_tripped} ? 1 : 0);
         {summary_text}
         {ph_summary}

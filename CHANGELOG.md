@@ -2,6 +2,9 @@
 
 ## 0.4.0
 
+- Added `run`, `validate`, `inspect` and `export` commands with a shared strict JSON result envelope,
+  stable lifecycle status and exit codes. Optional wall-time and RHS limits stop at existing event
+  boundaries, close streamed histories and retain partial results.
 - Unified physical components on assembly-time `NetworkPlan` translation. Custom electrical
   components can now register one frozen parameter dataclass whose `network()` declaration creates
   ports, zero-initialized states and the primitives shared by every circuit model.
@@ -288,7 +291,7 @@
 - State, control-signal and summary names use the same SI/per-unit convention as inputs.
   Controller states use `<unit>.ctrl.<state>`. Missing events are `None`/JSON `null`, switches
   are 0 or 1, and alarms, port-Hamiltonian defaults and energy problems are lists.
-- Results save the fully resolved configuration as `simulation.pes`; `--resolved` prints the same
+- Results save the fully resolved configuration as `simulation.pes`; `peslite inspect --resolved` prints the same
   representation, and both resolved and result-saved files can be run again.
 - The single root `examples/` directory contains only YAML-format `*-example.pes` files. They are
   included in the wheel and remain discoverable by the installed CLI. Custom Python examples are
@@ -392,7 +395,7 @@
   those values through `--set` and `Params.replace`; explicitly supplied values remain fixed.
 - `meta` contains optional text-only `title` and `description` fields.
 - `peslite.dumps` returns and `peslite.dump` writes a complete resolved simulation file.
-  Run results contain this file as `simulation.pes`, and `peslite FILE --resolved` prints it.
+  Run results contain this file as `simulation.pes`, and `peslite inspect FILE --resolved` prints it.
 
 ### Unified event model (#2)
 

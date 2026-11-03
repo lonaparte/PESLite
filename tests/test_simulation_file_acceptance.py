@@ -133,7 +133,7 @@ def test_resolved_cli_prints_a_loadable_complete_file():
     stream = io.StringIO()
     with redirect_stdout(stream):
         assert peslite.main([
-            "gfl-example", "--resolved",
+            "inspect", "gfl-example", "--resolved",
             "--set", "simulation.t_end=0.5",
             "--set", "units.vsc.pwm.f_sw=10000",
         ]) == 0

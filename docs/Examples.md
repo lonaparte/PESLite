@@ -11,7 +11,7 @@ Each example is an ordinary YAML simulation file. Use it directly, print its ful
 configuration, or copy that resolved form as the starting point for another case.
 
 ```bash
-peslite gfl-example --resolved > case.pes
+peslite inspect gfl-example --resolved > case.pes
 peslite case.pes
 ```
 
@@ -149,18 +149,17 @@ therefore refer to different converters.
 ## Inspect before running
 
 ```bash
-peslite gfl-example --list-states
-peslite gfl-example --ph-report
-peslite gfl-example --resolved
+peslite inspect gfl-example
+peslite inspect gfl-example --states
+peslite inspect gfl-example --ph-report --resolved
 ```
 
-These commands use the same configuration resolution and accept the same bridge presets and
-`--set` overrides as a simulation run.
+These commands use the same configuration resolution and accept `--set` overrides.
 
 ## Export an example to C++
 
 ```bash
-peslite-convert gfl-example all
+peslite export gfl-example all
 c++ -O3 -DNDEBUG -std=c++17 export/gfl-example/peslite.cpp \
   -o export/gfl-example/peslite
 export/gfl-example/peslite --list-params

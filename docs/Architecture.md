@@ -154,7 +154,7 @@ Components can declare storage and power ports. The energy layer uses these decl
 
 - account for stored, supplied and dissipated energy;
 - check Tellegen/power-balance residuals;
-- produce the `--ph-report` structure view;
+- produce the `peslite inspect --ph-report` structure view;
 - evaluate multirate interface and hold diagnostics.
 
 The port-Hamiltonian kernel is a structural and diagnostic layer; it does not force every solver to

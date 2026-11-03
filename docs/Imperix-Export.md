@@ -23,7 +23,7 @@ included in the ELF; these warnings do not imply that an iterative solver runs o
 Place `case.imperix.json` next to `case.pes`, then export:
 
 ```bash
-peslite-convert case.pes all --imperix
+peslite export case.pes all --imperix
 ```
 
 Without `--imperix-config`, the CLI reads the resolved PES file's same-directory sidecar:
@@ -34,8 +34,8 @@ in source-only mode; no hardware bindings are inferred or created automatically.
 This writes to `export/case/` and runs the configured SDK build. An explicit source-only export is:
 
 ```bash
-peslite-convert case.pes all --imperix --imperix-source-only
-peslite case.pes --export imperix --imperix-config bindings.json --imperix-source-only
+peslite export case.pes all --imperix --imperix-source-only
+peslite export case.pes --imperix --imperix-config bindings.json --imperix-source-only
 ```
 
 The generated package contains `user.cpp`, `user.h`, `peslite_control.hpp`, `manifest.json`,

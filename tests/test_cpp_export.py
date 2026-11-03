@@ -18,7 +18,6 @@ from conftest import EXAMPLES
 from peslite.assembly.params import from_dict
 from peslite.components import Bag, Element, Port, register_component_type
 from peslite.solver import BlackBoxSubsystem
-from peslite.solver.simulation import convert_main
 from test_measurement_network import load_case
 
 pytestmark = pytest.mark.full
@@ -677,8 +676,7 @@ def test_python_export_api_uses_export_run(tmp_path, monkeypatch):
 
 def test_cli_export_preserves_mode_name_and_emits_one_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    assert peslite.main([str(EXAMPLES / "gfl-example.pes"), "--averaging",
-                         "--export", "cpp"]) == 0
+    assert peslite.main(["export", str(EXAMPLES / "gfl-example.pes"), "--averaging"]) == 0
     project = tmp_path / "export/gfl-example-averaging"
     source = project / "peslite.cpp"
     assert tuple(project.iterdir()) == (source,)
@@ -688,9 +686,9 @@ def test_cli_export_preserves_mode_name_and_emits_one_file(tmp_path, monkeypatch
     assert "integrate_adaptive" not in text
 
 
-def test_convert_alias_and_all_variables(tmp_path, monkeypatch):
+def test_cli_export_all_variables(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    assert convert_main([str(EXAMPLES / "gfl-example.pes"), "all"]) == 0
+    assert peslite.main(["export", str(EXAMPLES / "gfl-example.pes"), "all"]) == 0
     source = (tmp_path / "export/gfl-example/peslite.cpp").read_text()
     assert "param_simulation_t_end" in source
     assert "param_units_vsc_ctrl_references_p_ref_pu" in source

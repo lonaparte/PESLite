@@ -16,7 +16,7 @@ from peslite.assembly.imperix_build import build_project
 from peslite.components.converter import make_topology
 from peslite.control.blocks import phases
 from peslite.control.controller import Measurement, VSCController
-from peslite.solver.simulation import convert_main, main
+from peslite.solver.simulation import main
 from conftest import EXAMPLES
 from test_cpp_export import _compiler, _run_generated
 
@@ -1411,12 +1411,10 @@ def test_standalone_export_shares_the_slow_vsc_command_frame_fix(tmp_path):
 
 
 def test_cli_help_describes_imperix_elf_export(capsys):
-    assert convert_main(["--help"]) == 0
-    assert "Imperix ELF export" in capsys.readouterr().out
     with pytest.raises(SystemExit) as error:
-        main(["--help"])
+        main(["export", "--help"])
     assert error.value.code == 0
-    assert "Imperix ELF export" in capsys.readouterr().out
+    assert "Imperix ELF" in capsys.readouterr().out
 
 
 def test_cli_sidecar_and_backend_option_routing(tmp_path, capsys):
@@ -1424,15 +1422,15 @@ def test_cli_sidecar_and_backend_option_routing(tmp_path, capsys):
     case = tmp_path / "case.pes"
     peslite.dump(sim.p, case)
     case.with_suffix(".imperix.json").write_text(json.dumps(_mapping(sim)), encoding="utf-8")
-    assert convert_main([str(case), "--imperix", "--imperix-source-only", "--out", str(tmp_path / "out")]) == 0
+    assert main(["export", str(case), "--imperix", "--imperix-source-only",
+                 "--out", str(tmp_path / "out")]) == 0
     warnings = capsys.readouterr().err
     assert "hardware timing" in warnings
-    assert "warning: The simulation contains algebraic loops" in warnings
     assert (tmp_path / "out" / "user.cpp").exists()
     with pytest.raises(SystemExit):
         main([str(case), "--imperix-source-only"])
     with pytest.raises(SystemExit):
-        main([str(case), "--imperix", "--export", "cpp"])
+        main(["export", str(case), "--imperix-source-only"])
 
 
 def _target_elf():

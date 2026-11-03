@@ -26,7 +26,6 @@ onnx = ["onnx>=1.17", "onnxruntime>=1.18"]
 
 [project.scripts]
 peslite = "peslite.solver.simulation:main"
-peslite-convert = "peslite.solver.simulation:convert_main"
 
 [project.urls]
 Homepage = "https://github.com/lonaparte/PESLite"

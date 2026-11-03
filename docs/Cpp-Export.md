@@ -6,17 +6,17 @@ Python.
 
 ## Export
 
-Use `peslite-convert` with a simulation file or bundled example:
+Use `peslite export` with a simulation file or bundled example:
 
 ```bash
-peslite-convert case.pes simulation.t_end units.vsc.ctrl.references.p_ref_pu
+peslite export case.pes simulation.t_end units.vsc.ctrl.references.p_ref_pu
 ```
 
 The paths after the file are the parameters that remain variable in the compiled program. Use
 `all` to retain every variable parameter supported for that configuration:
 
 ```bash
-peslite-convert case.pes all
+peslite export case.pes all
 ```
 
 By default, the command writes one file:
@@ -32,7 +32,7 @@ the translation unit.
 An explicit destination uses the familiar `--out` option:
 
 ```bash
-peslite-convert case.pes all --out export/my-simulator
+peslite export case.pes all --out export/my-simulator
 ```
 
 The Python API provides the same operation:
@@ -57,7 +57,7 @@ c++ -O3 -DNDEBUG -std=c++17 export/case/peslite.cpp -o export/case/peslite
 ```
 
 The compiler may create its normal build cache or object files when invoked through a build system,
-but `peslite-convert` itself emits only `peslite.cpp`.
+but `peslite export` itself emits only `peslite.cpp`.
 
 ## Run
 
@@ -99,9 +99,9 @@ thresholds and numerical timing/solver settings. The same paths apply to AC, DC 
 You can select one field, a section, `all`, or `common`:
 
 ```bash
-peslite-convert buck-example elements.load units.converter.filter
-peslite-convert wpt-example all
-peslite-convert buck-example common
+peslite export buck-example elements.load units.converter.filter
+peslite export wpt-example all
+peslite export buck-example common
 ```
 
 Leaf converters also expose `units.<name>.connected`, the initial connection command. Select it
@@ -191,7 +191,7 @@ These choices are fixed when `peslite.cpp` is generated:
 - every parameter not explicitly retained as a variable.
 
 Specialization lets the compiler inline the configured RHS and remove generic dispatch. To change a
-fixed choice, update the source `.pes` file and run `peslite-convert` again.
+fixed choice, update the source `.pes` file and run `peslite export` again.
 
 Discrete switching, protection and scheduling have native execution adapters. Numerical component
 outputs, derivatives and energy equations reuse the assembled Python equations, including those of

@@ -69,7 +69,7 @@ values, presets and command-line overrides.
 Print the resolved configuration without running:
 
 ```bash
-peslite gfl-example --resolved
+peslite inspect gfl-example --resolved
 ```
 
 Override a value by dotted path and choose an output directory:
@@ -96,7 +96,7 @@ peslite gfl-example --progress --watch vsc.vdc_pu
 The quickest starting point is a resolved bundled example:
 
 ```bash
-peslite gfl-example --resolved > my-case.pes
+peslite inspect gfl-example --resolved > my-case.pes
 ```
 
 Edit `my-case.pes`, then run it with `peslite my-case.pes`; its sections are listed in

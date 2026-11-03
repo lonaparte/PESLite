@@ -103,9 +103,9 @@ During a run, `simulation.solver.phs_check_step` sets the number of output snaps
 audits. It defaults to 1000 and is intended as an internal performance/diagnostic control rather
 than a primary model setting.
 
-`--ph-report` prints the assembled port-Hamiltonian structure without running, including when the
-configuration sets `energy_check: off`. `summary.json` records `n_rhs` and any multirate interface
-indicators.
+`peslite inspect case.pes --ph-report` prints the assembled port-Hamiltonian structure without
+running, including when the configuration sets `energy_check: off`. `summary.json` records `n_rhs`
+and any multirate interface indicators.
 
 ## Selection guidance
 

@@ -247,7 +247,8 @@ def small_signal_report(sim: Simulation, *, times: Iterable[float] = (),
                         periodic_tolerance: float = 1e-3, multiplier_tolerance: float = 1e-5,
                         change_tolerance: float = 1e-6,
                         out_dir: str | Path | None = "output/run", name: str = "simulation",
-                        info: Mapping[str, object] | None = None) -> SmallSignalReport:
+                        info: Mapping[str, object] | None = None, timeout: float | None = None,
+                        max_rhs: int | None = None) -> SmallSignalReport:
     """Run a fresh simulation and report only changes at selected analysis times.
 
     Start, end, and file-event times are always checked. Add explicit ``times`` or an
@@ -360,7 +361,7 @@ def small_signal_report(sim: Simulation, *, times: Iterable[float] = (),
         return None if final else next_endpoint()
 
     result = sim.run(out_dir=out_dir, name=name, info=info, observe=observe, times=selected,
-                     observe_values=reported)
+                     observe_values=reported, timeout=timeout, max_rhs=max_rhs)
     previous, timeline = {}, []
     metric_names = sorted({name for entry in records.values() for name in entry
                            if name.startswith("analysis.")})

@@ -21,7 +21,7 @@ def _resolved(*args):
     """Return the resolved tree after applying command-line arguments."""
     output = io.StringIO()
     with redirect_stdout(output):
-        assert peslite.main([*args, "--resolved"]) == 0
+        assert peslite.main(["inspect", *args, "--resolved"]) == 0
     return yaml.safe_load(output.getvalue())
 
 
@@ -125,7 +125,7 @@ def test_averaging_preset_overrides_file_solver_and_fixed_only_settings(tmp_path
 
 def test_bridge_flags_are_mutually_exclusive(capsys):
     with pytest.raises(SystemExit):
-        peslite.main(["gfl-example", "--switching", "--averaging", "--resolved"])
+        peslite.main(["inspect", "gfl-example", "--switching", "--averaging", "--resolved"])
     assert "not allowed with argument" in capsys.readouterr().err
 
 

@@ -143,7 +143,7 @@ def test_watch_needs_progress_lines(gfl, capsys, tmp_path):
         peslite.main(["gfl-example", "--watch", "vsc.vdc_pu"])
     assert "add --progress" in capsys.readouterr().err
     with pytest.raises(SystemExit):  # the same rule for the row selection of a restart
-        peslite.main(["gfl-example", "--initial-time", "0.5", "--resolved"])
+        peslite.main(["inspect", "gfl-example", "--initial-time", "0.5", "--resolved"])
     assert "add --initial FILE" in capsys.readouterr().err
 
     params = gfl(**{"simulation.progress.watch": ["vsc.vdc_pu"]})
