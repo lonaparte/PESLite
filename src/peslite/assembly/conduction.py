@@ -78,7 +78,7 @@ class DiodeConduction:
         )
         self._topology_owners = tuple(
             subsystem for subsystem in model.subsystems
-            if subsystem in self.commutating
+            if getattr(subsystem, "requires_topology_freeze", False)
             if callable(getattr(subsystem, "freeze_topology", None))
         )
         self._scheduled = tuple(

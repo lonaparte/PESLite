@@ -931,9 +931,14 @@ class DCConverter(Unit):
                     self.conduction, "lower_current_ratio",
                 ),
                 (self.bridge, "loss_factor"): (self.conduction, "resistance_factor"),
+                (self.bridge, "u_dc"): (self.dclink, "u_dc"),
+                (self.bridge, "i_c"): (self.branch_f, "i"),
             })
             if self._external_lower_rail:
-                connections[(self.conduction, "lower")] = self._control_voltage_port
+                connections.update({
+                    (self.conduction, "lower"): self._control_voltage_port,
+                    (self.bridge, "u_lower"): self._control_voltage_port,
+                })
             else:
                 connections[(self.conduction, "reference")] = (
                     self._control_supply_port

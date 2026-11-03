@@ -83,7 +83,7 @@ def test_netlist_node_without_capacitance_is_algebraic(form):
     assert net.node_voltage(middle)[0] == pytest.approx(9.0, rel=1e-14)
 
 
-@pytest.mark.parametrize("form", FORMS)
+@pytest.mark.parametrize("form", ("device", *FORMS))
 def test_selected_netlist_outputs_match_the_full_equations(form):
     net = Netlist(form)
     source, output = Node(), Node()
@@ -95,10 +95,33 @@ def test_selected_netlist_outputs_match_the_full_equations(form):
     derivative, values = net.evaluate_with_outputs(0.0, np.array([4.0]), selected)
     np.testing.assert_allclose(derivative, [3_000.0], rtol=0.0, atol=1e-12)
     np.testing.assert_allclose(values, net.outputs()[selected], rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(
+        net.evaluate_outputs(0.0, np.array([4.0]), selected), values,
+        rtol=0.0, atol=1e-12,
+    )
+
+
+def test_grouped_mna_selected_outputs_reuse_the_network_factorization():
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "wpt-ss-example.pes",
+        **QUIET,
+        **{"simulation.solver.circuit_model": "mna"},
+    ))
+    circuit, = simulation.system.circuits
+    circuit.receive()
+    net, states, selected = circuit.netlist, circuit._states(), circuit.output_indices
+    topology = net.topology()
+
+    assert topology._layout is not None
+    expected = net.evaluate_with_outputs(0.0, states, selected)[1]
+    np.testing.assert_allclose(
+        net.evaluate_outputs(0.0, states, selected), expected,
+        rtol=1e-12, atol=1e-12,
+    )
 
 
 def test_selected_scalar_outputs_follow_a_dynamic_transformer_mode():
-    ratio = [0.5]
+    ratio = [np.float64(0.5)]
     net = Netlist("device")
     primary, secondary, common = Node(), Node(), Node()
     transformer = Transformer(primary, common, secondary, common, lambda: ratio[0])
@@ -111,7 +134,7 @@ def test_selected_scalar_outputs_follow_a_dynamic_transformer_mode():
     np.testing.assert_allclose(evaluate(0.0, ()),
                                np.asarray(net.evaluate_scalar_outputs(0.0, ()))[selected],
                                rtol=0.0, atol=1e-12)
-    ratio[0] = 0.25
+    ratio[0] = np.float64(0.25)
     np.testing.assert_allclose(evaluate(0.0, ()),
                                np.asarray(net.evaluate_scalar_outputs(0.0, ()))[selected],
                                rtol=0.0, atol=1e-12)
@@ -276,6 +299,30 @@ def test_device_netlist_equations_are_inlined_into_the_model_program():
     assert "# pcc" in source and "# grid.branch" in source
 
 
+@pytest.mark.parametrize("circuit_model", CIRCUIT_MODELS)
+def test_numeric_circuit_stages_keep_the_declared_equation_dependencies(circuit_model):
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "buck-example.pes",
+        **QUIET,
+        **{"simulation.solver.circuit_model": circuit_model},
+    ))
+    circuit, = simulation.system.circuits
+
+    assert all(stage.method != "solve" for stage in circuit.output_stages)
+    assert not simulation.system.model.algebraic_loops
+
+
+@pytest.mark.full
+def test_transformed_device_runtime_is_stable_at_grazing_commutations(tmp_path):
+    params = peslite.load(
+        EXAMPLES / "wpt-phase-shift-example.pes",
+        **QUIET,
+        **{"simulation.t_end": 6e-4},
+    )
+    result = peslite.Simulation(params).run(out_dir=tmp_path)
+    assert all(np.isfinite(value) for value in result.final_states().values())
+
+
 @pytest.mark.full
 @pytest.mark.parametrize("example", ["wpt-phase-shift-example", "wpt-scc-example"])
 def test_switching_wpt_netlists_match_device_equations(example, tmp_path):
@@ -319,6 +366,36 @@ def test_switching_bridge_with_device_capacitance_is_native(circuit_model, tmp_p
     assert isinstance(bridge, NetworkView)
     actual = simulation.run(out_dir=tmp_path / circuit_model).final_states()
     np.testing.assert_allclose(list(actual.values()), list(reference.values()), rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("circuit_model", CIRCUIT_MODELS)
+def test_averaged_bridge_mixture_publishes_the_same_outputs(circuit_model, tmp_path):
+    changes = {
+        "simulation.t_end": 1e-8,
+        "simulation.solver.dt": 1e-10,
+        "simulation.solver.method": "radau",
+        "simulation.solver.rtol": 1e-9,
+        "simulation.solver.atol": 1e-11,
+        "simulation.progress.enable": 0,
+        "simulation.solver.linearisations": 0,
+        "units.vsc.bridge.model": "averaging",
+        "units.vsc.bridge.parallel_capacitance": 1e-7,
+        "units.vsc.bridge.on_resistance": 0.01,
+    }
+
+    def run(form):
+        simulation = peslite.Simulation(peslite.load(
+            EXAMPLES / "gfl-example.pes",
+            **changes,
+            **{"simulation.solver.circuit_model": form},
+        ))
+        simulation.run(out_dir=tmp_path / form)
+        bridge = simulation.unit().bridge.output
+        return bridge.u_c, bridge.i_dc, bridge.i_device
+
+    np.testing.assert_allclose(
+        run(circuit_model), run("device"), rtol=1e-9, atol=1e-9
+    )
 
 
 @pytest.mark.parametrize("circuit_model", CIRCUIT_MODELS)

@@ -110,6 +110,7 @@ _CACHE = 32  # compiled modes kept
 _DELTA_T = 1e-8  # half step (s) of the central difference of a source without a derivative
 _MAX_PATTERNS = 64  # diode conduction patterns tried at one instant
 _MARGIN_RTOL = 1e-9  # margins within this fraction of the circuit's scale count as zero
+_FLOAT_RTOL = 64.0 * np.finfo(float).eps  # equivalent scalar/matrix evaluations of the same zero
 _NOOP_RTOL = 1e-13  # projections smaller than this, relative to the states, are no jump
 _DENSE_ENTRIES = 1 << 14  # coupling matrices up to this size multiply as dense arrays (no sparse overhead)
 _GROUP_PARTS = 256  # factorized group blocks kept (least recently used first out)
@@ -167,6 +168,30 @@ class _Symbolic:
 
 
 _SCALAR_NUMBER = (int, float, complex, np.number)
+
+
+def _literal(value: Any) -> str:
+    """Render one scalar constant without leaking a library-specific representation."""
+    return repr(value.item() if isinstance(value, np.generic) else value)
+
+
+def _linear_terms(coefficients: Sequence[float], variables: Sequence[str]) -> list[str]:
+    """Render the nonzero terms of one numeric linear expression."""
+    terms = []
+    for coefficient, variable in zip(coefficients, variables):
+        value = float(coefficient)
+        if value == 1.0:
+            terms.append(f"({variable})")
+        elif value == -1.0:
+            terms.append(f"-({variable})")
+        elif value != 0.0:
+            terms.append(f"{value!r} * ({variable})")
+    return terms
+
+
+def _linear_expression(coefficients: Sequence[float], variables: Sequence[str]) -> str:
+    """Render one numeric linear expression."""
+    return " + ".join(_linear_terms(coefficients, variables)) or "0.0"
 
 
 def _zero(value: Any) -> bool:
@@ -351,7 +376,7 @@ def _symbolic_source(expressions: Sequence[Any]) -> tuple[list[str], tuple[str, 
 
     def render(value: Any, defining: Optional[_Symbolic] = None) -> str:
         if not isinstance(value, _Symbolic):
-            return repr(float(value)) if isinstance(value, np.floating) else repr(value)
+            return _literal(value)
         if value in names and value is not defining:
             return names[value]
         if value.operation == "value":
@@ -365,12 +390,12 @@ def _symbolic_source(expressions: Sequence[Any]) -> tuple[list[str], tuple[str, 
                 lines.append(f"{name} = {render(argument, argument)}")
         if value.operation == "linear":
             constant, terms = value.arguments
-            parts = ([] if _zero(constant) else [repr(constant)])
+            parts = ([] if _zero(constant) else [_literal(constant)])
             for coefficient, term in terms:
                 expression = render(term)
                 parts.append(expression if _one(coefficient) else
                              f"(-{expression})" if _minus_one(coefficient) else
-                             f"({coefficient!r} * {expression})")
+                             f"({_literal(coefficient)} * {expression})")
             return "(" + " + ".join(parts) + ")"
         arguments = tuple(render(argument) for argument in value.arguments)
         if value.operation == "neg":
@@ -860,11 +885,23 @@ class _DenseSolve:
             return solution
         return lapack.dgetrs(self.lu, self.piv, b)[0]
 
+    def solve_transpose(self, b: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Solve the transposed system from the same factorization."""
+        if self.inverse is not None:
+            return self.inverse.T @ b
+        return lapack.dgetrs(self.lu, self.piv, b, trans=1)[0]
+
 def _factor(m: sp.spmatrix, what: str) -> object:
     try:
         return splu(sp.csc_matrix(m))
     except RuntimeError as exc:
         raise ValueError(f"the {what} is singular in this mode ({exc})") from None
+
+
+def _solve_transpose(factor: object, b: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Solve a transposed dense, sparse or grouped factorization."""
+    solve = getattr(factor, "solve_transpose", None)
+    return solve(b) if solve is not None else factor.solve(b, trans="T")
 
 
 class _Layout:
@@ -875,14 +912,16 @@ class _Layout:
     def __init__(self, pattern: _Pattern, row: NDArray[np.intp], col: NDArray[np.intp], n_groups: int) -> None:
         G = n_groups
         rb, cb = np.where(row < 0, G, row), np.where(col < 0, G, col)
-        self.row_perm, col_perm = np.argsort(rb, kind="stable"), np.argsort(cb, kind="stable")
-        self.col_inv = np.argsort(col_perm)
+        self.row_perm = np.argsort(rb, kind="stable")
+        self.col_perm = np.argsort(cb, kind="stable")
+        self.row_inv = np.argsort(self.row_perm)
+        self.col_inv = np.argsort(self.col_perm)
         counts = np.bincount(rb, minlength=G + 1)
         self.offsets = np.concatenate([[0], np.cumsum(counts)]).tolist()
         self.n_i, self.failed = int(counts[G]), False
         r = pattern.indices.astype(np.intp)
         c = np.repeat(np.arange(pattern.n), np.diff(pattern.indptr))
-        pr, pc, br, bc = np.argsort(self.row_perm)[r], self.col_inv[c], rb[r], cb[c]
+        pr, pc, br, bc = self.row_inv[r], self.col_inv[c], rb[r], cb[c]
         self.groups = [g for g in range(G) if counts[g]]
         self.blocks: dict[tuple[int, int], tuple] = {}
         for a, b in [(g, h) for g in self.groups for h in (g, G)] + [(G, g) for g in self.groups] + [(G, G)]:
@@ -943,7 +982,7 @@ class _GroupedLU:
             if n_i:
                 schur -= part[3]
                 couplings.append(part)
-            self.solves.append((slice(layout.offsets[g], layout.offsets[g + 1]), part[0].solve))
+            self.solves.append((slice(layout.offsets[g], layout.offsets[g + 1]), part[0]))
         self.schur = _DenseSolve(schur, "interface system") if n_i else None
         if n_i:
             stats["interface"] += 1
@@ -954,13 +993,28 @@ class _GroupedLU:
         layout, i0 = self.layout, self.i0
         bp = b[layout.row_perm]
         zp = np.empty_like(bp)
-        for sl, solve in self.solves:
-            zp[sl] = solve(bp[sl])
+        for sl, factor in self.solves:
+            zp[sl] = factor.solve(bp[sl])
         if self.schur is not None:
             zi = self.schur.solve(bp[i0:] - self.C @ zp[:i0])
             zp[:i0] -= self.W @ zi
             zp[i0:] = zi
         return zp[layout.col_inv]
+
+    def solve_transpose(self, b: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Solve the transposed bordered system from the same group factors."""
+        layout, i0 = self.layout, self.i0
+        bp = b[layout.col_perm]
+        zp = np.empty_like(bp)
+        if self.schur is not None:
+            zi = self.schur.solve_transpose(bp[i0:] - self.W.T @ bp[:i0])
+            group_rhs = bp[:i0] - self.C.T @ zi
+            zp[i0:] = zi
+        else:
+            group_rhs = bp[:i0]
+        for sl, factor in self.solves:
+            zp[sl] = _solve_transpose(factor, group_rhs[sl])
+        return zp[layout.row_inv]
 
 
 class _Projector:
@@ -1008,23 +1062,13 @@ class _Projector:
         names_x = [f"x_{index}" for index in range(self.n)]
         names_u = [f"u[{index}]" for index in range(self.G_u.shape[1])]
 
-        def linear(row: NDArray[np.float64], names: Sequence[str]) -> list[str]:
-            terms = []
-            for coefficient, name in zip(row, names):
-                value = float(coefficient)
-                if value == 1.0:
-                    terms.append(name)
-                elif value == -1.0:
-                    terms.append(f"-{name}")
-                elif value != 0.0:
-                    terms.append(f"{value!r} * {name}")
-            return terms
-
         lines = [
             *(f"    {name} = y[{int(index)}]" for name, index in zip(names_x, self.index)),
         ]
         for index, (x_row, u_row) in enumerate(zip(px, pu)):
-            expression = " + ".join(linear(x_row, names_x) + linear(u_row, names_u)) or "0.0"
+            expression = " + ".join(
+                _linear_terms(x_row, names_x) + _linear_terms(u_row, names_u)
+            ) or "0.0"
             lines.append(f"    d_{index} = ({expression}) - x_{index}")
         changes = ", ".join(f"abs(d_{index})" for index in range(self.n))
         references = ", ".join(f"abs(x_{index})" for index in range(self.n))
@@ -1033,7 +1077,9 @@ class _Projector:
             *(f"        d_{index} = 0.0" for index in range(self.n)),
         ))
         for index, (x_row, u_row) in enumerate(zip(mx, mu)):
-            expression = " + ".join(linear(x_row, names_x) + linear(u_row, names_u)) or "0.0"
+            expression = " + ".join(
+                _linear_terms(x_row, names_x) + _linear_terms(u_row, names_u)
+            ) or "0.0"
             lines.append(f"    m_{index} = {expression}")
         projected = ", ".join(f"x_{index} + d_{index}" for index in range(self.n))
         multipliers = ", ".join(f"m_{index}" for index in range(mx.shape[0]))
@@ -1348,7 +1394,9 @@ class Topology:
         self._couplings()
         self._state_space: Optional[StateSpace] = None
         self._evaluations = 0
-        self._selected_equations: dict[tuple[int, ...], tuple[NDArray[np.float64], ...]] = {}
+        self._affine_equations: dict[
+            tuple[bool, tuple[int, ...]], tuple[NDArray[np.float64], ...]
+        ] = {}
         self._selected_outputs: dict[tuple[int, ...], NDArray[np.float64]] = {}
         self._projectors: Optional[tuple[Optional[_Projector], Optional[_Projector]]] = None
         self._constraint_key: Optional[object] = None
@@ -1374,7 +1422,7 @@ class Topology:
             top.lu = top._factorize(net, self._pattern.values(mode.ratios))
         top._state_space = top._projectors = top._constraint_key = None
         top._evaluations = 0
-        top._selected_equations = {}
+        top._affine_equations = {}
         top._selected_outputs = {}
         return top
 
@@ -1489,22 +1537,45 @@ class Topology:
             self._state_space = StateSpace(X[:, a], X[:, b], X[:, c], O[:, a], O[:, b], O[:, c])
         return self._state_space
 
-    def selected_equations(self, selected: Sequence[int]) -> tuple[NDArray[np.float64], ...]:
-        """Cached derivative equations and requested output rows for this compiled mode."""
-        key = tuple(map(int, selected))
-        equations = self._selected_equations.get(key)
+    def affine_equations(
+        self, selected: Sequence[int], *, derivatives: bool = True
+    ) -> tuple[NDArray[np.float64], ...]:
+        """Cached affine equations for derivatives, selected outputs, or both."""
+        rows = tuple(map(int, selected))
+        key = derivatives, rows
+        equations = self._affine_equations.get(key)
         if equations is None:
             if self._dense:
                 ss = self.state_space
-                rows = list(key)
-                equations = (
-                    np.vstack((ss.A, ss.C[rows])),
-                    np.vstack((ss.B, ss.D[rows])),
-                    np.vstack((ss.B1, ss.D1[rows])),
+                output_rows = list(rows)
+                output = (ss.C[output_rows], ss.D[output_rows], ss.D1[output_rows])
+                if derivatives and output_rows:
+                    equations = (
+                        np.vstack((ss.A, output[0])),
+                        np.vstack((ss.B, output[1])),
+                        np.vstack((ss.B1, output[2])),
+                    )
+                elif derivatives:
+                    equations = ss.A, ss.B, ss.B1
+                else:
+                    equations = output
+            elif derivatives:
+                raise ValueError("sparse affine equations apply only to electrical outputs")
+            elif not rows or not self.n_z:
+                n_x, n_u = self._net_shape
+                equations = (np.zeros((len(rows), n_x)),) + (
+                    np.zeros((len(rows), n_u)),
+                    np.zeros((len(rows), n_u)),
                 )
             else:
-                equations = (self.selected_outputs(key),)
-            self._selected_equations[key] = equations
+                selected = self.selected_outputs(rows)
+                right = selected.T.toarray() if sp.issparse(selected) else selected.T
+                dual = _solve_transpose(self.lu, np.asarray(right))
+                equations = tuple(
+                    np.asarray(matrix.T @ dual).T
+                    for matrix in (self.Ky, self.Ku, self.Kdu)
+                )
+            self._affine_equations[key] = equations
         return equations
 
     def selected_outputs(self, selected: Sequence[int]) -> NDArray[np.float64]:
@@ -2395,22 +2466,6 @@ class Netlist:
         return du
 
     @staticmethod
-    def _scalar_expression(coefficients: NDArray[np.float64], variables: Sequence[str]) -> str:
-        """A compact scalar linear expression, used once while compiling a circuit mode."""
-        terms = []
-        for coefficient, variable in zip(coefficients, variables):
-            value = float(coefficient)
-            if value == 0.0:
-                continue
-            if value == 1.0:
-                terms.append(variable)
-            elif value == -1.0:
-                terms.append(f"-{variable}")
-            else:
-                terms.append(f"{value!r} * {variable}")
-        return " + ".join(terms).replace("+ -", "- ") or "0.0"
-
-    @staticmethod
     def _complex_term(coefficient: complex, variable: str) -> str:
         """One compact term of a generated complex-linear expression."""
         if coefficient == 1.0:
@@ -2478,7 +2533,7 @@ class Netlist:
         for position, row in enumerate(rows):
             if position in processed:
                 continue
-            expressions[position] = self._scalar_expression(row, variables)
+            expressions[position] = _linear_expression(row, variables)
             scalar_columns.update(map(int, np.flatnonzero(row)))
         return expressions, statements, scalar_columns
 
@@ -2603,7 +2658,7 @@ class Netlist:
             variables = (["ul"] if dimension == 1 else ["ul.real", "ul.imag"]) \
                 + (["ur"] if dimension == 1 else ["ur.real", "ur.imag"]) \
                 + [f"y[{index}]" for index in range(dimension)]
-            result = [f"({self._scalar_expression(row, variables)}) if ({condition}) else 0.0"
+            result = [f"({_linear_expression(row, variables)}) if ({condition}) else 0.0"
                       for row in dynamics]
         expression = "(" + ", ".join(result) + ("," if dimension == 1 else "") + ")"
         statements = tuple(lines[1:])
@@ -3203,33 +3258,56 @@ class Netlist:
         derivative, _output = self.evaluate_with_outputs(t, y, ())
         return derivative
 
+    def _evaluate_numeric(
+        self, t: float, y: NDArray[np.float64], selected: Sequence[int], *, derivatives: bool
+    ) -> tuple[NDArray[np.float64], Optional[NDArray[np.float64]], NDArray[np.float64]]:
+        """Evaluate one numeric circuit form, optionally including its state derivatives."""
+        y = np.asarray(y, dtype=float)
+        top = self.topology()
+        x, u = y[self.states], self.inputs(t)
+        du = self.rates(t, top.needs_rate) if top.any_rate else np.zeros(self.n_u)
+        affine = (
+            self.form == "statewise"
+            and (top._evaluations >= _DENSE_REUSE or top._state_space is not None)
+        ) or (self.form == "mna" and not derivatives)
+        if affine:
+            equations = top.affine_equations(selected, derivatives=derivatives)
+            values = equations[0] @ x + equations[1] @ u
+            if top.any_rate:
+                values += equations[2] @ du
+            if derivatives:
+                dx, output = values[:self.n_x], values[self.n_x:]
+            else:
+                dx, output = None, values
+            z = None
+        else:
+            z = top.solve(x, u, du)
+            dx = z[top.xd_index] if derivatives else None
+            output = top.selected_outputs(selected) @ z
+        self._last = _Evaluation(top, float(t), x, u, du, z)
+        top._evaluations += 1
+        return y, dx, np.asarray(output, dtype=float)
+
+    def evaluate_outputs(
+        self, t: float, y: NDArray[np.float64], selected: Sequence[int]
+    ) -> NDArray[np.float64]:
+        """Evaluate selected electrical outputs without also forming state derivatives."""
+        if self.form == "device":
+            return np.asarray(self.evaluate_scalar_outputs(t, y), dtype=float)[list(selected)]
+        return self._evaluate_numeric(t, y, selected, derivatives=False)[2]
+
     def evaluate_with_outputs(self, t: float, y: NDArray[np.float64], selected: Sequence[int]
                               ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Evaluate the derivatives and selected electrical outputs in one compiled operation."""
         if self.form == "device":
             derivative, output = self.evaluate_scalar_raw(t, y)
             return np.asarray(derivative, dtype=float), np.asarray(output, dtype=float)[list(selected)]
-        y = np.asarray(y, dtype=float)
-        top = self.topology()
-        x, u = y[self.states], self.inputs(t)
-        du = self.rates(t, top.needs_rate) if top.any_rate else np.zeros(self.n_u)
-        if self.form == "statewise" and (top._evaluations >= _DENSE_REUSE or top._state_space is not None):
-            state_and_output = top.selected_equations(selected)
-            values = state_and_output[0] @ x + state_and_output[1] @ u
-            if top.any_rate:
-                values += state_and_output[2] @ du
-            dx, output, z = values[:self.n_x], values[self.n_x:], None
-        else:
-            z = top.solve(x, u, du)
-            dx = z[top.xd_index]
-            output = top.selected_outputs(selected) @ z
+        y, dx, output = self._evaluate_numeric(t, y, selected, derivatives=True)
         if y.size == self.n_x and self._ordered:
             dy = dx
         else:
             dy = np.zeros_like(y)
             dy[self.states] = dx
-        self._last = _Evaluation(top, float(t), x, u, du, z)
-        top._evaluations += 1
         return dy, output
 
     def outputs(self) -> NDArray[np.float64]:
@@ -3437,13 +3515,17 @@ class Netlist:
                    for k, diode in enumerate(self._diodes)]
         return tuple(math.inf if gated[k] else value for k, value in enumerate(margins))
 
-    def _margin_tolerances(self, out: Sequence[Any]) -> tuple[Any, ...]:
-        """Scale-dependent round-off tolerance of each diode margin."""
+    def _margin_scales(self, out: Sequence[Any]) -> tuple[Any, ...]:
+        """Physical scale of each diode margin in its present conduction state."""
         voltage_scale, current_scale = self._output_scales(out)
         gated = self._gated()
-        return tuple(0.0 if gated[k] else _MARGIN_RTOL * (
+        return tuple(0.0 if gated[k] else (
             current_scale if bool(diode.conducting) else voltage_scale
         ) for k, diode in enumerate(self._diodes))
+
+    def _margin_tolerances(self, out: Sequence[Any]) -> tuple[Any, ...]:
+        """Scale-dependent tolerance of each diode margin."""
+        return tuple(_MARGIN_RTOL * scale for scale in self._margin_scales(out))
 
     def projected_values(self, t: Any, y: Sequence[Any]) -> tuple[Any, ...]:
         """State values after the current mode's charge and flux projection."""
@@ -3477,6 +3559,12 @@ class Netlist:
             return np.asarray(result[1], dtype=float), np.asarray(result[2], dtype=float)
         x, inputs = np.asarray(y, dtype=float)[self.states], self.inputs(t)
         rates = self.rates(t, topology.needs_rate) if topology.any_rate else np.zeros(self.n_u)
+        if self.form == "statewise":
+            state_space = topology.state_space
+            output = state_space.C @ x + state_space.D @ inputs
+            if topology.any_rate:
+                output += state_space.D1 @ rates
+            return np.asarray(output, dtype=float), inputs
         return np.asarray(topology._S @ topology.solve(x, inputs, rates), dtype=float), inputs
 
     def impulse_flags(self, t: Any, y: Sequence[Any], *,
@@ -3563,15 +3651,17 @@ class Netlist:
             out, top = self._evaluated(t, y)
         return np.asarray(self._diode_margins(top, out), dtype=float), out
 
-    def _margins(self, t: float, y: NDArray[np.float64],
-                 topology: Optional[Topology] = None) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Conduction margins and their scale-dependent round-off tolerances."""
+    def _margins(
+        self, t: float, y: NDArray[np.float64], topology: Optional[Topology] = None
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Conduction margins, comparison tolerances and their physical scales."""
         if topology is None:
             margin, out = self._margin_values(t, y)
         else:
             out, _inputs = self._outputs_in_topology(topology, t, y)
             margin = np.asarray(self._diode_margins(topology, out), dtype=float)
-        return margin, np.asarray(self._margin_tolerances(out), dtype=float)
+        scale = np.asarray(self._margin_scales(out), dtype=float)
+        return margin, _MARGIN_RTOL * scale, scale
 
     def scalar_margin_key(self, top: Topology) -> tuple:
         """Structural equation and gate state that select one diode guard."""
@@ -3691,14 +3781,15 @@ class Netlist:
                     bad = self._impulses(t, y0, topology)
                     if not bad.size:
                         y1, loss = self.project(t, y0, topology=topology)
-                        margin, tol = self._margins(t, y1, topology)
+                        margin, tol, scale = self._margins(t, y1, topology)
                         bad = np.flatnonzero(
                             margin - self._residual < 0.0 if attempt == 0 else margin < -tol
                         )
                         if not bad.size:
                             if attempt:
-                                for diode, residual in zip(self._diodes, np.minimum(margin, 0.0)):
-                                    diode.residual = float(residual)
+                                residual = np.minimum(margin, 0.0) - _FLOAT_RTOL * scale
+                                for diode, value in zip(self._diodes, residual):
+                                    diode.residual = float(value)
                             return y1, loss
                     for k in bad:
                         diode = self._diodes[k]

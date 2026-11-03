@@ -384,6 +384,20 @@ def test_light_load_enters_dcm_without_a_mode_setting(tmp_path):
     assert np.count_nonzero(np.isclose(current, 0.0, atol=1e-10)) > 2
 
 
+@pytest.mark.parametrize("model", ["pwm_averaging", "averaging"])
+def test_averaged_bridge_currents_follow_the_connected_converter_state(model, tmp_path):
+    simulation = peslite.Simulation(_case(model=model, t_end=0.002))
+    simulation.run(out_dir=tmp_path / model)
+    unit = simulation.unit()
+
+    assert unit.bridge.input.u_dc == unit.dclink.output.u_dc
+    assert unit.bridge.input.i_c == unit.branch_f.output.i
+    assert unit.bridge.output.i_dc == pytest.approx(
+        unit.bridge.input.upper_current_ratio * unit.branch_f.output.i
+    )
+    assert unit.dclink.output.i_src == pytest.approx(unit.bridge.output.i_dc)
+
+
 def test_switching_diode_guard_is_derived_from_the_inductor_state():
     simulation = peslite.Simulation(_case(model="switching", t_end=1e-4))
     circuit = next(
