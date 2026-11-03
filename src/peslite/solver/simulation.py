@@ -16,6 +16,7 @@ import dataclasses
 import heapq
 import io
 import json
+import keyword
 import math
 import sys
 import sysconfig
@@ -1811,7 +1812,7 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
     """Run a simulation file and save its states, summary and configured signals."""
     ap = argparse.ArgumentParser(
         prog=prog, description=_run_main.__doc__,
-        epilog="commands: run, validate, inspect, export; a simulation file without a command implies run",
+        epilog="commands: run, create, validate, inspect, export; a simulation file without a command implies run",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_configuration_arguments(ap, optional=True)
@@ -1948,6 +1949,88 @@ def _assemble_command(p: Params, config: Path, json_output: bool) -> Simulation:
         if json_output:
             raise _CommandFailure(3, "assembly_error", str(exc), config=config) from None
         raise
+
+
+def _open_file(path: Path) -> None:
+    """Open *path* with the operating system's associated application."""
+    import os
+    import shlex
+    import subprocess
+
+    if sys.platform == "win32":
+        os.startfile(path)  # type: ignore[attr-defined]
+        return
+    editor = (os.environ.get("VISUAL", "").strip()
+              or os.environ.get("EDITOR", "").strip())
+    if editor:
+        try:
+            command = shlex.split(editor)
+        except ValueError as exc:
+            raise OSError(f"invalid editor command: {exc}") from exc
+        options = {}
+    else:
+        command = ["open" if sys.platform == "darwin" else "xdg-open"]
+        options = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "timeout": 10,
+        }
+    try:
+        result = subprocess.run([*command, str(path)], **options)
+    except subprocess.SubprocessError as exc:
+        raise OSError(str(exc)) from exc
+    if result.returncode:
+        detail = (result.stderr.strip() if result.stderr else
+                  f"exit code {result.returncode}")
+        raise OSError(f"{command[0]}: {detail}")
+
+
+def _create_main(argv=None) -> int | _CommandOutcome:
+    """Create a simulation file or project add-on from a bundled template."""
+    ap = argparse.ArgumentParser(prog="peslite create", description=_create_main.__doc__)
+    ap.add_argument("name", help="file name to create (.pes or .py)")
+    ap.add_argument("--open", action="store_true",
+                    help="open the created file with the configured editor or default application")
+    ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
+    args = ap.parse_args(argv)
+    name = Path(args.name)
+    if name.name != args.name or name.suffix not in {".pes", ".py"}:
+        ap.error("provide a file name ending in .pes or .py in the current directory")
+    target = Path.cwd() / name
+    templates = _EXAMPLE_CONFIGS / "templates"
+    template = templates / "template.pes"
+    replacements = ()
+    if name.suffix == ".py":
+        class_name = "".join(part[:1].upper() + part[1:] for part in name.stem.split("_"))
+        if (not name.stem.isascii() or not name.stem.isidentifier()
+                or keyword.iskeyword(name.stem) or not class_name.isidentifier()):
+            ap.error("Python file names must be ASCII Python identifiers")
+        kind = "component" if name.stem == "component" else "controller"
+        template = templates / f"{kind}.py"
+        target = Path.cwd() / "PESaddons" / ("components" if kind == "component" else "control") / name
+        replacements = ((f"Template{kind.title()}", class_name),
+                        (f"template_{kind}", name.stem.lower()))
+    try:
+        text = template.read_text(encoding="utf-8")
+        for original, replacement in replacements:
+            text = text.replace(original, replacement)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("x", encoding="utf-8") as stream:
+            stream.write(text)
+    except OSError as exc:
+        ap.error(str(exc))
+    if args.open:
+        try:
+            _open_file(target)
+        except OSError as exc:
+            warnings.warn(f"could not open {target}: {exc}", stacklevel=2)
+    if args.json:
+        return _CommandOutcome(0, _payload("create", output={
+            "directory": _absolute(target.parent), "summary": None, "files": [_absolute(target)],
+        }))
+    print("created", target)
+    return 0
 
 
 def _validate_main(argv=None) -> int | _CommandOutcome:
@@ -2126,9 +2209,9 @@ def _json_command(command: str, invoke: Callable[[], int | _CommandOutcome]) -> 
 
 
 def main(argv=None) -> int:
-    """Run, validate, inspect or export a PESLite simulation."""
+    """Create, run, validate, inspect or export a PESLite simulation."""
     values = list(sys.argv[1:] if argv is None else argv)
-    commands = {"run", "validate", "inspect", "export"}
+    commands = {"run", "create", "validate", "inspect", "export"}
     explicit_command = bool(values and values[0] in commands)
     command = values.pop(0) if explicit_command else "run"
     json_output = "--json" in values
@@ -2138,6 +2221,8 @@ def main(argv=None) -> int:
         invoke = lambda: _validate_main(values)
     elif command == "inspect":
         invoke = lambda: _inspect_main(values)
+    elif command == "create":
+        invoke = lambda: _create_main(values)
     else:
         invoke = lambda: _export_main(values)
     return _json_command(command, invoke) if json_output else int(invoke())

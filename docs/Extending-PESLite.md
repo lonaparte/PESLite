@@ -6,9 +6,9 @@ directory beside a simulation file share the same package search paths and regis
 elsewhere can still be imported and registered explicitly before loading a simulation file that
 names them.
 
-The root `examples/` directory contains simulation files only. Bundled Python implementations live
-under `peslite.addons`, while additional test-only implementations exercise the same interfaces in
-the test suite.
+The root `examples/` directory contains simulation files and a `templates/` directory for
+`peslite create`. Bundled Python implementations live under `peslite.addons`, while test fixtures
+exercise the same interfaces in the test suite.
 
 Project-local controllers, components and functions can live beside a simulation rather than in
 the installed package. Their exact search rules and their relationship to the output directory are

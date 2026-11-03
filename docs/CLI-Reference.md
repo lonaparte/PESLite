@@ -1,8 +1,9 @@
 # CLI Reference
 
-PESLite installs one `peslite` command with four operations:
+PESLite installs one `peslite` command with five operations:
 
 ```bash
+peslite create case.pes
 peslite run case.pes
 peslite validate case.pes
 peslite inspect case.pes
@@ -11,6 +12,31 @@ peslite export case.pes
 
 `peslite case.pes` is the short form of `peslite run case.pes`. Use `peslite --help` or
 `peslite <operation> --help` for the installed interface.
+
+## Create a file
+
+Specify the new file name:
+
+```bash
+peslite create case.pes
+peslite create component.py
+peslite create controller.py
+peslite create my_control.py
+```
+
+Simulation files are created in the current directory. `component.py` is created in
+`PESaddons/components/`; other `.py` files use the controller template in `PESaddons/control/`.
+Python class and registration names follow the supplied file name. Templates are bundled under
+`examples/templates/`, and existing files are never overwritten.
+
+Creation does not open the file unless `--open` is supplied:
+
+```bash
+peslite create case.pes --open
+```
+
+On Linux and macOS, the option uses `VISUAL`, then `EDITOR`, before falling back to the operating
+system's default application for the file type.
 
 ## Select a simulation
 
@@ -135,9 +161,10 @@ Inspection accepts the same configuration presets and `--set` overrides as a run
 
 ## Machine-readable results
 
-All four operations accept `--json`:
+All operations accept `--json`:
 
 ```bash
+peslite create case.pes --json
 peslite validate case.pes --json
 peslite inspect case.pes --json
 peslite run case.pes --out output/case --json

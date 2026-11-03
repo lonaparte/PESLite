@@ -1,4 +1,4 @@
-"""Custom loop, element and event example code lives in tests, not examples/."""
+"""Custom loop, element and event interfaces."""
 
 from dataclasses import dataclass
 from types import SimpleNamespace

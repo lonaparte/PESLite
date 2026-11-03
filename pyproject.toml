@@ -38,6 +38,7 @@ where = ["src"]
 
 [tool.setuptools.data-files]
 "share/peslite/examples" = ["examples/*.pes"]
+"share/peslite/examples/templates" = ["examples/templates/*.pes", "examples/templates/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
