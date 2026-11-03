@@ -1714,10 +1714,19 @@ class Model:
     def set_zoh_input(self, label: str, value: Any) -> None:
         """Set a held external input (e.g. the switching state) by label."""
         targets = self._zoh_targets[label]
+        changed = []
         for input, name in targets:
+            previous = getattr(input, name)
             setattr(input, name, value)
+            if self._held_input_refresh:
+                equal = previous == value
+                same = bool(np.all(equal)) if isinstance(equal, np.ndarray) else bool(equal)
+                if not same:
+                    changed.append((input, name))
+        if not changed:
+            return
         for refresh in self._held_input_refresh:
-            refresh(targets)
+            refresh(changed)
 
     def evaluate_outputs(self, t: float) -> None:
         """Run the ordered output-method / input-copy plan for the current states."""

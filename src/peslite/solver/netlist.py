@@ -35,7 +35,7 @@ import math
 import numbers
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
 import scipy.sparse as sp
@@ -166,16 +166,19 @@ class _Symbolic:
         return _Symbolic("imag", (self,))
 
 
+_SCALAR_NUMBER = (int, float, complex, np.number)
+
+
 def _zero(value: Any) -> bool:
-    return isinstance(value, numbers.Number) and value == 0.0
+    return isinstance(value, _SCALAR_NUMBER) and value == 0.0
 
 
 def _one(value: Any) -> bool:
-    return isinstance(value, numbers.Number) and value == 1.0
+    return isinstance(value, _SCALAR_NUMBER) and value == 1.0
 
 
 def _minus_one(value: Any) -> bool:
-    return isinstance(value, numbers.Number) and value == -1.0
+    return isinstance(value, _SCALAR_NUMBER) and value == -1.0
 
 
 def _negative_of(left: Any, right: Any) -> bool:
@@ -184,7 +187,7 @@ def _negative_of(left: Any, right: Any) -> bool:
 
 def _linear_form(value: Any) -> tuple[Any, dict[Any, Any]]:
     """Return the constant and ordered terms of an additive scalar expression."""
-    if isinstance(value, numbers.Number):
+    if isinstance(value, _SCALAR_NUMBER):
         return value, {}
     if isinstance(value, _Symbolic) and value.operation == "linear":
         constant, terms = value.arguments
@@ -222,7 +225,7 @@ def _linear_scaled(value: Any, factor: Any) -> Any:
 
 
 def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
-    if isinstance(left, numbers.Number) and isinstance(right, numbers.Number):
+    if isinstance(left, _SCALAR_NUMBER) and isinstance(right, _SCALAR_NUMBER):
         return {"+": lambda: left + right, "-": lambda: left - right,
                 "*": lambda: left * right, "/": lambda: left / right}[operation]()
     if operation == "+":
@@ -254,9 +257,9 @@ def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
             return -right
         if _minus_one(right):
             return -left
-        if isinstance(left, numbers.Number):
+        if isinstance(left, _SCALAR_NUMBER):
             return _linear_scaled(right, left)
-        if isinstance(right, numbers.Number):
+        if isinstance(right, _SCALAR_NUMBER):
             return _linear_scaled(left, right)
     elif operation == "/":
         if _zero(left):
@@ -265,47 +268,63 @@ def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
             return left
         if _minus_one(right):
             return -left
-        if isinstance(right, numbers.Number):
+        if isinstance(right, _SCALAR_NUMBER):
             return _linear_scaled(left, 1.0 / right)
     return _Symbolic(operation, (left, right))
 
 
-def _symbolic_solve(matrix: list[list[Any]], right: list[Any],
+def _symbolic_solve(matrix: Sequence[Sequence[Any] | Mapping[int, Any]], right: list[Any],
                     reference: NDArray[np.float64]) -> list[Any]:
-    """Eliminate a generated linear system using one valid numerical pivot pattern."""
+    """Eliminate a generated sparse linear system using one valid numerical pivot pattern."""
     n = len(right)
-    matrix = [list(row) for row in matrix]
+    rows = [
+        dict(row) if isinstance(row, Mapping) else
+        {column: value for column, value in enumerate(row) if not _zero(value)}
+        for row in matrix
+    ]
     right = list(right)
     reference = np.array(reference, dtype=float, copy=True)
     for column in range(n):
-        constants = [row for row in range(column, n)
-                     if isinstance(matrix[row][column], numbers.Number)
-                     and matrix[row][column] != 0.0]
+        active = [row for row in range(column, n) if column in rows[row]]
+        if not active:
+            raise ValueError("the generated netlist equations are singular")
+        constants = [row for row in active
+                     if isinstance(rows[row][column], _SCALAR_NUMBER)]
         pivot = (max(constants, key=lambda row: abs(reference[row, column]))
-                 if constants else column + int(np.argmax(np.abs(reference[column:, column]))))
+                 if constants else max(active, key=lambda row: abs(reference[row, column])))
         if reference[pivot, column] == 0.0:
             raise ValueError("the generated netlist equations are singular")
         if pivot != column:
-            matrix[column], matrix[pivot] = matrix[pivot], matrix[column]
+            rows[column], rows[pivot] = rows[pivot], rows[column]
             right[column], right[pivot] = right[pivot], right[column]
             reference[[column, pivot]] = reference[[pivot, column]]
+        pivot_row = rows[column]
+        pivot_value = pivot_row[column]
+        trailing = tuple((entry, value) for entry, value in pivot_row.items()
+                         if entry > column)
         for row in range(column + 1, n):
-            if _zero(matrix[row][column]):
+            value = rows[row].pop(column, None)
+            if value is None:
                 continue
-            factor = matrix[row][column] / matrix[column][column]
+            factor = value / pivot_value
             numeric_factor = reference[row, column] / reference[column, column]
-            matrix[row][column] = 0.0
             reference[row, column] = 0.0
-            for entry in range(column + 1, n):
-                matrix[row][entry] -= factor * matrix[column][entry]
+            target = rows[row]
+            for entry, pivot_entry in trailing:
+                updated = target.get(entry, 0.0) - factor * pivot_entry
+                if _zero(updated):
+                    target.pop(entry, None)
+                else:
+                    target[entry] = updated
                 reference[row, entry] -= numeric_factor * reference[column, entry]
             right[row] -= factor * right[column]
     solution: list[Any] = [0.0] * n
     for row in range(n - 1, -1, -1):
         residual = right[row] - sum(
-            matrix[row][column] * solution[column] for column in range(row + 1, n)
+            value * solution[column]
+            for column, value in rows[row].items() if column > row
         )
-        solution[row] = residual / matrix[row][row]
+        solution[row] = residual / rows[row][row]
     return solution
 
 
@@ -967,25 +986,10 @@ class _Projector:
                        [G_x, G_f, None]], format="csc")
         self.lu = _factor(kkt, "projection")
         self._affine: Optional[tuple[NDArray[np.float64], ...]] = None
+        self._numeric_projection: Optional[Callable] = None
 
-    def __call__(self, y: NDArray[np.float64], u: NDArray[np.float64]
-                 ) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
-        """The projected states, the multipliers and the dissipated energy."""
-        x = y[self.index]
-        sol = self.lu.solve(np.concatenate([self.W @ x, np.zeros(self.n_free), self.G_u @ u]))
-        dx = sol[:self.n] - x
-        if float(np.max(np.abs(dx), initial=0.0)) <= _NOOP_RTOL * float(np.max(np.abs(x), initial=0.0)):
-            dx[:] = 0.0
-        return x + dx, sol[self.n + self.n_free:], 0.5 * float(dx @ (self.W @ dx))
-
-    def significant(self, y: NDArray[np.float64], x: NDArray[np.float64], scale: float) -> bool:
-        """Whether the jump from ``y`` to the projected ``x`` exceeds round-off of the circuit's ``scale``."""
-        reference = max(scale, float(np.max(np.abs(y[self.index]), initial=0.0)))
-        return float(np.max(np.abs(x - y[self.index]), initial=0.0)) > _MARGIN_RTOL * reference
-
-    def expression_solution(self, y: Sequence[Any], u: Sequence[Any]
-                            ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
-        """Projected states and multipliers from the KKT factorization used by :meth:`__call__`."""
+    def _affine_maps(self) -> tuple[NDArray[np.float64], ...]:
+        """Dense state/input maps formed once from the projection factorization."""
         if self._affine is None:
             rows = self.n + self.n_free + self.G_u.shape[0]
             x_rhs = np.zeros((rows, self.n))
@@ -996,7 +1000,80 @@ class _Projector:
             multiplier = self.n + self.n_free
             self._affine = (x_map[:self.n], u_map[:self.n],
                             x_map[multiplier:], u_map[multiplier:])
-        px, pu, mx, mu = self._affine
+        return self._affine
+
+    def _compile_numeric_projection(self) -> Callable:
+        """Compile the small affine projection maps into one allocation-light scalar kernel."""
+        px, pu, mx, mu = self._affine_maps()
+        names_x = [f"x_{index}" for index in range(self.n)]
+        names_u = [f"u[{index}]" for index in range(self.G_u.shape[1])]
+
+        def linear(row: NDArray[np.float64], names: Sequence[str]) -> list[str]:
+            terms = []
+            for coefficient, name in zip(row, names):
+                value = float(coefficient)
+                if value == 1.0:
+                    terms.append(name)
+                elif value == -1.0:
+                    terms.append(f"-{name}")
+                elif value != 0.0:
+                    terms.append(f"{value!r} * {name}")
+            return terms
+
+        lines = [
+            *(f"    {name} = y[{int(index)}]" for name, index in zip(names_x, self.index)),
+        ]
+        for index, (x_row, u_row) in enumerate(zip(px, pu)):
+            expression = " + ".join(linear(x_row, names_x) + linear(u_row, names_u)) or "0.0"
+            lines.append(f"    d_{index} = ({expression}) - x_{index}")
+        changes = ", ".join(f"abs(d_{index})" for index in range(self.n))
+        references = ", ".join(f"abs(x_{index})" for index in range(self.n))
+        lines.extend((
+            f"    if max(({changes},)) <= _rtol * max(({references},)):",
+            *(f"        d_{index} = 0.0" for index in range(self.n)),
+        ))
+        for index, (x_row, u_row) in enumerate(zip(mx, mu)):
+            expression = " + ".join(linear(x_row, names_x) + linear(u_row, names_u)) or "0.0"
+            lines.append(f"    m_{index} = {expression}")
+        projected = ", ".join(f"x_{index} + d_{index}" for index in range(self.n))
+        multipliers = ", ".join(f"m_{index}" for index in range(mx.shape[0]))
+        W = self.W.toarray()
+        loss = " + ".join(
+            f"{0.5 * float(W[row, column])!r} * d_{row} * d_{column}"
+            for row in range(self.n) for column in range(self.n) if W[row, column] != 0.0
+        ) or "0.0"
+        lines.append(
+            f"    return _array(({projected},)), _array(({multipliers},)), {loss}"
+        )
+        namespace = {"_array": np.asarray, "_rtol": _NOOP_RTOL}
+        exec(compile("def project(y, u):\n" + "\n".join(lines) + "\n",
+                     "<peslite state projection>", "exec"), namespace)
+        return namespace["project"]
+
+    def __call__(self, y: NDArray[np.float64], u: NDArray[np.float64]
+                 ) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
+        """The projected states, the multipliers and the dissipated energy."""
+        x = y[self.index]
+        if (self.n + self.G_u.shape[0]) * (self.n + self.G_u.shape[1]) <= _DENSE_ENTRIES:
+            if self._numeric_projection is None:
+                self._numeric_projection = self._compile_numeric_projection()
+            return self._numeric_projection(y, u)
+        sol = self.lu.solve(np.concatenate([self.W @ x, np.zeros(self.n_free), self.G_u @ u]))
+        projected, multipliers = sol[:self.n], sol[self.n + self.n_free:]
+        dx = projected - x
+        if float(np.max(np.abs(dx), initial=0.0)) <= _NOOP_RTOL * float(np.max(np.abs(x), initial=0.0)):
+            dx[:] = 0.0
+        return x + dx, multipliers, 0.5 * float(dx @ (self.W @ dx))
+
+    def significant(self, y: NDArray[np.float64], x: NDArray[np.float64], scale: float) -> bool:
+        """Whether the jump from ``y`` to the projected ``x`` exceeds round-off of the circuit's ``scale``."""
+        reference = max(scale, float(np.max(np.abs(y[self.index]), initial=0.0)))
+        return float(np.max(np.abs(x - y[self.index]), initial=0.0)) > _MARGIN_RTOL * reference
+
+    def expression_solution(self, y: Sequence[Any], u: Sequence[Any]
+                            ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        """Projected states and multipliers from the KKT factorization used by :meth:`__call__`."""
+        px, pu, mx, mu = self._affine_maps()
         x = np.asarray([y[int(index)] for index in self.index], dtype=object)
         inputs = np.asarray(u, dtype=object)
         return tuple(px @ x + pu @ inputs), tuple(mx @ x + mu @ inputs)
@@ -1756,9 +1833,11 @@ class Netlist:
         self.impulsive_supply = 0.0
         self._cache: "OrderedDict[tuple, Topology]" = OrderedDict()
         self._structures: "OrderedDict[tuple, Topology]" = OrderedDict()  # by switch and diode pattern
+        self._invalid_structures: "OrderedDict[tuple, tuple[str, tuple[int, ...], bool]]" = OrderedDict()
         self._scalar_functions: "OrderedDict[tuple[tuple, str, Optional[tuple[int, ...]]], Callable]" = OrderedDict()
         self._dynamic_scalar_functions: "OrderedDict[tuple, Callable]" = OrderedDict()
         self._dynamic_scalar_equation_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+        self._scalar_margin_functions: "OrderedDict[tuple, Callable]" = OrderedDict()
         self._scalar_topology: Optional[Topology] = None
         self._last: Optional[_Evaluation] = None
         self._mode: Optional[Mode] = None
@@ -1852,10 +1931,12 @@ class Netlist:
         """Forget every compiled mode (after changing a parameter of an element)."""
         self._cache.clear()
         self._structures.clear()
+        self._invalid_structures.clear()
         self._parts.clear()
         self._scalar_functions.clear()
         self._dynamic_scalar_functions.clear()
         self._dynamic_scalar_equation_cache.clear()
+        self._scalar_margin_functions.clear()
         self._scalar_topology = None
         self._last = None
         self._frozen_mode = self._frozen_topology = self._frozen_scalar = None
@@ -1997,7 +2078,21 @@ class Netlist:
             structure = mode.key[:2]
             base = self._structures.get(structure)
             if base is None:
-                top = self._structures[structure] = Topology(self, mode)
+                failure = self._invalid_structures.get(structure)
+                if failure is not None:
+                    self._invalid_structures.move_to_end(structure)
+                    message, branches, loop = failure
+                    raise _Degenerate(message, list(branches), loop)
+                try:
+                    top = Topology(self, mode)
+                except _Degenerate as exc:
+                    self._invalid_structures[structure] = (
+                        str(exc), tuple(exc.branches), exc.loop
+                    )
+                    while len(self._invalid_structures) > self.cache_size:
+                        self._invalid_structures.popitem(last=False)
+                    raise
+                self._structures[structure] = top
                 while len(self._structures) > self.cache_size:
                     self._structures.popitem(last=False)
             else:
@@ -2711,9 +2806,10 @@ class Netlist:
         for position, flat, coefficient in zip(
                 pattern.slot_pos, pattern.slot_flat, pattern.slot_coef):
             entries[int(position)] += coefficient * flat_ratios[int(flat)]
-        matrix: list[list[Any]] = [[0.0] * pattern.n for _ in range(pattern.n)]
+        matrix: list[dict[int, Any]] = [{} for _ in range(pattern.n)]
         for value, row, column in zip(entries, pattern.indices, columns):
-            matrix[int(row)][int(column)] = value
+            if not _zero(value):
+                matrix[int(row)][int(column)] = value
 
         inputs: list[Any] = [0.0] * self.n_u
         rates: list[Any] = [0.0] * self.n_u
@@ -2985,7 +3081,8 @@ class Netlist:
         return -sum(self.power(src) for src, _ in self._sources)
 
     # ---------------------------------------------------------------- jumps and diodes
-    def project(self, t: float, y: NDArray[np.float64]) -> tuple[NDArray[np.float64], float]:
+    def project(self, t: float, y: NDArray[np.float64], *,
+                topology: Optional[Topology] = None) -> tuple[NDArray[np.float64], float]:
         """Make ``y`` consistent with the current mode's loops and cutsets.
 
         Capacitors jump by ``x+ = x- + C^-1 B^T lambda`` with ``B x+ = b`` (charge conservation) and
@@ -2995,7 +3092,7 @@ class Netlist:
         during the jump (zero when no source lies in the new loops and cutsets).
         """
         y = np.array(y, dtype=float)
-        projectors = [p for p in self.topology().projectors() if p is not None]
+        projectors = [p for p in (topology or self.topology()).projectors() if p is not None]
         self.impulsive_supply = 0.0
         if not projectors:
             return y, 0.0
@@ -3078,6 +3175,9 @@ class Netlist:
 
     def _output_scales(self, out: Sequence[Any]) -> tuple[Any, Any]:
         """Voltage and current scales of one electrical output vector."""
+        if isinstance(out, np.ndarray):
+            return (float(np.max(np.abs(out[:self.n_e]), initial=0.0)),
+                    float(np.max(np.abs(out[self.n_e + self.n_bd:]), initial=0.0)))
         return (_maximum_all([abs(value) for value in out[:self.n_e]]),
                 _maximum_all([abs(value) for value in out[self.n_e + self.n_bd:]]))
 
@@ -3138,29 +3238,54 @@ class Netlist:
                 inconsistent = _logical_or(inconsistent, abs(value - y[int(index)]) > tolerance)
         return inconsistent
 
-    def impulse_flags(self, t: Any, y: Sequence[Any]) -> tuple[Any, ...]:
+    def _outputs_in_topology(
+        self, topology: Topology, t: float, y: Sequence[float]
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Evaluate all electrical outputs and inputs in an already selected topology."""
+        if self.form == "device":
+            evaluator = (self._dynamic_scalar_function(topology)
+                         if any(item.constant is None for item in self._transformers)
+                         else self._scalar_function(topology, "all"))
+            result = evaluator(t, y)
+            return np.asarray(result[1], dtype=float), np.asarray(result[2], dtype=float)
+        x, inputs = np.asarray(y, dtype=float)[self.states], self.inputs(t)
+        rates = self.rates(t, topology.needs_rate) if topology.any_rate else np.zeros(self.n_u)
+        return np.asarray(topology._S @ topology.solve(x, inputs, rates), dtype=float), inputs
+
+    def impulse_flags(self, t: Any, y: Sequence[Any], *,
+                      topology: Optional[Topology] = None) -> tuple[Any, ...]:
         """Per-diode reverse impulse flags for a jump into the present topology."""
-        top, inputs = self.topology(), self.source_values(t)
+        top = topology or self.topology()
+        capacitor, inductor = top.projectors()
+        if capacitor is None and inductor is None:
+            return (False,) * len(self._diodes)
         numeric = all(isinstance(value, numbers.Real) for value in y)
         if numeric:
-            voltage_scale, current_scale = self._scales(float(t), np.asarray(y, dtype=float))
+            y_numeric = np.asarray(y, dtype=float)
+            output, inputs = self._outputs_in_topology(top, float(t), y_numeric)
+            voltage_scale, current_scale = self._output_scales(output)
         else:
+            inputs = self.source_values(t)
             output = self._scalar_function(top, "outputs")(t, y)
             voltage_scale, current_scale = self._output_scales(output)
         flags: list[Any] = [False] * len(self._diodes)
         gated = self._gated()
-        capacitor, inductor = top.projectors()
         if capacitor is not None:
-            projected, multipliers = capacitor.values(y, inputs)
-            reference = _maximum(
-                voltage_scale, _maximum_all([abs(y[int(index)]) for index in capacitor.index])
-            )
-            changed: Any = False
-            for index, value in zip(capacitor.index, projected):
-                changed = _logical_or(
-                    changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
+            if numeric:
+                projected, multipliers, _loss = capacitor(y_numeric, inputs)
+                changed = capacitor.significant(y_numeric, projected, voltage_scale)
+                tolerance = _MARGIN_RTOL * float(np.max(np.abs(multipliers), initial=0.0))
+            else:
+                projected, multipliers = capacitor.values(y, inputs)
+                reference = _maximum(
+                    voltage_scale, _maximum_all([abs(y[int(index)]) for index in capacitor.index])
                 )
-            tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
+                changed = False
+                for index, value in zip(capacitor.index, projected):
+                    changed = _logical_or(
+                        changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
+                    )
+                tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
             rows = dict(top._wrows)
             for index, diode in enumerate(self._diodes):
                 branch = self._ports[id(diode)][0]
@@ -3170,16 +3295,21 @@ class Netlist:
                         _logical_and(changed, multipliers[rows[branch]] < -tolerance),
                     )
         if inductor is not None:
-            projected, multipliers = inductor.values(y, inputs)
-            reference = _maximum(
-                current_scale, _maximum_all([abs(y[int(index)]) for index in inductor.index])
-            )
-            changed = False
-            for index, value in zip(inductor.index, projected):
-                changed = _logical_or(
-                    changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
+            if numeric:
+                projected, multipliers, _loss = inductor(y_numeric, inputs)
+                changed = inductor.significant(y_numeric, projected, current_scale)
+                tolerance = _MARGIN_RTOL * float(np.max(np.abs(multipliers), initial=0.0))
+            else:
+                projected, multipliers = inductor.values(y, inputs)
+                reference = _maximum(
+                    current_scale, _maximum_all([abs(y[int(index)]) for index in inductor.index])
                 )
-            tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
+                changed = False
+                for index, value in zip(inductor.index, projected):
+                    changed = _logical_or(
+                        changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
+                    )
+                tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
             _net, _c, _l, _cd, _p, _r, _w, offsets, supernodes = top._store
             potential = [multipliers[offsets[root]] if offsets[root] >= 0 else 0.0
                          for root in map(supernodes.find, range(self.n_vertices))]
@@ -3206,10 +3336,69 @@ class Netlist:
             out, top = self._evaluated(t, y)
         return np.asarray(self._diode_margins(top, out), dtype=float), out
 
-    def _margins(self, t: float, y: NDArray[np.float64]) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    def _margins(self, t: float, y: NDArray[np.float64],
+                 topology: Optional[Topology] = None) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Conduction margins and their scale-dependent round-off tolerances."""
-        margin, out = self._margin_values(t, y)
+        if topology is None:
+            margin, out = self._margin_values(t, y)
+        else:
+            out, _inputs = self._outputs_in_topology(topology, t, y)
+            margin = np.asarray(self._diode_margins(topology, out), dtype=float)
         return margin, np.asarray(self._margin_tolerances(out), dtype=float)
+
+    def scalar_margin_key(self, top: Topology) -> tuple:
+        """Structural equation and gate state that select one diode guard."""
+        gated = self._gated_state or (False,) * len(self._diodes)
+        return top.mode.key[:2], gated
+
+    def scalar_margin_evaluator(self, top: Topology) -> Callable[[Sequence[float]], float]:
+        """Compile the current mode's diode guard from an already evaluated output vector."""
+        if self._diode_branches is None:
+            self._diode_branches = tuple(
+                self._ports[id(diode)][0] for diode in self._diodes
+            )
+        if self._diode_output_bases is None:
+            self._diode_output_bases = tuple(
+                self.n_e + self._branches[index].output
+                for index in self._diode_branches
+            )
+        key = self.scalar_margin_key(top)
+        gated = key[1]
+        cached = self._scalar_margin_functions.get(key)
+        if cached is not None:
+            self._scalar_margin_functions.move_to_end(key)
+            return cached
+        active = [
+            (diode, base) for index, (diode, base) in enumerate(
+                zip(self._diodes, self._diode_output_bases)
+            ) if not gated[index]
+        ]
+        if not active:
+            evaluator = lambda _output: math.inf
+        elif top.blocking:
+            evaluator = lambda output: float(min(
+                margin - diode.residual for margin, diode in zip(
+                    self._diode_margins(top, output), self._diodes
+                )
+            ))
+        else:
+            namespace: dict[str, Any] = {}
+            expressions = []
+            for index, (diode, base) in enumerate(active):
+                name = f"_diode_{index}"
+                namespace[name] = diode
+                value = (f"output[{base + self.n_bd}]"
+                         if diode.conducting else f"-output[{base}]")
+                expressions.append(f"({value} - {name}.residual)")
+            expression = (expressions[0] if len(expressions) == 1
+                          else "min(" + ", ".join(expressions) + ")")
+            source = f"def margin(output):\n    return float({expression})\n"
+            exec(compile(source, "<peslite diode margin>", "exec"), namespace)
+            evaluator = namespace["margin"]
+        self._scalar_margin_functions[key] = evaluator
+        while len(self._scalar_margin_functions) > self.cache_size:
+            self._scalar_margin_functions.popitem(last=False)
+        return evaluator
 
     def commutation_margin(self, t: float, y: NDArray[np.float64], *, evaluated: bool = False) -> float:
         """Minimum diode margin in the current mode (on: current, off: -voltage), relative to the
@@ -3221,15 +3410,35 @@ class Netlist:
             out = self._last.output if self._last.output is not None else self.outputs()
         else:
             out, top = self._evaluated(t, y)
+        if not top.blocking:
+            if self._diode_output_bases is None:
+                self._diode_branches = tuple(
+                    self._ports[id(diode)][0] for diode in self._diodes
+                )
+                self._diode_output_bases = tuple(
+                    self.n_e + self._branches[index].output
+                    for index in self._diode_branches
+                )
+            gated = self._gated_state or (False,) * len(self._diodes)
+            return float(min(
+                math.inf if gated[index] else (
+                    out[base + self.n_bd] if diode.conducting else -out[base]
+                ) - diode.residual
+                for index, (diode, base) in enumerate(
+                    zip(self._diodes, self._diode_output_bases)
+                )
+            ))
         return float(min(
             margin - diode.residual
             for margin, diode in zip(self._diode_margins(top, out), self._diodes)
         ))
 
-    def _impulses(self, t: float, y: NDArray[np.float64]) -> NDArray[np.intp]:
+    def _impulses(self, t: float, y: NDArray[np.float64], topology: Topology) -> NDArray[np.intp]:
         """Diodes that the jump into the current mode would drive in reverse: a negative impulsive
         charge through a conducting ideal diode or a positive impulsive voltage across a blocking one."""
-        return np.flatnonzero(np.asarray(self.impulse_flags(t, y), dtype=bool))
+        return np.flatnonzero(np.asarray(
+            self.impulse_flags(t, y, topology=topology), dtype=bool
+        ))
 
     def commutate(self, t: float, y: NDArray[np.float64]) -> tuple[NDArray[np.float64], float]:
         """Flip diodes until the conduction pattern is consistent at ``(t, y)``; returns the projected
@@ -3251,10 +3460,11 @@ class Netlist:
                         break
                     seen[pattern] = attempt > 0
                     self._recovery_excluded = set(seen)
-                    bad = self._impulses(t, y0)
+                    topology = self.topology()
+                    bad = self._impulses(t, y0, topology)
                     if not bad.size:
-                        y1, loss = self.project(t, y0)
-                        margin, tol = self._margins(t, y1)
+                        y1, loss = self.project(t, y0, topology=topology)
+                        margin, tol = self._margins(t, y1, topology)
                         bad = np.flatnonzero(
                             margin - self._residual < 0.0 if attempt == 0 else margin < -tol
                         )

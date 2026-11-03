@@ -426,6 +426,8 @@ class Circuit:
         self._mirrored: Optional[tuple[bool, ...]] = None  # their conduction when the hooks last ran
         self._boundary_signature: Optional[tuple] = None
         self._stored: Optional[tuple[list[float], np.ndarray]] = None  # (component states, netlist vector) last stored
+        self._margin_evaluator_key: Optional[tuple] = None
+        self._margin_evaluator: Optional[Callable[[Sequence[float]], float]] = None
         self._views: tuple["NetworkView", ...] = ()
         self._structural_targets: set[tuple[int, str]] = set()
         self._direct_dynamic = False
@@ -531,6 +533,8 @@ class Circuit:
         if missing:
             raise ConfigError(f"netlist components declare no primitive for their states {missing}")
         old, self.netlist = self.netlist, net
+        self._margin_evaluator_key = None
+        self._margin_evaluator = None
         if old is not None and len(old.conducting) == len(net.conducting):  # a rebuild keeps diode memory
             for diode, previous in zip(net._diodes, old._diodes):
                 net.set_conducting(diode, previous.conducting, previous.residual)
@@ -950,12 +954,15 @@ class Circuit:
         if holder is None:
             return False
         topology = self.netlist.topology()
+        evaluator = self.netlist.scalar_margin_evaluator(topology)
         holder[:] = self.netlist, topology, (
             self.netlist._dynamic_scalar_function(topology)
             if any(transformer.constant is None
                    for transformer in self.netlist._transformers)
             else self.netlist._scalar_function(topology, "all")
         )
+        self._margin_evaluator_key = self.netlist.scalar_margin_key(topology)
+        self._margin_evaluator = evaluator
         return True
 
     def _compile_device_runtime(self, *, lazy: bool = False) -> bool:
@@ -975,7 +982,10 @@ class Circuit:
             def evaluate(t, y):
                 topology = self.netlist.topology()
                 compiled = self.netlist._dynamic_scalar_function(topology)
+                margin = self.netlist.scalar_margin_evaluator(topology)
                 holder[:] = self.netlist, topology, compiled
+                self._margin_evaluator_key = self.netlist.scalar_margin_key(topology)
+                self._margin_evaluator = margin
                 return compiled(t, y)
 
             holder[2] = evaluate
@@ -1230,9 +1240,14 @@ class Circuit:
         if not self.locate_commutations:
             return math.inf
         evaluated = evaluation is not None and evaluation.t == self.t
-        return net.commutation_margin(
-            self.t, () if evaluated else self._states(), evaluated=evaluated
-        )
+        if not evaluated:
+            return net.commutation_margin(self.t, self._states())
+        margin_key = net.scalar_margin_key(topology)
+        if self._margin_evaluator is None or self._margin_evaluator_key != margin_key:
+            self._margin_evaluator = net.scalar_margin_evaluator(topology)
+            self._margin_evaluator_key = margin_key
+        output = evaluation.output if evaluation.output is not None else net.outputs()
+        return self._margin_evaluator(output)
 
     def commutate(self, t: float) -> None:
         """Find the consistent diode pattern and jump the states into it (charge and flux conservation);
