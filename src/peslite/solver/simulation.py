@@ -829,11 +829,15 @@ class Simulation:
         for name, _subsystem in system.event_subsystems:
             if not values.keys().isdisjoint(self._states.read([name])):
                 self._continued.add(name)
-        self._states.load(values, ["solver"])
         # All initial connection commands are simultaneous.  Project their assembled circuit
         # modes once, after every physical state has been restored.
         for circuit in system.circuits:
             circuit.consistent_state(t0)
+        system.refresh_circuit_plan()
+        model_plan_changed = getattr(self.solver, "model_plan_changed", None)
+        if model_plan_changed is not None:
+            model_plan_changed()
+        self._states.load(values, ["solver"])
         return system.model.get_initial_values()
 
     # ------------------------------------------------------------ the loop

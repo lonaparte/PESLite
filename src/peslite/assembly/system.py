@@ -727,6 +727,16 @@ class System:
         """Commit all electrical command changes at one physical event boundary."""
         for circuit in self.circuits:
             circuit.reconcile(t)
+        self.refresh_circuit_plan()
+
+    def refresh_circuit_plan(self) -> None:
+        """Refresh model scheduling after circuit equations changed at a boundary."""
+        changed = [circuit for circuit in self.circuits if circuit.plan_changed]
+        if not changed:
+            return
+        self.model.rebuild_evaluation_plan()
+        for circuit in changed:
+            circuit.plan_changed = False
 
     def check_events(self, p: Params) -> None:
         """Check that custom elements and replacement controllers support their requested events."""

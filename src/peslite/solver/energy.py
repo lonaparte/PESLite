@@ -658,6 +658,10 @@ def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e
     tellegen_worst: Optional[float] = None
     consistent = [project for sub in model.subsystems
                   if callable(project := getattr(sub, "consistent_state", None))]
+    not_audited = {
+        name for name, sub in zip(model.names, model.subsystems)
+        if getattr(sub, "energy_audit_note", None)
+    }
     try:
         for label, value in (zoh or {}).items():
             model.set_zoh_input(label, value)
@@ -675,8 +679,8 @@ def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e
             scale = rep.scale
             for s in rep.subsystems:
                 st = statuses[s.name]
-                if s.kind in ("default", "observer"):
-                    continue  # closes by construction
+                if s.kind in ("default", "observer") or s.name in not_audited:
+                    continue
                 rel = abs(s.residual) / scale
                 st.balance_residual_rel = rel if st.balance_residual_rel is None else max(st.balance_residual_rel, rel)
                 if s.supplied != 0.0 and st.role == "passive":

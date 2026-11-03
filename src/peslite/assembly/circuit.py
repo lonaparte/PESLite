@@ -45,7 +45,7 @@ from ..components.network import Port
 from ..solver.energy import Energetic, spec_of
 from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _InlineProgram
 from ..solver.netlist import (QUANTITIES, CurrentSource, Diode, Element, Netlist, Node,
-                              VoltageSource, _Degenerate)
+                              VoltageSource, _Degenerate, _Evaluation)
 
 __all__ = ["NetlistBuilder", "Circuit", "NetworkView", "lower", "lower_devices",
            "bind_device", "declare_netlist"]
@@ -88,10 +88,10 @@ class _BoundValue:
 class _CallableValue:
     """A netlist callback with explicit component-input dependencies."""
 
-    __slots__ = ("callback", "inputs")
+    __slots__ = ("callback", "inputs", "record")
 
-    def __init__(self, callback: Callable, inputs: Sequence[str]) -> None:
-        self.callback, self.inputs = callback, tuple(inputs)
+    def __init__(self, callback: Callable, inputs: Sequence[str], record: Any = None) -> None:
+        self.callback, self.inputs, self.record = callback, tuple(inputs), record
 
     def __call__(self, *args: Any) -> Any:
         return self.callback(*args)
@@ -167,12 +167,14 @@ class NetlistBuilder:
         """A callback whose direct dependencies are named fields of the owner's input record."""
         if not callable(callback):
             raise TypeError("a netlist function value must be callable")
+        record = None
         if self.owner is not None:
             known = set(_fields(self.owner.input))
             unknown = set(inputs) - known
             if unknown:
                 raise ValueError(f"unknown netlist function input fields {sorted(unknown)}")
-        return _CallableValue(callback, inputs)
+            record = self.owner.input
+        return _CallableValue(callback, inputs, record)
 
     def add(self, *elements: Element) -> Element:
         first = self.netlist.add(*elements)
@@ -397,6 +399,8 @@ class Circuit:
         self.published: dict[tuple[int, str], str] = {}  # (id(component), out field) -> out key
         self.inputs: dict[str, Any] = {}  # input key -> initial value
         self.outputs: dict[str, Any] = {}  # out key -> initial value
+        self._output_producers: dict[str, str] = {}
+        self._output_stage_owners: dict[str, tuple[Any, ...]] = {}
         self.passthrough: list[tuple[str, str]] = []  # input key -> output key
         self.value_inputs: dict[tuple[int, str], str] = {}  # bound component outputs -> input key
         self.netlist: Optional[Netlist] = None
@@ -406,7 +410,6 @@ class Circuit:
         self.impulsive_supplied_energy = 0.0  # J, delivered by sources during those jumps
         self.locate_commutations = False  # only diodes commutate between boundaries
         self.commutation_active = False
-        self.topology_held = False
         self._consistent: Optional[tuple] = None  # the mode the states were last made consistent with
         self._consistent_constraints: Optional[tuple] = None
         self._loss_elements: dict[int, list[Element]] = {}
@@ -423,6 +426,13 @@ class Circuit:
         self._mirrored: Optional[tuple[bool, ...]] = None  # their conduction when the hooks last ran
         self._boundary_signature: Optional[tuple] = None
         self._stored: Optional[tuple[list[float], np.ndarray]] = None  # (component states, netlist vector) last stored
+        self._views: tuple["NetworkView", ...] = ()
+        self._structural_targets: set[tuple[int, str]] = set()
+        self._direct_dynamic = False
+        self._direct_mode_key: Optional[tuple] = None
+        self._device_stage_pending = False
+        self._standalone_runtime = False
+        self.plan_changed = False
 
     # ---------------------------------------------------------------- assembly
     def key(self, label: str, initial: Any, output: bool) -> str:
@@ -441,12 +451,6 @@ class Circuit:
         """Create the records, compile the state transfers and the netlist."""
         self.input = type("_CircuitInput", (Bag,), {"__slots__": tuple(self.inputs)})(**self.inputs)
         self.output = type("_CircuitOutput", (Bag,), {"__slots__": tuple(self.outputs)})(**self.outputs)
-        if self.outputs:
-            self.output_stages = (
-                OutputMethod("solve", tuple(self.inputs), ()),
-                OutputMethod("publish_outputs", (), tuple(self.outputs), rhs=False),
-            )
-            self._output_dependencies = {"publish_outputs": ((self, "solve"),)}
         layout, index = [], 0
         self._state_index: dict[tuple[int, str], np.ndarray] = {}
         for comp in self.components:
@@ -480,6 +484,7 @@ class Circuit:
 
     def build(self) -> None:
         """Compile the netlist from the components' present parameters (also after a ``set`` event)."""
+        rebuilding = self.netlist is not None
         if self.netlist is not None:
             refreshed = {id(component): declare_netlist(component) for component in self.components}
             if any(declaration is None for declaration in refreshed.values()):
@@ -557,9 +562,40 @@ class Circuit:
         self.commutation_active = self.locate_commutations or bool(self._hooks)
         self._mirrored = None
         self._boundary_signature = None
+        self._structural_targets = self._mode_input_targets(net)
+        self._direct_dynamic = False
+        self._direct_mode_key = None
+        self._device_stage_pending = False
         if self.form == "device":
             (self.scalar_derivatives, self.scalar_outputs,
              self.scalar_output_evaluator) = net.scalar_evaluators()
+        if (self.form != "device"
+                or not (self._compile_device_stages(defer_dynamic=not rebuilding)
+                        or (not self._standalone_runtime
+                            and self._compile_device_runtime(lazy=self._device_stage_pending)))):
+            self._use_runtime_stages()
+        if rebuilding:
+            for view in self._views:
+                view.update_circuit_dependencies(self)
+            self.plan_changed = True
+
+    def _mode_input_targets(self, net: Netlist) -> set[tuple[int, str]]:
+        """Held record fields whose changes can select another electrical structure."""
+        all_targets = {
+            *((id(component.input), field) for component, field, _key in self.copies),
+            *((id(self.input), key) for key in self.inputs),
+        }
+        targets: set[tuple[int, str]] = set()
+        callbacks = [switch.closed for switch in net._switches]
+        callbacks.extend(diode.gate for diode in net._diodes if diode.gate is not None)
+        for callback in callbacks:
+            if isinstance(callback, _BoundValue):
+                targets.add((id(callback.record), callback.field))
+            elif isinstance(callback, _CallableValue) and callback.record is not None:
+                targets.update((id(callback.record), field) for field in callback.inputs)
+            else:
+                targets.update(all_targets)
+        return targets.intersection(all_targets)
 
     def _compile_publish(self, nb: NetlistBuilder, node_of: dict[int, Node]) -> None:
         net = self.netlist
@@ -644,6 +680,346 @@ class Circuit:
                      "<peslite circuit outputs>", "exec"), env)
         self.publish = env["publish"]
 
+    def _use_runtime_stages(self) -> None:
+        """Evaluate a circuit as one runtime operation when it cannot be split statically."""
+        self._output_dependencies = {"publish_outputs": ((self, "solve"),)}
+        self._output_producers = dict.fromkeys(self.outputs, "publish_outputs")
+        self.output_stages = ((
+            OutputMethod("solve", tuple(self.inputs), ()),
+            OutputMethod("publish_outputs", (), tuple(self.outputs), rhs=False),
+        ) if self.outputs else None)
+        self._bind_stage_owners()
+
+    def _bind_stage_owners(self) -> None:
+        """Assign aggregated derivative stages to every component state view they advance."""
+        owners = (self, *self._views)
+        self._output_stage_owners = {
+            stage.method: owners for stage in self.output_stages or () if stage.rhs
+        }
+
+    def _program_dependencies(self, program: tuple) -> tuple[str, ...]:
+        """Circuit input fields read by one generated scalar program."""
+        statements, _result, namespace, expressions = program
+        active = "\n".join((*statements, *(expressions or ())))
+        copied = {
+            (id(component.input), field): key
+            for component, field, key in self.copies
+        }
+        dependencies = set()
+        for name, value in namespace.items():
+            if re.search(rf"\b{re.escape(name)}\b", active) is None:
+                continue
+            if isinstance(value, _BoundValue):
+                key = (value.field if value.record is self.input else
+                       copied.get((id(value.record), value.field)))
+                if key is not None:
+                    dependencies.add(key)
+            elif isinstance(value, _CallableValue) and value.record is not None:
+                dependencies.update(
+                    key for field in value.inputs
+                    if (key := copied.get((id(value.record), field))) is not None
+                )
+        return tuple(name for name in self.inputs if name in dependencies)
+
+    def _copy_prelude(
+        self, dependencies: Sequence[str], namespace: dict[str, Any]
+    ) -> list[str]:
+        """Copy only the component inputs read by one generated circuit stage."""
+        active = set(dependencies)
+        body = []
+        for index, (component, field, key) in enumerate(self.copies):
+            if key not in active:
+                continue
+            token = f"_circuit_input_{index}"
+            namespace[token] = component.input
+            body.append(f"{token}.{field} = self.input.{key}")
+        return body
+
+    def _bind_program(
+        self, program: tuple, dependencies: Sequence[str]
+    ) -> tuple[list[str], tuple[str, ...], dict[str, Any]]:
+        """Bind generated netlist expressions to the assembled state records."""
+        statements, _result, source_namespace, expressions = program
+        namespace = {}
+        bound_values: dict[str, str] = {}
+        for name, value in source_namespace.items():
+            if isinstance(value, _BoundValue):
+                token = f"_circuit_value_{len(bound_values)}"
+                namespace[token] = value.record
+                expression = f"{token}.{value.field}"
+                if value.invert:
+                    expression = f"not {expression}"
+                elif value.factor == -1.0:
+                    expression = f"-({expression})"
+                elif value.factor != 1.0:
+                    expression = f"{value.factor!r} * ({expression})"
+                bound_values[name] = expression
+            else:
+                namespace[name] = value.callback if isinstance(value, _CallableValue) else value
+        state_values: dict[int, str] = {}
+        for index, (component, name, complex_state, offset) in enumerate(self.layout):
+            token = f"_circuit_state_{index}"
+            namespace[token] = component.state
+            state_values[offset] = f"{token}.{name}.real" if complex_state else f"{token}.{name}"
+            if complex_state:
+                state_values[offset + 1] = f"{token}.{name}.imag"
+
+        def bind(source: str) -> str:
+            for name, expression in bound_values.items():
+                source = re.sub(rf"\b{re.escape(name)}\((?:t)?\)", expression, source)
+            for offset in sorted(state_values, reverse=True):
+                source = source.replace(f"y[{offset}]", f"({state_values[offset]})")
+            return source[4:] if source.startswith("    ") else source
+
+        body = self._copy_prelude(dependencies, namespace)
+        body.extend(bind(statement) for statement in statements)
+        return body, tuple(bind(expression) for expression in expressions or ()), namespace
+
+    def _generated_method(
+        self, name: str, body: Sequence[str], namespace: Mapping[str, Any]
+    ) -> Callable:
+        """Compile one method and expose the same straight-line body to the Model compiler."""
+        env = dict(namespace)
+        source = f"def {name}(self, t):\n" + "\n".join(
+            "    " + line for line in body or ("pass",)
+        ) + "\n"
+        exec(compile(source, "<peslite direct circuit>", "exec"), env)
+        function = env[name]
+        identifiers = set(re.findall(r"\b[A-Za-z_]\w*\b", "\n".join(body)))
+        function._peslite_inline_program = _InlineProgram(
+            tuple(body), (), {
+                key: value for key, value in namespace.items() if key in identifiers
+            }
+        )
+        method = MethodType(function, self)
+        setattr(self, name, method)
+        return method
+
+    def _append_publications(
+        self, keys: Sequence[str], values: Mapping[int, str], body: list[str],
+        namespace: dict[str, Any], label: str,
+    ) -> None:
+        """Append direct circuit-output and physical-port writes for scalar netlist rows."""
+        publications = {key: (dimension, terms)
+                        for key, dimension, terms in self.publications}
+        port_writes: dict[str, list[tuple[Port, str]]] = {}
+        for port, _group, voltage_key, current_key in self.port_values:
+            port_writes.setdefault(voltage_key, []).append((port, "voltage"))
+            port_writes.setdefault(current_key, []).append((port, "current"))
+
+        def scaled(factor: float, expression: str) -> str:
+            return f"({expression})" if factor == 1.0 else f"{factor!r} * ({expression})"
+
+        for key in keys:
+            dimension, terms = publications[key]
+            parts = [
+                " + ".join(
+                    scaled(factor, values[output.start + part])
+                    for factor, output in terms
+                ) or "0.0"
+                for part in range(dimension)
+            ]
+            expression = (f"({parts[0]}) + 1j * ({parts[1]})"
+                          if dimension == 2 else parts[0])
+            body.append(f"self.output.{key} = {expression}")
+            for port, attribute in port_writes.get(key, ()):
+                token = f"_circuit_port_{label}_{len(namespace)}"
+                namespace[token] = port
+                body.append(f"{token}.{attribute} = self.output.{key}")
+
+    def _compile_device_stages(self, *, defer_dynamic: bool = False) -> bool:
+        """Split a directly compilable device netlist into dependency-precise stages."""
+        net = self.netlist
+        dynamic = any(transformer.constant is None for transformer in net._transformers)
+        fixed = not (net._switches or net._diodes or dynamic)
+        boundary_compiled = dynamic and not net._diodes and not self._structural_targets
+        if self._transforms or self._mixtures or not (fixed or boundary_compiled):
+            return False
+        if defer_dynamic and dynamic:
+            self._device_stage_pending = True
+            return False
+
+        if dynamic:
+            topology = net.topology()
+            derivatives = net._dynamic_scalar_function(topology, "derivatives")
+            output_evaluator = lambda selected: net._dynamic_scalar_function(  # noqa: E731
+                topology, "outputs", selected
+            )
+        else:
+            derivatives = self.scalar_derivatives
+            output_evaluator = self.scalar_output_evaluator
+
+        publications = {key: (dimension, terms)
+                        for key, dimension, terms in self.publications}
+        if set(publications) | {output for _input, output in self.passthrough} != set(self.outputs):
+            return False
+
+        output_groups: list[tuple[tuple[str, ...], list[str]]] = []
+        if dynamic:
+            published = set(self.published.values())
+            groups = (
+                [key for key in publications if key in published],
+                [key for key in publications if key not in published],
+            )
+            for keys in groups:
+                if not keys:
+                    continue
+                selected = sorted({index for key in keys
+                                   for _factor, output in publications[key][1]
+                                   for index in range(output.start, output.stop)})
+                program = getattr(output_evaluator(selected), "_peslite_scalar_program", None)
+                if program is None or program[3] is None:
+                    return False
+                output_groups.append((self._program_dependencies(program), keys))
+        else:
+            dependency_groups: dict[tuple[str, ...], list[str]] = {}
+            for key, (_dimension, terms) in publications.items():
+                selected = sorted({index for _factor, output in terms
+                                   for index in range(output.start, output.stop)})
+                program = getattr(output_evaluator(selected), "_peslite_scalar_program", None)
+                if program is None or program[3] is None:
+                    return False
+                dependency_groups.setdefault(self._program_dependencies(program), []).append(key)
+            output_groups.extend(dependency_groups.items())
+
+        derivative_program = getattr(
+            derivatives, "_peslite_scalar_program", None
+        )
+        if self.n_states and (derivative_program is None or derivative_program[3] is None):
+            return False
+
+        stages = []
+        producers: dict[str, str] = {}
+        for index, (dependencies, keys) in enumerate(output_groups, 1):
+            name = f"_device_outputs_{index}"
+            selected = sorted({position for key in keys
+                               for _factor, output in publications[key][1]
+                               for position in range(output.start, output.stop)})
+            positions = {position: offset for offset, position in enumerate(selected)}
+            program = output_evaluator(selected)._peslite_scalar_program
+            body, values, namespace = self._bind_program(program, dependencies)
+
+            self._append_publications(
+                keys,
+                {position: values[offset] for position, offset in positions.items()},
+                body, namespace, str(index),
+            )
+            producers.update(dict.fromkeys(keys, name))
+            self._generated_method(name, body, namespace)
+            stages.append(OutputMethod(name, dependencies, tuple(keys), rhs=False))
+
+        if self.passthrough:
+            name = "_device_passthrough"
+            body = [f"self.output.{output} = self.input.{input_}"
+                    for input_, output in self.passthrough]
+            self._generated_method(name, body, {})
+            inputs = tuple(dict.fromkeys(input_ for input_, _output in self.passthrough))
+            outputs = tuple(output for _input, output in self.passthrough)
+            stages.append(OutputMethod(name, inputs, outputs, rhs=False))
+            producers.update(dict.fromkeys(outputs, name))
+
+        if self.n_states:
+            dependencies = self._program_dependencies(derivative_program)
+            body, values, namespace = self._bind_program(
+                derivative_program, dependencies
+            )
+            if len(values) != len(net.states):
+                return False
+            body.extend(
+                f"self.derivatives[{int(state)}] = {value}"
+                for state, value in zip(net.states, values)
+            )
+            body.append("self.t = t")
+            name = "_device_derivatives"
+            self._generated_method(name, body, namespace)
+            stages.append(OutputMethod(
+                name, dependencies, (), rhs=True
+            ))
+
+        self.output_stages = tuple(stages)
+        self._output_dependencies = {}
+        self._output_producers = producers
+        self._bind_stage_owners()
+        self._direct_dynamic = dynamic
+        self._direct_mode_key = topology.mode.key[:2] if dynamic else None
+        return True
+
+    def _refresh_device_evaluator(self) -> bool:
+        """Select the compiled scalar evaluator for the current structural mode."""
+        holder = getattr(self, "_device_runtime", None)
+        if holder is None:
+            return False
+        topology = self.netlist.topology()
+        holder[:] = self.netlist, topology, (
+            self.netlist._dynamic_scalar_function(topology)
+            if any(transformer.constant is None
+                   for transformer in self.netlist._transformers)
+            else self.netlist._scalar_function(topology, "all")
+        )
+        return True
+
+    def _compile_device_runtime(self, *, lazy: bool = False) -> bool:
+        """Bind the current compiled mode; mode selection remains at physical boundaries."""
+        if self._transforms or self._mixtures:
+            return False
+        holder = getattr(self, "_device_runtime", None)
+        if holder is not None:
+            self._refresh_device_evaluator()
+            self._use_runtime_stages()
+            return True
+
+        self._device_runtime = [self.netlist, None, None]
+        if lazy:
+            holder = self._device_runtime
+
+            def evaluate(t, y):
+                topology = self.netlist.topology()
+                compiled = self.netlist._dynamic_scalar_function(topology)
+                holder[:] = self.netlist, topology, compiled
+                return compiled(t, y)
+
+            holder[2] = evaluate
+        else:
+            self._refresh_device_evaluator()
+        namespace: dict[str, Any] = {
+            "_circuit_runtime": self._device_runtime,
+            "_circuit_evaluation": _Evaluation,
+        }
+        states = []
+        for item, (component, name, complex_state, _index) in enumerate(self.layout):
+            token = f"_circuit_runtime_state_{item}"
+            namespace[token] = component.state
+            states.extend(
+                (f"{token}.{name}.real", f"{token}.{name}.imag")
+                if complex_state else (f"{token}.{name}",)
+            )
+        state_tuple = "(" + ", ".join(states) + ("," if len(states) == 1 else "") + ")"
+        body = []
+        for item, (component, field, key) in enumerate(self.copies):
+            token = f"_circuit_runtime_input_{item}"
+            namespace[token] = component.input
+            body.append(f"{token}.{field} = self.input.{key}")
+        body.append(f"_circuit_result = _circuit_runtime[2](t, {state_tuple})")
+        body.extend(
+            f"self.derivatives[{int(state)}] = _circuit_result[0][{index}]"
+            for index, state in enumerate(self.netlist.states)
+        )
+        if self.locate_commutations:
+            selected = tuple(states[int(state)] for state in self.netlist.states)
+            state_values = "(" + ", ".join(selected) + ("," if len(selected) == 1 else "") + ")"
+            body.append(
+                "_circuit_runtime[0]._last = _circuit_evaluation("
+                f"_circuit_runtime[1], t, {state_values}, _circuit_result[2], "
+                "_circuit_result[3], None, _circuit_result[1])"
+            )
+        body.extend((
+            "self._solved_outputs = _circuit_result[1]",
+            "self.t = t",
+        ))
+        self._generated_method("solve", body, namespace)
+        self._use_runtime_stages()
+        return True
+
     # ---------------------------------------------------------------- evaluation
     def _states(self) -> np.ndarray:
         """The netlist's state vector: the components' states, in the netlist's coordinates where declared
@@ -675,8 +1051,8 @@ class Circuit:
                            f"(switches, diodes) through {owners}: {exc}")
 
     def solve(self, t: float) -> None:
-        self.receive()
         net = self.netlist
+        self.receive()
         try:
             if self._mixtures:
                 d, outputs = self._evaluate_mixture(t, self._states())
@@ -794,10 +1170,36 @@ class Circuit:
     def freeze_topology(self) -> None:
         """Keep the present netlist topology throughout one smooth integration attempt."""
         self.netlist.freeze_topology()
+        if any(transformer.constant is None for transformer in self.netlist._transformers):
+            self._refresh_device_evaluator()
 
     def release_topology(self) -> None:
         """Read topology callbacks again at the next model-changing boundary."""
         self.netlist.release_topology()
+
+    def held_inputs_changed(self, targets: Sequence[tuple[Any, str]]) -> None:
+        """Select the compiled mode after held circuit inputs changed at a boundary."""
+        if any((id(record), field) in self._structural_targets for record, field in targets):
+            self._refresh_device_evaluator()
+
+    def _refresh_device_mode(self) -> None:
+        """Bind or regenerate the equations selected by the current structural mode."""
+        if self._device_stage_pending:
+            self._device_stage_pending = False
+            if self._compile_device_stages():
+                for view in self._views:
+                    view.update_circuit_dependencies(self)
+                self.plan_changed = True
+                return
+        if self._direct_dynamic:
+            if self.netlist.topology().mode.key[:2] == self._direct_mode_key:
+                return
+            self._compile_device_stages()
+            for view in self._views:
+                view.update_circuit_dependencies(self)
+            self.plan_changed = True
+        else:
+            self._refresh_device_evaluator()
 
     # ---------------------------------------------------------------- mode changes and diodes
     def _pattern(self, mode: Any = None) -> tuple[bool, ...]:
@@ -808,7 +1210,7 @@ class Circuit:
         """Negative while the states are inconsistent with the present mode (it changed at a boundary),
         a diode must commutate or a component has not mirrored the conduction yet; read after the model
         was synchronized. A change of transformer ratios alone keeps constraints that do not involve them."""
-        net, y = self.netlist, self._states()
+        net = self.netlist
         evaluation = net._last
         topology = evaluation.topology if evaluation is not None and evaluation.t == self.t else net.topology()
         mode = topology.mode
@@ -818,7 +1220,8 @@ class Circuit:
         if key != last:
             try:
                 constraints = topology.constraint_key()
-                if constraints is not self._consistent_constraints and not net.consistent(self.t, y, topology):
+                if (constraints is not self._consistent_constraints
+                        and not net.consistent(self.t, self._states(), topology)):
                     return -math.inf
             except _Degenerate as exc:
                 raise self._degenerate(exc, self.t) from None
@@ -826,8 +1229,9 @@ class Circuit:
             self._consistent_constraints = constraints
         if not self.locate_commutations:
             return math.inf
+        evaluated = evaluation is not None and evaluation.t == self.t
         return net.commutation_margin(
-            self.t, y, evaluated=evaluation is not None and evaluation.t == self.t
+            self.t, () if evaluated else self._states(), evaluated=evaluated
         )
 
     def commutate(self, t: float) -> None:
@@ -849,6 +1253,7 @@ class Circuit:
         if self._hooks:
             self._mirrored = self._pattern()
         self._boundary_signature = self._boundary_mode()
+        self._refresh_device_mode()
 
     def _boundary_mode(self) -> tuple:
         """Discrete commands that can change the netlist constraints at an outer boundary."""
@@ -863,6 +1268,8 @@ class Circuit:
         mode = self._boundary_mode()
         if mode != self._boundary_signature:
             self.commutate(t)
+        else:
+            self._refresh_device_evaluator()
 
     def consistent_state(self, t: float) -> None:
         """Project the states onto the present mode without recording a jump (audit states)."""
@@ -872,6 +1279,7 @@ class Circuit:
         self._consistent = topology.mode.key
         self._consistent_constraints = topology.constraint_key()
         self._boundary_signature = self._boundary_mode()
+        self._refresh_device_mode()
 
     def dissipated_power_of(self, component: Any) -> float:
         """The power dissipated in ``component``'s resistive primitives at the last evaluation."""
@@ -958,6 +1366,7 @@ class NetworkView:
         self.declared = tuple(outputs)
         self.output_stages = tuple(kept) if kept or outputs else None
         self._output_dependencies: dict[str, tuple[tuple[Any, str], ...]] = {}
+        self._derived_output_methods: tuple[str, ...] = ()
         self.outputs_need_inputs = component.outputs_need_inputs if stages is None else True
 
     def bind(self, circuit: Circuit, fed: Sequence[str]) -> None:
@@ -982,6 +1391,7 @@ class NetworkView:
         self.rhs = MethodType(env["rhs"], self)
         if self.declared:
             derived = tuple(stage.method for stage in self.output_stages or ())
+            self._derived_output_methods = derived
             env = {}
             body = "".join(
                 f"    self.output.{field} = self._circuit.output."
@@ -994,10 +1404,23 @@ class NetworkView:
             self.output_stages = (OutputMethod(
                 "netlist_outputs", (), self.declared, rhs=False
             ), *(self.output_stages or ()))
-            self._output_dependencies = {
-                "netlist_outputs": ((circuit, "publish_outputs"),),
-                **{method: ((self, "netlist_outputs"),) for method in derived},
-            }
+            self.update_circuit_dependencies(circuit)
+
+    def update_circuit_dependencies(self, circuit: Circuit) -> None:
+        """Point this view at the circuit stages producing its declared outputs."""
+        if not self.declared:
+            return
+        producers = tuple(dict.fromkeys(
+            circuit._output_producers[circuit.published[id(self.component), field]]
+            for field in self.declared
+        ))
+        self._output_dependencies = {
+            "netlist_outputs": tuple((circuit, method) for method in producers),
+            **{
+                method: ((self, "netlist_outputs"),)
+                for method in self._derived_output_methods
+            },
+        }
 
     def expose(self, margin: Any, commutate: Any, next_time: Any = None) -> None:
         """Expose the component's own commutation hooks for its netlist form (a gate clock)."""
@@ -1168,7 +1591,8 @@ class _DeviceRuntime:
         def generated_inputs(field: str) -> tuple[str, ...]:
             """Direct component inputs used by one compiled netlist output."""
             fallback = direct_inputs.get(field, all_inputs)
-            if circuit._transforms or circuit._mixtures or circuit.standalone_ports:
+            if (circuit._transforms or circuit._mixtures or circuit.standalone_ports
+                    or circuit.netlist.has_discrete_topology):
                 return fallback
             _dimension, terms = publications[publish[field]]
             selected = sorted(
@@ -1249,7 +1673,8 @@ class _DeviceRuntime:
             body = []
             inline_values = None
             calculation = []
-            if circuit._transforms or circuit._mixtures or circuit.standalone_ports:
+            if (circuit._transforms or circuit._mixtures or circuit.standalone_ports
+                    or circuit.netlist.has_discrete_topology):
                 body.extend((
                     "    self._device_circuit.solve(t)",
                     "    self._device_circuit.publish_outputs(t)",
@@ -1291,6 +1716,7 @@ class _DeviceRuntime:
             aliases = set()
             for field in fields if not (
                     circuit._transforms or circuit._mixtures or circuit.standalone_ports
+                    or circuit.netlist.has_discrete_topology
             ) else ():
                 key = publish[field]
                 dimension, terms = publications[key]
@@ -1384,7 +1810,8 @@ class _DeviceRuntime:
         rhs_lines = []
         if not entries:
             rhs_lines.append("    return ()")
-        elif circuit._transforms or circuit._mixtures or circuit.standalone_ports:
+        elif (circuit._transforms or circuit._mixtures or circuit.standalone_ports
+              or circuit.netlist.has_discrete_topology):
             rhs_lines.extend(("    self._device_circuit.solve(t)",
                               "    d = self._device_circuit.derivatives"))
         else:
@@ -1452,6 +1879,7 @@ def bind_device(name: str, component: Any, declaration: _NetlistDeclaration,
                 names: Optional[dict[int, str]] = None) -> Circuit:
     """Compile one component directly from its declaration, preserving its Model identity."""
     circuit = Circuit("device")
+    circuit._standalone_runtime = True
     circuit.names = {id(component): name} if names is None else names
     circuit.components = [component]
     circuit.declarations = {id(component): declaration}
@@ -1513,6 +1941,7 @@ def device_outputs(component: Any, t: float) -> None:
     """Evaluate a standalone component's output stages from its netlist declaration."""
     circuit = _standalone_device(component)
     circuit.release_topology()
+    circuit._refresh_device_evaluator()
     for stage in component.output_stages or ():
         getattr(component, stage.method)(t)
 
@@ -1768,6 +2197,7 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
             held[(views[id(dst)], field)] = label
             if label not in held_keys:
                 held_keys[label] = circuit.key(f"held.{label}", getattr(dst.input, field), output=False)
+            circuit.copies.append((dst, field, held_keys[label]))
         else:
             held[(dst, field)] = label
     held.update(((circuit, key), label) for label, key in held_keys.items())
@@ -1779,16 +2209,8 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
         name = f"circuit_{k}"
     out[name] = circuit
     circuit.finalize()
-    held_targets = {(id(dst.input), field) for dst, field in zoh}
-    dynamic_ratios = [
-        transformer.N for transformer in circuit.netlist._transformers
-        if transformer.constant is None
-    ]
-    circuit.topology_held = bool(dynamic_ratios) and all(
-        isinstance(value, _BoundValue)
-        and (id(value.record), value.field) in held_targets
-        for value in dynamic_ratios
-    )
+    circuit._views = tuple(views.values())
+    circuit._bind_stage_owners()
     for sub in circuit.components:
         views[id(sub)].bind(circuit, ())
     return out, lowered, held, circuit

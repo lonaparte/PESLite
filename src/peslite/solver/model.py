@@ -1141,10 +1141,22 @@ class Model:
             self._zoh_targets.setdefault(label, []).append((dst.input, name))
         self._check_connections()
         self._build_state_layout()
+        self.plan_revision = 0
         self._build_evaluation_plan()
         self._compile()
         # energy declaration per subsystem (default if none declared)
         self.energy_specs: dict[str, _energy.EnergySpec] = {n: _energy.spec_of(s) for n, s in zip(names, subsystems)}
+        self._held_input_refresh = tuple(
+            refresh for subsystem in subsystems
+            if callable(refresh := getattr(subsystem, "held_inputs_changed", None))
+        )
+
+    def rebuild_evaluation_plan(self) -> None:
+        """Rebuild scheduling after a subsystem changes its declared output stages."""
+        self._build_evaluation_plan()
+        self._compile()
+        self._energy_balance_plan = None
+        self.plan_revision += 1
 
     # ---------------------------------------------------------------- setup
     def _check_connections(self) -> None:
@@ -1277,7 +1289,7 @@ class Model:
         def add(operation, owner, sources, label, rhs=True):
             index = len(operations)
             operations.append(operation)
-            owners.append(((owner,), sources))
+            owners.append((owner if isinstance(owner, tuple) else (owner,), sources))
             dependencies.append(set())
             labels.append(label)
             rhs_required.append(rhs)
@@ -1294,7 +1306,10 @@ class Model:
                 legacy[id(sub)] = node  # state aliases need no output evaluation
             else:
                 for stage in declared:
-                    node = add(("output", getattr(sub, stage.method)), sub, (),
+                    stage_owners = getattr(sub, "_output_stage_owners", {}).get(
+                        stage.method, (sub,)
+                    )
+                    node = add(("output", getattr(sub, stage.method)), stage_owners, (),
                                f"{name}.{stage.method}", stage.rhs)
                     stage_nodes[id(sub), stage.method] = node
                     stages.append((node, sub, stage.inputs))
@@ -1510,8 +1525,24 @@ class Model:
         # Rebuilt models own their debugging source; collecting one must release its cache entry.
         weakref.finalize(self, linecache.cache.pop, filename, None)
         self.compiled_source = source
-        self._load, self._outputs, self._zoh_outputs, self.rhs_list = (
-            env["_load"], env["_outputs"], env["_zoh_outputs"], env["rhs_list"])
+        names = ("_load", "_outputs", "_zoh_outputs", "rhs_list")
+        compiled = tuple(env[name] for name in names)
+        previous = getattr(self, "_compiled_plan_functions", None)
+        if previous is None:
+            active = compiled
+            for name, function in zip(names, active):
+                setattr(self, name, function)
+        else:
+            active = previous
+            for old, new in zip(active, compiled):
+                old.__globals__.update(new.__globals__)
+                old.__code__ = new.__code__
+                old.__defaults__ = new.__defaults__
+                old.__kwdefaults__ = new.__kwdefaults__
+            for name, function in zip(names, active):
+                if getattr(self, name) in previous:
+                    setattr(self, name, function)
+        self._compiled_plan_functions = active
 
     # -------------------------------------------------------------- groups
     def groups(self, assignment: Mapping[str, str], system: str = "system") -> dict[str, GroupPlan]:
@@ -1682,8 +1713,11 @@ class Model:
     # --------------------------------------------------------- evaluation
     def set_zoh_input(self, label: str, value: Any) -> None:
         """Set a held external input (e.g. the switching state) by label."""
-        for input, name in self._zoh_targets[label]:
+        targets = self._zoh_targets[label]
+        for input, name in targets:
             setattr(input, name, value)
+        for refresh in self._held_input_refresh:
+            refresh(targets)
 
     def evaluate_outputs(self, t: float) -> None:
         """Run the ordered output-method / input-copy plan for the current states."""

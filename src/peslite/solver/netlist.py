@@ -153,7 +153,9 @@ class _Symbolic:
         return _symbolic_binary("/", other, self)
 
     def __neg__(self):
-        return _Symbolic("neg", (self,))
+        if self.operation == "neg":
+            return self.arguments[0]
+        return _linear_scaled(self, -1.0)
 
     @property
     def real(self):
@@ -172,6 +174,53 @@ def _one(value: Any) -> bool:
     return isinstance(value, numbers.Number) and value == 1.0
 
 
+def _minus_one(value: Any) -> bool:
+    return isinstance(value, numbers.Number) and value == -1.0
+
+
+def _negative_of(left: Any, right: Any) -> bool:
+    return isinstance(right, _Symbolic) and right.operation == "neg" and right.arguments[0] == left
+
+
+def _linear_form(value: Any) -> tuple[Any, dict[Any, Any]]:
+    """Return the constant and ordered terms of an additive scalar expression."""
+    if isinstance(value, numbers.Number):
+        return value, {}
+    if isinstance(value, _Symbolic) and value.operation == "linear":
+        constant, terms = value.arguments
+        return constant, {term: coefficient for coefficient, term in terms}
+    return 0.0, {value: 1.0}
+
+
+def _linear_value(constant: Any, terms: Mapping[Any, Any]) -> Any:
+    active = tuple((coefficient, term) for term, coefficient in terms.items()
+                   if not _zero(coefficient))
+    if not active:
+        return constant
+    if _zero(constant) and len(active) == 1:
+        coefficient, term = active[0]
+        if _one(coefficient):
+            return term
+        if _minus_one(coefficient):
+            return _Symbolic("neg", (term,))
+    return _Symbolic("linear", (constant, active))
+
+
+def _linear_sum(left: Any, right: Any, sign: float = 1.0) -> Any:
+    left_constant, left_terms = _linear_form(left)
+    right_constant, right_terms = _linear_form(right)
+    for term, coefficient in right_terms.items():
+        left_terms[term] = left_terms.get(term, 0.0) + sign * coefficient
+    return _linear_value(left_constant + sign * right_constant, left_terms)
+
+
+def _linear_scaled(value: Any, factor: Any) -> Any:
+    constant, terms = _linear_form(value)
+    return _linear_value(factor * constant, {
+        term: factor * coefficient for term, coefficient in terms.items()
+    })
+
+
 def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
     if isinstance(left, numbers.Number) and isinstance(right, numbers.Number):
         return {"+": lambda: left + right, "-": lambda: left - right,
@@ -181,11 +230,19 @@ def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
             return right
         if _zero(right):
             return left
+        if _negative_of(left, right) or _negative_of(right, left):
+            return 0.0
+        return _linear_sum(left, right)
     elif operation == "-":
         if _zero(right):
             return left
+        if _zero(left):
+            return -right
         if left == right:
             return 0.0
+        if isinstance(right, _Symbolic) and right.operation == "neg":
+            return _symbolic_binary("+", left, right.arguments[0])
+        return _linear_sum(left, right, -1.0)
     elif operation == "*":
         if _zero(left) or _zero(right):
             return 0.0
@@ -193,11 +250,23 @@ def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
             return right
         if _one(right):
             return left
+        if _minus_one(left):
+            return -right
+        if _minus_one(right):
+            return -left
+        if isinstance(left, numbers.Number):
+            return _linear_scaled(right, left)
+        if isinstance(right, numbers.Number):
+            return _linear_scaled(left, right)
     elif operation == "/":
         if _zero(left):
             return 0.0
         if _one(right):
             return left
+        if _minus_one(right):
+            return -left
+        if isinstance(right, numbers.Number):
+            return _linear_scaled(left, 1.0 / right)
     return _Symbolic(operation, (left, right))
 
 
@@ -248,8 +317,12 @@ def _symbolic_source(expressions: Sequence[Any]) -> tuple[list[str], tuple[str, 
         if not isinstance(value, _Symbolic) or value.operation == "value":
             return
         uses[value] = uses.get(value, 0) + 1
-        for argument in value.arguments:
-            count(argument)
+        if value.operation == "linear":
+            for _coefficient, term in value.arguments[1]:
+                count(term)
+        else:
+            for argument in value.arguments:
+                count(argument)
 
     for expression in expressions:
         count(expression)
@@ -264,11 +337,22 @@ def _symbolic_source(expressions: Sequence[Any]) -> tuple[list[str], tuple[str, 
             return names[value]
         if value.operation == "value":
             return value.arguments[0]
-        for argument in value.arguments:
+        children = ([term for _coefficient, term in value.arguments[1]]
+                    if value.operation == "linear" else value.arguments)
+        for argument in children:
             if isinstance(argument, _Symbolic) and argument in shared and argument not in names:
                 name = f"v{len(names)}"
                 names[argument] = name
                 lines.append(f"{name} = {render(argument, argument)}")
+        if value.operation == "linear":
+            constant, terms = value.arguments
+            parts = ([] if _zero(constant) else [repr(constant)])
+            for coefficient, term in terms:
+                expression = render(term)
+                parts.append(expression if _one(coefficient) else
+                             f"(-{expression})" if _minus_one(coefficient) else
+                             f"({coefficient!r} * {expression})")
+            return "(" + " + ".join(parts) + ")"
         arguments = tuple(render(argument) for argument in value.arguments)
         if value.operation == "neg":
             return f"(-{arguments[0]})"
@@ -1661,6 +1745,8 @@ class Netlist:
         self._inductors: list[Element] = []
         self._switches: list[Switch] = []
         self._diodes: list[Diode] = []
+        self._diode_branches: Optional[tuple[int, ...]] = None
+        self._diode_output_bases: Optional[tuple[int, ...]] = None
         self._transformers: list[Transformer] = []
         self._gates: list[tuple[int, Callable[[], bool]]] = []  # (diode, gate) of device positions
         self._gated_state: tuple[bool, ...] = ()
@@ -1672,6 +1758,7 @@ class Netlist:
         self._structures: "OrderedDict[tuple, Topology]" = OrderedDict()  # by switch and diode pattern
         self._scalar_functions: "OrderedDict[tuple[tuple, str, Optional[tuple[int, ...]]], Callable]" = OrderedDict()
         self._dynamic_scalar_functions: "OrderedDict[tuple, Callable]" = OrderedDict()
+        self._dynamic_scalar_equation_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
         self._scalar_topology: Optional[Topology] = None
         self._last: Optional[_Evaluation] = None
         self._mode: Optional[Mode] = None
@@ -1753,6 +1840,8 @@ class Netlist:
                 if el.gate is not None:
                     self._gates.append((len(self._diodes), el.gate))
                 self._diodes.append(el)
+                self._diode_branches = None
+                self._diode_output_bases = None
             elif isinstance(el, Transformer):
                 self._transformers.append(el)
         self._plan = None
@@ -1766,6 +1855,7 @@ class Netlist:
         self._parts.clear()
         self._scalar_functions.clear()
         self._dynamic_scalar_functions.clear()
+        self._dynamic_scalar_equation_cache.clear()
         self._scalar_topology = None
         self._last = None
         self._frozen_mode = self._frozen_topology = self._frozen_scalar = None
@@ -1805,6 +1895,11 @@ class Netlist:
     def conducting(self) -> tuple[bool, ...]:
         """The diodes' own conduction states, in netlist order."""
         return tuple(bool(diode.conducting) for diode in self._diodes)
+
+    @property
+    def has_discrete_topology(self) -> bool:
+        """Whether switch or diode states can change the circuit equations."""
+        return bool(self._switches or self._diodes)
 
     @property
     def _residual(self) -> NDArray[np.float64]:
@@ -2572,8 +2667,21 @@ class Netlist:
             return self._dynamic_scalar_function(top)(t, y)[1]
         return self._scalar_function(top, "outputs")(t, y)
 
-    def _compile_dynamic_scalar(self, top: Topology) -> Callable:
-        """Compile scalar equations whose transformer ratios remain run-time values."""
+    def _dynamic_scalar_equations(self, top: Topology) -> tuple:
+        """Return one symbolic equation set shared by all scalar stages of a structural mode."""
+        key = top.mode.key[:2]
+        equations = self._dynamic_scalar_equation_cache.get(key)
+        if equations is None:
+            equations = self._build_dynamic_scalar_equations(top)
+            self._dynamic_scalar_equation_cache[key] = equations
+            while len(self._dynamic_scalar_equation_cache) > self.cache_size:
+                self._dynamic_scalar_equation_cache.popitem(last=False)
+        else:
+            self._dynamic_scalar_equation_cache.move_to_end(key)
+        return equations
+
+    def _build_dynamic_scalar_equations(self, top: Topology) -> tuple:
+        """Build symbolic equations for a mode whose transformer ratios remain run-time values."""
         env: dict[str, Any] = {}
         preamble: list[str] = []
         flat_ratios: list[Any] = []
@@ -2660,31 +2768,73 @@ class Netlist:
         output_matrix = top.S_out.toarray()
         outputs = [sum((coefficient * value for coefficient, value in zip(row, solution)
                         if coefficient != 0.0), 0.0) for row in output_matrix]
-        expressions = [*derivatives, *outputs, *inputs, *rates]
+        return (tuple(preamble), env, tuple(inputs), tuple(rates),
+                tuple(derivatives), tuple(outputs))
+
+    def _compile_dynamic_scalar(
+        self, top: Topology, part: str = "all", selected: Optional[tuple[int, ...]] = None,
+    ) -> Callable:
+        """Compile one scalar stage from the structural mode's shared symbolic equations."""
+        if part not in ("all", "derivatives", "outputs"):
+            raise ValueError(f"unknown device equation part {part!r}")
+        if selected is not None and part != "outputs":
+            raise ValueError("selected rows apply only to device outputs")
+        preamble, source_env, inputs, rates, derivatives, outputs = (
+            self._dynamic_scalar_equations(top)
+        )
+        env = dict(source_env)
+        if part == "derivatives":
+            active_derivatives, active_outputs = derivatives, []
+        elif part == "outputs":
+            active_derivatives = []
+            rows = tuple(range(len(outputs))) if selected is None else selected
+            active_outputs = [outputs[index] for index in rows]
+        else:
+            active_derivatives, active_outputs = derivatives, outputs
+        expressions = [*active_derivatives, *active_outputs]
+        if part == "all":
+            expressions.extend((*inputs, *rates))
         shared, rendered = _symbolic_source(expressions)
-        n_d, n_o, n_u = len(derivatives), len(outputs), len(inputs)
+        n_d, n_o, n_u = len(active_derivatives), len(active_outputs), len(inputs)
         derivative_text = rendered[:n_d]
         output_text = rendered[n_d:n_d + n_o]
-        input_text = rendered[n_d + n_o:n_d + n_o + n_u]
-        rate_text = rendered[n_d + n_o + n_u:]
+        input_text = rendered[n_d + n_o:n_d + n_o + n_u] if part == "all" else []
+        rate_text = rendered[n_d + n_o + n_u:] if part == "all" else []
 
         def tuple_expression(items: Sequence[str]) -> str:
             return "(" + ", ".join(items) + ("," if len(items) == 1 else "") + ")"
 
-        result = ", ".join(tuple_expression(items) for items in (
+        result = (", ".join(tuple_expression(items) for items in (
             derivative_text, output_text, input_text, rate_text,
-        ))
+        )) if part == "all" else
+                  tuple_expression(derivative_text if part == "derivatives" else output_text))
         lines = ["def evaluate(t, y):", *preamble,
                  *(f"    {line}" for line in shared), f"    return {result}"]
         exec(compile("\n".join(lines) + "\n", "<peslite dynamic circuit equations>", "exec"), env)
-        return env["evaluate"]
+        evaluate = env["evaluate"]
+        evaluate._peslite_scalar_program = (
+            tuple((*preamble, *(f"    {line}" for line in shared))),
+            result,
+            {key: value for key, value in env.items()
+             if key not in ("evaluate", "__builtins__")},
+            tuple(rendered),
+        )
+        evaluate._peslite_scalar_parts = (
+            n_d, n_o, n_u if part == "all" else 0, len(rates) if part == "all" else 0
+        )
+        return evaluate
 
-    def _dynamic_scalar_function(self, top: Topology) -> Callable:
-        key = top.mode.key[:2]
+    def _dynamic_scalar_function(
+        self, top: Topology, part: str = "all", selected: Optional[Sequence[int]] = None,
+    ) -> Callable:
+        selected_key = None if selected is None else tuple(sorted(set(map(int, selected))))
+        key = top.mode.key[:2], part, selected_key
         evaluate = self._dynamic_scalar_functions.get(key)
         if evaluate is None:
-            evaluate = self._dynamic_scalar_functions[key] = self._compile_dynamic_scalar(top)
-            while len(self._dynamic_scalar_functions) > self.cache_size:
+            evaluate = self._dynamic_scalar_functions[key] = self._compile_dynamic_scalar(
+                top, part, selected_key
+            )
+            while len(self._dynamic_scalar_functions) > 3 * self.cache_size:
                 self._dynamic_scalar_functions.popitem(last=False)
         else:
             self._dynamic_scalar_functions.move_to_end(key)
@@ -2933,19 +3083,31 @@ class Netlist:
 
     def _diode_margins(self, top: Topology, out: Sequence[Any]) -> tuple[Any, ...]:
         """Interpret diode branch outputs in the current conduction state."""
-        branches = [self._ports[id(diode)][0] for diode in self._diodes]
-        base = [self.n_e + self._branches[k].output for k in branches]
+        if self._diode_branches is None:
+            self._diode_branches = tuple(self._ports[id(diode)][0] for diode in self._diodes)
+        branches = self._diode_branches
+        if self._diode_output_bases is None:
+            self._diode_output_bases = tuple(
+                self.n_e + self._branches[index].output for index in branches
+            )
+        base = self._diode_output_bases
+        gated = self._gated()
+        if not top.blocking:
+            return tuple(
+                math.inf if gated[k] else (
+                    out[index + self.n_bd] if bool(diode.conducting) else -out[index]
+                )
+                for k, (diode, index) in enumerate(zip(self._diodes, base))
+            )
         voltage = [out[index] for index in base]
-        if top.blocking:
-            potential: list[Any] = [0.0] * self.n_vertices
-            for vertex in range(1, self.n_vertices):
-                potential[vertex] = out[int(self._e_off[vertex])]
-            blocking = self._blocking_voltages(top, potential)
-            voltage = [blocking.get(k, value) for k, value in zip(branches, voltage)]
+        potential: list[Any] = [0.0] * self.n_vertices
+        for vertex in range(1, self.n_vertices):
+            potential[vertex] = out[int(self._e_off[vertex])]
+        blocking = self._blocking_voltages(top, potential)
+        voltage = [blocking.get(k, value) for k, value in zip(branches, voltage)]
         current = [out[index + self.n_bd] for index in base]
         margins = [current[k] if bool(diode.conducting) else -voltage[k]
                    for k, diode in enumerate(self._diodes)]
-        gated = self._gated()
         return tuple(math.inf if gated[k] else value for k, value in enumerate(margins))
 
     def _margin_tolerances(self, out: Sequence[Any]) -> tuple[Any, ...]:
@@ -3038,7 +3200,8 @@ class Netlist:
                        ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Conduction margins (on: current, off: -voltage) and evaluated outputs."""
         if evaluated and self._last is not None:
-            out, top = self.outputs(), self._last.topology
+            top = self._last.topology
+            out = self._last.output if self._last.output is not None else self.outputs()
         else:
             out, top = self._evaluated(t, y)
         return np.asarray(self._diode_margins(top, out), dtype=float), out
@@ -3053,7 +3216,15 @@ class Netlist:
         residual each margin had at the last commutation; negative when a diode must commutate."""
         if not self._diodes:
             return math.inf
-        return float(np.min(self._margin_values(t, y, evaluated=evaluated)[0] - self._residual))
+        if evaluated and self._last is not None:
+            top = self._last.topology
+            out = self._last.output if self._last.output is not None else self.outputs()
+        else:
+            out, top = self._evaluated(t, y)
+        return float(min(
+            margin - diode.residual
+            for margin, diode in zip(self._diode_margins(top, out), self._diodes)
+        ))
 
     def _impulses(self, t: float, y: NDArray[np.float64]) -> NDArray[np.intp]:
         """Diodes that the jump into the current mode would drive in reverse: a negative impulsive

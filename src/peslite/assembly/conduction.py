@@ -71,7 +71,7 @@ class DiodeConduction:
         )
         self._topology_owners = tuple(
             subsystem for subsystem in model.subsystems
-            if (subsystem in self.commutating or getattr(subsystem, "topology_held", False))
+            if subsystem in self.commutating
             if callable(getattr(subsystem, "freeze_topology", None))
         )
         self._scheduled = tuple(
@@ -264,15 +264,18 @@ class DiodeConduction:
                            if float(sub.next_commutation_time()) <= due)
             if not pending:
                 return state
+            changed = False
             for sub in self.commutating:
                 if sub not in pending:
                     continue
-                self.model.sync(t, state)
+                if changed:
+                    self.model.sync(t, state)
                 scheduled = sub in self._scheduled and float(sub.next_commutation_time()) <= due
-                if not scheduled and sub.commutation_margin() >= 0.0:
+                if changed and not scheduled and sub.commutation_margin() >= 0.0:
                     continue
                 sub.commutate(t)
                 state[:] = self.model.get_initial_values()
+                changed = True
         names = sorted(self.model.name_of(sub) for sub in pending)
         raise CommutationError(
             f"t = {t:.12g} s: {names} commutated {_MAX_COMMUTATIONS} times without time "

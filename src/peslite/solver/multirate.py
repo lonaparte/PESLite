@@ -175,18 +175,9 @@ class MultirateSolver:
         self.window_steps = int(round(min(outer.values()))) if outer else 1  # system steps per window
         assignment = {n: "inner" for n in inner}
         assignment.update({n: "outer" for n in outer})
-        self.groups = groups = model.groups(assignment)  # validates the names
-        self.system = groups["system"]
-        self.inner = groups.get("inner")
-        self.outer = groups.get("outer")
-        self._mask_inner = self.inner.mask if self.inner is not None else np.zeros(model.n_states, dtype=bool)
-        self._mask_outer = self.outer.mask if self.outer is not None else np.zeros(model.n_states, dtype=bool)
-        self._mask_moving = ~self._mask_outer  # what the system step advances (system and inner states)
-        self._outer_labels = [lab for lab, m in zip(model.state_labels(), self._mask_outer) if m]
-        # windowed-group inputs whose window sums are restart state: (label, input record, field), plan order
-        owner = {id(sub.input): model.name_of(sub) for sub in self.outer.members} if self.outer is not None else {}
-        self._input_labels = [(f"{owner[id(input)]}.{field}", input, field)
-                              for _kind, (input, field, *_rest) in (self.outer.inputs if self.outer is not None else ())]
+        self._assignment = assignment
+        self._plan_revision = model.plan_revision
+        self._refresh_group_plans()
         self.window = self.window_steps * self.dt
         self.outer_method = outer_method or method
         self._outer_solver = (integrator(self.outer_method, self.window, rtol, atol)
@@ -233,6 +224,7 @@ class MultirateSolver:
     def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
                 max_step: float = math.inf) -> SolverStep:
         """Advance with a local limit applied coherently to every system and inner step."""
+        self.model_plan_changed()
         if max_step <= 0.0:
             raise ValueError("max_step must be positive")
         if t1 - t0 <= 0.0:
@@ -311,10 +303,49 @@ class MultirateSolver:
 
     def parameters_changed(self) -> None:
         """Refresh storage declarations after a ``set`` event changed parameters."""
+        self.model_plan_changed()
         self._storage_of = {
             self.model.state_slice(sub, st.state).start: (sub, st)
             for sub in self.model.subsystems for st in getattr(sub, "storage", ())
         }
+
+    def model_plan_changed(self) -> None:
+        """Refresh grouped schedules when the model compiled a new evaluation plan."""
+        if self._plan_revision != self.model.plan_revision:
+            self._refresh_group_plans()
+            self._plan_revision = self.model.plan_revision
+
+    def _refresh_group_plans(self) -> None:
+        """Rebind group execution plans after the model recompiles its signal schedule."""
+        model = self.model
+        self.groups = groups = model.groups(self._assignment)
+        self.system = groups["system"]
+        self.inner = groups.get("inner")
+        self.outer = groups.get("outer")
+        self._mask_inner = (
+            self.inner.mask if self.inner is not None else np.zeros(model.n_states, dtype=bool)
+        )
+        self._mask_outer = (
+            self.outer.mask if self.outer is not None else np.zeros(model.n_states, dtype=bool)
+        )
+        self._mask_moving = ~self._mask_outer
+        self._outer_labels = [
+            label for label, member in zip(model.state_labels(), self._mask_outer) if member
+        ]
+        owner = ({id(sub.input): model.name_of(sub) for sub in self.outer.members}
+                 if self.outer is not None else {})
+        self._input_labels = [
+            (f"{owner[id(input_)]}.{field}", input_, field)
+            for _kind, (input_, field, *_rest) in (
+                self.outer.inputs if self.outer is not None else ()
+            )
+        ]
+        if hasattr(self, "_coupling"):
+            self._coupling[:] = True
+            for subsystem in model.subsystems:
+                if getattr(subsystem, "observer", False):
+                    for state in subsystem.state_names:
+                        self._coupling[model.state_slice(subsystem, state)] = False
 
     def _sample_outer_rate(self, t: float, y: NDArray[np.float64]) -> None:
         """Evaluate the windowed group's rates once per window to update the rate peaks."""

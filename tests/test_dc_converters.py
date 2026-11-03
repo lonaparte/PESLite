@@ -479,8 +479,9 @@ def test_strict_energy_audit_rejects_cycle_averaged_dcm_storage():
         "simulation.energy_check": "strict",
     })
 
-    with pytest.raises(ConfigError, match="cycle-averaged DCM current"):
+    with pytest.raises(ConfigError, match="cycle-averaged DCM current") as error:
         peslite.Simulation(params)
+    assert "power balance off" not in str(error.value)
 
 
 def test_ratio_one_solver_schedule_still_honours_the_dcm_local_step():
