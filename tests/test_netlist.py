@@ -13,8 +13,8 @@ from conftest import EXAMPLES, QUIET
 from peslite.assembly.circuit import Circuit, NetworkView, bind_device, declare_netlist
 from peslite.components.network import ACVoltageSource
 from peslite.solver import FixedStepSolver
-from peslite.solver.netlist import (Capacitor, CurrentSource, Inductor, Netlist, Node, Resistor,
-                                    StateSpace, Transformer, VoltageSource)
+from peslite.solver.netlist import (Capacitor, CurrentSource, Diode, Inductor, Netlist, Node,
+                                    Resistor, StateSpace, Transformer, VoltageSource)
 
 
 FORMS = ("statewise", "mna")
@@ -180,6 +180,33 @@ def test_scalar_reduction_does_not_treat_parallel_branches_as_a_series_path():
     )
     derivatives, _outputs, _selected_outputs = net.scalar_evaluators()
     assert derivatives(0.0, (1.0,))[0] == pytest.approx(9_000.0)
+
+
+def test_diode_state_relation_is_proved_from_compiled_network_equations():
+    net = Netlist("device")
+    source, middle, winding = Node(), Node(), Node()
+    diode = Diode(source, middle)
+    net.add(
+        VoltageSource(source, None, lambda _t: 10.0),
+        diode,
+        Resistor(middle, winding, 2.0),
+        Inductor(winding, None, 1e-3, [0]),
+    )
+
+    net.set_conducting(diode, True)
+    assert net.state_diode_relations() == ((0, ((0, 1.0),)),)
+
+    parallel = Netlist("device")
+    source, middle, winding = Node(), Node(), Node()
+    parallel.add(
+        VoltageSource(source, None, lambda _t: 10.0),
+        Diode(source, middle),
+        Resistor(middle, winding, 2.0),
+        Inductor(winding, None, 1e-3, [0]),
+    )
+    parallel.add(CurrentSource(middle, None, lambda _t: 1.0))
+    parallel.set_conducting(parallel._diodes[0], True)
+    assert parallel.state_diode_relations() == ()
 
 
 def _final(example: str, circuit_model: str, out_dir: Path) -> tuple[peslite.Simulation, dict]:

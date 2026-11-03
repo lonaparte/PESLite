@@ -1838,6 +1838,10 @@ class Netlist:
         self._dynamic_scalar_functions: "OrderedDict[tuple, Callable]" = OrderedDict()
         self._dynamic_scalar_equation_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
         self._scalar_margin_functions: "OrderedDict[tuple, Callable]" = OrderedDict()
+        self._state_diode_relations: dict[int, Optional[tuple[int, float]]] = {}
+        self._state_diode_structures: dict[int, set[tuple]] = {}
+        self._state_diode_modes: dict[tuple, tuple[tuple[bool, ...], Topology]] = {}
+        self._state_diode_guards: dict[tuple, Optional[tuple[tuple[int, float], ...]]] = {}
         self._scalar_topology: Optional[Topology] = None
         self._last: Optional[_Evaluation] = None
         self._mode: Optional[Mode] = None
@@ -1937,6 +1941,10 @@ class Netlist:
         self._dynamic_scalar_functions.clear()
         self._dynamic_scalar_equation_cache.clear()
         self._scalar_margin_functions.clear()
+        self._state_diode_relations.clear()
+        self._state_diode_structures.clear()
+        self._state_diode_modes.clear()
+        self._state_diode_guards.clear()
         self._scalar_topology = None
         self._last = None
         self._frozen_mode = self._frozen_topology = self._frozen_scalar = None
@@ -1970,6 +1978,208 @@ class Netlist:
         if ids is None or not 0 <= port < len(ids):
             raise KeyError(f"{element!r} has no port {port} in this netlist")
         return self._branches[ids[port]]
+
+    def state_diode_relations(
+            self, topology: Optional[Topology] = None
+    ) -> tuple[tuple[int, tuple[tuple[int, float], ...]], ...]:
+        """Return diode currents proved to be signed scalar inductor states.
+
+        Each item is ``(state_index, ((diode_index, sign), ...))`` and means that a
+        conducting diode's current is exactly ``sign * y[state_index]``.  The proof
+        uses the compiled equations, so callers need no component- or topology-name
+        knowledge.  An incomplete proof returns no relations; ordinary voltage/current
+        commutation remains the fallback.
+        """
+        if (not self._diodes
+                or any(relation is None for relation in self._state_diode_relations.values())
+                or any(
+                    transformer.constant is None for transformer in self._transformers
+                )):
+            return ()
+        inductor_states = set()
+        for element in self._inductors:
+            for branch_index in self._ports[id(element)]:
+                branch = self._branches[branch_index]
+                if branch.x >= 0:
+                    inductor_states.update(range(branch.x, branch.x + branch.dim))
+        if not inductor_states:
+            return ()
+
+        topology = self.topology() if topology is None else topology
+        structure = topology.mode.key[:2]
+        for diode_index, diode in enumerate(self._diodes):
+            if (not topology.mode.conducting[diode_index]
+                    or structure in self._state_diode_structures.get(diode_index, ())):
+                continue
+            branch = self.output_slice("branch_current", diode)
+            if branch.stop - branch.start != 1:
+                self._state_diode_relations[diode_index] = None
+                continue
+            state_space = topology.state_space
+            current = state_space.C[branch.start]
+            active = np.flatnonzero(np.abs(current) > 1e-12)
+            if (active.size != 1
+                    or int(active[0]) not in inductor_states
+                    or not np.all(np.abs(state_space.D[branch.start]) <= 1e-12)
+                    or not np.all(np.abs(state_space.D1[branch.start]) <= 1e-12)):
+                self._state_diode_relations[diode_index] = None
+                continue
+            state = int(active[0])
+            coefficient = float(current[state])
+            if not math.isclose(abs(coefficient), 1.0, rel_tol=1e-12, abs_tol=1e-12):
+                self._state_diode_relations[diode_index] = None
+                continue
+            relation = (
+                int(self.states[state]), math.copysign(1.0, coefficient)
+            )
+            previous = self._state_diode_relations.get(diode_index, relation)
+            self._state_diode_relations[diode_index] = relation if previous == relation else None
+            self._state_diode_structures.setdefault(diode_index, set()).add(structure)
+        if (len(self._state_diode_relations) != len(self._diodes)
+                or any(relation is None for relation in self._state_diode_relations.values())):
+            return ()
+        relations: dict[int, list[tuple[int, float]]] = {}
+        for diode_index, relation in self._state_diode_relations.items():
+            state, direction = relation
+            relations.setdefault(state, []).append((diode_index, direction))
+        return tuple((state, tuple(items)) for state, items in relations.items())
+
+    def state_diode_guard_plan(
+            self, topology: Topology
+    ) -> tuple[
+        tuple[tuple[int, tuple[tuple[int, float], ...]], ...],
+        Optional[tuple[tuple[int, float], ...]],
+    ]:
+        """Return proved diode-current groups and their current state guards."""
+        groups = self.state_diode_relations(topology)
+        if not groups:
+            return (), None
+        gated = self._gated_state or (False,) * len(self._diodes)
+        key = topology.mode.key[:2], gated, groups
+        if key in self._state_diode_guards:
+            return groups, self._state_diode_guards[key]
+
+        covered: set[int] = set()
+        guards = []
+        for state, relations in groups:
+            natural = [(index, sign) for index, sign in relations if not gated[index]]
+            conducting = [
+                (index, sign) for index, sign in natural
+                if topology.mode.conducting[index]
+            ]
+            if not conducting:
+                if (any(gated[index] for index, _sign in relations)
+                        and self.diode_turn_on_excluded(
+                            topology, [index for index, _sign in natural]
+                        )):
+                    covered.update(index for index, _sign in natural)
+                    continue
+                self._state_diode_guards[key] = None
+                return groups, None
+            if len(conducting) != 1:
+                self._state_diode_guards[key] = None
+                return groups, None
+            active, direction = conducting[0]
+            if any(sign == direction for index, sign in natural if index != active):
+                self._state_diode_guards[key] = None
+                return groups, None
+            guards.append((state, direction))
+            covered.update(index for index, _sign in natural)
+        result = (
+            None
+            if any(not gated[index] and index not in covered
+                   for index in range(len(self._diodes)))
+            else tuple(guards)
+        )
+        self._state_diode_guards[key] = result
+        return groups, result
+
+    def select_state_diode_mode(
+            self, y: NDArray[np.float64],
+            groups: Sequence[tuple[int, Sequence[tuple[int, float]]]],
+    ) -> Optional[Topology]:
+        """Select a proved diode pattern directly from nonzero inductor currents.
+
+        This is valid only when every diode belongs to a proved signed-current group,
+        no state projection is introduced, and a unique diode carries each ungated
+        current direction.  Otherwise the caller retains the ordinary commutation
+        search.
+        """
+        gated = [False] * len(self._diodes)
+        for index, gate in self._gates:
+            gated[index] = bool(gate())
+        self._gated_state = tuple(gated)
+        selected: dict[int, bool] = {}
+        directions = []
+        for state, relations in groups:
+            group = tuple(relations)
+            gated_group = [index for index, _direction in group if gated[index]]
+            if gated_group:
+                if len(gated_group) != 1:
+                    return None
+                directions.append(0.0)
+                selected.update((index, False) for index, _direction in group)
+                continue
+            value = float(y[state])
+            if value == 0.0:
+                return None
+            direction = math.copysign(1.0, value)
+            directions.append(direction)
+            candidates = [index for index, sign in group if sign == direction]
+            if len(candidates) != 1:
+                return None
+            chosen = candidates[0]
+            selected.update((index, index == chosen) for index, _sign in group)
+        if len(selected) != len(self._diodes):
+            return None
+
+        key = (
+            tuple(bool(switch.closed()) for switch in self._switches),
+            tuple(gated),
+            tuple(directions),
+        )
+        cached = self._state_diode_modes.get(key)
+        if cached is not None:
+            pattern, topology = cached
+            self.release_topology()
+            for diode, conducting in zip(self._diodes, pattern):
+                diode.conducting, diode.residual = conducting, 0.0
+            self._mode = topology.mode
+            return topology
+
+        previous = tuple((diode.conducting, diode.residual) for diode in self._diodes)
+        self.release_topology()
+        for index, conducting in selected.items():
+            diode = self._diodes[index]
+            diode.conducting, diode.residual = conducting, 0.0
+        expected = self.conducting
+        try:
+            topology = self.topology()
+            if self.conducting != expected or any(
+                    projector is not None for projector in topology.projectors()
+            ):
+                raise ValueError
+            self._state_diode_modes[key] = expected, topology
+            return topology
+        except (_Degenerate, ConductionError, ValueError):
+            self.release_topology()
+            for diode, (conducting, residual) in zip(self._diodes, previous):
+                diode.conducting, diode.residual = conducting, residual
+            return None
+
+    def diode_turn_on_excluded(self, topology: Topology, indices: Sequence[int]) -> bool:
+        """Whether closing any listed blocking diode makes the present mode singular."""
+        for index in indices:
+            conducting = list(topology.mode.conducting)
+            conducting[index] = True
+            try:
+                self._compiled(Mode(
+                    topology.mode.closed, conducting, topology.mode.ratios
+                ))
+            except _Degenerate:
+                continue
+            return False
+        return True
 
     # ---------------------------------------------------------------- modes
     @property

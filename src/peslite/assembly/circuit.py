@@ -44,7 +44,7 @@ import numpy as np
 from ..components.network import Port
 from ..solver.energy import Energetic, spec_of
 from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _InlineProgram
-from ..solver.netlist import (QUANTITIES, CurrentSource, Diode, Element, Netlist, Node,
+from ..solver.netlist import (QUANTITIES, CurrentSource, Diode, Element, Netlist, Node, Topology,
                               VoltageSource, _Degenerate, _Evaluation)
 
 __all__ = ["NetlistBuilder", "Circuit", "NetworkView", "lower", "lower_devices",
@@ -434,6 +434,10 @@ class Circuit:
         self._direct_mode_key: Optional[tuple] = None
         self._device_stage_pending = False
         self._standalone_runtime = False
+        self._state_diode_groups: tuple[
+            tuple[int, tuple[tuple[int, float], ...]], ...
+        ] = ()
+        self._device_bindings: dict[tuple, tuple[Topology, Callable, Callable]] = {}
         self.plan_changed = False
 
     # ---------------------------------------------------------------- assembly
@@ -555,6 +559,8 @@ class Circuit:
         self._mixture_loss.clear()
         self._mixture_supply.clear()
         self.locate_commutations = not self._mixtures and any(isinstance(el, Diode) for el in net.elements)
+        self._state_diode_groups = ()
+        self._device_bindings.clear()
         self._consistent = None  # new parameters (a set event) may move the loops' and cutsets' constraints
         self._consistent_constraints = None
         self._transforms = tuple((index, T, np.linalg.inv(T)) for index, T in nb.transforms)
@@ -948,21 +954,31 @@ class Circuit:
         self._direct_mode_key = topology.mode.key[:2] if dynamic else None
         return True
 
-    def _refresh_device_evaluator(self) -> bool:
+    def _refresh_device_evaluator(self, topology: Optional[Topology] = None) -> bool:
         """Select the compiled scalar evaluator for the current structural mode."""
         holder = getattr(self, "_device_runtime", None)
         if holder is None:
             return False
-        topology = self.netlist.topology()
-        evaluator = self.netlist.scalar_margin_evaluator(topology)
-        holder[:] = self.netlist, topology, (
-            self.netlist._dynamic_scalar_function(topology)
-            if any(transformer.constant is None
-                   for transformer in self.netlist._transformers)
-            else self.netlist._scalar_function(topology, "all")
+        self.netlist._last = None
+        topology = self.netlist.topology() if topology is None else topology
+        margin_key = self.netlist.scalar_margin_key(topology)
+        dynamic = any(
+            transformer.constant is None for transformer in self.netlist._transformers
         )
-        self._margin_evaluator_key = self.netlist.scalar_margin_key(topology)
-        self._margin_evaluator = evaluator
+        key = (topology.mode.key, margin_key[1])
+        binding = None if dynamic else self._device_bindings.get(key)
+        if binding is None:
+            binding = topology, self.netlist.scalar_margin_evaluator(topology), (
+                self.netlist._dynamic_scalar_function(topology)
+                if dynamic
+                else self.netlist._scalar_function(topology, "all")
+            )
+            if not dynamic:
+                self._device_bindings[key] = binding
+        topology, margin, evaluate = binding
+        holder[:] = self.netlist, topology, evaluate
+        self._margin_evaluator_key = margin_key
+        self._margin_evaluator = margin
         return True
 
     def _compile_device_runtime(self, *, lazy: bool = False) -> bool:
@@ -1190,26 +1206,37 @@ class Circuit:
     def held_inputs_changed(self, targets: Sequence[tuple[Any, str]]) -> None:
         """Select the compiled mode after held circuit inputs changed at a boundary."""
         if any((id(record), field) in self._structural_targets for record, field in targets):
+            boundary = self._boundary_mode()
+            previous = self._boundary_signature
+            if (previous is not None
+                    and boundary[0] == previous[0]
+                    and boundary[1] != previous[1]
+                    and self._commutate_state_diodes()):
+                self._boundary_signature = boundary
+                return
             self._refresh_device_evaluator()
 
-    def _refresh_device_mode(self) -> None:
+    def _refresh_device_mode(self, topology: Optional[Topology] = None) -> None:
         """Bind or regenerate the equations selected by the current structural mode."""
         if self._device_stage_pending:
             self._device_stage_pending = False
             if self._compile_device_stages():
+                self.netlist._last = None
                 for view in self._views:
                     view.update_circuit_dependencies(self)
                 self.plan_changed = True
                 return
         if self._direct_dynamic:
-            if self.netlist.topology().mode.key[:2] == self._direct_mode_key:
+            self.netlist._last = None
+            selected = self.netlist.topology() if topology is None else topology
+            if selected.mode.key[:2] == self._direct_mode_key:
                 return
             self._compile_device_stages()
             for view in self._views:
                 view.update_circuit_dependencies(self)
             self.plan_changed = True
         else:
-            self._refresh_device_evaluator()
+            self._refresh_device_evaluator(topology)
 
     # ---------------------------------------------------------------- mode changes and diodes
     def _pattern(self, mode: Any = None) -> tuple[bool, ...]:
@@ -1249,9 +1276,44 @@ class Circuit:
         output = evaluation.output if evaluation.output is not None else net.outputs()
         return self._margin_evaluator(output)
 
+    def commutation_state_guards(self) -> Optional[tuple[tuple[int, float], ...]]:
+        """Replace diode-output guards by proved signed state guards when possible.
+
+        A conducting diode and every blocking diode tied to the opposite direction of
+        the same scalar current can change mode only when that current reaches zero.
+        Returning ``None`` keeps the full netlist margin, notably while all diodes in a
+        group are blocking and their terminal voltages decide which one turns on.
+        """
+        if self._mixtures or self._hooks:
+            return None
+        net = self.netlist
+        evaluation = net._last
+        runtime = getattr(self, "_device_runtime", None)
+        bound_topology = runtime[1] if runtime is not None else None
+        mode = net.mode()
+        topology = (
+            bound_topology
+            if bound_topology is not None and bound_topology.mode.key == mode.key else
+            evaluation.topology
+            if (evaluation is not None and evaluation.t == self.t
+                and evaluation.topology.mode.key == mode.key) else
+            net.topology(mode)
+        )
+        groups, guards = net.state_diode_guard_plan(topology)
+        self._state_diode_groups = groups
+        return guards
+
     def commutate(self, t: float) -> None:
         """Find the consistent diode pattern and jump the states into it (charge and flux conservation);
         then let the components mirror the conduction (``NetlistBuilder.commutation``)."""
+        boundary = self._boundary_mode()
+        previous_boundary = self._boundary_signature
+        if (previous_boundary is not None
+                and boundary[0] == previous_boundary[0]
+                and boundary[1] != previous_boundary[1]
+                and self._commutate_state_diodes()):
+            self._boundary_signature = boundary
+            return
         net, before = self.netlist, self.gather()
         try:
             y, loss = net.commutate(t, self._states())
@@ -1267,7 +1329,7 @@ class Circuit:
                       for c, n, z, i in self.layout if c is comp})
         if self._hooks:
             self._mirrored = self._pattern()
-        self._boundary_signature = self._boundary_mode()
+        self._boundary_signature = boundary
         self._refresh_device_mode()
 
     def _boundary_mode(self) -> tuple:
@@ -1285,6 +1347,20 @@ class Circuit:
             self.commutate(t)
         else:
             self._refresh_device_evaluator()
+
+    def _commutate_state_diodes(self) -> bool:
+        """Apply a gate-only mode change through proved current relations."""
+        if not self._state_diode_groups or self._hooks:
+            return False
+        topology = self.netlist.select_state_diode_mode(
+            self._states(), self._state_diode_groups
+        )
+        if topology is None:
+            return False
+        self._consistent = topology.mode.key
+        self._consistent_constraints = topology.constraint_key()
+        self._refresh_device_mode(topology)
+        return True
 
     def consistent_state(self, t: float) -> None:
         """Project the states onto the present mode without recording a jump (audit states)."""

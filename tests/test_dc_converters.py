@@ -7,6 +7,7 @@ import pytest
 
 import peslite
 from conftest import EXAMPLES
+from peslite.assembly.circuit import Circuit
 from peslite.assembly.params import ConfigError, from_dict
 from peslite.components import HalfBridge, HalfBridgeDiodeConduction, PWMAveragingModel
 from peslite.assembly.conduction import DiodeConduction
@@ -381,6 +382,29 @@ def test_light_load_enters_dcm_without_a_mode_setting(tmp_path):
 
     assert current.min() >= -1e-12
     assert np.count_nonzero(np.isclose(current, 0.0, atol=1e-10)) > 2
+
+
+def test_switching_diode_guard_is_derived_from_the_inductor_state():
+    simulation = peslite.Simulation(_case(model="switching", t_end=1e-4))
+    circuit = next(
+        subsystem for subsystem in simulation.system.model.subsystems
+        if isinstance(subsystem, Circuit)
+    )
+    net = circuit.netlist
+    for selected in range(2):
+        for index, diode in enumerate(net._diodes):
+            net.set_conducting(diode, index == selected)
+        circuit.release_topology()
+        net.state_diode_relations()
+    groups, guards = net.state_diode_guard_plan(net.topology())
+    assert guards == ((1, 1.0),)
+    assert groups == ((1, ((0, -1.0), (1, 1.0))),)
+
+    net.set_conducting(net._diodes[1], False)
+    net.set_conducting(net._diodes[0], True)
+    circuit.release_topology()
+    _groups, guards = net.state_diode_guard_plan(net.topology())
+    assert guards == ((1, -1.0),)
 
 
 @pytest.mark.parametrize("load,expected_voltage,expected_total", [

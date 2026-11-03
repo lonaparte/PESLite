@@ -90,6 +90,18 @@ def test_boundary_only_commutation_settles_without_interval_location():
     assert y[0] == pytest.approx(0.5, abs=1e-12)
 
 
+def test_zero_state_guard_still_settles_the_boundary_mode():
+    part = _Ramp()
+    part.commutation_state_guards = lambda: ((0, 1.0),)
+    part.commutation_margin = lambda: -1.0 if part.flag == 0 else 1.0
+    _model, handler = _handler(part)
+
+    y = handler.advance(0.0, 0.1, np.zeros(1))
+
+    assert part.at == [0.0]
+    assert y[0] == pytest.approx(0.1, abs=1e-12)
+
+
 def test_zero_margin_plateau_does_not_move_the_commutation_to_its_start():
     part = _Ramp()
     part.commutation_margin = lambda: (
