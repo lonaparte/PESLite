@@ -47,6 +47,30 @@ jobs:
         run: python -m pytest
 
 
+  test-minimum-python:
+    name: Test Python 3.10.1
+    runs-on: ubuntu-24.04
+    container: python:3.10.1-bullseye
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Verify Python version
+        run: python -c "import sys; assert sys.version_info[:3] == (3, 10, 1)"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[test]"
+
+      - name: Run pytest
+        run: python -m pytest
+
+
   reference-test:
     name: Compare with motulator
     runs-on: ubuntu-24.04
@@ -102,6 +126,7 @@ jobs:
     name: Build distribution
     needs:
       - test
+      - test-minimum-python
       - reference-test
       - onnx-test
     runs-on: ubuntu-24.04
@@ -212,7 +237,7 @@ jobs:
       - name: Test installed CLI
         run: |
           peslite --help
-          peslite gfl-example --list-states > /tmp/peslite-states.txt
+          peslite inspect gfl-example --states > /tmp/peslite-states.txt
           test -s /tmp/peslite-states.txt
           head -n 10 /tmp/peslite-states.txt
 
@@ -291,6 +316,6 @@ jobs:
       - name: Verify PyPI CLI
         run: |
           peslite --help
-          peslite gfl-example --list-states > /tmp/peslite-states.txt
+          peslite inspect gfl-example --states > /tmp/peslite-states.txt
           test -s /tmp/peslite-states.txt
           head -n 10 /tmp/peslite-states.txt
