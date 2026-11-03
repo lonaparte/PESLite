@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,22 +7,22 @@ name = "peslite"
 version = "0.4.0"
 description = "Open-source, lightweight, multirate, and extensible power electronics simulator in Python. Designed as a deterministic simulation backend for LLM reasoning."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10.1"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 dependencies = [
-    "numpy>=1.24",
-    "scipy>=1.10",
-    "PyYAML>=6.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "PyYAML>=6.0.0",
 ]
 
 [project.optional-dependencies]
-plot = ["matplotlib>=3.7"]
-all = ["matplotlib>=3.7", "onnx>=1.17", "onnxruntime>=1.18"]
-test = ["pytest>=7", "matplotlib>=3.7"]
+plot = ["matplotlib>=3.7.0"]
+all = ["matplotlib>=3.7.0", "onnx>=1.17.0", "onnxruntime>=1.18.0"]
+test = ["pytest>=7.0.0", "matplotlib>=3.7.0"]
 reference = ["motulator==0.21.0; python_version >= '3.12'"]
-pyspice = ["PySpice==1.5"]
-onnx = ["onnx>=1.17", "onnxruntime>=1.18"]
+pyspice = ["PySpice==1.5.0"]
+onnx = ["onnx>=1.17.0", "onnxruntime>=1.18.0"]
 
 [project.scripts]
 peslite = "peslite.solver.simulation:main"
