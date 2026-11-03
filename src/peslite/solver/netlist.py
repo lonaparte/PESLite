@@ -1840,6 +1840,9 @@ class Netlist:
         self._scalar_margin_functions: "OrderedDict[tuple, Callable]" = OrderedDict()
         self._state_diode_relations: dict[int, Optional[tuple[int, float]]] = {}
         self._state_diode_structures: dict[int, set[tuple]] = {}
+        self._state_diode_groups: Optional[
+            tuple[tuple[int, tuple[tuple[int, float], ...]], ...]
+        ] = None
         self._state_diode_modes: dict[tuple, tuple[tuple[bool, ...], Topology]] = {}
         self._state_diode_guards: dict[tuple, Optional[tuple[tuple[int, float], ...]]] = {}
         self._scalar_topology: Optional[Topology] = None
@@ -1943,6 +1946,7 @@ class Netlist:
         self._scalar_margin_functions.clear()
         self._state_diode_relations.clear()
         self._state_diode_structures.clear()
+        self._state_diode_groups = None
         self._state_diode_modes.clear()
         self._state_diode_guards.clear()
         self._scalar_topology = None
@@ -1996,26 +2000,34 @@ class Netlist:
                     transformer.constant is None for transformer in self._transformers
                 )):
             return ()
-        inductor_states = set()
-        for element in self._inductors:
-            for branch_index in self._ports[id(element)]:
-                branch = self._branches[branch_index]
-                if branch.x >= 0:
-                    inductor_states.update(range(branch.x, branch.x + branch.dim))
+        topology = self.topology() if topology is None else topology
+        structure = topology.mode.key[:2]
+        pending = tuple(
+            (diode_index, diode)
+            for diode_index, diode in enumerate(self._diodes)
+            if topology.mode.conducting[diode_index]
+            and structure not in self._state_diode_structures.get(diode_index, ())
+        )
+        if not pending:
+            return self._state_diode_groups or ()
+
+        inductor_states = {
+            state
+            for element in self._inductors
+            for branch_index in self._ports[id(element)]
+            for branch in (self._branches[branch_index],)
+            if branch.x >= 0
+            for state in range(branch.x, branch.x + branch.dim)
+        }
         if not inductor_states:
             return ()
 
-        topology = self.topology() if topology is None else topology
-        structure = topology.mode.key[:2]
-        for diode_index, diode in enumerate(self._diodes):
-            if (not topology.mode.conducting[diode_index]
-                    or structure in self._state_diode_structures.get(diode_index, ())):
-                continue
+        state_space = topology.state_space
+        for diode_index, diode in pending:
             branch = self.output_slice("branch_current", diode)
             if branch.stop - branch.start != 1:
                 self._state_diode_relations[diode_index] = None
                 continue
-            state_space = topology.state_space
             current = state_space.C[branch.start]
             active = np.flatnonzero(np.abs(current) > 1e-12)
             if (active.size != 1
@@ -2037,12 +2049,17 @@ class Netlist:
             self._state_diode_structures.setdefault(diode_index, set()).add(structure)
         if (len(self._state_diode_relations) != len(self._diodes)
                 or any(relation is None for relation in self._state_diode_relations.values())):
+            self._state_diode_groups = None
             return ()
         relations: dict[int, list[tuple[int, float]]] = {}
         for diode_index, relation in self._state_diode_relations.items():
             state, direction = relation
             relations.setdefault(state, []).append((diode_index, direction))
-        return tuple((state, tuple(items)) for state, items in relations.items())
+        if self._state_diode_groups is None:
+            self._state_diode_groups = tuple(
+                (state, tuple(items)) for state, items in relations.items()
+            )
+        return self._state_diode_groups
 
     def state_diode_guard_plan(
             self, topology: Topology

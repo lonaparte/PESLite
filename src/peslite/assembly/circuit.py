@@ -1195,6 +1195,8 @@ class Circuit:
 
     def freeze_topology(self) -> None:
         """Keep the present netlist topology throughout one smooth integration attempt."""
+        if self._bound_device_topology() is not None:
+            return
         self.netlist.freeze_topology()
         if any(transformer.constant is None for transformer in self.netlist._transformers):
             self._refresh_device_evaluator()
@@ -1202,6 +1204,14 @@ class Circuit:
     def release_topology(self) -> None:
         """Read topology callbacks again at the next model-changing boundary."""
         self.netlist.release_topology()
+
+    def _bound_device_topology(self) -> Optional[Topology]:
+        """Return the fixed topology already selected by the device runtime, if any."""
+        runtime = getattr(self, "_device_runtime", None)
+        if (runtime is None or runtime[1] is None
+                or any(transformer.constant is None for transformer in self.netlist._transformers)):
+            return None
+        return runtime[1]
 
     def held_inputs_changed(self, targets: Sequence[tuple[Any, str]]) -> None:
         """Select the compiled mode after held circuit inputs changed at a boundary."""
@@ -1288,17 +1298,15 @@ class Circuit:
             return None
         net = self.netlist
         evaluation = net._last
-        runtime = getattr(self, "_device_runtime", None)
-        bound_topology = runtime[1] if runtime is not None else None
-        mode = net.mode()
-        topology = (
-            bound_topology
-            if bound_topology is not None and bound_topology.mode.key == mode.key else
-            evaluation.topology
-            if (evaluation is not None and evaluation.t == self.t
-                and evaluation.topology.mode.key == mode.key) else
-            net.topology(mode)
-        )
+        topology = self._bound_device_topology()
+        if topology is None:
+            mode = net.mode()
+            topology = (
+                evaluation.topology
+                if (evaluation is not None and evaluation.t == self.t
+                    and evaluation.topology.mode.key == mode.key) else
+                net.topology(mode)
+            )
         groups, guards = net.state_diode_guard_plan(topology)
         self._state_diode_groups = groups
         return guards

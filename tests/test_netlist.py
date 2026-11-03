@@ -14,7 +14,7 @@ from peslite.assembly.circuit import Circuit, NetworkView, bind_device, declare_
 from peslite.components.network import ACVoltageSource
 from peslite.solver import FixedStepSolver
 from peslite.solver.netlist import (Capacitor, CurrentSource, Diode, Inductor, Netlist, Node,
-                                    Resistor, StateSpace, Transformer, VoltageSource)
+                                    Resistor, StateSpace, Switch, Transformer, VoltageSource)
 
 
 FORMS = ("statewise", "mna")
@@ -184,17 +184,27 @@ def test_scalar_reduction_does_not_treat_parallel_branches_as_a_series_path():
 
 def test_diode_state_relation_is_proved_from_compiled_network_equations():
     net = Netlist("device")
-    source, middle, winding = Node(), Node(), Node()
+    source, middle, winding, switched, load = Node(), Node(), Node(), Node(), Node()
     diode = Diode(source, middle)
+    closed = False
     net.add(
         VoltageSource(source, None, lambda _t: 10.0),
         diode,
         Resistor(middle, winding, 2.0),
         Inductor(winding, None, 1e-3, [0]),
+        VoltageSource(switched, None, lambda _t: 1.0),
+        Switch(switched, load, lambda: closed),
+        Resistor(load, None, 1.0),
     )
 
     net.set_conducting(diode, True)
-    assert net.state_diode_relations() == ((0, ((0, 1.0),)),)
+    relations = net.state_diode_relations()
+    assert relations == ((0, ((0, 1.0),)),)
+    assert net.state_diode_relations() is relations
+
+    closed = True
+    assert net.state_diode_relations() is relations
+    assert len(net._state_diode_structures[0]) == 2
 
     parallel = Netlist("device")
     source, middle, winding = Node(), Node(), Node()
@@ -207,6 +217,24 @@ def test_diode_state_relation_is_proved_from_compiled_network_equations():
     parallel.add(CurrentSource(middle, None, lambda _t: 1.0))
     parallel.set_conducting(parallel._diodes[0], True)
     assert parallel.state_diode_relations() == ()
+
+
+@pytest.mark.parametrize("circuit_model, frozen", [("device", False), ("statewise", True)])
+def test_circuit_freezes_only_when_its_runtime_has_not_bound_the_topology(
+        circuit_model, frozen):
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "buck-example.pes",
+        **QUIET,
+        **{
+            "simulation.solver.circuit_model": circuit_model,
+            "units.converter.bridge.model": "switching",
+        },
+    ))
+    circuit, = simulation.system.circuits
+
+    circuit.freeze_topology()
+    assert (circuit.netlist._frozen_topology is not None) is frozen
+    circuit.release_topology()
 
 
 def _final(example: str, circuit_model: str, out_dir: Path) -> tuple[peslite.Simulation, dict]:
