@@ -213,7 +213,11 @@ jobs:
       - name: Test Python import
         run: |
           python - <<'PY'
+          from importlib.metadata import version
+
           import peslite
+
+          assert peslite.__version__ == version("peslite")
 
           print("peslite module:", peslite.__file__)
           print("peslite version:", peslite.__version__)
