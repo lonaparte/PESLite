@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0
+## 0.5.0
 
 - Added `run`, `validate`, `inspect` and `export` commands with a shared strict JSON result envelope,
   stable lifecycle status and exit codes. Optional wall-time and RHS limits stop at existing event
@@ -24,6 +24,18 @@
 - Deferred unused ratio-dependent network factorization, cached symbolic hashes and skipped empty
   diode work. Adaptive solvers retain the last full warm-start step, automatic stiffness detection uses
   a conservative Jacobian bound, and native CSV histories use one buffered writer.
+- Added `peslite create` with simulation, component and controller templates that follow the ordinary
+  project workspace and add-on discovery rules.
+- Allowed bus objects without implicit shunt capacitance while retaining the same named connection,
+  measurement and optional passive-device interfaces.
+- Split the Python distribution into composable `peslite-core`, `peslite`, `peslite-frontend` and
+  `peslite-full` packages under the same `peslite` import namespace. The default package adds the
+  built-in add-ons and examples; the full package adds the frontend and ONNX support.
+- Updated release automation to build, verify and publish all four distributions behind one approval,
+  and set the minimum supported Python version to 3.10.1.
+
+## 0.4.0
+
 - Added single-phase AC network sources through ordinary scalar power ports and assembly-time
   electrical-domain constraints on inherently AC or DC terminals. Also made ADC window integration
   follow the configured physical sampling grid, and added open-loop duty control, the traceable
