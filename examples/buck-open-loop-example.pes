@@ -1,4 +1,4 @@
-# PESLite 0.4.0
+# PESLite 0.5.0
 # Open-loop synchronous Buck. The duty command is a controller reference and is changed by the
 # event below. The filter, output capacitor and load remain ordinary network components.
 

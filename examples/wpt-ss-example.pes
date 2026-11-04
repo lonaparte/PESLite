@@ -1,4 +1,4 @@
-# PESLite 0.4.0
+# PESLite 0.5.0
 # SS WPT with primary-side power feedback driving modulation amplitude.
 # Both sides measure only their own port. Positive power leaves each converter.
 # The existing ADC averages instantaneous power over its PWM/control interval.
