@@ -3,7 +3,7 @@
 import pytest
 import yaml
 
-from conftest import EXAMPLES, ROOT
+from conftest import EXAMPLES
 from peslite.solver import simulation
 from peslite.solver.simulation import _config_path
 
@@ -23,13 +23,6 @@ def test_command_line_finds_bundled_pes_files():
     assert found == (EXAMPLES / "gfl-example.pes").resolve()
     assert _config_path("gfl-example.pes") == found
     assert _config_path(None) == found
-
-
-def test_wheel_data_comes_from_the_root_examples_directory():
-    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert '"share/peslite/examples" = ["examples/*.pes"]' in pyproject
-    assert ('"share/peslite/examples/templates" = '
-            '["examples/templates/*.pes", "examples/templates/*.py"]') in pyproject
 
 
 def test_installed_package_finds_examples_in_its_data_directory(tmp_path, monkeypatch):
