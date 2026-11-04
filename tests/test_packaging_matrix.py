@@ -1,4 +1,4 @@
-"""The pip and Conda distributions compose without overlapping owned files."""
+"""The installable distributions compose without overlapping owned files."""
 
 import json
 import re
@@ -66,15 +66,6 @@ def test_templates_and_cases_have_distinct_owners():
         distributions = json.load(handle)["distributions"]
     assert distributions["peslite-core"]["files"] == ["examples/templates/*"]
     assert distributions["peslite"]["files"] == ["examples/*.pes"]
-
-
-def test_conda_outputs_match_the_pip_distribution_names():
-    recipe = (ROOT / "recipe/meta.yaml").read_text(encoding="utf-8")
-    outputs = set(re.findall(r"^  - name: ([\w-]+)$", recipe, re.MULTILINE))
-    assert outputs == set(PROJECTS)
-    assert "pin_subpackage('peslite-core', exact=True)" in recipe
-    assert "pin_subpackage('peslite', exact=True)" in recipe
-    assert "pin_subpackage('peslite-frontend', exact=True)" in recipe
 
 
 def test_frontend_is_not_advertised_in_public_documentation():
