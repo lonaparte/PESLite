@@ -10,7 +10,7 @@ from peslite.addons import control as addon_control
 from peslite.addons.components.cable import CableModel
 from peslite.assembly.params import runtime_changeable
 from peslite.addons.control.voltage_adaptive_pll import VoltageAdaptivePLL
-from peslite.components import ELEMENT_TYPES
+from peslite.components.network import ELEMENT_TYPES
 from peslite.control import LOOP_TYPES, Loop
 
 
@@ -84,7 +84,9 @@ def test_addon_entry_points_match_builtin_public_apis():
     assert set(peslite.control.__all__) < set(addon_control.__all__)
     assert set(peslite.components.__all__) < set(addon_components.__all__)
     assert addon_control.LOOP_TYPES is LOOP_TYPES
-    assert addon_components.ELEMENT_TYPES is ELEMENT_TYPES
+    assert not {"Element", "NetworkComponent", "ELEMENT_TYPES"} & set(
+        addon_components.__all__
+    )
 
 
 def test_cable_model_has_two_inward_ports_and_closes_its_power_balance():
@@ -171,15 +173,25 @@ class ProjectLocalPLL(Loop):
     )
     (components / "project_local_element.py").write_text(
         """from dataclasses import dataclass
-from peslite.addons.components import Load, register_component_type
+from peslite.addons.components import register_component_type
+from peslite.solver import netlist as nl
 
 @register_component_type
-class ProjectLocalElement(Load):
-    @dataclass(frozen=True, kw_only=True)
-    class Params(Load.Params):
-        type: str = "project_local_element"
+@dataclass(frozen=True, kw_only=True)
+class ProjectLocalElement:
+    bus: str
+    l: float
+    r: float
+    type: str = "project_local_element"
 
-    type = "project_local_element"
+    def network(self, n):
+        middle = n.internal()
+        n.add(
+            nl.Resistor(n.bus, middle, self.r),
+            nl.Inductor(middle, n.ground, self.l, n.state("i")),
+        )
+        n.port_output("i", "bus", "current")
+        n.losses()
 """,
         encoding="utf-8",
     )

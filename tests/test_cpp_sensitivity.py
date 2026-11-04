@@ -11,7 +11,7 @@ import peslite
 from peslite.assembly import cpp
 from peslite.solver import model as kernel
 from peslite.assembly.cpp import _ModelGenerator, _RuntimeParameters
-from peslite.components import Element, register_component_type
+from peslite.components.network import Element, _register_assembled_type
 from peslite.solver import Bag, Model
 from test_cpp_equations import _Feedback
 from test_cpp_parameters import _case, _compare_run, _compile, _table
@@ -26,7 +26,7 @@ class _Parameters:
     changes: tuple = ()
 
 
-@register_component_type
+@_register_assembled_type
 class _FeedbackElement(Element):
     type = "test_sensitive_feedback"
 

@@ -13,8 +13,8 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, ClassVar
 
-from . import (Bag, ConfigError, Element, Empty, NetworkComponent, Port, StoragePort,
-               register_component_type)
+from ...components.network import Element, NetworkComponent, _register_assembled_type
+from ...solver import Bag, ConfigError, Empty, Port, StoragePort
 
 __all__ = ["Cable", "CableModel"]
 
@@ -109,7 +109,7 @@ class CableModel(NetworkComponent):
         nb.losses(self)
 
 
-@register_component_type
+@_register_assembled_type
 class Cable(Element):
     """Registered long-cable element using SI per-kilometre parameters."""
 

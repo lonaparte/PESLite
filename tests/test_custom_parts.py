@@ -10,13 +10,15 @@ import pytest
 import peslite
 from peslite.assembly import Event, register_event_type
 from peslite.assembly.params import ConfigError, from_dict
-from peslite.components import ELEMENT_TYPES, Element, RLBranch, register_component_type
+from peslite.components import RLBranch, register_component_type
+from peslite.components.network import ELEMENT_TYPES, Element, _register_assembled_type
 from peslite.control import ANGLE, FREQUENCY, V_AB, V_DQ, Loop, SyncLaw, register_loop_type
 from peslite.solver import SolverStep
 
 
 def test_declarative_component_builds_ports_states_and_network_plan(case, tmp_path):
     from peslite.assembly.circuit import compile_network
+    from peslite.assembly.cpp import _ModelGenerator
     from peslite.solver import netlist as nl
 
     @register_component_type
@@ -67,6 +69,9 @@ def test_declarative_component_builds_ports_states_and_network_plan(case, tmp_pa
     assembled = simulation.system.named_elements["rc"].model
     assert assembled.state_names == ("u",)
     assert assembled.state.u == 0j
+    generator = _ModelGenerator(simulation, None)
+    generated = "\n".join(generator.body())
+    assert generator.value(assembled.state, "u") in generated
     simulation.run(out_dir=tmp_path / "declarative")
     assert simulation.system.named_elements["rc"].cfg.r == 4.0
 
@@ -143,7 +148,7 @@ class _TrackingOscillator(Loop):
         return self.phase, self.unit.base.w0, 1.0 + 0j, self.unit.base.w0, 0.0
 
 
-@register_component_type
+@_register_assembled_type
 class _ShuntRL(Element):
     @dataclass(frozen=True, kw_only=True)
     class Params:

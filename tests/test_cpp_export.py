@@ -16,7 +16,8 @@ import yaml
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import from_dict
-from peslite.components import Bag, Element, Port, register_component_type
+from peslite.components import Bag, Port
+from peslite.components.network import Element, _register_assembled_type
 from peslite.solver import BlackBoxSubsystem
 from test_measurement_network import load_case
 
@@ -61,7 +62,7 @@ class _ConditionalModel:
         return ((self.input.u - resistance * self.state.i) / self.inductance,)
 
 
-@register_component_type
+@_register_assembled_type
 class _ConditionalElement(Element):
     type = "test_conditional_element"
 
@@ -94,7 +95,7 @@ class _ConditionalElement(Element):
                 f"{self.name}.i_mag": abs(self.model.output.i)}
 
 
-@register_component_type
+@_register_assembled_type
 class _BlackBoxElement(Element):
     type = "test_black_box"
 
@@ -129,7 +130,7 @@ class _BlackBoxElement(Element):
         return {f"{self.name}.y": self.model.output.y}
 
 
-@register_component_type
+@_register_assembled_type
 class _DiscreteBlackBoxElement(Element):
     type = "test_discrete_black_box"
 

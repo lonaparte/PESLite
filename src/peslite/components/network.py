@@ -17,8 +17,7 @@ from ..solver.energy import Port, StoragePort
 from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _complex, _real
 
 __all__ = [
-    "Port", "NetworkComponent", "ComponentDefinition", "ACVoltageSource", "RLBranch", "RCNode",
-    "Element", "ELEMENT_TYPES", "register_component_type",
+    "Port", "ACVoltageSource", "RLBranch", "RCNode", "register_component_type",
     "element_buses", "Load", "Resistor", "VoltageSource",
 ]
 
@@ -372,7 +371,7 @@ def _register_definition(cls: type, params: type, constructor: Callable) -> type
 
 
 def _register_assembled_type(cls: type) -> type:
-    """Register an assembly-aware :class:`Element` class."""
+    """Register a package-owned assembly adapter."""
     return _register_definition(cls, getattr(cls, "Params", None), cls)
 
 
@@ -618,9 +617,7 @@ class _ConfiguredComponent(Element):
 
 
 def register_component_type(cls: type) -> type:
-    """Register a direct electrical dataclass or an assembly-aware :class:`Element`."""
-    if isinstance(cls, type) and issubclass(cls, Element):
-        return _register_assembled_type(cls)
+    """Register a frozen electrical parameter dataclass declaring ``network(builder)``."""
     if not is_dataclass(cls):
         raise TypeError("a declarative component type must be a dataclass")
     if not cls.__dataclass_params__.frozen:
@@ -634,7 +631,7 @@ def register_component_type(cls: type) -> type:
     )
 
 
-@register_component_type
+@_register_assembled_type
 class Load(Element):
     """Built-in series R-L load from ``bus`` to ground; a small impedance models a fault."""
 
@@ -728,7 +725,7 @@ class _ResistorModel(NetworkComponent):
         nb.losses(self)
 
 
-@register_component_type
+@_register_assembled_type
 class Resistor(Element):
     """Shunt resistance, or a series resistance inserted after a bus's voltage driver."""
 
@@ -820,7 +817,7 @@ class _VoltageSourceModel(NetworkComponent):
         nb.supplies(self)
 
 
-@register_component_type
+@_register_assembled_type
 class VoltageSource(Element):
     """Scalar named-bus voltage source behind a positive series resistance."""
 

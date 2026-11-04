@@ -62,6 +62,13 @@ def test_dependency_analysis_matches_mutual_reachability():
             assert set(residual) == {node for member in cyclic for node in reach[member]}
 
 
+def test_component_plan_orders_acyclic_nodes_and_condensed_cycles():
+    dependencies = ((), (0,), (1, 3), (2,), (3,), (4,), ())
+    assert kernel._component_plan(dependencies) == (
+        (0,), (6,), (1,), (2, 3), (4,), (5,),
+    )
+
+
 def test_residual_analysis_does_not_depend_on_the_python_recursion_limit():
     dependencies = [{0}] + [{node - 1} for node in range(1, 2500)]
     successors = _successors(dependencies)

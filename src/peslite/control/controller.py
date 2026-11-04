@@ -20,7 +20,8 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
-from ..solver.model import Bag, ConfigError, _complex, _real, gather, scatter
+from ..solver.model import (Bag, ConfigError, _complex, _component_plan, _dependency_plan,
+                            _real, gather, scatter)
 from ..solver.energy import Port, port_power
 from ..solver.timing import control_clock_offset
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
@@ -454,28 +455,30 @@ class ControlGraph:
                 owner = source.partition(".")[0]
                 if owner in self.nodes:
                     dependencies[name].add(owner)
-        self.order = []
+        names = tuple(dependencies)
+        positions = {name: index for index, name in enumerate(names)}
+        numeric_dependencies = tuple(
+            tuple(positions[dependency] for dependency in dependencies[name])
+            for name in names
+        )
         if not self.continuous:
-            pending = {name: set(deps) for name, deps in dependencies.items()}
-            while pending:
-                ready = [n for n, deps in pending.items() if not deps]
-                if not ready:
-                    raise ConfigError(
-                        "ctrl.connections: instantaneous cycle in sampled control; "
-                        "store one dependency's previous sample inside its owning loop"
-                    )
-                for name in ready:
-                    self.order.append(name)
-                    pending.pop(name)
-                for deps in pending.values():
-                    deps.difference_update(ready)
+            plan = _dependency_plan(numeric_dependencies)
+            if plan.residual:
+                raise ConfigError(
+                    "ctrl.connections: instantaneous cycle in sampled control; "
+                    "store one dependency's previous sample inside its owning loop"
+                )
+            self.order = [names[index] for index in plan.order]
             self._continuous_plan = tuple((name,) for name in self.order)
             self._continuous_cycles = frozenset()
         else:
             # A continuous control graph may contain algebraic feedback between loops.  Collapse
             # its strongly connected components now: acyclic components retain the ordinary
             # one-pass path, while only a genuinely cyclic component is iterated at RHS time.
-            component_plan = self._continuous_components(dependencies)
+            component_plan = tuple(
+                tuple(names[index] for index in component)
+                for component in _component_plan(numeric_dependencies)
+            )
             self._continuous_plan = component_plan
             self._continuous_cycles = frozenset(
                 group for group in component_plan
@@ -539,69 +542,6 @@ class ControlGraph:
     def clear_limit(self, name):
         if self._limits.pop(name, None) is not None:
             self._samples[name] = self.nodes[name].sample
-
-    @staticmethod
-    def _continuous_components(dependencies):
-        """Return SCCs of a loop dependency graph in condensation-graph signal order."""
-        names = tuple(dependencies)
-        rank = {name: i for i, name in enumerate(names)}
-        successors = {name: [] for name in names}
-        for name, deps in dependencies.items():
-            for dependency in deps:
-                successors[dependency].append(name)
-
-        index = 0
-        stack = []
-        on_stack = set()
-        indices = {}
-        low = {}
-        components = []
-
-        def visit(name):
-            nonlocal index
-            indices[name] = low[name] = index
-            index += 1
-            stack.append(name)
-            on_stack.add(name)
-            for nxt in successors[name]:
-                if nxt not in indices:
-                    visit(nxt)
-                    low[name] = min(low[name], low[nxt])
-                elif nxt in on_stack:
-                    low[name] = min(low[name], indices[nxt])
-            if low[name] == indices[name]:
-                component = []
-                while True:
-                    member = stack.pop()
-                    on_stack.remove(member)
-                    component.append(member)
-                    if member == name:
-                        break
-                components.append(tuple(sorted(component, key=rank.get)))
-
-        for name in names:
-            if name not in indices:
-                visit(name)
-
-        owner = {name: i for i, group in enumerate(components) for name in group}
-        compact_deps = [set() for _ in components]
-        for name, deps in dependencies.items():
-            here = owner[name]
-            compact_deps[here].update(owner[dependency] for dependency in deps
-                                      if owner[dependency] != here)
-        pending = set(range(len(components)))
-        ordered = []
-        while pending:
-            ready = sorted(
-                (i for i in pending if not (compact_deps[i] & pending)),
-                key=lambda i: min(rank[name] for name in components[i]),
-            )
-            if not ready:
-                raise RuntimeError("internal error while ordering continuous control components")
-            for i in ready:
-                ordered.append(components[i])
-                pending.remove(i)
-        return tuple(ordered)
 
     def _rewire(self):
         """Resolve loop inputs and graph outputs against the current references."""

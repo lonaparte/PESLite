@@ -231,13 +231,11 @@ Their primary and secondary remain ordinary `DCConverter` units with independent
 shared compensated link uses the same netlist lowering as other electrical components.
 
 Named measurement bindings, independent series/shunt resistors and configured RMS windows use
-the same assembly as Python. `set` events may change an element scalar declared by its
-`parameter_bindings()` contract; the built-in resistor declares `r`. The generated parameter is
-shared by output and energy equations, and a load step does not recreate electrical/controller
-state. A retained initial resistance and a scheduled resistance step share that same model
-parameter. Starting a new run with different parameters is distinct from changing them during a
-run: event changes retain their existing state-continuity restrictions. RMS protection uses the
-common trip path, not a WPT phase override.
+the same assembly as Python. Supported element `set` targets use the same generated parameter in
+their output, energy and event equations, so a load step does not recreate electrical or controller
+state. Starting a new run with different parameters is distinct from changing them during a run:
+event changes retain their existing state-continuity restrictions. RMS protection uses the common
+trip path, not a WPT phase override.
 
 ## Current limitations
 
@@ -259,8 +257,8 @@ common trip path, not a WPT phase override.
 - Only parameters reported by `--list-params` can change in the compiled simulator.
 - Scheduled `set` events are lowered for controller references
   (`units.<unit>.ctrl.references.<name>`), source `v`, `f` and `angle`, connection commands and
-  element scalars declared by `parameter_bindings()`. Export refuses the other `set` targets that
-  a Python run accepts, with `event '<name>' writes unsupported variable '<path>'`: bus `c` and
+  supported element parameters. Export refuses the other `set` targets that a Python run accepts,
+  with `event '<name>' writes unsupported variable '<path>'`: bus `c` and
   `r_d`, branch and source `l` and `r`, controller loop parameters
   (`units.<unit>.ctrl.loops.<loop>.<field>`), protection settings (`units.<unit>.protection.*`),
   DC-link source values (`units.<unit>.dclink.source.*`) and element fields without a binding.
@@ -278,10 +276,7 @@ The native dispatcher shares scheduled boundaries, margin location, simultaneous
 state resets and the no-progress guard. Adaptive commutations require a finite `max_step`.
 Component-owned state projections, discharge-energy columns and diagnostics are exported too.
 
-Custom components declare mutable scalar equation memory with `equation_state_bindings()`, a
-mapping from local names to `(owner, attribute)` storage references. These bindings describe the
-existing memory; they do not create another state store or restart schema. `get_state()` and
-`set_state()` retain public restart names. Annotated scalar and void helper methods are traced
-at their existing boundaries to avoid multiplying unrelated branch paths. Component equations and
-state-changing callbacks are traced from their Python implementation; no converter-specific
-commutation equations are maintained in the backend.
+Custom electrical components are exported from the same declarative `network()` primitives used by
+Python; the backend does not require a second equation implementation. Package-owned dynamic
+components retain their existing state and restart schema when their callbacks are lowered, and no
+converter-specific commutation equations are maintained in the backend.

@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 from ..solver.model import BlackBoxSubsystem, ConfigError
-from .network import Element, register_component_type
+from .network import Element, _register_assembled_type
 
 __all__ = ["ONNXModel", "ONNXStateParams"]
 
@@ -198,7 +198,7 @@ class _ONNXInference:
         return flattened(self.public), flattened(self.next_hidden)
 
 
-@register_component_type
+@_register_assembled_type
 class ONNXModel(Element):
     """A configured, non-loading ONNX model connected to physical subsystem outputs."""
 

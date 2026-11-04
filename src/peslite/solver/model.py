@@ -1123,6 +1123,34 @@ def _dependency_plan(dependencies) -> _DependencyPlan:
     )
 
 
+def _ordered_components(graph: _DependencyPlan) -> tuple[tuple[int, ...], ...]:
+    """Return one analyzed graph's SCCs in condensation-graph order."""
+    if not graph.residual:
+        return tuple((node,) for node in graph.order)
+    components = tuple(sorted(
+        tuple((node,) for node in graph.order) + graph.components,
+        key=lambda component: min(component),
+    ))
+    owner = {
+        node: index for index, component in enumerate(components) for node in component
+    }
+    compact = tuple(tuple(sorted({
+        owner[dependency]
+        for node in component
+        for dependency in graph.dependencies[node]
+        if owner[dependency] != index
+    })) for index, component in enumerate(components))
+    condensation = _dependency_plan(compact)
+    if condensation.residual:
+        raise RuntimeError("internal error while ordering dependency components")
+    return tuple(components[index] for index in condensation.order)
+
+
+def _component_plan(dependencies) -> tuple[tuple[int, ...], ...]:
+    """Analyze dependencies and return their ordered strongly connected components."""
+    return _ordered_components(_dependency_plan(dependencies))
+
+
 class Model:
     """Connected subsystems evaluated as ``rhs(t, y)`` on a flat real state vector.
 
@@ -1463,7 +1491,7 @@ class Model:
         order, residual = list(graph.order), graph.residual
         if residual:
             # Residual nodes can be downstream of a loop. Only cyclic SCCs become solver groups.
-            components = [(node,) for node in order] + list(graph.components)
+            components = _ordered_components(graph)
             component_of = {node: ci for ci, component in enumerate(components) for node in component}
             compact_ops, compact_owners, compact_deps, compact_rhs = [], [], [], []
             for ci, component in enumerate(components):

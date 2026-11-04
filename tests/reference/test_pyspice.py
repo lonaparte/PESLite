@@ -25,23 +25,31 @@ if not (os.environ.get("NGSPICE_LIBRARY_PATH") or ctypes.util.find_library("ngsp
     pytest.skip("the PySpice comparisons need the ngspice shared library", allow_module_level=True)
 
 from PySpice.Spice.Netlist import Circuit
-from PySpice.Spice.NgSpice.Shared import NgSpiceShared
+from PySpice.Spice.NgSpice.Shared import NgSpiceCommandError, NgSpiceShared
 
 
 PYSPICE_VERSION = "1.5"
-MAX_SUPPORTED_NGSPICE_VERSION = 34
 pytestmark = [pytest.mark.full, pytest.mark.pyspice]
 
+
+class _ReferenceNgSpice(NgSpiceShared):
+    """Accept informational stderr emitted by newer ngspice shared libraries."""
+
+    def exec_command(self, command, join_lines=True):
+        try:
+            return super().exec_command(command, join_lines)
+        except NgSpiceCommandError:
+            messages = (*self._stdout, *self._stderr)
+            severe = ("error", "fatal", "panic", "run simulation(s) aborted")
+            if any(line.lstrip().lower().startswith(severe) for line in messages):
+                raise
+            return self.stdout if join_lines else list(self._stdout)
+
+
 try:
-    NGSPICE_VERSION = int(NgSpiceShared.new_instance().ngspice_version)
+    NGSPICE = _ReferenceNgSpice.new_instance()
 except (OSError, ValueError) as error:
     pytest.skip(f"ngspice is not usable through PySpice: {error}", allow_module_level=True)
-if NGSPICE_VERSION > MAX_SUPPORTED_NGSPICE_VERSION:
-    pytest.skip(
-        f"PySpice {PYSPICE_VERSION} supports ngspice through version "
-        f"{MAX_SUPPORTED_NGSPICE_VERSION}, found {NGSPICE_VERSION}",
-        allow_module_level=True,
-    )
 
 
 @dataclass(frozen=True)
@@ -62,6 +70,9 @@ class DCCase:
     input_capacitance: float = 100e-6
     duration: float = 1e-3
     step: float = 0.125e-6
+    upper_controlled: bool = True
+    lower_controlled: bool = True
+    expected_conduction: str | None = None
 
     @property
     def period(self) -> float:
@@ -98,6 +109,14 @@ class DCCase:
             "on_resistance": (
                 "units.converter.bridge.on_resistance", "SwitchModel.ron", self.on_resistance,
             ),
+            "upper_controlled": (
+                "units.converter.bridge.upper_controlled",
+                "upper device control", self.upper_controlled,
+            ),
+            "lower_controlled": (
+                "units.converter.bridge.lower_controlled",
+                "lower device control", self.lower_controlled,
+            ),
         }
         if self.topology == "boost":
             mapping.update({
@@ -112,7 +131,9 @@ class DCCase:
 
     def peslite_params(self):
         bridge = {
-            "model": "switching", "upper_controlled": True, "lower_controlled": True,
+            "model": "switching",
+            "upper_controlled": self.upper_controlled,
+            "lower_controlled": self.lower_controlled,
             "on_resistance": self.on_resistance,
         }
         buses = {}
@@ -169,7 +190,7 @@ class DCCase:
                 },
                 "output": {
                     "period": self.step, "states": True, "signals": False,
-                    "energy": False,
+                    "energy": False, "precision": 17,
                 },
             },
         })
@@ -185,10 +206,19 @@ class DCCase:
             f"Bgate_bar {gate_bar} 0 V=1-v({gate})\n"
         )
         circuit.model("switch", "SW", ron=self.on_resistance, roff=1e12, vt=0.5, vh=0.0)
+
+        def device(name, node1, node2, control, controlled, anode, cathode):
+            if not controlled:
+                control = f"{name}_diode_gate"
+                circuit.raw_spice += (
+                    f"B{name}_diode {control} 0 V=u(v({anode})-v({cathode}))\n"
+                )
+            circuit.VCS(name, node1, node2, control, ground, model="switch")
+
         if self.topology == "buck":
             circuit.V("input", "vin", ground, self.input_voltage)
-            circuit.VCS("upper", "vin", "switch", gate, ground, model="switch")
-            circuit.VCS("lower", "switch", ground, gate_bar, ground, model="switch")
+            device("upper", "vin", "switch", gate, self.upper_controlled, "vin", "switch")
+            device("lower", ground, "switch", gate_bar, self.lower_controlled, ground, "switch")
             circuit.L("filter", "switch", "filter_r", self.inductance)
             circuit.R("filter", "filter_r", "output", self.inductor_resistance)
         elif self.topology == "boost":
@@ -197,12 +227,14 @@ class DCCase:
             circuit.C("input", "input", ground, self.input_capacitance)
             circuit.L("filter", "input", "filter_r", self.inductance)
             circuit.R("filter", "filter_r", "switch", self.inductor_resistance)
-            circuit.VCS("lower", "switch", ground, gate, ground, model="switch")
-            circuit.VCS("upper", "output", "switch", gate_bar, ground, model="switch")
+            device("lower", "switch", ground, gate, self.lower_controlled, "switch", ground)
+            device("upper", "switch", "output", gate_bar, self.upper_controlled,
+                   "switch", "output")
         elif self.topology == "buck_boost":
             circuit.V("input", "vin", ground, self.input_voltage)
-            circuit.VCS("upper", "vin", "switch", gate, ground, model="switch")
-            circuit.VCS("lower", "switch", "output", gate_bar, ground, model="switch")
+            device("upper", "vin", "switch", gate, self.upper_controlled, "vin", "switch")
+            device("lower", "output", "switch", gate_bar, self.lower_controlled,
+                   "output", "switch")
             circuit.L("filter", "switch", "filter_r", self.inductance)
             circuit.R("filter", "filter_r", ground, self.inductor_resistance)
         else:
@@ -215,12 +247,23 @@ class DCCase:
         return circuit
 
 DC_CASES = (
-    DCCase("buck", "buck", 48.0, 0.4, 1e-3, 0.05, 470e-6, 6.0),
-    DCCase("boost", "boost", 24.0, 0.5, 500e-6, 0.05, 470e-6, 1.0),
+    DCCase("buck", "buck", 48.0, 0.4, 1e-3, 0.05, 470e-6, 6.0,
+           expected_conduction="ccm"),
+    DCCase("boost", "boost", 24.0, 0.5, 500e-6, 0.05, 470e-6, 1.0,
+           expected_conduction="ccm"),
     DCCase("buck_boost_duty_0_40", "buck_boost", 24.0, 0.4,
-           500e-6, 0.05, 470e-6, 12.0),
+           500e-6, 0.05, 470e-6, 12.0, expected_conduction="ccm"),
     DCCase("buck_boost_duty_0_65", "buck_boost", 36.0, 0.65,
-           750e-6, 0.08, 330e-6, 18.0),
+           750e-6, 0.08, 330e-6, 18.0, expected_conduction="ccm"),
+    DCCase("buck_dcm_light_load", "buck", 48.0, 0.30,
+           200e-6, 0.03, 100e-6, 80.0, step=0.025e-6,
+           lower_controlled=False, expected_conduction="dcm"),
+    DCCase("boost_dcm_light_load", "boost", 24.0, 0.35,
+           200e-6, 0.03, 100e-6, 0.1, source_resistance=0.05,
+           step=0.025e-6, upper_controlled=False, expected_conduction="dcm"),
+    DCCase("buck_boost_dcm_light_load", "buck_boost", 24.0, 0.30,
+           200e-6, 0.03, 100e-6, 80.0, duration=2e-3, step=0.020e-6,
+           lower_controlled=False, expected_conduction="dcm"),
 )
 
 
@@ -396,7 +439,7 @@ class WPTCase:
                 },
                 "output": {
                     "period": self.step, "states": False, "signals": True,
-                    "energy": False,
+                    "energy": False, "precision": 17,
                 },
             },
         })
@@ -505,7 +548,9 @@ def compare_dc(case: DCCase, out_dir):
     started = perf_counter()
     result = peslite_simulation.run(out_dir=out_dir)
     peslite_seconds = perf_counter() - started
-    simulator = case.pyspice_circuit().simulator(temperature=25, nominal_temperature=25)
+    simulator = case.pyspice_circuit().simulator(
+        ngspice_shared=NGSPICE, temperature=25, nominal_temperature=25,
+    )
     started = perf_counter()
     analysis = simulator.transient(
         step_time=case.step,
@@ -531,7 +576,23 @@ def compare_dc(case: DCCase, out_dir):
         for name, values in pyspice.items()
     }
     errors = _normalized_errors(actual, paired)
-    return errors, {"peslite": peslite_seconds, "pyspice": pyspice_seconds}
+    settled = peslite_time >= case.duration - case.period
+    actual_current = actual["inductor_current"][settled]
+    pyspice_current = paired["inductor_current"][settled]
+    current_tolerance = 1e-6
+    operating_point = {
+        "peslite_minimum_current": float(np.min(actual_current)),
+        "pyspice_minimum_current": float(np.min(pyspice_current)),
+        "peslite_peak_current": float(np.max(np.abs(actual_current))),
+        "pyspice_peak_current": float(np.max(np.abs(pyspice_current))),
+        "peslite_zero_current_fraction": float(np.mean(
+            np.abs(actual_current) <= current_tolerance
+        )),
+        "pyspice_zero_current_fraction": float(np.mean(
+            np.abs(pyspice_current) <= current_tolerance
+        )),
+    }
+    return errors, {"peslite": peslite_seconds, "pyspice": pyspice_seconds}, operating_point
 
 
 def compare_wpt(case: WPTCase, out_dir):
@@ -541,7 +602,9 @@ def compare_wpt(case: WPTCase, out_dir):
     result = peslite_simulation.run(out_dir=out_dir)
     peslite_seconds = perf_counter() - started
 
-    simulator = case.pyspice_circuit().simulator(temperature=25, nominal_temperature=25)
+    simulator = case.pyspice_circuit().simulator(
+        ngspice_shared=NGSPICE, temperature=25, nominal_temperature=25,
+    )
     simulator.options(reltol=1e-8, abstol=1e-10, chgtol=1e-16)
     started = perf_counter()
     analysis = simulator.transient(
@@ -596,7 +659,23 @@ def test_switched_dc_converter_matches_pyspice(case, tmp_path, record_property):
     assert importlib.metadata.version("PySpice") == PYSPICE_VERSION
     assert all(peslite_path and pyspice_path and math.isfinite(value)
                for peslite_path, pyspice_path, value in case.parameter_map().values())
-    errors, timings = compare_dc(case, tmp_path / case.name)
+    errors, timings, operating_point = compare_dc(case, tmp_path / case.name)
+    for name, value in operating_point.items():
+        record_property(name, value)
+    if case.expected_conduction == "dcm":
+        assert operating_point["peslite_minimum_current"] >= -1e-9
+        assert operating_point["pyspice_minimum_current"] >= (
+            -5e-4 * operating_point["pyspice_peak_current"]
+        )
+        assert operating_point["peslite_zero_current_fraction"] > 0.02
+        assert operating_point["pyspice_zero_current_fraction"] > 0.02
+    elif case.expected_conduction == "ccm":
+        assert operating_point["peslite_minimum_current"] > (
+            1e-4 * operating_point["peslite_peak_current"]
+        )
+        assert operating_point["pyspice_minimum_current"] > (
+            1e-4 * operating_point["pyspice_peak_current"]
+        )
     _check_errors(errors, 5e-4, timings, record_property)
 
 

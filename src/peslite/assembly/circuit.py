@@ -50,7 +50,7 @@ from ..solver.netlist import (QUANTITIES, CurrentSource, Diode, Element, Mode, N
                               _linear_expression, _numeric_values)
 
 __all__ = ["NetlistBuilder", "NetworkPlan", "Circuit", "NetworkView", "CircuitAnalysis",
-           "lower", "lower_devices", "bind_device", "compile_network"]
+           "lower", "bind_device", "compile_network"]
 
 
 def _kind(port: Port) -> tuple[int, float]:
@@ -479,6 +479,7 @@ class Circuit:
         self.outputs: dict[str, Any] = {}  # out key -> initial value
         self._output_producers: dict[str, str] = {}
         self._output_stage_owners: dict[str, tuple[Any, ...]] = {}
+        self._output_stage_fields: dict[Callable, tuple[str, ...]] = {}
         self.passthrough: list[tuple[str, str]] = []  # input key -> output key
         self.value_inputs: dict[tuple[int, str], str] = {}  # bound component outputs -> input key
         self.netlist: Optional[Netlist] = None
@@ -823,11 +824,15 @@ class Circuit:
         self._bind_stage_owners()
 
     def _bind_stage_owners(self) -> None:
-        """Assign aggregated derivative stages to every component state view they advance."""
+        """Retain stage metadata and assign derivative stages to the views they advance."""
         owners = (self, *self._views)
         self._output_stage_owners = {
             stage.method: owners for stage in self.output_stages or () if stage.rhs
         }
+        for stage in self.output_stages or ():
+            method = getattr(self, stage.method)
+            function = getattr(method, "__func__", method)
+            self._output_stage_fields[function] = tuple(stage.outputs)
 
     def _program_dependencies(self, program: tuple) -> tuple[str, ...]:
         """Circuit input fields read by one generated scalar program."""
@@ -1353,8 +1358,11 @@ class Circuit:
 
     def cpp_output_stage(self, generator: Any, method: Any) -> list[str]:
         """Publish the outputs declared by the same dependency stage used in Python."""
-        fields = next(stage.outputs for stage in self.output_stages
-                      if stage.method == method.__name__)
+        function = getattr(method, "__func__", method)
+        try:
+            fields = self._output_stage_fields[function]
+        except KeyError:
+            raise RuntimeError("C++ export received an unknown circuit output stage") from None
         return generator.trace_circuit_outputs(self, fields) if fields else []
 
     def cpp_commutation_margin(self, generator: Any) -> str:
@@ -2292,17 +2300,6 @@ def _find(parent: dict[int, int], a: int) -> int:
         parent[a] = parent[parent[a]]
         a = parent[a]
     return a
-
-
-def lower_devices(subsystems: Mapping[str, Any], connections: Mapping, zoh: Mapping,
-                  buses: Mapping[str, Sequence[Port]],
-                  declarations: Mapping[int, Optional[NetworkPlan]]) -> tuple[
-        dict, dict, dict, tuple[Circuit, ...]]:
-    """Compile the complete acausal electrical network into direct scalar equations."""
-    out, lowered, held, circuit = lower(
-        "device", subsystems, connections, zoh, buses, declarations
-    )
-    return out, lowered, held, (() if circuit is None else (circuit,))
 
 
 def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mapping, zoh: Mapping,

@@ -1,8 +1,8 @@
 # Black-box Models
 
-`BlackBoxSubsystem` connects an array-valued Python callable to the normal model graph without
-requiring a model base class or file format. A registered element places it through the ordinary
-`subsystems()`, `connections()` and `port_bindings()` interfaces.
+`BlackBoxSubsystem` connects an array-valued Python callable directly to the model graph without
+requiring a model base class or file format. The built-in ONNX element provides its configuration
+adapter; custom electrical components use the declarative network interface.
 
 ## Stateless models
 
