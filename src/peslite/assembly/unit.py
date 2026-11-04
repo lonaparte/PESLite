@@ -196,6 +196,16 @@ class Unit(ABC):
     @abstractmethod
     def port_bindings(self) -> tuple: ...
 
+    def _measurement_connections(self, sources: Mapping[str, Any]) -> dict:
+        """Connect continuous controller channels not explicitly rebound by configuration."""
+        if not self.continuous or self.ctrl is None:
+            return {}
+        return {
+            (self.ctrl, channel): source
+            for channel, source in sources.items()
+            if channel not in self.cfg.meas.sources
+        }
+
     def _power_port_bindings(
         self,
         network: tuple[str, Port, Port] | None = None,
@@ -717,14 +727,13 @@ class VSC(Unit):
 
     def connections(self) -> dict:
         """Return this unit's internal and measurement wiring."""
-        connections = {}
-        if self.continuous:
-            connections.update({
-                (self.ctrl, "u_g"): (self.bus, self._bus_voltage_field),
-                (self.ctrl, "i_c"): (self.branch_f, "i"),
-                (self.ctrl, "u_dc"): (self.dclink, "u_dc"),
-                (self.bridge, "q"): (self.ctrl, "q"),
-            })
+        connections = self._measurement_connections({
+            "u_g": (self.bus, self._bus_voltage_field),
+            "i_c": (self.branch_f, "i"),
+            "u_dc": (self.dclink, "u_dc"),
+        })
+        if self.continuous and self.ctrl is not None:
+            connections[(self.bridge, "q")] = (self.ctrl, "q")
         return connections
 
     def zoh_connections(self) -> dict:
@@ -951,16 +960,17 @@ class DCConverter(Unit):
                     else self._control_voltage_port
                 )
         if self.continuous and self.ctrl is not None:
-            connections.update({
-                (self.ctrl, "current"): self._current_connection(),
-                (self.ctrl, "voltage"): self._control_voltage_port,
-                (self.ctrl, "vin"): self._control_supply_port,
-                (self.bridge, "q"): (self.ctrl, "q"),
-            })
+            measurements = {
+                "current": self._current_connection(),
+                "voltage": self._control_voltage_port,
+                "vin": self._control_supply_port,
+            }
+            if "meas.power" in self.ctrl.interface.inputs:
+                measurements["power"] = (self.power_measurement, "power")
+            connections.update(self._measurement_connections(measurements))
+            connections[(self.bridge, "q")] = (self.ctrl, "q")
             if self.conduction is not None:
                 connections[(self.conduction, "q")] = (self.ctrl, "q")
-            if "meas.power" in self.ctrl.interface.inputs and "power" not in self.cfg.meas.sources:
-                connections[(self.ctrl, "power")] = (self.power_measurement, "power")
         return connections
 
     def zoh_connections(self) -> dict:

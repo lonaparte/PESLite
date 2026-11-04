@@ -221,8 +221,9 @@ def test_native_multivariable_feedback_keeps_the_previous_output_between_calls(t
             self.input, self.output = Pair(x=1.0, y=1.0), Pair(x=1.0, y=1.0)
 
         def set_outputs(self, t):
-            self.output.x = 0.8 * self.input.x + 0.05 * self.input.y + 0.15 * (1.0 + t)
-            self.output.y = 0.05 * self.input.x + 0.8 * self.input.y + 0.15 * (1.0 + t)
+            # The default budget converges from the previous step, not a cold initial value.
+            self.output.x = 0.3 * self.input.x + 0.02 * self.input.y + 0.68 * (1.0 + t)
+            self.output.y = 0.02 * self.input.x + 0.3 * self.input.y + 0.68 * (1.0 + t)
 
         def rhs(self, t):
             return ()

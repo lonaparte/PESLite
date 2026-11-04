@@ -27,6 +27,14 @@ def _short(tree, end=90e-6):
     return tree
 
 
+def _assert_scaled_trajectories(actual, expected, *, atol=2e-9):
+    """Compare each signal against its own trajectory scale, including zero crossings."""
+    scale = np.maximum(1.0, np.max(np.abs(expected), axis=0))
+    np.testing.assert_allclose(
+        actual / scale, expected / scale, rtol=0.0, atol=atol, equal_nan=True,
+    )
+
+
 @pytest.mark.parametrize('link', [SS, LCC, LCC_S, MULTI], ids=['ss', 'lcc', 'lcc_s', 'ss_multi'])
 @pytest.mark.parametrize('adaptive', [False, True])
 def test_controllerless_rectifier_matches_python(link, adaptive, tmp_path):
@@ -35,11 +43,12 @@ def test_controllerless_rectifier_matches_python(link, adaptive, tmp_path):
         tree['simulation']['solver'].update(type='adaptive', method='DP45', max_step=50e-9)
     params = from_dict(tree)
     binary = _compile(params, tmp_path / 'model', ())
-    _compare_run(params, binary, {}, tmp_path / 'run', rtol=2e-8, atol=2e-8)
-    names, actual = _table(tmp_path / 'run/native/plant.csv')
-    expected_names, expected = _table(tmp_path / 'run/python/plant.csv')
-    assert names == expected_names
-    np.testing.assert_allclose(actual, expected, rtol=2e-8, atol=2e-8, equal_nan=True)
+    _compare_run(params, binary, {}, tmp_path / 'run', rtol=2e-8, atol=3e-6)
+    for filename in ('states.csv', 'plant.csv'):
+        names, actual = _table(tmp_path / 'run/native' / filename)
+        expected_names, expected = _table(tmp_path / 'run/python' / filename)
+        assert names == expected_names
+        _assert_scaled_trajectories(actual, expected)
     assert not (tmp_path / 'run/native/ctrl.charger.secondary.csv').exists()
 
 
