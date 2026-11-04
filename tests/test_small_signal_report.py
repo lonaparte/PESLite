@@ -36,11 +36,11 @@ def _linear_sim(*, initial=0.0, growth=-4.0, decay_from_load=False, fail_at=None
 
         def __init__(self):
             self.state = SimpleNamespace(x=initial)
-            self.inp, self.out = Empty(), SimpleNamespace(x=initial)
+            self.input, self.output = Empty(), SimpleNamespace(x=initial)
             self.growth = growth
 
         def set_outputs(self, t):
-            self.out.x = self.state.x
+            self.output.x = self.state.x
 
         def rhs(self, t):
             if fail_at is not None and fail_at + 1e-12 < t <= self.end:
@@ -56,10 +56,10 @@ def _linear_sim(*, initial=0.0, growth=-4.0, decay_from_load=False, fail_at=None
 
         retune(params)
         model = Model({"plant": plant}, {})
-        return SimpleNamespace(units={}, event_subsystems=(), model=model, _port_bindings={},
+        return SimpleNamespace(units={}, event_subsystems=(), model=model, _unit_port_bindings={},
                                state_parts=lambda: [("", model)],
                                apply=lambda change: retune(change.params),
-                               signals=lambda t: {"plant.signal": plant.out.x})
+                               signals=lambda t: {"plant.signal": plant.output.x})
 
     return peslite.Simulation(_params(**overrides), parts={"system": factory})
 

@@ -1,7 +1,39 @@
 # Solvers
 
-PESLite integrates every interval up to the next exact boundary: an event, output point, sampled
-hardware instant or requested end time. Solver stages never cross a model-changing boundary.
+PESLite provides several time-integration and circuit-solution methods, some of which draw on ideas
+used by established commercial simulators such as PLECS, PSCAD and SIMBA while being implemented
+independently. Regardless of the selected time integrator, PESLite advances only to the next exact
+boundary, such as an event, output point, sampled hardware instant or requested end time. Solver
+stages never cross a model-changing boundary.
+
+## Circuit model
+
+`circuit_model` selects the electrical circuit representation independently of the time integrator:
+
+| Value | Implementation |
+|---|---|
+| `device` | netlist primitives compiled into direct scalar device equations |
+| `statewise` | the same netlist compiled to a dense state equation for each circuit mode |
+| `nodal` | the same netlist solved as a sparse, factorized modified nodal system |
+
+```yaml
+simulation:
+  solver:
+    type: fixed
+    method: radau
+    circuit_model: statewise
+```
+
+The default is `device`. Electrical components declare R, L, C, source, transformer and switching
+primitives; controls remain in the sampled control graph. A component law without an instantaneous
+primitive representation connects to the same network through a behavioral voltage or current port.
+All three circuit models work with explicit and implicit time integrators.
+For explicit integration of small circuits, `device` usually has the lowest per-stage overhead;
+`statewise` and `nodal` are selected for their network formulation rather than assumed speedups.
+Assembly builds the dependency order, algebraic-loop SCCs, electrical state partition, exact
+Jacobian columns and mode signature once; Python simulation and C++ export reuse that plan.
+
+Export the automatic electrical partition with `peslite inspect case.pes --groups --json > groups.json`.
 
 ## Fixed-step solvers
 
@@ -9,15 +41,21 @@ hardware instant or requested end time. Solver stages never cross a model-changi
 simulation:
   solver:
     type: fixed
-    method: rk4
+    method: RK4
     dt: 25e-6
 ```
 
-Available fixed methods are `euler`, `heun` and `rk4`. `dt` (default `1e-6` s) is the maximum step;
-PESLite divides intervals as needed to end exactly at scheduled boundaries.
+Available fixed methods are `euler`, `heun`, `RK4`, `trapezoidal` and `radau`. `trapezoidal` is the
+second-order A-stable trapezoidal rule; `radau` is the fifth-order, L-stable three-stage Radau IIA
+method. `dt` (default `1e-6` s) is the maximum step; PESLite divides intervals as needed to end
+exactly at scheduled boundaries. Fixed implicit methods use `rtol` and `atol` for Newton convergence.
 
 RK4 is the normal starting point for `switching` and `pwm_averaging`. Reduce `dt` until important
 outputs and event responses are insensitive to further reduction.
+
+Before a fixed explicit step, Python and generated C++ check the present linear circuit mode against
+that method's stability region. A mode outside the region uses fixed Radau for that interval; this
+preserves the configured step grid without explicit-step divergence during stiff commutation.
 
 ## Adaptive solvers
 
@@ -32,7 +70,14 @@ simulation:
 ```
 
 `DP45` is PESLite's built-in Dormand-Prince 4(5) implementation. SciPy methods `RK23`, `RK45`,
-`DOP853`, `Radau`, `BDF` and `LSODA` are also available in Python simulations.
+`DOP853`, `radau`, `BDF` and `LSODA` are also available in Python simulations. `auto` starts with DP45
+and switches to adaptive Radau when stiffness limits its steps, using existing stage values and
+Jacobians for the switching decisions. `LSODA` selects
+between nonstiff and stiff integration internally. Python implicit methods take exact electrical
+blocks from the present netlist mode, retain full finite differences where states enter behavioral
+or cross-subsystem feedback, and reuse the assembled state partition and returning-mode cache across
+all circuit representations. Generated C++ fixed implicit methods use the same partition, mode
+identity and commutation boundaries.
 
 `rtol` controls error relative to the current state scale, while `atol` supplies an absolute floor
 near zero. Smaller tolerances generally increase accepted steps and RHS evaluations. `max_step`
@@ -71,9 +116,9 @@ During a run, `simulation.solver.phs_check_step` sets the number of output snaps
 audits. It defaults to 1000 and is intended as an internal performance/diagnostic control rather
 than a primary model setting.
 
-`--ph-report` prints the assembled port-Hamiltonian structure without running, including when the
-configuration sets `energy_check: off`. `summary.json` records `n_rhs` and any multirate interface
-indicators.
+`peslite inspect case.pes --ph-report` prints the assembled port-Hamiltonian structure without
+running, including when the configuration sets `energy_check: off`. `summary.json` records `n_rhs`
+and any multirate interface indicators.
 
 ## Selection guidance
 

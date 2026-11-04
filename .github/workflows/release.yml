@@ -41,10 +41,34 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[test]"
+          python -m pip install -e ".[test]"
 
       - name: Run pytest
-        run: python -m pytest
+        run: python -m pytest -x
+
+
+  test-minimum-python:
+    name: Test Python 3.10.1
+    runs-on: ubuntu-24.04
+    container: python:3.10.1-bullseye
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Verify Python version
+        run: python -c "import sys; assert sys.version_info[:3] == (3, 10, 1)"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Run pytest
+        run: python -m pytest -x
 
 
   reference-test:
@@ -65,11 +89,12 @@ jobs:
       - name: Install reference dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[test,reference]"
+          python -m pip install -e ".[test]"
+          python -m pip install "motulator==0.21.0"
 
       - name: Run reference comparisons
         run: >-
-          python -m pytest --run-full
+          python -m pytest -x --run-full
           tests/reference/test_motulator.py
           tests/reference/test_motulator_dead_time.py
 
@@ -92,16 +117,18 @@ jobs:
       - name: Install ONNX test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[test,onnx]"
+          python -m pip install -e ".[test]"
+          python -m pip install --group onnx-test
 
       - name: Run ONNX compatibility tests
-        run: python -m pytest --run-full tests/test_black_box_onnx.py
+        run: python -m pytest -x --run-full tests/test_black_box_onnx.py
 
 
   build:
     name: Build distribution
     needs:
       - test
+      - test-minimum-python
       - reference-test
       - onnx-test
     runs-on: ubuntu-24.04
@@ -124,8 +151,19 @@ jobs:
           import os
           import tomllib
 
-          with open("pyproject.toml", "rb") as f:
-              version = tomllib.load(f)["project"]["version"]
+          projects = [
+              "pyproject.toml",
+              "packages/peslite/pyproject.toml",
+              "packages/frontend/pyproject.toml",
+              "packages/full/pyproject.toml",
+          ]
+          versions = set()
+          for project in projects:
+              with open(project, "rb") as f:
+                  versions.add(tomllib.load(f)["project"]["version"])
+          if len(versions) != 1:
+              raise SystemExit(f"Distribution versions differ: {sorted(versions)}")
+          version = versions.pop()
 
           tag = os.environ["GITHUB_REF_NAME"]
           tag_version = tag[1:] if tag.startswith("v") else tag
@@ -144,14 +182,17 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install build twine
 
-      - name: Build wheel and source distribution
-        run: python -m build
+      - name: Build wheels and source distributions
+        run: python scripts/distributions.py build dist
 
       - name: Check distribution metadata
-        run: python -m twine check dist/*
+        run: python -m twine check dist/*/*
+
+      - name: Check distribution ownership
+        run: python scripts/check_distributions.py dist
 
       - name: Show distributions
-        run: ls -lh dist/
+        run: find dist -maxdepth 2 -type f -print
 
       - name: Upload distributions
         uses: actions/upload-artifact@v7
@@ -183,16 +224,26 @@ jobs:
       - name: Install wheel
         run: |
           python -m pip install --upgrade pip
-          python -m pip install dist/*.whl
+          python -m pip install dist/*/*.whl
 
       - name: Test Python import
         run: |
           python - <<'PY'
+          from importlib.metadata import version
+
           import peslite
+          import peslite.frontend
+          import onnx
+          import onnxruntime
+
+          assert peslite.__version__ == version("peslite")
 
           print("peslite module:", peslite.__file__)
           print("peslite version:", peslite.__version__)
           print("Simulation:", peslite.Simulation)
+          print("Frontend:", peslite.frontend)
+          print("ONNX:", onnx.__version__)
+          print("ONNX Runtime:", onnxruntime.__version__)
           PY
 
       - name: Verify packaged example configuration
@@ -212,13 +263,13 @@ jobs:
       - name: Test installed CLI
         run: |
           peslite --help
-          peslite gfl-example --list-states > /tmp/peslite-states.txt
+          peslite inspect gfl-example --states > /tmp/peslite-states.txt
           test -s /tmp/peslite-states.txt
           head -n 10 /tmp/peslite-states.txt
 
 
-  publish:
-    name: Publish to PyPI
+  approve-release:
+    name: Approve release
     if: github.event_name == 'release'
     needs:
       - build
@@ -227,8 +278,37 @@ jobs:
     runs-on: ubuntu-24.04
 
     environment:
-      name: pypi
-      url: https://pypi.org/p/peslite
+      name: release
+
+    steps:
+      - name: Confirm approval
+        run: echo "Release approved"
+
+
+  publish:
+    name: Publish ${{ matrix.distribution }} to PyPI
+    if: github.event_name == 'release'
+    needs:
+      - approve-release
+
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distribution: peslite
+            environment: pypi
+          - distribution: peslite-core
+            environment: pypi
+          - distribution: peslite-frontend
+            environment: pypi-frontend
+          - distribution: peslite-full
+            environment: pypi-full
+
+    environment:
+      name: ${{ matrix.environment }}
+      url: https://pypi.org/p/${{ matrix.distribution }}
 
     permissions:
       id-token: write
@@ -242,6 +322,8 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/${{ matrix.distribution }}
 
 
   verify-pypi:
@@ -267,7 +349,7 @@ jobs:
 
             if python -m pip install \
               --no-cache-dir \
-              "peslite==${VERSION}"
+              "peslite-full==${VERSION}"
             then
               exit 0
             fi
@@ -275,22 +357,32 @@ jobs:
             sleep 10
           done
 
-          echo "Could not install peslite==${VERSION} from PyPI"
+          echo "Could not install peslite-full==${VERSION} from PyPI"
           exit 1
 
       - name: Verify PyPI package
         run: |
           python - <<'PY'
+          from importlib.util import find_spec
+
           import peslite
+          import onnx
+          import onnxruntime
+          from peslite.addons.components.cable import CableModel
+          import peslite.frontend
 
           print("Installed from:", peslite.__file__)
           print("Version:", peslite.__version__)
           print("Simulation:", peslite.Simulation)
+          print("Built-in addon:", CableModel)
+          print("ONNX:", onnx.__version__)
+          print("ONNX Runtime:", onnxruntime.__version__)
+          assert find_spec("peslite.frontend") is not None
           PY
 
       - name: Verify PyPI CLI
         run: |
           peslite --help
-          peslite gfl-example --list-states > /tmp/peslite-states.txt
+          peslite inspect gfl-example --states > /tmp/peslite-states.txt
           test -s /tmp/peslite-states.txt
           head -n 10 /tmp/peslite-states.txt

@@ -117,6 +117,7 @@ def test_auxiliary_registers_follow_the_existing_converter_transport(example, un
 
 def test_nonzero_rectifier_current_is_preserved_before_projection(tmp_path):
     tree = _short(_tree(SS, 200., 1e-6), 1e-6)
+    tree['simulation']['energy_check'] = 'off'
     tree['simulation']['initial'] = {'states': {'charger.link.i_mode_1': 1.0}}
     params = from_dict(tree)
     binary = _compile(params, tmp_path / 'model', ())
@@ -159,12 +160,12 @@ class _Reset:
     outputs_need_inputs = False
 
     def __init__(self):
-        self.state, self.inp, self.out = _ResetState(x=0j), Empty(), _ResetOutput(x=0j)
+        self.state, self.input, self.output = _ResetState(x=0j), Empty(), _ResetOutput(x=0j)
         self.located, self.scheduled = False, 0
         self.time, self.next = 0.0, .3333333
 
     def set_outputs(self, t):
-        self.time, self.out.x = t, self.state.x
+        self.time, self.output.x = t, self.state.x
 
     def rhs(self, t):
         return (1.0 + 2.0j,)

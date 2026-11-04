@@ -31,6 +31,7 @@ from typing import Any, Callable, Optional, Union, get_args, get_origin, get_typ
 from ..components.network import ELEMENT_TYPES, element_buses
 from ..control.loops import LOOP_TYPES, loop_key_type, loop_type
 from ..control.profiles import ReferenceParams, control_type
+from ..solver.integrators import CIRCUIT_MODELS, canonical_method
 from ..solver.model import ConfigError
 from .events import EVENT_TYPES, NAMED, SWITCHABLE, events_for
 from .types import unit_type
@@ -249,13 +250,13 @@ def _scale(expression: str, scales: dict[str, float]) -> float:
 
 @dataclass(frozen=True)
 class BusParams:
-    """Electrical node with a shunt capacitor to ground.
+    """Named electrical connection point with an optional shunt capacitor to ground.
 
     ``phases`` is 3 for the peak-scaled AC space-vector domain and 1 for a real scalar domain.
-    ``c`` is capacitance in F and ``r_d`` is series damping resistance in ohm.
+    ``c`` is capacitance in F and ``r_d`` is its series damping resistance in ohm.
     """
 
-    c: float
+    c: Optional[float] = None
     r_d: float = 0.0
     phases: int = field(default=3, metadata={"structural": True})
 
@@ -308,7 +309,7 @@ class SourceParams:
 
 @dataclass(frozen=True)
 class FilterParams:
-    """Series R-L branch at a converter terminal (``l_f`` H, ``r_f`` ohm).
+    """Series R-L branch at a converter port (``l_f`` H, ``r_f`` ohm).
 
     The shunt capacitor is set on the connected bus (:class:`BusParams`).
     """
@@ -515,13 +516,13 @@ class BridgeParams:
     upper_controlled: bool = True
     lower_controlled: bool = True
     reverse_port: bool = False
-    external_terminal: str = "midpoint"
+    external_port: str = "midpoint"
     on_resistance: float = 0.0  # ohm, per conducting switch or diode
     parallel_capacitance: float = 0.0  # F, across the power port (per phase for three phases)
 
     _choices = {
         "model": ("switching", "pwm_averaging", "averaging"),
-        "external_terminal": ("midpoint", "lower_rail"),
+        "external_port": ("midpoint", "lower_rail"),
     }
 
     @property
@@ -866,11 +867,13 @@ class SolverParams:
     (integer N, or 1/N) or to ``{step, method}``, e.g. ``{dclink: 10, network: 0.1}``.
     """
 
+    circuit_model: str = "device"  # "device" | "statewise" | "nodal"
     type: str = "fixed"  # "fixed" | "adaptive"
-    method: str = "rk4"  # fixed: euler|heun|rk4 ; adaptive: RK45|DOP853|Radau|BDF|LSODA|RK23|DP45
+    method: str = "RK4"  # fixed: euler|heun|RK4|trapezoidal|radau
+    #                      adaptive: RK23|RK45|DOP853|radau|BDF|LSODA|DP45|auto
     dt: float = 1e-6  # s; fixed: maximum system step
-    rtol: float = 1e-6
-    atol: float = 1e-9
+    rtol: float = 1e-6  # adaptive error; fixed implicit Newton convergence
+    atol: float = 1e-9  # adaptive error; fixed implicit Newton convergence
     max_step: float = math.inf
     warm_start: bool = True  # adaptive: reuse the last step size across intervals
     subsystems: dict = field(default_factory=dict)  # fixed only: {name: step relative to dt | {step, method}}
@@ -878,7 +881,15 @@ class SolverParams:
     linearisations: int = 3  # linearisation points for the split error bound (0: none)
     write_length: int = 1000  # streamed CSV rows per write batch (>= 1)
     phs_check_step: int = 1000  # snapshots between port-Hamiltonian energy audits (>= 1)
-    _choices = {"type": ("fixed", "adaptive")}
+    _choices = {"circuit_model": CIRCUIT_MODELS, "type": ("fixed", "adaptive")}
+
+    def __post_init__(self) -> None:
+        solver_type = self.type.casefold() if isinstance(self.type, str) else self.type
+        circuit_model = (self.circuit_model.casefold()
+                         if isinstance(self.circuit_model, str) else self.circuit_model)
+        object.__setattr__(self, "type", solver_type)
+        object.__setattr__(self, "circuit_model", circuit_model)
+        object.__setattr__(self, "method", canonical_method(self.method, solver_type))
 
 
 @dataclass(frozen=True)
@@ -908,15 +919,13 @@ class OutputParams:
 
 @dataclass(frozen=True)
 class ProgressParams:
-    """Progress lines, controlled by ``enable``.
+    """Progress bar, controlled by ``enable``.
 
-    ``period`` is simulated seconds between lines. ``watch`` names state-table or plant-table
-    quantities to append to each line; a complex state may be named without ``.re``/``.im`` to
-    report its magnitude.
+    ``watch`` names state-table or plant-table quantities to append to the bar; a complex state
+    may be named without ``.re``/``.im`` to report its magnitude.
     """
 
     enable: bool = False
-    period: Optional[float] = None
     watch: list = field(default_factory=list)
 
 
@@ -1159,8 +1168,8 @@ def _is_optional(tp) -> tuple[bool, Any]:
 
 _TYPED = {
     "loop": (LOOP_TYPES, ""),
-    "element": (ELEMENT_TYPES, ". Register a custom element type with "
-                               "peslite.register_element_type before loading the file"),
+    "element": (ELEMENT_TYPES, ". Register a custom component type with "
+                               "peslite.register_component_type before loading the file"),
     "event": (EVENT_TYPES, ". Register a custom event type with peslite.register_event_type before loading the file"),
 }
 
@@ -1255,7 +1264,7 @@ def _typed_class(what: str, data: Any, path: str) -> type:
         return loop_type(kind, f"{path}.type").Params
     if not isinstance(kind, str) or kind not in registry:
         raise ConfigError(f"{path}.type: unknown {what} type {kind!r}; known: {sorted(registry)}{hint}")
-    return registry[kind].Params
+    return registry[kind].params if what == "element" else registry[kind].Params
 
 
 def _loop_entry(name: str, item: Any, path: str) -> Any:
@@ -1517,7 +1526,7 @@ def runtime_changeable(path: str, p: Params) -> bool:
     section, name, rest = _split_path(p, path)
     keys = rest.split(".")
     if section == "buses":
-        return keys in (["c"], ["r_d"])
+        return p.buses[name].c is not None and keys in (["c"], ["r_d"])
     if section == "branches":
         return keys in (["l"], ["r"])
     if section == "sources":
@@ -1632,7 +1641,7 @@ def event_changes(p: Params) -> tuple[Change, ...]:
         changed = (path for path in new if new[path] != flat.get(path)) if parameters else ()
         paths = tuple(dict.fromkeys([*changed, *values]))
         for path in paths:
-            if path not in connections and not runtime_changeable(path, after):
+            if path not in connections and not runtime_changeable(path, current):
                 raise ConfigError(f"{where}: {path} cannot change during a run; an event changes "
                                   f"{', '.join(RUNTIME)}")
             key = (event_t, path)

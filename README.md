@@ -28,7 +28,7 @@ API—designed as a deterministic simulation backend for LLM reasoning and verif
 pip install peslite
 ```
 
-PESLite requires Python 3.10 or newer.
+PESLite requires Python 3.10.1 or newer.
 
 ## Quick start
 
@@ -82,7 +82,7 @@ print(result.final_states())
 Select the parameters that should remain variable in the compiled simulator, or use `common`:
 
 ```bash
-peslite-convert case.pes common
+peslite export case.pes common
 c++ -O3 -DNDEBUG -std=c++17 export/case/peslite.cpp -o export/case/peslite
 ```
 

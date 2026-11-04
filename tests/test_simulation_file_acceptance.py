@@ -10,6 +10,7 @@ from contextlib import redirect_stdout
 import numpy as np
 import pytest
 import yaml
+from packaging.version import Version
 
 import peslite
 from conftest import EXAMPLES
@@ -20,12 +21,14 @@ from peslite.control import LOOP_TYPES
 BUNDLED = sorted(path.name for path in EXAMPLES.glob("*-example.pes"))
 
 
+@pytest.mark.static
 @pytest.mark.parametrize("name", BUNDLED)
 def test_bundled_examples_declare_the_current_interface_version(name):
     first_line = (EXAMPLES / name).read_text(encoding="utf-8").splitlines()[0]
-    assert first_line == f"# PESLite {peslite.__version__}"
+    assert first_line == f"# PESLite {Version(peslite.__version__).base_version}"
 
 
+@pytest.mark.static
 @pytest.mark.parametrize("name", BUNDLED)
 def test_bundled_examples_use_control_loop_classes_directly(name):
     tree = read_tree(EXAMPLES / name)
@@ -60,6 +63,7 @@ def _without(tree, path):
     return result
 
 
+@pytest.mark.static
 @pytest.mark.parametrize("name", BUNDLED)
 def test_bundled_examples_restate_no_defaults(name):
     tree = read_tree(EXAMPLES / name)
@@ -116,6 +120,7 @@ def test_bus_without_own_source_keeps_default_and_explicit_values_win(case, tmp_
             == pytest.approx(500.0))
 
 
+@pytest.mark.static
 def test_dataclass_rebuild_keeps_defaults_following_the_system_base(gfl):
     params = gfl()
     unit = dataclasses.replace(params.unit("vsc"), ctrl=dataclasses.replace(
@@ -124,16 +129,18 @@ def test_dataclass_rebuild_keeps_defaults_following_the_system_base(gfl):
     assert rebuilt.unit("vsc").base.s_base == 1.0e6
 
 
+@pytest.mark.static
 def test_unused_measurement_window_is_warned_about(gfl):
     with pytest.warns(UserWarning, match="window has no effect"):
         gfl(**{"units.vsc.meas.window": 25e-6})
 
 
+@pytest.mark.static
 def test_resolved_cli_prints_a_loadable_complete_file():
     stream = io.StringIO()
     with redirect_stdout(stream):
         assert peslite.main([
-            "gfl-example", "--resolved",
+            "inspect", "gfl-example", "--resolved",
             "--set", "simulation.t_end=0.5",
             "--set", "units.vsc.pwm.f_sw=10000",
         ]) == 0
@@ -158,6 +165,7 @@ def test_saved_simulation_file_repeats_the_run(gfl, tmp_path):
         assert np.array_equal(first.states[name], second.states[name], equal_nan=True), name
 
 
+@pytest.mark.static
 @pytest.mark.parametrize("suffix", [".yaml", ".yml"])
 def test_yaml_suffixes_remain_supported(tmp_path, suffix):
     copied = tmp_path / f"gfl{suffix}"

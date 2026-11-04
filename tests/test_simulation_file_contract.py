@@ -1,13 +1,17 @@
 """Bundled simulation-file discovery and packaging."""
 
+import pytest
 import yaml
 
 from conftest import EXAMPLES, ROOT
 from peslite.solver import simulation
 from peslite.solver.simulation import _config_path
 
+pytestmark = pytest.mark.static
+
+
 def test_bundled_examples_are_named_pes_files_containing_yaml():
-    paths = {path.name: path for path in EXAMPLES.iterdir()}
+    paths = {path.name: path for path in EXAMPLES.iterdir() if path.is_file()}
     assert paths and all(name.endswith("-example.pes") for name in paths)
     for path in paths.values():
         assert path.is_file()
@@ -24,6 +28,8 @@ def test_command_line_finds_bundled_pes_files():
 def test_wheel_data_comes_from_the_root_examples_directory():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert '"share/peslite/examples" = ["examples/*.pes"]' in pyproject
+    assert ('"share/peslite/examples/templates" = '
+            '["examples/templates/*.pes", "examples/templates/*.py"]') in pyproject
 
 
 def test_installed_package_finds_examples_in_its_data_directory(tmp_path, monkeypatch):

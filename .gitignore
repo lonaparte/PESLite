@@ -1,3 +1,6 @@
 /site/
 /output/
 __pycache__/
+build/
+dist/
+*.egg-info/

@@ -277,12 +277,13 @@ def test_a_loop_class_uses_a_class_qualified_name_without_type():
 
 
 def test_resolved_cli_and_meta_contract(capsys):
-    assert peslite.main(["gfl-example", "--resolved", "--set", "units.vsc.pwm.f_sw=10000"]) == 0
+    assert peslite.main(["inspect", "gfl-example", "--resolved",
+                         "--set", "units.vsc.pwm.f_sw=10000"]) == 0
     resolved = yaml.safe_load(capsys.readouterr().out)
     assert resolved["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)
     from_dict(resolved)
 
-    assert peslite.main(["gfl-example", "--switching", "--resolved",
+    assert peslite.main(["inspect", "gfl-example", "--switching", "--resolved",
                          "--set", "units.vsc.pwm.f_sw=10000"]) == 0
     sampled = yaml.safe_load(capsys.readouterr().out)
     assert sampled["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)

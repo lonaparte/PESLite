@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 pytest.importorskip(
-    "motulator", reason="install the reference dependencies with peslite[reference]"
+    "motulator", reason="install the Motulator reference dependency"
 )
 from motulator.common.control import InverterNonlinearity, PWM as MotulatorPWM
 from motulator.common.model import CarrierComparison as MotulatorCarrier
@@ -64,7 +64,7 @@ def _averaged_bridge(duties, currents, *, compensated=False):
         ZOH(), ThreePhaseBridge(), dead_time=DEAD_TIME,
         dead_time_compensation=compensated,
     )
-    bridge.inp.i_c = abc2complex(currents)
+    bridge.input.i_c = abc2complex(currents)
     duties = bridge.compensated(tuple(duties), motulator_abc2complex(currents))
     bridge.reset(np.asarray(duties), on=True)
     return bridge

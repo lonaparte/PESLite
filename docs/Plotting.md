@@ -1,10 +1,7 @@
 # Plotting
 
-Install the optional plotting dependency:
-
-```bash
-pip install "peslite[plot]"
-```
+Plotting is a built-in addon included with the default package; see
+[Install](Getting-Started.md#install) for the installation matrix.
 
 ## Command line
 

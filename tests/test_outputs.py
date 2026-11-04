@@ -112,6 +112,7 @@ def test_run_uses_a_default_output_directory(gfl, tmp_path, monkeypatch):
 def test_run_without_trip_uses_none_and_lists_for_absent_results(gfl, tmp_path):
     result = _run(gfl(), tmp_path)
     summary = result.summary
+    assert summary["status"] == "completed"
     assert (summary["tripped"], summary["vsc.tripped"]) == (0, 0)
     assert summary["vsc.trip_time"] is None and summary["vsc.trip_cause"] is None
     assert summary["vsc.alarms"] == []
@@ -135,6 +136,7 @@ def test_trip_reports_time_cause_alarm_and_first_crossing(gfl, tmp_path):
         "simulation.t_end": 0.002,
     }), tmp_path)
     summary = result.summary
+    assert summary["status"] == "stopped"
     assert (summary["tripped"], summary["vsc.tripped"], summary["vsc.trip_cause"]) == (
         1, 1, "overcurrent"
     )

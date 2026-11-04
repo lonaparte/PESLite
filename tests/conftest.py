@@ -26,13 +26,16 @@ def pytest_addoption(parser):
 
 
 def pytest_collection_modifyitems(config, items):
-    """Run fast tests by default; the explicit switch includes the full suite."""
-    if config.getoption("--run-full"):
-        return
-    selected = [item for item in items if "full" not in item.keywords]
-    deselected = [item for item in items if "full" in item.keywords]
-    items[:] = selected
-    config.hook.pytest_deselected(items=deselected)
+    """Run static checks first and expensive tests last; omit full tests by default."""
+    if not config.getoption("--run-full"):
+        selected = [item for item in items if item.get_closest_marker("full") is None]
+        deselected = [item for item in items if item.get_closest_marker("full") is not None]
+        items[:] = selected
+        config.hook.pytest_deselected(items=deselected)
+    items.sort(key=lambda item: (
+        item.get_closest_marker("full") is not None,
+        item.get_closest_marker("static") is None,
+    ))
 
 
 @pytest.fixture

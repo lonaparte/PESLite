@@ -16,10 +16,10 @@ from typing import Any, Callable, Iterator, Mapping, Optional
 
 import numpy as np
 
-from ..components.adc import ADC, ADCSample, MeasurementPorts
+from ..components.adc import ADC, ADCSample, MeasurementPorts, _PortMeasurement
 from ..components.converter import (HalfBridgeDiodeConduction, make_bridge, make_dclink,
                                     make_topology)
-from ..components.network import RLBranch, Terminal
+from ..components.network import RLBranch, Port
 from ..components.pwm import Modulator
 from ..control.blocks import phases
 from ..control.controller import (Controller, ConverterMeasurement,
@@ -42,9 +42,10 @@ class Plant:
 
     def __init__(self, model: Any, state: Any, *,
                  project: Optional[Callable] = None, settle: Optional[Callable] = None,
-                 synchronize: Optional[Callable] = None) -> None:
+                 synchronize: Optional[Callable] = None,
+                 reconcile: Optional[Callable[[float], None]] = None) -> None:
         self.model, self.state = model, state
-        self.project, self.settle = project, settle
+        self.project, self.settle, self.reconcile = project, settle, reconcile
         self.inputs_changed = self.zoh_changed = False
         self._synced_at: Optional[float] = None
         self._sync = synchronize or model.sync
@@ -74,10 +75,15 @@ class Plant:
         self.zoh_changed = True
 
     @contextmanager
-    def change(self) -> Iterator[None]:
+    def change(self, t: float) -> Iterator[None]:
         if self.settle is not None:
             self.settle()
         yield
+        if self.reconcile is not None:
+            self.reconcile(t)
+        invalidate = getattr(self.model, "invalidate_equations", None)
+        if invalidate is not None:
+            invalidate()
         self.read_state()
         self.inputs_changed = True
 
@@ -88,6 +94,14 @@ class Unit(ABC):
     def __init__(self, name: str, cfg: UnitParams, bus: Any) -> None:
         """Bind the identity, event scenario and DC link shared by converter units."""
         self.name, self.cfg, self.bus = name, cfg, bus
+        if bus is None:
+            self._bus_voltage_field, self._bus_voltage = None, None
+        elif bus.voltage_field == "voltage":
+            self._bus_voltage_field = bus.voltage_field
+            self._bus_voltage = lambda: bus.port.voltage
+        else:
+            self._bus_voltage_field = bus.voltage_field
+            self._bus_voltage = lambda: bus.output.u
         self._current_channel = unit_type(cfg.type).current_channel
         self.scenario = Scenario(cfg.events, f"units.{name}", initial=cfg.connected)
         self.dclink = _parameterized(lambda c: make_dclink(c.dclink), cfg)
@@ -180,25 +194,25 @@ class Unit(ABC):
     def zoh_connections(self) -> dict: ...
 
     @abstractmethod
-    def terminals(self) -> tuple: ...
+    def port_bindings(self) -> tuple: ...
 
-    def _power_terminals(
+    def _power_port_bindings(
         self,
-        network: tuple[str, Terminal, Terminal] | None = None,
-    ) -> tuple[tuple[str, Terminal], ...]:
-        """Expose the DC rail and power terminal through the common named-bus contract."""
-        terminals = [
-            (self.dc_bus, self.dclink.terminal),
-            (self.dc_bus, self.bridge.dc_terminal),
-            (self.power_bus, self.bridge.power_terminal),
+        network: tuple[str, Port, Port] | None = None,
+    ) -> tuple[tuple[str, Port], ...]:
+        """Bind the DC rail and power ports through the common named-bus contract."""
+        bindings = [
+            (self.dc_bus, self.dclink.port),
+            (self.dc_bus, self.bridge.dc_port),
+            (self.power_bus, self.bridge.power_port),
         ]
         if network is not None:
             external_bus, bridge_side, network_side = network
-            terminals.extend((
+            bindings.extend((
                 (self.power_bus, bridge_side),
                 (external_bus, network_side),
             ))
-        return tuple(terminals)
+        return tuple(bindings)
 
     def aliases(self) -> dict[str, str]:
         """Return the aliases ``<unit>.i_c`` (filter current) and ``<unit>.u_dc`` (dc-link voltage)."""
@@ -303,7 +317,7 @@ class Unit(ABC):
     def trip(self, t: float, cause: str, plant: Optional[Plant] = None,
              detail: str = "") -> None:
         if plant is not None:
-            with plant.change():
+            with plant.change(t):
                 self.trip(t, cause, detail=detail)
             return
         self.protection.latch(t, cause, detail)
@@ -328,7 +342,7 @@ class Unit(ABC):
             self.ctrl.set_state({"startup.steps": self.bridge.control_count(since, t)})
 
     def states_loaded(self) -> None:
-        """Apply restored lifecycle and bridge state to the physical terminal."""
+        """Apply restored lifecycle and bridge state to the physical port."""
         self.breaker = self._initially_connected and not self.tripped
         current = self.branch_f.state.i if self.branch_f is not None else None
         self._restore_bridge_state(current)
@@ -344,7 +358,7 @@ class Unit(ABC):
         track = getattr(self.ctrl, "track", None)
         if track is not None:
             plant.outputs(t)
-            with plant.change():
+            with plant.change(t):
                 track(self._instantaneous_measurement(t))
 
     def begin_timing(self, t: float, plant: Plant, continued: bool, window_given: bool) -> None:
@@ -484,7 +498,7 @@ class Unit(ABC):
         changes = bridge.actuate(t, self._write_due, enabled)
         active = bridge.on and enabled
         if active != self.gates:
-            with plant.change():
+            with plant.change(t):
                 self._set_gates(active)
         for value in changes:
             plant.hold(self.zoh, value)
@@ -507,7 +521,7 @@ class Unit(ABC):
         if self.branch_f is None:
             self.gates = self.gates and self.breaker
             if not self.continuous:
-                self.bridge.inp.q = self._held_bridge_command(self.bridge.inp.q)
+                self.bridge.input.q = self._held_bridge_command(self.bridge.input.q)
         else:
             self._update_terminal()
         self.bridge.enabled = self.gates
@@ -676,9 +690,9 @@ class VSC(Unit):
         # ------------------------------------------------------------ ADC
         self.ports = MeasurementPorts(
             {
-                "u_g": lambda: bus.out.u,
-                "i_c": lambda: self.branch_f.out.i,
-                "u_dc": lambda: self.dclink.out.u_dc,
+                "u_g": self._bus_voltage,
+                "i_c": lambda: self.branch_f.output.i,
+                "u_dc": lambda: self.dclink.output.u_dc,
             }
         )
         self._configure_runtime(
@@ -706,7 +720,7 @@ class VSC(Unit):
         connections = {}
         if self.continuous:
             connections.update({
-                (self.ctrl, "u_g"): (self.bus, "u"),
+                (self.ctrl, "u_g"): (self.bus, self._bus_voltage_field),
                 (self.ctrl, "i_c"): (self.branch_f, "i"),
                 (self.ctrl, "u_dc"): (self.dclink, "u_dc"),
                 (self.bridge, "q"): (self.ctrl, "q"),
@@ -716,12 +730,12 @@ class VSC(Unit):
     def zoh_connections(self) -> dict:
         return {} if self.continuous else self.bridge.zoh_connections(self.zoh)
 
-    def terminals(self) -> tuple[tuple[str, Terminal], ...]:
-        """Bind the DC link, bridge, filter and public terminal through named buses."""
-        return self._power_terminals((
+    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
+        """Bind the DC link, bridge, filter and public port through named buses."""
+        return self._power_port_bindings((
             self.cfg.bus,
-            self.branch_f.terminal1,
-            self.branch_f.terminal2,
+            self.branch_f.port1,
+            self.branch_f.port2,
         ))
 
     # ---------------------------------------------------------------- run instants
@@ -745,10 +759,10 @@ class VSC(Unit):
     def signals(self) -> dict[str, float | complex]:
         """Return this unit's recorded signals (SI); outputs must be synced first."""
         return {
-            f"{self.name}.i_c": self.branch_f.out.i,
-            f"{self.name}.u_g": self.bus.out.u,
-            f"{self.name}.u_dc": self.dclink.out.u_dc,
-            f"{self.name}.i_dc": self.dclink.inp.i_dc,
+            f"{self.name}.i_c": self.branch_f.output.i,
+            f"{self.name}.u_g": self._bus_voltage(),
+            f"{self.name}.u_dc": self.dclink.output.u_dc,
+            f"{self.name}.i_dc": -self.dclink.port.current,
         }
 
     def control_inputs_from(
@@ -821,8 +835,11 @@ class DCConverter(Unit):
         ), cfg.filter)
         controlled = getattr(topology, "controlled", True)
         self._blocked_warned = False
-        self._external_lower_rail = getattr(topology, "external_terminal", None) == "lower_rail"
-        power_voltage_port = (bus, "u") if bus is not None else (self.bridge, "u_c")
+        self._external_lower_rail = getattr(topology, "external_port", None) == "lower_rail"
+        if self._external_lower_rail and self.branch_f is not None:
+            self.branch_f.port2.grounded = True
+        power_voltage_port = ((bus, self._bus_voltage_field)
+                              if bus is not None else (self.bridge, "u_c"))
         self._control_voltage_port = (
             power_voltage_port if self._external_lower_rail or not topology.reverse_port
             else (self.dclink, "u_dc")
@@ -855,16 +872,20 @@ class DCConverter(Unit):
         channel_zeros = {"current": 0.0, "voltage": 0.0, "vin": 0.0}
         interface = getattr(self.ctrl, "interface", None)
         needs_power = interface is not None and "meas.power" in interface.inputs
+        external_bus = cfg.bus if cfg.bus is not None else self.power_bus
+        self._power_port, = (
+            port for bus_name, port in self.port_bindings() if bus_name == external_bus
+        )
         if (needs_power or "power" in cfg.meas.average or "power" in cfg.meas.rms
                 or "power" in cfg.meas.sources):
-            external_bus = cfg.bus if cfg.bus is not None else self.power_bus
-            self._power_terminal, = (
-                terminal for bus_name, terminal in self.terminals() if bus_name == external_bus
-            )
-            self.ports.readers["power"] = lambda: -self._power_terminal.power()
+            self.ports.readers["power"] = lambda: -self._power_port.power()
             channel_zeros["power"] = 0.0
             if needs_power:
-                self.ctrl.bind_power_port(self._power_terminal.power_port)
+                self.ctrl.bind_power_port(self._power_port)
+        self.power_measurement = (
+            _PortMeasurement(self._power_port)
+            if self.continuous and (needs_power or self.branch_f is None) else None
+        )
         self._configure_runtime(
             sim,
             channel_zeros,
@@ -900,6 +921,8 @@ class DCConverter(Unit):
             parts[f"{self.name}.conduction"] = self.conduction
         if self.continuous and self.ctrl is not None:
             parts[f"{self.name}.ctrl"] = self.ctrl
+        if self.power_measurement is not None:
+            parts[f"{self.name}.power"] = self.power_measurement
         return parts
 
     def connections(self) -> dict:
@@ -916,10 +939,8 @@ class DCConverter(Unit):
                 (self.bridge, "upper_current_ratio"): (
                     self.conduction, "upper_current_ratio",
                 ),
-                (self.bridge, "lower_current_ratio"): (
-                    self.conduction, "lower_current_ratio",
-                ),
                 (self.bridge, "loss_factor"): (self.conduction, "resistance_factor"),
+                (self.bridge, "i_c"): (self.branch_f, "i"),
             })
             if self._external_lower_rail:
                 connections[(self.conduction, "lower")] = self._control_voltage_port
@@ -939,9 +960,7 @@ class DCConverter(Unit):
             if self.conduction is not None:
                 connections[(self.conduction, "q")] = (self.ctrl, "q")
             if "meas.power" in self.ctrl.interface.inputs and "power" not in self.cfg.meas.sources:
-                voltage, current = self._power_terminal.signal_sources()
-                connections[(self.ctrl, "power_voltage")] = voltage
-                connections[(self.ctrl, "power_current")] = current
+                connections[(self.ctrl, "power")] = (self.power_measurement, "power")
         return connections
 
     def zoh_connections(self) -> dict:
@@ -952,30 +971,31 @@ class DCConverter(Unit):
             connections[(self.conduction, "q")] = self.zoh
         return connections
 
-    def terminals(self) -> tuple:
+    def port_bindings(self) -> tuple:
         if self.branch_f is None:
-            return self._power_terminals()
+            return self._power_port_bindings()
         if self._external_lower_rail:
-            assert self.bridge.lower_terminal is not None
+            assert self.bridge.lower_port is not None
             return (
-                *self._power_terminals(),
-                (self.power_bus, self.branch_f.terminal1),
-                (self.cfg.bus, self.bridge.lower_terminal),
+                *self._power_port_bindings(),
+                (self.power_bus, self.branch_f.port1),
+                (self.cfg.bus, self.bridge.lower_port),
             )
         if self.bridge.topology.reverse_port:
-            bridge_side, network_side = self.branch_f.terminal2, self.branch_f.terminal1
+            bridge_side, network_side = self.branch_f.port2, self.branch_f.port1
         else:
-            bridge_side, network_side = self.branch_f.terminal1, self.branch_f.terminal2
-        return self._power_terminals((self.cfg.bus, bridge_side, network_side))
+            bridge_side, network_side = self.branch_f.port1, self.branch_f.port2
+        return self._power_port_bindings((self.cfg.bus, bridge_side, network_side))
 
     def signals(self) -> dict[str, float]:
         return {
             f"{self.name}.i_c": self._current(),
             f"{self.name}.u_g": (
-                self.bus.out.u if self.bus is not None else self.bridge.out.u_c
+                self._bus_voltage()
+                if self.bus is not None else self.bridge.output.u_c
             ),
-            f"{self.name}.u_dc": self.dclink.out.u_dc,
-            f"{self.name}.i_dc": self.bridge.out.i_dc,
+            f"{self.name}.u_dc": self.dclink.output.u_dc,
+            f"{self.name}.i_dc": self.bridge.output.i_dc,
         }
 
     def control_inputs_from(
@@ -994,16 +1014,15 @@ class DCConverter(Unit):
 
     def _current(self) -> float:
         if self.branch_f is not None:
-            return self.branch_f.out.i
-        return self.bridge.inp.i_c
+            return self.branch_f.output.i
+        return -self.bridge.power_port.current
 
     def _current_connection(self) -> Any:
         if self.branch_f is not None:
             return self.branch_f, "i"
-        sources = self.bridge.power_terminal.current_sources
-        if sources is None:
-            raise RuntimeError(f"{self.name}: the bridge power bus has not been assembled")
-        return sources
+        if self.power_measurement is None:
+            raise RuntimeError(f"{self.name}: continuous current feedback needs a port measurement")
+        return self.power_measurement, "current", -1.0
 
     def _protection_currents(self) -> tuple[float, ...]:
         return (self._current(),)
@@ -1024,7 +1043,7 @@ class DCConverter(Unit):
         return ProtectionSample(
             terminal_voltage_pu=abs(measurement.voltage) / self.cfg.dc_base.v,
             dc_voltage_error_pu=(
-                float(self.dclink.out.u_dc) / self.cfg.dc_base.v - 1.0
+                float(self.dclink.output.u_dc) / self.cfg.dc_base.v - 1.0
             ),
             startup_complete=self._startup_complete(output),
         )
@@ -1032,5 +1051,5 @@ class DCConverter(Unit):
     @staticmethod
     def _port_value(port: tuple[Any, str]) -> float:
         subsystem, field = port
-        return getattr(subsystem.out, field)
+        return getattr(subsystem.output, field)
 

@@ -7,11 +7,13 @@ import pytest
 
 import peslite
 from conftest import EXAMPLES
+from peslite.assembly.circuit import Circuit
 from peslite.assembly.params import ConfigError, from_dict
 from peslite.components import HalfBridge, HalfBridgeDiodeConduction, PWMAveragingModel
 from peslite.assembly.conduction import DiodeConduction
 from peslite.control import (BridgeControlOutput, DCVoltageControl, GraphController,
                              InductorCurrentControl, Startup)
+from peslite.solver.netlist import CurrentState, Dissipation, Inductor, VoltageSource
 
 
 def _case(*, model="pwm_averaging", bridge_type="half_bridge",
@@ -74,21 +76,21 @@ def _case(*, model="pwm_averaging", bridge_type="half_bridge",
     ("boost", 24.0, 5.0, -120.0),
     ("buck-boost", -48.0, 2.5, 120.0),
 ])
-def test_scalar_power_uses_the_external_terminal_not_control_feedback(
+def test_scalar_power_uses_the_external_port_not_control_feedback(
         mode, case, voltage, current, expected):
     params = peslite.load(EXAMPLES / f"{case}-example.pes").replace(**{
         "units.converter.bridge.model": mode,
         "units.converter.meas.average": ["power"],
     })
     unit = peslite.System(params).units["converter"]
-    terminal, = (terminal for bus, terminal in unit.terminals() if bus == unit.cfg.bus)
-    assert unit._power_terminal is terminal
-    setattr(terminal.subsystem.inp, terminal.voltage, voltage)
-    setattr(terminal.subsystem.out, terminal.current, current)
+    port, = (port for bus, port in unit.port_bindings() if bus == unit.cfg.bus)
+    assert unit._power_port is port
+    port.voltage = voltage
+    port.current = -expected / voltage
     # Keep the regulation feedback deliberately different from the measured power port.
-    unit.branch_f.out.i = 5.0
-    unit.bus.out.u = voltage
-    unit.dclink.out.u_dc = 48.0 if case == "boost" else 24.0
+    unit.branch_f.output.i = current
+    unit.bus.output.u = voltage
+    unit.dclink.output.u_dc = 48.0 if case == "boost" else 24.0
     assert unit.ports.value("power") == pytest.approx(expected)
     if case != "buck":
         control_voltage = unit._port_value(unit._control_voltage_port)
@@ -115,18 +117,13 @@ def test_scalar_feedback_binds_the_same_terminal_power_for_sampled_and_continuou
         },
     })
     unit = peslite.System(params).units["converter"]
-    terminal = unit._power_terminal
-    terminal.subsystem.inp.u1 = 24.0
-    terminal.subsystem.out.i = 5.0
+    port = unit._power_port
+    port.voltage = 24.0
+    port.current = 5.0
     assert unit.control_inputs()["meas.power"] == -120.0
     if mode == "averaging":
         connections = unit.connections()
-        voltage_source, current_source = terminal.signal_sources()
-        assert connections[unit.ctrl, "power_voltage"] == voltage_source
-        assert connections[unit.ctrl, "power_current"] == current_source
-        unit.ctrl.inp.power_voltage = 24.0
-        unit.ctrl.inp.power_current = 5.0
-        assert unit.ctrl._flow_measurement().power == -120.0
+        assert connections[unit.ctrl, "power"] == (unit.power_measurement, "power")
 
 
 class _FixedDutyController:
@@ -193,10 +190,10 @@ def test_dc_converter_is_an_open_unit_connected_through_the_common_terminal_api(
 
     assert isinstance(unit.bridge.topology, peslite.HalfBridge)
     assert unit.bus is simulation.system.buses["output"]
-    assert ("converter.bus.dc", unit.dclink.terminal) in unit.terminals()
-    assert ("converter.bus.dc", unit.bridge.dc_terminal) in unit.terminals()
-    assert ("converter.bus.power", unit.bridge.power_terminal) in unit.terminals()
-    assert ("output", unit.branch_f.terminal2) in unit.terminals()
+    assert ("converter.bus.dc", unit.dclink.port) in unit.port_bindings()
+    assert ("converter.bus.dc", unit.bridge.dc_port) in unit.port_bindings()
+    assert ("converter.bus.power", unit.bridge.power_port) in unit.port_bindings()
+    assert ("output", unit.branch_f.port2) in unit.port_bindings()
     assert {"output", "load", "converter.branch_f", "converter.bridge",
             "converter.dclink"} <= names
     assert not hasattr(unit, "plant")
@@ -236,7 +233,7 @@ def test_dc_converter_uses_each_shared_bridge_form(model, tmp_path):
 
     assert result.summary["t_stop"] == pytest.approx(0.002)
     assert np.isfinite(simulation.system.model.get_initial_values()).all()
-    assert 0.0 <= float(simulation.unit().bridge.inp.q) <= 1.0
+    assert 0.0 <= float(simulation.unit().bridge.input.q) <= 1.0
 
 
 @pytest.mark.parametrize("bridge_type,topology", [
@@ -270,29 +267,34 @@ def test_half_bridge_device_placement_controls_unilateral_current():
     assert controlled_unit.bridge.topology.lower_controlled
 
 
-def test_buck_boost_uses_the_three_physical_half_bridge_terminals():
+def test_buck_boost_uses_the_three_physical_half_bridge_ports():
     params = peslite.load(EXAMPLES / "buck-boost-example.pes").replace(**{
         "units.converter.bridge.model": "switching",
     })
     simulation = peslite.Simulation(params)
     unit = simulation.unit()
-    terminals = unit.terminals()
+    bindings = unit.port_bindings()
 
-    assert (unit.power_bus, unit.bridge.power_terminal) in terminals
-    assert (unit.power_bus, unit.branch_f.terminal1) in terminals
-    assert (unit.cfg.bus, unit.bridge.lower_terminal) in terminals
-    assert all(terminal is not unit.branch_f.terminal2 for _bus, terminal in terminals)
+    assert (unit.power_bus, unit.bridge.power_port) in bindings
+    assert (unit.power_bus, unit.branch_f.port1) in bindings
+    assert (unit.cfg.bus, unit.bridge.lower_port) in bindings
+    assert all(port is not unit.branch_f.port2 for _bus, port in bindings)
+    assert unit.branch_f.port2.grounded
 
     bridge = unit.bridge
-    bridge.inp.u_dc = 24.0
-    bridge.inp.u_lower = -36.0
-    bridge.inp.i_c = 2.0
-    bridge.inp.q = 1.0
+    bridge.enabled = True
+    bridge.dc_port.voltage = 24.0
+    bridge.lower_port.voltage = -36.0
+    bridge.power_port.current = -2.0
+    bridge.input.q = 1.0
     bridge.set_outputs(0.0)
-    assert (bridge.out.u_c, bridge.out.i_dc, bridge.out.i_lower) == (24.0, 2.0, 0.0)
-    bridge.inp.q = 0.0
+    assert (bridge.output.u_c, bridge.output.i_dc, bridge.output.i_lower) == (24.0, 2.0, 0.0)
+    bridge.input.q = 0.0
     bridge.set_outputs(0.0)
-    assert (bridge.out.u_c, bridge.out.i_dc, bridge.out.i_lower) == (-36.0, 0.0, 2.0)
+    if bridge.commutation_margin() < 0.0:
+        bridge.commutate(0.0)
+        bridge.set_outputs(0.0)
+    assert (bridge.output.u_c, bridge.output.i_dc, bridge.output.i_lower) == (-36.0, 0.0, 2.0)
 
 
 @pytest.mark.parametrize("resistance,mode", [(10.0, "ccm"), (40.0, "dcm")])
@@ -350,7 +352,7 @@ def test_buck_boost_switching_matches_an_independent_circuit_reference(
 def test_averaged_buck_boost_has_the_same_ccm_and_dcm_balance_relations():
     vin, duty = 24.0, 0.4
     period, inductance = 50.0e-6, 200.0e-6
-    topology = HalfBridge(lower_controlled=False, external_terminal="lower_rail")
+    topology = HalfBridge(lower_controlled=False, external_port="lower_rail")
     conduction = HalfBridgeDiodeConduction(period, inductance, 0.0, topology)
 
     ccm_voltage = duty / (1.0 - duty) * vin
@@ -381,6 +383,139 @@ def test_light_load_enters_dcm_without_a_mode_setting(tmp_path):
 
     assert current.min() >= -1e-12
     assert np.count_nonzero(np.isclose(current, 0.0, atol=1e-10)) > 2
+
+
+@pytest.mark.parametrize("model", ["pwm_averaging", "averaging"])
+def test_averaged_bridge_currents_follow_the_connected_converter_state(model, tmp_path):
+    simulation = peslite.Simulation(_case(model=model, t_end=0.002))
+    simulation.run(out_dir=tmp_path / model)
+    unit = simulation.unit()
+
+    assert unit.bridge.output.i_dc == pytest.approx(
+        unit.bridge.input.upper_current_ratio * unit.branch_f.output.i
+    )
+    assert unit.dclink.output.i_src == pytest.approx(unit.bridge.output.i_dc)
+    assert unit.bridge.output.u_c * unit.branch_f.output.i == pytest.approx(
+        unit.dclink.output.u_dc * unit.bridge.output.i_dc
+    )
+
+
+@pytest.mark.parametrize("model", ["pwm_averaging", "averaging"])
+@pytest.mark.parametrize("circuit_model", ["device", "statewise", "nodal"])
+def test_reverse_averaged_bridge_is_a_lossless_two_port(
+        model, circuit_model, tmp_path):
+    params = peslite.load(EXAMPLES / "boost-example.pes").replace(**{
+        "units.converter.bridge.model": model,
+        "simulation.solver.circuit_model": circuit_model,
+        "simulation.t_end": 2e-4,
+        "simulation.progress.enable": 0,
+        "simulation.output.signals": 0,
+    })
+    simulation = peslite.Simulation(params)
+    simulation.run(out_dir=tmp_path / f"{model}-{circuit_model}")
+    unit = simulation.unit()
+    assert abs(unit.bridge.output.u_c * unit.branch_f.output.i) == pytest.approx(
+        abs(unit.dclink.output.u_dc * unit.bridge.output.i_dc)
+    )
+    assert sum(port.power() for port in unit.bridge.ports) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_averaged_boost_regulates_its_output(tmp_path):
+    params = peslite.load(EXAMPLES / "boost-example.pes").replace(**{
+        "simulation.t_end": 0.02,
+        "simulation.progress.enable": 0,
+        "simulation.output.signals": 0,
+    })
+    result = peslite.Simulation(params).run(out_dir=tmp_path)
+    states = result.final_states()
+    assert states["converter.dclink.u_C"] == pytest.approx(48.0, abs=1.0)
+    assert 0.0 < states["converter.branch_f.i"] < 5.0
+
+
+def test_switching_diode_guard_is_derived_from_the_inductor_state():
+    simulation = peslite.Simulation(_case(model="switching", t_end=1e-4))
+    circuit = next(
+        subsystem for subsystem in simulation.system.model.subsystems
+        if isinstance(subsystem, Circuit)
+    )
+    net = circuit.netlist
+    for selected in range(2):
+        for index, diode in enumerate(net._diodes):
+            net.set_conducting(diode, index == selected)
+        circuit.release_topology()
+        net.state_diode_relations()
+    groups, guards = net.state_diode_guard_plan(net.topology())
+    assert guards == ((1, 1.0),)
+    assert groups == ((1, ((0, -1.0), (1, 1.0))),)
+
+    net.set_conducting(net._diodes[1], False)
+    net.set_conducting(net._diodes[0], True)
+    circuit.release_topology()
+    _groups, guards = net.state_diode_guard_plan(net.topology())
+    assert guards == ((1, -1.0),)
+
+
+def test_switching_boost_uses_the_existing_implicit_solver_for_its_stiff_startup():
+    """A diode Boost must start an empty, nearly ideal output without commutation chatter."""
+    base = peslite.load(EXAMPLES / "boost-example.pes")
+    final = []
+    for circuit_model in ("device", "statewise", "nodal"):
+        params = base.replace(**{
+            "units.converter.bridge.model": "switching",
+            "units.converter.bridge.on_resistance": 1e-6,
+            "units.converter.ctrl": {
+                "type": "open_loop",
+                "period": 50e-6,
+                "computation": 0.0,
+                "loops": {"DutyModulation": {}},
+                "references": {"duty": 0.5},
+            },
+            "simulation.initial.states.converter.dclink.u_C": 0.0,
+            "simulation.solver.dt": 0.125e-6,
+            "simulation.solver.circuit_model": circuit_model,
+            "simulation.t_end": 1e-4,
+            "simulation.energy_check": "strict",
+            "simulation.progress.enable": 0,
+            "simulation.output.states": 0,
+            "simulation.output.signals": 0,
+            "simulation.output.energy": 0,
+        })
+        simulation = peslite.Simulation(params)
+        result = simulation.run(out_dir=None)
+        states = result.final_states()
+
+        assert simulation.solver._implicit is not None
+        assert not simulation.energy_problems
+        assert all(np.isfinite(value) for value in states.values())
+        assert states["converter.dclink.u_C"] > 0.0
+        assert states["converter.branch_f.i"] > 0.0
+        bridge = simulation.unit().bridge
+        assert sum(port.power() for port in bridge.ports) == pytest.approx(
+            bridge.dissipated_power(), rel=1e-10, abs=1e-12
+        )
+        final.append([
+            states["input.u_C"],
+            states["converter.dclink.u_C"],
+            states["converter.branch_f.i"],
+        ])
+
+    np.testing.assert_allclose(final, np.broadcast_to(final[0], np.shape(final)),
+                               rtol=1e-12, atol=1e-12)
+
+
+def test_switching_boost_keeps_explicit_integration_for_its_ordinary_modes():
+    params = peslite.load(EXAMPLES / "boost-example.pes").replace(**{
+        "units.converter.bridge.model": "switching",
+        "simulation.t_end": 1e-4,
+        "simulation.progress.enable": 0,
+        "simulation.output.states": 0,
+        "simulation.output.signals": 0,
+        "simulation.output.energy": 0,
+    })
+    simulation = peslite.Simulation(params)
+    simulation.run(out_dir=None)
+
+    assert simulation.solver._implicit is None
 
 
 @pytest.mark.parametrize("load,expected_voltage,expected_total", [
@@ -414,8 +549,8 @@ def test_explicit_half_bridge_orientation_sets_the_named_bus_and_boost_feedforwa
     unit = peslite.Simulation(params).unit()
 
     assert unit.bridge.topology.reverse_port
-    assert ("converter.bus.power", unit.branch_f.terminal2) in unit.terminals()
-    assert ("input", unit.branch_f.terminal1) in unit.terminals()
+    assert ("converter.bus.power", unit.branch_f.port2) in unit.port_bindings()
+    assert ("input", unit.branch_f.port1) in unit.port_bindings()
     assert unit.ctrl.control_inputs(2.0, 48.0, 24.0)["meas.duty_feedforward"] == pytest.approx(0.5)
 
 
@@ -440,16 +575,26 @@ def test_averaged_dcm_relation_drives_branch_current_loss_and_bridge_dc_current(
     connections = simulation.system.model.connections
 
     assert law is not None
-    assert connections[(unit.branch_f, "di_dt")] == (law, "derivative")
-    assert connections[(unit.branch_f, "loss_factor")] == (
-        law, "resistance_factor",
+    circuit, = simulation.system.circuits
+    assert circuit.netlist.elements
+    assert unit.branch_f in circuit.components
+    assert unit.bridge in circuit.components
+    branch_elements = circuit._loss_elements[id(unit.branch_f)]
+    assert sum(isinstance(element, CurrentState) for element in branch_elements) == 1
+    assert sum(isinstance(element, Dissipation) for element in branch_elements) == 1
+    assert not any(isinstance(element, (Inductor, VoltageSource))
+                   for element in branch_elements)
+    copies = {(component, field): key for component, field, key in circuit.copies}
+    assert connections[(circuit, copies[unit.branch_f, "di_dt"])] == (
+        law, "derivative"
     )
-    assert connections[(unit.bridge, "upper_current_ratio")] == (
-        law, "upper_current_ratio",
+    assert connections[(circuit, copies[unit.branch_f, "loss_factor"])] == (
+        law, "resistance_factor"
     )
-    assert connections[(unit.bridge, "lower_current_ratio")] == (
-        law, "lower_current_ratio",
+    assert connections[(circuit, copies[unit.bridge, "upper_current_ratio"])] == (
+        law, "upper_current_ratio"
     )
+    assert (unit.bridge, "lower_current_ratio") not in copies
 
     current = 32.0993023218081 / 600.0
     result = law.equations(current, 0.3, 48.0, 0.0, 32.0993023218081)
@@ -472,8 +617,9 @@ def test_strict_energy_audit_rejects_cycle_averaged_dcm_storage():
         "simulation.energy_check": "strict",
     })
 
-    with pytest.raises(ConfigError, match="cycle-averaged DCM current"):
+    with pytest.raises(ConfigError, match="cycle-averaged DCM current") as error:
         peslite.Simulation(params)
+    assert "power balance off" not in str(error.value)
 
 
 def test_ratio_one_solver_schedule_still_honours_the_dcm_local_step():

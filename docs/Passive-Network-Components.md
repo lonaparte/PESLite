@@ -4,21 +4,23 @@ Passive network components are configured under `buses`, `branches` and `element
 
 ## Buses
 
-A bus is a named capacitor node:
+A bus is a named electrical connection point with an optional shunt capacitor:
 
 ```yaml
 buses:
   pcc: {c_pu: 0.02, r_d_pu: 0.5, phases: 3}
-  output: {c: 470e-6, phases: 1}
+  output: {phases: 1}
 ```
 
 | Field | Required | Default | Meaning |
 |---|---:|---|---|
-| `c` or `c_pu` | yes | — | shunt capacitance |
+| `c` or `c_pu` | no | none | shunt capacitance |
 | `r_d` or `r_d_pu` | no | 0 | series damping resistance |
 | `phases` | no | 3 | `1` for a real single-phase node or `3` for a three-phase space-vector node |
 
-A circuit that does not need a capacitor node does not need a `buses` section.
+Without `c`, the bus only joins the ports of branches, sources, Units or other elements and adds no
+state or physical component. Declaring an empty bus is allowed but not recommended because the
+connection point then has no electrical effect. `r_d` is valid only with `c`.
 
 ## Branches
 
@@ -31,11 +33,11 @@ branches:
 
 | Field | Required | Default | Meaning |
 |---|---:|---|---|
-| `bus1`, `bus2` | yes | — | terminal bus or Unit-port names |
+| `bus1`, `bus2` | yes | — | bus or Unit-port names |
 | `l` or `x_pu` | yes | — | series inductance |
 | `r` or `r_pu` | no | 0 | series resistance |
 
-Branch current is positive from `bus1` to `bus2`. Both terminals must use the same phase count.
+Branch current is positive from `bus1` to `bus2`. Both ports must use the same phase count.
 Use [Events Timeline](Events-Timeline.md) to connect or disconnect a branch.
 
 ## Loads and resistors
@@ -56,7 +58,7 @@ system base.
 
 ## Connections
 
-Component terminals accept a public bus name or Unit-port path. Examples:
+Component ports accept a public bus name or Unit-port path. Examples:
 
 ```yaml
 branches:

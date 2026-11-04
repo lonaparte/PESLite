@@ -27,7 +27,7 @@ units:
 | Field | Required | Default | Meaning |
 |---|---:|---|---|
 | `type` | yes | — | `dc_converter` |
-| `bus`, `filter` | together for an external connection | omitted | external terminal and series R-L filter |
+| `bus`, `filter` | together for an external connection | omitted | external port and series R-L filter |
 | `s_base` | no | `base.s_base` | Unit rating in VA |
 | `dclink` | yes | — | rated DC voltage and source |
 | `bridge.type` | no | selected by `ctrl.type` | `half_bridge` or `full_bridge` |
@@ -43,11 +43,11 @@ documented under [Electrical Sources](Electrical-Sources.md#converter-dc-source)
 |---|---|---|
 | Buck | `lower_controlled: 0` | midpoint through `filter` to output `bus` |
 | Boost | `upper_controlled: 0`, `reverse_port: 1` | input `bus` through `filter` to midpoint |
-| Buck-Boost | `lower_controlled: 0`, `external_terminal: lower_rail` | lower rail to output `bus`; midpoint through `filter` to common point |
+| Buck-Boost | `lower_controlled: 0`, `external_port: lower_rail` | lower rail to output `bus`; midpoint through `filter` to common point |
 | bidirectional half bridge | both device rows controlled | midpoint through `filter` to `bus` |
 | full bridge | `type: full_bridge` | power port through `filter` to `bus` |
 
-`external_terminal: lower_rail` requires `bus`, `filter` and `reverse_port: 0`.
+`external_port: lower_rail` requires `bus`, `filter` and `reverse_port: 0`.
 
 ### CCM and DCM
 
@@ -61,6 +61,9 @@ is no mode setting.
 | `averaging` | same cycle-mean conduction relation | same local DCM limit |
 
 The DCM step limit is inactive in CCM.
+An averaged DCM current is a cycle-mean state rather than an instantaneous inductor storage
+coordinate, so `energy_check: strict` rejects that reduced model instead of reporting a false
+instantaneous energy balance.
 
 ### Controllers and measurements
 

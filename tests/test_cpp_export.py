@@ -16,9 +16,9 @@ import yaml
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import from_dict
-from peslite.components import Bag, Element, Terminal, register_element_type
+from peslite.components import Bag, Port
+from peslite.components.network import Element, _register_assembled_type
 from peslite.solver import BlackBoxSubsystem
-from peslite.solver.simulation import convert_main
 from test_measurement_network import load_case
 
 pytestmark = pytest.mark.full
@@ -46,20 +46,23 @@ class _ConditionalModel:
         self.resistance_high = resistance_high
         self.threshold = threshold
         self.state = _ConditionalState(i=0j)
-        self.inp = _ConditionalInput(u=0j)
-        self.out = _ConditionalOutput(i=0j)
-        self.terminal = Terminal(self, "u", "i", 1)
+        self.input = _ConditionalInput(u=0j)
+        self.output = _ConditionalOutput(i=0j)
+        self.port = Port(
+            self, "power", voltage=self.input.u, current=self.output.i, scale=1.5,
+            effort="input.u", flow="output.i"
+        )
 
     def set_outputs(self, t):
-        self.out.i = self.state.i
+        self.output.i = self.state.i
 
     def rhs(self, t):
         resistance = (self.resistance_high
                       if abs(self.state.i) > self.threshold else self.resistance_low)
-        return ((self.inp.u - resistance * self.state.i) / self.inductance,)
+        return ((self.input.u - resistance * self.state.i) / self.inductance,)
 
 
-@register_element_type
+@_register_assembled_type
 class _ConditionalElement(Element):
     type = "test_conditional_element"
 
@@ -84,15 +87,15 @@ class _ConditionalElement(Element):
     def connections(self):
         return {}
 
-    def terminals(self):
-        return ((self.cfg.bus, self.model.terminal),)
+    def port_bindings(self):
+        return ((self.cfg.bus, self.model.port),)
 
     def signals(self):
-        return {f"{self.name}.i": self.model.out.i,
-                f"{self.name}.i_mag": abs(self.model.out.i)}
+        return {f"{self.name}.i": self.model.output.i,
+                f"{self.name}.i_mag": abs(self.model.output.i)}
 
 
-@register_element_type
+@_register_assembled_type
 class _BlackBoxElement(Element):
     type = "test_black_box"
 
@@ -120,14 +123,14 @@ class _BlackBoxElement(Element):
     def connections(self):
         return {}
 
-    def terminals(self):
+    def port_bindings(self):
         return ()
 
     def signals(self):
-        return {f"{self.name}.y": self.model.out.y}
+        return {f"{self.name}.y": self.model.output.y}
 
 
-@register_element_type
+@_register_assembled_type
 class _DiscreteBlackBoxElement(Element):
     type = "test_discrete_black_box"
 
@@ -166,11 +169,11 @@ class _DiscreteBlackBoxElement(Element):
     def connections(self):
         return {(self.lag, "y"): (self.model, "y")}
 
-    def terminals(self):
+    def port_bindings(self):
         return ()
 
     def signals(self):
-        return {f"{self.name}.y": self.model.out.y}
+        return {f"{self.name}.y": self.model.output.y}
 
 
 def _compiler() -> str | None:
@@ -502,7 +505,9 @@ def test_native_continuous_control_feedback_checks_convergence(tmp_path):
     tree["simulation"]["solver"].update(type="fixed", method="rk4", dt=1e-6,
                                         subsystems={}, linearisations=0)
     source, native, python = _run_generated(from_dict(tree), tmp_path / "feedback", compiler)
-    assert "if (!control_converged) throw" in source.read_text()
+    generated = source.read_text()
+    assert "if (!control_converged) throw" in generated
+    assert "class CsvStream" in generated and "CsvStream states" in generated
     actual, expected = _final_csv(native / "states.csv"), _final_csv(python / "states.csv")
     np.testing.assert_allclose(list(actual.values()), list(expected.values()),
                                rtol=2e-9, atol=2e-8)
@@ -675,8 +680,7 @@ def test_python_export_api_uses_export_run(tmp_path, monkeypatch):
 
 def test_cli_export_preserves_mode_name_and_emits_one_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    assert peslite.main([str(EXAMPLES / "gfl-example.pes"), "--averaging",
-                         "--export", "cpp"]) == 0
+    assert peslite.main(["export", str(EXAMPLES / "gfl-example.pes"), "--averaging"]) == 0
     project = tmp_path / "export/gfl-example-averaging"
     source = project / "peslite.cpp"
     assert tuple(project.iterdir()) == (source,)
@@ -686,9 +690,9 @@ def test_cli_export_preserves_mode_name_and_emits_one_file(tmp_path, monkeypatch
     assert "integrate_adaptive" not in text
 
 
-def test_convert_alias_and_all_variables(tmp_path, monkeypatch):
+def test_cli_export_all_variables(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    assert convert_main([str(EXAMPLES / "gfl-example.pes"), "all"]) == 0
+    assert peslite.main(["export", str(EXAMPLES / "gfl-example.pes"), "all"]) == 0
     source = (tmp_path / "export/gfl-example/peslite.cpp").read_text()
     assert "param_simulation_t_end" in source
     assert "param_units_vsc_ctrl_references_p_ref_pu" in source

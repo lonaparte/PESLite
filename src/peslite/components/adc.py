@@ -9,39 +9,56 @@ from typing import Any, Callable, Mapping, Optional
 import numpy as np
 
 from ..control.blocks import MovingWindow
-from ..solver.energy import PowerPort, port_power, re_product
-from ..solver.model import Bag, Empty, _real
+from ..solver.energy import Port, port_power, re_product
+from ..solver.model import Bag, Empty, OutputMethod, _real
 from ..solver.timing import TIME_EPS, PeriodicClock
 
 __all__ = ["ADCSample", "MeasurementPorts", "ADC"]
 
 
-class _PortMeasurementInp(Bag):
+class _PortMeasurementInput(Bag):
     __slots__ = ("voltage", "current")
 
 
-class _PortMeasurementOut(Bag):
+class _PortMeasurementOutput(Bag):
     __slots__ = ("voltage", "current", "power")
 
 
 class _PortMeasurement:
-    """Non-loading observation of an already assembled electrical terminal."""
+    """Non-loading observation of an already assembled electrical port."""
 
     observer = True
+    voltage_field = "voltage"
     outputs_need_inputs = True
     state_names = ()
+    output_stages = (OutputMethod(
+        "set_outputs", ("voltage", "current"), ("voltage", "current", "power"), rhs=False,
+    ),)
 
-    def __init__(self, terminal) -> None:
-        port = terminal.power_port
-        self.ports = (PowerPort("inp.voltage", "inp.current", port.scale, -port.sign),)
+    def __init__(self, port: Port | None = None, *, phases: int | None = None) -> None:
+        if port is None and phases not in (1, 3):
+            raise ValueError("an unbound port measurement needs phases=1 or phases=3")
+        scale = port.scale if port is not None else 1.5 if phases == 3 else 1.0
+        zero = port.voltage if port is not None else 0j if phases == 3 else 0.0
+        self.port = port
+        self.phases = phases
         self.state = Empty()
-        self.inp = _PortMeasurementInp()
-        self.out = _PortMeasurementOut()
+        self.input = _PortMeasurementInput(voltage=zero, current=zero)
+        self.output = _PortMeasurementOutput(voltage=zero, current=zero, power=0.0)
+        self.ports = (Port.signals(
+            "input.voltage", "input.current", scale, -1.0
+        ),)
+
+    def observe(self, port: Port) -> None:
+        """Bind a representative physical port after network assembly."""
+        if port.scale != self.ports[0].scale:
+            raise ValueError("the observed port uses a different phase convention")
+        self.port = port
 
     def set_outputs(self, t: float) -> None:
-        self.out.voltage = self.inp.voltage
-        self.out.current = self.inp.current
-        self.out.power = port_power(self, self.ports[0])
+        self.output.voltage = self.input.voltage
+        self.output.current = self.input.current
+        self.output.power = port_power(self, self.ports[0])
 
     def rhs(self, t: float):
         return ()

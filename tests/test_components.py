@@ -16,7 +16,7 @@ from peslite.components import (
     PWMAveragingModel,
     RCNode,
     RLBranch,
-    Terminal,
+    Port,
     ThreePhaseBridge,
     ZOH,
 )
@@ -24,51 +24,55 @@ from peslite.components import (
 COMPONENTS = Path(peslite.components.__file__).parent
 
 
-def test_electrical_terminals_use_the_energy_direction_and_numbered_voltage_ports():
+def test_electrical_ports_store_inward_current_and_numbered_names():
     branch = RLBranch(0.1, 0.01)
 
-    assert (branch.terminal1.subsystem, branch.terminal1.voltage,
-            branch.terminal1.current, branch.terminal1.direction) == (
-                branch, "u1", "i", 1,
+    assert (branch.port1.component, branch.port1.name,
+            branch.port1.voltage, branch.port1.current) == (
+                branch, "1", 0j, 0j,
             )
-    assert (branch.terminal2.subsystem, branch.terminal2.voltage,
-            branch.terminal2.current, branch.terminal2.direction) == (
-                branch, "u2", "i", -1,
+    assert (branch.port2.component, branch.port2.name,
+            branch.port2.voltage, branch.port2.current) == (
+                branch, "2", 0j, 0j,
             )
-    assert [port.sign for port in branch.ports] == [
-        branch.terminal1.direction, branch.terminal2.direction,
-    ]
 
     node = RCNode(0.1, 0.01)
-    assert node.inp.__slots__ == ("i",)
-    assert node.terminal.drives_voltage
-    assert (node.terminal.voltage, node.terminal.current, node.terminal.direction) == (
-        "u", "i", 1,
-    )
-    with pytest.raises(ValueError, match="direction must be"):
-        Terminal(branch, "u1", "i", 0)
-    with pytest.raises(TypeError, match="drives_voltage must be bool"):
-        Terminal(branch, "u1", "i", 1, drives_voltage=1)
-    with pytest.raises(ValueError, match="does not match the energy-port direction"):
-        Terminal(branch, "u1", "i", -1)
+    assert node.port.component is node
+    assert node.port.name == "power"
+    with pytest.raises(ValueError, match="scale must be positive"):
+        Port(branch, "1", scale=0.0)
 
 
-def test_inherited_branch_behavior_uses_the_preselected_equations():
+def test_inherited_branch_behavior_uses_the_declared_netlist_equations():
     class DerivedBranch(RLBranch):
         pass
 
-    branch = DerivedBranch(1.0, 0.0, i0=-1.0, phases=1, unilateral=True)
-    branch.inp.u1, branch.inp.u2 = 0.0, 1.0
+    branch = DerivedBranch(1.0, 0.0, i0=1.0, phases=1, unilateral=True)
+    branch.port1.voltage, branch.port2.voltage = 0.0, 1.0
     branch.set_outputs(0.0)
 
-    assert branch.set_outputs.__func__ is RLBranch._set_outputs_unilateral
-    assert branch.rhs.__func__ is RLBranch._rhs_unilateral
-    assert branch.out.i == 0.0
-    assert branch.rhs(0.0) == (0.0,)
+    assert any(type(element).__name__ == "Inductor"
+               for element in branch._device_circuit.netlist.elements)
+    if branch.commutation_margin() < 0.0:
+        branch.commutate(0.0)
+        branch.set_outputs(0.0)
+    assert branch.output.i == 1.0
+    assert branch.rhs(0.0) == (-1.0,)
     branch.open_breaker()
-    assert branch.rhs.__func__ is RLBranch._rhs_open
+    assert branch.rhs(0.0) == (0.0,)
     branch.close_breaker()
-    assert branch.rhs.__func__ is RLBranch._rhs_unilateral
+    branch.state.i = 1.0
+    assert branch.rhs(0.0) == (-1.0,)
+
+
+def test_model_prepares_a_standalone_component_before_planning():
+    branch = RLBranch(1.0, 2.0, i0=3.0, phases=1)
+    branch.port1.voltage, branch.port2.voltage = 5.0, 1.0
+
+    model = peslite.Model({"branch": branch}, {})
+
+    assert branch._device_circuit is not None
+    assert model.rhs_list(0.0, [3.0]) == [-2.0]
 
 
 def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():
@@ -97,14 +101,13 @@ def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():
 @pytest.mark.parametrize("phases,voltage,current,expected", [
     (1, 24.0, 5.0, 120.0), (3, 3.0 + 4.0j, 2.0 - 1.0j, 3.0),
 ])
-def test_terminal_power_reuses_the_declared_energy_convention(phases, voltage, current, expected):
+def test_port_power_reuses_the_declared_energy_convention(phases, voltage, current, expected):
     branch = RLBranch(0.1, 0.01, phases=phases)
-    branch.inp.u1 = branch.inp.u2 = voltage
-    branch.out.i = current
-    assert branch.terminal1.power_port is branch.ports[0]
-    assert branch.terminal2.power_port is branch.ports[1]
-    assert branch.terminal1.power() == pytest.approx(expected)
-    assert branch.terminal2.power() == pytest.approx(-expected)
+    branch.port1.voltage = branch.port2.voltage = voltage
+    branch.port1.current = current
+    branch.port2.current = -current
+    assert branch.port1.power() == pytest.approx(expected)
+    assert branch.port2.power() == pytest.approx(-expected)
 
 
 def test_adc_owns_oversampling_and_averaging_window_state():

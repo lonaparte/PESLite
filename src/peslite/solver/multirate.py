@@ -14,8 +14,9 @@ from typing import Any, Mapping, Optional
 import numpy as np
 from numpy.typing import NDArray
 
-from .energy import re_product, signal
-from .integrators import RHS, TABLEAUS, SolverStep, combine, integrator, stage_state, subintervals
+from .energy import re_product
+from .integrators import (EXPLICIT_FIXED_METHODS, RHS, TABLEAUS, SolverStep, combine,
+                          canonical_method, integrator, stage_state, subintervals)
 from .model import ConfigError
 
 __all__ = ["MultirateSolver", "HeldStorage", "make_solver", "parse_step"]
@@ -30,20 +31,28 @@ def make_solver(cfg: Any, model: Optional[Any] = None, ratings: Any = None):
     ``ratings``: mapping storage scale -> (rated effort, rated flow), or a callable
     ``(subsystem_name, storage) -> (effort, flow)``.
     """
-    if cfg.type == "fixed" and cfg.subsystems:
+    solver_type = cfg.type
+    method = cfg.method
+    if solver_type == "fixed" and cfg.subsystems:
         if model is None:
             raise ConfigError("simulation.solver.subsystems needs the model whose subsystems it names")
         try:
             parsed = {name: parse_step(value)[0] for name, value in cfg.subsystems.items()}
             if any(ratio != 1.0 for ratio in parsed.values()):
-                return MultirateSolver(model, cfg.subsystems, cfg.dt, cfg.method, cfg.sweeps, cfg.rtol, cfg.atol,
+                if method not in EXPLICIT_FIXED_METHODS:
+                    raise ConfigError(
+                        "simulation.solver.subsystems needs an explicit system method, got "
+                        f"{method!r}"
+                    )
+                return MultirateSolver(model, cfg.subsystems, cfg.dt, method, cfg.sweeps, cfg.rtol, cfg.atol,
                                        ratings)
             unknown = [name for name in parsed if not model.select(name)]  # every step is dt: single-rate
             if unknown:
                 raise KeyError(f"unknown subsystem(s) or namespace(s) {unknown}; this model has {model.names}")
         except (KeyError, ValueError) as exc:
             raise ConfigError(f"simulation.solver.subsystems: {exc.args[0]}") from None
-    return integrator(cfg.method, cfg.dt, cfg.rtol, cfg.atol, cfg.max_step, cfg.warm_start)
+    return integrator(method, cfg.dt, cfg.rtol, cfg.atol, cfg.max_step, cfg.warm_start,
+                      model=model, solver_type=solver_type)
 
 
 def parse_step(value: Any) -> tuple[float, Optional[str]]:
@@ -52,7 +61,7 @@ def parse_step(value: Any) -> tuple[float, Optional[str]]:
     if isinstance(value, Mapping):
         if "step" not in value:
             raise ValueError("a mapping needs a 'step'")
-        method = value.get("method")
+        method = canonical_method(value.get("method"))
         value = value["step"]
     if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
             or value <= 0.0):
@@ -107,15 +116,16 @@ class MultirateSolver:
     """Explicit RK with system step ``dt`` (s) and, per named subsystem, a step relative to it.
 
     ``steps``: ``{name: ratio}`` or ``{name: {"step": ratio, "method": ...}}``, ratio ``1/N`` or an
-    integer ``M``; ``method``: ``"euler"``, ``"heun"`` or ``"rk4"``; ``sweeps``: coupling sweeps
+    integer ``M``; ``method``: ``"euler"``, ``"heun"`` or ``"RK4"``; ``sweeps``: coupling sweeps
     for ``1/N`` steps (>= 1); ``rtol`` / ``atol``: for an adaptive windowed method; ``ratings``:
     as in :func:`make_solver`. ``n_system``, ``n_inner`` and ``n_outer`` count RHS evaluations;
     ``groups``: the ``{label: GroupPlan}`` of the split (see :meth:`~peslite.solver.model.Model.groups`).
     """
 
-    def __init__(self, model: Any, steps: Mapping[str, Any], dt: float, method: str = "rk4",
+    def __init__(self, model: Any, steps: Mapping[str, Any], dt: float, method: str = "RK4",
                  sweeps: int = 2, rtol: float = 1e-6, atol: float = 1e-9,
                  ratings: Any = None) -> None:
+        method = canonical_method(method, "fixed")
         if method not in TABLEAUS:
             raise ValueError(f"unknown fixed-step method {method!r}")
         if int(sweeps) < 1:
@@ -160,18 +170,9 @@ class MultirateSolver:
         self.window_steps = int(round(min(outer.values()))) if outer else 1  # system steps per window
         assignment = {n: "inner" for n in inner}
         assignment.update({n: "outer" for n in outer})
-        self.groups = groups = model.groups(assignment)  # validates the names
-        self.system = groups["system"]
-        self.inner = groups.get("inner")
-        self.outer = groups.get("outer")
-        self._mask_inner = self.inner.mask if self.inner is not None else np.zeros(model.n_states, dtype=bool)
-        self._mask_outer = self.outer.mask if self.outer is not None else np.zeros(model.n_states, dtype=bool)
-        self._mask_moving = ~self._mask_outer  # what the system step advances (system and inner states)
-        self._outer_labels = [lab for lab, m in zip(model.state_labels(), self._mask_outer) if m]
-        # windowed-group inputs whose window sums are restart state: (label, input record, field), plan order
-        owner = {id(sub.inp): model.name_of(sub) for sub in self.outer.members} if self.outer is not None else {}
-        self._input_labels = [(f"{owner[id(inp)]}.{field}", inp, field)
-                              for _kind, (inp, field, *_rest) in (self.outer.inputs if self.outer is not None else ())]
+        self._assignment = assignment
+        self._plan_revision = model.plan_revision
+        self._refresh_group_plans()
         self.window = self.window_steps * self.dt
         self.outer_method = outer_method or method
         self._outer_solver = (integrator(self.outer_method, self.window, rtol, atol)
@@ -218,6 +219,7 @@ class MultirateSolver:
     def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
                 max_step: float = math.inf) -> SolverStep:
         """Advance with a local limit applied coherently to every system and inner step."""
+        self.model_plan_changed()
         if max_step <= 0.0:
             raise ValueError("max_step must be positive")
         if t1 - t0 <= 0.0:
@@ -255,6 +257,15 @@ class MultirateSolver:
         for provider in providers:
             owner = getattr(provider, "local_step_state", provider)
             if owner not in self.model.subsystems:
+                owner = next(
+                    (
+                        subsystem
+                        for subsystem in self.model.subsystems
+                        if getattr(subsystem, "component", None) is owner
+                    ),
+                    None,
+                )
+            if owner is None:
                 continue
             mask = np.zeros(self.model.n_states, dtype=bool)
             for state in getattr(owner, "state_names", ()):
@@ -287,10 +298,49 @@ class MultirateSolver:
 
     def parameters_changed(self) -> None:
         """Refresh storage declarations after a ``set`` event changed parameters."""
+        self.model_plan_changed()
         self._storage_of = {
             self.model.state_slice(sub, st.state).start: (sub, st)
             for sub in self.model.subsystems for st in getattr(sub, "storage", ())
         }
+
+    def model_plan_changed(self) -> None:
+        """Refresh grouped schedules when the model compiled a new evaluation plan."""
+        if self._plan_revision != self.model.plan_revision:
+            self._refresh_group_plans()
+            self._plan_revision = self.model.plan_revision
+
+    def _refresh_group_plans(self) -> None:
+        """Rebind group execution plans after the model recompiles its signal schedule."""
+        model = self.model
+        self.groups = groups = model.groups(self._assignment)
+        self.system = groups["system"]
+        self.inner = groups.get("inner")
+        self.outer = groups.get("outer")
+        self._mask_inner = (
+            self.inner.mask if self.inner is not None else np.zeros(model.n_states, dtype=bool)
+        )
+        self._mask_outer = (
+            self.outer.mask if self.outer is not None else np.zeros(model.n_states, dtype=bool)
+        )
+        self._mask_moving = ~self._mask_outer
+        self._outer_labels = [
+            label for label, member in zip(model.state_labels(), self._mask_outer) if member
+        ]
+        owner = ({id(sub.input): model.name_of(sub) for sub in self.outer.members}
+                 if self.outer is not None else {})
+        self._input_labels = [
+            (f"{owner[id(input_)]}.{field}", input_, field)
+            for _kind, (input_, field, *_rest) in (
+                self.outer.inputs if self.outer is not None else ()
+            )
+        ]
+        if hasattr(self, "_coupling"):
+            self._coupling[:] = True
+            for subsystem in model.subsystems:
+                if getattr(subsystem, "observer", False):
+                    for state in subsystem.state_names:
+                        self._coupling[model.state_slice(subsystem, state)] = False
 
     def _sample_outer_rate(self, t: float, y: NDArray[np.float64]) -> None:
         """Evaluate the windowed group's rates once per window to update the rate peaks."""
@@ -402,8 +452,8 @@ class MultirateSolver:
             for lab, a, sl in zip(self._outer_labels, self._anchor, self._slope):
                 s[f"anchor.{lab}"] = float(a)
                 s[f"slope.{lab}"] = float(sl)
-        for lab, inp, field in self._input_labels:
-            s[f"acc.{lab}"] = self._acc.get((id(inp), field), 0.0 * getattr(inp, field))
+        for lab, input, field in self._input_labels:
+            s[f"acc.{lab}"] = self._acc.get((id(input), field), 0.0 * getattr(input, field))
         return s
 
     def set_state(self, values: Mapping[str, Any]) -> None:
@@ -426,8 +476,8 @@ class MultirateSolver:
             self._anchor = self._slope = None
             return
         self._open_window(float(t_anchor), anchor, slope)
-        self._acc = {(id(inp), field): values[f"acc.{lab}"]
-                     for lab, inp, field in self._input_labels if f"acc.{lab}" in values}
+        self._acc = {(id(input), field): values[f"acc.{lab}"]
+                     for lab, input, field in self._input_labels if f"acc.{lab}" in values}
         end = float(values.get("window_end", math.nan))
         self._window_end = end if end > t_anchor else t_anchor + self.window
         self._last_returned = None  # a loaded anchor is trusted on the next call
@@ -475,9 +525,10 @@ class MultirateSolver:
                 if not self._mask_outer[idx]:
                     continue
                 e_seen = getattr(sub.state, st.state)  # extrapolated effort
-                flow = 0.0
-                for name, sign in st.flows:
-                    flow += sign * signal(sub, name)
+                flow = sum(
+                    sign * getattr(port, quantity)
+                    for port, quantity, sign in st.power_terms
+                )
                 self._acc_energy[idx] = self._acc_energy.get(idx, 0.0) + weight * st.scale * re_product(e_seen, flow)
                 # running flow integral
                 run = self._acc_flow.get(idx, 0.0) + weight * flow
@@ -646,10 +697,7 @@ class MultirateSolver:
             is_c = sl.stop - sl.start == 2
             e_old = complex(y_start[sl.start], y_start[sl.start + 1]) if is_c else y_start[sl.start]
             e_new = complex(full_new[sl.start], full_new[sl.start + 1]) if is_c else full_new[sl.start]
-            flow = 0.0
-            for name, sign in st.flows:
-                where, _, attr = name.partition(".")
-                flow += sign * self._acc.get((id(getattr(sub, where)), attr), 0.0)
+            flow = self._acc_flow.get(idx, 0.0)
             # energy residual: delivered minus accepted by the storage
             r = self._acc_energy.get(idx, 0.0) - st.scale * re_product(0.5 * (e_old + e_new), flow)
             residual += r

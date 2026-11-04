@@ -91,14 +91,15 @@ def test_each_bridge_topology_has_switching_pwm_and_averaging_forms(
     pwm.reset(duties, on=True)
     assert pwm.start(0.0, (None, None), continued=False) == pytest.approx(expected)
 
-    averaging.inp.q = expected
-    averaging.inp.u_dc = 48.0
+    averaging.input.q = expected
+    averaging.dc_port.voltage = 48.0
     three_phase = isinstance(topology, ThreePhaseBridge)
-    averaging.inp.i_c = 2.0 + 0.0j if three_phase else 2.0
+    averaging.input.i_c = 2.0 + 0.0j if three_phase else 2.0
+    averaging.power_port.current = -averaging.input.i_c
     averaging.set_outputs(0.0)
     factor = 1.5 if three_phase else 1.0
-    assert averaging.out.u_c == pytest.approx(48.0 * expected)
-    assert averaging.out.i_dc == pytest.approx(factor * (expected * 2.0).real)
+    assert averaging.output.u_c == pytest.approx(48.0 * expected)
+    assert averaging.output.i_dc == pytest.approx(factor * (expected * 2.0).real)
 
 
 @pytest.mark.parametrize(("topology", "duties", "current", "expected", "commanded"), [
@@ -120,14 +121,14 @@ def test_pwm_average_dead_time_uses_each_topologys_pole_current_mapping(
     cfg = _bridge_configuration("pwm_averaging")
     cfg.pwm.dead_time = 1.0e-5
     bridge = make_bridge(cfg, topology=topology)
-    bridge.inp.i_c = current
+    bridge.input.i_c = current
     bridge.reset(duties, on=True)
 
     assert bridge.start(0.0, (None, None), continued=False) == pytest.approx(expected)
 
     cfg.pwm.dead_time_compensation = True
     compensated = make_bridge(cfg, topology=topology)
-    compensated.inp.i_c = current
+    compensated.input.i_c = current
     compensated.reset(compensated.compensated(tuple(duties), current), on=True)
     assert compensated.duty == pytest.approx(commanded)
     assert compensated.start(0.0, (None, None), continued=False) == pytest.approx(
@@ -164,18 +165,18 @@ def test_switching_dead_time_compensation_preconditions_the_command_before_physi
     cfg.pwm.dead_time = 1.0e-5
     cfg.pwm.dead_time_compensation = True
     bridge = make_bridge(cfg, topology=topology)
-    bridge.inp.i_c = 2.0
-    bridge.reset(bridge.compensated((0.75,), bridge.inp.i_c), on=True)
+    bridge.input.i_c = 2.0
+    bridge.reset(bridge.compensated((0.75,), bridge.input.i_c), on=True)
 
     assert bridge.duty == pytest.approx([0.85])
     warmup = bridge.modulator(-bridge.carrier_period, bridge.carrier_period, bridge.duty)
     bridge._dead_time_sequence(
         -bridge.carrier_period, bridge.carrier_period, warmup,
-        topology.pole_currents(bridge.inp.i_c), enabled=True,
+        topology.pole_currents(bridge.input.i_c), enabled=True,
     )
     raw = bridge.modulator(0.0, bridge.carrier_period, bridge.duty)
     actual = bridge._dead_time_sequence(
-        0.0, bridge.carrier_period, raw, topology.pole_currents(bridge.inp.i_c), enabled=True,
+        0.0, bridge.carrier_period, raw, topology.pole_currents(bridge.input.i_c), enabled=True,
     )
     assert np.average(actual.q_abc[:, 0], weights=actual.dt) == pytest.approx(0.75)
     assert bridge.dead_time == pytest.approx(1.0e-5)
@@ -199,7 +200,7 @@ def test_unit_applies_dead_time_compensation_from_its_adc_measurement(monkeypatc
     output = ControlOutput(
         np.asarray([0.75, 0.25, 0.5]), theta=0.0, omega=unit.cfg.base.w0,
     )
-    unit.bridge.inp.i_c = 2.0 + 0.0j
+    unit.bridge.input.i_c = 2.0 + 0.0j
     monkeypatch.setattr(unit, "_sample_control", lambda _t, _plant: measurement)
     unit.ctrl = lambda _t, _measurement: output
 
@@ -220,11 +221,12 @@ def test_full_bridge_device_attributes_select_rectification_on_the_same_structur
     cfg.bridge.parallel_capacitance = 0.0
     model = make_bridge(cfg, topology=rectifier)
     assert model.topology is rectifier and model.modulator is None
-    model.inp.u_dc, model.inp.i_c, model.inp.u_hold = 100.0, 2.0, 0.0
+    model.dc_port.voltage = 100.0
+    model.power_port.current = -2.0
     assert model.commutation_margin() < 0.0
     model.commutate(0.0)
     model.set_outputs(0.0)
-    assert model.out.u_c == -100.0 and model.out.i_dc == -2.0
+    assert model.output.u_c == -100.0 and model.output.i_dc == -2.0
 
 
 def test_half_bridge_fixes_device_placement_at_construction():

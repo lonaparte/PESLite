@@ -6,9 +6,9 @@ models use the ADC (:mod:`.adc`) and own their PWM timing/register implementatio
 :mod:`.pwm`; the ideal averaging bridge connects directly to continuous controller equations.
 """
 
-from ..solver import Bag, ConfigError, PowerPort, StoragePort
-from .network import (ACVoltageSource, ELEMENT_TYPES, Element, Load, Resistor, RCNode, RLBranch,
-                      Terminal, VoltageSource, register_element_type)
+from ..solver import Bag, ConfigError, Empty, Port, StoragePort
+from .network import (ACVoltageSource, Load, Resistor, RCNode, RLBranch,
+                      VoltageSource, register_component_type)
 from .converter import (AveragingModel, PWMAveragingModel, SwitchingModel,
                         ThreePhaseBridge,
                         DCCapacitor, DCCurrentSource, DCLink,
@@ -22,9 +22,10 @@ from .wpt import (CompensatedLink, SwitchControlledCapacitor, SwitchedCompensate
                   make_wpt_link)
 from .onnx import ONNXModel, ONNXStateParams
 
-__all__ = ["Terminal", "ACVoltageSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
-           "Bag", "ConfigError", "PowerPort", "StoragePort",
-           "register_element_type", "Load", "Resistor", "VoltageSource", "ThreePhaseBridge", "SwitchingModel",
+__all__ = ["Port", "ACVoltageSource", "RLBranch", "RCNode",
+           "Bag", "Empty", "ConfigError", "StoragePort",
+           "register_component_type", "Load", "Resistor", "VoltageSource",
+           "ThreePhaseBridge", "SwitchingModel",
            "PWMAveragingModel", "make_bridge", "DCLink",
            "DCCapacitor", "DCCurrentSource", "DCVoltageSource",
            "make_dclink", "ADC", "ADCSample",

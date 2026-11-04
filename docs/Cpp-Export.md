@@ -6,17 +6,17 @@ Python.
 
 ## Export
 
-Use `peslite-convert` with a simulation file or bundled example:
+Use `peslite export` with a simulation file or bundled example:
 
 ```bash
-peslite-convert case.pes simulation.t_end units.vsc.ctrl.references.p_ref_pu
+peslite export case.pes simulation.t_end units.vsc.ctrl.references.p_ref_pu
 ```
 
 The paths after the file are the parameters that remain variable in the compiled program. Use
 `all` to retain every variable parameter supported for that configuration:
 
 ```bash
-peslite-convert case.pes all
+peslite export case.pes all
 ```
 
 By default, the command writes one file:
@@ -32,7 +32,7 @@ the translation unit.
 An explicit destination uses the familiar `--out` option:
 
 ```bash
-peslite-convert case.pes all --out export/my-simulator
+peslite export case.pes all --out export/my-simulator
 ```
 
 The Python API provides the same operation:
@@ -57,7 +57,7 @@ c++ -O3 -DNDEBUG -std=c++17 export/case/peslite.cpp -o export/case/peslite
 ```
 
 The compiler may create its normal build cache or object files when invoked through a build system,
-but `peslite-convert` itself emits only `peslite.cpp`.
+but `peslite export` itself emits only `peslite.cpp`.
 
 ## Run
 
@@ -99,9 +99,9 @@ thresholds and numerical timing/solver settings. The same paths apply to AC, DC 
 You can select one field, a section, `all`, or `common`:
 
 ```bash
-peslite-convert buck-example elements.load units.converter.filter
-peslite-convert wpt-example all
-peslite-convert buck-example common
+peslite export buck-example elements.load units.converter.filter
+peslite export wpt-example all
+peslite export buck-example common
 ```
 
 Leaf converters also expose `units.<name>.connected`, the initial connection command. Select it
@@ -112,8 +112,7 @@ Scheduled connection events retain their normal precedence and timing; see
 `common` means `all` minus the parameters identified by the existing structural sensitivity
 check. It keeps those detected parameters constant at their configured values; every other
 available numerical parameter remains adjustable. No separate parameter list is maintained.
-For the default Buck model this freezes `buses.output.r_d` and
-`units.converter.dclink.source.r`. The export diagnostic lists the actual exclusions, and
+The export diagnostic lists the actual exclusions, and
 `--list-params` lists the parameters still adjustable with `--set`. Use
 `variables=["common"]` for the same selection through the Python API.
 
@@ -140,6 +139,7 @@ So do represented history dimensions: numerical periods/windows can change toget
 ADC oversample count or RMS/ROCOF history size requires a new export. Parameter validation and
 checked initialization branches come from the ordinary schemas and constructors. Invalid values
 and changes outside the compiled specialization fail before simulation output is created.
+Adding a branch that was omitted at zero requires a new export.
 Clock changes that would alter an already initialized switching-edge sequence also require a new export.
 So do clock changes that would alter the start-up interrupt count of a unit connected at or before
 the initial time.
@@ -191,21 +191,19 @@ These choices are fixed when `peslite.cpp` is generated:
 - every parameter not explicitly retained as a variable.
 
 Specialization lets the compiler inline the configured RHS and remove generic dispatch. To change a
-fixed choice, update the source `.pes` file and run `peslite-convert` again.
+fixed choice, update the source `.pes` file and run `peslite export` again.
 
-Discrete switching, protection and scheduling have native execution adapters. Numerical component
-outputs, derivatives and energy equations reuse the assembled Python equations, including those of
-R-L branches, capacitor nodes and DC links. PESLite traces each component's fixed `state`, `inp`,
-`out`, `set_outputs()` and `rhs()` scalar equations while exporting,
-specialises configuration-dependent branches and loops, and emits ordinary static C++. Common
-arithmetic, complex operations, state-dependent branches and NumPy scalar ufuncs are lowered. The
-generated binary does not contain an expression interpreter or Python runtime, so using the
-fallback does not add a generic dispatch layer to each solver stage.
+Discrete switching, protection and scheduling have native execution adapters. Electrical outputs,
+derivatives and energy calculations reuse the same netlist declarations and matrix assembly as
+Python. Control equations use scalar tracing, including arithmetic, complex operations,
+state-dependent branches and NumPy scalar ufuncs. Both paths emit static C++ without a Python
+runtime or expression interpreter.
 
 Subclass overrides and explicit component export hooks are respected. Runtime event state is bound
 during tracing rather than by maintaining another copy of the physical formula. RK coefficients
-come from the shared fixed-step tables or the actual DP45 solver object's coefficients, including
-factory-supplied instance and subclass values. Algebraic loops use matching tolerances and
+come from the configured integrator's tables, including factory-supplied instance and subclass
+values. Implicit methods use simplified Newton iteration with a cached dense Jacobian and
+partial-pivoting LU. Algebraic loops use matching tolerances and
 iteration limits, and nonconvergence is an error rather than an accepted approximate result.
 Dependencies eliminated by fixed parameter values are reduced to straight-line assignments by a
 conservative assignment analysis and standard topological sorting. Unrecognized code keeps the
@@ -230,26 +228,25 @@ ODE states are read and written directly in the solver vector rather than duplic
 
 Composite WPT configurations are expanded before export exactly as they are for Python execution.
 Their primary and secondary remain ordinary `DCConverter` units with independent clocks, while the
-shared compensated link is lowered through its fixed scalar state equations.
+shared compensated link uses the same netlist lowering as other electrical components.
 
 Named measurement bindings, independent series/shunt resistors and configured RMS windows use
-the same assembly as Python. `set` events may change an element scalar declared by its
-`parameter_bindings()` contract; the built-in resistor declares `r`. The generated parameter is
-shared by output and energy equations, and a load step does not recreate electrical/controller
-state. A retained initial resistance and a scheduled resistance step share that same model
-parameter. Starting a new run with different parameters is distinct from changing them during a
-run: event changes retain their existing state-continuity restrictions. RMS protection uses the
-common trip path, not a WPT phase override.
+the same assembly as Python. Supported element `set` targets use the same generated parameter in
+their output, energy and event equations, so a load step does not recreate electrical or controller
+state. Starting a new run with different parameters is distinct from changing them during a run:
+event changes retain their existing state-continuity restrictions. RMS protection uses the common
+trip path, not a WPT phase override.
 
 ## Current limitations
 
-- Supported solvers are fixed `euler`, `heun` and `rk4`, plus adaptive `DP45`.
+- Supported solvers are fixed `euler`, `heun`, `RK4`, `trapezoidal` and `radau`, plus adaptive `DP45`.
+  Adaptive `auto` and SciPy methods run in Python.
 - Multirate subsystem schedules are not currently lowered to C++.
 - Arbitrary Python behavior is not embedded in the standalone executable. File or network I/O,
   reflection, run-time type/layout changes and unsupported library calls in a custom equation are
   rejected during export rather than silently approximated.
-- Symbolic branch exploration is bounded; deeply state-dependent iterative control flow needs
-  dedicated backend support instead of an exponentially large generated expression.
+- Symbolic branch exploration is bounded; large combinations of independent switching modes or
+  deeply state-dependent iterative code can exceed the export budget.
 - Custom controller loops with non-traceable Python behavior, events and modulators still need
   backend support because they alter the discrete schedule rather than only contributing
   continuous scalar equations.
@@ -260,8 +257,8 @@ common trip path, not a WPT phase override.
 - Only parameters reported by `--list-params` can change in the compiled simulator.
 - Scheduled `set` events are lowered for controller references
   (`units.<unit>.ctrl.references.<name>`), source `v`, `f` and `angle`, connection commands and
-  element scalars declared by `parameter_bindings()`. Export refuses the other `set` targets that
-  a Python run accepts, with `event '<name>' writes unsupported variable '<path>'`: bus `c` and
+  supported element parameters. Export refuses the other `set` targets that a Python run accepts,
+  with `event '<name>' writes unsupported variable '<path>'`: bus `c` and
   `r_d`, branch and source `l` and `r`, controller loop parameters
   (`units.<unit>.ctrl.loops.<loop>.<field>`), protection settings (`units.<unit>.protection.*`),
   DC-link source values (`units.<unit>.dclink.source.*`) and element fields without a binding.
@@ -279,10 +276,7 @@ The native dispatcher shares scheduled boundaries, margin location, simultaneous
 state resets and the no-progress guard. Adaptive commutations require a finite `max_step`.
 Component-owned state projections, discharge-energy columns and diagnostics are exported too.
 
-Custom components declare mutable scalar equation memory with `equation_state_bindings()`, a
-mapping from local names to `(owner, attribute)` storage references. These bindings describe the
-existing memory; they do not create another state store or restart schema. `get_state()` and
-`set_state()` retain public restart names. Annotated scalar and void helper methods are traced
-at their existing boundaries to avoid multiplying unrelated branch paths. Component equations and
-state-changing callbacks are traced from their Python implementation; no converter-specific
-commutation equations are maintained in the backend.
+Custom electrical components are exported from the same declarative `network()` primitives used by
+Python; the backend does not require a second equation implementation. Package-owned dynamic
+components retain their existing state and restart schema when their callbacks are lowered, and no
+converter-specific commutation equations are maintained in the backend.

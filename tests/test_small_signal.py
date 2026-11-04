@@ -157,15 +157,15 @@ class _LinearPlant:
     def __init__(self, matrix):
         self.matrix = matrix
         self.state = SimpleNamespace(x=0.0, y=0.0)
-        self.inp = SimpleNamespace(feedback=0.0)
-        self.out = SimpleNamespace(x=0.0)
+        self.input = SimpleNamespace(feedback=0.0)
+        self.output = SimpleNamespace(x=0.0)
 
     def set_outputs(self, t):
-        self.out.x = self.state.x
+        self.output.x = self.state.x
 
     def rhs(self, t):
         result = self.matrix @ np.array([self.state.x, self.state.y])
-        return result[0] + self.inp.feedback, result[1]
+        return result[0] + self.input.feedback, result[1]
 
 
 class _Feedback:
@@ -174,11 +174,11 @@ class _Feedback:
 
     def __init__(self):
         self.state = Empty()
-        self.inp = SimpleNamespace(u=0.0, feedback=0.0)
-        self.out = SimpleNamespace(y=0.0)
+        self.input = SimpleNamespace(u=0.0, feedback=0.0)
+        self.output = SimpleNamespace(y=0.0)
 
     def set_outputs(self, t):
-        self.out.y = 0.2 * self.inp.u + 0.5 * self.inp.feedback
+        self.output.y = 0.2 * self.input.u + 0.5 * self.input.feedback
 
     def rhs(self, t):
         return ()
@@ -204,7 +204,7 @@ def _linear_sim(matrix, *, feedback=False, **overrides):
                            (gain, "feedback"): (gain, "y"),
                            (plant, "feedback"): (gain, "y")}
         model = Model(subsystems, connections)
-        return SimpleNamespace(units={}, event_subsystems=(), model=model, _port_bindings={},
+        return SimpleNamespace(units={}, event_subsystems=(), model=model, _unit_port_bindings={},
                                state_parts=lambda: [("", model)])
 
     sim = peslite.Simulation(_params(**{"simulation.solver.dt": 1e-4, **overrides}),

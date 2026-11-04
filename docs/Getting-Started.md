@@ -5,16 +5,14 @@ resolved example into a new simulation file.
 
 ## Install
 
-```bash
-python -m pip install peslite
-```
+| Installation | pip | Conda |
+| --- | --- | --- |
+| Core runtime | `python -m pip install peslite-core` | `conda install peslite-core` |
+| Default, including built-in addons | `python -m pip install peslite` | `conda install peslite` |
+| All runtime features | `python -m pip install peslite-full` | `conda install peslite-full` |
 
-Addon modules are included in the package. To install PESLite with all dependencies, including the
-optional dependencies required by addons such as [PDF plotting](Plotting.md):
-
-```bash
-python -m pip install "peslite[all]"
-```
+The default installation keeps each built-in addon together with its runtime dependencies. The
+core installation retains the addon extension interface without installing built-in addons.
 
 Check the command-line interface:
 
@@ -22,7 +20,7 @@ Check the command-line interface:
 peslite --help
 ```
 
-PESLite requires Python 3.10 or newer.
+PESLite requires Python 3.10.1 or newer.
 
 ## Run the first case
 
@@ -69,7 +67,7 @@ values, presets and command-line overrides.
 Print the resolved configuration without running:
 
 ```bash
-peslite gfl-example --resolved
+peslite inspect gfl-example --resolved
 ```
 
 Override a value by dotted path and choose an output directory:
@@ -84,10 +82,11 @@ peslite gfl-example \
 `--set` values take priority over presets and file values
 ([CLI Reference](CLI-Reference.md#override-parameters)).
 
-Use `--progress SECONDS` to print progress and `--watch NAME` to include a state or output value:
+Interactive runs show a progress bar. Use `--progress` to enable it explicitly and `--watch NAME`
+to include a state or output value:
 
 ```bash
-peslite gfl-example --progress 0.1 --watch vsc.vdc_pu
+peslite gfl-example --progress --watch vsc.vdc_pu
 ```
 
 ## Create a simulation file
@@ -95,7 +94,7 @@ peslite gfl-example --progress 0.1 --watch vsc.vdc_pu
 The quickest starting point is a resolved bundled example:
 
 ```bash
-peslite gfl-example --resolved > my-case.pes
+peslite inspect gfl-example --resolved > my-case.pes
 ```
 
 Edit `my-case.pes`, then run it with `peslite my-case.pes`; its sections are listed in

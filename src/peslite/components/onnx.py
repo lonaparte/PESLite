@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 from ..solver.model import BlackBoxSubsystem, ConfigError
-from .network import Element, register_element_type
+from .network import Element, _register_assembled_type
 
 __all__ = ["ONNXModel", "ONNXStateParams"]
 
@@ -115,7 +115,7 @@ class _ONNXInference:
             import onnxruntime as ort  # type: ignore
         except ImportError as exc:
             raise ConfigError(
-                "ONNX models require the optional dependencies: pip install peslite[onnx]"
+                "ONNX models require the full installation: pip install peslite-full"
             ) from exc
 
         path = Path(cfg.model).expanduser().resolve()
@@ -198,7 +198,7 @@ class _ONNXInference:
         return flattened(self.public), flattened(self.next_hidden)
 
 
-@register_element_type
+@_register_assembled_type
 class ONNXModel(Element):
     """A configured, non-loading ONNX model connected to physical subsystem outputs."""
 
@@ -312,11 +312,11 @@ class ONNXModel(Element):
         return {(self.model, name): source for name, source in self._sources.items()}
 
     @staticmethod
-    def terminals() -> tuple:
+    def port_bindings() -> tuple:
         return ()
 
     def signals(self) -> dict[str, Any]:
         return {
-            f"{self.name}.{name}": getattr(self.model.out, name)
+            f"{self.name}.{name}": getattr(self.model.output, name)
             for name in self.model.output_names
         }

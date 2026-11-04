@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Callable, Mapping, Optional
 
-from ..components.network import ACVoltageSource, ELEMENT_TYPES, RCNode, RLBranch, Terminal
+from ..components.network import ACVoltageSource, ELEMENT_TYPES, RCNode, RLBranch, Port
 from ..components.adc import _PortMeasurement
 from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
@@ -86,10 +87,10 @@ class _UnitAssembly:
     units: dict[str, Unit] = field(default_factory=dict)
     subsystems: dict[str, Any] = field(default_factory=dict)
     signal_sources: tuple[Any, ...] = ()
-    terminals: tuple[tuple[str, Terminal], ...] = ()
+    attached_ports: tuple[tuple[str, Port], ...] = ()
     ports: dict[str, _UnitPort] = field(default_factory=dict)
     default_port: Optional[str] = None
-    port_bindings: dict[str, tuple[_UnitPort, ...]] = field(default_factory=dict)
+    unit_port_bindings: dict[str, tuple[_UnitPort, ...]] = field(default_factory=dict)
     endpoints: dict[str, _UnitPort] = field(default_factory=dict)
 
     def port(self, name: Optional[str] = None) -> _UnitPort:
@@ -104,13 +105,13 @@ class _UnitAssembly:
             )
         return self.ports[name]
 
-    def attach(self, terminal: Terminal, where: str, port: Optional[str] = None) -> None:
-        """Attach one parent terminal to a named port or the Unit's default port."""
+    def attach(self, physical_port: Port, where: str, port: Optional[str] = None) -> None:
+        """Attach one physical port to a named Unit port or its default port."""
         try:
             selected = self.port(port)
         except ConfigError as exc:
             raise ConfigError(f"{where}: {exc}") from None
-        self.terminals += ((selected.bus, terminal),)
+        self.attached_ports += ((selected.bus, physical_port),)
 
     def include(self, other: "_UnitAssembly") -> None:
         """Merge one child assembly while preserving its single public unit mapping."""
@@ -119,19 +120,19 @@ class _UnitAssembly:
         self.units.update(other.units)
         self.subsystems.update(other.subsystems)
         self.signal_sources += other.signal_sources
-        self.terminals += other.terminals
+        self.attached_ports += other.attached_ports
         _merge_unique(self.endpoints, other.endpoints, "unit endpoint")
-        for target, ports in other.port_bindings.items():
-            existing = self.port_bindings.setdefault(target, ())
-            self.port_bindings[target] = existing + tuple(
+        for target, ports in other.unit_port_bindings.items():
+            existing = self.unit_port_bindings.setdefault(target, ())
+            self.unit_port_bindings[target] = existing + tuple(
                 port for port in ports if port not in existing
             )
 
 
 def _validate_electrical_domains(
     endpoints: Mapping[str, _UnitPort],
-    passive_groups: tuple[tuple[tuple[str, Terminal], ...], ...],
-    terminal_bindings: tuple[tuple[str, Terminal], ...],
+    passive_groups: tuple[tuple[tuple[str, Port], ...], ...],
+    physical_bindings: tuple[tuple[str, Port], ...],
     resolve_bus: Callable[[str], str],
 ) -> None:
     """Reject only explicit AC/DC constraints joined by domain-neutral circuitry."""
@@ -157,10 +158,10 @@ def _validate_electrical_domains(
             continue
         seen_ports.add(id(port))
         constraints.append((node(port.bus), port.electrical_domain, f"unit port {name}"))
-    for bus, terminal in terminal_bindings:
-        if terminal.electrical_domain is not None:
-            label = f"{type(terminal.subsystem).__name__}.{terminal.voltage}"
-            constraints.append((node(bus), terminal.electrical_domain, label))
+    for bus, port in physical_bindings:
+        if port.electrical_domain is not None:
+            label = f"{type(port.component).__name__}.{port.name}"
+            constraints.append((node(bus), port.electrical_domain, label))
 
     by_bus: dict[str, list[tuple[str, str]]] = {}
     for bus, domain, label in constraints:
@@ -192,10 +193,10 @@ class _WPTSignals:
     def __init__(self, name: str, link: Any) -> None:
         self.name = name
         self.link = link
-        self._outputs = tuple(type(link.out).__slots__)
+        self._outputs = tuple(type(link.output).__slots__)
 
     def signals(self) -> dict[str, float]:
-        out = self.link.out
+        out = self.link.output
         return {f"{self.name}.link.{name}": getattr(out, name) for name in self._outputs}
 
 
@@ -222,10 +223,8 @@ class _Source:
             lambda values: RLBranch(values[0].l, values[0].r, phases=values[1]),
             (cfg, phases),
         )
-        self.branch.terminal2 = Terminal(
-            self.branch, "u2", "i", -1, electrical_domain="ac"
-        )
-        self.terminal = self.branch.terminal2
+        self.branch.port2.electrical_domain = "ac"
+        self.port = self.branch.port2
 
     def retune(self, cfg, paths: list[str], t: float) -> None:
         """Apply changed source impedance, magnitude, frequency or angle at ``t``."""
@@ -243,16 +242,16 @@ class _Source:
         return {f"{self.name}.emf": self.emf, f"{self.name}.branch": self.branch}
 
     def connections(self) -> dict:
-        return {
-            (self.branch, "u1"): (self.emf, "e_g"),
-            (self.emf, "i"): [(self.branch, "i", 1.0)],
-        }
+        return {}
 
-    def terminals(self) -> tuple[tuple[str, Terminal], ...]:
-        return ((self.cfg.bus, self.terminal),)
+    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
+        internal = f"{self.name}.source"
+        return ((internal, self.emf.port),
+                (internal, self.branch.port1),
+                (self.cfg.bus, self.port))
 
     def signals(self) -> dict[str, float | complex]:
-        return {f"{self.name}.i": self.branch.out.i, f"{self.name}.angle": self.emf.out.phi}
+        return {f"{self.name}.i": self.branch.output.i, f"{self.name}.angle": self.emf.output.phi}
 
 
 class _BranchAssembly:
@@ -270,9 +269,9 @@ class _BranchAssembly:
     def connections() -> dict:
         return {}
 
-    def terminals(self) -> tuple[tuple[str, Terminal], ...]:
-        return ((self.cfg.bus1, self.branch.terminal1),
-                (self.cfg.bus2, self.branch.terminal2))
+    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
+        return ((self.cfg.bus1, self.branch.port1),
+                (self.cfg.bus2, self.branch.port2))
 
 
 def _part(parts: Mapping[str, Any], name: str, suffix: str = "") -> Any:
@@ -298,7 +297,7 @@ def _assemble_vsc(name: str, cfg: Any, system: "System",
         units={name: unit},
         ports=ports,
         default_port=unit_type(cfg.type).default_port,
-        port_bindings={
+        unit_port_bindings={
             unit.dc_bus: (ports["dc"],),
             cfg.bus: (ports["power"],),
             f"{name}.dclink": (ports["dc"],),
@@ -334,7 +333,7 @@ def _assemble_dc_converter(name: str, cfg: Any, system: "System",
         units={name: unit},
         ports=ports,
         default_port=unit_type(cfg.type).default_port,
-        port_bindings=bindings,
+        unit_port_bindings=bindings,
     )
 
 
@@ -352,15 +351,15 @@ def _assemble_wpt(name: str, cfg: Any, system: "System",
     )
     for side in unit_type(cfg.type).children:
         child = _assemble_unit(f"{name}.{side}", getattr(cfg, side), system, parts)
-        terminal = getattr(link, f"{side}_terminal")
-        child.attach(terminal, f"units.{name}.{side}", "power")
+        physical_port = getattr(link, f"{side}_port")
+        child.attach(physical_port, f"units.{name}.{side}", "power")
         for scc in link.switched:
             if scc.side == side:
                 scc.bind_bridge(child.units[child.port("power").owner].bridge)
         assembly.ports[side] = child.port()
         assembly.include(child)
     default = assembly.port()
-    assembly.port_bindings[f"{name}.link"] = (default,)
+    assembly.unit_port_bindings[f"{name}.link"] = (default,)
     return assembly
 
 
@@ -390,20 +389,28 @@ class System:
         parts = dict(parts or {})
         base = p.base
         # ---------------------------------------------------------- the elements
-        # Three-phase buses start at one pu; scalar buses start de-energized unless overridden.
-        self.buses = {name: _parameterized(lambda values: RCNode(
-                          values[0].c,
-                          values[0].r_d,
-                          u0=values[1].v_phase_peak if values[0].phases == 3 else 0.0,
-                          phases=values[0].phases,
-                      ), (cfg, base))
-                      for name, cfg in p.buses.items()}
+        # A capacitor gives the bus a physical state; otherwise it remains a connection point.
+        def make_bus(values):
+            cfg, system_base = values
+            if cfg.c is None:
+                return _PortMeasurement(phases=cfg.phases)
+            return RCNode(
+                cfg.c,
+                cfg.r_d,
+                u0=system_base.v_phase_peak if cfg.phases == 3 else 0.0,
+                phases=cfg.phases,
+            )
+
+        self.buses = {
+            name: _parameterized(make_bus, (cfg, base))
+            for name, cfg in p.buses.items()
+        }
         assembled = _UnitAssembly()
         for name, cfg in p.units.items():
             assembled.include(_assemble_unit(name, cfg, self, parts))
         self.units = assembled.units
         self.composite_signal_sources = assembled.signal_sources
-        self._port_bindings = assembled.port_bindings
+        self._unit_port_bindings = assembled.unit_port_bindings
 
         # ---------------------------------------------------------- the wiring
         subsystems: dict[str, Any] = dict(self.buses)
@@ -415,13 +422,25 @@ class System:
         def claim_connections(targets, where: str) -> None:
             """Assign each model input to one connection mechanism during assembly."""
             targets = set(targets)
+            unknown = [
+                (type(subsystem).__name__, field)
+                for subsystem, field in targets
+                if not hasattr(getattr(subsystem, "input", None), field)
+            ]
+            if unknown:
+                raise ConfigError(f"{where}: unknown input target: {_names(unknown)}")
             overlap = connection_targets & targets
             if overlap:
                 raise ConfigError(f"{where}: input target is already driven: {_names(overlap)}")
             connection_targets.update(targets)
 
-        bus_terminals: dict[str, list[Terminal]] = {
-            name: [node.terminal] for name, node in self.buses.items()
+        bus_ports: dict[str, list[Port]] = {
+            name: ([] if node.port is None else [node.port])
+            for name, node in self.buses.items()
+        }
+        continuous_bus_signals = {
+            id(unit.bus) for unit in self.units.values()
+            if unit.continuous and unit.ctrl is not None
         }
         network_buses = {**assembled.endpoints, **self.buses}
 
@@ -453,98 +472,47 @@ class System:
                                   for name, branch in self.branches.items())
         elements = (*branch_assemblies, *self.sources.values(), *self.units.values(),
                     *self.named_elements.values())
-        element_terminals = tuple((element, tuple(element.terminals())) for element in elements)
+        element_ports = tuple((element, tuple(element.port_bindings())) for element in elements)
         for element in elements:
             _merge_unique(subsystems, element.subsystems(), "subsystem name")
-        terminal_bindings = assembled.terminals + tuple(
-            binding for _element, bindings in element_terminals for binding in bindings
+        physical_bindings = assembled.attached_ports + tuple(
+            binding for _element, bindings in element_ports for binding in bindings
         )
         passive_groups = tuple(
-            bindings for element, bindings in element_terminals
+            bindings for element, bindings in element_ports
             if getattr(element, "domain_transparent", False)
         )
         _validate_electrical_domains(
-            assembled.endpoints, passive_groups, terminal_bindings, resolve_bus
+            assembled.endpoints, passive_groups, physical_bindings, resolve_bus
         )
-        for bus_name, terminal in assembled.terminals:
-            bus_terminals.setdefault(bus_name, []).append(terminal)
-        # Every electrical connection uses the same named-terminal contract. Assembly fans one
-        # driving voltage out to the followers and sums their signed currents into the driver.
-        for element, element_bindings in element_terminals:
+        for bus_name, port in assembled.attached_ports:
+            bus_ports.setdefault(bus_name, []).append(port)
+        for element, element_bindings in element_ports:
             for bus, inlet in getattr(element, "series_connections", lambda: {})().items():
-                attached = bus_terminals.setdefault(resolve_bus(bus), [])
-                drivers = [terminal for terminal in attached if terminal.drives_voltage]
-                if len(drivers) != 1:
-                    raise ConfigError(f"series inlet {bus!r} needs one existing voltage driver")
-                attached.remove(drivers[0])
-                bus_terminals.setdefault(resolve_bus(inlet), []).append(drivers[0])
-            for bus_name, terminal in element_bindings:
-                if not isinstance(terminal, Terminal):
-                    raise TypeError(
-                        f"{type(element).__name__}.terminals() returned "
-                        f"{type(terminal).__name__}, not Terminal"
-                    )
-                bus_terminals.setdefault(resolve_bus(bus_name), []).append(terminal)
-        lowered_buses: dict[str, dict] = {}
-        for bus_name, terminals in bus_terminals.items():
-            drivers = [terminal for terminal in terminals if terminal.drives_voltage]
-            if len(drivers) != 1:
-                raise ConfigError(
-                    f"bus {bus_name!r} needs exactly one voltage-driving terminal, got "
-                    f"{len(drivers)}"
-                )
-            driver = drivers[0]
-            followers = [terminal for terminal in terminals if not terminal.drives_voltage]
-            if not followers:
-                if bus_name in self.buses:
-                    driver.bind_current_sources([])
-                    continue
-                raise ConfigError(f"internal bus {bus_name!r} has no attached terminal")
-            voltage_connections = {}
-            for terminal in followers:
-                target = (terminal.subsystem, terminal.voltage)
-                claim_connections((target,),
-                                  f"{type(terminal.subsystem).__name__}.{terminal.voltage}")
-                voltage_connections[target] = (
-                    driver.subsystem, driver.voltage
-                )
-                terminal.bind_voltage_source(voltage_connections[target])
-            current_target = (driver.subsystem, driver.current)
-            claim_connections((current_target,),
-                              f"{type(driver.subsystem).__name__}.{driver.current}")
-            current_sources = [
-                (
-                    terminal.subsystem,
-                    terminal.current,
-                    -terminal.direction / driver.direction,
-                )
-                for terminal in followers
-            ]
-            driver.bind_current_sources(current_sources)
-            lowered = lowered_buses.setdefault(bus_name, {})
-            if driver.hold_voltage_input is not None:
-                if len(followers) != 1:
+                attached = bus_ports.setdefault(resolve_bus(bus), [])
+                if len(attached) != 2:
                     raise ConfigError(
-                        f"bus {bus_name!r}: blocking needs one current-owning terminal "
-                        "with a zero-current voltage law")
-                hold_target = (driver.subsystem, driver.hold_voltage_input)
-                claim_connections((hold_target,),
-                                  f"{type(driver.subsystem).__name__}.{driver.hold_voltage_input}")
-                lowered[hold_target] = (
-                    followers[0].hold_voltage_source(
-                        getattr(driver.subsystem, "current_constraint", None)))
-            if bus_name not in self.buses:
-                lowered[current_target] = current_sources
-                lowered.update(voltage_connections)
+                        f"series inlet {bus!r} needs a node joining exactly two ports, "
+                        f"got {len(attached)}"
+                    )
+                bus_ports.setdefault(resolve_bus(inlet), []).append(attached.pop())
+            for bus_name, port in element_bindings:
+                if not isinstance(port, Port):
+                    raise TypeError(
+                        f"{type(element).__name__}.port_bindings() returned "
+                        f"{type(port).__name__}, not Port"
+                    )
+                bus_ports.setdefault(resolve_bus(bus_name), []).append(port)
+        for name, bus in self.buses.items():
+            if bus.port is not None:
+                continue
+            if bus_ports[name]:
+                bus.observe(bus_ports[name][0])
+                if id(bus) not in continuous_bus_signals:
+                    subsystems.pop(name)
             else:
-                lowered.update(voltage_connections)
-                lowered[current_target] = current_sources
-        # Keep the established evaluation order: internal power buses, controller and other
-        # component wiring, then the configured external network buses. This only affects the
-        # construction-time ordering of an otherwise identical direct connection graph.
-        for bus_name, lowered in lowered_buses.items():
-            if bus_name not in self.buses:
-                connections.update(lowered)
+                subsystems.pop(name)
+        circuit_model = p.simulation.solver.circuit_model
         for element in elements:
             own_connections = element.connections()
             claim_connections(own_connections, f"{type(element).__name__}.connections()")
@@ -555,9 +523,6 @@ class System:
                     )
                 else:
                     connections[target] = source
-        for bus_name, lowered in lowered_buses.items():
-            if bus_name in self.buses:
-                connections.update(lowered)
         zoh: dict = {}
         for unit in self.units.values():
             own_zoh = unit.zoh_connections()
@@ -573,33 +538,32 @@ class System:
                     "voltage", "current", "power"):
                 bus = resolve_bus(owner)
                 if bus not in port_measurements:
-                    terminal, = (item for item in bus_terminals[bus] if item.drives_voltage)
-                    observer = _PortMeasurement(terminal)
-                    voltage, current = terminal.signal_sources()
-                    # Preserve the domain in record metadata before Model packs the graph.
-                    observer.inp.voltage = getattr(terminal.subsystem.out, terminal.voltage)
-                    observer.inp.current = getattr(terminal.subsystem.inp, terminal.current)
-                    observer.out.voltage = observer.inp.voltage
-                    observer.out.current = observer.inp.current
+                    ports = bus_ports.get(bus, ())
+                    if not ports:
+                        raise ConfigError(
+                            f"{where}: bus {owner!r} has no connected electrical port"
+                        )
+                    port = ports[0]
+                    observer = _PortMeasurement(port)
+                    observer.input.voltage = port.voltage
+                    observer.input.current = port.current
+                    observer.output.voltage = observer.input.voltage
+                    observer.output.current = observer.input.current
                     _merge_unique(subsystems, {f"measurements.{owner}": observer},
                                   "subsystem name")
-                    claim_connections(((observer, "voltage"), (observer, "current")),
-                                      f"measurement {owner!r}")
-                    connections[(observer, "voltage")] = voltage
-                    connections[(observer, "current")] = current
                     port_measurements[bus] = observer
                 subsystem = port_measurements[bus]
-            if subsystem is None or not hasattr(subsystem.out, output):
+            if subsystem is None or not hasattr(subsystem.output, output):
                 raise ConfigError(f"{where}: unknown physical output {source!r}")
             return subsystem, output
 
         def connect_source(target: tuple[Any, str], source: str, where: str) -> None:
             subsystem, output = physical_output(source, where)
             target_subsystem, target_input = target
-            if not hasattr(target_subsystem.inp, target_input):
+            if not hasattr(target_subsystem.input, target_input):
                 raise ConfigError(f"{where}: unknown input target {target_input!r}")
-            if (isinstance(getattr(subsystem.out, output), complex)
-                    and not isinstance(getattr(target_subsystem.inp, target_input), complex)):
+            if (isinstance(getattr(subsystem.output, output), complex)
+                    and not isinstance(getattr(target_subsystem.input, target_input), complex)):
                 raise ConfigError(f"{where}: a complex output cannot drive a scalar input")
             connections[target] = (subsystem, output)
 
@@ -610,20 +574,36 @@ class System:
             for channel, source in unit.cfg.meas.sources.items():
                 where = f"units.{unit.name}.meas.sources.{channel}"
                 subsystem, output = physical_output(source, where)
-                if (isinstance(getattr(subsystem.out, output), complex)
+                if (isinstance(getattr(subsystem.output, output), complex)
                         and not isinstance(unit.ports.value(channel), complex)):
                     raise ConfigError(f"{where}: a complex output cannot drive a scalar channel")
                 unit.ports.readers[channel] = (
-                    lambda sub=subsystem, field=output: getattr(sub.out, field)
+                    lambda sub=subsystem, field=output: getattr(sub.output, field)
                 )
                 if unit.continuous and unit.ctrl is not None:
-                    if not hasattr(unit.ctrl.inp, channel):
+                    if not hasattr(unit.ctrl.input, channel):
                         raise ConfigError(f"units.{unit.name}.meas.sources.{channel}: "
                                           "controller has no matching continuous input")
                     target = (unit.ctrl, channel)
                     claim_connections((target,), where)
                     connections[target] = (subsystem, output)
-        self.model = Model(subsystems, connections, zoh)
+        from .circuit import (circuit_linear_blocks, circuit_linear_dynamic,
+                              circuit_linear_modes, circuit_mode_key,
+                              circuit_structure, compile_network, lower)
+        declarations = {id(subsystem): compile_network(subsystem)
+                        for subsystem in subsystems.values()}
+        subsystems, connections, zoh, circuit = lower(
+            circuit_model, subsystems, connections, zoh, bus_ports, declarations
+        )
+        self.circuits = () if circuit is None else (circuit,)
+        self.model = Model(
+            subsystems, connections, zoh,
+            linear_structure=partial(circuit_structure, circuits=self.circuits),
+            linear_mode_key=partial(circuit_mode_key, circuits=self.circuits),
+            linear_blocks=partial(circuit_linear_blocks, circuits=self.circuits),
+            linear_modes=partial(circuit_linear_modes, circuits=self.circuits),
+            linear_dynamic=circuit_linear_dynamic(self.circuits),
+        )
         self.event_subsystems = tuple(
             (name, subsystem)
             for name, subsystem in zip(self.model.names, self.model.subsystems)
@@ -648,7 +628,16 @@ class System:
         for unit in self.units.values():
             parts.extend(unit.state_parts())
         registered = {id(part) for _name, part in parts}
-        parts.extend((name, sub) for name, sub in zip(self.model.names, self.model.subsystems)
+        if not self.circuits:
+            subsystems = iter(self.model.subsystems)
+        else:
+            from .circuit import NetworkView
+
+            subsystems = (
+                subsystem.component if isinstance(subsystem, NetworkView) else subsystem
+                for subsystem in self.model.subsystems
+            )
+        parts.extend((name, sub) for name, sub in zip(self.model.names, subsystems)
                      if id(sub) not in registered and callable(getattr(sub, "get_state", None)))
         return parts
 
@@ -685,11 +674,11 @@ class System:
                 if internal is not None:
                     return internal
                 bus = self.units[head].cfg.bus if head in self.units else head
-                at_bus = [s.emf.out.e_g for s in self.sources.values() if s.cfg.bus == bus]
+                at_bus = [s.emf.output.e_g for s in self.sources.values() if s.cfg.bus == bus]
                 if at_bus:
                     return at_bus[0]
                 if len(self.sources) == 1:
-                    return next(iter(self.sources.values())).emf.out.e_g
+                    return next(iter(self.sources.values())).emf.output.e_g
                 raise ValueError(f"{key}: 'source' needs a source at bus {bus!r}, or exactly one "
                                  f"source in the system (there are {len(self.sources)})")
             raise ValueError(f"{key}: unknown keyword {word!r} (keywords here: rated, source)")
@@ -730,10 +719,11 @@ class System:
 
     def apply(self, change: Change) -> None:
         """Write one checked event's parameters and connection commands through existing owners."""
-        p, done = change.params, set()
+        p, done, connections_changed = change.params, set(), False
         for path in change.paths:
             if path in change.connections:
                 self.switch(path.removesuffix(".connected"), change.values[path], change.t, change.ramp)
+                connections_changed = True
                 continue
             section, name, _ = _split_path(self.p, path)
             if (section, name) in done:
@@ -752,9 +742,28 @@ class System:
             elif section == "elements":
                 self.named_elements[name].retune(p.elements[name])
         if done:
+            for circuit in self.circuits:
+                circuit.build()
             model = self.model
             model.energy_specs = {name: spec_of(subsystem)
                                   for name, subsystem in zip(model.names, model.subsystems)}
+        if done or connections_changed:
+            self.reconcile_circuits(change.t)
+
+    def reconcile_circuits(self, t: float) -> None:
+        """Commit all electrical command changes at one physical event boundary."""
+        for circuit in self.circuits:
+            circuit.reconcile(t)
+        self.refresh_circuit_plan()
+
+    def refresh_circuit_plan(self) -> None:
+        """Refresh model scheduling after circuit equations changed at a boundary."""
+        changed = [circuit for circuit in self.circuits if circuit.plan_changed]
+        if not changed:
+            return
+        self.model.rebuild_evaluation_plan()
+        for circuit in changed:
+            circuit.plan_changed = False
 
     def check_events(self, p: Params) -> None:
         """Check that custom elements and replacement controllers support their requested events."""
@@ -805,8 +814,11 @@ class System:
             if unit.adc is not None and (unit.adc.clocked or unit.adc.rms):
                 add(unit, unit.measurement_signals())
         for name, branch in self.branches.items():
-            add(branch, {f"{name}.i": branch.out.i})
+            add(branch, {f"{name}.i": branch.output.i})
         for name, node in self.buses.items():
-            add(node, {f"{name}.u": node.out.u})
+            if node.port is not None:
+                value = (node.port.voltage if node.voltage_field == "voltage"
+                         else node.output.u)
+                add(node, {f"{name}.u": value})
         self._signal_names_checked = True
         return out

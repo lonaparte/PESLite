@@ -1,7 +1,7 @@
-# PESLite 0.4.0
+# PESLite 0.5.0
 # Series-series compensated wireless power transfer. The WPT entry is a composite Unit; assembly
 # expands its independently clocked primary and secondary DCConverter children during assembly.
-# Each bridge and matching magnetic-link terminal share one scoped named bus. Electrical plant
+# Each bridge and matching magnetic-link port share one scoped named bus. Electrical plant
 # values are SI.
 
 base:

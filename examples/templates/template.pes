@@ -1,0 +1,35 @@
+# PESLite 0.5.0
+# Grid-following converter; electrical values with a _pu suffix use per-unit values.
+base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
+
+buses:
+  pcc: {c_pu: 0.02, r_d_pu: 0.5}
+
+sources:
+  grid: {bus: pcc, x_pu: 0.4, r_pu: 0.04}
+
+units:
+  converter:
+    type: vsc
+    bus: pcc
+    ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
+    dclink:
+      vdc_ref: 1500.0
+      capacitor: {c_pu: 35.0, r_esr_pu: 0.001}
+      source: {type: current, i_pu: 0.9}
+    pwm: {f_sw: 20000.0, modulation_limit: 0.95}
+    ctrl:
+      type: gfl
+      loops:
+        SRFPLL: {kp_pu: 20.0, ki_pu: 1200.0}
+        CurrentLoop: {bandwidth: 200.0}
+        DCVoltageControl: {kp: 0.8, ki: 90.0, minimum: 0.0, maximum: 1.15,
+                           feedforward: 0.9, output_polarity: -1.0}
+
+events:
+  connect_converter: {type: connect, target: converter, t: 0.0, ramp: 0.01}
+
+simulation:
+  t_end: 0.02
+  solver: {dt: 12.5e-6}
+  output: {period: 100.0e-6}

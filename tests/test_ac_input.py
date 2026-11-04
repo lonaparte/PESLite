@@ -41,10 +41,10 @@ def test_ac_source_representation_follows_the_connected_phase_count():
 
     for source in (single, three):
         source.set_outputs(1.0e-3)
-        assert source.terminal.electrical_domain == "ac"
-    assert isinstance(single.out.e_g, float)
-    assert isinstance(three.out.e_g, complex)
-    assert single.out.e_g == pytest.approx(three.out.e_g.real)
+        assert source.port.electrical_domain == "ac"
+    assert isinstance(single.output.e_g, float)
+    assert isinstance(three.output.e_g, complex)
+    assert single.output.e_g == pytest.approx(three.output.e_g.real)
 
 
 def test_single_phase_source_connects_directly_to_converter_power_port(tmp_path):
@@ -53,7 +53,7 @@ def test_single_phase_source_connects_directly_to_converter_power_port(tmp_path)
 
     assert source.emf.phases == 1
     assert source.branch.phases == 1
-    assert simulation.system._port_bindings["rectifier.dclink"][0].electrical_domain == "dc"
+    assert simulation.system._unit_port_bindings["rectifier.dclink"][0].electrical_domain == "dc"
     result = simulation.run(out_dir=tmp_path)
     assert result.t[-1] == pytest.approx(10.0e-6)
 
@@ -96,7 +96,7 @@ def test_dc_converter_power_port_accepts_a_dc_network():
         },
     }
     simulation = peslite.Simulation(from_dict(tree))
-    assert simulation.system._port_bindings["rectifier.bus.power"][0].electrical_domain is None
+    assert simulation.system._unit_port_bindings["rectifier.bus.power"][0].electrical_domain is None
 
 
 def test_domain_constraints_propagate_through_passive_branches():

@@ -21,7 +21,7 @@ def _resolved(*args):
     """Return the resolved tree after applying command-line arguments."""
     output = io.StringIO()
     with redirect_stdout(output):
-        assert peslite.main([*args, "--resolved"]) == 0
+        assert peslite.main(["inspect", *args, "--resolved"]) == 0
     return yaml.safe_load(output.getvalue())
 
 
@@ -58,7 +58,7 @@ def test_bridge_flag_keeps_an_incompatible_unit_with_a_warning(flag):
 
     assert resolved["units"]["charger"]["primary"]["bridge"]["model"] == "switching"
     assert (resolved["simulation"]["solver"]["type"],
-            resolved["simulation"]["solver"]["method"]) == ("fixed", "rk4")
+            resolved["simulation"]["solver"]["method"]) == ("fixed", "RK4")
 
 
 @pytest.mark.parametrize("flag", ["--switching", "--pwm-averaging"])
@@ -75,13 +75,13 @@ def test_bridge_flag_warns_and_keeps_a_model_whose_dormant_config_is_incompatibl
 
     assert resolved["units"]["vsc"]["bridge"]["model"] == "averaging"
     assert (resolved["simulation"]["solver"]["type"],
-            resolved["simulation"]["solver"]["method"]) == ("fixed", "rk4")
+            resolved["simulation"]["solver"]["method"]) == ("fixed", "RK4")
 
 
 @pytest.mark.parametrize(("flag", "expected"), [
-    (None, ("fixed", "rk4")),
-    ("--switching", ("fixed", "rk4")),
-    ("--pwm-averaging", ("fixed", "rk4")),
+    (None, ("fixed", "RK4")),
+    ("--switching", ("fixed", "RK4")),
+    ("--pwm-averaging", ("fixed", "RK4")),
     ("--averaging", ("adaptive", "DP45")),
 ])
 def test_bridge_flags_are_solver_presets(flag, expected):
@@ -125,7 +125,7 @@ def test_averaging_preset_overrides_file_solver_and_fixed_only_settings(tmp_path
 
 def test_bridge_flags_are_mutually_exclusive(capsys):
     with pytest.raises(SystemExit):
-        peslite.main(["gfl-example", "--switching", "--averaging", "--resolved"])
+        peslite.main(["inspect", "gfl-example", "--switching", "--averaging", "--resolved"])
     assert "not allowed with argument" in capsys.readouterr().err
 
 
@@ -181,8 +181,8 @@ def test_changing_bridge_model_keeps_the_same_bridge_power_boundary(gfl):
         gfl(**{"units.vsc.bridge.model": "averaging"})
     ).unit()
 
-    assert tuple(switching.bridge.inp.__slots__) == tuple(averaging.bridge.inp.__slots__)
-    assert set(switching.bridge.inp.__slots__) == {
+    assert tuple(switching.bridge.input.__slots__) == tuple(averaging.bridge.input.__slots__)
+    assert set(switching.bridge.input.__slots__) == {
         "q", "u_dc", "i_c",
     }
     assert [port for _component, port in switching.zoh_connections()] == ["q"]
@@ -190,8 +190,8 @@ def test_changing_bridge_model_keeps_the_same_bridge_power_boundary(gfl):
     assert (averaging.bridge, "q") in averaging.connections()
     assert averaging.connections()[(averaging.ctrl, "u_dc")] == (averaging.dclink, "u_dc")
     for unit in (switching, averaging):
-        assert unit.bridge.dc_terminal in [terminal for _bus, terminal in unit.terminals()]
-        assert unit.bridge.power_terminal in [terminal for _bus, terminal in unit.terminals()]
+        assert unit.bridge.dc_port in [port for _bus, port in unit.port_bindings()]
+        assert unit.bridge.power_port in [port for _bus, port in unit.port_bindings()]
 
 
 def test_only_exact_switching_bridge_enters_the_switching_event_loop(gfl):

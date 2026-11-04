@@ -8,14 +8,40 @@ import pytest
 import peslite
 from peslite.assembly.params import ConfigError
 from peslite.assembly.unit import Plant
-from peslite.components.network import RCNode
 from peslite.components.converter import PWMAveragingModel, ThreePhaseBridge
 from peslite.components.pwm import ZOH, carrier_position
-from peslite.solver.model import Model
+from peslite.solver.model import Bag, Model
+
+
+class _HeldNode:
+    """Minimal causal block used to exercise held-input scheduling."""
+
+    class State(Bag):
+        __slots__ = ("u_C",)
+
+    class Input(Bag):
+        __slots__ = ("i",)
+
+    class Output(Bag):
+        __slots__ = ("u",)
+
+    state_names = ("u_C",)
+    outputs_need_inputs = True
+
+    def __init__(self):
+        self.state = self.State(u_C=0.0)
+        self.input = self.Input(i=0.0)
+        self.output = self.Output(u=0.0)
+
+    def set_outputs(self, _t):
+        self.output.u = self.state.u_C + self.input.i
+
+    def rhs(self, _t):
+        return (0.0,)
 
 
 def test_shared_plant_refreshes_same_time_held_changes_and_discontinuous_states(monkeypatch):
-    nodes = {name: RCNode(1.0, 1.0, phases=1) for name in ("first", "second")}
+    nodes = {name: _HeldNode() for name in ("first", "second")}
     model = Model(nodes, {}, {(node, "i"): name for name, node in nodes.items()})
     calls = []
     for method in ("sync", "sync_zoh"):
@@ -32,13 +58,13 @@ def test_shared_plant_refreshes_same_time_held_changes_and_discontinuous_states(
     plant.hold("second", 2.0)
     plant.outputs(0.0)
     plant.outputs(0.0)
-    assert nodes["first"].out.u == 1.0
-    assert nodes["second"].out.u == 2.0
+    assert nodes["first"].output.u == 1.0
+    assert nodes["second"].output.u == 2.0
     assert calls == ["sync", "sync_zoh"]
-    with plant.change():
+    with plant.change(0.0):
         nodes["first"].state.u_C = 3.0
     plant.outputs(0.0)
-    assert nodes["first"].out.u == 4.0
+    assert nodes["first"].output.u == 4.0
     assert plant.inputs_changed
     assert calls == ["sync", "sync_zoh", "sync"]
 

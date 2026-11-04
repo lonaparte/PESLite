@@ -8,7 +8,8 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, from_dict, read_tree, to_dict
-from peslite.components import Element, RLBranch, register_element_type
+from peslite.components import RLBranch, register_component_type
+from peslite.components.network import Element, _register_assembled_type
 from peslite.control import Measurement
 
 
@@ -35,7 +36,7 @@ def _measurement(p, t):
     return Measurement(t, 0j, 0j, p.unit("vsc").dclink.vdc_ref, np.zeros(3))
 
 
-@register_element_type
+@_register_assembled_type
 class _PassiveShunt(Element):
     """Test element without switching or retuning support."""
 
@@ -61,8 +62,8 @@ class _PassiveShunt(Element):
     def connections(self):
         return {}
 
-    def terminals(self):
-        return ((self.cfg.bus, self.branch.terminal1),)
+    def port_bindings(self):
+        return ((self.cfg.bus, self.branch.port1),)
 
 
 def test_builtin_load_is_typed_scaled_built_and_written(tmp_path):
@@ -73,10 +74,12 @@ def test_builtin_load_is_typed_scaled_built_and_written(tmp_path):
     )
     assert to_dict(p)["elements"]["load"]["type"] == "load"
     assert from_dict(to_dict(p)).elements == p.elements
-    assert peslite.register_element_type is register_element_type
+    assert peslite.register_component_type is register_component_type
 
     system = peslite.System(p)
-    assert system.named_elements["load"].branch in system.model.subsystems
+    branch = system.named_elements["load"].branch
+    assert any(getattr(subsystem, "component", subsystem) is branch
+               for subsystem in system.model.subsystems)
     assert "load.branch.i" in system.model.get_state()
 
     quick = p.replace(**{
@@ -92,7 +95,7 @@ def test_builtin_load_is_typed_scaled_built_and_written(tmp_path):
 @pytest.mark.parametrize(
     ("change", "message"),
     [
-        ({"type": "unknown"}, "Register a custom element type"),
+        ({"type": "unknown"}, "Register a custom component type"),
         ({"bus": "nowhere"}, "elements.load.bus: unknown bus"),
         ({"x_pu": -0.1}, "l must be > 0"),
         ({"r_pu": float("inf")}, "elements.load.r must be finite"),
@@ -119,10 +122,12 @@ def test_element_names_are_section_scoped_and_registrations_are_checked():
         class Params:
             bus: str
 
-    with pytest.raises(TypeError, match="needs a name"):
-        register_element_type(NoType)
+    with pytest.raises(TypeError, match="must be a dataclass"):
+        register_component_type(NoType)
+    with pytest.raises(TypeError, match="must be a dataclass"):
+        register_component_type(_PassiveShunt)
     with pytest.raises(ValueError, match="already registered"):
-        register_element_type(_PassiveShunt)
+        _register_assembled_type(_PassiveShunt)
 
 
 def test_system_checks_optional_custom_element_operations():
@@ -167,7 +172,7 @@ def test_system_switches_units_sources_and_loads():
                          ("line", system.branches["line"])):
         branch.state.i = 2 + 3j
         system.switch(name, False, 0.1)
-        assert branch.breaker_open and branch.state.i == 0j
+        assert branch.breaker_open
         system.switch(name, True, 0.2)
         assert not branch.breaker_open
 

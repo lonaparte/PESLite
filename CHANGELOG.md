@@ -2,6 +2,28 @@
 
 ## 0.4.0
 
+- Added `run`, `validate`, `inspect` and `export` commands with a shared strict JSON result envelope,
+  stable lifecycle status and exit codes. Optional wall-time and RHS limits stop at existing event
+  boundaries, close streamed histories and retain partial results.
+- Unified physical components on assembly-time `NetworkPlan` translation. Custom electrical
+  components can now register one frozen parameter dataclass whose `network()` declaration creates
+  ports, zero-initialized states and the primitives shared by every circuit model.
+- Added fixed-step trapezoidal and fifth-order Radau IIA integration. Electrical components now
+  declare one netlist source compiled as direct scalar device equations, dense per-mode state
+  equations or a sparse factorized modified nodal system. Time integrators consume all three
+  representations through the same model interface.
+- Reused exact netlist blocks and assembly mode identities in Python implicit Jacobians, and reduced
+  Python Radau Newton solves from one stage-expanded system to one shifted state system per stage.
+  Fixed Python explicit methods hand numerically unstable linear modes to the same Radau path at the
+  configured boundaries.
+- Replaced isolated helper circuits for externally governed current states and losses with a physical
+  behavioral current port and a node-free dissipation primitive shared by every circuit model.
+- Reused the lossless transformer primitive for averaged one-way bridge transfer, restoring Boost
+  polarity and power conservation. Generated circuit stages now discard unused equations and
+  inline the same scalar output expressions for every circuit model.
+- Deferred unused ratio-dependent network factorization, cached symbolic hashes and skipped empty
+  diode work. Adaptive solvers retain the last full warm-start step, automatic stiffness detection uses
+  a conservative Jacobian bound, and native CSV histories use one buffered writer.
 - Added single-phase AC network sources through ordinary scalar power ports and assembly-time
   electrical-domain constraints on inherently AC or DC terminals. Also made ADC window integration
   follow the configured physical sampling grid, and added open-loop duty control, the traceable
@@ -140,7 +162,7 @@
 ## 0.2.0
 
 - The default per-unit bridge model is now `pwm_averaging`. The mutually exclusive run presets
-  select `switching + fixed/rk4`, `pwm_averaging + fixed/rk4` or
+  select `switching + fixed/RK4`, `pwm_averaging + fixed/RK4` or
   `averaging + adaptive/DP45`; `--set` overrides a preset, and a preset overrides the file.
 - Ideal `averaging` now integrates controller states and instantaneous measurements with the plant
   ODE and directly drives the controlled voltage-source bridge. ADC, control-interrupt,
@@ -232,14 +254,14 @@
   `--averaging` uses the `-averaging` result suffix and is mutually exclusive with
   `--pwm-averaging`.
 
-### Progress lines and watched quantities (#3)
+### Progress bar and watched quantities (#3)
 
-- `simulation.progress: {enable, period, watch}` replaces `simulation.progress_every`.
-  `--progress SECONDS` enables the lines; repeatable `--watch NAME` arguments, including
+- `simulation.progress: {enable, watch}` replaces `simulation.progress_every`.
+  `--progress` enables the display; repeatable `--watch NAME` arguments, including
   comma-separated names, replace the file's watch list.
 - Watched names may be state-table columns, plant/controller result columns, state aliases, or a
   complex state without `.re`/`.im` to report its magnitude. State paths are entity-first, with no
-  `plant.*` domain. Unknown names report the known set at the first progress line, and observing
+  `plant.*` domain. Unknown names report the known set at the first progress update, and observing
   values does not change the simulation trajectory.
 
 ### Packaging and verification
@@ -281,7 +303,7 @@
 - State, control-signal and summary names use the same SI/per-unit convention as inputs.
   Controller states use `<unit>.ctrl.<state>`. Missing events are `None`/JSON `null`, switches
   are 0 or 1, and alarms, port-Hamiltonian defaults and energy problems are lists.
-- Results save the fully resolved configuration as `simulation.pes`; `--resolved` prints the same
+- Results save the fully resolved configuration as `simulation.pes`; `peslite inspect --resolved` prints the same
   representation, and both resolved and result-saved files can be run again.
 - The single root `examples/` directory contains only YAML-format `*-example.pes` files. They are
   included in the wheel and remain discoverable by the installed CLI. Custom Python examples are
@@ -385,7 +407,7 @@
   those values through `--set` and `Params.replace`; explicitly supplied values remain fixed.
 - `meta` contains optional text-only `title` and `description` fields.
 - `peslite.dumps` returns and `peslite.dump` writes a complete resolved simulation file.
-  Run results contain this file as `simulation.pes`, and `peslite FILE --resolved` prints it.
+  Run results contain this file as `simulation.pes`, and `peslite inspect FILE --resolved` prints it.
 
 ### Unified event model (#2)
 

@@ -1,9 +1,10 @@
-# PESLite 0.4.0
+# PESLite 0.5.0
 # Grid-following converter on a Thevenin grid: an annotated simulation file.
 # A simulation file is YAML (named .pes): the model (base, buses, branches, sources, units, elements),
 # what happens during the run (events), how it is simulated (simulation), then notes (meta). A key that
-# is left out takes its default; the commented keys show every option. `peslite gfl-example --resolved` prints
-# this file with every value written out. A name without a suffix is in SI units, a `_pu` name in pu:
+# is left out takes its default; the commented keys show every option. Run
+# `peslite inspect gfl-example --resolved` to print this file with every value written out.
+# A name without a suffix is in SI units, a `_pu` name in pu:
 # network quantities on the system base, converter quantities on the unit's own base; a quantity can
 # also be given in SI by dropping `_pu` (e.g. `l_f: 1.5e-4` in H). A switch is 1 (on) or 0 (off).
 
@@ -12,7 +13,7 @@ base:                      # system base
   v_ll_rms: 690.0          # V
   f0: 50.0                 # Hz
 
-buses:                     # nodes (AC or scalar); every bus needs a shunt capacitor
+buses:                     # named AC or scalar connection points; a shunt capacitor is optional
   pcc:
     # phases: 3             # 3: AC space vector (default), 1: real scalar bus
     c_pu: 0.02             # shunt capacitor, pu susceptance at f0
@@ -76,9 +77,9 @@ units:                     # converters, one entry each
     #   upper_controlled: 1        # half bridge: device placement; full bridge: both 0 = diode
     #   lower_controlled: 1        # rectifier (no ctrl/pwm); half/full bridge only
     #   on_resistance: 0           # conducting-device resistance [ohm]; positive for nonzero capacitance
-    #   parallel_capacitance: 0    # capacitance across the power terminals [F]
+    #   parallel_capacitance: 0    # capacitance across the power ports [F]
     #   reverse_port: 0            # half-bridge scalar-port orientation
-    #   external_terminal: midpoint # half bridge: midpoint | lower_rail
+    #   external_port: midpoint # half bridge: midpoint | lower_rail
     #                              # CLI: --averaging | --pwm-averaging | --switching
 
     ctrl:
@@ -132,7 +133,7 @@ units:                     # converters, one entry each
       # hold: 0.02         # s
 
 # elements:                # other circuit elements: the built-in load, or types registered with
-#   load1: {type: load, bus: pcc, r_pu: 2.0, x_pu: 1.0}  # peslite.register_element_type
+#   load1: {type: load, bus: pcc, r_pu: 2.0, x_pu: 1.0}  # peslite.register_component_type
 #                          # load: series R-L from the bus to ground; a small impedance is a fault
 
 events:                    # what happens during the run, by name; written only when it happens
@@ -156,8 +157,11 @@ simulation:                # how the model is simulated
   t_end: 3.0
   solver:
     dt: 25e-6              # fixed: maximum step
+    # circuit_model: device      # device | statewise | nodal
     # type: fixed          # fixed | adaptive; presets: --averaging adaptive, the other two fixed
-    # method: rk4          # presets: --averaging DP45, the other two rk4; --set has priority
+    # method: RK4          # fixed: euler | heun | RK4 | trapezoidal | radau
+    #                      # adaptive: DP45 | RK23 | RK45 | DOP853 | radau | BDF | LSODA
+    #                      # presets: --averaging DP45, the other two RK4; --set has priority
     # rtol: 1.0e-6         # adaptive tolerances
     # atol: 1.0e-9
     # max_step: .inf       # adaptive: largest step, s
@@ -177,9 +181,8 @@ simulation:                # how the model is simulated
     # signals: 0           # plant.csv and ctrl.<unit>.csv
     # energy: 0            # energy.csv
   # stop_on_trip: 1
-  # progress:              # console lines (--progress SECONDS, --watch NAME)
+  # progress:              # terminal progress bar (--progress, --watch NAME)
   #   enable: 0
-  #   period: 0.1          # simulated seconds between lines
   #   watch: [vsc.vdc_pu, vsc.i_c]  # states/outputs; complex state -> magnitude
   # energy_check: warn     # warn | strict | off
 

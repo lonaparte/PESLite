@@ -23,7 +23,7 @@ history and then export it afterward.
 | `plant.csv` | `simulation.output.signals: 1` | Network and converter plant outputs. |
 | `ctrl.<unit>.csv` | `simulation.output.signals: 1` | Controller signals for one unit. |
 | `energy.csv` | `simulation.output.energy: 1` | Stored energy and power-balance history. |
-| `summary.json` | Always | Stop reason, solver counts, protection, peaks and diagnostics. |
+| `summary.json` | End of every run | Stop reason, solver counts, protection, peaks and diagnostics. |
 | `<name>_report.json` | Python `--report`, with the analysis addon available | Optional report sections, including `small_signal_stability`. |
 | `simulation.pes` | Always | Complete resolved configuration used for the run. |
 
@@ -89,12 +89,13 @@ Scalar signals keep their names. Python CSV output and standalone C++ share this
 States retain their `.re` / `.im` representation.
 
 Aliases such as `<unit>.i_c` and `<unit>.u_dc` may resolve to the underlying physical state. Use
-`--list-states` to print the exact state columns for one configuration.
+`peslite inspect case.pes --states` to print the exact state columns for one configuration.
 
 ## Summary conventions
 
 `summary.json` uses stable machine-readable values:
 
+- `status` is `completed`, `stopped`, `diverged` or `timed_out`;
 - switches are `0` or `1`;
 - a time or result that did not occur is `null`;
 - alarms, energy problems and port-Hamiltonian defaults are lists;
@@ -130,21 +131,24 @@ or programmatically.
 
 ## Progress and watch
 
-Progress is console output, not a result history:
+An interactive run displays a single updating progress bar. Use `--progress` or `--no-progress`
+to override that behavior:
 
 ```bash
-peslite case.pes --progress 0.1 \
+peslite case.pes --progress \
   --watch vsc.vdc_pu \
   --watch vsc.i_c,vsc.u_dc
 ```
 
-`--progress` is measured in simulated seconds. The options set the file section
-`simulation.progress: {enable, period, watch}`, which a simulation file may also contain; `--watch`
-replaces its watch list. `--watch` accepts state columns, public
+In redirected output, explicit progress prints one line per update instead of terminal control
+characters. The options set the file section `simulation.progress: {enable, watch}`, which a
+simulation file may also contain; `--watch` replaces its watch list. `--watch` accepts state columns, public
 plant/controller columns and aliases. Naming a complex state without `.re` or `.im` displays its
 magnitude. Unknown names are reported with the available names when progress first prints.
 
-Watching does not enable CSV histories or alter solver state or results.
+Progress and watched values are terminal-only; they do not enable CSV histories or alter solver
+state or results. Enabled histories stream to CSV during the run, while `summary.json` is written
+once after the run finishes.
 
 ## Restart from output
 

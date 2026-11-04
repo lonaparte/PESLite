@@ -58,7 +58,7 @@ def _matplotlib() -> Any:
         import matplotlib
     except ImportError as exc:  # pragma: no cover - depends on the installation
         raise RuntimeError(
-            "plotting requires Matplotlib; install it with `pip install 'peslite[plot]'`"
+            "plotting requires Matplotlib; install it with `pip install peslite`"
         ) from exc
     return matplotlib
 

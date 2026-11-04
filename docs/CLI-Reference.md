@@ -1,11 +1,42 @@
 # CLI Reference
 
-PESLite installs two commands:
+PESLite installs one `peslite` command with five operations:
 
-- `peslite`: run, inspect or export a simulation;
-- `peslite-convert`: export a standalone C++ simulator or an experimental Imperix ELF executable.
+```bash
+peslite create case.pes
+peslite run case.pes
+peslite validate case.pes
+peslite inspect case.pes
+peslite export case.pes
+```
 
-Use `peslite --help` and `peslite-convert --help` for the interface of the installed version.
+`peslite case.pes` is the short form of `peslite run case.pes`. Use `peslite --help` or
+`peslite <operation> --help` for the installed interface.
+
+## Create a file
+
+Specify the new file name:
+
+```bash
+peslite create case.pes
+peslite create component.py
+peslite create controller.py
+peslite create my_control.py
+```
+
+Simulation files are created in the current directory. `component.py` is created in
+`PESaddons/components/`; other `.py` files use the controller template in `PESaddons/control/`.
+Python class and registration names follow the supplied file name. Templates are bundled under
+`examples/templates/`, and existing files are never overwritten.
+
+Creation does not open the file unless `--open` is supplied:
+
+```bash
+peslite create case.pes --open
+```
+
+On Linux and macOS, the option uses `VISUAL`, then `EDITOR`, before falling back to the operating
+system's default application for the file type.
 
 ## Select a simulation
 
@@ -23,14 +54,9 @@ peslite case.pes
 peslite ./cases/my-converter.pes
 ```
 
-The suffix may be omitted. PESLite tries the path, then `.pes`, `.yaml`, `.yml` and `.json`
-variants, then bundled examples, and uses the first match:
-
-```bash
-peslite case
-```
-
-The default result directory is `output/<name>/`.
+The suffix may be omitted. PESLite checks the supplied path and its `.pes`, `.yaml`, `.yml` and
+`.json` variants before checking bundled examples. The default result directory is
+`output/<name>/`.
 
 ## Override parameters
 
@@ -51,9 +77,9 @@ peslite case.pes \
   --set simulation.solver.rtol=1e-3
 ```
 
-The priority, from highest, is: `--set`, a command preset, the simulation file, package defaults.
+The priority, from highest, is `--set`, a command preset, the simulation file and package defaults.
 
-## Select a bridge/solver preset
+## Select a bridge and solver preset
 
 ```bash
 peslite case.pes --switching
@@ -61,8 +87,8 @@ peslite case.pes --pwm-averaging
 peslite case.pes --averaging
 ```
 
-What each preset selects is listed in
-[Command presets](Bridge-and-PWM.md#command-presets).
+See [Command presets](Bridge-and-PWM.md#command-presets) for the model and solver selected by each
+preset.
 
 ## Choose the output directory
 
@@ -70,18 +96,22 @@ What each preset selects is listed in
 peslite case.pes --out output/my-run
 ```
 
-Without `--out`, a bridge preset adds its mode name to the default directory. Files and output
-settings are documented in [Output and Results](Output-and-Results.md).
+Without `--out`, a bridge preset adds its mode name to the default directory. See
+[Output and Results](Output-and-Results.md) for the generated files.
 
 ## Progress and watched values
 
+Interactive simulations show one updating progress bar by default:
+
 ```bash
-peslite case.pes --progress 0.1 --watch vsc.vdc_pu
-peslite case.pes --progress 0.1 --watch vsc.i_c,vsc.u_dc
+peslite case.pes --progress --watch vsc.vdc_pu
+peslite case.pes --progress --watch vsc.i_c,vsc.u_dc
+peslite case.pes --no-progress
 ```
 
-`--progress SECONDS` uses simulated time. `--watch` may be repeated or contain comma-separated
-names; see [Progress and watch](Output-and-Results.md#progress-and-watch).
+`--watch` may be repeated or contain comma-separated names. Redirected runs remain quiet unless
+progress is explicitly enabled; see
+[Progress and watch](Output-and-Results.md#progress-and-watch).
 
 ## Optional simulation report
 
@@ -90,70 +120,98 @@ peslite case.pes --report
 ```
 
 With the online stability analysis addon available, this also writes `case_report.json`; see
-[Online Stability Analysis](Online-Stability-Analysis.md#online-simulation-report) for its
-contents and compatible options.
+[Online Stability Analysis](Online-Stability-Analysis.md#online-simulation-report).
 
 ## Plot recorded waveforms
 
-`--plot NAME [NAME ...]` invokes the optional plotting add-on after the simulation. See
-[Plotting](Plotting.md) for installation, output requirements and presentation options.
+`--plot NAME [NAME ...]` invokes the optional plotting addon after the simulation. See
+[Plotting](Plotting.md) for output requirements and presentation options.
 
 ## Continue from saved state
 
-`--initial FILE` starts from the last row of a saved `states.csv`; `--initial-time T` selects the
-row saved at another time. See
-[Events Timeline](Events-Timeline.md#continue-from-a-saved-csv)
-for the commands and what is restored.
+`--initial FILE` starts from the last row of a saved `states.csv`; `--initial-time T` selects
+another row. See [Events Timeline](Events-Timeline.md#continue-from-a-saved-csv).
+
+## Validate without running
+
+```bash
+peslite validate case.pes
+```
+
+`validate` loads and assembles the configuration without running or creating output files.
 
 ## Inspect without running
 
 ```bash
-peslite case.pes --resolved
-peslite case.pes --list-states
-peslite case.pes --ph-report
+peslite inspect case.pes
 ```
 
-- `--resolved` prints the complete configuration after defaults, presets and overrides;
-- `--list-states` prints the generated `states.csv` state columns;
-- `--ph-report` prints the assembled port-Hamiltonian structure and coverage.
-
-The inspection command respects `--set` and the bridge/solver presets supplied with it.
-
-## Export through `peslite`
-
-The general command can invoke a registered exporter:
+With no view option, `inspect` prints the resolved configuration, generated state names, electrical
+groups and port-Hamiltonian structure report. Select any subset by combining these options:
 
 ```bash
-peslite case.pes --export cpp
-peslite case.pes --export cpp simulation.t_end units.vsc.ctrl.references.p_ref_pu
-peslite case.pes --export cpp all --out export/my-simulator
-peslite case.pes --export imperix --imperix-source-only
+peslite inspect case.pes --resolved
+peslite inspect case.pes --states
+peslite inspect case.pes --ph-report
+peslite inspect case.pes --groups
+peslite inspect case.pes --resolved --states
 ```
 
-The first item after `--export` is the format; later items are variable parameter paths for that
-backend.
+Inspection accepts the same configuration presets and `--set` overrides as a run.
 
-## Export through `peslite-convert`
+## Machine-readable results
 
-`peslite-convert` defaults to standalone C++ simulator export:
+All operations accept `--json`:
 
 ```bash
-peslite-convert case.pes
-peslite-convert case.pes simulation.t_end units.vsc.ctrl.references.p_ref_pu
-peslite-convert case.pes all --out export/my-simulator
+peslite create case.pes --json
+peslite validate case.pes --json
+peslite inspect case.pes --json
+peslite run case.pes --out output/case --json
+peslite export case.pes common --json
 ```
 
-It emits `peslite.cpp` in `export/<name>/` or the explicit `--out` directory. Compilation, runtime
-options and backend limits are documented in [C++ Export](Cpp-Export.md).
+Standard output then contains one strict JSON object with schema `peslite.cli/v1`. Its envelope
+includes `command`, `status`, `exit_code`, absolute configuration and result paths, `diagnostics`
+and `error`. A run also reports simulated start, requested end, actual stop time, wall time, RHS
+evaluations and trip status. Terminal progress options cannot be combined with `--json`.
+
+Execution success does not assert that the configured physical system is correct; model warnings,
+protection results and numerical diagnostics remain separate fields.
+
+Exit codes are `0` for a completed command, `2` for command or configuration errors, `3` for
+assembly errors, `4` for simulation failures, `5` for a run limit and `70` for an internal error.
+
+## Run limits
+
+```bash
+peslite run case.pes --timeout 60
+peslite run case.pes --max-rhs 1000000
+```
+
+Limits are checked at existing event boundaries and therefore do not add simulation events.
+PESLite closes the histories and writes the partial `summary.json` before returning exit code `5`.
+
+## Export
+
+Standalone C++ is the default export target:
+
+```bash
+peslite export case.pes
+peslite export case.pes simulation.t_end units.vsc.ctrl.references.p_ref_pu
+peslite export case.pes common --out export/my-simulator
+peslite export case.pes all
+```
+
+Items after the simulation file are variable parameter paths, `common` or `all`. See
+[C++ Export](Cpp-Export.md) for compilation, runtime options and backend limits.
 
 Use `--imperix` for [Imperix ELF export (Experimental)](Imperix-Export.md):
 
 ```bash
-peslite-convert case.pes --imperix
+peslite export case.pes all --imperix
+peslite export case.pes all --imperix --imperix-source-only
 ```
-
-This builds an ELF using the configured official SDK. Add `--imperix-source-only` to generate
-sources without building the ELF.
 
 ## Common command patterns
 
@@ -161,7 +219,7 @@ Print a short run with live values:
 
 ```bash
 peslite case.pes --set simulation.t_end=0.5 \
-  --progress 0.05 --watch vsc.vdc_pu,vsc.i_c
+  --progress --watch vsc.vdc_pu,vsc.i_c
 ```
 
 Compare bridge presets without editing the file:
@@ -175,5 +233,5 @@ peslite case.pes --averaging
 Create an editable, fully resolved starting file:
 
 ```bash
-peslite gfl-example --resolved > case.pes
+peslite inspect gfl-example --resolved > case.pes
 ```

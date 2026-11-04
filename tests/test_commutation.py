@@ -17,15 +17,15 @@ class _Ramp:
 
     def __init__(self, scheduled=(), zeno=False):
         self.state = type("_S", (Bag,), {"__slots__": ("x",)})()
-        self.inp = type("_I", (Bag,), {"__slots__": ()})()
-        self.out = type("_O", (Bag,), {"__slots__": ("x",)})()
+        self.input = type("_I", (Bag,), {"__slots__": ()})()
+        self.output = type("_O", (Bag,), {"__slots__": ("x",)})()
         self.flag = 0
         self.at = []
         self.scheduled = list(scheduled)
         self.zeno = zeno
 
     def set_outputs(self, t):
-        self.out.x = self.state.x
+        self.output.x = self.state.x
 
     def rhs(self, t):
         return (1.0,)
@@ -50,7 +50,7 @@ class _Ramp:
 def _handler(part, dt=0.1):
     from peslite.solver.integrators import FixedStepSolver
     model = Model({"ramp": part}, {})
-    return model, DiodeConduction(model, FixedStepSolver(dt, "rk4"))
+    return model, DiodeConduction(model, FixedStepSolver(dt, "RK4"))
 
 
 def test_margin_commutation_is_located_and_its_state_written_back():
@@ -59,6 +59,47 @@ def test_margin_commutation_is_located_and_its_state_written_back():
     y = handler.advance(0.0, 3.0, np.zeros(1))
     assert part.at == [pytest.approx(1.0, abs=1e-14)]
     assert y[0] == pytest.approx(2.0, abs=1e-12)  # reset to 0 at t = 1, then 2 s of ramp
+
+
+def test_margin_observation_reuses_rhs_synchronization(monkeypatch):
+    part = _Ramp()
+    model, handler = _handler(part)
+    synchronize = model.sync
+    calls = 0
+
+    def counted(t, y):
+        nonlocal calls
+        calls += 1
+        synchronize(t, y)
+
+    monkeypatch.setattr(model, "sync", counted)
+    handler.advance(0.0, 0.9, np.zeros(1))
+
+    # One initial boundary synchronization and one final endpoint synchronization suffice;
+    # interior guards reuse the already synchronized first RK stage.
+    assert calls == 2
+
+
+def test_boundary_only_commutation_settles_without_interval_location():
+    part = _Ramp()
+    part.locate_commutations = False
+    part.state.x = 2.0
+    _model, handler = _handler(part)
+    y = handler.advance(0.0, 0.5, np.array([2.0]))
+    assert part.at == [0.0]
+    assert y[0] == pytest.approx(0.5, abs=1e-12)
+
+
+def test_zero_state_guard_still_settles_the_boundary_mode():
+    part = _Ramp()
+    part.commutation_state_guards = lambda: ((0, 1.0),)
+    part.commutation_margin = lambda: -1.0 if part.flag == 0 else 1.0
+    _model, handler = _handler(part)
+
+    y = handler.advance(0.0, 0.1, np.zeros(1))
+
+    assert part.at == [0.0]
+    assert y[0] == pytest.approx(0.1, abs=1e-12)
 
 
 def test_zero_margin_plateau_does_not_move_the_commutation_to_its_start():
@@ -120,7 +161,7 @@ def test_located_and_scheduled_events_on_distinct_owners_share_the_boundary():
     clock = _Ramp(scheduled=[1.0])
     clock.flag = 1
     model = Model({"crossing": crossing, "clock": clock}, {})
-    handler = DiodeConduction(model, FixedStepSolver(0.25, "rk4"))
+    handler = DiodeConduction(model, FixedStepSolver(0.25, "RK4"))
     handler.advance(0.0, 1.5, np.zeros(2))
     assert crossing.at == pytest.approx([1.0], abs=1e-14)
     assert clock.at == pytest.approx([1.0], abs=1e-14)
@@ -131,10 +172,10 @@ def test_bounded_current_and_margin_event_use_the_same_advance():
     from peslite.solver.integrators import FixedStepSolver
 
     branch = RLBranch(1.0, 0.0, i0=0.5, phases=1, unilateral=True)
-    branch.inp.u1 = -1.0
+    branch.port1.voltage = -1.0
     ramp = _Ramp()
     model = Model({"branch": branch, "ramp": ramp}, {})
-    handler = DiodeConduction(model, FixedStepSolver(0.1, "rk4"))
+    handler = DiodeConduction(model, FixedStepSolver(0.1, "RK4"))
     state = handler.advance(0.0, 2.0, model.get_initial_values())
     assert state[model.state_slice(branch, "i")][0] == 0.0
     assert state[model.state_slice(ramp, "x")][0] == pytest.approx(1.0, abs=1e-12)
@@ -151,8 +192,8 @@ def test_current_zero_locator_preserves_plain_float_solver_times():
             return super().advance(rhs, t0, t1, state, **kwargs)
 
     branch = RLBranch(1.0, 0.0, i0=0.5, phases=1, unilateral=True)
-    branch.inp.u1 = -1.0
+    branch.port1.voltage = -1.0
     model = Model({"branch": branch}, {})
-    handler = DiodeConduction(model, CheckingSolver(1.0, "rk4"))
+    handler = DiodeConduction(model, CheckingSolver(1.0, "RK4"))
     state = handler.advance(0.0, 1.0, model.get_initial_values())
     assert state[0] == 0.0

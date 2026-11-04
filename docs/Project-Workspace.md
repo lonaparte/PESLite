@@ -2,6 +2,9 @@
 
 The directory containing a `.pes` file may also contain project add-ons and result directories.
 
+Create a simulation file with `peslite create case.pes`; use `peslite create component.py` or
+`peslite create controller.py` to create project add-on templates in the paths below.
+
 ## Layout
 
 ```text

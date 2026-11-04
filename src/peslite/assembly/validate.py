@@ -17,7 +17,8 @@ from ..components.converter import make_topology
 from ..components.pwm import validate_modulator
 from ..components.network import element_buses
 from ..control.profiles import control_type
-from ..solver.integrators import ADAPTIVE_METHODS, FIXED_METHODS
+from ..solver.integrators import (ADAPTIVE_METHODS, EXPLICIT_FIXED_METHODS, FIXED_METHODS,
+                                  IMPLICIT_ADAPTIVE_METHODS, IMPLICIT_FIXED_METHODS)
 from ..solver.model import ConfigError
 from ..solver.multirate import parse_step
 from ..solver.timing import TIME_EPS, PeriodicClock, control_clock_offset
@@ -305,10 +306,10 @@ def _dc_converter(u, base, where: str, *, nested: bool = False) -> None:
     topology, continuous = _converter(u, base, where)
     if (u.bus is None) != (u.filter is None):
         raise ConfigError(f"{where}: bus and filter must be specified together")
-    if (getattr(topology, "external_terminal", None) == "lower_rail"
+    if (getattr(topology, "external_port", None) == "lower_rail"
             and (u.bus is None or u.filter is None)):
         raise ConfigError(
-            f"{where}.bridge.external_terminal: lower_rail needs a bus and a midpoint filter"
+            f"{where}.bridge.external_port: lower_rail needs a bus and a midpoint filter"
         )
     if nested and u.bus is not None:
         raise ConfigError(f"{where}: a composite child uses its parent's scoped power bus")
@@ -433,9 +434,10 @@ def _network(p: Params) -> None:
         if unit.bus is not None
     }
     for name, bus in p.buses.items():
-        if bus.c <= 0.0:
-            raise ConfigError(f"buses.{name}.c must be > 0: the shunt capacitor is what makes the "
-                              f"bus voltage a state (a bus without one would need a node-voltage solver)")
+        if bus.c is not None and bus.c <= 0.0:
+            raise ConfigError(f"buses.{name}.c must be > 0 when specified")
+        if bus.c is None and bus.r_d != 0.0:
+            raise ConfigError(f"buses.{name}.r_d requires c")
         if bus.phases not in (1, 3):
             raise ConfigError(f"buses.{name}.phases must be 1 or 3")
         if bus.phases == 3:
@@ -491,7 +493,12 @@ def _solver(s) -> None:
         raise ConfigError(f"simulation.solver.method {s.method!r} is not one of {FIXED_METHODS}")
     if s.type == "adaptive" and s.method not in ADAPTIVE_METHODS:
         raise ConfigError(f"simulation.solver.method {s.method!r} is not one of {ADAPTIVE_METHODS}")
-    names = ("dt",) if s.type == "fixed" else ("rtol", "atol", "max_step")
+    fixed = s.type == "fixed"
+    implicit = s.method in (IMPLICIT_FIXED_METHODS if fixed else IMPLICIT_ADAPTIVE_METHODS)
+    if fixed:
+        names = ("dt", "rtol", "atol") if implicit else ("dt",)
+    else:
+        names = ("rtol", "atol", "max_step")
     for name in names:
         value = getattr(s, name)
         if value <= 0.0 or math.isnan(value) or (name != "max_step" and not math.isfinite(value)):
@@ -511,9 +518,14 @@ def _solver(s) -> None:
         if isinstance(value, dict) and (set(value) - {"step", "method"} or "step" not in value):
             raise ConfigError(f"{where}: expected {{step, method}} (step required), got {sorted(value)}")
         try:
-            _ratio, method = parse_step(value)
+            ratio, method = parse_step(value)
         except ValueError as exc:
             raise ConfigError(f"{where}: {exc}") from None
+        if ratio != 1.0 and s.method not in EXPLICIT_FIXED_METHODS:
+            raise ConfigError(
+                f"{where}: a subsystem on its own step needs an explicit system method "
+                f"{EXPLICIT_FIXED_METHODS}, got {s.method!r}"
+            )
         if method is not None and method not in FIXED_METHODS + ADAPTIVE_METHODS:
             raise ConfigError(f"{where}.method: {method!r} is not one of {FIXED_METHODS + ADAPTIVE_METHODS}")
 
@@ -594,7 +606,7 @@ def _initial(p: Params) -> None:
 
 
 def _progress(progress) -> None:
-    """Check progress settings; watched names are resolved at the first progress line."""
+    """Check progress settings; watched names are resolved at the first bar update."""
     _switched(progress, "simulation.progress")
     watch = progress.watch
     if not isinstance(watch, list) or not all(isinstance(name, str) and name for name in watch):

@@ -221,8 +221,8 @@ def _ps_tree(primary, secondary, t_end, *, states=False, events=None):
             "simulation": {"t_end": t_end,
                            "solver": {"type": "fixed", "method": "rk4", "dt": 20e-9,
                                       "linearisations": 0},
-                           "output": {"period": 1e-7, "record_every": 1, "states": states,
-                                      "signals": True, "energy": False}}}
+                           "output": {"period": 1e-7, "record_every": 1, "precision": 17,
+                                      "states": states, "signals": True, "energy": False}}}
     if events:
         tree["events"] = events
     return tree

@@ -11,7 +11,7 @@ Each example is an ordinary YAML simulation file. Use it directly, print its ful
 configuration, or copy that resolved form as the starting point for another case.
 
 ```bash
-peslite gfl-example --resolved > case.pes
+peslite inspect gfl-example --resolved > case.pes
 peslite case.pes
 ```
 
@@ -73,9 +73,9 @@ peslite wpt-lcc-example --averaging
 the [scalar feedback loops](Bridge-and-PWM.md#scalar-feedback-loops). Set phase
 limits and gain polarity for a monotonic circuit branch; the controller does not infer them.
 
-The power channel uses the paired voltage and current of the converter's external `power` terminal,
+The power channel uses the paired voltage and current of the converter's external `power` port,
 including its direction and power convention, independently of control feedback coordinates. In
-these unfiltered full bridges that is the local magnetic-link terminal. Positive power leaves the
+these unfiltered full bridges that is the local magnetic-link port. Positive power leaves the
 converter, so negative
 secondary power means power is delivered to its ideal DC voltage source. These examples demonstrate
 power-transfer regulation between stiff DC rails, not battery dynamics or output-voltage regulation.
@@ -135,11 +135,11 @@ peslite gfm-psc-example \
   --out output/psc-short
 ```
 
-For progress lines with selected live values:
+For a progress bar with selected live values:
 
 ```bash
 peslite two-converters-example \
-  --progress 0.05 \
+  --progress \
   --watch vsc_1.vdc_pu,vsc_2.vdc_pu
 ```
 
@@ -149,18 +149,17 @@ therefore refer to different converters.
 ## Inspect before running
 
 ```bash
-peslite gfl-example --list-states
-peslite gfl-example --ph-report
-peslite gfl-example --resolved
+peslite inspect gfl-example
+peslite inspect gfl-example --states
+peslite inspect gfl-example --ph-report --resolved
 ```
 
-These commands use the same configuration resolution and accept the same bridge presets and
-`--set` overrides as a simulation run.
+These commands use the same configuration resolution and accept `--set` overrides.
 
 ## Export an example to C++
 
 ```bash
-peslite-convert gfl-example all
+peslite export gfl-example all
 c++ -O3 -DNDEBUG -std=c++17 export/gfl-example/peslite.cpp \
   -o export/gfl-example/peslite
 export/gfl-example/peslite --list-params

@@ -14,7 +14,7 @@ from .control import OutputStage, VSCController, make_controller, register_loop_
 from .components import (ADC, ADCSample, PWM, PWMAveragingModel, ZOH, AveragingModel, SwitchingModel,
                          ThreePhaseBridge, CarrierComparison, FullBridge, HalfBridge,
                          MeasurementPorts, make_bridge,
-                         make_modulator, register_element_type)
+                         make_modulator, register_component_type)
 from .assembly import (DCConverter, Params, Protection, ProtectionSample,
                        SourceScenario, System, Unit, VSC,
                        dump, dumps, load, register_event_type)
@@ -25,7 +25,7 @@ from .assembly.params import _register_load_preparer
 
 _register_load_preparer(addons._discover_for)
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "solver", "control", "components", "assembly", "addons",
@@ -33,7 +33,7 @@ __all__ = [
     "DCConverter", "Protection", "ProtectionSample", "MeasurementPorts", "Model", "BlackBoxSubsystem",
     "SourceScenario",
     "Simulation", "SimulationResult", "ExportResult", "export", "VSCController", "main", "make_controller", "make_modulator", "make_solver",
-    "register_loop_type", "register_element_type", "register_event_type",
+    "register_loop_type", "register_component_type", "register_event_type",
     "OutputStage", "ADC", "ADCSample", "PWM", "SwitchingModel", "PWMAveragingModel", "AveragingModel",
     "ThreePhaseBridge", "make_bridge",
     "HalfBridge", "FullBridge",

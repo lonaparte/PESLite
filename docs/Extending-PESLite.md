@@ -6,9 +6,9 @@ directory beside a simulation file share the same package search paths and regis
 elsewhere can still be imported and registered explicitly before loading a simulation file that
 names them.
 
-The root `examples/` directory contains simulation files only. Bundled Python implementations live
-under `peslite.addons`, while additional test-only implementations exercise the same interfaces in
-the test suite.
+The root `examples/` directory contains simulation files and a `templates/` directory for
+`peslite create`. Bundled Python implementations live under `peslite.addons`, while test fixtures
+exercise the same interfaces in the test suite.
 
 Project-local controllers, components and functions can live beside a simulation rather than in
 the installed package. Their exact search rules and their relationship to the output directory are
@@ -20,9 +20,9 @@ uses a filtered measured-voltage magnitude and grid-frequency state, then joins 
 as the built-in current and DC-voltage loops.
 
 The bundled `cable-gfl-example` similarly keeps its case in `examples/`, while
-`peslite.addons.components.cable` implements its own distributed R-L/G-C state equations. It is a
-two-terminal custom element rather than a renamed built-in branch: both terminal currents are
-positive into the cable, and its internal inductor currents and capacitor voltages are ordinary
+`peslite.addons.components.cable` declares a distributed R-L/G-C network through the same component
+interface. It is a two-port custom element rather than a renamed built-in branch: both port currents
+are positive into the cable, and its internal inductor currents and capacitor voltages are ordinary
 restartable PESLite states.
 
 ## Custom control loops
@@ -120,74 +120,70 @@ the trapezoidal (Tustin) method. The complete bundled example is
 
 ## Custom circuit elements
 
-An element class registered by `register_element_type` owns:
-
-- a frozen `Params` dataclass including its `type` and `bus` or `busN` fields;
-- `subsystems()` for its physical model objects;
-- `connections()` for its internal and auxiliary signal wiring;
-- `terminals()` binding each configured bus to an electrical `Terminal`;
-- optional `signals()` returning namespaced scalar or complex values for `plant.csv`;
-- optional `breakers` or `connect(on, t, ramp)` for connection events, plus `retune(cfg)` for
-  `set` events.
+A custom electrical component is a frozen parameter dataclass registered by
+`register_component_type`. Its `network()` method declares the physical primitives used by every
+circuit model.
 
 ```python
-from peslite.addons.components import Element, Terminal, register_element_type
+from dataclasses import dataclass
+from typing import ClassVar
 
-@register_element_type
-class MyElement(Element):
-    type = "my_element"
-    # Params and assembly methods...
+from peslite.addons.components import register_component_type
+from peslite.solver import netlist as nl
+
+@register_component_type
+@dataclass(frozen=True, kw_only=True)
+class SeriesRL:
+    bus: str
+    r: float
+    l: float
+    type: str = "series_rl"
+    domain_transparent: ClassVar[bool] = True
+
+    def network(self, n):
+        middle = n.internal()
+        n.add(
+            nl.Resistor(n.bus, middle, self.r),
+            nl.Inductor(middle, n.ground, self.l, n.state("i")),
+        )
+        n.port_output("i", "bus", "current")
+        n.losses()
 ```
 
 The file can then use:
 
 ```yaml
 elements:
-  device: {type: my_element, bus: pcc}
+  load: {type: series_rl, bus: pcc, r: 1.0, l: 2e-3}
 ```
 
 Modules under `peslite/addons/components/` are discovered automatically. Built-in and add-on
-elements follow the same registry mechanism. Public names are namespaced by the element instance,
-so two instances do not share state paths.
+components use the same registry and assembly-time translation. A `bus` field creates one port;
+`bus1`, `bus2` and later numbered fields create multiple ports. Each port starts with zero voltage
+and current, with current positive into the component. `n.bus` or `n.busN` is its network node,
+`n.ground` is the reference node, and `n.internal()` inherits the component's electrical dimension.
+`n.state("name")` registers a zero initial state; pass `initial=` only for a nonzero initial value.
+Scalar ports create real states and three-phase ports create complex space-vector states.
 
-An electrical `Terminal` names a subsystem voltage and current once. Its direction is `+1` when
-positive current enters the subsystem and `-1` when it leaves. The default terminal receives
-voltage through `inp` and publishes current through `out`; `drives_voltage=True` reverses those
-roles. A one-terminal element uses `bus` and returns one binding; a multi-terminal element uses
-`bus1`, `bus2`, and so on. Each bus needs exactly one voltage driver. System assembly converts the
-voltage fan-out and signed current sum to direct model connections, so terminal metadata adds no
-work to the integration loop.
-
-Terminals can also declare circuit constraints. A voltage-driving terminal with
-`hold_voltage_input="u_hold"` receives the voltage that keeps its connected current constant
-while it is blocked. Its current-owning peer implements
-`hold_voltage_source(terminal, *, current_constraint=None)` and
-returns the ordinary model output `(subsystem, output_name)` carrying that voltage. Its owner
-may also supply `current_constraint()`, returning its constrained current or `None` when free.
-The current-owning peer receives this callback and installs `project_state()` to enforce active
-constraints on its own states; coupled constraints must be projected together.
-Assembly checks these capabilities after resolving default and named Unit ports; they apply to
-ordinary branches, composite links and add-on elements alike.
+Use `n.output`, `n.linear_output` or `n.port_output` to publish values. Ordinary scalar inductor and
+capacitor storage is inferred from the declared primitives; `n.losses()` and `n.supplies()` select
+the primitives used for energy accounting. Public names are namespaced by the configured component
+name, so instances do not share state or output paths.
 
 Configured element buses may also name an assembled Unit default or named port. An optional
-`series_connections()` mapping `{downstream_bus: inlet_bus}` inserts an element after the original
-voltage driver; its ordinary `terminals()` still declares both electrical boundaries. This is a
-construction-time operation, not a new network solver. The built-in `Resistor(series=True)` is a
-stateless reference implementation.
+`series_connections()` mapping `{bus: inlet_bus}` cuts a node that joins exactly two ports and
+places the element between them. Repeated declarations form a series chain in declaration order.
+The built-in `Resistor(series=True)` is a stateless reference implementation.
 
-An optional `parameter_bindings()` mapping `{field: (subsystem, attribute)}` exposes retunable
-scalar parameters to C++ event lowering. Implement `retune()` using the same bindings so Python
-and native output/energy equations share one parameter definition. Structural changes, such as
-changing the element's series connection, remain assembly-time configuration. Mark structural
-parameter fields with dataclass metadata `{"runtime": False}` to reject their `set` events. A
-numerical field marked `{"structural": True}` is also fixed during a run and excluded from native
-runtime parameters.
+Structural changes remain assembly-time configuration. Mark a field with dataclass metadata
+`{"runtime": False}` to reject its `set` events; `{"structural": True}` also excludes a numerical
+field from native runtime parameters.
 
 Every entry returned by `signals()` follows the same output path. Complex values become three
 phase columns with `_a`, `_b` and `_c` suffixes, while scalar values retain their declared name;
 custom signal names do not require recorder-specific code.
 
-The cable add-on is a complete multi-terminal reference implementation:
+The cable add-on is a complete multi-port reference implementation:
 
 ```yaml
 elements:

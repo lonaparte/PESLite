@@ -21,7 +21,7 @@ import peslite
 from peslite.assembly.params import from_dict
 
 pytest.importorskip(
-    "motulator", reason="install the reference dependencies with peslite[reference]"
+    "motulator", reason="install the Motulator reference dependency"
 )
 from motulator.common import control as motulator_control
 from motulator.common import model as common_model
@@ -187,7 +187,7 @@ def _peslite_params(controls, source_voltage, source_phase, t_end):
                 "type": "fixed", "method": "rk4", "dt": T_CONTROL / 20.0,
                 "linearisations": 0,
             },
-            "output": {"period": T_CONTROL},
+            "output": {"period": T_CONTROL, "precision": 17},
         },
     })
 
@@ -559,7 +559,7 @@ def compare_parallel(case: ParallelCase, out_dir):
             "energy_check": "off", "progress": {"enable": False},
             "solver": {"type": "fixed", "method": "rk4", "dt": T_CONTROL / 20.0,
                        "linearisations": 0},
-            "output": {"period": T_CONTROL},
+            "output": {"period": T_CONTROL, "precision": 17},
         },
     }
     peslite_simulation = peslite.Simulation(from_dict(tree))

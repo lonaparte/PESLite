@@ -22,7 +22,7 @@ sources:
 
 | Field | Required | Default | Meaning |
 |---|---:|---|---|
-| `bus` | yes | — | terminal bus or Unit port |
+| `bus` | yes | — | connected bus or Unit port |
 | `l` or `x_pu` | yes | — | series inductance |
 | `r` or `r_pu` | no | 0 | series resistance |
 | `v` or `v_pu` | no | system voltage base | phase-peak emf magnitude |

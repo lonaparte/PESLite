@@ -109,18 +109,9 @@ def test_without_the_flag_the_addon_is_not_imported(tmp_path, monkeypatch, capsy
     assert "ph_verdict" not in json.loads((tmp_path / "summary.json").read_text())
 
     capsys.readouterr()
-    assert peslite.main(_args(tmp_path, "--ph-report")) == 0
-    assert "port-hamiltonian" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("options", [["--list-states"], ["--ph-report"], ["--resolved"],
-                                     ["--export", "cpp"], ["--imperix"]])
-def test_report_requires_a_simulation_not_an_inspection_or_export(tmp_path, options, capsys):
-    with pytest.raises(SystemExit) as exc:
-        peslite.main(_args(tmp_path, "--report", *options))
-    assert exc.value.code == 2
-    assert "--report requires a simulation run" in capsys.readouterr().err
-    assert not (tmp_path / "summary.json").exists()
+    assert peslite.main(["inspect", "buck-example", "--ph-report",
+                         "--set", "simulation.energy_check=off"]) == 0
+    assert "port-hamiltonian" in capsys.readouterr().out.lower()
 
 
 def test_report_can_be_combined_with_the_existing_plot_workflow(tmp_path, monkeypatch):

@@ -9,7 +9,6 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly import Event, register_event_type
-from peslite.components.network import RCNode
 from peslite.solver import MultirateSolver, SolverStep
 from peslite.solver.model import Bag, Empty, Model
 
@@ -267,7 +266,7 @@ def test_set_event_before_restart_time_is_in_force_before_the_first_stage(tmp_pa
 
 
 class _ConstantFlow:
-    class Out(Bag):
+    class Output(Bag):
         __slots__ = ("flow",)
 
     state_names = ()
@@ -275,23 +274,46 @@ class _ConstantFlow:
 
     def __init__(self, flow):
         self.flow = flow
-        self.state, self.inp, self.out = Empty(), Empty(), self.Out()
+        self.state, self.input, self.output = Empty(), Empty(), self.Output()
 
     def set_outputs(self, _t):
-        self.out.flow = self.flow
+        self.output.flow = self.flow
 
     def rhs(self, _t):
         return ()
 
 
+class _Accumulator:
+    """Minimal causal integrator used to test multirate window boundaries."""
+
+    class State(Bag):
+        __slots__ = ("value",)
+
+    class Input(Bag):
+        __slots__ = ("flow",)
+
+    state_names = ("value",)
+    outputs_need_inputs = False
+
+    def __init__(self):
+        self.state = self.output = self.State(value=0.0)
+        self.input = self.Input(flow=0.0)
+
+    def set_outputs(self, _t):
+        pass
+
+    def rhs(self, _t):
+        return (self.input.flow,)
+
+
 @pytest.mark.parametrize("method", ["euler", "heun", "rk4", "DP45"])
 def test_shortened_multirate_window_uses_its_length_and_keeps_the_grid(method):
     def build():
-        flow, capacitor = _ConstantFlow(2.0), RCNode(1.0, 0.0)
-        model = Model({"flow": flow, "capacitor": capacitor},
-                      {(capacitor, "i"): (flow, "flow")})
+        flow, accumulator = _ConstantFlow(2.0), _Accumulator()
+        model = Model({"flow": flow, "accumulator": accumulator},
+                      {(accumulator, "flow"): (flow, "flow")})
         solver = MultirateSolver(
-            model, {"capacitor": {"step": 4, "method": method}}, dt=0.001
+            model, {"accumulator": {"step": 4, "method": method}}, dt=0.001
         )
         return flow, model, solver
 
@@ -364,7 +386,7 @@ def test_fixed_adaptive_multirate_and_user_solver_use_the_right_model_at_event(k
                 assert t >= event_t - 1e-14
             else:
                 assert source.branch.R == old_resistance
-                assert source.emf.out.phi == 0.0
+                assert source.emf.output.phi == 0.0
             seen.append((t, changed))
             return value
         return watched
@@ -375,7 +397,7 @@ def test_fixed_adaptive_multirate_and_user_solver_use_the_right_model_at_event(k
     simulation.run(out_dir=tmp_path)
 
     assert any(abs(t - event_t) < 1e-14 and not after for t, after in seen)
-    assert source.emf.out.phi == 0.1
+    assert source.emf.output.phi == 0.1
     assert source.branch.R == pytest.approx(2 * old_resistance)
     if kind == "multirate":
         ends = np.array([entry[0] for entry in simulation.solver.window_log])

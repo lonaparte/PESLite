@@ -108,7 +108,7 @@ def test_natural_ccm_and_dcm_maps_match_exhaustive_differences(model, resistance
     light_load = resistance == 300.0
     if model == "pwm_averaging":
         # A cycle-averaged DCM current remains positive; the conduction interval identifies DCM.
-        assert bool(sim.unit().conduction.out.in_dcm) == light_load
+        assert bool(sim.unit().conduction.output.in_dcm) == light_load
     else:
         row = sim.result.final_states()
         start = row.pop("t")

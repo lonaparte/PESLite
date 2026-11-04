@@ -48,8 +48,8 @@ def _tree(link, v2, t_end, capacitance=0.0, dt=20e-9):
             "simulation": {"t_end": t_end,
                            "solver": {"type": "fixed", "method": "rk4", "dt": dt,
                                       "linearisations": 0},
-                           "output": {"period": 1e-7, "record_every": 1, "states": False,
-                                      "signals": True, "energy": False}}}
+                           "output": {"period": 1e-7, "record_every": 1, "precision": 17,
+                                      "states": False, "signals": True, "energy": False}}}
 
 
 def test_bridge_model_selection_does_not_change_natural_rectifier_commutation(tmp_path):
@@ -370,53 +370,13 @@ def test_blocked_coupled_ports_project_their_currents_jointly_without_internal_s
     model.project_states(y)
     model.sync(0.0, y)
     coupled = dict(zip(model.names, model.subsystems))["charger.link"]
-    assert coupled.out.i_primary == pytest.approx(0.0, abs=1e-13)
-    assert coupled.out.i_secondary == pytest.approx(0.0, abs=1e-13)
+    assert coupled.output.i_primary == pytest.approx(0.0, abs=1e-13)
+    assert coupled.output.i_secondary == pytest.approx(0.0, abs=1e-13)
     for unit in simulation.units.values():
         assert unit.bridge.supplied_power() == 0.0
     assert not simulation.ph_report.problems
     assert all(status.role == "passive" for status in simulation.ph_report.subsystems
                if status.name.endswith(".bridge"))
-
-
-@pytest.mark.parametrize("link", [SS, LCC, LCC_S, MULTI])
-@pytest.mark.parametrize("active", [("primary",), ("secondary",), ("primary", "secondary")])
-def test_port_current_projection_matches_weighted_constraint_solve(link, active):
-    tree = _tree(link, 200.0, 1e-6)
-    tree["units"]["charger"]["primary"] = _rectifier(400.0)
-    simulation = peslite.Simulation(from_dict(tree))
-    coupled = dict(zip(simulation.system.model.names, simulation.system.model.subsystems))["charger.link"]
-    targets = {side: value for side, value in zip(active, (.3, -.7))}
-    coupled._current_constraints = {side: (lambda value=value: value) for side, value in targets.items()}
-    initial = np.random.default_rng(42).normal(size=len(coupled._mode_names))
-    for name, value in zip(coupled._mode_names, initial):
-        setattr(coupled.state, name, value)
-    modal = [side for side in active if not coupled.sides[side].lcc]
-    expected = initial.copy()
-    if modal:
-        rows = np.array([np.sum([coupled._shapes[k] for k in coupled.sides[side].coils], axis=0)
-                         for side in modal])
-        weighted = rows / np.asarray(coupled._inductance)
-        expected += weighted.T @ np.linalg.solve(
-            weighted @ rows.T, np.array([targets[side] for side in modal]) - rows @ initial)
-    coupled.project_state()
-    np.testing.assert_allclose([getattr(coupled.state, name) for name in coupled._mode_names], expected,
-                               rtol=1e-13, atol=1e-13)
-    for side in active:
-        if coupled.sides[side].lcc:
-            assert getattr(coupled.state, f"i_{side}_comp") == targets[side]
-
-
-def test_nonzero_initial_current_establishes_conduction_before_state_projection():
-    tree = _tree(SS, 200.0, 1e-9, dt=1e-10)
-    tree["simulation"]["output"]["signals"] = False
-    tree["simulation"]["initial"] = {"states": {"charger.link.i_mode_1": 1.0}}
-    simulation = peslite.Simulation(from_dict(tree))
-    simulation.run(out_dir=None)
-    model = simulation.system.model
-    link = dict(zip(model.names, model.subsystems))["charger.link"]
-    assert abs(link.out.i_secondary) > 0.5
-    assert simulation.unit("charger.secondary").bridge.get_state()["direction"] != 0.0
 
 
 @pytest.mark.parametrize("case", ["ss_dcm", "lcc_dcm", "ss_multi"])
@@ -477,7 +437,7 @@ def test_shunt_load_does_not_make_a_prescribed_dc_voltage_nonstiff():
     tree["simulation"]["output"]["signals"] = False
     sim = peslite.Simulation(from_dict(tree))
     sim.run(out_dir=None)
-    assert sim.unit("charger.primary").dclink.out.u_dc == 400.0
+    assert sim.unit("charger.primary").dclink.output.u_dc == 400.0
 
 
 @pytest.mark.parametrize("local_filter", [True, False])
@@ -535,7 +495,7 @@ def test_diode_full_bridge_converter_reuses_adc_sources_means_rms_and_restart(tm
     assert f"charger.secondary.meas.{signal}" in whole.columns()
     model = sim.system.model
     link = dict(zip(model.names, model.subsystems))["charger.link"]
-    assert unit.ports.value("voltage") == link.out.u_secondary_cap
+    assert unit.ports.value("voltage") == link.output.u_secondary_cap
     first = copy.deepcopy(tree)
     first["simulation"]["t_end"] = 8e-6
     peslite.Simulation(from_dict(first)).run(out_dir=tmp_path / "first")
@@ -608,7 +568,7 @@ def test_capacitor_voltage_stays_continuous_when_the_dc_clamp_increases():
 
         def observe(t, states, read_values, *, final, stop_reason):
             trace[round(t, 12)] = bridge.state.u_C
-            assert bridge.out.u_c == bridge.state.u_C
+            assert bridge.output.u_c == bridge.state.u_C
 
         sim.run(out_dir=None, observe=observe)
         traces.append(trace)

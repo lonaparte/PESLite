@@ -10,7 +10,7 @@ from peslite.addons import control as addon_control
 from peslite.addons.components.cable import CableModel
 from peslite.assembly.params import runtime_changeable
 from peslite.addons.control.voltage_adaptive_pll import VoltageAdaptivePLL
-from peslite.components import ELEMENT_TYPES
+from peslite.components.network import ELEMENT_TYPES
 from peslite.control import LOOP_TYPES, Loop
 
 
@@ -48,16 +48,18 @@ def test_component_addon_path_registers_elements(tmp_path, monkeypatch):
     path.mkdir()
     (path / "test_component_addon.py").write_text(
         """from dataclasses import dataclass
-from peslite.addons.components import Element, register_element_type
+from peslite.addons.components import register_component_type
+from peslite.solver import netlist as nl
 
-@register_element_type
-class AddonElement(Element):
-    @dataclass(frozen=True, kw_only=True)
-    class Params:
-        type: str = "addon_test_element"
-        bus: str
+@register_component_type
+@dataclass(frozen=True, kw_only=True)
+class AddonElement:
+    bus: str
+    type: str = "addon_test_element"
 
-    type = "addon_test_element"
+    def network(self, n):
+        n.add(nl.Resistor(n.bus, n.ground, 1.0))
+        n.losses()
 """,
         encoding="utf-8",
     )
@@ -69,7 +71,7 @@ class AddonElement(Element):
     assert [module.__name__ for module in imported] == [
         "peslite.addons.components.test_component_addon"
     ]
-    assert ELEMENT_TYPES["addon_test_element"].__module__ == imported[0].__name__
+    assert ELEMENT_TYPES["addon_test_element"].params.__module__ == imported[0].__name__
 
 
 def test_functions_hold_the_plotting_addon():
@@ -82,7 +84,9 @@ def test_addon_entry_points_match_builtin_public_apis():
     assert set(peslite.control.__all__) < set(addon_control.__all__)
     assert set(peslite.components.__all__) < set(addon_components.__all__)
     assert addon_control.LOOP_TYPES is LOOP_TYPES
-    assert addon_components.ELEMENT_TYPES is ELEMENT_TYPES
+    assert not {"Element", "NetworkComponent", "ELEMENT_TYPES"} & set(
+        addon_components.__all__
+    )
 
 
 def test_cable_model_has_two_inward_ports_and_closes_its_power_balance():
@@ -95,8 +99,8 @@ def test_cable_model_has_two_inward_ports_and_closes_its_power_balance():
         sections=2,
         voltage0=0j,
     )
-    cable.inp.u1 = 8000.0 + 200.0j
-    cable.inp.u2 = 7600.0 - 100.0j
+    cable.port1.voltage = 8000.0 + 200.0j
+    cable.port2.voltage = 7600.0 - 100.0j
     cable.state.iL1 = 20.0 + 3.0j
     cable.state.iL2 = 18.0 + 2.0j
     cable.state.iL3 = 16.0 + 1.0j
@@ -109,14 +113,11 @@ def test_cable_model_has_two_inward_ports_and_closes_its_power_balance():
     for storage, derivative in zip(cable.storage, derivatives):
         value = getattr(cable.state, storage.state)
         stored_rate += storage.scale * storage.value * (value * derivative.conjugate()).real
-    power_in = 1.5 * (
-        (cable.inp.u1 * cable.out.i1.conjugate()).real
-        + (cable.inp.u2 * cable.out.i2.conjugate()).real
-    )
+    power_in = cable.port1.power() + cable.port2.power()
 
-    assert cable.terminal1.direction == cable.terminal2.direction == 1
-    assert cable.out.i1 == cable.state.iL1
-    assert cable.out.i2 == -cable.state.iL3
+    assert cable.port1.component is cable and cable.port2.component is cable
+    assert cable.output.i1 == cable.state.iL1
+    assert cable.output.i2 == -cable.state.iL3
     assert sum(cable.series_r) == pytest.approx(0.16)
     assert sum(cable.series_l) == pytest.approx(1.2e-3)
     assert power_in == pytest.approx(stored_rate + cable.dissipated_power())
@@ -172,15 +173,25 @@ class ProjectLocalPLL(Loop):
     )
     (components / "project_local_element.py").write_text(
         """from dataclasses import dataclass
-from peslite.addons.components import Load, register_element_type
+from peslite.addons.components import register_component_type
+from peslite.solver import netlist as nl
 
-@register_element_type
-class ProjectLocalElement(Load):
-    @dataclass(frozen=True, kw_only=True)
-    class Params(Load.Params):
-        type: str = "project_local_element"
+@register_component_type
+@dataclass(frozen=True, kw_only=True)
+class ProjectLocalElement:
+    bus: str
+    l: float
+    r: float
+    type: str = "project_local_element"
 
-    type = "project_local_element"
+    def network(self, n):
+        middle = n.internal()
+        n.add(
+            nl.Resistor(n.bus, middle, self.r),
+            nl.Inductor(middle, n.ground, self.l, n.state("i")),
+        )
+        n.port_output("i", "bus", "current")
+        n.losses()
 """,
         encoding="utf-8",
     )

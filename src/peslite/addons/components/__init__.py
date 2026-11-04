@@ -1,7 +1,7 @@
 """Entry point for optional and custom PESLite component modules.
 
-Place modules in this package and register their element classes with
-``register_element_type``.  PESLite imports each module during package initialisation, so its
+Place modules in this package and register their parameter dataclasses with
+``register_component_type``. PESLite imports each module during package initialisation, so its
 types enter the same registry and configuration search path as built-in circuit elements.
 """
 

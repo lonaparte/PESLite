@@ -10,6 +10,7 @@ import peslite
 from conftest import EXAMPLES
 from peslite.solver import (AdaptiveSolver, Bag, DormandPrince45, Empty, FixedStepSolver,
                             Model, MultirateSolver, OutputMethod, make_solver)
+from peslite.solver.integrators import TABLEAUS, combine
 from peslite.solver.multirate import parse_step
 
 QUIET = {"simulation.progress.enable": 0, "simulation.solver.linearisations": 0}
@@ -21,6 +22,71 @@ def test_solver_and_control_output_stage_names_do_not_collide():
     assert peslite.solver.OutputMethod is OutputMethod
     assert not hasattr(peslite.solver, "OutputStage")
     assert peslite.OutputStage is peslite.control.OutputStage
+
+
+def test_fixed_explicit_solver_uses_implicit_step_for_an_unstable_linear_mode():
+    class StiffMode:
+        @staticmethod
+        def linear_modes():
+            return (("stiff", np.array([[-1e8]])),)
+
+    solver = FixedStepSolver(1e-5, model=StiffMode())
+    result = solver(lambda _t, y: -1e8 * y, 0.0, 1e-5, np.array([1.0]))
+
+    assert solver._implicit is not None
+    assert abs(result.y[0]) < 0.01
+
+
+def test_fixed_explicit_stability_is_reused_by_equation_mode():
+    class Modes:
+        explicit_stability_dynamic = False
+        equation_revision = 0
+        mode = "a"
+        checks = 0
+
+        def linear_mode_key(self):
+            return self.mode
+
+        def linear_modes(self):
+            self.checks += 1
+            return ((self.mode, np.array([[-1.0]])),)
+
+    model = Modes()
+    solver = FixedStepSolver(1e-5, model=model)
+    rhs = lambda _t, y: -y
+    state = np.array([1.0])
+
+    solver(rhs, 0.0, 1e-5, state)
+    model.equation_revision += 1
+    solver(rhs, 1e-5, 2e-5, state)
+    assert model.checks == 1
+
+    model.mode = "b"
+    model.equation_revision += 1
+    solver(rhs, 2e-5, 3e-5, state)
+    assert model.checks == 2
+
+    solver.parameters_changed()
+    solver(rhs, 3e-5, 4e-5, state)
+    assert model.checks == 3
+
+
+def test_continuous_linear_modes_recheck_explicit_stability():
+    class DynamicMode:
+        explicit_stability_dynamic = True
+        equation_revision = 0
+        checks = 0
+
+        def linear_modes(self):
+            self.checks += 1
+            return ((self.checks, np.array([[-1.0]])),)
+
+    model = DynamicMode()
+    solver = FixedStepSolver(1e-5, model=model)
+    state = np.array([1.0])
+    solver(lambda _t, y: -y, 0.0, 1e-5, state)
+    solver(lambda _t, y: -y, 1e-5, 2e-5, state)
+    assert model.checks == 2
 
 
 @pytest.mark.full
@@ -53,6 +119,13 @@ def test_make_solver_builds_the_configured_integrator():
             make_solver(configured, model)
 
 
+def test_fixed_step_combination_uses_the_registered_tableau_weights(monkeypatch):
+    monkeypatch.setitem(TABLEAUS, "midpoint", ((0.0, 0.5), ((0.5,),), (0.0, 1.0)))
+    state = np.array([1.0])
+    derivatives = [np.array([3.0]), np.array([5.0])]
+    np.testing.assert_allclose(combine("midpoint", state, 0.1, derivatives), [1.5])
+
+
 def test_dp45_float_model_path_matches_the_array_path():
     class Oscillator:
         @staticmethod
@@ -71,11 +144,39 @@ def test_dp45_float_model_path_matches_the_array_path():
     np.testing.assert_allclose(fast.y, array.y, rtol=1e-13, atol=1e-14)
 
 
+def test_fixed_solver_observes_a_guard_inside_its_internal_step_loop():
+    class Ramp:
+        calls = 0
+
+        def rhs_list(self, _t, _y):
+            self.calls += 1
+            return [1.0]
+
+        def rhs(self, t, y):
+            return np.asarray(self.rhs_list(t, y))
+
+    ramp = Ramp()
+    solver = FixedStepSolver(0.1, "RK4")
+    result = solver.advance_guarded(
+        ramp.rhs, 0.0, 1.0, np.zeros(1),
+        lambda _t, y: 0.55 - y[0],
+        synchronized_guard=lambda _t, y: 0.55 - y[0],
+    )
+
+    assert result.crossed
+    assert result.previous_t == pytest.approx(0.5)
+    assert result.previous_y[0] == pytest.approx(0.5)
+    assert result.t == pytest.approx(0.6)
+    assert result.y[0] == pytest.approx(0.6)
+    # Six complete RK4 steps and only the first stage of the next step are needed.
+    assert ramp.calls == result.n_rhs == 25
+
+
 def test_model_automatically_solves_an_algebraic_output_loop():
     class In(Bag):
         __slots__ = ("x",)
 
-    class Out(Bag):
+    class Output(Bag):
         __slots__ = ("y",)
 
     class Feedback:
@@ -83,10 +184,10 @@ def test_model_automatically_solves_an_algebraic_output_loop():
         outputs_need_inputs = True
 
         def __init__(self):
-            self.state, self.inp, self.out = Empty(), In(), Out()
+            self.state, self.input, self.output = Empty(), In(), Output()
 
         def set_outputs(self, _t):
-            self.out.y = 1.0 + 0.5 * self.inp.x
+            self.output.y = 1.0 + 0.5 * self.input.x
 
         def rhs(self, _t):
             return ()
@@ -96,8 +197,8 @@ def test_model_automatically_solves_an_algebraic_output_loop():
     model.sync(0.0, np.empty(0))
 
     assert len(model.algebraic_loops) == 1
-    assert block.inp.x == pytest.approx(2.0)
-    assert block.out.y == pytest.approx(2.0)
+    assert block.input.x == pytest.approx(2.0)
+    assert block.output.y == pytest.approx(2.0)
 
 
 def test_observational_output_stage_is_pruned_or_promoted_by_rhs_dependencies():
@@ -116,12 +217,12 @@ def test_observational_output_stage_is_pruned_or_promoted_by_rhs_dependencies():
         output_stages = (OutputMethod("observe", (), ("x",), rhs=False),)
 
         def __init__(self):
-            self.state, self.inp, self.out = State(x=2.0), Empty(), Output()
+            self.state, self.input, self.output = State(x=2.0), Empty(), Output()
             self.observations = 0
 
         def observe(self, _t):
             self.observations += 1
-            self.out.x = self.state.x
+            self.output.x = self.state.x
 
         def set_outputs(self, t):
             self.observe(t)
@@ -134,13 +235,13 @@ def test_observational_output_stage_is_pruned_or_promoted_by_rhs_dependencies():
         outputs_need_inputs = False
 
         def __init__(self):
-            self.state, self.inp, self.out = State(), Input(), State()
+            self.state, self.input, self.output = State(), Input(), State()
 
         def set_outputs(self, _t):
-            self.out.x = self.state.x
+            self.output.x = self.state.x
 
         def rhs(self, _t):
-            return (self.inp.x,)
+            return (self.input.x,)
 
     unconnected = Producer()
     isolated = Model({"producer": unconnected}, {})

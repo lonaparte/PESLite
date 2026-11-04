@@ -6,12 +6,12 @@ connection-port powers; undeclared subsystems get their net power from neighbour
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import KW_ONLY, dataclass, field
 from typing import Any, ClassVar, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
-__all__ = ["StoragePort", "PowerPort", "Energetic", "EnergySpec", "EnergyReport", "SubsystemEnergy", "PHReport", "SubsystemStatus", "CutStatus", "signal",
+__all__ = ["StoragePort", "Port", "Energetic", "EnergySpec", "EnergyReport", "SubsystemEnergy", "PHReport", "SubsystemStatus", "CutStatus", "signal",
            "re_product", "spec_of", "balance", "ph_report"]
 
 
@@ -22,28 +22,120 @@ class StoragePort:
     """Linear storage with ``H = scale * value * |state|^2 / 2``.
 
     ``state``: name of the effort state; ``value``: capacitance or inductance;
-    ``scale``: power-convention factor of the signal; ``flows``: external conjugate-flow
-    inputs as ``("inp.name", sign)`` pairs; ``kind``: ``"capacitor"`` or ``"inductor"``.
+    ``scale``: power-convention factor of the signal; ``power_terms``: external conjugate
+    quantities as ``(port, "voltage" | "current", sign)`` triples; ``kind``:
+    ``"capacitor"`` or ``"inductor"``.
     """
 
     state: str
     value: float
     scale: float = 1.0
-    flows: tuple[tuple[str, float], ...] = ()
+    power_terms: tuple[tuple["Port", str, float], ...] = ()
     kind: str = "capacitor"
 
+    def __post_init__(self) -> None:
+        for port, quantity, _sign in self.power_terms:
+            if not isinstance(port, Port) or not port.physical:
+                raise TypeError("a storage power term needs a physical Port")
+            if quantity not in ("voltage", "current"):
+                raise ValueError("a storage power term must select voltage or current")
 
-@dataclass(frozen=True)
-class PowerPort:
-    """Connection port with power entering the subsystem ``P_in = sign * scale * Re(effort * conj(flow))``.
 
-    ``effort`` and ``flow`` name signals of the subsystem: ``"inp.x"``, ``"out.x"`` or ``"state.x"``.
+@dataclass(eq=False)
+class Port:
+    """One acausal electrical port, or one power pair of a signal subsystem.
+
+    A physical port stores its voltage and the current entering ``component``. A causal
+    black-box component may also name the input/output paths adapting that port to its
+    callable model. Signal subsystems use :meth:`signals` for a power pair without a
+    physical connection.
     """
 
-    effort: str
-    flow: str
+    component: Any = field(default=None, repr=False, compare=False)
+    name: str = ""
+    _: KW_ONLY
+    voltage: complex | float = 0.0
+    current: complex | float = 0.0
     scale: float = 1.0
-    sign: float = 1.0
+    electrical_domain: Optional[str] = None
+    standalone: Optional[str] = field(default=None, repr=False)
+    grounded: bool = field(default=False, repr=False)
+    effort: Optional[str] = field(default=None, repr=False)
+    flow: Optional[str] = field(default=None, repr=False)
+    sign: float = field(default=1.0, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.scale > 0.0:
+            raise ValueError(f"port scale must be positive, got {self.scale!r}")
+        if self.electrical_domain not in (None, "ac", "dc"):
+            raise ValueError(
+                "port electrical_domain must be 'ac', 'dc' or None, got "
+                f"{self.electrical_domain!r}"
+            )
+        if self.standalone not in (None, "voltage", "current"):
+            raise ValueError(
+                "port standalone boundary must be 'voltage', 'current' or None, got "
+                f"{self.standalone!r}"
+            )
+        if type(self.grounded) is not bool:
+            raise TypeError("port grounded must be bool")
+        if self.grounded and self.standalone is not None:
+            raise ValueError("a grounded port does not take a standalone boundary")
+        if (self.effort is None) != (self.flow is None):
+            raise ValueError("a signal port needs both effort and flow paths")
+        for label, path in (("effort", self.effort), ("flow", self.flow)):
+            if path is None:
+                continue
+            record, separator, field_name = path.partition(".")
+            if separator != "." or record not in ("input", "output", "state") or not field_name:
+                raise ValueError(
+                    f"port {label} must be an input, output or state path, got {path!r}"
+                )
+        self._validate_component()
+
+    def _validate_component(self) -> None:
+        if self.component is None or self.effort is None:
+            return
+        for path in (self.effort, self.flow):
+            record_name, _, field_name = path.partition(".")
+            if not hasattr(getattr(self.component, record_name), field_name):
+                raise ValueError(
+                    f"{type(self.component).__name__}.{record_name} has no port field "
+                    f"{field_name!r}"
+                )
+
+    def bind(self, component: Any) -> "Port":
+        """Bind a declared port to its physical component and return the port."""
+        if self.component is not None and self.component is not component:
+            raise ValueError("a physical port is already bound to another component")
+        self.component = component
+        self._validate_component()
+        return self
+
+    @classmethod
+    def signals(cls, effort: str, flow: str, scale: float = 1.0,
+                sign: float = 1.0) -> "Port":
+        """Declare a signal subsystem's power pair with the same port abstraction."""
+        return cls(scale=scale, effort=effort, flow=flow, sign=sign)
+
+    @property
+    def physical(self) -> bool:
+        return self.component is not None
+
+    @property
+    def behavioral(self) -> bool:
+        """Whether a physical port adapts a causal input/output component."""
+        return self.physical and self.effort is not None
+
+    def power(self, component: Any = None) -> float:
+        if self.physical:
+            return self.scale * re_product(self.voltage, self.current)
+        owner = self.component if component is None else component
+        if owner is None:
+            raise RuntimeError("an unbound signal port needs its component")
+        return self.sign * self.scale * re_product(
+            signal(owner, self.effort), signal(owner, self.flow)
+        )
 
 
 @runtime_checkable
@@ -56,7 +148,7 @@ class Energetic(Protocol):
     """
 
     storage: ClassVar[tuple[StoragePort, ...]]
-    ports: ClassVar[tuple[PowerPort, ...]]
+    ports: ClassVar[tuple[Port, ...]]
 
     def dissipated_power(self) -> float: ...
 
@@ -66,7 +158,7 @@ class Energetic(Protocol):
 # ------------------------------------------------------------------ accounting
 
 def signal(sub: Any, name: str) -> Any:
-    """Read ``"inp.x"`` / ``"out.x"`` / ``"state.x"`` from a subsystem's records."""
+    """Read ``"input.x"`` / ``"output.x"`` / ``"state.x"`` from a subsystem's records."""
     where, _, attr = name.partition(".")
     return getattr(getattr(sub, where), attr)
 
@@ -82,7 +174,7 @@ class EnergySpec:
 
     kind: str
     storage: tuple[StoragePort, ...] = ()
-    ports: tuple[PowerPort, ...] = ()
+    ports: tuple[Port, ...] = ()
     dissipated: Optional[Any] = None
     supplied: Optional[Any] = None
     has_source: bool = False
@@ -118,8 +210,8 @@ def re_product(e: Any, f: Any) -> float:
     return (e * f.conjugate()).real
 
 
-def port_power(sub: Any, port: PowerPort) -> float:
-    return port.sign * port.scale * re_product(signal(sub, port.effort), signal(sub, port.flow))
+def port_power(sub: Any, port: Port) -> float:
+    return port.power(sub)
 
 
 @dataclass
@@ -134,6 +226,8 @@ class SubsystemEnergy:
     kind: str = "declared"
     # J, cumulative energy dissipated at state jumps (switch closings); None: none declared
     impulsive: Optional[float] = None
+    # J, cumulative energy sources delivered during those jumps; None: none declared
+    impulsive_supply: Optional[float] = None
 
 
 @dataclass
@@ -183,10 +277,12 @@ class EnergyReport:
         for s in self.subsystems:
             if s.kind == "default":
                 cols[f"{s.name}.power_supplied_W"] = s.supplied  # inferred net injection
-            else:
+            elif s.kind != "observer":
                 cols[f"{s.name}.energy_J"] = s.energy
             if s.impulsive is not None:
                 cols[f"{s.name}.dissipated_impulsive_J"] = s.impulsive
+            if s.impulsive_supply is not None:
+                cols[f"{s.name}.supplied_impulsive_J"] = s.impulsive_supply
         return cols
 
 
@@ -205,11 +301,12 @@ class _StorageCheck:
 class _PowerCheck:
     """Pre-resolved access to one power port."""
 
-    effort_record: Any
-    effort_field: str
-    flow_record: Any
-    flow_field: str
+    port: Optional[Port]
     coefficient: float
+    effort_record: Any = None
+    effort_field: str = ""
+    flow_record: Any = None
+    flow_field: str = ""
 
 
 @dataclass(frozen=True)
@@ -260,6 +357,13 @@ class _BalancePlan:
         for check in self.subsystems:
             spec = check.spec
             if spec.kind == "observer":
+                impulsive = getattr(check.subsystem, "impulsive_dissipated_energy", None)
+                if impulsive is not None:
+                    report.subsystems.append(SubsystemEnergy(
+                        check.name, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                        "observer", float(impulsive),
+                        float(getattr(check.subsystem, "impulsive_supplied_energy", 0.0)),
+                    ))
                 continue
             if spec.kind == "dirac":
                 report.dirac.append(check.name)
@@ -282,10 +386,11 @@ class _BalancePlan:
                     rate += storage.coefficient * x * dx
                 energy += 0.5 * storage.coefficient * (abs(x) ** 2)
             p_in = sum(
-                port.coefficient * re_product(
-                    getattr(port.effort_record, port.effort_field),
-                    getattr(port.flow_record, port.flow_field),
-                )
+                (port.port.power() if port.port is not None else
+                 port.coefficient * re_product(
+                     getattr(port.effort_record, port.effort_field),
+                     getattr(port.flow_record, port.flow_field),
+                 ))
                 for port in check.ports
             )
             supplied = float(spec.supplied(check.subsystem))
@@ -297,6 +402,9 @@ class _BalancePlan:
             impulsive = getattr(check.subsystem, "impulsive_dissipated_energy", None)
             if impulsive is not None:
                 entry.impulsive = float(impulsive)
+            supply = getattr(check.subsystem, "impulsive_supplied_energy", None)
+            if supply is not None:
+                entry.impulsive_supply = float(supply)
             report.subsystems.append(entry)
         return report
 
@@ -330,16 +438,23 @@ def compile_balance(model: Any) -> _BalancePlan:
             ))
         power_checks = []
         for port in spec.ports:
+            if port.physical:
+                if port.component is not sub and getattr(sub, "component", None) is not port.component:
+                    raise ValueError(
+                        f"{name}: physical port {port.name!r} is not bound to its component"
+                    )
+                power_checks.append(_PowerCheck(port, port.scale))
+                continue
             effort_record, effort_field = signal_ref(sub, port.effort)
             flow_record, flow_field = signal_ref(sub, port.flow)
             power_checks.append(_PowerCheck(
+                None, port.sign * port.scale,
                 effort_record, effort_field, flow_record, flow_field,
-                port.sign * port.scale,
             ))
             for input_name, other_name in ((port.flow, port.effort),
                                            (port.effort, port.flow)):
                 where, _, input_field = input_name.partition(".")
-                if where != "inp":
+                if where != "input":
                     continue
                 sources = model.connections.get((sub, input_field))
                 if sources is None:
@@ -353,7 +468,7 @@ def compile_balance(model: Any) -> _BalancePlan:
                         continue
                     gain = float(entry[2]) if len(entry) > 2 else 1.0
                     transfers.append(_DefaultTransfer(
-                        index, other_record, other_field, source.out, source_field,
+                        index, other_record, other_field, source.output, source_field,
                         port.sign * port.scale * gain,
                     ))
                 break
@@ -514,9 +629,21 @@ def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e
             n_covered += n
         else:
             kind, role = "default", "black box"
-        storages = [{"state": st.state, "value": st.value, "scale": st.scale, "flows": list(st.flows)}
+        storages = [{
+            "state": st.state,
+            "value": st.value,
+            "scale": st.scale,
+            "power_terms": [
+                (port.name, quantity, sign)
+                for port, quantity, sign in st.power_terms
+            ],
+        }
                     for st in spec.storage]
-        ports = [f"{p.effort} x {p.flow} ({p.scale:g}, {p.sign:+g})" for p in spec.ports]
+        ports = [
+            (f"{p.name or 'port'}: voltage x current ({p.scale:g})" if p.physical else
+             f"{p.effort} x {p.flow} ({p.scale:g}, {p.sign:+g})")
+            for p in spec.ports
+        ]
         if kind == "default":
             neighbours: set[str] = set()
             for (dst, _inp), src_spec in model.connections.items():
@@ -529,6 +656,12 @@ def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e
         statuses[name] = SubsystemStatus(name, kind, states, storages, ports, None, role)
     problems: list[str] = []
     tellegen_worst: Optional[float] = None
+    consistent = [project for sub in model.subsystems
+                  if callable(project := getattr(sub, "consistent_state", None))]
+    not_audited = {
+        name for name, sub in zip(model.names, model.subsystems)
+        if getattr(sub, "energy_audit_note", None)
+    }
     try:
         for label, value in (zoh or {}).items():
             model.set_zoh_input(label, value)
@@ -536,12 +669,18 @@ def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e
             y = rng.normal(size=model.n_states) * 100.0
             if getattr(model, "has_state_bounds", False):
                 y = model.project_states(y)
+            if consistent:
+                t = 0.01 * (k + 1)
+                model.sync(t, y)
+                for project in consistent:
+                    project(t)
+                y = model.get_initial_values()
             rep = balance(model, 0.01 * (k + 1), y)
             scale = rep.scale
             for s in rep.subsystems:
                 st = statuses[s.name]
-                if s.kind == "default":
-                    continue  # closes by construction
+                if s.kind in ("default", "observer") or s.name in not_audited:
+                    continue
                 rel = abs(s.residual) / scale
                 st.balance_residual_rel = rel if st.balance_residual_rel is None else max(st.balance_residual_rel, rel)
                 if s.supplied != 0.0 and st.role == "passive":
@@ -573,7 +712,7 @@ def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e
             for op in gp.plan:
                 kind, item = op
                 op_owners, srcs = owners[id(op)]
-                if kind in ("out", "algebraic"):
+                if kind in ("output", "algebraic"):
                     for owner in op_owners:
                         if id(owner) not in member_ids:
                             held_subs[id(owner)] = owner

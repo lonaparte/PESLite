@@ -3,7 +3,11 @@
 import ast
 from pathlib import Path
 
+import pytest
+
 import peslite
+
+pytestmark = pytest.mark.static
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "src" / "peslite"
@@ -20,6 +24,7 @@ BELOW = {
     "addons": {"solver", "control", "components", "addons"},
 }
 TOP = {"solver/simulation.py"}
+INTEGRATIONS = {"frontend"}
 
 
 def _imports(path):
@@ -38,19 +43,19 @@ def _imports(path):
 
 def test_the_package_has_five_code_parts():
     entries = {p.name for p in PACKAGE.iterdir() if p.name != "__pycache__"}
-    assert entries == {"__init__.py", *PARTS}
+    assert entries == {"__init__.py", "frontend", *PARTS}
 
 
-def test_the_root_examples_directory_contains_only_pes_files():
+def test_the_root_examples_directory_contains_only_pes_case_files():
     examples = ROOT / "examples"
     assert examples.is_dir()
-    assert {path.suffix for path in examples.iterdir()} == {".pes"}
+    assert {path.suffix for path in examples.iterdir() if path.is_file()} == {".pes"}
 
 
 def test_each_part_imports_only_the_parts_below_it():
     for path in sorted(PACKAGE.rglob("*.py")):
         rel = path.relative_to(PACKAGE)
-        if rel.as_posix() in ("__init__.py", *TOP):
+        if rel.as_posix() in ("__init__.py", *TOP) or rel.parts[0] in INTEGRATIONS:
             continue
         wrong = _imports(path) - BELOW[rel.parts[0]]
         assert not wrong, f"{rel} imports {sorted(wrong)}"

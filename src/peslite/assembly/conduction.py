@@ -63,19 +63,36 @@ class DiodeConduction:
             subsystem for subsystem in model.subsystems
             if callable(getattr(subsystem, "commutation_margin", None))
             and callable(getattr(subsystem, "commutate", None))
+            and getattr(subsystem, "commutation_active", True)
+        )
+        self.located = tuple(
+            subsystem for subsystem in self.commutating
+            if getattr(subsystem, "locate_commutations", True)
+        )
+        self._boundary_only = tuple(
+            subsystem for subsystem in self.commutating if subsystem not in self.located
+        )
+        self.state_guard_subsystems = tuple(
+            subsystem for subsystem in self.located
+            if callable(getattr(subsystem, "commutation_state_guards", None))
+        )
+        self._topology_owners = tuple(
+            subsystem for subsystem in model.subsystems
+            if getattr(subsystem, "requires_topology_freeze", False)
+            if callable(getattr(subsystem, "freeze_topology", None))
         )
         self._scheduled = tuple(
             subsystem for subsystem in self.commutating
             if callable(getattr(subsystem, "next_commutation_time", None))
         )
-        if self.commutating and getattr(solver, "outer", None) is not None:
+        if self.located and getattr(solver, "outer", None) is not None:
             raise ConfigError(
                 "simulation.solver.subsystems: commutating subsystems "
-                f"{sorted(model.name_of(sub) for sub in self.commutating)} need a single-rate "
+                f"{sorted(model.name_of(sub) for sub in self.located)} need a single-rate "
                 "solver; a windowed subsystem group cannot locate their commutation instants"
             )
         self._probe = None
-        if self.commutating and solver is not None:
+        if self.located and solver is not None:
             dt = getattr(solver, "dt", None)
             probe = dt if dt is not None and dt > 0.0 else getattr(solver, "max_step", math.inf)
             if not math.isfinite(probe) or probe <= 0.0:
@@ -90,7 +107,8 @@ class DiodeConduction:
             validate(self.resolution_subsystems)
 
     def __bool__(self) -> bool:
-        return bool(self.current_states or self.resolution_subsystems or self.commutating)
+        return bool(self.current_states or self.resolution_subsystems
+                    or self.commutating or self._topology_owners)
 
     def synchronize(self, t: float, state: NDArray[np.float64]) -> None:
         """Resolve boundary modes before measurements, controls or observations read them."""
@@ -102,26 +120,56 @@ class DiodeConduction:
         """Advance all conduction guards through one locator and one boundary dispatcher."""
         if self.solver is None:
             raise RuntimeError("diode conduction cannot advance without a solver")
-        if not self.current_states and not self.commutating:
-            return self._advance_with_resolution(t0, t1, state)
-        if self.commutating:
+        initial_guarded, initial_located = self._guard_plan(state)
+        scheduled_due = any(
+            float(subsystem.next_commutation_time()) <= t0 + commutation_tolerance(t0)
+            for subsystem in self._scheduled
+        )
+        state_proves_mode = (
+            not self._boundary_only
+            and not initial_located
+            and all(direction * state[index] > 0.0
+                    for index, direction, commutates in initial_guarded if commutates)
+        )
+        if self.commutating and (scheduled_due or not state_proves_mode):
             state = self._settle(t0, state)
+            initial_guarded = initial_located = None
+        if not self.current_states and not self.located and not self._scheduled:
+            return self._smooth(t0, t1, state)
         t = t0
         end = t1 - commutation_tolerance(t1)
         stalled = 0
         while t < end:
-            target = min(t1, t + self._probe) if self._probe is not None else t1
+            guarded_advance = getattr(self.solver, "advance_guarded", None)
+            if initial_guarded is None:
+                guarded, located = self._guard_plan(state)
+            else:
+                guarded, located = initial_guarded, initial_located
+                initial_guarded = initial_located = None
+            observe_steps = guarded_advance is not None and bool(guarded or located)
+            target = (
+                t1 if guarded_advance is not None or self._probe is None
+                else min(t1, t + self._probe)
+            )
             scheduled = math.inf
             if self._scheduled:
                 scheduled = min(float(sub.next_commutation_time()) for sub in self._scheduled)
                 target = min(target, scheduled)
-            guarded = tuple(index for sub, index in self.current_states
-                            if sub.diode_blocks_reverse_current() and state[index] > 0.0)
-            trial = self._advance_with_resolution(t, target, state.copy())
-            upper_margin = self._margin(target, trial, guarded)
+            origin_t, origin_state = t, state
+            lower_margin = None
+            if observe_steps:
+                step = self._guarded(t, target, state.copy(), guarded, located)
+                trial, upper_margin = step.y, step.margin
+                if step.crossed:
+                    origin_t, origin_state = step.previous_t, step.previous_y
+                    lower_margin = step.previous_margin
+                    target = step.t
+            else:
+                trial, upper_margin = self._trial(t, target, state.copy(), guarded, located)
             if upper_margin < 0.0:
-                lower, upper = t, target
-                lower_margin = self._margin(t, state, guarded)
+                lower, upper = origin_t, target
+                if lower_margin is None:
+                    lower_margin = self._margin(lower, origin_state, guarded, located)
                 bisect_next = False
                 for _ in range(_LOCATOR_ITERATIONS):
                     tolerance = commutation_tolerance(upper)
@@ -138,8 +186,9 @@ class DiodeConduction:
                             interpolated = True
                     # Alternation guarantees bracket contraction even if a secant hugs an end.
                     bisect_next = interpolated
-                    value = self._advance_with_resolution(t, middle, state.copy())
-                    margin = self._margin(middle, value, guarded)
+                    value, margin = self._trial(
+                        origin_t, middle, origin_state.copy(), guarded, located
+                    )
                     invalid = margin < 0.0
                     if invalid:
                         upper, upper_margin, trial = middle, margin, value
@@ -150,15 +199,16 @@ class DiodeConduction:
                         # accepting a small residual (a valid guard may have a zero plateau).
                         adjacent = middle - tolerance if invalid else middle + tolerance
                         if lower < adjacent < upper:
-                            value = self._advance_with_resolution(t, adjacent, state.copy())
-                            margin = self._margin(adjacent, value, guarded)
+                            value, margin = self._trial(
+                                origin_t, adjacent, origin_state.copy(), guarded, located
+                            )
                             if margin < 0.0:
                                 upper, upper_margin, trial = adjacent, margin, value
                             else:
                                 lower, lower_margin = adjacent, margin
                 target = upper
-                for index in guarded:
-                    if trial[index] < 0.0:
+                for index, direction, commutates in guarded:
+                    if not commutates and direction * trial[index] < 0.0:
                         trial[index] = 0.0
             state = trial
             if self.commutating and (upper_margin < 0.0 or scheduled <= target):
@@ -171,16 +221,72 @@ class DiodeConduction:
             t = target
         return state
 
-    def _margin(self, t: float, state: NDArray[np.float64], guarded=()) -> float:
+    def _guard_plan(self, state: NDArray[np.float64]) -> tuple[tuple, tuple]:
+        """Replace located subsystem margins with their proved state guards."""
+        guarded = tuple((index, 1.0, False) for sub, index in self.current_states
+                        if sub.diode_blocks_reverse_current() and state[index] > 0.0)
+        located = list(self.located)
+        for subsystem in self.state_guard_subsystems:
+            replacements = subsystem.commutation_state_guards()
+            if replacements is None:
+                continue
+            located.remove(subsystem)
+            guarded += tuple((index, direction, True) for index, direction in replacements)
+        return guarded, tuple(located)
+
+    def _guarded(self, t0: float, t1: float, state: NDArray[np.float64], guarded, located):
+        """Observe margins inside one solver call while reusing a fixed topology."""
+        maximum_step = self._probe if self._probe is not None else math.inf
+        if self.resolution_subsystems:
+            self.model.sync(t0, state)
+            maximum_step = min(
+                maximum_step,
+                *(subsystem.diode_maximum_step() for subsystem in self.resolution_subsystems),
+            )
+        for subsystem in self._topology_owners:
+            subsystem.freeze_topology()
+        try:
+            return self.solver.advance_guarded(
+                self.model.rhs, t0, t1, state,
+                lambda t, y: self._margin(t, y, guarded, located),
+                max_step=maximum_step,
+                synchronized_guard=lambda t, y: self._margin(
+                    t, y, guarded, located, synchronized=True
+                ),
+            )
+        finally:
+            for subsystem in self._topology_owners:
+                subsystem.release_topology()
+
+    def _trial(self, t0: float, t1: float, state: NDArray[np.float64], guarded, located
+               ) -> tuple[NDArray[np.float64], float]:
+        """Integrate and test one smooth interval while reusing its compiled topology."""
+        value = self._smooth(t0, t1, state)
+        return value, self._margin(t1, value, guarded, located)
+
+    def _smooth(self, t0: float, t1: float, state: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Integrate one interval while every topology owner reuses its boundary mode."""
+        for subsystem in self._topology_owners:
+            subsystem.freeze_topology()
+        try:
+            return self._advance_with_resolution(t0, t1, state)
+        finally:
+            for subsystem in self._topology_owners:
+                subsystem.release_topology()
+
+    def _margin(self, t: float, state: NDArray[np.float64], guarded=(), subsystems=None, *,
+                synchronized: bool = False) -> float:
         """Minimum guard margin; no owner lists are needed to bracket a boundary."""
-        if self.commutating:
+        subsystems = self.commutating if subsystems is None else subsystems
+        if subsystems and not synchronized:
             self.model.sync(t, state)
         margin = math.inf
-        for sub in self.commutating:
+        for sub in subsystems:
             margin = min(margin, sub.commutation_margin())
-        for index in guarded:
-            if state[index] < margin:
-                margin = state[index]
+        for index, direction, _commutates in guarded:
+            value = direction * state[index]
+            if value < margin:
+                margin = value
         return float(margin)
 
     def _settle(self, t: float, state: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -192,22 +298,31 @@ class DiodeConduction:
         if not self.commutating:
             return state
         due = t + commutation_tolerance(t)
+        commutated = False
         for _ in range(_MAX_COMMUTATIONS):
             self.model.sync(t, state)
             pending = {sub for sub in self.commutating if sub.commutation_margin() < 0.0}
             pending.update(sub for sub in self._scheduled
                            if float(sub.next_commutation_time()) <= due)
             if not pending:
+                if commutated:
+                    invalidate = getattr(self.model, "invalidate_equations", None)
+                    if invalidate is not None:
+                        invalidate()
                 return state
+            changed = False
             for sub in self.commutating:
                 if sub not in pending:
                     continue
-                self.model.sync(t, state)
+                if changed:
+                    self.model.sync(t, state)
                 scheduled = sub in self._scheduled and float(sub.next_commutation_time()) <= due
-                if not scheduled and sub.commutation_margin() >= 0.0:
+                if changed and not scheduled and sub.commutation_margin() >= 0.0:
                     continue
                 sub.commutate(t)
                 state[:] = self.model.get_initial_values()
+                changed = True
+                commutated = True
         names = sorted(self.model.name_of(sub) for sub in pending)
         raise CommutationError(
             f"t = {t:.12g} s: {names} commutated {_MAX_COMMUTATIONS} times without time "

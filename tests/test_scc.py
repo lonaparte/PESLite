@@ -359,7 +359,7 @@ def _capacitor(current, *, angle=1.2, drive="alternating", voltage=0.0):
     class Capacitor(RCNode):
         def set_outputs(self, t):
             self.t = t
-            self.inp.i = 0.0 if switch.on else current(t)
+            self.input.i = 0.0 if switch.on else current(t)
             super().set_outputs(t)
 
         def commutation_margin(self):
@@ -373,7 +373,7 @@ def _capacitor(current, *, angle=1.2, drive="alternating", voltage=0.0):
 
     capacitor = Capacitor(60e-9, 0.0, u0=voltage, phases=1)
     model = Model({"capacitor": capacitor}, {})
-    handler = DiodeConduction(model, FixedStepSolver(2e-9, "rk4"))
+    handler = DiodeConduction(model, FixedStepSolver(2e-9, "RK4"))
     return switch, capacitor, model, handler
 
 

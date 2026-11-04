@@ -315,7 +315,7 @@ def test_control_graph_has_one_typed_boundary_for_inputs_and_outputs(gfl):
                                   "units.vsc.ctrl.references.omega": 300.0})
         controller.retune(moved.unit("vsc"), ["ctrl.references.theta", "ctrl.references.omega"], 0.0)
         if controller.continuous:
-            controller.inp.u_g = cfg.base.v_phase_peak + 0j
+            controller.input.u_g = cfg.base.v_phase_peak + 0j
             controller.set_outputs(0.0)
         else:
             controller(0.0, Measurement(0.0, cfg.base.v_phase_peak + 0j, 0j,
@@ -346,7 +346,7 @@ def test_reference_changes_rewire_graph_outputs_and_frame(gfl, model):
         0.0,
     )
     if controller.continuous:
-        controller.inp.u_g = cfg.base.v_phase_peak + 0j
+        controller.input.u_g = cfg.base.v_phase_peak + 0j
         controller.set_outputs(0.0)
     else:
         controller(0.0, Measurement(
@@ -464,7 +464,7 @@ def test_averaging_clips_dc_current_reference_and_tracks_antiwindup(gfl):
     intended = 2.0 * dvc.maximum
     integral = (intended - dvc.cfg.feedforward) / dvc.ki
     setattr(ctrl.state, "DCVoltageControl.integral", integral)
-    ctrl.inp.u_dc = ctrl.p.dclink.vdc_ref
+    ctrl.input.u_dc = ctrl.p.dclink.vdc_ref
 
     ctrl.set_outputs(0.0)
 

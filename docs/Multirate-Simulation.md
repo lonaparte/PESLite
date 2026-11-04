@@ -4,7 +4,8 @@ Multirate integration lets named subsystems advance on a step different from the
 useful when one part of a connected model is much faster or slower than the rest and a single global
 step would waste evaluations.
 
-Multirate schedules currently require the fixed-step solver.
+Multirate schedules currently require an explicit fixed-step system method: `euler`, `heun` or
+`RK4`.
 
 ## Step definition
 
@@ -24,7 +25,7 @@ assembled subsystem name, such as `pcc`, `grid.branch` or `vsc.dclink`.
 simulation:
   solver:
     type: fixed
-    method: rk4
+    method: RK4
     dt: 25e-6
     subsystems:
       pcc: 0.1
@@ -52,7 +53,7 @@ inputs. All windowed subsystems share one window method; an entry may specify it
 
 ```yaml
 subsystems:
-  vsc.dclink: {step: 10, method: rk4}
+  vsc.dclink: {step: 10, method: RK4}
 ```
 
 Windowing is most effective for storage dynamics whose state changes little over one window. Large
@@ -106,7 +107,7 @@ simulation:
   t_end: 1.0
   solver:
     type: fixed
-    method: rk4
+    method: RK4
     dt: 25e-6
     subsystems:
       vsc.dclink: 10

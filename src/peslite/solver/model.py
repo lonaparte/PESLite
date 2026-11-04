@@ -1,7 +1,7 @@
 """Continuous-time model: what a subsystem is, subsystems connected by signals into one model, and
 named states and automatically solved algebraic signal loops.
 
-A subsystem has ``state``, ``inp`` and ``out`` records (:class:`Bag`) and state derivatives; the
+A subsystem has ``state``, ``input`` and ``output`` records (:class:`Bag`) and state derivatives; the
 :class:`Model` packs the states of its subsystems into a flat real vector (two entries per complex
 state) named ``<subsystem>.<state>`` and evaluates their outputs and connections in signal order.
 Strongly connected output/input dependencies are detected during assembly and reduced to
@@ -103,7 +103,7 @@ def _integer(value):
 
 
 class Bag:
-    """Record whose ``__slots__`` fields default to ``0.0`` unless given as keywords (``state``, ``inp``, ``out``)."""
+    """Record whose fields default to ``0.0`` unless supplied as keywords."""
 
     __slots__ = ()
 
@@ -122,10 +122,11 @@ class Empty(Bag):
 class OutputMethod:
     """One output method of a subsystem and its direct input dependencies.
 
-    ``method``: name of a method taking ``t``; ``inputs``: ``inp`` fields it reads;
-    ``outputs``: ``out`` fields it writes. Every output field needs exactly one producer.
+    ``method``: name of a method taking ``t``; ``inputs``: ``input`` fields it reads;
+    ``outputs``: ``output`` fields it writes. Every output field needs exactly one producer.
     ``rhs`` may be false when no state derivative of the owning subsystem reads the stage.  The
-    model still includes it when an RHS-required downstream signal depends on its outputs.
+    model still includes it when an RHS-required downstream signal depends on its outputs. A
+    state-derivative preparation stage may have no outputs when ``rhs`` is true.
     """
 
     method: str
@@ -134,28 +135,43 @@ class OutputMethod:
     rhs: bool = True
 
 
+@dataclass(frozen=True)
+class _InlineProgram:
+    """Straight-line implementation of a generated subsystem method.
+
+    Generated physical models may expose their already compiled statements to :class:`Model`.
+    The model scheduler then places those statements directly in its evaluation program instead
+    of calling through one Python method per component. ``results`` contains the expressions
+    returned by an RHS method; output methods leave it empty.
+    """
+
+    statements: tuple[str, ...]
+    results: tuple[str, ...]
+    namespace: Mapping[str, Any]
+
+
 @runtime_checkable
 class Subsystem(Protocol):
-    """Continuous block with ``state``, ``inp`` and ``out`` records and state derivatives.
+    """Continuous block with ``state``, ``input`` and ``output`` records and state derivatives.
 
     ``state_names``: packing order (a complex state takes two real entries);
-    ``outputs_need_inputs``: whether ``set_outputs`` reads ``inp``; optional ``output_stages``
+    ``outputs_need_inputs``: whether ``set_outputs`` reads ``input``; optional ``output_stages``
     (tuple of :class:`OutputMethod`) replaces ``set_outputs``. A subsystem may declare real-state
     unilateral constraints as ``state_bounds = {name: (lower, upper)}``, using ``None`` for an
     open side. An optional ``project_state()`` enforces coupled constraints on the component's
     own state. The host applies projections after integration and when preparing audit states;
     they must be idempotent and must not change other components or discrete modes.
-    ``out`` and connected ``inp`` fields are current when ``rhs`` runs.
+    ``output`` and connected ``input`` fields are current when ``rhs`` runs.
     """
 
     state: Any
-    inp: Any
-    out: Any
+    input: Any
+    output: Any
     state_names: ClassVar[tuple[str, ...]]
     outputs_need_inputs: ClassVar[bool]
 
     def set_outputs(self, t: float) -> None:
-        """Update ``out`` from ``state`` (and ``inp`` if ``outputs_need_inputs``)."""
+        """Update ``output`` from ``state`` (and ``input`` if ``outputs_need_inputs``)."""
 
     def rhs(self, t: float) -> Sequence[complex | float]:
         """Time derivatives of the states, in ``state_names`` order."""
@@ -233,15 +249,15 @@ class BlackBoxSubsystem:
         offset: float = 0.0,
         feedthrough: Sequence[str] | None = None,
         observer: bool = False,
-        ports: Sequence[_energy.PowerPort] | None = None,
+        ports: Sequence[_energy.Port] | None = None,
         storage: Sequence[_energy.StoragePort] | None = None,
         dissipated_power: Callable[[Any], float] | None = None,
         supplied_power: Callable[[Any], float] | None = None,
     ) -> None:
         if not callable(output):
             raise TypeError("output must be callable")
-        self.input_names, self.inp = _black_box_record(inputs, "inputs")
-        self.output_names, self.out = _black_box_record(outputs, "outputs")
+        self.input_names, self.input = _black_box_record(inputs, "inputs")
+        self.output_names, self.output = _black_box_record(outputs, "outputs")
         if not self.output_names:
             raise ValueError("outputs must contain at least one name")
 
@@ -309,7 +325,7 @@ class BlackBoxSubsystem:
         self.outputs_need_inputs = bool(dependencies)
         self.output_stages = (OutputMethod("set_outputs", tuple(dependencies), self.output_names),)
 
-        self._input_values = _black_box_values(self.inp, self.input_names)
+        self._input_values = _black_box_values(self.input, self.input_names)
         self._state_values = _black_box_values(self.state, self._state_names)
 
     @staticmethod
@@ -337,14 +353,14 @@ class BlackBoxSubsystem:
 
     def _arguments(self) -> tuple[NDArray, NDArray]:
         self._state_values = self._read(self.state, self._state_names, self._state_values)
-        self._input_values = self._read(self.inp, self.input_names, self._input_values)
+        self._input_values = self._read(self.input, self.input_names, self._input_values)
         return self._state_values, self._input_values
 
     def set_outputs(self, t: float) -> None:
         state, inputs = self._arguments()
         values = self._result(self._call_output(t, state, inputs), len(self.output_names), "output")
         for name, value in zip(self.output_names, values):
-            setattr(self.out, name, self._scalar(value))
+            setattr(self.output, name, self._scalar(value))
 
     def rhs(self, t: float) -> Sequence[complex | float]:
         if self._call_rhs is None:
@@ -389,7 +405,7 @@ class BlackBoxSubsystem:
     def actuate(self, t: float, plant: Any) -> bool:
         """Commit a sampled update as a plant change; a model subsystem never trips."""
         if self._pending is not None:
-            with plant.change():
+            with plant.change(t):
                 for name, value, scalar_type in zip(
                         self._state_names, self._pending, self._state_types):
                     setattr(self.state, name, scalar_type(value))
@@ -875,7 +891,7 @@ class _AlgebraicLoop:
 
     def __init__(self, operations: tuple, tears: tuple, owners: tuple,
                  labels: tuple[str, ...],
-                 max_sweeps: int = 16, rtol: float = 1e-8, atol: float = 1e-10) -> None:
+                 max_sweeps: int = 16, rtol: float = 1e-14, atol: float = 1e-16) -> None:
         self.tears = tears
         torn = {id(item) for item in tears}
         self.operations = tuple(operation for operation in operations
@@ -1078,6 +1094,71 @@ def _strong_components(successors, nodes):
     return components
 
 
+@dataclass(frozen=True)
+class _DependencyPlan:
+    """One instantaneous dependency graph and its reusable scheduling analysis."""
+
+    dependencies: tuple[tuple[int, ...], ...]
+    successors: tuple[tuple[int, ...], ...]
+    order: tuple[int, ...]
+    residual: tuple[int, ...]
+    components: tuple[tuple[int, ...], ...]
+
+
+def _dependency_plan(dependencies) -> _DependencyPlan:
+    """Build one graph, running SCC analysis only on the topological residual."""
+    dependencies = tuple(tuple(sorted(map(int, item))) for item in dependencies)
+    successors = [[] for _ in dependencies]
+    for node, required in enumerate(dependencies):
+        for dependency in required:
+            successors[dependency].append(node)
+    order, residual = _topological_order(dependencies, successors)
+    components = _strong_components(successors, residual) if residual else ()
+    return _DependencyPlan(
+        dependencies,
+        tuple(tuple(item) for item in successors),
+        tuple(order),
+        tuple(residual),
+        tuple(components),
+    )
+
+
+def _ordered_components(graph: _DependencyPlan) -> tuple[tuple[int, ...], ...]:
+    """Return one analyzed graph's SCCs in condensation-graph order."""
+    if not graph.residual:
+        return tuple((node,) for node in graph.order)
+    components = tuple(sorted(
+        tuple((node,) for node in graph.order) + graph.components,
+        key=lambda component: min(component),
+    ))
+    owner = {
+        node: index for index, component in enumerate(components) for node in component
+    }
+    compact = tuple(tuple(sorted({
+        owner[dependency]
+        for node in component
+        for dependency in graph.dependencies[node]
+        if owner[dependency] != index
+    })) for index, component in enumerate(components))
+    condensation = _dependency_plan(compact)
+    if condensation.residual:
+        raise RuntimeError("internal error while ordering dependency components")
+    return tuple(components[index] for index in condensation.order)
+
+
+def _component_plan(dependencies) -> tuple[tuple[int, ...], ...]:
+    """Analyze dependencies and return their ordered strongly connected components."""
+    return _ordered_components(_dependency_plan(dependencies))
+
+
+def _no_linear_mode():
+    return None
+
+
+def _no_linear_data():
+    return ()
+
+
 class Model:
     """Connected subsystems evaluated as ``rhs(t, y)`` on a flat real state vector.
 
@@ -1085,6 +1166,7 @@ class Model:
     dots in names form namespaces.
     ``connections``: ``(dst, input) -> (src, output[, gain])`` or a list of these (summed).
     ``zoh_connections``: ``(dst, input) -> label`` for held inputs set by :meth:`set_zoh_input`.
+    Assembly may supply the state structure and exact linear circuit blocks used by solvers.
     """
 
     def __init__(
@@ -1092,7 +1174,18 @@ class Model:
         subsystems: Sequence[Subsystem] | Mapping[str, Subsystem],
         connections: Mapping[Connection, Connection | Sequence[Connection]],
         zoh_connections: Mapping[Connection, str] | None = None,
+        *, linear_structure: Callable[[Model], Any] | None = None,
+        linear_mode_key: Callable[[], Any] | None = None,
+        linear_blocks: Callable[[], Sequence[Any]] | None = None,
+        linear_modes: Callable[[], Sequence[Any]] | None = None,
+        linear_dynamic: bool = False,
     ) -> None:
+        self._linear_structure_builder = linear_structure
+        self.linear_mode_key = linear_mode_key or _no_linear_mode
+        self.linear_blocks = linear_blocks or _no_linear_data
+        self.linear_modes = linear_modes or _no_linear_data
+        self._linear_dynamic = bool(linear_dynamic)
+        self.equation_revision = 0
         if isinstance(subsystems, Mapping):
             names = [str(n) for n in subsystems]
             subsystems = list(subsystems.values())
@@ -1112,19 +1205,93 @@ class Model:
             if not isinstance(sub, Subsystem):
                 raise TypeError(
                     f"{type(sub).__name__} does not satisfy the Subsystem protocol "
-                    "(needs state/inp/out, state_names, outputs_need_inputs, set_outputs, rhs)")
+                    "(needs state/input/output, state_names, outputs_need_inputs, set_outputs, rhs)")
+        from .netlist import prepare_device
+        for sub in subsystems:
+            rhs = getattr(getattr(sub, "rhs", None), "__func__", None)
+            if (callable(getattr(type(sub), "network", None))
+                    and getattr(rhs, "_peslite_device_adapter", False)
+                    and not hasattr(sub, "_device_circuit")):
+                prepare_device(sub)
         self.subsystems: list[Subsystem] = list(subsystems)
         self.connections = dict(connections)
         self.zoh_connections = dict(zoh_connections or {})
         self._zoh_targets: dict[str, list[tuple[Any, str]]] = {}
         for (dst, name), label in self.zoh_connections.items():
-            self._zoh_targets.setdefault(label, []).append((dst.inp, name))
+            self._zoh_targets.setdefault(label, []).append((dst.input, name))
         self._check_connections()
         self._build_state_layout()
+        self.plan_revision = 0
+        self._external_state_dependency_cache: dict[frozenset[int], bool] = {}
         self._build_evaluation_plan()
         self._compile()
+        self._structure = (self._linear_structure_builder(self)
+                           if self._linear_structure_builder is not None else None)
         # energy declaration per subsystem (default if none declared)
         self.energy_specs: dict[str, _energy.EnergySpec] = {n: _energy.spec_of(s) for n, s in zip(names, subsystems)}
+        self._held_input_refresh = tuple(
+            refresh for subsystem in subsystems
+            if callable(refresh := getattr(subsystem, "held_inputs_changed", None))
+        )
+
+    def rebuild_evaluation_plan(self) -> None:
+        """Rebuild scheduling after a subsystem changes its declared output stages."""
+        self._build_evaluation_plan()
+        self._compile()
+        self._energy_balance_plan = None
+        self._external_state_dependency_cache.clear()
+        self._structure = (self._linear_structure_builder(self)
+                           if self._linear_structure_builder is not None else None)
+        self.plan_revision += 1
+
+    def linear_structure(self):
+        """Return the state partition supplied by assembly, or use the solver's dense default."""
+        return self._structure
+
+    @property
+    def explicit_stability_dynamic(self) -> bool:
+        """Whether continuously varying network ratios require a stability check every step."""
+        return self._linear_dynamic
+
+    def invalidate_equations(self) -> None:
+        """Record a boundary change which may select different continuous equations."""
+        self.equation_revision += 1
+
+    def has_external_state_dependency(self, members: Sequence[Any]) -> bool:
+        """Whether outputs of ``members`` reach another stateful subsystem's RHS plan."""
+        member_ids = {id(member) for member in members}
+        key = frozenset(member_ids)
+        cached = self._external_state_dependency_cache.get(key)
+        if cached is not None:
+            return cached
+        external = {
+            id(subsystem) for subsystem in self.subsystems
+            if id(subsystem) not in member_ids and subsystem.state_names
+        }
+        if not member_ids or not external:
+            self._external_state_dependency_cache[key] = False
+            return False
+        successors = [[] for _ in self._plan]
+        for node, dependencies in enumerate(self._plan_dependencies):
+            for dependency in dependencies:
+                successors[dependency].append(node)
+        pending = [
+            node for node, (owners, _sources) in enumerate(self._plan_owners)
+            if any(id(owner) in member_ids for owner in owners)
+        ]
+        reached = set(pending)
+        while pending:
+            node = pending.pop()
+            owners, _sources = self._plan_owners[node]
+            if self._plan_rhs[node] and any(id(owner) in external for owner in owners):
+                self._external_state_dependency_cache[key] = True
+                return True
+            for successor in successors[node]:
+                if successor not in reached:
+                    reached.add(successor)
+                    pending.append(successor)
+        self._external_state_dependency_cache[key] = False
+        return False
 
     # ---------------------------------------------------------------- setup
     def _check_connections(self) -> None:
@@ -1132,18 +1299,18 @@ class Model:
         for (dst, dst_name), src in self.connections.items():
             if id(dst) not in known:
                 raise ValueError(f"connection target {type(dst).__name__} is not in the subsystem list")
-            if not hasattr(dst.inp, dst_name):
-                raise ValueError(f"{type(dst).__name__}.inp has no field {dst_name!r}")
+            if not hasattr(dst.input, dst_name):
+                raise ValueError(f"{type(dst).__name__}.input has no field {dst_name!r}")
             sources = src if isinstance(src, list) else [src]
             for entry in sources:
                 s_obj, s_name = entry[0], entry[1]
                 if id(s_obj) not in known:
                     raise ValueError(f"connection source {type(s_obj).__name__} is not in the subsystem list")
-                if not hasattr(s_obj.out, s_name):
-                    raise ValueError(f"{type(s_obj).__name__}.out has no field {s_name!r}")
+                if not hasattr(s_obj.output, s_name):
+                    raise ValueError(f"{type(s_obj).__name__}.output has no field {s_name!r}")
         for (dst, dst_name) in self.zoh_connections:
-            if not hasattr(dst.inp, dst_name):
-                raise ValueError(f"{type(dst).__name__}.inp has no field {dst_name!r}")
+            if not hasattr(dst.input, dst_name):
+                raise ValueError(f"{type(dst).__name__}.input has no field {dst_name!r}")
 
     def _build_state_layout(self) -> None:
         """Map every state field to a slice of the flat real vector."""
@@ -1226,7 +1393,7 @@ class Model:
             if stage.method in methods:
                 raise ValueError(f"{where}: duplicate stage method")
             methods.add(stage.method)
-            for label, fields, record in (("inputs", stage.inputs, sub.inp), ("outputs", stage.outputs, sub.out)):
+            for label, fields, record in (("inputs", stage.inputs, sub.input), ("outputs", stage.outputs, sub.output)):
                 if not isinstance(fields, (tuple, list)) or any(not isinstance(f, str) for f in fields):
                     raise ValueError(f"{where}.{label}: expected a sequence of field names")
                 if len(set(fields)) != len(fields):
@@ -1234,12 +1401,12 @@ class Model:
                 for field in fields:
                     if not hasattr(record, field):
                         raise ValueError(f"{where}.{label}: unknown field {field!r}")
-            if not stage.outputs:
-                raise ValueError(f"{where}: at least one output is required")
+            if not stage.outputs and not stage.rhs:
+                raise ValueError(f"{where}: an output-free stage must be required by rhs")
             if produced.intersection(stage.outputs):
                 raise ValueError(f"{where}: an output has more than one producer")
             produced.update(stage.outputs)
-        outputs = {f for f in dir(sub.out) if not f.startswith("_") and not callable(getattr(sub.out, f))}
+        outputs = {f for f in dir(sub.output) if not f.startswith("_") and not callable(getattr(sub.output, f))}
         missing = outputs - produced
         if missing:
             raise ValueError(f"{name}.output_stages: outputs without a producer: {sorted(missing)}")
@@ -1257,28 +1424,38 @@ class Model:
         def add(operation, owner, sources, label, rhs=True):
             index = len(operations)
             operations.append(operation)
-            owners.append(((owner,), sources))
+            owners.append((owner if isinstance(owner, tuple) else (owner,), sources))
             dependencies.append(set())
             labels.append(label)
             rhs_required.append(rhs)
             return index
 
-        producers, legacy, stages = {}, {}, []
+        producers, legacy, stages, stage_nodes = {}, {}, [], {}
         for name, sub in zip(self.names, self.subsystems):
             declared = self._output_stages(sub, name)
             if declared is None:
                 node = None
-                if sub.outputs_need_inputs or sub.out is not sub.state:
-                    node = add(("out", sub.set_outputs), sub, (), f"{name}.set_outputs")
+                if sub.outputs_need_inputs or sub.output is not sub.state:
+                    node = add(("output", sub.set_outputs), sub, (), f"{name}.set_outputs")
                     stages.append((node, sub, connected[id(sub)] if sub.outputs_need_inputs else ()))
                 legacy[id(sub)] = node  # state aliases need no output evaluation
             else:
                 for stage in declared:
-                    node = add(("out", getattr(sub, stage.method)), sub, (),
+                    stage_owners = getattr(sub, "_output_stage_owners", {}).get(
+                        stage.method, (sub,)
+                    )
+                    node = add(("output", getattr(sub, stage.method)), stage_owners, (),
                                f"{name}.{stage.method}", stage.rhs)
+                    stage_nodes[id(sub), stage.method] = node
                     stages.append((node, sub, stage.inputs))
                     for field in stage.outputs:
                         producers[id(sub), field] = node
+
+        for sub in self.subsystems:
+            for method, requirements in getattr(sub, "_output_dependencies", {}).items():
+                node = stage_nodes[id(sub), method]
+                for source, source_method in requirements:
+                    dependencies[node].add(stage_nodes[id(source), source_method])
 
         def producer(sub, field):
             key = (id(sub), field)
@@ -1286,7 +1463,7 @@ class Model:
                 return producers[key]
             if id(sub) in legacy:
                 return legacy[id(sub)]
-            raise ValueError(f"{names[id(sub)]}.out.{field}: no output stage produces this signal")
+            raise ValueError(f"{names[id(sub)]}.output.{field}: no output stage produces this signal")
 
         copies = {}
         for (dst, field), spec in self.connections.items():
@@ -1294,12 +1471,15 @@ class Model:
             sources = tuple(entry[0] for entry in entries)
             if len(entries) == 1 and (len(entries[0]) < 3 or entries[0][2] == 1.0):
                 src, src_field = entries[0][:2]
-                operation = (dst.inp, field, src.out, src_field, None)
+                operation = (dst.input, field, src.output, src_field, None)
             else:
-                terms = tuple((entry[0].out, entry[1], float(entry[2]) if len(entry) > 2 else 1.0)
+                terms = tuple((entry[0].output, entry[1], float(entry[2]) if len(entry) > 2 else 1.0)
                               for entry in entries)
-                operation = (dst.inp, field, None, None, terms)
-            node = add(("copy", operation), dst, sources, f"{names[id(dst)]}.inp.{field}")
+                operation = (dst.input, field, None, None, terms)
+            node = add(
+                ("copy", operation), dst, sources, f"{names[id(dst)]}.input.{field}",
+                rhs=bool(dst.state_names),
+            )
             copies[id(dst), field] = node
             for entry in entries:
                 source = producer(entry[0], entry[1])
@@ -1312,14 +1492,11 @@ class Model:
                     dependencies[node].add(copy)
 
         # Reuse the scheduling pass: DAGs need neither SCC analysis nor a condensed graph.
-        successors = [[] for _ in operations]
-        for node, deps in enumerate(dependencies):
-            for dep in deps:
-                successors[dep].append(node)
-        order, residual = _topological_order(dependencies, successors)
+        graph = _dependency_plan(dependencies)
+        order, residual = list(graph.order), graph.residual
         if residual:
             # Residual nodes can be downstream of a loop. Only cyclic SCCs become solver groups.
-            components = [(node,) for node in order] + _strong_components(successors, residual)
+            components = _ordered_components(graph)
             component_of = {node: ci for ci, component in enumerate(components) for node in component}
             compact_ops, compact_owners, compact_deps, compact_rhs = [], [], [], []
             for ci, component in enumerate(components):
@@ -1370,11 +1547,8 @@ class Model:
 
             operations, owners, dependencies, rhs_required = (
                 compact_ops, compact_owners, compact_deps, compact_rhs)
-            successors = [[] for _ in operations]
-            for node, deps in enumerate(dependencies):
-                for dep in deps:
-                    successors[dep].append(node)
-            order, residual = _topological_order(dependencies, successors)
+            graph = _dependency_plan(dependencies)
+            order, residual = list(graph.order), graph.residual
             if residual:
                 raise RuntimeError("internal error while collapsing algebraic output groups")
         # An observational producer is still part of the derivative plan when a required
@@ -1385,6 +1559,7 @@ class Model:
             if rhs_required[node]:
                 for dependency in dependencies[node]:
                     rhs_required[dependency] = True
+        self.dependency_plan = graph
         position = {node: i for i, node in enumerate(order)}
         self._plan = tuple(operations[i] for i in order)
         self._plan_rhs = tuple(rhs_required[i] for i in order)
@@ -1413,24 +1588,68 @@ class Model:
         load = [put(st, name, f"complex(v[{idx}], v[{idx + 1}])" if is_c else f"v[{idx}]")
                 for st, name, idx, is_c in self._state_ops]
 
-        plan, derivative_plan = [], []
+        def inline(method: Callable) -> tuple[list[str], tuple[str, ...]] | None:
+            function = getattr(method, "__func__", method)
+            program = getattr(function, "_peslite_inline_program", None)
+            owner = getattr(method, "__self__", None)
+            if not isinstance(program, _InlineProgram) or owner is None:
+                return None
+            records = {
+                "self.state": getattr(owner, "state", None),
+                "self.input": getattr(owner, "input", None),
+                "self.output": getattr(owner, "output", None),
+            }
+            records = {name: ref(value) for name, value in records.items() if value is not None}
+            replacements = {"self": ref(owner)}
+            replacements.update({name: ref(value) for name, value in program.namespace.items()})
+            pattern = re.compile(
+                r"\b(" + "|".join(map(re.escape, sorted(replacements, key=len, reverse=True)))
+                + r")\b"
+            )
+
+            def substitute(source: str) -> str:
+                for name, replacement in records.items():
+                    source = source.replace(name, replacement)
+                return pattern.sub(lambda match: replacements[match.group(1)], source)
+
+            return ([substitute(line) for line in program.statements],
+                    tuple(substitute(result) for result in program.results))
+
+        def operation_lines(operation: tuple) -> list[str]:
+            kind, method = operation
+            program = inline(method) if kind == "output" else None
+            return program[0] if program is not None and not program[1] else [step(operation)]
+
+        plan_by_operation, derivative_by_operation = [], []
         for operation, (op_owners, _srcs), rhs_required in zip(
                 self._plan, self._plan_owners, self._plan_rhs):
             comment = ", ".join(owners[id(owner)] for owner in op_owners)
-            line = f"{step(operation)}  # {comment}"
-            plan.append(line)
-            if rhs_required:
-                derivative_plan.append(line)
+            lines = operation_lines(operation)
+            if lines:
+                lines[-1] += f"  # {comment}"
+            plan_by_operation.append(lines)
+            derivative_by_operation.append(lines if rhs_required else [])
+
+        plan = [line for lines in plan_by_operation for line in lines]
+        derivative_plan = [line for lines in derivative_by_operation for line in lines]
+        zoh_plan = [line for index in self._zoh_plan for line in plan_by_operation[index]]
 
         derive, packed = [], []
         for j, (sub, flags, _all_complex) in enumerate(self._rhs_plan):
             got = [f"d{j}_{q}" for q in range(len(flags))]
-            derive.append(f"{', '.join(got)}, = {ref(sub)}.rhs(t)  # {owners[id(sub)]}")
+            program = inline(sub.rhs)
+            if program is None or len(program[1]) != len(got):
+                derive.append(f"{', '.join(got)}, = {ref(sub)}.rhs(t)  # {owners[id(sub)]}")
+            else:
+                statements, results = program
+                derive.extend(statements)
+                derive.extend(f"{name} = {result}" for name, result in zip(got, results))
+                derive[-1] += f"  # {owners[id(sub)]}"
             for d, is_c in zip(got, flags):
                 packed += [f"{d}.real", f"{d}.imag"] if is_c else [d]
 
         source = "\n".join(_function("_load(v)", load) + _function("_outputs(t)", plan)
-                           + _function("_zoh_outputs(t)", [plan[i] for i in self._zoh_plan])
+                           + _function("_zoh_outputs(t)", zoh_plan)
                            + _function("rhs_list(t, v)", load + derivative_plan + derive
                                        + [f"return [{', '.join(packed)}]"])) + "\n"
         filename = f"<peslite model {id(self):#x}>"
@@ -1439,8 +1658,24 @@ class Model:
         # Rebuilt models own their debugging source; collecting one must release its cache entry.
         weakref.finalize(self, linecache.cache.pop, filename, None)
         self.compiled_source = source
-        self._load, self._outputs, self._zoh_outputs, self.rhs_list = (
-            env["_load"], env["_outputs"], env["_zoh_outputs"], env["rhs_list"])
+        names = ("_load", "_outputs", "_zoh_outputs", "rhs_list")
+        compiled = tuple(env[name] for name in names)
+        previous = getattr(self, "_compiled_plan_functions", None)
+        if previous is None:
+            active = compiled
+            for name, function in zip(names, active):
+                setattr(self, name, function)
+        else:
+            active = previous
+            for old, new in zip(active, compiled):
+                old.__globals__.update(new.__globals__)
+                old.__code__ = new.__code__
+                old.__defaults__ = new.__defaults__
+                old.__kwdefaults__ = new.__kwdefaults__
+            for name, function in zip(names, active):
+                if getattr(self, name) in previous:
+                    setattr(self, name, function)
+        self._compiled_plan_functions = active
 
     # -------------------------------------------------------------- groups
     def groups(self, assignment: Mapping[str, str], system: str = "system") -> dict[str, GroupPlan]:
@@ -1486,7 +1721,7 @@ class Model:
         plan = closure(member_ops)
         own = tuple(item for item, (owners, srcs) in zip(self._plan, self._plan_owners)
                     if any(id(owner) in member_ids for owner in owners)
-                    and (item[0] in ("out", "algebraic")
+                    and (item[0] in ("output", "algebraic")
                          or all(id(x) in member_ids for x in srcs)))
         boundary = [i for i, ((kind, _), (owners, srcs))
                     in enumerate(zip(self._plan, self._plan_owners))
@@ -1611,8 +1846,21 @@ class Model:
     # --------------------------------------------------------- evaluation
     def set_zoh_input(self, label: str, value: Any) -> None:
         """Set a held external input (e.g. the switching state) by label."""
-        for inp, name in self._zoh_targets[label]:
-            setattr(inp, name, value)
+        targets = self._zoh_targets[label]
+        changed = []
+        for input, name in targets:
+            previous = getattr(input, name)
+            setattr(input, name, value)
+            if self._held_input_refresh:
+                equal = previous == value
+                same = bool(np.all(equal)) if isinstance(equal, np.ndarray) else bool(equal)
+                if not same:
+                    changed.append((input, name))
+        if not changed:
+            return
+        for refresh in self._held_input_refresh:
+            refresh(changed)
+        self.invalidate_equations()
 
     def evaluate_outputs(self, t: float) -> None:
         """Run the ordered output-method / input-copy plan for the current states."""
@@ -1628,7 +1876,7 @@ class Model:
 
     def sync(self, t: float, y: NDArray[np.float64]) -> None:
         """Load ``y`` into the subsystems and refresh all outputs (for sampling/logging)."""
-        self._load(y.tolist())
+        self._load(y.tolist() if hasattr(y, "tolist") else y)
         self._outputs(t)
 
     # ---------------------------------------------------------------- energy

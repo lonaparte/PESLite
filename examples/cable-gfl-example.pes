@@ -1,4 +1,4 @@
-# PESLite 0.4.0
+# PESLite 0.5.0
 # A grid-following converter connected to a stiff grid through the custom distributed cable model.
 base: {s_base: 10.0e6, v_ll_rms: 10.0e3, f0: 50.0}
 buses:
@@ -43,4 +43,4 @@ simulation:
   output: {record_every: 10}
 meta:
   title: Cable-connected grid-following converter
-  description: A GFL converter connected through a two-terminal distributed R-L/G-C cable add-on.
+  description: A GFL converter connected through a two-port distributed R-L/G-C cable add-on.

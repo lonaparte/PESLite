@@ -62,6 +62,13 @@ def test_dependency_analysis_matches_mutual_reachability():
             assert set(residual) == {node for member in cyclic for node in reach[member]}
 
 
+def test_component_plan_orders_acyclic_nodes_and_condensed_cycles():
+    dependencies = ((), (0,), (1, 3), (2,), (3,), (4,), ())
+    assert kernel._component_plan(dependencies) == (
+        (0,), (6,), (1,), (2, 3), (4,), (5,),
+    )
+
+
 def test_residual_analysis_does_not_depend_on_the_python_recursion_limit():
     dependencies = [{0}] + [{node - 1} for node in range(1, 2500)]
     successors = _successors(dependencies)
@@ -84,15 +91,52 @@ class _Feedthrough:
     outputs_need_inputs = True
 
     def __init__(self, offset=1.0, gain=0.5):
-        self.state, self.inp, self.out = Empty(), _Input(), _Signal()
+        self.state, self.input, self.output = Empty(), _Input(), _Signal()
         self.offset, self.gain, self.calls = offset, gain, 0
 
     def set_outputs(self, _t):
         self.calls += 1
-        self.out.x = self.offset + self.gain * (self.inp.x + self.inp.feedback)
+        self.output.x = self.offset + self.gain * (self.input.x + self.input.feedback)
 
     def rhs(self, _t):
         return ()
+
+
+def test_stateless_output_only_connection_is_not_evaluated_by_rhs():
+    class Deferred(_Feedthrough):
+        output_stages = (OutputMethod(
+            "set_outputs", ("x", "feedback"), ("x",), rhs=False,
+        ),)
+
+        def __init__(self):
+            super().__init__()
+            self.input.x = self.input.feedback = 0.0
+            self.output.x = 0.0
+
+    source, observer = Deferred(), Deferred()
+    model = Model([source, observer], {(observer, "x"): (source, "x")})
+
+    assert model.rhs_list(0.0, []) == []
+    assert source.calls == observer.calls == 0
+    model.evaluate_outputs(0.0)
+    assert source.calls == observer.calls == 1
+    assert observer.output.x == 1.5
+
+    class Integrator(_Feedthrough):
+        state_names = ("x",)
+
+        def __init__(self):
+            super().__init__()
+            self.state = _Signal(x=0.0)
+            self.input.x = self.input.feedback = self.output.x = 0.0
+
+        def rhs(self, _t):
+            return (self.input.x,)
+
+    source, integrator = Deferred(), Integrator()
+    continuous = Model([source, integrator], {(integrator, "x"): (source, "x")})
+    assert continuous.rhs_list(0.0, [0.0]) == [1.0]
+    assert source.calls == 1
 
 
 @pytest.mark.parametrize("cyclic", [False, True])
@@ -118,7 +162,7 @@ def test_generated_source_cache_follows_model_lifetime(cyclic):
     assert all(ref() is None for ref in released)
     assert cached_models() == before | {filename}
     live.evaluate_outputs(0.0)
-    assert live.subsystems[0].out.x == pytest.approx(1.0)
+    assert live.subsystems[0].output.x == pytest.approx(1.0)
     assert linecache.getlines(filename) == live.compiled_source.splitlines(keepends=True)
     del live
     gc.collect()
@@ -135,7 +179,7 @@ def test_acyclic_model_skips_scc_even_for_a_deep_signal_chain(monkeypatch):
     model = Model(blocks, connections)
     model.evaluate_outputs(0.0)
     assert not model.algebraic_loops
-    assert blocks[-1].out.x == 1200.0
+    assert blocks[-1].output.x == 1200.0
     assert len(model._plan) == 2399
 
 
@@ -159,13 +203,13 @@ def test_model_only_analyzes_residual_and_solves_distinct_loops_in_order(monkeyp
     # Source output (0) and the first input copy (4) are topologically sortable.
     assert observed == [set(range(9)) - {0, 4}]
     assert [set(loop.labels) for loop in model.algebraic_loops] == [
-        {"first.set_outputs", "first.inp.feedback"},
-        {"second.set_outputs", "second.inp.feedback"},
+        {"first.set_outputs", "first.input.feedback"},
+        {"second.set_outputs", "second.input.feedback"},
     ]
     model.evaluate_outputs(0.0)
-    assert first.out.x == pytest.approx(4.0)
-    assert second.out.x == pytest.approx(6.0)
-    assert downstream.out.x == pytest.approx(4.0)
+    assert first.output.x == pytest.approx(4.0)
+    assert second.output.x == pytest.approx(6.0)
+    assert downstream.output.x == pytest.approx(4.0)
 
 
 def test_state_feedback_is_not_direct_feedthrough():
@@ -175,10 +219,10 @@ def test_state_feedback_is_not_direct_feedthrough():
 
         def __init__(self):
             super().__init__()
-            self.state = self.out = _Signal(x=3.0)
+            self.state = self.output = _Signal(x=3.0)
 
         def rhs(self, _t):
-            return (self.inp.x,)
+            return (self.input.x,)
 
     state, feedback = Integrator(), _Feedthrough()
     model = Model([state, feedback], {(feedback, "x"): (state, "x"),
@@ -198,23 +242,23 @@ def test_output_stage_dependencies_do_not_create_an_artificial_loop():
 
         def __init__(self):
             super().__init__()
-            self.state, self.out = _Signal(x=3.0), Outputs()
+            self.state, self.output = _Signal(x=3.0), Outputs()
 
         def observe(self, _t):
-            self.out.value = self.state.x
+            self.output.value = self.state.x
 
         def drive(self, _t):
-            self.out.driven = 2.0 * self.inp.x
+            self.output.driven = 2.0 * self.input.x
 
         def rhs(self, _t):
-            return (self.inp.x,)
+            return (self.input.x,)
 
     staged, feedback = Staged(), _Feedthrough()
     model = Model([staged, feedback], {(feedback, "x"): (staged, "value"),
                                       (staged, "x"): (feedback, "x")})
     assert not model.algebraic_loops
     assert model.rhs_list(0.0, [3.0]) == [2.5]
-    assert staged.out.driven == 5.0
+    assert staged.output.driven == 5.0
 
 
 @pytest.mark.parametrize("cyclic", [False, True])
@@ -230,6 +274,6 @@ def test_held_input_refresh_uses_the_same_dependency_plan(cyclic):
     model.set_zoh_input("held", 4.0)
     model.sync_zoh(0.0)
     expected = 6.0 if cyclic else 3.0
-    assert driven.out.x == pytest.approx(expected)
-    assert consumer.out.x == pytest.approx(1.0 + 0.5 * expected)
+    assert driven.output.x == pytest.approx(expected)
+    assert consumer.output.x == pytest.approx(1.0 + 0.5 * expected)
     assert independent.calls == calls
