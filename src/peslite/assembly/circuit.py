@@ -49,8 +49,9 @@ from ..solver.netlist import (QUANTITIES, CurrentSource, Diode, Element, Mode, N
                               Topology, VoltageSource, _Degenerate, _Evaluation,
                               _linear_expression, _numeric_values)
 
-__all__ = ["NetlistBuilder", "NetworkPlan", "Circuit", "NetworkView", "CircuitAnalysis",
-           "lower", "bind_device", "compile_network"]
+__all__ = ["NetlistBuilder", "NetworkPlan", "Circuit", "NetworkView", "circuit_structure",
+           "circuit_mode_key", "circuit_linear_blocks", "circuit_linear_modes",
+           "circuit_linear_dynamic", "lower", "bind_device", "compile_network"]
 
 
 def _kind(port: Port) -> tuple[int, float]:
@@ -522,7 +523,8 @@ class Circuit:
             tuple[int, tuple[tuple[int, float], ...]], ...
         ] = ()
         self._device_bindings: dict[tuple, tuple[Topology, Callable, Callable]] = {}
-        self._analysis: Optional["CircuitAnalysis"] = None
+        self._structure_plan: Optional["_CircuitPlan"] = None
+        self._switch_decompositions: dict[tuple, Optional["_SwitchDecomposition"]] = {}
         self.plan_changed = False
 
     # ---------------------------------------------------------------- assembly
@@ -646,8 +648,8 @@ class Circuit:
         self.locate_commutations = not self._mixtures and any(isinstance(el, Diode) for el in net.elements)
         self._state_diode_groups = ()
         self._device_bindings.clear()
-        if self._analysis is not None:
-            self._analysis.invalidate()
+        self._structure_plan = None
+        self._switch_decompositions.clear()
         self._consistent = None  # new parameters (a set event) may move the loops' and cutsets' constraints
         self._consistent_constraints = None
         transforms = []
@@ -2523,7 +2525,7 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
     return out, lowered, held, circuit
 
 
-class _CircuitAnalysisPlan:
+class _CircuitPlan:
     """Static state mapping and exact-column metadata of one assembled circuit."""
 
     __slots__ = ("circuit", "local_to_model", "transform", "inverse", "states", "exact",
@@ -2552,402 +2554,283 @@ class _SwitchDecomposition:
         self.topologies = tuple(topologies)
 
 
-class CircuitAnalysis:
-    """One structural analysis shared by assembly, numerical solvers and native export.
+def circuit_structure(model: Any, circuits: Sequence[Circuit]):
+    """Build the common state partition after any circuit formulation has been lowered."""
+    from ..solver.implicit import Structure
 
-    State-coordinate maps, network groups, exact Jacobian columns and external-feedback decisions
-    are fixed at assembly and are built once.  A mode change only selects a new netlist matrix and
-    structural signature; it never repeats that static analysis.  Exporters consume this same
-    object instead of reconstructing circuit ownership and state layouts.
-    """
+    circuits = tuple(circuits)
+    n = model.n_states
+    component_subsystem = {
+        id(subsystem.component if isinstance(subsystem, NetworkView) else subsystem): subsystem
+        for subsystem in model.subsystems
+    }
+    all_groups: list[set[int]] = []
+    all_labels: list[str] = []
+    all_interface: set[int] = set()
+    for circuit in circuits:
+        local_to_model = np.empty(circuit.n_states, dtype=np.intp)
+        for component, name, complex_state, local in circuit.layout:
+            subsystem = component_subsystem[id(component)]
+            positions = tuple(range(*model.state_slice(subsystem, name).indices(n)))
+            if len(positions) != (2 if complex_state else 1):
+                raise RuntimeError("circuit and model state layouts differ")
+            local_to_model[local:local + len(positions)] = positions
 
-    def __init__(self, circuits: Sequence[Circuit]) -> None:
-        self.circuits = tuple(circuits)
-        self.model: Any = None
-        self._prepared = False
-        self._plans: tuple[_CircuitAnalysisPlan, ...] = ()
-        self._structure: Any = None
-        self._mode_eigenvalues: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
-        self._explicit_stability: "OrderedDict[tuple, tuple[float, float]]" = OrderedDict()
-        self._switch_decompositions: dict[tuple, Optional[_SwitchDecomposition]] = {}
-        self.dynamic = any(
-            transformer.constant is None
-            for circuit in self.circuits
-            for transformer in circuit.netlist._transformers
-        )
+        def mapped_states(elements) -> set[int]:
+            return {
+                int(local_to_model[int(local)])
+                for element in elements
+                for local in np.asarray(
+                    getattr(element, "state", ()), dtype=np.intp
+                ).reshape(-1)
+                if 0 <= int(local) < local_to_model.size
+            }
 
-    def bind(self, model: Any) -> None:
-        """Bind the completed model layout and build the immutable structural plan."""
-        self.model = model
-        for circuit in self.circuits:
-            circuit._analysis = self
-        self._prepare()
+        grouping = circuit.netlist.grouping()
+        groups = [mapped_states(elements) for elements in grouping.elements]
+        labels = [", ".join(dict.fromkeys(
+            circuit._owners.get(id(element), "?") for element in elements
+        )) for elements in grouping.elements]
+        interface = mapped_states(grouping.interface_elements)
+        interface_nodes = {id(node) for node in grouping.interface}
+        interface.update(mapped_states(
+            element for element in circuit.netlist.elements
+            if any(id(node) in interface_nodes
+                   for port in element.ports for node in port if node is not None)
+        ))
 
-    def invalidate(self) -> None:
-        """Discard data derived from rebuilt circuit declarations or parameters."""
-        self._prepared = False
-        self._plans = ()
-        self._structure = None
-        self._mode_eigenvalues.clear()
-        self._explicit_stability.clear()
-        self._switch_decompositions.clear()
-        if self.model is not None:
-            self.dynamic = any(
-                transformer.constant is None
-                for circuit in self.circuits
-                for transformer in circuit.netlist._transformers
-            )
-
-    def _prepare(self) -> None:
-        if self._prepared or self.model is None:
-            return
-        from ..solver.implicit import Structure
-
-        model, n = self.model, self.model.n_states
-        component_subsystem = {
-            id(subsystem.component if isinstance(subsystem, NetworkView) else subsystem): subsystem
-            for subsystem in model.subsystems
+        local = circuit.n_states
+        transform = np.eye(local)
+        inverse = np.eye(local)
+        for index, matrix, inv in circuit._transforms:
+            transform[np.ix_(index, index)] = matrix
+            inverse[np.ix_(index, index)] = inv
+        unsafe = {
+            int(index)
+            for value, _offset, _dimension, _name in circuit.netlist._source_slots
+            for component, name in getattr(value, "state_dependencies", ())
+            for index in circuit._state_index[id(component), name]
         }
-        plans: list[_CircuitAnalysisPlan] = []
-        all_groups: list[set[int]] = []
-        all_labels: list[str] = []
-        all_interface: set[int] = set()
-        for circuit in self.circuits:
-            local_to_model = np.empty(circuit.n_states, dtype=np.intp)
-            for component, name, complex_state, local in circuit.layout:
-                subsystem = component_subsystem[id(component)]
-                positions = tuple(range(*model.state_slice(subsystem, name).indices(n)))
-                if len(positions) != (2 if complex_state else 1):
-                    raise RuntimeError("circuit and model state layouts differ")
-                local_to_model[local:local + len(positions)] = positions
+        for index, _matrix, _inverse in circuit._transforms:
+            if unsafe.intersection(map(int, index)):
+                unsafe.update(map(int, index))
+        exact = local_to_model[[index for index in range(local) if index not in unsafe]]
+        members = {
+            id(component_subsystem[id(component)]): component_subsystem[id(component)]
+            for component in circuit.components if id(component) in component_subsystem
+        }
+        if id(circuit) in component_subsystem:
+            members[id(circuit)] = component_subsystem[id(circuit)]
+        skipped = (np.zeros(0, dtype=np.intp)
+                   if model.has_external_state_dependency(tuple(members.values())) else exact)
+        circuit._structure_plan = _CircuitPlan(
+            circuit, local_to_model, transform, inverse,
+            np.asarray(circuit.netlist.states, dtype=np.intp), exact, skipped,
+            groups, labels, interface,
+        )
+        circuit._switch_decompositions.clear()
+        all_groups.extend(groups)
+        all_labels.extend(labels)
+        all_interface.update(interface)
 
-            def mapped_states(elements) -> set[int]:
-                return {
-                    int(local_to_model[int(local)])
-                    for element in elements
-                    for local in np.asarray(
-                        getattr(element, "state", ()), dtype=np.intp
-                    ).reshape(-1)
-                    if 0 <= int(local) < local_to_model.size
-                }
+    occurrences: dict[int, int] = {}
+    for group in all_groups:
+        for position in group:
+            occurrences[position] = occurrences.get(position, 0) + 1
+    all_interface.update(position for position, count in occurrences.items() if count > 1)
+    grouped = set().union(*all_groups) if all_groups else set()
+    all_interface.update(set(range(n)) - grouped)
+    groups, labels = [], []
+    for group, label in zip(all_groups, all_labels):
+        interior = np.array(sorted(group - all_interface), dtype=np.intp)
+        if interior.size:
+            groups.append(interior)
+            labels.append(label)
+    return Structure(groups, np.array(sorted(all_interface), dtype=np.intp), labels)
 
-            grouping = circuit.netlist.grouping()
-            groups = [mapped_states(elements) for elements in grouping.elements]
-            labels = [", ".join(dict.fromkeys(
-                circuit._owners.get(id(element), "?") for element in elements
-            )) for elements in grouping.elements]
-            interface = mapped_states(grouping.interface_elements)
-            interface_nodes = {id(node) for node in grouping.interface}
-            interface.update(mapped_states(
-                element for element in circuit.netlist.elements
-                if any(id(node) in interface_nodes
-                       for port in element.ports for node in port if node is not None)
+
+def circuit_mode_key(circuits: Sequence[Circuit]):
+    """Current discrete circuit identity, excluding continuously varying ratios."""
+    circuits = tuple(circuits)
+    if not circuits:
+        return None
+    return tuple(
+        (id(circuit.netlist), (
+            circuit._bound_device_topology() or circuit.netlist.topology()
+        ).mode.key[:2])
+        for circuit in circuits
+    )
+
+
+def circuit_linear_blocks(circuits: Sequence[Circuit]):
+    """Return present exact circuit matrices in global model coordinates."""
+    blocks = []
+    for circuit in circuits:
+        plan = circuit._structure_plan
+        if plan is None:
+            raise RuntimeError("circuit_structure must run before linear block evaluation")
+        matrix = np.zeros((circuit.n_states, circuit.n_states))
+        matrix[np.ix_(plan.states, plan.states)] = circuit.netlist.topology().state_space.A
+        blocks.append((plan.local_to_model,
+                       plan.inverse @ matrix @ plan.transform,
+                       plan.exact, plan.skipped))
+    return tuple(blocks)
+
+
+def circuit_linear_modes(circuits: Sequence[Circuit]):
+    """Return materialized linear circuit matrices for explicit-stability checks.
+
+    Direct compiled equations need no numeric network factorization. Their continuously varying
+    form therefore remains direct instead of constructing a second representation solely for this
+    optional check.
+    """
+    modes = []
+    for circuit in circuits:
+        topology = circuit.netlist.topology()
+        if topology._state_space is None and circuit._direct_dynamic:
+            continue
+        modes.append(((id(circuit.netlist), topology.mode.key), topology.state_space.A))
+    return tuple(modes)
+
+
+def circuit_linear_dynamic(circuits: Sequence[Circuit]) -> bool:
+    """Whether circuit coefficients may vary without a discrete mode change."""
+    return any(
+        transformer.constant is None
+        for circuit in circuits
+        for transformer in circuit.netlist._transformers
+    )
+
+
+def _switch_decomposition(
+    circuit: Circuit,
+    free: Sequence[int],
+    closed: Sequence[bool],
+    conducting: Sequence[bool],
+) -> Optional[_SwitchDecomposition]:
+    """Find independent run-time switch clusters for native equation lowering.
+
+    Dynamic transformer coefficients use one deterministic, nondegenerate structural value while
+    discovering dependencies. Generated equations still use the actual coefficient expressions.
+    """
+    free = tuple(map(int, free))
+    if len(free) < 2:
+        return None
+    net = circuit.netlist
+    actual = tuple(
+        np.asarray(ratio, dtype=float)
+        for ratio in (net._ratio_override if net._ratio_override is not None
+                      else tuple(transformer.ratio() for transformer in net._transformers))
+    )
+    ratio_key = tuple((ratio.shape, ratio.tobytes()) for ratio in actual)
+    key = free, tuple(closed), tuple(conducting), ratio_key
+    cache = circuit._switch_decompositions
+    if key in cache:
+        return cache[key]
+
+    structural = tuple(
+        ratio if transformer.constant is not None else (
+            np.eye(*transformer.shape)
+            + np.fromfunction(
+                lambda row, column: 1.0 / (8.0 + row + 2.0 * column),
+                transformer.shape,
+                dtype=float,
+            )
+        )
+        for ratio, transformer in zip(actual, net._transformers)
+    )
+
+    def mode(opened: frozenset[int], ratios=structural) -> Mode:
+        return Mode(
+            tuple(False if index in opened else value
+                  for index, value in enumerate(closed)),
+            conducting, ratios,
+        )
+
+    numeric: dict[frozenset[int], np.ndarray] = {}
+
+    def rows(opened: frozenset[int]) -> np.ndarray:
+        if opened not in numeric:
+            state_space = net._compiled(mode(opened)).state_space
+            numeric[opened] = np.vstack((
+                np.hstack((state_space.A, state_space.B, state_space.B1)),
+                np.hstack((state_space.C, state_space.D, state_space.D1)),
             ))
+        return numeric[opened]
 
-            local = circuit.n_states
-            transform = np.eye(local)
-            inverse = np.eye(local)
-            for index, matrix, inv in circuit._transforms:
-                transform[np.ix_(index, index)] = matrix
-                inverse[np.ix_(index, index)] = inv
-            unsafe = {
-                int(index)
-                for value, _offset, _dimension, _name in circuit.netlist._source_slots
-                for component, name in getattr(value, "state_dependencies", ())
-                for index in circuit._state_index[id(component), name]
-            }
-            for index, _matrix, _inverse in circuit._transforms:
-                if unsafe.intersection(map(int, index)):
-                    unsafe.update(map(int, index))
-            exact = local_to_model[[index for index in range(local) if index not in unsafe]]
-            member_map = {
-                id(component_subsystem[id(component)]): component_subsystem[id(component)]
-                for component in circuit.components if id(component) in component_subsystem
-            }
-            if id(circuit) in component_subsystem:
-                member_map[id(circuit)] = component_subsystem[id(circuit)]
-            skipped = (np.zeros(0, dtype=np.intp)
-                       if model.has_external_state_dependency(tuple(member_map.values())) else exact)
-            plan = _CircuitAnalysisPlan(
-                circuit, local_to_model, transform, inverse,
-                np.asarray(circuit.netlist.states, dtype=np.intp), exact, skipped,
-                groups, labels, interface,
-            )
-            plans.append(plan)
-            all_groups.extend(groups)
-            all_labels.extend(labels)
-            all_interface.update(interface)
-
-        occurrences: dict[int, int] = {}
-        for group in all_groups:
-            for position in group:
-                occurrences[position] = occurrences.get(position, 0) + 1
-        all_interface.update(position for position, count in occurrences.items() if count > 1)
-        grouped = set().union(*all_groups) if all_groups else set()
-        all_interface.update(set(range(n)) - grouped)
-        groups, labels = [], []
-        for group, label in zip(all_groups, all_labels):
-            interior = np.array(sorted(group - all_interface), dtype=np.intp)
-            if interior.size:
-                groups.append(interior)
-                labels.append(label)
-        self._plans = tuple(plans)
-        self._structure = Structure(groups, np.array(sorted(all_interface), dtype=np.intp), labels)
-        self._prepared = True
-
-    @property
-    def plans(self) -> tuple[_CircuitAnalysisPlan, ...]:
-        """Static per-circuit plans, for solvers and exporters."""
-        self._prepare()
-        return self._plans
-
-    def structure(self):
-        """State partition for block linear algebra."""
-        self._prepare()
-        return self._structure
-
-    def mode_key(self):
-        """Current structural identity, excluding continuously variable transformer ratios."""
-        if not self.circuits:
-            return None
-        return tuple(
-            (id(circuit.netlist), (
-                circuit._bound_device_topology() or circuit.netlist.topology()
-            ).mode.key[:2])
-            for circuit in self.circuits
+    def support(opened: frozenset[int]) -> np.ndarray:
+        matrix, reference = rows(opened), rows(frozenset())
+        magnitude = np.maximum(np.abs(matrix), np.abs(reference))
+        scale = np.maximum(
+            magnitude.max(axis=1, initial=0.0)[:, None],
+            magnitude.max(axis=0, initial=0.0)[None, :],
         )
+        return np.abs(matrix - reference) > 1e-12 * scale
 
-    def linear_blocks(self):
-        """Present exact circuit matrices in model coordinates using the static plan."""
-        blocks = []
-        for plan in self.plans:
-            circuit = plan.circuit
-            matrix = np.zeros((circuit.n_states, circuit.n_states))
-            matrix[np.ix_(plan.states, plan.states)] = circuit.netlist.topology().state_space.A
-            blocks.append((plan.local_to_model,
-                           plan.inverse @ matrix @ plan.transform,
-                           plan.exact, plan.skipped))
-        return tuple(blocks)
-
-    def signature(self) -> tuple:
-        """Stable symbolic structure and current discrete mode used by all backends."""
-        self._prepare()
-        dependencies = getattr(getattr(self.model, "dependency_plan", None), "dependencies", ())
-        return dependencies, tuple(
-            (
-                tuple(map(int, plan.local_to_model)),
-                tuple(map(int, plan.exact)),
-                tuple(map(int, plan.skipped)),
-                (plan.circuit._bound_device_topology()
-                 or plan.circuit.netlist.topology()).mode.key,
-            )
-            for plan in self._plans
-        )
-
-    def switch_decomposition(
-        self,
-        circuit: Circuit,
-        free: Sequence[int],
-        closed: Sequence[bool],
-        conducting: Sequence[bool],
-    ) -> Optional[_SwitchDecomposition]:
-        """Find deterministic independent switch clusters from the ordinary netlist equations.
-
-        Each individual switch first contributes the state-space entries changed from the all-closed
-        reference. Overlapping supports form a cluster. Exact cross-cluster combinations are then
-        checked; clusters are merged until their contributions superpose. The result enumerates only
-        local cluster modes, never the Cartesian product of independent clusters. Dynamic transformer
-        ratios use the current value and two deterministic perturbations of the same shape.
-        """
-        free = tuple(map(int, free))
-        if len(free) < 2:
-            return None
-        net = circuit.netlist
-        actual = tuple(
-            np.asarray(ratio, dtype=float)
-            for ratio in (net._ratio_override if net._ratio_override is not None
-                          else tuple(transformer.ratio() for transformer in net._transformers))
-        )
-        ratio_key = tuple((ratio.shape, ratio.tobytes()) for ratio in actual)
-        key = id(circuit), free, tuple(closed), tuple(conducting), ratio_key
-        if key in self._switch_decompositions:
-            return self._switch_decompositions[key]
-        varies = tuple(transformer.constant is None for transformer in net._transformers)
-        samples = [actual]
-        if any(varies):
-            for weight in (0.75, 1.25):
-                samples.append(tuple(
-                    ratio * weight + (1.0 - weight) * np.eye(*ratio.shape)
-                    if dynamic and ratio.ndim == 2 else ratio * weight if dynamic else ratio
-                    for ratio, dynamic in zip(actual, varies)
-                ))
-
-        def mode(opened: frozenset[int], ratios: Sequence[np.ndarray]) -> Mode:
-            return Mode(
-                tuple(False if index in opened else value
-                      for index, value in enumerate(closed)),
-                conducting, ratios,
+    def combinations(cluster: Sequence[int], *, include_empty: bool = False):
+        start = 0 if include_empty else 1
+        for bits in range(start, 1 << len(cluster)):
+            yield frozenset(
+                switch for position, switch in enumerate(cluster) if bits >> position & 1
             )
 
-        numeric: dict[tuple[frozenset[int], int], np.ndarray] = {}
-
-        def rows(opened: frozenset[int], sample: int) -> np.ndarray:
-            cache_key = opened, sample
-            if cache_key not in numeric:
-                state_space = net._compiled(mode(opened, samples[sample])).state_space
-                numeric[cache_key] = np.vstack((
-                    np.hstack((state_space.A, state_space.B, state_space.B1)),
-                    np.hstack((state_space.C, state_space.D, state_space.D1)),
-                ))
-            return numeric[cache_key]
-
-        def support(opened: frozenset[int]) -> np.ndarray:
-            changed = None
-            for sample in range(len(samples)):
-                matrix, reference = rows(opened, sample), rows(frozenset(), sample)
-                magnitude = np.maximum(np.abs(matrix), np.abs(reference))
-                scale = np.maximum(
-                    magnitude.max(axis=1, initial=0.0)[:, None],
-                    magnitude.max(axis=0, initial=0.0)[None, :],
-                )
-                mask = np.abs(matrix - reference) > 1e-12 * scale
-                changed = mask if changed is None else changed | mask
-            return changed
-
-        def combinations(cluster: Sequence[int], *, include_empty: bool = False):
-            start = 0 if include_empty else 1
-            for bits in range(start, 1 << len(cluster)):
-                yield frozenset(
-                    switch for position, switch in enumerate(cluster) if bits >> position & 1
-                )
-
-        try:
-            supports = {switch: support(frozenset((switch,))) for switch in free}
-            clusters: list[list[int]] = []
-            for switch in free:
-                touching = [index for index, cluster in enumerate(clusters)
-                            if any(np.any(supports[switch] & supports[item]) for item in cluster)]
-                if not touching:
-                    clusters.append([switch])
-                    continue
-                first = touching[0]
-                clusters[first].append(switch)
-                for index in reversed(touching[1:]):
-                    clusters[first].extend(clusters.pop(index))
-
-            while True:
-                merged = False
-                for left in range(len(clusters)):
-                    if merged:
-                        break
-                    for right in range(left + 1, len(clusters)):
-                        a, b = clusters[left], clusters[right]
-                        independent = True
-                        for sample in range(len(samples)):
-                            base = rows(frozenset(), sample)
-                            scale = max(1.0, float(np.max(np.abs(base), initial=0.0)))
-                            for opened_a in combinations(a, include_empty=True):
-                                for opened_b in combinations(b, include_empty=True):
-                                    expected = (rows(opened_a, sample) + rows(opened_b, sample) - base)
-                                    if not np.allclose(
-                                        expected, rows(opened_a | opened_b, sample),
-                                        rtol=1e-10, atol=1e-13 * scale,
-                                    ):
-                                        independent = False
-                                        break
-                                if not independent:
-                                    break
-                            if not independent:
-                                break
-                        if not independent:
-                            clusters[left].extend(clusters.pop(right))
-                            merged = True
-                            break
-                if not merged:
-                    break
-
-            options = [tuple(combinations(cluster)) for cluster in clusters]
-            base_rows = rows(frozenset(), 0)
-            owners: list[list[int]] = [[] for _row in range(base_rows.shape[0])]
-            for cluster_index, choices in enumerate(options):
-                affected = np.zeros(base_rows.shape[0], dtype=bool)
-                for opened in choices:
-                    affected |= np.any(support(opened), axis=1)
-                for row in np.flatnonzero(affected).tolist():
-                    owners[row].append(cluster_index)
-            modes: dict[frozenset[int], Mode] = {
-                frozenset(): mode(frozenset(), actual)
-            }
-            for choices in options:
-                modes.update((opened, mode(opened, actual)) for opened in choices)
-            topologies = tuple(net._compiled(item) for item in modes.values())
-        except (_Degenerate, ValueError, np.linalg.LinAlgError):
-            self._switch_decompositions[key] = None
-            return None
-        result = _SwitchDecomposition(clusters, owners, modes, topologies)
-        self._switch_decompositions[key] = result
-        return result
-
-    def explicit_stable(self, method: str, step: float) -> bool:
-        """Whether every present linear circuit mode lies in an explicit RK stability region."""
-        from ..solver.integrators import TABLEAUS
-
-        _c, rows, weights = TABLEAUS[method]
-        for circuit in self.circuits:
-            topology = circuit.netlist.topology()
-            if (circuit.netlist.form == "device" and topology._state_space is None
-                    and any(transformer.constant is None
-                            for transformer in circuit.netlist._transformers)):
+    try:
+        supports = {switch: support(frozenset((switch,))) for switch in free}
+        clusters: list[list[int]] = []
+        for switch in free:
+            touching = [index for index, cluster in enumerate(clusters)
+                        if any(np.any(supports[switch] & supports[item]) for item in cluster)]
+            if not touching:
+                clusters.append([switch])
                 continue
-            key = id(circuit.netlist), topology.mode.key
-            result_key = method, key
-            bounds = self._explicit_stability.get(result_key)
-            if bounds is not None:
-                self._explicit_stability.move_to_end(result_key)
-                stable_below, unstable_above = bounds
-                if step <= stable_below:
-                    continue
-                if step >= unstable_above:
-                    return False
-            eigenvalues = self._mode_eigenvalues.get(key)
-            if eigenvalues is None:
-                eigenvalues = np.linalg.eigvals(topology.state_space.A)
-                self._mode_eigenvalues[key] = eigenvalues
-                self._mode_eigenvalues.move_to_end(key)
-                while len(self._mode_eigenvalues) > circuit.netlist.cache_size:
-                    self._mode_eigenvalues.popitem(last=False)
+            first = touching[0]
+            clusters[first].append(switch)
+            for index in reversed(touching[1:]):
+                clusters[first].extend(clusters.pop(index))
 
-            def stable_at(candidate: float) -> bool:
-                for eigenvalue in eigenvalues:
-                    scale = max(1.0, abs(eigenvalue))
-                    if eigenvalue.real > 1e-12 * scale:
-                        continue
-                    z = candidate * eigenvalue
-                    stages = [1.0 + 0.0j]
-                    for row in rows:
-                        stages.append(1.0 + z * sum(
-                            coefficient * value for coefficient, value in zip(row, stages)
-                        ))
-                    amplification = 1.0 + z * sum(
-                        coefficient * value for coefficient, value in zip(weights, stages)
+        while True:
+            merged = False
+            for left in range(len(clusters)):
+                if merged:
+                    break
+                for right in range(left + 1, len(clusters)):
+                    a, b = clusters[left], clusters[right]
+                    base = rows(frozenset())
+                    scale = max(1.0, float(np.max(np.abs(base), initial=0.0)))
+                    independent = all(
+                        np.allclose(
+                            rows(opened_a) + rows(opened_b) - base,
+                            rows(opened_a | opened_b),
+                            rtol=1e-10, atol=1e-13 * scale,
+                        )
+                        for opened_a in combinations(a, include_empty=True)
+                        for opened_b in combinations(b, include_empty=True)
                     )
-                    if abs(amplification) > 1.0 + 1e-10:
-                        return False
-                return True
+                    if not independent:
+                        clusters[left].extend(clusters.pop(right))
+                        merged = True
+                        break
+            if not merged:
+                break
 
-            stable = stable_at(step)
-            previous_stable, previous_unstable = bounds or (0.0, math.inf)
-            if stable:
-                probe = 1.25 * step
-                probe_stable = stable_at(probe)
-                bounds = (max(previous_stable, probe if probe_stable else step),
-                          previous_unstable if probe_stable else min(previous_unstable, probe))
-            else:
-                bounds = previous_stable, min(previous_unstable, step)
-            self._explicit_stability[result_key] = bounds
-            self._explicit_stability.move_to_end(result_key)
-            while len(self._explicit_stability) > circuit.netlist.cache_size:
-                self._explicit_stability.popitem(last=False)
-            if not stable:
-                return False
-        return True
+        options = [tuple(combinations(cluster)) for cluster in clusters]
+        base_rows = rows(frozenset())
+        owners: list[list[int]] = [[] for _row in range(base_rows.shape[0])]
+        for cluster_index, choices in enumerate(options):
+            affected = np.zeros(base_rows.shape[0], dtype=bool)
+            for opened in choices:
+                affected |= np.any(support(opened), axis=1)
+            for row in np.flatnonzero(affected).tolist():
+                owners[row].append(cluster_index)
+        modes: dict[frozenset[int], Mode] = {
+            frozenset(): mode(frozenset(), actual)
+        }
+        for choices in options:
+            modes.update((opened, mode(opened, actual)) for opened in choices)
+        topologies = tuple(net._compiled(item) for item in modes.values())
+    except (_Degenerate, ValueError, np.linalg.LinAlgError):
+        cache[key] = None
+        return None
+    result = _SwitchDecomposition(clusters, owners, modes, topologies)
+    cache[key] = result
+    return result

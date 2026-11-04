@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Callable, Mapping, Optional
 
 from ..components.network import ACVoltageSource, ELEMENT_TYPES, RCNode, RLBranch, Port
@@ -560,7 +561,9 @@ class System:
                     target = (unit.ctrl, channel)
                     claim_connections((target,), where)
                     connections[target] = (subsystem, output)
-        from .circuit import CircuitAnalysis, compile_network, lower
+        from .circuit import (circuit_linear_blocks, circuit_linear_dynamic,
+                              circuit_linear_modes, circuit_mode_key,
+                              circuit_structure, compile_network, lower)
         declarations = {id(subsystem): compile_network(subsystem)
                         for subsystem in subsystems.values()}
         subsystems, connections, zoh, circuit = lower(
@@ -569,7 +572,11 @@ class System:
         self.circuits = () if circuit is None else (circuit,)
         self.model = Model(
             subsystems, connections, zoh,
-            structural_analysis=CircuitAnalysis(self.circuits),
+            linear_structure=partial(circuit_structure, circuits=self.circuits),
+            linear_mode_key=partial(circuit_mode_key, circuits=self.circuits),
+            linear_blocks=partial(circuit_linear_blocks, circuits=self.circuits),
+            linear_modes=partial(circuit_linear_modes, circuits=self.circuits),
+            linear_dynamic=circuit_linear_dynamic(self.circuits),
         )
         self.event_subsystems = tuple(
             (name, subsystem)

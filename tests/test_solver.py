@@ -27,8 +27,8 @@ def test_solver_and_control_output_stage_names_do_not_collide():
 def test_fixed_explicit_solver_uses_implicit_step_for_an_unstable_linear_mode():
     class StiffMode:
         @staticmethod
-        def explicit_stable(_method, _step):
-            return False
+        def linear_modes():
+            return (("stiff", np.array([[-1e8]])),)
 
     solver = FixedStepSolver(1e-5, model=StiffMode())
     result = solver(lambda _t, y: -1e8 * y, 0.0, 1e-5, np.array([1.0]))
@@ -47,9 +47,9 @@ def test_fixed_explicit_stability_is_reused_by_equation_mode():
         def linear_mode_key(self):
             return self.mode
 
-        def explicit_stable(self, _method, _step):
+        def linear_modes(self):
             self.checks += 1
-            return True
+            return ((self.mode, np.array([[-1.0]])),)
 
     model = Modes()
     solver = FixedStepSolver(1e-5, model=model)
@@ -77,9 +77,9 @@ def test_continuous_linear_modes_recheck_explicit_stability():
         equation_revision = 0
         checks = 0
 
-        def explicit_stable(self, _method, _step):
+        def linear_modes(self):
             self.checks += 1
-            return True
+            return ((self.checks, np.array([[-1.0]])),)
 
     model = DynamicMode()
     solver = FixedStepSolver(1e-5, model=model)

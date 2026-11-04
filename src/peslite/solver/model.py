@@ -1151,6 +1151,14 @@ def _component_plan(dependencies) -> tuple[tuple[int, ...], ...]:
     return _ordered_components(_dependency_plan(dependencies))
 
 
+def _no_linear_mode():
+    return None
+
+
+def _no_linear_data():
+    return ()
+
+
 class Model:
     """Connected subsystems evaluated as ``rhs(t, y)`` on a flat real state vector.
 
@@ -1158,7 +1166,7 @@ class Model:
     dots in names form namespaces.
     ``connections``: ``(dst, input) -> (src, output[, gain])`` or a list of these (summed).
     ``zoh_connections``: ``(dst, input) -> label`` for held inputs set by :meth:`set_zoh_input`.
-    ``structural_analysis``: optional shared network analysis for linear solves and export.
+    Assembly may supply the state structure and exact linear circuit blocks used by solvers.
     """
 
     def __init__(
@@ -1166,9 +1174,17 @@ class Model:
         subsystems: Sequence[Subsystem] | Mapping[str, Subsystem],
         connections: Mapping[Connection, Connection | Sequence[Connection]],
         zoh_connections: Mapping[Connection, str] | None = None,
-        *, structural_analysis: Any = None,
+        *, linear_structure: Callable[[Model], Any] | None = None,
+        linear_mode_key: Callable[[], Any] | None = None,
+        linear_blocks: Callable[[], Sequence[Any]] | None = None,
+        linear_modes: Callable[[], Sequence[Any]] | None = None,
+        linear_dynamic: bool = False,
     ) -> None:
-        self.structural_analysis = structural_analysis
+        self._linear_structure_builder = linear_structure
+        self.linear_mode_key = linear_mode_key or _no_linear_mode
+        self.linear_blocks = linear_blocks or _no_linear_data
+        self.linear_modes = linear_modes or _no_linear_data
+        self._linear_dynamic = bool(linear_dynamic)
         self.equation_revision = 0
         if isinstance(subsystems, Mapping):
             names = [str(n) for n in subsystems]
@@ -1206,8 +1222,8 @@ class Model:
         self._external_state_dependency_cache: dict[frozenset[int], bool] = {}
         self._build_evaluation_plan()
         self._compile()
-        if self.structural_analysis is not None:
-            self.structural_analysis.bind(self)
+        self._structure = (self._linear_structure_builder(self)
+                           if self._linear_structure_builder is not None else None)
         # energy declaration per subsystem (default if none declared)
         self.energy_specs: dict[str, _energy.EnergySpec] = {n: _energy.spec_of(s) for n, s in zip(names, subsystems)}
         self._held_input_refresh = tuple(
@@ -1221,35 +1237,18 @@ class Model:
         self._compile()
         self._energy_balance_plan = None
         self._external_state_dependency_cache.clear()
-        if self.structural_analysis is not None:
-            self.structural_analysis.invalidate()
-            self.structural_analysis.bind(self)
+        self._structure = (self._linear_structure_builder(self)
+                           if self._linear_structure_builder is not None else None)
         self.plan_revision += 1
 
     def linear_structure(self):
         """Return the state partition supplied by assembly, or use the solver's dense default."""
-        return (self.structural_analysis.structure()
-                if self.structural_analysis is not None else None)
-
-    def linear_mode_key(self):
-        """Return the current assembled equation mode, or ``None`` without a structural key."""
-        return (self.structural_analysis.mode_key()
-                if self.structural_analysis is not None else None)
-
-    def linear_blocks(self):
-        """Return present-mode exact circuit blocks for an implicit Newton matrix."""
-        return (self.structural_analysis.linear_blocks()
-                if self.structural_analysis is not None else ())
-
-    def explicit_stable(self, method: str, step: float) -> bool:
-        """Return whether the assembled linear modes are stable at one explicit RK step."""
-        return (self.structural_analysis.explicit_stable(method, step)
-                if self.structural_analysis is not None else True)
+        return self._structure
 
     @property
     def explicit_stability_dynamic(self) -> bool:
         """Whether continuously varying network ratios require a stability check every step."""
-        return bool(self.structural_analysis is not None and self.structural_analysis.dynamic)
+        return self._linear_dynamic
 
     def invalidate_equations(self) -> None:
         """Record a boundary change which may select different continuous equations."""

@@ -174,6 +174,7 @@ class FixedStepSolver:
         self._stable_step = 0.0
         self._unstable_step = math.inf
         self._stability_modes: OrderedDict[object, tuple[float, float]] = OrderedDict()
+        self._mode_eigenvalues: OrderedDict[object, NDArray[np.complex128]] = OrderedDict()
         self._dynamic_stability = bool(
             getattr(model, "explicit_stability_dynamic", False)
         )
@@ -186,16 +187,49 @@ class FixedStepSolver:
         self._stable_step = 0.0
         self._unstable_step = math.inf
         self._stability_modes.clear()
+        self._mode_eigenvalues.clear()
         if self._implicit is not None:
             self._implicit.parameters_changed()
 
+    def _explicit_stable(self, step: float) -> bool:
+        """Check assembled linear modes against this Runge-Kutta stability region."""
+        modes = getattr(self.model, "linear_modes", None)
+        if not callable(modes):
+            return True
+        _c, rows, weights = TABLEAUS[self.method]
+        for key, matrix in modes():
+            eigenvalues = self._mode_eigenvalues.get(key)
+            if eigenvalues is None:
+                eigenvalues = np.linalg.eigvals(matrix)
+                self._mode_eigenvalues[key] = eigenvalues
+                self._mode_eigenvalues.move_to_end(key)
+                while len(self._mode_eigenvalues) > 64:
+                    self._mode_eigenvalues.popitem(last=False)
+            else:
+                self._mode_eigenvalues.move_to_end(key)
+            for eigenvalue in eigenvalues:
+                scale = max(1.0, abs(eigenvalue))
+                if eigenvalue.real > 1e-12 * scale:
+                    continue
+                z = step * eigenvalue
+                stages = [1.0 + 0.0j]
+                for row in rows:
+                    stages.append(1.0 + z * sum(
+                        coefficient * value for coefficient, value in zip(row, stages)
+                    ))
+                amplification = 1.0 + z * sum(
+                    coefficient * value for coefficient, value in zip(weights, stages)
+                )
+                if abs(amplification) > 1.0 + 1e-10:
+                    return False
+        return True
+
     def _stiff(self, step: float) -> bool:
-        stable = getattr(self.model, "explicit_stable", None)
-        if stable is None:
+        if not callable(getattr(self.model, "linear_modes", None)):
             return False
         revision = getattr(self.model, "equation_revision", 0)
         if self._dynamic_stability:
-            return not stable(self.method, step)
+            return not self._explicit_stable(step)
         if revision != self._stability_revision:
             self._stability_revision = revision
             mode_key = getattr(self.model, "linear_mode_key", lambda: None)()
@@ -208,7 +242,7 @@ class FixedStepSolver:
             return False
         if step >= self._unstable_step:
             return True
-        result = not stable(self.method, step)
+        result = not self._explicit_stable(step)
         if result:
             self._unstable_step = min(self._unstable_step, step)
         else:

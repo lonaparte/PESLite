@@ -38,7 +38,7 @@ from ..solver.model import _dependency_plan, commutation_tolerance
 from ..solver.netlist import Mode, Topology, _DELTA_T, _FLOAT_RTOL, _MAX_PATTERNS, _symbolic_solve
 from ..solver.timing import TIME_EPS
 from .conduction import DiodeConduction, _LOCATOR_ITERATIONS, _MAX_COMMUTATIONS
-from .circuit import NetworkView, _BoundValue, compile_network
+from .circuit import NetworkView, _BoundValue, _switch_decomposition, compile_network
 from .protection import ProtectionStats
 from .params import (BaseValues, SourceParams, UnitParams, _PARAMETER_RECORDER, _event_assignments,
                      _written_out, connection_defaults, dumps, parameter_leaves)
@@ -689,7 +689,6 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
         implicit_jacobian.assign(state_count * state_count, 0.0);
         implicit_factors.clear();
         auto& matrix = implicit_jacobian;
-        {exact_body}
         State probe = state, value{{}};
         for (std::size_t j = 0; j < state_count; ++j) {{
             if (implicit_exact_columns[j]) continue;
@@ -700,6 +699,7 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
             for (std::size_t i = 0; i < state_count; ++i)
                 implicit_jacobian[i * state_count + j] = (value[i] - f0[i]) / increment;
         }}
+        {exact_body}
         implicit_mode = {mode};
         implicit_mode_valid = true;
         auto found = std::find_if(implicit_modes.begin(), implicit_modes.end(),
@@ -2937,7 +2937,7 @@ class _ModelGenerator:
 
     @classmethod
     def _switched_decomposition(cls, circuit: Any):
-        """Use the assembled structural analysis to split independent run-time switches."""
+        """Split independently acting run-time switches from the lowered circuit."""
         flags = tuple(cls._switch_flag(switch) for switch in circuit.netlist._switches)
         free = tuple(index for index, flag in enumerate(flags) if flag is not None)
         if len(free) < 2:
@@ -2948,10 +2948,7 @@ class _ModelGenerator:
         for index, gate in circuit.netlist._gates:
             if bool(gate()):
                 conducting[index] = True
-        analysis = getattr(getattr(circuit, "_analysis", None), "switch_decomposition", None)
-        if analysis is None:
-            return None
-        decomposition = analysis(circuit, free, closed, tuple(conducting))
+        decomposition = _switch_decomposition(circuit, free, closed, tuple(conducting))
         return None if decomposition is None else (decomposition, flags)
 
     @classmethod
@@ -3249,13 +3246,13 @@ class _ModelGenerator:
                 for index, complex_state in entries]
 
     def implicit_linearization(self) -> tuple[tuple[bool, ...], list[str]]:
-        """Lower the exact circuit columns selected by the shared structural analysis."""
-        analysis = getattr(self.model, "structural_analysis", None)
-        if analysis is None:
-            return (False,) * self.model.n_states, []
+        """Lower exact circuit columns selected while building the circuit structure."""
         exact = np.zeros(self.model.n_states, dtype=bool)
         lines: list[str] = []
-        for plan in analysis.plans:
+        for circuit in self.system.circuits:
+            plan = circuit._structure_plan
+            if plan is None:
+                raise RuntimeError("circuit structure is unavailable during C++ export")
             circuit = plan.circuit
             exact[plan.skipped] = True
             model_to_local = {
@@ -6948,11 +6945,14 @@ class _CppGenerator:
             rhs = f"if (!({guard})) {{ evaluate_feedback(t, y, dy); return; }}\n        " + rhs
         sync_body = "\n        ".join(model.body(derivatives=False))
         native_implicit = isinstance(self.simulation.solver, ImplicitSolver)
-        analysis = getattr(self.model, "structural_analysis", None)
+        structure = self.model.linear_structure()
+        circuit_plans = tuple(
+            circuit._structure_plan for circuit in self.system.circuits
+            if circuit._structure_plan is not None
+        )
         stiff_fallback = (
             isinstance(self.simulation.solver, FixedStepSolver)
-            and analysis is not None
-            and any(plan.local_to_model.size for plan in analysis.plans)
+            and any(plan.local_to_model.size for plan in circuit_plans)
         )
         uses_implicit_linearization = native_implicit or stiff_fallback
         implicit_exact_columns: tuple[bool, ...] = ()
@@ -7172,7 +7172,6 @@ class _CppGenerator:
             fixed_dt = f"std::min({fixed_dt}, maximum_step)"
             adaptive_max_step = f"std::min({adaptive_max_step}, maximum_step)"
         if implicit:
-            structure = analysis.structure() if analysis is not None else None
             solver_code = _implicit_solver(self.simulation.solver, integration_name, integration_args,
                                            fixed_dt, adaptive_atol, adaptive_rtol, raw_projection_call,
                                            exact_columns=implicit_exact_columns,
@@ -7183,7 +7182,6 @@ class _CppGenerator:
         elif fixed:
             step_code = _fixed_step(solver.method)
             if stiff_fallback:
-                structure = analysis.structure()
                 fallback = ImplicitSolver(
                     solver.dt, "radau", solver.rtol, solver.atol
                 )
@@ -7196,7 +7194,7 @@ class _CppGenerator:
                     groups=structure.groups,
                     interface=structure.interface,
                 )
-                blocks = tuple(plan.local_to_model for plan in analysis.plans)
+                blocks = tuple(plan.local_to_model for plan in circuit_plans)
                 stability_code = _explicit_stability(solver.method, blocks)
                 stiff_call = (
                     "integrate_stiff(t, target, maximum_step);"
