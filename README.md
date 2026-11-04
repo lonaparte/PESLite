@@ -92,24 +92,10 @@ for compilation, runtime configuration and current backend limits.
 
 ## Documentation
 
+- [Documentation](https://github.com/lonaparte/PESLite/wiki)
 - [Getting Started](https://github.com/lonaparte/PESLite/wiki/Getting-Started)
-- [Project Workspace](https://github.com/lonaparte/PESLite/wiki/Project-Workspace)
-- [Simulation Files](https://github.com/lonaparte/PESLite/wiki/Simulation-Files)
-- [Events Timeline](https://github.com/lonaparte/PESLite/wiki/Events-Timeline)
-- [Output and Results](https://github.com/lonaparte/PESLite/wiki/Output-and-Results)
-- [Solvers](https://github.com/lonaparte/PESLite/wiki/Solvers)
-- [Multirate Simulation](https://github.com/lonaparte/PESLite/wiki/Multirate-Simulation)
-- [Passive Network Components](https://github.com/lonaparte/PESLite/wiki/Passive-Network-Components)
-- [Electrical Sources](https://github.com/lonaparte/PESLite/wiki/Electrical-Sources)
-- [Bridge and PWM](https://github.com/lonaparte/PESLite/wiki/Bridge-and-PWM)
-- [Voltage-Source Converters](https://github.com/lonaparte/PESLite/wiki/Voltage-Source-Converters)
-- [DC converters and WPT](https://github.com/lonaparte/PESLite/wiki/DC-Converters-and-WPT)
-- [Architecture](https://github.com/lonaparte/PESLite/wiki/Architecture)
-- [Extending PESLite](https://github.com/lonaparte/PESLite/wiki/Extending-PESLite)
-- [CLI Reference](https://github.com/lonaparte/PESLite/wiki/CLI-Reference)
 - [Examples](https://github.com/lonaparte/PESLite/wiki/Examples)
-
-The Wiki documents the current `main` branch. Releases and the changelog record versioned changes.
+- [CLI Reference](https://github.com/lonaparte/PESLite/wiki/CLI-Reference)
 
 ## Development
 
