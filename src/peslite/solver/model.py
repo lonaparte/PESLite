@@ -1476,7 +1476,10 @@ class Model:
                 terms = tuple((entry[0].output, entry[1], float(entry[2]) if len(entry) > 2 else 1.0)
                               for entry in entries)
                 operation = (dst.input, field, None, None, terms)
-            node = add(("copy", operation), dst, sources, f"{names[id(dst)]}.input.{field}")
+            node = add(
+                ("copy", operation), dst, sources, f"{names[id(dst)]}.input.{field}",
+                rhs=bool(dst.state_names),
+            )
             copies[id(dst), field] = node
             for entry in entries:
                 source = producer(entry[0], entry[1])

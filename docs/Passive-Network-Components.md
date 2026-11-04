@@ -4,21 +4,23 @@ Passive network components are configured under `buses`, `branches` and `element
 
 ## Buses
 
-A bus is a named capacitor node:
+A bus is a named electrical connection point with an optional shunt capacitor:
 
 ```yaml
 buses:
   pcc: {c_pu: 0.02, r_d_pu: 0.5, phases: 3}
-  output: {c: 470e-6, phases: 1}
+  output: {phases: 1}
 ```
 
 | Field | Required | Default | Meaning |
 |---|---:|---|---|
-| `c` or `c_pu` | yes | — | shunt capacitance |
+| `c` or `c_pu` | no | none | shunt capacitance |
 | `r_d` or `r_d_pu` | no | 0 | series damping resistance |
 | `phases` | no | 3 | `1` for a real single-phase node or `3` for a three-phase space-vector node |
 
-A circuit that does not need a capacitor node does not need a `buses` section.
+Without `c`, the bus only joins the ports of branches, sources, Units or other elements and adds no
+state or physical component. Declaring an empty bus is allowed but not recommended because the
+connection point then has no electrical effect. `r_d` is valid only with `c`.
 
 ## Branches
 

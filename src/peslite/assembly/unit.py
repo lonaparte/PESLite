@@ -94,6 +94,14 @@ class Unit(ABC):
     def __init__(self, name: str, cfg: UnitParams, bus: Any) -> None:
         """Bind the identity, event scenario and DC link shared by converter units."""
         self.name, self.cfg, self.bus = name, cfg, bus
+        if bus is None:
+            self._bus_voltage_field, self._bus_voltage = None, None
+        elif bus.voltage_field == "voltage":
+            self._bus_voltage_field = bus.voltage_field
+            self._bus_voltage = lambda: bus.port.voltage
+        else:
+            self._bus_voltage_field = bus.voltage_field
+            self._bus_voltage = lambda: bus.output.u
         self._current_channel = unit_type(cfg.type).current_channel
         self.scenario = Scenario(cfg.events, f"units.{name}", initial=cfg.connected)
         self.dclink = _parameterized(lambda c: make_dclink(c.dclink), cfg)
@@ -682,7 +690,7 @@ class VSC(Unit):
         # ------------------------------------------------------------ ADC
         self.ports = MeasurementPorts(
             {
-                "u_g": lambda: bus.output.u,
+                "u_g": self._bus_voltage,
                 "i_c": lambda: self.branch_f.output.i,
                 "u_dc": lambda: self.dclink.output.u_dc,
             }
@@ -712,7 +720,7 @@ class VSC(Unit):
         connections = {}
         if self.continuous:
             connections.update({
-                (self.ctrl, "u_g"): (self.bus, "u"),
+                (self.ctrl, "u_g"): (self.bus, self._bus_voltage_field),
                 (self.ctrl, "i_c"): (self.branch_f, "i"),
                 (self.ctrl, "u_dc"): (self.dclink, "u_dc"),
                 (self.bridge, "q"): (self.ctrl, "q"),
@@ -752,7 +760,7 @@ class VSC(Unit):
         """Return this unit's recorded signals (SI); outputs must be synced first."""
         return {
             f"{self.name}.i_c": self.branch_f.output.i,
-            f"{self.name}.u_g": self.bus.output.u,
+            f"{self.name}.u_g": self._bus_voltage(),
             f"{self.name}.u_dc": self.dclink.output.u_dc,
             f"{self.name}.i_dc": -self.dclink.port.current,
         }
@@ -830,7 +838,8 @@ class DCConverter(Unit):
         self._external_lower_rail = getattr(topology, "external_port", None) == "lower_rail"
         if self._external_lower_rail and self.branch_f is not None:
             self.branch_f.port2.grounded = True
-        power_voltage_port = (bus, "u") if bus is not None else (self.bridge, "u_c")
+        power_voltage_port = ((bus, self._bus_voltage_field)
+                              if bus is not None else (self.bridge, "u_c"))
         self._control_voltage_port = (
             power_voltage_port if self._external_lower_rail or not topology.reverse_port
             else (self.dclink, "u_dc")
@@ -982,7 +991,8 @@ class DCConverter(Unit):
         return {
             f"{self.name}.i_c": self._current(),
             f"{self.name}.u_g": (
-                self.bus.output.u if self.bus is not None else self.bridge.output.u_c
+                self._bus_voltage()
+                if self.bus is not None else self.bridge.output.u_c
             ),
             f"{self.name}.u_dc": self.dclink.output.u_dc,
             f"{self.name}.i_dc": self.bridge.output.i_dc,

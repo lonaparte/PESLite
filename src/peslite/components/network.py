@@ -209,6 +209,7 @@ class RCNode(NetworkComponent):
     """
 
     state_names: ClassVar[tuple[str, ...]] = ("u_C",)
+    voltage_field: ClassVar[str] = "u"
     outputs_need_inputs: ClassVar[bool] = False
     def __init__(self, C: float, R_d: float, u0: complex | float = 0j, *, phases: int = 3) -> None:
         self.power_scale, zero, initial = _phase_convention(phases, u0)

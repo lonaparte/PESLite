@@ -93,6 +93,56 @@ def test_public_bus_may_have_no_attached_component(case):
     assert node.port.current == 0j
 
 
+@pytest.mark.parametrize("circuit_model", ("device", "statewise", "nodal"))
+@pytest.mark.parametrize("bridge_model", ("switching", "pwm_averaging", "averaging"))
+def test_bus_without_capacitance_joins_devices_without_adding_a_state(
+        case, tmp_path, circuit_model, bridge_model):
+    tree = case()
+    tree["buses"]["pcc"] = {"phases": 3}
+    tree["elements"] = {"load": {"type": "resistor", "bus": "pcc", "r": 10.0}}
+    tree["units"]["vsc"]["bridge"] = {"model": bridge_model}
+    tree["simulation"].update(t_end=5e-5, energy_check="off")
+    tree["simulation"]["solver"]["circuit_model"] = circuit_model
+    tree["simulation"]["progress"] = {"enable": 0}
+    simulation = peslite.Simulation(from_dict(tree))
+    simulation.run(out_dir=tmp_path)
+    bus = simulation.system.buses["pcc"]
+
+    assert bus.state_names == ()
+    assert bus.port is not None
+    assert simulation.system.units["vsc"].bus is bus
+    assert abs(simulation.system.signals(tree["simulation"]["t_end"])["pcc.u"]) > 0.0
+
+
+def test_empty_bus_without_capacitance_has_no_model_or_signal(case):
+    tree = case()
+    tree["buses"]["unused"] = {}
+    system = peslite.System(from_dict(tree))
+
+    assert system.buses["unused"].port is None
+    assert "unused" not in system.model.names
+    assert "unused.u" not in system.signals(0.0)
+
+
+def test_bus_damping_resistance_requires_capacitance(case):
+    tree = case()
+    tree["buses"]["pcc"] = {"r_d": 1.0}
+
+    with pytest.raises(ConfigError, match=r"buses\.pcc\.r_d requires c"):
+        from_dict(tree)
+
+
+def test_bus_capacitance_cannot_be_added_during_a_run(case):
+    tree = case()
+    tree["buses"]["pcc"] = {"phases": 3}
+    tree["events"] = {"add_capacitor": {
+        "type": "set", "t": 1e-3, "set": {"buses.pcc.c": 1e-3},
+    }}
+
+    with pytest.raises(ConfigError, match=r"buses\.pcc\.c cannot change during a run"):
+        from_dict(tree)
+
+
 def test_assembly_rejects_a_subsystem_name_collision(case):
     params = from_dict(case())
     unit = peslite.System(params).units["vsc"]

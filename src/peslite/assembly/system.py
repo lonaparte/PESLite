@@ -389,14 +389,22 @@ class System:
         parts = dict(parts or {})
         base = p.base
         # ---------------------------------------------------------- the elements
-        # Three-phase buses start at one pu; scalar buses start de-energized unless overridden.
-        self.buses = {name: _parameterized(lambda values: RCNode(
-                          values[0].c,
-                          values[0].r_d,
-                          u0=values[1].v_phase_peak if values[0].phases == 3 else 0.0,
-                          phases=values[0].phases,
-                      ), (cfg, base))
-                      for name, cfg in p.buses.items()}
+        # A capacitor gives the bus a physical state; otherwise it remains a connection point.
+        def make_bus(values):
+            cfg, system_base = values
+            if cfg.c is None:
+                return _PortMeasurement(phases=cfg.phases)
+            return RCNode(
+                cfg.c,
+                cfg.r_d,
+                u0=system_base.v_phase_peak if cfg.phases == 3 else 0.0,
+                phases=cfg.phases,
+            )
+
+        self.buses = {
+            name: _parameterized(make_bus, (cfg, base))
+            for name, cfg in p.buses.items()
+        }
         assembled = _UnitAssembly()
         for name, cfg in p.units.items():
             assembled.include(_assemble_unit(name, cfg, self, parts))
@@ -427,7 +435,12 @@ class System:
             connection_targets.update(targets)
 
         bus_ports: dict[str, list[Port]] = {
-            name: [node.port] for name, node in self.buses.items()
+            name: ([] if node.port is None else [node.port])
+            for name, node in self.buses.items()
+        }
+        continuous_bus_signals = {
+            id(unit.bus) for unit in self.units.values()
+            if unit.continuous and unit.ctrl is not None
         }
         network_buses = {**assembled.endpoints, **self.buses}
 
@@ -490,6 +503,15 @@ class System:
                         f"{type(port).__name__}, not Port"
                     )
                 bus_ports.setdefault(resolve_bus(bus_name), []).append(port)
+        for name, bus in self.buses.items():
+            if bus.port is not None:
+                continue
+            if bus_ports[name]:
+                bus.observe(bus_ports[name][0])
+                if id(bus) not in continuous_bus_signals:
+                    subsystems.pop(name)
+            else:
+                subsystems.pop(name)
         circuit_model = p.simulation.solver.circuit_model
         for element in elements:
             own_connections = element.connections()
@@ -516,8 +538,12 @@ class System:
                     "voltage", "current", "power"):
                 bus = resolve_bus(owner)
                 if bus not in port_measurements:
-                    port = (self.buses[bus].port if bus in self.buses
-                            else bus_ports[bus][0])
+                    ports = bus_ports.get(bus, ())
+                    if not ports:
+                        raise ConfigError(
+                            f"{where}: bus {owner!r} has no connected electrical port"
+                        )
+                    port = ports[0]
                     observer = _PortMeasurement(port)
                     observer.input.voltage = port.voltage
                     observer.input.current = port.current
@@ -790,6 +816,9 @@ class System:
         for name, branch in self.branches.items():
             add(branch, {f"{name}.i": branch.output.i})
         for name, node in self.buses.items():
-            add(node, {f"{name}.u": node.output.u})
+            if node.port is not None:
+                value = (node.port.voltage if node.voltage_field == "voltage"
+                         else node.output.u)
+                add(node, {f"{name}.u": value})
         self._signal_names_checked = True
         return out

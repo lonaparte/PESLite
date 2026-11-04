@@ -434,9 +434,10 @@ def _network(p: Params) -> None:
         if unit.bus is not None
     }
     for name, bus in p.buses.items():
-        if bus.c <= 0.0:
-            raise ConfigError(f"buses.{name}.c must be > 0: the shunt capacitor is what makes the "
-                              f"bus voltage a state (a bus without one would need a node-voltage solver)")
+        if bus.c is not None and bus.c <= 0.0:
+            raise ConfigError(f"buses.{name}.c must be > 0 when specified")
+        if bus.c is None and bus.r_d != 0.0:
+            raise ConfigError(f"buses.{name}.r_d requires c")
         if bus.phases not in (1, 3):
             raise ConfigError(f"buses.{name}.phases must be 1 or 3")
         if bus.phases == 3:

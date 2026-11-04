@@ -250,13 +250,13 @@ def _scale(expression: str, scales: dict[str, float]) -> float:
 
 @dataclass(frozen=True)
 class BusParams:
-    """Electrical node with a shunt capacitor to ground.
+    """Named electrical connection point with an optional shunt capacitor to ground.
 
     ``phases`` is 3 for the peak-scaled AC space-vector domain and 1 for a real scalar domain.
-    ``c`` is capacitance in F and ``r_d`` is series damping resistance in ohm.
+    ``c`` is capacitance in F and ``r_d`` is its series damping resistance in ohm.
     """
 
-    c: float
+    c: Optional[float] = None
     r_d: float = 0.0
     phases: int = field(default=3, metadata={"structural": True})
 
@@ -1526,7 +1526,7 @@ def runtime_changeable(path: str, p: Params) -> bool:
     section, name, rest = _split_path(p, path)
     keys = rest.split(".")
     if section == "buses":
-        return keys in (["c"], ["r_d"])
+        return p.buses[name].c is not None and keys in (["c"], ["r_d"])
     if section == "branches":
         return keys in (["l"], ["r"])
     if section == "sources":
@@ -1641,7 +1641,7 @@ def event_changes(p: Params) -> tuple[Change, ...]:
         changed = (path for path in new if new[path] != flat.get(path)) if parameters else ()
         paths = tuple(dict.fromkeys([*changed, *values]))
         for path in paths:
-            if path not in connections and not runtime_changeable(path, after):
+            if path not in connections and not runtime_changeable(path, current):
                 raise ConfigError(f"{where}: {path} cannot change during a run; an event changes "
                                   f"{', '.join(RUNTIME)}")
             key = (event_t, path)

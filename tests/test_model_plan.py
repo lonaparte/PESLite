@@ -102,6 +102,43 @@ class _Feedthrough:
         return ()
 
 
+def test_stateless_output_only_connection_is_not_evaluated_by_rhs():
+    class Deferred(_Feedthrough):
+        output_stages = (OutputMethod(
+            "set_outputs", ("x", "feedback"), ("x",), rhs=False,
+        ),)
+
+        def __init__(self):
+            super().__init__()
+            self.input.x = self.input.feedback = 0.0
+            self.output.x = 0.0
+
+    source, observer = Deferred(), Deferred()
+    model = Model([source, observer], {(observer, "x"): (source, "x")})
+
+    assert model.rhs_list(0.0, []) == []
+    assert source.calls == observer.calls == 0
+    model.evaluate_outputs(0.0)
+    assert source.calls == observer.calls == 1
+    assert observer.output.x == 1.5
+
+    class Integrator(_Feedthrough):
+        state_names = ("x",)
+
+        def __init__(self):
+            super().__init__()
+            self.state = _Signal(x=0.0)
+            self.input.x = self.input.feedback = self.output.x = 0.0
+
+        def rhs(self, _t):
+            return (self.input.x,)
+
+    source, integrator = Deferred(), Integrator()
+    continuous = Model([source, integrator], {(integrator, "x"): (source, "x")})
+    assert continuous.rhs_list(0.0, [0.0]) == [1.0]
+    assert source.calls == 1
+
+
 @pytest.mark.parametrize("cyclic", [False, True])
 def test_generated_source_cache_follows_model_lifetime(cyclic):
     def cached_models():

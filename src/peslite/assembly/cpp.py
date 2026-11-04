@@ -3849,8 +3849,14 @@ class _ModelGenerator:
         self._add_observation = add
 
         for name, node in self.system.buses.items():
-            add(f"{name}.u", self.value(node.output, "u"),
-                self.record_types[id(node.output), "u"])
+            if getattr(node, "port", None) is None:
+                continue
+            if node.voltage_field == "voltage":
+                record, field = self.physical_port_fields[id(node.port)][:2]
+            else:
+                record, field = node.output, node.voltage_field
+            add(f"{name}.u", self.value(record, field),
+                self.record_types[id(record), field])
         for name, branch in self.system.branches.items():
             add(f"{name}.i", self.value(branch.output, "i"),
                 self.record_types[id(branch.output), "i"])

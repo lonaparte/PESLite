@@ -13,7 +13,7 @@ base:                      # system base
   v_ll_rms: 690.0          # V
   f0: 50.0                 # Hz
 
-buses:                     # nodes (AC or scalar); every bus needs a shunt capacitor
+buses:                     # named AC or scalar connection points; a shunt capacitor is optional
   pcc:
     # phases: 3             # 3: AC space vector (default), 1: real scalar bus
     c_pu: 0.02             # shunt capacitor, pu susceptance at f0
