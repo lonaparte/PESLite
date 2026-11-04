@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 from scripts.distributions import selections
 
 try:
@@ -37,15 +38,17 @@ def test_distribution_names_versions_and_dependencies_form_the_install_matrix():
     projects = {name: _project(path) for name, path in PROJECTS.items()}
     assert set(ROOT.rglob("pyproject.toml")) == set(PROJECTS.values())
     assert {project["name"] for project in projects.values()} == set(PROJECTS)
-    assert {project["version"] for project in projects.values()} == {"0.5.0"}
+    versions = {project["version"] for project in projects.values()}
+    assert len(versions) == 1
+    version, = versions
     assert _requirements(projects["peslite-core"]) == {"numpy", "scipy", "PyYAML"}
     assert _requirements(projects["peslite"]) == {"peslite-core", "matplotlib"}
     assert _requirements(projects["peslite-frontend"]) == {"peslite"}
     assert _requirements(projects["peslite-full"]) == {
         "peslite-frontend", "onnx", "onnxruntime"}
-    assert "peslite-core==0.5.0" in projects["peslite"]["dependencies"]
-    assert "peslite==0.5.0" in projects["peslite-frontend"]["dependencies"]
-    assert "peslite-frontend==0.5.0" in projects["peslite-full"]["dependencies"]
+    assert f"peslite-core=={version}" in projects["peslite"]["dependencies"]
+    assert f"peslite=={version}" in projects["peslite-frontend"]["dependencies"]
+    assert f"peslite-frontend=={version}" in projects["peslite-full"]["dependencies"]
 
 
 def test_code_distributions_own_disjoint_python_files():
@@ -74,11 +77,22 @@ def test_frontend_is_not_advertised_in_public_documentation():
 
 
 def test_release_uses_one_approval_gate_for_the_distribution_matrix():
-    workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
-    assert "  approve-release:" in workflow
-    assert "      name: release" in workflow
-    assert "  publish:" in workflow
-    assert "      - approve-release" in workflow
-    for distribution in PROJECTS:
-        assert f"          - distribution: {distribution}" in workflow
-    assert workflow.count("uses: pypa/gh-action-pypi-publish@release/v1") == 1
+    with (ROOT / ".github/workflows/release.yml").open(encoding="utf-8") as stream:
+        jobs = yaml.safe_load(stream)["jobs"]
+
+    assert jobs["approve-release"]["environment"]["name"] == "release"
+    publish = jobs["publish"]
+    needs = publish["needs"] if isinstance(publish["needs"], list) else [publish["needs"]]
+    assert "approve-release" in needs
+    assert publish["environment"]["name"] == "${{ matrix.environment }}"
+    expected = {
+        "peslite": "pypi",
+        "peslite-core": "pypi",
+        "peslite-frontend": "pypi-frontend",
+        "peslite-full": "pypi-full",
+    }
+    matrix = publish["strategy"]["matrix"]["include"]
+    assert {entry["distribution"]: entry["environment"] for entry in matrix} == expected
+    publisher, = [step for step in publish["steps"]
+                  if step.get("uses") == "pypa/gh-action-pypi-publish@release/v1"]
+    assert publisher["with"]["packages-dir"] == "dist/${{ matrix.distribution }}"

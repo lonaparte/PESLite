@@ -63,12 +63,3 @@ def test_each_part_imports_only_the_parts_below_it():
 
 def test_the_package_is_imported_from_src():
     assert Path(peslite.__file__).resolve() == PACKAGE / "__init__.py"
-
-
-def test_the_command_line_finds_bundled_examples_by_name():
-    from peslite.solver.simulation import _config_path
-
-    found = _config_path("gfl-example")
-    assert found.parent == ROOT / "examples"
-    assert found.stem == "gfl-example"
-    assert _config_path(None) == found

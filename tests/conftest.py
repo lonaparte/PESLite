@@ -1,6 +1,7 @@
 """Import the package from ``src/`` and provide shared test cases."""
 
 import copy
+import subprocess
 import sys
 import warnings
 from pathlib import Path
@@ -15,6 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import peslite  # noqa: E402
 
 QUIET = {"simulation.solver.linearisations": 0, "simulation.progress.enable": 0}
+FULL_TEST_PROCESS_TIMEOUT = 120
 
 
 def pytest_addoption(parser):
@@ -77,6 +79,24 @@ def _quiet():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         yield
+
+
+@pytest.fixture(autouse=True)
+def _bound_full_test_processes(request):
+    """Keep every subprocess launched by an opt-in full test time-bounded."""
+    if request.node.get_closest_marker("full") is None:
+        yield
+        return
+
+    monkeypatch = request.getfixturevalue("monkeypatch")
+    run = subprocess.run
+
+    def bounded_run(*args, **kwargs):
+        kwargs.setdefault("timeout", FULL_TEST_PROCESS_TIMEOUT)
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", bounded_run)
+    yield
 
 
 @pytest.fixture

@@ -18,6 +18,8 @@ from typing import Sequence
 import peslite
 from peslite.assembly.params import _unit_items
 
+PROCESS_TIMEOUT = 120
+
 
 def _compiler(command: str | Sequence[str] | None = None) -> list[str]:
     if command is None:
@@ -61,7 +63,8 @@ def benchmark_cpp_export(config: str | Path, work: str | Path, *,
         executable = project / "peslite"
         start = time.perf_counter()
         subprocess.run([*compiler_command, optimization, "-DNDEBUG", "-std=c++17",
-                        str(project / "peslite.cpp"), "-o", str(executable)], check=True)
+                        str(project / "peslite.cpp"), "-o", str(executable)], check=True,
+                       timeout=PROCESS_TIMEOUT)
         compile_seconds = time.perf_counter() - start
         start = time.perf_counter()
         peslite.Simulation(params).run(t_end=t_end, out_dir=project / "python-output")
@@ -69,7 +72,8 @@ def benchmark_cpp_export(config: str | Path, work: str | Path, *,
         cpp_process_times, cpp_times = [], []
         for _ in range(cpp_repeats):
             start = time.perf_counter()
-            subprocess.run([str(executable), str(project / "cpp-output")], check=True)
+            subprocess.run([str(executable), str(project / "cpp-output")], check=True,
+                           timeout=PROCESS_TIMEOUT)
             cpp_process_times.append(time.perf_counter() - start)
             cpp_times.append(json.loads(
                 (project / "cpp-output/summary.json").read_text(encoding="utf-8")

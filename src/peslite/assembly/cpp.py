@@ -6801,14 +6801,13 @@ class _CppGenerator:
                     (id(storage.record), storage.field), storage.coefficient)
                 energy_terms.append(f"0.5 * {_number(coefficient)} * ({norm})")
                 rate_terms.append(f"{_number(coefficient)} * ({rate})")
-            port_terms = [
-                f"{_number(port.coefficient)} * ({product(*(
-                    model.physical_port_fields[id(port.port)] if port.port is not None else
-                    (port.effort_record, port.effort_field,
-                     port.flow_record, port.flow_field)
-                ))})"
-                for port in check.ports
-            ]
+            port_terms = []
+            for port in check.ports:
+                fields = (model.physical_port_fields[id(port.port)] if port.port is not None else
+                          (port.effort_record, port.effort_field,
+                           port.flow_record, port.flow_field))
+                port_terms.append(
+                    f"{_number(port.coefficient)} * ({product(*fields)})")
             supplied, dissipated = powers(check)
             lines += [
                 f"    const double {tag}_energy = {' + '.join(energy_terms) if energy_terms else '0.0'};",
