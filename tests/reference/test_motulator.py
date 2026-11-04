@@ -21,7 +21,7 @@ import peslite
 from peslite.assembly.params import from_dict
 
 pytest.importorskip(
-    "motulator", reason="install the reference dependencies with peslite[reference]"
+    "motulator", reason="install the Motulator reference dependency"
 )
 from motulator.common import control as motulator_control
 from motulator.common import model as common_model

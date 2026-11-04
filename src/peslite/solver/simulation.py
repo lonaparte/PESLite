@@ -1551,17 +1551,18 @@ def _example_configs_dir() -> Path:
     source = Path(__file__).resolve().parents[3] / "examples"
     if source.is_dir():
         return source
-    try:
-        dist = distribution("peslite")
-    except PackageNotFoundError:
-        return source
-    # data-files live below the installation prefix, outside the import package.  A ``--target``
+    # data-files live below the installation prefix, outside the import package. A ``--target``
     # installation puts them below the metadata root; a normal environment uses sysconfig's data root.
-    roots = (Path(dist.locate_file("")).resolve(), Path(sysconfig.get_path("data")).resolve())
-    for root in roots:
-        candidate = root / "share" / "peslite" / "examples"
-        if candidate.is_dir():
-            return candidate
+    for distribution_name in ("peslite", "peslite-core"):
+        try:
+            dist = distribution(distribution_name)
+        except PackageNotFoundError:
+            continue
+        roots = (Path(dist.locate_file("")).resolve(), Path(sysconfig.get_path("data")).resolve())
+        for root in roots:
+            candidate = root / "share" / "peslite" / "examples"
+            if candidate.is_dir():
+                return candidate
     return source
 
 

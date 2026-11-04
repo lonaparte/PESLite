@@ -115,7 +115,7 @@ class _ONNXInference:
             import onnxruntime as ort  # type: ignore
         except ImportError as exc:
             raise ConfigError(
-                "ONNX models require the optional dependencies: pip install peslite[onnx]"
+                "ONNX models require the full installation: pip install peslite-full"
             ) from exc
 
         path = Path(cfg.model).expanduser().resolve()

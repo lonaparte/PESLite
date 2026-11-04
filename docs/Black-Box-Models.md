@@ -106,8 +106,9 @@ callables that the scalar equation tracer can lower, but does not embed external
 
 ## ONNX files
 
-Install `peslite[onnx]`, then add an ONNX file as a non-loading element. Tensor names are mapping
-keys; each list maps its flattened values to PESLite signal paths or public scalar outputs:
+ONNX support is included in the full package; see [Install](Getting-Started.md#install). Add an ONNX
+file as a non-loading element. Tensor names are mapping keys; each list maps its flattened values
+to PESLite signal paths or public scalar outputs:
 
 ```yaml
 elements:

@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 pytest.importorskip(
-    "motulator", reason="install the reference dependencies with peslite[reference]"
+    "motulator", reason="install the Motulator reference dependency"
 )
 from motulator.common.control import InverterNonlinearity, PWM as MotulatorPWM
 from motulator.common.model import CarrierComparison as MotulatorCarrier

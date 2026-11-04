@@ -125,7 +125,7 @@ With the online stability analysis addon available, this also writes `case_repor
 ## Plot recorded waveforms
 
 `--plot NAME [NAME ...]` invokes the optional plotting addon after the simulation. See
-[Plotting](Plotting.md) for installation, output requirements and presentation options.
+[Plotting](Plotting.md) for output requirements and presentation options.
 
 ## Continue from saved state
 

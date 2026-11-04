@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "peslite-full"
+version = "0.5.0"
+description = "Complete PESLite installation with frontend and ONNX support."
+readme = "README.md"
+requires-python = ">=3.10.1"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+dependencies = [
+    "peslite-frontend==0.5.0",
+    "onnx>=1.17.0",
+    "onnxruntime>=1.18.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/lonaparte/PESLite"
+Repository = "https://github.com/lonaparte/PESLite"
+Issues = "https://github.com/lonaparte/PESLite/issues"
+
+[tool.setuptools]
+packages = []

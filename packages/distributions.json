@@ -1,0 +1,35 @@
+{
+  "file-groups": {
+    "all": ["src/peslite/**/*.py"],
+    "addons": [
+      "src/peslite/addons/components/**/*.py",
+      "src/peslite/addons/control/**/*.py",
+      "src/peslite/addons/functions/**/*.py",
+      "!src/peslite/addons/components/__init__.py",
+      "!src/peslite/addons/control/__init__.py",
+      "!src/peslite/addons/functions/__init__.py"
+    ],
+    "frontend": ["src/peslite/frontend/**/*.py"]
+  },
+  "distributions": {
+    "peslite-core": {
+      "project": "pyproject.toml",
+      "include": ["all"],
+      "exclude": ["addons", "frontend"],
+      "files": ["examples/templates/*"]
+    },
+    "peslite": {
+      "project": "packages/peslite/pyproject.toml",
+      "include": ["addons"],
+      "files": ["examples/*.pes"]
+    },
+    "peslite-frontend": {
+      "project": "packages/frontend/pyproject.toml",
+      "include": ["frontend"]
+    },
+    "peslite-full": {
+      "project": "packages/full/pyproject.toml",
+      "include": []
+    }
+  }
+}

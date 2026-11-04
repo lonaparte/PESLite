@@ -20,7 +20,7 @@ import peslite
 from peslite.assembly.params import from_dict
 
 
-pytest.importorskip("PySpice", reason="install the optional dependency with peslite[pyspice]")
+pytest.importorskip("PySpice", reason="install the PySpice reference dependency")
 if not (os.environ.get("NGSPICE_LIBRARY_PATH") or ctypes.util.find_library("ngspice")):
     pytest.skip("the PySpice comparisons need the ngspice shared library", allow_module_level=True)
 

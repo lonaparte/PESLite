@@ -5,16 +5,14 @@ resolved example into a new simulation file.
 
 ## Install
 
-```bash
-python -m pip install peslite
-```
+| Installation | pip | Conda |
+| --- | --- | --- |
+| Core runtime | `python -m pip install peslite-core` | `conda install peslite-core` |
+| Default, including built-in addons | `python -m pip install peslite` | `conda install peslite` |
+| All runtime features | `python -m pip install peslite-full` | `conda install peslite-full` |
 
-Addon modules are included in the package. To install PESLite with all dependencies, including the
-optional dependencies required by addons such as [PDF plotting](Plotting.md):
-
-```bash
-python -m pip install "peslite[all]"
-```
+The default installation keeps each built-in addon together with its runtime dependencies. The
+core installation retains the addon extension interface without installing built-in addons.
 
 Check the command-line interface:
 

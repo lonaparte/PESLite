@@ -19,7 +19,7 @@ src/peslite/
 ├── control/      control loops, graphs, startup and modulation
 ├── assembly/     parameters, events, protection, units, systems and exporters
 ├── solver/       connected model kernel, energy model, integrators and simulation run
-└── addons/       custom extension entry points and optional functions
+└── addons/       custom extension entry points
     ├── control/      automatically discovered custom control-loop modules
     ├── components/   automatically discovered custom circuit-element modules
     └── functions/    optional user-facing functions such as IEEE PDF plotting
@@ -31,8 +31,8 @@ assembled system.
 
 Controller and component modules in their respective add-on packages are imported once at package
 initialisation. Their decorators populate the same registries used by built-in types, so there is
-no add-on lookup or dispatch in the simulation hot path. Optional dependencies stay behind the
-`addons/functions` boundary; [plotting](Plotting.md) is loaded only when requested.
+no add-on lookup or dispatch in the simulation hot path. Built-in function addons such as
+[plotting](Plotting.md) do not run unless explicitly invoked.
 The optional online stability analysis functions also live in `addons/functions`. They consume
 selected observations during a run and share the solver-side loop-map linearization. The runner
 exposes an optional observation callback on its existing event grid; core time stepping never

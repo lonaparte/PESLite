@@ -3,9 +3,9 @@ requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "peslite"
+name = "peslite-core"
 version = "0.5.0"
-description = "Open-source, lightweight, multirate, and extensible power electronics simulator in Python. Designed as a deterministic simulation backend for LLM reasoning."
+description = "Core runtime for the PESLite power electronics simulator."
 readme = "README.md"
 requires-python = ">=3.10.1"
 license = "AGPL-3.0-only"
@@ -17,12 +17,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-plot = ["matplotlib>=3.7.0"]
-all = ["matplotlib>=3.7.0", "onnx>=1.17.0", "onnxruntime>=1.18.0"]
-test = ["pytest>=7.0.0", "matplotlib>=3.7.0"]
-reference = ["motulator==0.21.0; python_version >= '3.12'"]
-pyspice = ["PySpice==1.5.0"]
-onnx = ["onnx>=1.17.0", "onnxruntime>=1.18.0"]
+test = [
+    "pytest>=7.0.0",
+    "matplotlib>=3.7.0",
+    "tomli>=2.0.0; python_version < '3.11'",
+]
+
+[dependency-groups]
+onnx-test = ["onnx>=1.17.0", "onnxruntime>=1.18.0"]
 
 [project.scripts]
 peslite = "peslite.solver.simulation:main"
@@ -37,7 +39,6 @@ Issues = "https://github.com/lonaparte/PESLite/issues"
 where = ["src"]
 
 [tool.setuptools.data-files]
-"share/peslite/examples" = ["examples/*.pes"]
 "share/peslite/examples/templates" = ["examples/templates/*.pes", "examples/templates/*.py"]
 
 [tool.pytest.ini_options]
