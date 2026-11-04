@@ -1,7 +1,7 @@
 # Getting Started
 
-This guide installs PESLite, runs a bundled case, explains the output directory and turns a
-resolved example into a new simulation file.
+This guide installs PESLite, runs a bundled case, explains the output directory and creates a
+new simulation file.
 
 ## Install
 
@@ -91,7 +91,13 @@ peslite gfl-example --progress --watch vsc.vdc_pu
 
 ## Create a simulation file
 
-The quickest starting point is a resolved bundled example:
+Create a simulation file from the built-in template:
+
+```bash
+peslite create my-case.pes
+```
+
+You can also use a resolved bundled example as the starting point:
 
 ```bash
 peslite inspect gfl-example --resolved > my-case.pes
