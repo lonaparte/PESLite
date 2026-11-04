@@ -72,6 +72,41 @@ def test_native_export_keeps_python_adaptive_methods_explicit(tmp_path):
         peslite.export(params, "cpp", tmp_path / "unsupported")
 
 
+def test_native_fixed_explicit_reuses_the_stiff_mode_fallback(tmp_path):
+    params = peslite.load(EXAMPLES / "boost-example.pes").replace(**{
+        "units.converter.bridge.model": "switching",
+        "units.converter.bridge.on_resistance": 1e-6,
+        "units.converter.ctrl": {
+            "type": "open_loop",
+            "period": 50e-6,
+            "computation": 0.0,
+            "loops": {"DutyModulation": {}},
+            "references": {"duty": 0.5},
+        },
+        "simulation.initial.states.converter.dclink.u_C": 0.0,
+        "simulation.solver.type": "fixed",
+        "simulation.solver.method": "RK4",
+        "simulation.solver.dt": 0.125e-6,
+        "simulation.t_end": 1e-4,
+        "simulation.progress.enable": False,
+        "simulation.energy_check": "off",
+        "simulation.output.states": True,
+        "simulation.output.signals": False,
+        "simulation.output.energy": False,
+    })
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    source, native, python = _run_generated(params, tmp_path / "native", compiler)
+    assert "integrate_stiff" in source.read_text(encoding="utf-8")
+    actual = _final_csv(native / "states.csv")
+    expected = _final_csv(python / "states.csv")
+    np.testing.assert_allclose(
+        list(actual.values()), list(expected.values()), rtol=2e-8, atol=2e-9
+    )
+    assert actual["converter.dclink.u_C"] > 0.0
+
+
 @pytest.mark.parametrize("method", ["trapezoidal", "radau"])
 @pytest.mark.parametrize("variables", [(), ("common",), ("all",)])
 def test_native_implicit_parameters_and_events(method, variables, tmp_path):

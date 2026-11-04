@@ -1094,6 +1094,35 @@ def _strong_components(successors, nodes):
     return components
 
 
+@dataclass(frozen=True)
+class _DependencyPlan:
+    """One instantaneous dependency graph and its reusable scheduling analysis."""
+
+    dependencies: tuple[tuple[int, ...], ...]
+    successors: tuple[tuple[int, ...], ...]
+    order: tuple[int, ...]
+    residual: tuple[int, ...]
+    components: tuple[tuple[int, ...], ...]
+
+
+def _dependency_plan(dependencies) -> _DependencyPlan:
+    """Build one graph, running SCC analysis only on the topological residual."""
+    dependencies = tuple(tuple(sorted(map(int, item))) for item in dependencies)
+    successors = [[] for _ in dependencies]
+    for node, required in enumerate(dependencies):
+        for dependency in required:
+            successors[dependency].append(node)
+    order, residual = _topological_order(dependencies, successors)
+    components = _strong_components(successors, residual) if residual else ()
+    return _DependencyPlan(
+        dependencies,
+        tuple(tuple(item) for item in successors),
+        tuple(order),
+        tuple(residual),
+        tuple(components),
+    )
+
+
 class Model:
     """Connected subsystems evaluated as ``rhs(t, y)`` on a flat real state vector.
 
@@ -1101,8 +1130,7 @@ class Model:
     dots in names form namespaces.
     ``connections``: ``(dst, input) -> (src, output[, gain])`` or a list of these (summed).
     ``zoh_connections``: ``(dst, input) -> label`` for held inputs set by :meth:`set_zoh_input`.
-    ``linear_structure``: optional state-partition provider for implicit linear solves.
-    ``linear_mode_key``: optional exact equation-mode identity for Jacobian reuse.
+    ``structural_analysis``: optional shared network analysis for linear solves and export.
     """
 
     def __init__(
@@ -1110,17 +1138,9 @@ class Model:
         subsystems: Sequence[Subsystem] | Mapping[str, Subsystem],
         connections: Mapping[Connection, Connection | Sequence[Connection]],
         zoh_connections: Mapping[Connection, str] | None = None,
-        *, linear_structure: Callable[[Model], Any] | None = None,
-        linear_mode_key: Callable[[Model], Any] | None = None,
-        linear_blocks: Callable[[Model], Any] | None = None,
-        explicit_stability: Callable[[Model, str, float], bool] | None = None,
-        explicit_stability_dynamic: bool = False,
+        *, structural_analysis: Any = None,
     ) -> None:
-        self._linear_structure = linear_structure
-        self._linear_mode_key = linear_mode_key
-        self._linear_blocks = linear_blocks
-        self._explicit_stability = explicit_stability
-        self.explicit_stability_dynamic = bool(explicit_stability_dynamic)
+        self.structural_analysis = structural_analysis
         self.equation_revision = 0
         if isinstance(subsystems, Mapping):
             names = [str(n) for n in subsystems]
@@ -1158,6 +1178,8 @@ class Model:
         self._external_state_dependency_cache: dict[frozenset[int], bool] = {}
         self._build_evaluation_plan()
         self._compile()
+        if self.structural_analysis is not None:
+            self.structural_analysis.bind(self)
         # energy declaration per subsystem (default if none declared)
         self.energy_specs: dict[str, _energy.EnergySpec] = {n: _energy.spec_of(s) for n, s in zip(names, subsystems)}
         self._held_input_refresh = tuple(
@@ -1171,24 +1193,35 @@ class Model:
         self._compile()
         self._energy_balance_plan = None
         self._external_state_dependency_cache.clear()
+        if self.structural_analysis is not None:
+            self.structural_analysis.invalidate()
+            self.structural_analysis.bind(self)
         self.plan_revision += 1
 
     def linear_structure(self):
         """Return the state partition supplied by assembly, or use the solver's dense default."""
-        return self._linear_structure(self) if self._linear_structure is not None else None
+        return (self.structural_analysis.structure()
+                if self.structural_analysis is not None else None)
 
     def linear_mode_key(self):
         """Return the current assembled equation mode, or ``None`` without a structural key."""
-        return self._linear_mode_key(self) if self._linear_mode_key is not None else None
+        return (self.structural_analysis.mode_key()
+                if self.structural_analysis is not None else None)
 
     def linear_blocks(self):
         """Return present-mode exact circuit blocks for an implicit Newton matrix."""
-        return self._linear_blocks(self) if self._linear_blocks is not None else ()
+        return (self.structural_analysis.linear_blocks()
+                if self.structural_analysis is not None else ())
 
     def explicit_stable(self, method: str, step: float) -> bool:
         """Return whether the assembled linear modes are stable at one explicit RK step."""
-        return (self._explicit_stability(self, method, step)
-                if self._explicit_stability is not None else True)
+        return (self.structural_analysis.explicit_stable(method, step)
+                if self.structural_analysis is not None else True)
+
+    @property
+    def explicit_stability_dynamic(self) -> bool:
+        """Whether continuously varying network ratios require a stability check every step."""
+        return bool(self.structural_analysis is not None and self.structural_analysis.dynamic)
 
     def invalidate_equations(self) -> None:
         """Record a boundary change which may select different continuous equations."""
@@ -1426,14 +1459,11 @@ class Model:
                     dependencies[node].add(copy)
 
         # Reuse the scheduling pass: DAGs need neither SCC analysis nor a condensed graph.
-        successors = [[] for _ in operations]
-        for node, deps in enumerate(dependencies):
-            for dep in deps:
-                successors[dep].append(node)
-        order, residual = _topological_order(dependencies, successors)
+        graph = _dependency_plan(dependencies)
+        order, residual = list(graph.order), graph.residual
         if residual:
             # Residual nodes can be downstream of a loop. Only cyclic SCCs become solver groups.
-            components = [(node,) for node in order] + _strong_components(successors, residual)
+            components = [(node,) for node in order] + list(graph.components)
             component_of = {node: ci for ci, component in enumerate(components) for node in component}
             compact_ops, compact_owners, compact_deps, compact_rhs = [], [], [], []
             for ci, component in enumerate(components):
@@ -1484,11 +1514,8 @@ class Model:
 
             operations, owners, dependencies, rhs_required = (
                 compact_ops, compact_owners, compact_deps, compact_rhs)
-            successors = [[] for _ in operations]
-            for node, deps in enumerate(dependencies):
-                for dep in deps:
-                    successors[dep].append(node)
-            order, residual = _topological_order(dependencies, successors)
+            graph = _dependency_plan(dependencies)
+            order, residual = list(graph.order), graph.residual
             if residual:
                 raise RuntimeError("internal error while collapsing algebraic output groups")
         # An observational producer is still part of the derivative plan when a required
@@ -1499,6 +1526,7 @@ class Model:
             if rhs_required[node]:
                 for dependency in dependencies[node]:
                     rhs_required[dependency] = True
+        self.dependency_plan = graph
         position = {node: i for i, node in enumerate(order)}
         self._plan = tuple(operations[i] for i in order)
         self._plan_rhs = tuple(rhs_required[i] for i in order)

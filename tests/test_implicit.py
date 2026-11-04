@@ -341,6 +341,21 @@ def test_nodal_group_solve_matches_the_dense_newton_system():
         np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-12)
 
 
+def test_assembly_and_solvers_share_one_structural_analysis():
+    model = peslite.System(peslite.load(EXAMPLES / "two-converters-example.pes")).model
+    analysis = model.structural_analysis
+    linear = linear_system(model)
+
+    assert analysis.structure() is analysis.structure()
+    assert analysis.plans is analysis.plans
+    assert linear.structure is analysis.structure()
+    assert linear.mode_key.__self__ is analysis
+    assert linear.exact_blocks.__self__ is analysis
+    dependencies, circuits = analysis.signature()
+    assert dependencies == model.dependency_plan.dependencies
+    assert circuits and all(entry[0] for entry in circuits)
+
+
 def test_make_solver_uses_each_configured_circuit_model():
     params = peslite.load(EXAMPLES / "two-converters-example.pes")
     model = peslite.System(params).model

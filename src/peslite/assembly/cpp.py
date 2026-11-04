@@ -17,10 +17,9 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from functools import cached_property
-from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -35,11 +34,11 @@ from ..solver.energy import Port, re_product
 from ..solver.integrators import DormandPrince45, FixedStepSolver, TABLEAUS
 from ..solver.implicit import (ImplicitSolver, _JACOBIAN_STEP, _MAX_SPLITS,
                                _NEWTON_ITERATIONS, _NEWTON_SCALE, _THETA_MAX)
-from ..solver.model import _strong_components, commutation_tolerance
-from ..solver.netlist import Topology, _DELTA_T, _FLOAT_RTOL, _MAX_PATTERNS, _symbolic_solve
+from ..solver.model import _dependency_plan, commutation_tolerance
+from ..solver.netlist import Mode, Topology, _DELTA_T, _FLOAT_RTOL, _MAX_PATTERNS, _symbolic_solve
 from ..solver.timing import TIME_EPS
 from .conduction import DiodeConduction, _LOCATOR_ITERATIONS, _MAX_COMMUTATIONS
-from .circuit import NetworkView, compile_network
+from .circuit import NetworkView, _BoundValue, compile_network
 from .protection import ProtectionStats
 from .params import (BaseValues, SourceParams, UnitParams, _PARAMETER_RECORDER, _event_assignments,
                      _written_out, connection_defaults, dumps, parameter_leaves)
@@ -229,7 +228,7 @@ _CONDUCTION_KERNEL = r'''
             if constexpr (commutation_count != 0) sim.sync(t);
             double value = std::numeric_limits<double>::infinity();
             for (std::size_t k = 0; k < commutation_count; ++k)
-                value = std::min(value, sim.commutation_margin(k));
+                value = std::min(value, sim.commutation_margin(k, t));
             @@CURRENT_MARGINS@@
             return value;
         }
@@ -251,7 +250,7 @@ _CONDUCTION_KERNEL = r'''
                 std::array<bool, commutation_count> pending{};
                 bool any = false;
                 for (std::size_t k = 0; k < commutation_count; ++k) {
-                    pending[k] = sim.commutation_margin(k) < 0.0
+                    pending[k] = sim.commutation_margin(k, t) < 0.0
                               || sim.commutation_next(k) <= t + tolerance(t);
                     any = any || pending[k];
                 }
@@ -260,7 +259,7 @@ _CONDUCTION_KERNEL = r'''
                     if (!pending[k]) continue;
                     sim.sync(t);
                     if (sim.commutation_next(k) <= t + tolerance(t)
-                            || sim.commutation_margin(k) < 0.0)
+                            || sim.commutation_margin(k, t) < 0.0)
                         sim.commutate(k, t);
                 }
             }
@@ -458,13 +457,191 @@ def _fixed_step(method: str) -> str:
     return "\n".join(lines)
 
 
+def _stability_polynomial(method: str) -> tuple[float, ...]:
+    """Return the scalar RK stability polynomial in ascending powers of ``z``."""
+    _nodes, rows, weights = TABLEAUS[method]
+
+    def add(left, right, scale=1.0):
+        result = list(left) + [0.0] * max(0, len(right) - len(left))
+        for index, value in enumerate(right):
+            result[index] += scale * value
+        return result
+
+    stages = [[1.0]]
+    for row in rows:
+        contribution = [0.0]
+        for coefficient, stage in zip(row, stages):
+            contribution = add(contribution, stage, coefficient)
+        stages.append(add([1.0], [0.0, *contribution]))
+    contribution = [0.0]
+    for coefficient, stage in zip(weights, stages):
+        contribution = add(contribution, stage, coefficient)
+    return tuple(add([1.0], [0.0, *contribution]))
+
+
+def _explicit_stability(method: str, blocks: Sequence[Sequence[int]]) -> str:
+    """Emit the Python solver's eigenvalue RK stability test over electrical state blocks."""
+    blocks = tuple(tuple(map(int, block)) for block in blocks if len(block))
+    coefficients = ", ".join(_number(value) for value in _stability_polynomial(method))
+    checks = "\n        ".join(
+        "if (!block_stable({" + ", ".join(map(str, block)) + "})) result = false;"
+        for block in blocks
+    )
+    return f'''
+    struct ExplicitStabilityMode {{
+        std::size_t epoch;
+        StructuralMode key;
+        double step;
+        bool stable;
+    }};
+    std::vector<ExplicitStabilityMode> explicit_stability_modes;
+
+    bool explicit_stable(double t, double h) {{
+        const StructuralMode selected = structural_mode();
+        auto held = std::find_if(
+            explicit_stability_modes.begin(), explicit_stability_modes.end(),
+            [&](const auto& item) {{
+                return item.epoch == implicit_epoch && item.key == selected
+                    && item.step == h;
+            }}
+        );
+        if (held != explicit_stability_modes.end()) return held->stable;
+        State stability_rhs{{}};
+        rhs(t, y, stability_rhs);
+        implicit_select(t, y, stability_rhs);
+        static constexpr double coefficients[] = {{{coefficients}}};
+        const auto block_stable = [&](std::initializer_list<std::size_t> listed) {{
+            const std::vector<std::size_t> index(listed);
+            const std::size_t n = index.size();
+            std::vector<Complex> matrix(n * n), q(n * n), r(n * n), vector(n);
+            for (std::size_t row = 0; row < n; ++row)
+                for (std::size_t column = 0; column < n; ++column)
+                    matrix[row * n + column] =
+                        implicit_jacobian[index[row] * state_count + index[column]];
+            for (std::size_t iteration = 0; iteration < 64 * n; ++iteration) {{
+                double lower = 0.0, scale = 1.0;
+                for (std::size_t row = 0; row < n; ++row)
+                    for (std::size_t column = 0; column < n; ++column) {{
+                        scale = std::max(scale, std::abs(matrix[row * n + column]));
+                        if (row > column) lower = std::max(
+                            lower, std::abs(matrix[row * n + column]));
+                    }}
+                if (lower <= 1e-12 * scale) break;
+                Complex shift = matrix[(n - 1) * n + n - 1];
+                if (n > 1) {{
+                    const Complex a = matrix[(n - 2) * n + n - 2];
+                    const Complex b = matrix[(n - 2) * n + n - 1];
+                    const Complex c = matrix[(n - 1) * n + n - 2];
+                    const Complex d = shift;
+                    const Complex root = std::sqrt((a - d) * (a - d) + 4.0 * b * c);
+                    const Complex left = 0.5 * (a + d + root);
+                    const Complex right = 0.5 * (a + d - root);
+                    shift = std::abs(left - d) < std::abs(right - d) ? left : right;
+                }}
+                std::fill(q.begin(), q.end(), Complex{{}});
+                std::fill(r.begin(), r.end(), Complex{{}});
+                for (std::size_t column = 0; column < n; ++column) {{
+                    for (std::size_t row = 0; row < n; ++row)
+                        vector[row] = matrix[row * n + column]
+                            - (row == column ? shift : Complex{{}});
+                    for (std::size_t previous = 0; previous < column; ++previous) {{
+                        Complex product{{}};
+                        for (std::size_t row = 0; row < n; ++row)
+                            product += std::conj(q[row * n + previous]) * vector[row];
+                        r[previous * n + column] = product;
+                        for (std::size_t row = 0; row < n; ++row)
+                            vector[row] -= product * q[row * n + previous];
+                    }}
+                    double length = 0.0;
+                    for (const auto& value : vector) length += std::norm(value);
+                    length = std::sqrt(length);
+                    if (length <= 1e-15 * scale) {{
+                        for (std::size_t candidate = 0; candidate < n; ++candidate) {{
+                            std::fill(vector.begin(), vector.end(), Complex{{}});
+                            vector[candidate] = 1.0;
+                            for (std::size_t previous = 0; previous < column; ++previous) {{
+                                Complex product{{}};
+                                for (std::size_t row = 0; row < n; ++row)
+                                    product += std::conj(q[row * n + previous]) * vector[row];
+                                for (std::size_t row = 0; row < n; ++row)
+                                    vector[row] -= product * q[row * n + previous];
+                            }}
+                            length = 0.0;
+                            for (const auto& value : vector) length += std::norm(value);
+                            length = std::sqrt(length);
+                            if (length > 1e-15 * scale) break;
+                        }}
+                    }}
+                    r[column * n + column] = length;
+                    for (std::size_t row = 0; row < n; ++row)
+                        q[row * n + column] = vector[row] / length;
+                }}
+                std::fill(matrix.begin(), matrix.end(), Complex{{}});
+                for (std::size_t row = 0; row < n; ++row)
+                    for (std::size_t column = 0; column < n; ++column) {{
+                        for (std::size_t inner = 0; inner < n; ++inner)
+                            matrix[row * n + column] += r[row * n + inner] * q[inner * n + column];
+                        if (row == column) matrix[row * n + column] += shift;
+                    }}
+            }}
+            for (std::size_t index = 0; index < n; ++index) {{
+                const Complex eigenvalue = matrix[index * n + index];
+                const double scale = std::max(1.0, std::abs(eigenvalue));
+                if (std::real(eigenvalue) > 1e-12 * scale) continue;
+                Complex amplification = coefficients[std::size(coefficients) - 1];
+                for (std::size_t degree = std::size(coefficients) - 1; degree-- > 0;)
+                    amplification = amplification * (h * eigenvalue) + coefficients[degree];
+                if (std::abs(amplification) > 1.0 + 1e-10) return false;
+            }}
+            return true;
+        }};
+        bool result = true;
+        {checks}
+        if (explicit_stability_modes.size() >= 64)
+            explicit_stability_modes.erase(explicit_stability_modes.begin());
+        explicit_stability_modes.push_back({{implicit_epoch, selected, h, result}});
+        return result;
+    }}'''
+
+
 def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
-                     dt: str, atol: str, rtol: str, projection: str) -> str:
+                     dt: str, atol: str, rtol: str, projection: str, *,
+                     exact_columns: Sequence[bool] = (), exact_lines: Sequence[str] = (),
+                     mode: str = "structural_mode()", mode_size: int = 0,
+                     groups: Sequence[Sequence[int]] = (),
+                     interface: Sequence[int] = ()) -> str:
     """Lower the configured implicit tableau and Newton controls over the ordinary generated RHS."""
     stages = solver._c.size
     rows = ", ".join("{" + ", ".join(_number(v) for v in row) + "}" for row in solver._A)
     nodes = ", ".join(_number(v) for v in solver._c)
     initial = ", ".join(_number(v) for v in solver._e0)
+    exact = ", ".join("true" if value else "false" for value in exact_columns)
+    exact_body = "\n        ".join(exact_lines)
+    n_states = len(exact_columns)
+    state_groups = [tuple(map(int, group)) for group in groups if len(group)]
+    interface = tuple(map(int, interface))
+    if not state_groups or sum(map(len, state_groups)) + len(interface) != n_states:
+        state_groups, interface = [tuple(range(n_states))], ()
+    expanded_groups = [tuple(stage * n_states + index
+                             for stage in range(stages) for index in group)
+                       for group in state_groups]
+    expanded_interface = tuple(stage * n_states + index
+                               for stage in range(stages) for index in interface)
+    group_values = ", ".join("{" + ", ".join(map(str, group)) + "}"
+                             for group in expanded_groups)
+    interface_values = ", ".join(map(str, expanded_interface))
+    select_body = f'''const StructuralMode selected = {mode};
+        if (!implicit_jacobian.empty() && implicit_mode_valid && selected == implicit_mode) return;
+        auto found = std::find_if(implicit_modes.begin(), implicit_modes.end(),
+            [&](const auto& item) {{ return item.key == selected; }});
+        implicit_factors.clear();
+        if (found == implicit_modes.end()) {{
+            implicit_linearize(t, state, f0);
+        }} else {{
+            implicit_mode = selected;
+            implicit_mode_valid = true;
+            implicit_jacobian = found->jacobian;
+        }}'''
     return f'''
     static constexpr std::size_t implicit_stages = {stages};
     static constexpr std::size_t implicit_size = implicit_stages * state_count;
@@ -472,25 +649,50 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
     static constexpr double implicit_c[implicit_stages] = {{{nodes}}};
     static constexpr double implicit_e0[implicit_stages] = {{{initial}}};
     using ImplicitVector = std::array<double, implicit_size>;
+    using StructuralMode = std::array<double, {mode_size}>;
 
-    struct ImplicitFactor {{
-        double h;
+    struct DenseFactor {{
+        std::size_t n = 0;
         std::vector<double> lu;
         std::vector<std::size_t> pivots;
     }};
+    struct ImplicitGroupFactor {{
+        std::vector<std::size_t> index;
+        DenseFactor factor;
+        std::vector<double> coupling;
+        std::vector<double> response;
+    }};
+    struct ImplicitFactor {{
+        double h;
+        std::vector<ImplicitGroupFactor> groups;
+        std::vector<std::size_t> interface;
+        DenseFactor schur;
+    }};
     std::vector<double> implicit_jacobian;
     std::vector<ImplicitFactor> implicit_factors;
+    struct ImplicitMode {{ StructuralMode key; std::vector<double> jacobian; }};
+    std::vector<ImplicitMode> implicit_modes;
+    StructuralMode implicit_mode{{}};
+    bool implicit_mode_valid = false;
+    std::size_t implicit_epoch = 0;
+    static constexpr std::array<bool, state_count> implicit_exact_columns = {{{exact}}};
 
     void implicit_invalidate() {{
         implicit_jacobian.clear();
         implicit_factors.clear();
+        implicit_modes.clear();
+        implicit_mode_valid = false;
+        ++implicit_epoch;
     }}
 
     void implicit_linearize(double t, const State& state, const State& f0) {{
-        implicit_jacobian.resize(state_count * state_count);
+        implicit_jacobian.assign(state_count * state_count, 0.0);
         implicit_factors.clear();
+        auto& matrix = implicit_jacobian;
+        {exact_body}
         State probe = state, value{{}};
         for (std::size_t j = 0; j < state_count; ++j) {{
+            if (implicit_exact_columns[j]) continue;
             const double increment = {_number(_JACOBIAN_STEP)} * std::max(std::abs(state[j]), 1.0);
             probe[j] = state[j] + increment;
             rhs(t, probe, value);
@@ -498,21 +700,24 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
             for (std::size_t i = 0; i < state_count; ++i)
                 implicit_jacobian[i * state_count + j] = (value[i] - f0[i]) / increment;
         }}
+        implicit_mode = {mode};
+        implicit_mode_valid = true;
+        auto found = std::find_if(implicit_modes.begin(), implicit_modes.end(),
+            [&](const auto& item) {{ return item.key == implicit_mode; }});
+        if (found == implicit_modes.end()) {{
+            if (implicit_modes.size() >= 64) implicit_modes.erase(implicit_modes.begin());
+            implicit_modes.push_back({{implicit_mode, implicit_jacobian}});
+        }} else {{
+            found->jacobian = implicit_jacobian;
+        }}
     }}
 
-    const ImplicitFactor& implicit_factor(double h) {{
-        for (const auto& factor : implicit_factors)
-            if (factor.h == h) return factor;
-        if (implicit_factors.size() > 16) implicit_factors.clear();
-        constexpr std::size_t n = implicit_size;
-        ImplicitFactor factor{{h, std::vector<double>(n * n), std::vector<std::size_t>(n)}};
-        for (std::size_t p = 0; p < implicit_stages; ++p)
-            for (std::size_t q = 0; q < implicit_stages; ++q)
-                for (std::size_t i = 0; i < state_count; ++i)
-                    for (std::size_t j = 0; j < state_count; ++j)
-                        factor.lu[(p * state_count + i) * n + q * state_count + j] =
-                            (p == q && i == j ? 1.0 : 0.0)
-                            - h * implicit_a[p][q] * implicit_jacobian[i * state_count + j];
+    void implicit_select(double t, const State& state, const State& f0) {{
+        {select_body}
+    }}
+
+    static DenseFactor implicit_dense_factor(std::vector<double> matrix, std::size_t n) {{
+        DenseFactor factor{{n, std::move(matrix), std::vector<std::size_t>(n)}};
         for (std::size_t k = 0; k < n; ++k) {{
             std::size_t pivot = k;
             for (std::size_t i = k + 1; i < n; ++i)
@@ -522,19 +727,18 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
                 std::swap_ranges(factor.lu.begin() + k * n, factor.lu.begin() + (k + 1) * n,
                                  factor.lu.begin() + pivot * n);
             const double diagonal = factor.lu[k * n + k];
-            if (diagonal == 0.0) continue;
+            if (diagonal == 0.0) throw std::runtime_error("singular implicit Newton matrix");
             for (std::size_t i = k + 1; i < n; ++i) {{
                 const double multiplier = factor.lu[i * n + k] /= diagonal;
                 for (std::size_t j = k + 1; j < n; ++j)
                     factor.lu[i * n + j] -= multiplier * factor.lu[k * n + j];
             }}
         }}
-        implicit_factors.push_back(std::move(factor));
-        return implicit_factors.back();
+        return factor;
     }}
 
-    static void implicit_solve(const ImplicitFactor& factor, ImplicitVector& value) {{
-        constexpr std::size_t n = implicit_size;
+    static void implicit_dense_solve(const DenseFactor& factor, std::vector<double>& value) {{
+        const std::size_t n = factor.n;
         for (std::size_t k = 0; k < n; ++k)
             if (factor.pivots[k] != k) std::swap(value[k], value[factor.pivots[k]]);
         for (std::size_t i = 0; i < n; ++i)
@@ -542,6 +746,86 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
         for (std::size_t i = n; i-- > 0;) {{
             for (std::size_t j = i + 1; j < n; ++j) value[i] -= factor.lu[i * n + j] * value[j];
             value[i] /= factor.lu[i * n + i];
+        }}
+    }}
+
+    const ImplicitFactor& implicit_factor(double h) {{
+        for (const auto& factor : implicit_factors)
+            if (factor.h == h) return factor;
+        if (implicit_factors.size() > 16) implicit_factors.clear();
+        constexpr std::size_t n = implicit_size;
+        std::vector<double> matrix(n * n);
+        for (std::size_t p = 0; p < implicit_stages; ++p)
+            for (std::size_t q = 0; q < implicit_stages; ++q)
+                for (std::size_t i = 0; i < state_count; ++i)
+                    for (std::size_t j = 0; j < state_count; ++j)
+                        matrix[(p * state_count + i) * n + q * state_count + j] =
+                            (p == q && i == j ? 1.0 : 0.0)
+                            - h * implicit_a[p][q] * implicit_jacobian[i * state_count + j];
+        ImplicitFactor factor{{h, {{}}, {{{interface_values}}}, {{}}}};
+        const std::vector<std::vector<std::size_t>> group_indices{{{group_values}}};
+        const std::size_t ni = factor.interface.size();
+        std::vector<double> schur(ni * ni);
+        for (std::size_t row = 0; row < ni; ++row)
+            for (std::size_t column = 0; column < ni; ++column)
+                schur[row * ni + column] = matrix[factor.interface[row] * n + factor.interface[column]];
+        for (const auto& index : group_indices) {{
+            const std::size_t ng = index.size();
+            std::vector<double> diagonal(ng * ng), coupling(ni * ng), response(ng * ni);
+            for (std::size_t row = 0; row < ng; ++row)
+                for (std::size_t column = 0; column < ng; ++column)
+                    diagonal[row * ng + column] = matrix[index[row] * n + index[column]];
+            for (std::size_t row = 0; row < ni; ++row)
+                for (std::size_t column = 0; column < ng; ++column)
+                    coupling[row * ng + column] = matrix[factor.interface[row] * n + index[column]];
+            auto local = implicit_dense_factor(std::move(diagonal), ng);
+            for (std::size_t column = 0; column < ni; ++column) {{
+                std::vector<double> rhs(ng);
+                for (std::size_t row = 0; row < ng; ++row)
+                    rhs[row] = matrix[index[row] * n + factor.interface[column]];
+                implicit_dense_solve(local, rhs);
+                for (std::size_t row = 0; row < ng; ++row) response[row * ni + column] = rhs[row];
+            }}
+            for (std::size_t row = 0; row < ni; ++row)
+                for (std::size_t column = 0; column < ni; ++column)
+                    for (std::size_t inner = 0; inner < ng; ++inner)
+                        schur[row * ni + column] -=
+                            coupling[row * ng + inner] * response[inner * ni + column];
+            factor.groups.push_back({{index, std::move(local), std::move(coupling), std::move(response)}});
+        }}
+        if (ni) factor.schur = implicit_dense_factor(std::move(schur), ni);
+        implicit_factors.push_back(std::move(factor));
+        return implicit_factors.back();
+    }}
+
+    static void implicit_solve(const ImplicitFactor& factor, ImplicitVector& value) {{
+        const std::size_t ni = factor.interface.size();
+        std::vector<std::vector<double>> local_values;
+        std::vector<double> interface_value(ni);
+        for (std::size_t row = 0; row < ni; ++row)
+            interface_value[row] = value[factor.interface[row]];
+        for (const auto& group : factor.groups) {{
+            std::vector<double> local(group.index.size());
+            for (std::size_t row = 0; row < group.index.size(); ++row)
+                local[row] = value[group.index[row]];
+            implicit_dense_solve(group.factor, local);
+            for (std::size_t row = 0; row < ni; ++row)
+                for (std::size_t column = 0; column < group.index.size(); ++column)
+                    interface_value[row] -= group.coupling[row * group.index.size() + column]
+                                            * local[column];
+            local_values.push_back(std::move(local));
+        }}
+        if (ni) implicit_dense_solve(factor.schur, interface_value);
+        for (std::size_t row = 0; row < ni; ++row)
+            value[factor.interface[row]] = interface_value[row];
+        for (std::size_t group_index = 0; group_index < factor.groups.size(); ++group_index) {{
+            const auto& group = factor.groups[group_index];
+            auto& local = local_values[group_index];
+            for (std::size_t row = 0; row < group.index.size(); ++row)
+                for (std::size_t column = 0; column < ni; ++column)
+                    local[row] -= group.response[row * ni + column] * interface_value[column];
+            for (std::size_t row = 0; row < group.index.size(); ++row)
+                value[group.index[row]] = local[row];
         }}
     }}
 
@@ -620,7 +904,7 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
         const double h = span / static_cast<double>(count), begin = t;
         State f0{{}};
         rhs(begin, y, f0);
-        if (implicit_jacobian.empty()) implicit_linearize(begin, y, f0);
+        implicit_select(begin, y, f0);
         for (std::size_t k = 0; k < count; ++k) implicit_step(begin + k * h, y, h, f0, 0);
         {projection}
         t = target;
@@ -2636,13 +2920,241 @@ class _ModelGenerator:
             circuit._cpp_topologies[mode.key] = topology
         return circuit._cpp_topologies[mode.key]
 
+    @staticmethod
+    def _switch_flag(switch: Any) -> _Expression | None:
+        """Return one run-time switch position without asking the tracer to branch."""
+        closed = switch.closed
+        if not isinstance(closed, _BoundValue):
+            return None
+        value = getattr(closed.record, closed.field)
+        if not isinstance(value, _Expression) or (
+                value.kind == "bool" and value.code in ("true", "false")):
+            return None
+        flag = (value if value.kind == "bool" else
+                _Expression(f"(std::abs({value.code}) != 0.0)", "bool", pure=value.pure))
+        return (_Expression(f"!({flag.code})", "bool", pure=flag.pure)
+                if closed.invert else flag)
+
+    @classmethod
+    def _switched_decomposition(cls, circuit: Any):
+        """Use the assembled structural analysis to split independent run-time switches."""
+        flags = tuple(cls._switch_flag(switch) for switch in circuit.netlist._switches)
+        free = tuple(index for index, flag in enumerate(flags) if flag is not None)
+        if len(free) < 2:
+            return None
+        closed = tuple(True if flag is not None else bool(switch.closed())
+                       for flag, switch in zip(flags, circuit.netlist._switches))
+        conducting = list(circuit.netlist.conducting)
+        for index, gate in circuit.netlist._gates:
+            if bool(gate()):
+                conducting[index] = True
+        analysis = getattr(getattr(circuit, "_analysis", None), "switch_decomposition", None)
+        if analysis is None:
+            return None
+        decomposition = analysis(circuit, free, closed, tuple(conducting))
+        return None if decomposition is None else (decomposition, flags)
+
+    @classmethod
+    def _switched_roles(cls, circuit: Any, elements: Iterable[Any]):
+        """Return one topology when the requested elements keep the same dissipative role."""
+        selected = cls._switched_decomposition(circuit)
+        if selected is None:
+            return None
+        decomposition, _flags = selected
+        net = circuit.netlist
+        branches = [branch for element in elements for branch in net._ports[id(element)]]
+        first, *others = decomposition.topologies
+        if all((topology.roles[branch] == "res") == (first.roles[branch] == "res")
+               for topology in others for branch in branches):
+            return first
+        return None
+
+    @classmethod
+    def _select_switch_clusters(cls, decomposition: Any, flags: Sequence[Any],
+                                owners: Sequence[Sequence[int]],
+                                variants: Mapping[frozenset[int], tuple]) -> list[Any]:
+        """Select local cluster equations and add only independently verified changes."""
+        base = variants[frozenset()]
+
+        def select(cluster: Sequence[int], value: Callable[[frozenset[int]], Any]) -> Any:
+            def build(position: int, opened: frozenset[int]) -> Any:
+                if position == len(cluster):
+                    return value(opened)
+                switch = cluster[position]
+                return cls._merge_trace(
+                    flags[switch],
+                    build(position + 1, opened | {switch}),
+                    build(position + 1, opened),
+                )
+            return build(0, frozenset())
+
+        combined = []
+        for entry, entry_owners in enumerate(owners):
+            if not entry_owners:
+                combined.append(base[entry])
+            elif len(entry_owners) == 1:
+                owner = entry_owners[0]
+                combined.append(select(
+                    decomposition.clusters[owner],
+                    lambda opened, entry=entry: variants[opened][entry],
+                ))
+            else:
+                total = base[entry]
+                for owner in entry_owners:
+                    total = total + select(
+                        decomposition.clusters[owner],
+                        lambda opened, entry=entry: (
+                            variants[opened][entry] - base[entry] if opened else 0.0
+                        ),
+                    )
+                combined.append(total)
+        return combined
+
+    @classmethod
+    def _trace_switched_netlist(cls, circuit: Any, t: Any, states: list[Any],
+                                dynamic: bool):
+        """Trace independently selected local mode families instead of their global product."""
+        selected = cls._switched_decomposition(circuit)
+        if selected is None:
+            return None
+        decomposition, flags = selected
+        net = circuit.netlist
+        variants = {}
+        for opened, mode in decomposition.modes.items():
+            topology = net._compiled(mode)
+            if dynamic:
+                placed, outputs = cls._trace_dynamic_netlist(
+                    circuit, t, states, topology=topology
+                )
+                derivative = tuple(placed[int(index)] for index in net.states)
+            else:
+                derivative, outputs, _inputs, _rates = net._scalar_function(
+                    topology, "all"
+                )(t, states)
+            variants[opened] = (*derivative, *outputs)
+        rows = cls._select_switch_clusters(
+            decomposition, flags, decomposition.owners, variants
+        )
+        return (net._place_scalar_derivatives(rows[:net.n_x], len(states)),
+                tuple(rows[net.n_x:]))
+
+    @classmethod
+    def _switched_jump(cls, circuit: Any, states: list[Any]):
+        """Select charge and flux projections from the same independent local mode families."""
+        selected = cls._switched_decomposition(circuit)
+        if selected is None:
+            return None
+        decomposition, flags = selected
+        net = circuit.netlist
+        if net._diodes:
+            return None
+        modes = decomposition.modes
+        n_y, n_u = len(states), net.n_u
+        reference_mode = modes[frozenset()]
+
+        def topology(opened: frozenset[int]):
+            mode = modes.get(opened)
+            if mode is None:
+                mode = Mode(
+                    tuple(False if index in opened else value
+                          for index, value in enumerate(reference_mode.closed)),
+                    reference_mode.conducting, reference_mode.ratios,
+                )
+            return net._compiled(mode)
+
+        def maps(top: Topology) -> tuple[np.ndarray, ...]:
+            total = n_y + n_u
+            projected = np.zeros((n_y, total))
+            projected[:, :n_y] = np.eye(n_y)
+            loss = np.zeros((total, total))
+            for projector in top.projectors():
+                if projector is None:
+                    continue
+                state, inputs, _multipliers_state, _multipliers_input = projector._affine_maps()
+                rows = np.asarray(projector.index, dtype=np.intp)
+                projected[rows] = 0.0
+                projected[np.ix_(rows, rows)] = state
+                projected[np.ix_(rows, np.arange(n_y, total))] = inputs
+                delta = projected[rows].copy()
+                delta[np.arange(rows.size), rows] -= 1.0
+                loss += delta.T @ np.asarray(projector.W.toarray(), dtype=float) @ delta
+            storage = np.zeros((n_y, n_y))
+            for element in (*net._capacitors, *net._inductors):
+                branch = net._branch(element)
+                coefficient = element.C if hasattr(element, "C") else element.L
+                storage[np.ix_(element.state, element.state)] += (
+                    branch.scale * np.asarray(coefficient, dtype=float)
+                )
+            extended = np.zeros((total, total))
+            extended[:n_y, :n_y] = storage
+            supply = projected.T @ storage @ projected - extended + loss
+            return projected, loss, supply
+
+        try:
+            signatures = {opened: maps(topology(opened)) for opened in modes}
+            base = signatures[frozenset()]
+            owners: list[list[int]] = [[] for _ in range(n_y + 2)]
+            for owner, cluster in enumerate(decomposition.clusters):
+                choices = [opened for opened in modes if opened and opened <= set(cluster)]
+                for entry in range(n_y):
+                    if any(not np.allclose(signatures[opened][0][entry], base[0][entry],
+                                           rtol=1e-10, atol=1e-13)
+                           for opened in choices):
+                        owners[entry].append(owner)
+                for entry, matrix in enumerate((1, 2), start=n_y):
+                    if any(not np.allclose(signatures[opened][matrix], base[matrix],
+                                           rtol=1e-10, atol=1e-13)
+                           for opened in choices):
+                        owners[entry].append(owner)
+            for left in range(len(decomposition.clusters)):
+                a = decomposition.clusters[left]
+                for right in range(left + 1, len(decomposition.clusters)):
+                    b = decomposition.clusters[right]
+                    choices_a = [frozenset()] + [opened for opened in modes
+                                                  if opened and opened <= set(a)]
+                    choices_b = [frozenset()] + [opened for opened in modes
+                                                  if opened and opened <= set(b)]
+                    for opened_a in choices_a:
+                        for opened_b in choices_b:
+                            actual = maps(topology(opened_a | opened_b))
+                            for value, reference, value_a, value_b in zip(
+                                    actual, base, signatures[opened_a], signatures[opened_b]):
+                                if not np.allclose(
+                                    value, value_a + value_b - reference,
+                                    rtol=1e-10, atol=1e-12,
+                                ):
+                                    return None
+        except (ValueError, np.linalg.LinAlgError):
+            return None
+
+        variants = {}
+        frozen = net._frozen_mode, net._frozen_topology
+        try:
+            for opened, mode in modes.items():
+                top = net._compiled(mode)
+                net._frozen_mode, net._frozen_topology = top.mode, top
+                projected, loss, supply = net.projected_jump(
+                    _Expression("t", "real"), states
+                )
+                variants[opened] = (*projected, loss, supply)
+        finally:
+            net._frozen_mode, net._frozen_topology = frozen
+        combined = cls._select_switch_clusters(decomposition, flags, owners, variants)
+        return tuple(combined[:-2]), combined[-2], combined[-1]
+
     @classmethod
     def _trace_circuit_solve(cls, circuit: Any, t: Any):
         """Evaluate the circuit's selected netlist execution form with symbolic values."""
         circuit.receive()
         states = circuit._states() if circuit._transforms else circuit.gather()
-        if (circuit._cpp_coefficients
-                or any(transformer.constant is None for transformer in circuit.netlist._transformers)):
+        dynamic = bool(circuit._cpp_coefficients) or any(
+            transformer.constant is None for transformer in circuit.netlist._transformers
+        )
+        switched = cls._trace_switched_netlist(circuit, t, states, dynamic)
+        if switched is not None:
+            derivatives, all_outputs = switched
+            outputs = tuple(all_outputs[index] for index in circuit.output_indices)
+        elif dynamic:
             derivatives, all_outputs = cls._trace_dynamic_netlist(circuit, t, states)
             outputs = tuple(all_outputs[index] for index in circuit.output_indices)
         elif circuit.form == "device":
@@ -2706,7 +3218,8 @@ class _ModelGenerator:
                     power = circuit.netlist.scalar_power(outputs, elements)
                 else:
                     power = circuit.netlist.scalar_dissipated_power(
-                        outputs, elements, t=_Expression("t", "real")
+                        outputs, elements, t=_Expression("t", "real"),
+                        topology=self._switched_roles(circuit, elements),
                     )
                 return -power if supplied else power
 
@@ -2734,6 +3247,95 @@ class _ModelGenerator:
         values, _outputs = self._circuit_values(circuit)
         return [(values[index] + 1j * values[index + 1] if complex_state else values[index]).code
                 for index, complex_state in entries]
+
+    def implicit_linearization(self) -> tuple[tuple[bool, ...], list[str]]:
+        """Lower the exact circuit columns selected by the shared structural analysis."""
+        analysis = getattr(self.model, "structural_analysis", None)
+        if analysis is None:
+            return (False,) * self.model.n_states, []
+        exact = np.zeros(self.model.n_states, dtype=bool)
+        lines: list[str] = []
+        for plan in analysis.plans:
+            circuit = plan.circuit
+            exact[plan.skipped] = True
+            model_to_local = {
+                int(model_index): local_index
+                for local_index, model_index in enumerate(plan.local_to_model)
+            }
+            local_columns = {
+                model_to_local[int(model_index)]: int(model_index)
+                for model_index in plan.exact
+            }
+            if not local_columns:
+                continue
+            with self._netlist_symbols(circuit):
+                state_fields = [(component.state, name, complex_state, local)
+                                for component, name, complex_state, local in circuit.layout]
+                saved = [(record, name, getattr(record, name))
+                         for record, name, _complex, _local in state_fields]
+
+                def set_basis(position: int | None) -> None:
+                    for record, name, complex_state, local in state_fields:
+                        value: Any = 0j if complex_state else 0.0
+                        if position is not None and local <= position < local + (2 if complex_state else 1):
+                            value = (1.0 if not complex_state or position == local else 1j)
+                        setattr(record, name, value)
+                    circuit._stored = None
+
+                try:
+                    set_basis(None)
+                    baseline, _outputs = self._trace(
+                        lambda: self._trace_circuit_solve(circuit, _Expression("t", "real"))
+                    )
+                    for local_column, model_column in local_columns.items():
+                        set_basis(local_column)
+                        values, _outputs = self._trace(
+                            lambda: self._trace_circuit_solve(circuit, _Expression("t", "real"))
+                        )
+                        assignments = []
+                        for local_row, (value, base) in enumerate(zip(values, baseline)):
+                            if (value.code, value.kind) == (base.code, base.kind):
+                                continue
+                            coefficient = value - base
+                            if coefficient.code in ("0.0", "0"):
+                                continue
+                            model_row = int(plan.local_to_model[local_row])
+                            assignments.append(
+                                f"matrix[{model_row} * state_count + {model_column}] = "
+                                f"{self.solver_expression(coefficient.code)};"
+                            )
+                        lines.extend(assignments)
+                finally:
+                    for record, name, value in saved:
+                        setattr(record, name, value)
+                    circuit._stored = None
+        return tuple(map(bool, exact)), lines
+
+    def structural_mode_values(self) -> tuple[_Expression, ...]:
+        """C++ values forming the netlist's complete discrete-and-ratio mode identity."""
+        values: list[_Expression] = []
+        for circuit in self.system.circuits:
+            with self._netlist_symbols(circuit):
+                gates = {index: self._trace(gate)
+                         for index, gate in circuit.netlist._gates}
+                for switch in circuit.netlist._switches:
+                    flag = self._switch_flag(switch)
+                    if flag is None:
+                        flag = self._trace(switch.closed)
+                    if flag.code not in ("true", "false"):
+                        values.append(flag)
+                for index, diode in enumerate(circuit.netlist._diodes):
+                    conducting = _Expression.of(diode.conducting)
+                    values.append(conducting | gates[index] if index in gates else conducting)
+                for transformer in circuit.netlist._transformers:
+                    if transformer.constant is None:
+                        values.extend(
+                            _Expression.of(value)
+                            for value in np.asarray(
+                                self._ratio_matrix(transformer), dtype=object
+                            ).flat
+                        )
+        return tuple(values)
 
     def trace_circuit_commutation_margin(self, circuit: Any) -> str:
         """Trace the minimum diode guard from the circuit's own netlist primitives."""
@@ -2790,15 +3392,20 @@ class _ModelGenerator:
                 net = circuit.netlist
                 for diode, name in zip(net._diodes, previous):
                     diode.conducting = _Expression(name, "bool")
-                impulses = net.impulse_flags(_Expression("t", "real"), states)
-                projected, jump_loss, jump_supply = net.projected_jump(
-                    _Expression("t", "real"), states
-                )
+                switched = self._switched_jump(circuit, states)
+                if switched is None:
+                    impulses = net.impulse_flags(_Expression("t", "real"), states)
+                    projected, jump_loss, jump_supply = net.projected_jump(
+                        _Expression("t", "real"), states
+                    )
+                else:
+                    impulses = ()
+                    projected, jump_loss, jump_supply = switched
                 projected = list(projected)
                 margins, tolerances, scales = net.scalar_margins(
                     _Expression("t", "real"), projected
                 )
-                effective = tuple(net.mode().conducting)
+                effective = tuple(net.mode().conducting) if net._diodes else ()
                 conducting = tuple(diode.conducting for diode in net._diodes)
                 if circuit._transforms:
                     component = np.asarray(projected, dtype=object)
@@ -3019,21 +3626,23 @@ class _ModelGenerator:
             assignments[match[1]] = (line, set(re.findall(r"\b\w+\b", match[2])))
             if conditional:
                 conditional_by_target[match[1]] = match[2], conditional
-        targets = set(assignments)
-        sorter = TopologicalSorter({
-            name: dependencies & targets
-            for name, (_line, dependencies) in assignments.items()
-        })
-        try:
-            order = sorter.static_order()
-            plan = tuple(assignments[name][0] for name in order)
-        except CycleError:
+        names = tuple(assignments)
+        index = {name: position for position, name in enumerate(names)}
+        graph = _dependency_plan(
+            tuple(index[dependency] for dependency in dependencies if dependency in index)
+            for _line, dependencies in assignments.values()
+        )
+        if graph.residual:
             if conditional_by_target:
-                self._parameter_dependencies(loop, assignments, conditional_by_target, sorter)
+                self._parameter_dependencies(
+                    loop, assignments, conditional_by_target, names, graph
+                )
             return None
-        return plan
+        return tuple(assignments[names[position]][0] for position in graph.order)
 
-    def _parameter_dependencies(self, loop, assignments, conditional_by_target, sorter):
+    def _parameter_dependencies(
+        self, loop, assignments, conditional_by_target, names, graph
+    ):
         """Associate conditional edges with parameters, only inside actual scalar SCCs."""
         expressions = {coefficient for _rhs, conditional in conditional_by_target.values()
                        for contributions in conditional.values()
@@ -3041,22 +3650,13 @@ class _ModelGenerator:
         parameters = self.runtime.parameter_dependencies(expressions)
         if not any(parameters.values()):
             return
-        residual = set(assignments)
-        # CycleError leaves the sorter's ready prefix usable; do not build or sort another graph.
-        while sorter.is_active():
-            ready = sorter.get_ready()
-            residual.difference_update(ready)
-            sorter.done(*ready)
-        names = [name for name in assignments if name in residual]
-        index = {name: i for i, name in enumerate(names)}
-        successors = [[] for _ in names]
-        for name in names:
-            for dependency in assignments[name][1] & residual:
-                successors[index[dependency]].append(index[name])
-        components = _strong_components(successors, range(len(names)))
-        component_of = {names[node]: ci for ci, component in enumerate(components)
-                        if len(component) > 1 or component[0] in successors[component[0]]
-                        for node in component}
+        residual = {names[position] for position in graph.residual}
+        component_of = {
+            names[node]: ci
+            for ci, component in enumerate(graph.components)
+            if len(component) > 1 or component[0] in graph.successors[component[0]]
+            for node in component
+        }
         public = {self.value(getattr(owner, role), field):
                   f"{self.subsystem_name[id(owner)]}.{role}.{field}"
                   for owner in loop.owners for role in ("state", "input", "output")
@@ -6049,13 +6649,20 @@ class _CppGenerator:
             if circuit.commutation_active:
                 continue  # its existing continuous commutation dispatcher owns projection
 
-            def commands():
-                with model._netlist_symbols(circuit):
-                    return tuple(value for group in circuit._boundary_mode()
-                                 for value in group if value is not None)
+            with model._netlist_symbols(circuit):
+                flags = tuple(model._switch_flag(switch)
+                              for switch in circuit.netlist._switches)
+            if all(flag is not None or isinstance(switch.closed(), bool)
+                   for flag, switch in zip(flags, circuit.netlist._switches)):
+                values = [flag for flag in flags if flag is not None]
+            else:
+                def commands():
+                    with model._netlist_symbols(circuit):
+                        return tuple(value for group in circuit._boundary_mode()
+                                     for value in group if value is not None)
 
-            values = [value for value in model._trace(commands)
-                      if value.code not in {"true", "false"}]
+                values = [value for value in model._trace(commands)
+                          if value.code not in {"true", "false"}]
             if not values:
                 continue
             tag = "boundary_" + model.prefix[id(circuit)]
@@ -6340,6 +6947,34 @@ class _CppGenerator:
             guard = " && ".join(dict.fromkeys(direct_guards.values()))
             rhs = f"if (!({guard})) {{ evaluate_feedback(t, y, dy); return; }}\n        " + rhs
         sync_body = "\n        ".join(model.body(derivatives=False))
+        native_implicit = isinstance(self.simulation.solver, ImplicitSolver)
+        analysis = getattr(self.model, "structural_analysis", None)
+        stiff_fallback = (
+            isinstance(self.simulation.solver, FixedStepSolver)
+            and analysis is not None
+            and any(plan.local_to_model.size for plan in analysis.plans)
+        )
+        uses_implicit_linearization = native_implicit or stiff_fallback
+        implicit_exact_columns: tuple[bool, ...] = ()
+        implicit_exact_lines: list[str] = []
+        mode_size = 0
+        mode_lines: list[str] = []
+        if uses_implicit_linearization:
+            implicit_exact_columns, implicit_exact_lines = model.implicit_linearization()
+            mode_values = model.structural_mode_values()
+            entries = []
+            for value in mode_values:
+                code = model.solver_expression(value.code)
+                if value.kind == "complex":
+                    entries += [f"std::real({code})", f"std::imag({code})"]
+                else:
+                    entries.append(f"static_cast<double>({code})")
+            mode_size = len(entries)
+            mode_lines = [
+                "StructuralMode structural_mode() {",
+                "    return {{" + ", ".join(entries) + "}};",
+                "}",
+            ]
         observation_members, observation_assignments = model.observations(generators)
         tracking = {generator.name: generator.tracking_method()
                     for generator in generators.values()}
@@ -6358,6 +6993,8 @@ class _CppGenerator:
                     for method in (generator.sense_method(), generator.actuate_method(),
                                    generator.protection_method(), generator.adc_methods())]
         methods += event_methods
+        if mode_lines:
+            methods.append("\n".join(mode_lines))
         energy_method, energy_columns = self._energy_method(model)
         if energy_method:
             methods.append(energy_method)
@@ -6516,7 +7153,7 @@ class _CppGenerator:
             )
         solver = self.p.simulation.solver
         fixed = solver.type == "fixed"
-        implicit = isinstance(self.simulation.solver, ImplicitSolver)
+        implicit = native_implicit
         runtime_declarations = self.runtime.declarations()
         runtime_setters = self.runtime.setters()
         runtime_listing = self.runtime.listing()
@@ -6535,17 +7172,52 @@ class _CppGenerator:
             fixed_dt = f"std::min({fixed_dt}, maximum_step)"
             adaptive_max_step = f"std::min({adaptive_max_step}, maximum_step)"
         if implicit:
+            structure = analysis.structure() if analysis is not None else None
             solver_code = _implicit_solver(self.simulation.solver, integration_name, integration_args,
-                                           fixed_dt, adaptive_atol, adaptive_rtol, raw_projection_call)
+                                           fixed_dt, adaptive_atol, adaptive_rtol, raw_projection_call,
+                                           exact_columns=implicit_exact_columns,
+                                           exact_lines=implicit_exact_lines,
+                                           mode_size=mode_size,
+                                           groups=() if structure is None else structure.groups,
+                                           interface=() if structure is None else structure.interface)
         elif fixed:
             step_code = _fixed_step(solver.method)
-            solver_code = step_code + f'''
+            if stiff_fallback:
+                structure = analysis.structure()
+                fallback = ImplicitSolver(
+                    solver.dt, "radau", solver.rtol, solver.atol
+                )
+                implicit_code = _implicit_solver(
+                    fallback, "integrate_stiff", integration_args,
+                    fixed_dt, adaptive_atol, adaptive_rtol, raw_projection_call,
+                    exact_columns=implicit_exact_columns,
+                    exact_lines=implicit_exact_lines,
+                    mode_size=mode_size,
+                    groups=structure.groups,
+                    interface=structure.interface,
+                )
+                blocks = tuple(plan.local_to_model for plan in analysis.plans)
+                stability_code = _explicit_stability(solver.method, blocks)
+                stiff_call = (
+                    "integrate_stiff(t, target, maximum_step);"
+                    if local_limit else "integrate_stiff(t, target);"
+                )
+                stiffness = f'''{implicit_code}
+{stability_code}
+'''
+                stiffness_dispatch = f'''
+        if (!explicit_stable(t, h)) {{ {stiff_call} return; }}'''
+            else:
+                stiffness = ""
+                stiffness_dispatch = ""
+            solver_code = stiffness + step_code + f'''
 
     void {integration_name}(double& t, double target{integration_args}) {{
         const double span = target - t;
         if (span <= 0.0) return;
         const std::size_t count = std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(span / {fixed_dt} - 1e-9)));
         const double h = span / static_cast<double>(count);
+        {stiffness_dispatch}
         for (std::size_t k = 0; k < count; ++k) step(t, h);
         {raw_projection_call}
         t = target;
@@ -6602,12 +7274,14 @@ class _CppGenerator:
                          for k, guard in enumerate(diode_blocking_guards)]
             callbacks += [f"double diode_maximum_step_{k}() {{ return {value}; }}"
                           for k, value in enumerate(diode_step_limits)]
-            for name, expressions in (("commutation_margin", commutation_margins),
-                                      ("commutation_next", commutation_times)):
-                callbacks += [f"double {name}(std::size_t index) {{ switch (index) {{",
-                              *[f"case {k}: return {expression};"
-                                for k, expression in enumerate(expressions)],
-                              "default: return std::numeric_limits<double>::infinity(); } }"]
+            callbacks += ["double commutation_margin(std::size_t index, double t) { switch (index) {",
+                          *[f"case {k}: return {expression};"
+                            for k, expression in enumerate(commutation_margins)],
+                          "default: return std::numeric_limits<double>::infinity(); } }"]
+            callbacks += ["double commutation_next(std::size_t index) { switch (index) {",
+                          *[f"case {k}: return {expression};"
+                            for k, expression in enumerate(commutation_times)],
+                          "default: return std::numeric_limits<double>::infinity(); } }"]
             callbacks += ["void commutate(std::size_t index, double t) { switch (index) {",
                           *[f"case {k}: {{ " + " ".join(lines) + "; break; }"
                             for k, lines in enumerate(commutation_transitions)],
@@ -6976,7 +7650,7 @@ public:
                     actions_applied = true;
                     ++action_index;
                 }}
-                if (actions_applied) {{ {boundary_call} sync(t); {'implicit_invalidate();' if implicit else ''} }}
+                if (actions_applied) {{ {boundary_call} sync(t); {'implicit_invalidate();' if uses_implicit_linearization else ''} }}
                 {conduction_sync}
                 bool trip_now = false;
                 {' '.join(protect)}

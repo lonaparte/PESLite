@@ -9,6 +9,7 @@ import pytest
 
 import peslite
 from peslite.assembly import cpp
+from peslite.solver import model as kernel
 from peslite.assembly.cpp import _ModelGenerator, _RuntimeParameters
 from peslite.components import Element, register_component_type
 from peslite.solver import Bag, Model
@@ -157,13 +158,17 @@ def test_conditional_downstream_output_is_not_a_feedback_parameter():
 
 
 def test_dag_and_additive_parameters_do_not_request_scc_analysis(monkeypatch):
+    generators = (
+        _generator(feedback=False),
+        _generator(gain=0.5, variable=("offset",)),
+        _generator(gain=0.5, variable=()),
+    )
+
     def unexpected_scc(*_args):
         pytest.fail("SCC analysis is unnecessary without conditional feedback")
 
-    monkeypatch.setattr(cpp, "_strong_components", unexpected_scc)
-    assert not _generator(feedback=False).diagnostics
-    assert not _generator(gain=0.5, variable=("offset",)).diagnostics
-    assert not _generator(gain=0.5, variable=()).diagnostics
+    monkeypatch.setattr(kernel, "_strong_components", unexpected_scc)
+    assert all(not generator.diagnostics for generator in generators)
 
 
 @pytest.mark.parametrize("gain", [0.0, 0.1])

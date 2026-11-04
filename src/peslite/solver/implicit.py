@@ -562,12 +562,10 @@ class ModeJacobian:
 
 def linear_system(model: Any = None) -> LinearSystem:
     """Use the assembled state partition when supplied, otherwise one dense block."""
-    structure = getattr(model, "linear_structure", None)
-    mode_key = getattr(model, "linear_mode_key", None)
-    exact_blocks = getattr(model, "linear_blocks", None)
+    analysis = getattr(model, "structural_analysis", None)
     return LinearSystem(
-        structure() if structure is not None else None,
+        analysis.structure() if analysis is not None else None,
         cache=True,
-        mode_key=mode_key,
-        exact_blocks=exact_blocks,
+        mode_key=analysis.mode_key if analysis is not None else None,
+        exact_blocks=analysis.linear_blocks if analysis is not None else None,
     )

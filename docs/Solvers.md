@@ -30,6 +30,8 @@ primitive representation connects to the same network through a behavioral volta
 All three circuit models work with explicit and implicit time integrators.
 For explicit integration of small circuits, `device` usually has the lowest per-stage overhead;
 `statewise` and `nodal` are selected for their network formulation rather than assumed speedups.
+Assembly builds the dependency order, algebraic-loop SCCs, electrical state partition, exact
+Jacobian columns and mode signature once; Python simulation and C++ export reuse that plan.
 
 Export the automatic electrical partition with `peslite inspect case.pes --groups --json > groups.json`.
 
@@ -51,10 +53,9 @@ exactly at scheduled boundaries. Fixed implicit methods use `rtol` and `atol` fo
 RK4 is the normal starting point for `switching` and `pwm_averaging`. Reduce `dt` until important
 outputs and event responses are insensitive to further reduction.
 
-Before a fixed explicit step in Python, PESLite checks the present linear circuit mode against that
-method's stability region. A mode outside the region uses the existing fixed Radau solver for that
-interval; this preserves the configured step grid without explicit-step divergence during stiff
-commutation.
+Before a fixed explicit step, Python and generated C++ check the present linear circuit mode against
+that method's stability region. A mode outside the region uses fixed Radau for that interval; this
+preserves the configured step grid without explicit-step divergence during stiff commutation.
 
 ## Adaptive solvers
 
@@ -75,7 +76,8 @@ Jacobians for the switching decisions. `LSODA` selects
 between nonstiff and stiff integration internally. Python implicit methods take exact electrical
 blocks from the present netlist mode, retain full finite differences where states enter behavioral
 or cross-subsystem feedback, and reuse the assembled state partition and returning-mode cache across
-all circuit representations.
+all circuit representations. Generated C++ fixed implicit methods use the same partition, mode
+identity and commutation boundaries.
 
 `rtol` controls error relative to the current state scale, while `atol` supplies an absolute floor
 near zero. Smaller tolerances generally increase accepted steps and RHS evaluations. `max_step`
