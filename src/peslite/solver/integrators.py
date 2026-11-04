@@ -20,6 +20,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .model import commutation_tolerance
+from .netlist import FORMS as CIRCUIT_MODELS
 
 __all__ = ["RHS", "SolverStep", "Solver", "FIXED_METHODS", "ADAPTIVE_METHODS", "EXPLICIT_FIXED_METHODS",
            "IMPLICIT_FIXED_METHODS", "IMPLICIT_ADAPTIVE_METHODS", "CIRCUIT_MODELS", "TABLEAUS", "combine",
@@ -75,7 +76,6 @@ EXPLICIT_FIXED_METHODS = ("euler", "heun", "RK4")
 IMPLICIT_FIXED_METHODS = ("trapezoidal", "radau")
 FIXED_METHODS = EXPLICIT_FIXED_METHODS + IMPLICIT_FIXED_METHODS
 ADAPTIVE_METHODS = ("RK23", "RK45", "DOP853", "radau", "BDF", "LSODA", "DP45", "auto")
-CIRCUIT_MODELS = ("device", "statewise", "nodal")
 IMPLICIT_ADAPTIVE_METHODS = ("radau", "BDF", "LSODA")
 
 

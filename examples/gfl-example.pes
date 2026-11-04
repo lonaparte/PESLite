@@ -133,7 +133,7 @@ units:                     # converters, one entry each
       # hold: 0.02         # s
 
 # elements:                # other circuit elements: the built-in load, or types registered with
-#   load1: {type: load, bus: pcc, r_pu: 2.0, x_pu: 1.0}  # peslite.register_element_type
+#   load1: {type: load, bus: pcc, r_pu: 2.0, x_pu: 1.0}  # peslite.register_component_type
 #                          # load: series R-L from the bus to ground; a small impedance is a fault
 
 events:                    # what happens during the run, by name; written only when it happens

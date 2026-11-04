@@ -1208,7 +1208,10 @@ class Model:
                     "(needs state/input/output, state_names, outputs_need_inputs, set_outputs, rhs)")
         from .netlist import prepare_device
         for sub in subsystems:
-            if callable(getattr(sub, "netlist", None)) and not hasattr(sub, "_circuit"):
+            rhs = getattr(getattr(sub, "rhs", None), "__func__", None)
+            if (callable(getattr(type(sub), "network", None))
+                    and getattr(rhs, "_peslite_device_adapter", False)
+                    and not hasattr(sub, "_device_circuit")):
                 prepare_device(sub)
         self.subsystems: list[Subsystem] = list(subsystems)
         self.connections = dict(connections)

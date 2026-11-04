@@ -1081,6 +1081,18 @@ class DCLink(NetworkComponent):
         """Disconnect the source from the capacitor; a link without capacitor is unchanged."""
         self.tripped = True
 
+    def equation_state_bindings(self) -> dict[str, tuple[Any, str]]:
+        """Return discrete physical state that generated backends must preserve."""
+        return {"tripped": (self, "tripped")}
+
+    def cpp_equation_attributes(self, generator: Any) -> dict[str, Any]:
+        """Return native values needed by the declared source equation."""
+        return {"source": generator.ramped_equation_value(self, self.source)}
+
+    def cpp_equation_members(self, generator: Any, controllers=()) -> list[str]:
+        """Return native source-ramp members for this link."""
+        return generator.ramp_equation_members(self, self.source, controllers)
+
     def connect(self, on: bool, t: float, ramp: float = 0.0) -> None:
         """Connect or disconnect the unit's source; current sources honor the connection ramp."""
         if isinstance(self.source, DCCurrentSource):

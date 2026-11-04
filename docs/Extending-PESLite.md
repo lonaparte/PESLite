@@ -20,9 +20,9 @@ uses a filtered measured-voltage magnitude and grid-frequency state, then joins 
 as the built-in current and DC-voltage loops.
 
 The bundled `cable-gfl-example` similarly keeps its case in `examples/`, while
-`peslite.addons.components.cable` implements its own distributed R-L/G-C state equations. It is a
-two-port custom element rather than a renamed built-in branch: both port currents are
-positive into the cable, and its internal inductor currents and capacitor voltages are ordinary
+`peslite.addons.components.cable` declares a distributed R-L/G-C network through the same component
+interface. It is a two-port custom element rather than a renamed built-in branch: both port currents
+are positive into the cable, and its internal inductor currents and capacitor voltages are ordinary
 restartable PESLite states.
 
 ## Custom control loops

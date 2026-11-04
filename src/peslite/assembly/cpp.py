@@ -23,7 +23,6 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
-from ..components.converter import DCLink
 from ..components.network import ACVoltageSource, RLBranch
 from ..components.pwm import (_EPS, _SNAP, CarrierComparison, SynchronousCarrier, PhaseClock,
                                PhaseShiftModulator, ZOH)
@@ -1917,11 +1916,11 @@ class _ModelGenerator:
         )
         return [f"{flag} = {open_expression};", *(["{", *updates, "}"] if updates else [])]
 
-    def source_ramp_members(self, link: DCLink) -> tuple[str, str, str] | None:
-        """Physical source ramp state and law, independent of restored controller startup state."""
-        if link.source is None or not hasattr(link.source, "i_nom"):
+    def ramp_member_names(self, owner: Any, source: Any) -> tuple[str, str, str] | None:
+        """Return native member names for a source with a connection ramp."""
+        if source is None or not hasattr(source, "i_nom"):
             return None
-        tag = self.prefix[id(link)]
+        tag = self.prefix[id(owner)]
         return "source_start_" + tag, "source_duration_" + tag, "source_ramp_" + tag
 
     def unit_control_inputs(self, unit: Any) -> dict[str, _Expression]:
@@ -2629,14 +2628,12 @@ class _ModelGenerator:
             return self.trace_netlist_outputs(owner, method, circuit, fields)
         stage_hook = getattr(owner, "cpp_output_stage", None)
         if stage_hook is not None:
-            return list(stage_hook(self, method))
+            rendered = stage_hook(self, method)
+            if rendered is not None:
+                return list(rendered)
         hook = getattr(owner, "cpp_outputs", None)
         if hook is not None:
             return list(hook(self))
-        if (isinstance(owner, ACVoltageSource)
-                and ACVoltageSource.uses_standard_outputs(method)):
-            return [f"{self.value(out, field)} = {value.code};"
-                    for field, value in self._source_equations(owner).items()]
         generator = self.continuous_units.get(id(owner))
         if generator is not None:
             return generator.output_lines()
@@ -2655,18 +2652,60 @@ class _ModelGenerator:
         enabled = self.enabled_by.get(id(owner))
         if enabled is not None:
             attributes["enabled"] = _Expression(enabled, "bool")
-        if (isinstance(owner, RLBranch) and (self._lifecycle_writes is None
-                or (id(owner), "breaker_open") in self._lifecycle_writes)):
-            attributes["breaker_open"] = _Expression(f"breaker_open_{self.prefix[id(owner)]}", "bool")
-        if isinstance(owner, DCLink):
-            attributes["tripped"] = _Expression(f"dclink_tripped_{self.prefix[id(owner)]}", "bool")
-            source = self.runtime.object(owner.source)
-            ramp = self.source_ramp_members(owner)
-            if ramp is not None:
-                source = copy.copy(source)
-                source.ramp = lambda t: _Expression(f"{ramp[2]}({t.code})", "real", pure=True)
-            attributes["source"] = source
+        conditional = getattr(owner, "conditional_equation_states", ())
+        for name, (record, field) in self.equation_bindings.get(id(owner), {}).items():
+            if record is not owner or name != field or not name.isidentifier():
+                continue
+            if (name in conditional and self._lifecycle_writes is not None
+                    and (id(record), field) not in self._lifecycle_writes):
+                continue
+            member, kind, _record, _field = self.equation_members[id(record), field]
+            attributes[name] = _Expression(member, kind)
+        hook = getattr(owner, "cpp_equation_attributes", None)
+        if hook is not None:
+            attributes.update(hook(self))
         return attributes
+
+    def source_output_lines(self, source: ACVoltageSource) -> list[str]:
+        """Render one source's configured native waveform."""
+        return [
+            f"{self.value(source.output, field)} = {value.code};"
+            for field, value in self._source_equations(source).items()
+        ]
+
+    def ramped_equation_value(self, owner: Any, value: Any) -> Any:
+        """Bind a source-like equation value to its optional native ramp function."""
+        source = self.runtime.object(value)
+        ramp = self.ramp_member_names(owner, value)
+        if ramp is not None:
+            source = copy.copy(source)
+            source.ramp = lambda t: _Expression(f"{ramp[2]}({t.code})", "real", pure=True)
+        return source
+
+    def ramp_equation_members(self, owner: Any, source: Any, controllers=()) -> list[str]:
+        """Render the optional native ramp state of one source-like equation value."""
+        ramp = self.ramp_member_names(owner, source)
+        if ramp is None:
+            return []
+        start, duration, law = ramp
+        control = next((
+            control for control in controllers
+            if any(part is owner for part in control.unit.subsystems().values())
+        ), None)
+        expression = "1.0"
+        lines = []
+        if control is not None:
+            _, since, ramp_time = control.unit.scenario.at(self.p.simulation.initial.t)
+            since = since if math.isfinite(since) else self.p.simulation.initial.t
+            lines.append(
+                f"double {start} = {_number(since)}, {duration} = {_number(ramp_time)};"
+            )
+            expression = (
+                f"(!{control.m('breaker')} ? 0.0 : {duration} <= 0.0 ? 1.0 : "
+                f"smoothstep((t - {start}) / {duration}))"
+            )
+        lines.append(f"double {law}(double t) const noexcept {{ return {expression}; }}")
+        return lines
 
     @contextmanager
     def _netlist_symbols(self, circuit: Any):
@@ -3696,13 +3735,13 @@ class _ModelGenerator:
 
     def _rhs(self, sub: Any) -> list[str]:
         method = sub.rhs
+        hook = getattr(sub, "cpp_rhs", None)
+        if hook is not None:
+            return list(hook(self))
         generated = getattr(getattr(method, "__func__", method), "_peslite_netlist_rhs", None)
         if generated is not None:
             circuit, entries = generated
             return self.trace_netlist_rhs(circuit, entries)
-        hook = getattr(sub, "cpp_rhs", None)
-        if hook is not None:
-            return list(hook(self))
         generator = self.continuous_units.get(id(sub))
         if generator is not None:
             return generator.derivatives()
@@ -3785,23 +3824,9 @@ class _ModelGenerator:
             )
         for sub in self.model.subsystems:
             owner = getattr(sub, "component", sub)
-            attributes = self._equation_attributes(owner)
-            for name in ("breaker_open", "tripped"):
-                if name in attributes:
-                    lines.append(f"bool {attributes[name].code} = {_literal(bool(getattr(owner, name)))};")
-            ramp_members = self.source_ramp_members(owner) if "source" in attributes else None
-            if ramp_members is not None:
-                start, duration, law = ramp_members
-                control = next((control for control in controllers
-                                if control.unit.dclink is owner), None)
-                expression = "1.0"
-                if control is not None:
-                    _, since, ramp = control.unit.scenario.at(self.p.simulation.initial.t)
-                    since = since if math.isfinite(since) else self.p.simulation.initial.t
-                    lines.append(f"double {start} = {_number(since)}, {duration} = {_number(ramp)};")
-                    expression = (f"(!{control.m('breaker')} ? 0.0 : {duration} <= 0.0 ? 1.0 : "
-                                  f"smoothstep((t - {start}) / {duration}))")
-                lines.append(f"double {law}(double t) const noexcept {{ return {expression}; }}")
+            hook = getattr(owner, "cpp_equation_members", None)
+            if hook is not None:
+                lines.extend(hook(self, controllers))
         for generator in self.continuous_units.values():
             lines.extend(generator.members())
         return lines
@@ -6546,7 +6571,9 @@ class _CppGenerator:
                     generator = generators.get(target)
                     if generator is None:
                         raise TypeError(f"C++ export: connection variable {path!r} has no controller")
-                    source_ramp = model.source_ramp_members(generator.unit.dclink)
+                    source_ramp = model.ramp_member_names(
+                        generator.unit.dclink, generator.unit.dclink.source
+                    )
                     if source_ramp is not None:
                         start, duration, _law = source_ramp
                         lines += [f"{start} = t;", f"{duration} = {_number(action.ramp)};"]

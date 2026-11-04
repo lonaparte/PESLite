@@ -35,7 +35,7 @@ import math
 import numbers
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
 import scipy.sparse as sp
@@ -47,57 +47,71 @@ __all__ = ["Node", "Element", "Resistor", "Inductor", "CoupledInductors", "Capac
            "CurrentSource", "CurrentState", "Dissipation", "Transformer", "Switch", "Diode", "Netlist", "Mode", "Topology", "StateSpace",
            "Grouping", "ConductionError", "FORMS", "QUANTITIES", "device_rhs", "device_outputs",
            "device_dissipated_power", "device_supplied_power",
-           "device_commutation_margin", "device_commutate", "prepare_device",
-           "register_device_runtime"]
+           "device_commutation_margin", "device_commutate", "prepare_device"]
 
 
-_DEVICE_RUNTIME: dict[str, Callable] = {}
+class _DeviceRuntime(Protocol):
+    """Assembly implementation of standalone component execution."""
+
+    def prepare(self, component: Any) -> None: ...
+    def rhs(self, component: Any, t: float): ...
+    def outputs(self, component: Any, t: float) -> None: ...
+    def dissipated_power(self, component: Any) -> float: ...
+    def supplied_power(self, component: Any) -> float: ...
+    def commutation_margin(self, component: Any) -> float: ...
+    def commutate(self, component: Any, t: float) -> None: ...
 
 
-def register_device_runtime(**operations: Callable) -> None:
-    """Install the assembly-owned compiler behind the component-facing netlist protocol."""
-    _DEVICE_RUNTIME.update(operations)
+_DEVICE_RUNTIME: Optional[_DeviceRuntime] = None
 
 
-def _device_operation(name: str) -> Callable:
-    try:
-        return _DEVICE_RUNTIME[name]
-    except KeyError:
-        raise RuntimeError("the PESLite netlist runtime has not been initialized") from None
-
-def device_rhs(component: Any, t: float):
-    """Evaluate a component through its declared device netlist."""
-    return _device_operation("rhs")(component, t)
+def _install_device_runtime(runtime: _DeviceRuntime) -> None:
+    """Install the assembly implementation exactly once."""
+    global _DEVICE_RUNTIME
+    if _DEVICE_RUNTIME is not None and _DEVICE_RUNTIME is not runtime:
+        raise RuntimeError("the standalone netlist runtime is already installed")
+    _DEVICE_RUNTIME = runtime
 
 
-def device_outputs(component: Any, t: float) -> None:
-    """Publish a component's outputs through its declared device netlist."""
-    _device_operation("outputs")(component, t)
-
-
-def device_dissipated_power(component: Any) -> float:
-    """Return loss derived from a component's declared resistive primitives."""
-    return _device_operation("dissipated_power")(component)
-
-
-def device_supplied_power(component: Any) -> float:
-    """Return supply derived from a component's declared source primitives."""
-    return _device_operation("supplied_power")(component)
-
-
-def device_commutation_margin(component: Any) -> float:
-    """Return the consistency margin of a component's declared diode network."""
-    return _device_operation("commutation_margin")(component)
-
-
-def device_commutate(component: Any, t: float) -> None:
-    """Commutate a component's declared diode network at ``t``."""
-    _device_operation("commutate")(component, t)
+def _device_runtime() -> _DeviceRuntime:
+    if _DEVICE_RUNTIME is None:
+        raise RuntimeError("the standalone netlist runtime has not been initialized")
+    return _DEVICE_RUNTIME
 
 
 def prepare_device(component: Any) -> None:
-    """Compile a standalone component's physical netlist before model planning."""
-    _device_operation("prepare")(component)
+    """Compile a standalone component before Model plans its output dependencies."""
+    _device_runtime().prepare(component)
+
+
+def device_rhs(component: Any, t: float):
+    """Evaluate a standalone component through its declared device netlist."""
+    return _device_runtime().rhs(component, t)
+
+
+def device_outputs(component: Any, t: float) -> None:
+    """Publish a standalone component's outputs through its device netlist."""
+    _device_runtime().outputs(component, t)
+
+
+def device_dissipated_power(component: Any) -> float:
+    """Return loss derived from a component's resistive primitives."""
+    return _device_runtime().dissipated_power(component)
+
+
+def device_supplied_power(component: Any) -> float:
+    """Return supply derived from a component's source primitives."""
+    return _device_runtime().supplied_power(component)
+
+
+def device_commutation_margin(component: Any) -> float:
+    """Return the consistency margin of a component's diode network."""
+    return _device_runtime().commutation_margin(component)
+
+
+def device_commutate(component: Any, t: float) -> None:
+    """Commutate a standalone component's declared diode network."""
+    _device_runtime().commutate(component, t)
 
 Port = Optional["Node"]
 Value = Callable[[float], ArrayLike]

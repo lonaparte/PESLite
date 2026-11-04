@@ -175,7 +175,6 @@ class NetlistBuilder:
         self.hooks: dict[int, dict[str, Any]] = {}
         self.bindings: list[tuple[Callable, tuple[Any, ...]]] = []
         self.mixtures: list[tuple[Callable, Callable]] = []
-        self.local = False
         self.value_outputs: dict[tuple[int, str], tuple[Any, str]] = {}
         self.value_bindings: dict[tuple[int, str], _BoundValue] = {}
 
@@ -311,11 +310,6 @@ class NetlistBuilder:
     def mixture(self, cases: Callable, select: Callable) -> None:
         """Average evaluations of this declaration over ``(weight, case)`` values."""
         self.mixtures.append((cases, select))
-
-    def local_model(self) -> None:
-        """Compile this signal-controlled declaration locally instead of merging its nodes."""
-        self.local = True
-
 
 class NetworkPlan:
     """A component's assembly-time electrical plan, materialized by every circuit model."""
@@ -1807,389 +1801,184 @@ class _EnergeticView(NetworkView):
         return self.component.supplied_power() if self._supply is None else self._supply()
 
 
-class _DeviceRuntime:
-    """Bind one component's runtime equations to its independently compiled netlist.
+def _bind_standalone(component: Any, circuit: Circuit, outputs: Sequence[str]) -> None:
+    """Map one standalone Circuit's compiled stages back to its component records."""
+    component._device_circuit = circuit
+    declared = tuple(dict.fromkeys(outputs))
+    published = {
+        field: circuit.published[id(component), field] for field in declared
+    }
+    input_fields = {
+        key: field
+        for owner, field, key in circuit.copies
+        if owner is component
+    }
+    stages = getattr(component, "output_stages", None)
+    if stages is None and (
+        component.outputs_need_inputs or component.output is not component.state
+    ):
+        stages = (OutputMethod(
+            "set_outputs",
+            _fields(component.input) if component.outputs_need_inputs else (),
+            _fields(component.output),
+        ),)
 
-    The component remains the Model subsystem.  Its ordinary input connections, state record,
-    event ownership and public identity therefore stay unchanged; only the electrical output and
-    derivative methods are generated from the netlist declaration.
-    """
+    stage_by_name = {
+        stage.method: stage for stage in circuit.output_stages or ()
+    }
 
-    def __init__(self, component: Any, circuit: Circuit, outputs: Sequence[str]) -> None:
-        self.component, self.circuit = component, circuit
-        component._device_circuit = circuit
-        declared = tuple(dict.fromkeys(outputs))
+    def stage_plan(stage: OutputMethod) -> tuple[OutputMethod, ...]:
+        """Return the Circuit stages required for ``stage`` in execution order."""
+        ordered: list[OutputMethod] = []
+        visited: set[str] = set()
 
-        stages = getattr(component, "output_stages", None)
-        if stages is None and (component.outputs_need_inputs or component.output is not component.state):
-            stages = (OutputMethod(
-                "set_outputs",
-                _fields(component.input) if component.outputs_need_inputs else (),
-                _fields(component.output),
-            ),)
-        direct_inputs = {
-            field: tuple(stage.inputs)
-            for stage in stages or ()
-            for field in stage.outputs
-        }
-        publish = {field: circuit.published[id(component), field] for field in declared}
-        env: dict[str, Any] = {}
-        publications = ({key: (dimension, terms) for key, dimension, terms in circuit.publications}
-                        if not circuit._transforms else {})
-        state_values = []
-        if not circuit._transforms:
-            for owner, name, complex_state, _index in circuit.layout:
-                if owner is not component:
-                    continue
-                state_values.extend((f"state.{name}.real", f"state.{name}.imag")
-                                    if complex_state else (f"state.{name}",))
-        state_tuple = "(" + ", ".join(state_values) + ("," if len(state_values) == 1 else "") + ")"
+        def visit(current: OutputMethod) -> None:
+            if current.method in visited:
+                return
+            visited.add(current.method)
+            for owner, method in circuit._output_dependencies.get(current.method, ()):
+                if owner is not circuit or method not in stage_by_name:
+                    raise RuntimeError("a standalone circuit has an external stage dependency")
+                visit(stage_by_name[method])
+            ordered.append(current)
 
-        def substitute(code: str, namespace: Mapping[str, Any], values: Sequence[str]) -> str:
-            for index in range(len(values) - 1):
-                real, imag = values[index], values[index + 1]
-                if real.endswith(".real") and imag == real[:-5] + ".imag":
-                    for compose in ("_complex", "complex"):
-                        code = code.replace(
-                            f"{compose}(y[{index}], y[{index + 1}])", real[:-5]
+        visit(stage)
+        return tuple(ordered)
+
+    def adapt(
+        name: str,
+        plan: Sequence[OutputMethod],
+        assignments: Sequence[str] = (),
+        results: Sequence[str] = (),
+    ) -> Callable:
+        """Bind already-compiled Circuit stages to the component records."""
+        namespace: dict[str, Any] = {"_device_circuit": circuit}
+        inputs = tuple(dict.fromkeys(
+            field for stage in plan for field in stage.inputs
+        ))
+        body = [
+            f"_device_circuit.input.{key} = self.input.{input_fields[key]}"
+            for key in inputs
+        ]
+        values: tuple[str, ...] = ()
+        for index, stage in enumerate(plan):
+            method = getattr(circuit, stage.method)
+            function = getattr(method, "__func__", method)
+            program = getattr(function, "_peslite_inline_program", None)
+            if isinstance(program, _InlineProgram):
+                rename = {
+                    key: f"_device_stage_{index}_{key}"
+                    for key in program.namespace
+                }
+                namespace.update(
+                    (rename[key], value) for key, value in program.namespace.items()
+                )
+
+                def rewrite(source: str) -> str:
+                    source = re.sub(r"\bself\b", "_device_circuit", source)
+                    for key in sorted(rename, key=len, reverse=True):
+                        source = re.sub(
+                            rf"\b{re.escape(key)}\b", rename[key], source
                         )
-            for index in range(len(values) - 1, -1, -1):
-                code = code.replace(f"y[{index}]", f"({values[index]})")
-            for name, value in namespace.items():
-                if isinstance(value, _BoundValue):
-                    records = ((component, "self"), (component.input, "self.input"),
-                               (component.state, "self.state"), (component.output, "self.output"))
-                    prefix = next((label for record, label in records if value.record is record), None)
-                    if prefix is not None:
-                        expression = f"{prefix}.{value.field}"
-                        if value.invert:
-                            expression = f"not {expression}"
-                        elif value.factor == -1.0:
-                            expression = f"-{expression}"
-                        elif value.factor != 1.0:
-                            expression = f"({value.factor!r} * {expression})"
-                        code = re.sub(rf"\b{re.escape(name)}\((?:t)?\)", expression, code)
-            return code
+                    return source
 
-        def complex_pair(real: str, imag: str) -> Optional[str]:
-            sign = ""
-            if real.startswith("-") and imag.startswith("-"):
-                sign, real, imag = "-", real[1:], imag[1:]
-            return sign + real[:-5] if real.endswith(".real") and imag == real[:-5] + ".imag" else None
-
-        def scaled(factor: float, expression: str) -> str:
-            if factor == 1.0:
-                return f"({expression})"
-            if factor == -1.0:
-                if expression.startswith("-"):
-                    return f"({expression[1:]})"
-                return f"-({expression})"
-            return f"{factor!r} * ({expression})"
-
-        direct_values: dict[str, str] = {}
-
-        def runtime_namespace(namespace: Mapping[str, Any]) -> dict[str, Any]:
-            """Remove declaration-only callback wrappers from generated runtime code."""
-            return {
-                name: value.callback if isinstance(value, _CallableValue) else value
-                for name, value in namespace.items()
-            }
-
-        def replace_direct(expression: str) -> str:
-            for name, value in direct_values.items():
-                expression = re.sub(rf"\b{re.escape(name)}\b", value, expression)
-            return expression
-
-        def replace_direct_statement(statement: str) -> str:
-            match = re.fullmatch(r"(\s*[A-Za-z_]\w*\s*=\s*)(.*)", statement)
-            return (match.group(1) + replace_direct(match.group(2))
-                    if match is not None else replace_direct(statement))
-
-        def generated_inputs(field: str) -> tuple[str, ...]:
-            """Direct component inputs used by one compiled netlist output."""
-            fallback = direct_inputs.get(field, all_inputs)
-            if (circuit._transforms or circuit._mixtures or circuit.standalone_ports
-                    or circuit.netlist.has_discrete_topology):
-                return fallback
-            _dimension, terms = publications[publish[field]]
-            selected = sorted(
-                index
-                for _factor, output in terms
-                for index in range(output.start, output.stop)
-            )
-            program = getattr(
-                circuit.scalar_output_evaluator(selected), "_peslite_scalar_program", None
-            )
-            if program is None:
-                return fallback
-            statements, _result, namespace, expressions = program
-            active = "\n".join((*_live_statements(statements, expressions), *expressions))
-            dependencies = set()
-            for name, value in namespace.items():
-                if re.search(rf"\b{re.escape(name)}\b", active) is None:
-                    continue
-                declared = _record_dependencies(value)
-                if declared is not None:
-                    record, fields = declared
-                    if record is component.input:
-                        dependencies.update(fields)
-                elif name != "_complex" and callable(value):
-                    return fallback
-            return tuple(name for name in all_inputs if name in dependencies)
-
-        def inline_single_use(statements: Sequence[str], expressions: Sequence[str]
-                              ) -> tuple[list[str], tuple[str, ...]]:
-            """Inline pure generated temporaries used once, without moving callback evaluations."""
-            lines, results = list(statements), list(expressions)
-            assignment = re.compile(r"\s*([A-Za-z_]\w*)\s*=\s*(.*)")
-            call = re.compile(r"\b[A-Za-z_]\w*\s*\(")
-            changed = True
-            while changed:
-                changed = False
-                for index, statement in enumerate(lines):
-                    match = assignment.fullmatch(statement)
-                    if match is None:
-                        continue
-                    name, value = match.groups()
-                    if call.search(value):
-                        continue
-                    if any(
-                        (later := assignment.fullmatch(line)) is not None
-                        and later.group(1) == name
-                        for line in lines[index + 1:]
-                    ):
-                        continue
-                    pattern = re.compile(rf"\b{re.escape(name)}\b")
-                    uses = sum(len(pattern.findall(line)) for line in lines[index + 1:])
-                    uses += sum(len(pattern.findall(expression)) for expression in results)
-                    uses -= sum(
-                        complex_pair(results[i], results[i + 1]) in (name, f"-{name}")
-                        for i in range(len(results) - 1)
-                    )
-                    if uses != 1:
-                        continue
-                    use_line = next(
-                        (offset for offset, line in enumerate(lines[index + 1:], index + 1)
-                         if pattern.search(line)),
-                        len(lines),
-                    )
-                    if any(call.search(line) for line in lines[index + 1:use_line]):
-                        continue
-                    replacement = f"({value})"
-                    lines[index + 1:] = [
-                        pattern.sub(replacement, line) for line in lines[index + 1:]
-                    ]
-                    results = [pattern.sub(replacement, expression) for expression in results]
-                    lines.pop(index)
-                    changed = True
-                    break
-            return lines, tuple(results)
-
-        def output_function(name: str, fields: Sequence[str], *, stamp: bool
-                            ) -> tuple[Optional[Callable], tuple[str, ...], set[str]]:
-            body = []
-            inline_values = None
-            calculation = []
-            if (circuit._transforms or circuit._mixtures or circuit.standalone_ports
-                    or circuit.netlist.has_discrete_topology):
-                body.extend((
-                    "    self._device_circuit.solve(t)",
-                    "    self._device_circuit.publish_outputs(t)",
-                ))
-                body.extend(
-                    f"    self.output.{field} = self._device_circuit.output.{publish[field]}"
-                    for field in fields
-                )
+                body.extend(rewrite(line) for line in program.statements)
+                values = tuple(rewrite(value) for value in program.results)
             else:
-                selected = sorted({index for field in fields for _factor, output in publications[publish[field]][1]
-                                   for index in range(output.start, output.stop)})
-                position = {output: index for index, output in enumerate(selected)}
-                evaluator_name = f"_{name}_evaluate"
-                evaluator = circuit.scalar_output_evaluator(selected)
-                program = getattr(evaluator, "_peslite_scalar_program", None)
-                if program is None:
-                    env[evaluator_name] = evaluator
-                    body.append(
-                        f"    values = {evaluator_name}(t, {state_tuple.replace('state.', 'self.state.')})"
-                    )
-                else:
-                    statements, _result, namespace, expressions = program
-                    env.update(runtime_namespace(namespace))
-                    bound = [value.replace("state.", "self.state.") for value in state_values]
-                    bound_statements = [
-                        substitute(replace_direct_statement(statement), namespace, bound)
-                        for statement in statements
-                    ]
-                    bound_expressions = tuple(
-                        substitute(replace_direct(expression), namespace, bound)
-                        for expression in expressions
-                    )
-                    bound_statements = _live_statements(bound_statements, bound_expressions)
-                    bound_statements, inline_values = inline_single_use(
-                        bound_statements, bound_expressions
-                    )
-                    calculation = bound_statements
-            assignments = []
-            aliases = set()
-            for field in fields if not (
-                    circuit._transforms or circuit._mixtures or circuit.standalone_ports
-                    or circuit.netlist.has_discrete_topology
-            ) else ():
-                key = publish[field]
-                dimension, terms = publications[key]
-                paired = None
-                if inline_values is not None and dimension == 2 and len(terms) == 1:
-                    factor, output = terms[0]
-                    paired = complex_pair(
-                        inline_values[position[output.start]],
-                        inline_values[position[output.start + 1]],
-                    )
-                if inline_values is not None and dimension == 1 and len(terms) == 1:
-                    factor, output = terms[0]
-                    value = inline_values[position[output.start]]
-                    direct = re.fullmatch(r"\(*\s*([A-Za-z_]\w*)\s*\)*", value)
-                    if factor == 1.0 and direct is not None:
-                        direct_values.setdefault(direct.group(1), f"self.output.{field}")
-                parts = [
-                    " + ".join(
-                        scaled(factor, inline_values[position[output.start + k]])
-                        if inline_values is not None else
-                        scaled(factor, f"values[{position[output.start + k]}]")
-                               for factor, output in terms) or "0.0"
-                    for k in range(dimension)
-                ]
-                expression = (scaled(terms[0][0], paired) if paired is not None else
-                              f"({parts[0]}) + 1j * ({parts[1]})" if dimension == 2 else parts[0])
-                direct = re.fullmatch(
-                    rf"\(*\s*self\.output\.{re.escape(field)}\s*\)*", expression
-                )
-                if direct is not None:
-                    aliases.add(field)
-                else:
-                    assignments.append(f"    self.output.{field} = {expression}")
-            actual = tuple(field for field in fields if field not in aliases)
-            if actual:
-                body.extend(calculation)
-                if stamp and (circuit._energy_uses_time or circuit.locate_commutations):
-                    body.append("    self._device_circuit.t = t")
-                body.extend(assignments)
-            if not body:
-                return None, (), aliases
-            exec(compile(f"def {name}(self, t):\n" + "\n".join(body or ["    pass"]) + "\n",
-                         "<peslite device netlist>", "exec"), env)
-            source = tuple(line[4:] for line in body)
-            identifiers = set(re.findall(r"\b[A-Za-z_]\w*\b", "\n".join(source)))
-            namespace = {
-                key: value for key, value in env.items()
-                if key in identifiers and key not in (name, "__builtins__")
-            }
-            env[name]._peslite_inline_program = _InlineProgram(source, (), namespace)
-            env[name]._peslite_netlist_outputs = (circuit, actual)
-            return MethodType(env[name], component), actual, aliases
-
-        dependencies: dict[tuple[str, ...], list[str]] = {}
-        all_inputs = _fields(component.input)
-        for field in declared:
-            dependencies.setdefault(generated_inputs(field), []).append(field)
-        generated = []
-        functions = []
-        aliases = set()
-        dependency_stages = tuple(dependencies.items())
-        for index, (inputs_, fields) in enumerate(dependency_stages):
-            name = "_netlist_outputs" + (f"_{index + 1}" if index else "")
-            function, actual, direct = output_function(
-                name, fields, stamp=index == len(dependency_stages) - 1
+                token = f"_device_stage_{index}"
+                namespace[token] = method
+                body.append(f"{token}(t)")
+                values = ()
+        body.extend(assignments)
+        values = tuple(results) if results else values
+        source = [f"    {line}" for line in body]
+        if values:
+            source.append(
+                "    return (" + ", ".join(values)
+                + ("," if len(values) == 1 else "") + ")"
             )
-            aliases.update(direct)
-            if function is not None:
-                setattr(component, name, function)
-                functions.append(function)
-                generated.append(OutputMethod(name, inputs_, actual))
-        kept, observers = [], []
-        for stage in stages or ():
-            remaining = tuple(
-                field for field in stage.outputs
-                if field not in declared or field in aliases
-            )
-            if remaining:
-                target = kept if stage.rhs else observers
-                target.append(OutputMethod(
-                    stage.method, tuple(stage.inputs), remaining, rhs=stage.rhs
-                ))
-        self.outputs = tuple(functions)
-        component.output_stages = (*kept, *generated, *observers)
+        elif not source:
+            source.append("    pass")
+        env = dict(namespace)
+        exec(compile(
+            f"def {name}(self, t):\n" + "\n".join(source) + "\n",
+            "<peslite standalone netlist>", "exec",
+        ), env)
+        function = env[name]
+        identifiers = set(_IDENTIFIERS.findall("\n".join((*body, *values))))
+        function._peslite_inline_program = _InlineProgram(
+            tuple(body), values, {
+                key: value for key, value in namespace.items() if key in identifiers
+            },
+        )
+        return function
 
-        entries = [(name, i, complex_state) for owner, name, complex_state, i in circuit.layout
-                   if owner is component]
-        items = [f"d[{i}] + 1j * d[{i + 1}]" if complex_state else f"d[{i}]"
-                 for _name, i, complex_state in entries]
-        rhs_env: dict[str, Any] = {}
-        rhs_lines = []
-        if not entries:
-            rhs_lines.append("    return ()")
-        elif (circuit._transforms or circuit._mixtures or circuit.standalone_ports
-              or circuit.netlist.has_discrete_topology):
-            rhs_lines.extend(("    self._device_circuit.solve(t)",
-                              "    d = self._device_circuit.derivatives"))
-        else:
-            state_values = []
-            for name, _index, complex_state in entries:
-                state_values.extend((f"self.state.{name}.real", f"self.state.{name}.imag")
-                                    if complex_state else (f"self.state.{name}",))
-            state_tuple = "(" + ", ".join(state_values) + ("," if len(state_values) == 1 else "") + ")"
-            evaluator = circuit.scalar_derivatives
-            program = getattr(evaluator, "_peslite_scalar_program", None)
-            if program is None:
-                rhs_lines.append(f"    d = self._device_circuit.scalar_derivatives(t, {state_tuple})")
-            else:
-                statements, _result, namespace, expressions = program
-                rhs_env.update(runtime_namespace(namespace))
-                expressions = tuple(
-                    substitute(replace_direct(expression), namespace, state_values)
-                    for expression in expressions
-                )
-                statements = [
-                    substitute(replace_direct_statement(statement), namespace, state_values)
-                    for statement in statements
-                ]
-                statements = _live_statements(statements, expressions)
-                statements, expressions = inline_single_use(statements, expressions)
-                rhs_lines.extend(statements)
-                items = []
-                for _name, index, complex_state in entries:
-                    paired = complex_pair(expressions[index], expressions[index + 1]) \
-                        if complex_state else None
-                    items.append(f"({paired})" if paired is not None else
-                                 f"({expressions[index]}) + 1j * ({expressions[index + 1]})"
-                                 if complex_state else f"({expressions[index]})")
-        if entries:
-            rhs_lines.append("    return (" + ", ".join(items) + ("," if len(items) == 1 else "") + ")")
-        exec(compile("def rhs(self, t):\n" + "\n".join(rhs_lines) + "\n",
-                     "<peslite device derivatives>", "exec"), rhs_env)
-        if entries:
-            source = tuple(line[4:] for line in rhs_lines[:-1])
-            identifiers = set(re.findall(
-                r"\b[A-Za-z_]\w*\b", "\n".join((*source, *items))
+    produced: dict[str, list[str]] = {}
+    for field, key in published.items():
+        produced.setdefault(circuit._output_producers[key], []).append(field)
+
+    generated = []
+    for index, (producer, fields) in enumerate(produced.items(), 1):
+        stage = stage_by_name[producer]
+        name = f"_netlist_outputs_{index}"
+        assignments = tuple(
+            f"self.output.{field} = _device_circuit.output.{published[field]}"
+            for field in fields
+        )
+        plan = stage_plan(stage)
+        function = adapt(name, plan, assignments)
+        setattr(component, name, MethodType(function, component))
+        generated.append(OutputMethod(
+            name,
+            tuple(input_fields[key] for key in dict.fromkeys(
+                field for item in plan for field in item.inputs
+            )),
+            tuple(fields),
+        ))
+
+    kept, observers = [], []
+    for stage in stages or ():
+        remaining = tuple(field for field in stage.outputs if field not in declared)
+        if remaining:
+            (kept if stage.rhs else observers).append(OutputMethod(
+                stage.method, tuple(stage.inputs), remaining, rhs=stage.rhs
             ))
-            namespace = {
-                key: value for key, value in rhs_env.items()
-                if key in identifiers and key not in ("rhs", "__builtins__")
-            }
-            rhs_env["rhs"]._peslite_inline_program = _InlineProgram(
-                source, tuple(items), namespace
-            )
-        rhs_env["rhs"]._peslite_netlist_rhs = (circuit, tuple((i, z) for _name, i, z in entries))
-        self.rhs = MethodType(rhs_env["rhs"], component)
-        component.rhs = self.rhs
-        if id(component) in circuit._loss_elements:
-            component.dissipated_power = lambda: circuit.dissipated_power_of(component)
-        if id(component) in circuit._supply_elements:
-            component.supplied_power = lambda: circuit.supplied_power_of(component)
-        if circuit.commutation_active:
-            component.commutation_margin = circuit.commutation_margin
-            component.commutate = circuit.commutate
-            component.commutation_active = True
-            component.locate_commutations = circuit.locate_commutations
+    component.output_stages = (*kept, *generated, *observers)
+
+    entries = [
+        (index, complex_state)
+        for owner, _name, complex_state, index in circuit.layout
+        if owner is component
+    ]
+    derivative_stage = next(
+        (stage for stage in circuit.output_stages or () if stage.rhs), None
+    )
+    if entries and derivative_stage is None:
+        raise RuntimeError("a stateful standalone circuit has no derivative stage")
+    results = tuple(
+        f"_device_circuit.derivatives[{index}] + "
+        f"1j * _device_circuit.derivatives[{index + 1}]"
+        if complex_state else f"_device_circuit.derivatives[{index}]"
+        for index, complex_state in entries
+    )
+    if derivative_stage is None:
+        def rhs(_self, _t):
+            return ()
+        rhs._peslite_inline_program = _InlineProgram((), (), {})
+    else:
+        rhs = adapt("rhs", stage_plan(derivative_stage), results=results)
+    rhs._peslite_netlist_rhs = (circuit, tuple(entries))
+    component.rhs = MethodType(rhs, component)
+
+    if id(component) in circuit._loss_elements:
+        component.dissipated_power = lambda: circuit.dissipated_power_of(component)
+    if id(component) in circuit._supply_elements:
+        component.supplied_power = lambda: circuit.supplied_power_of(component)
+    if circuit.commutation_active:
+        component.commutation_margin = circuit.commutation_margin
+        component.commutate = circuit.commutate
+        component.commutation_active = True
+        component.locate_commutations = circuit.locate_commutations
 
 
 def bind_device(name: str, component: Any, declaration: NetworkPlan,
@@ -2228,13 +2017,17 @@ def bind_device(name: str, component: Any, declaration: NetworkPlan,
     circuit.standalone_ports = tuple(
         port for port in _ports(component) if port.standalone is not None
     )
+    for field in _fields(component.input):
+        key = circuit.key(f"{name}.{field}", getattr(component.input, field), output=False)
+        circuit.copies.append((component, field, key))
+        circuit.value_inputs[id(component.input), field] = key
     output_fields = list(dict.fromkeys(output_fields))
     for field in output_fields:
         circuit.published[id(component), field] = circuit.key(
             f"{name}.{field}", getattr(component.output, field), output=True
         )
     circuit.finalize()
-    _DeviceRuntime(component, circuit, output_fields)
+    _bind_standalone(component, circuit, output_fields)
     return circuit
 
 
@@ -2246,6 +2039,11 @@ def _standalone_device(component: Any) -> Circuit:
     if declaration is None:
         raise TypeError(f"{type(component).__name__} has no device netlist equations")
     return bind_device(type(component).__name__, component, declaration)
+
+
+def prepare_device(component: Any) -> None:
+    """Compile a standalone component before Model plans its output dependencies."""
+    _standalone_device(component)
 
 
 def device_rhs(component: Any, t: float):
@@ -2283,17 +2081,19 @@ def device_commutate(component: Any, t: float) -> None:
     _standalone_device(component).commutate(t)
 
 
-from ..solver.netlist import register_device_runtime
+class _StandaloneRuntime:
+    """The assembly implementation of the solver's standalone netlist protocol."""
 
-register_device_runtime(
-    prepare=_standalone_device,
-    rhs=device_rhs,
-    outputs=device_outputs,
-    dissipated_power=device_dissipated_power,
-    supplied_power=device_supplied_power,
-    commutation_margin=device_commutation_margin,
-    commutate=device_commutate,
-)
+    prepare = staticmethod(prepare_device)
+    rhs = staticmethod(device_rhs)
+    outputs = staticmethod(device_outputs)
+    dissipated_power = staticmethod(device_dissipated_power)
+    supplied_power = staticmethod(device_supplied_power)
+    commutation_margin = staticmethod(device_commutation_margin)
+    commutate = staticmethod(device_commutate)
+
+
+STANDALONE_RUNTIME = _StandaloneRuntime()
 
 
 def _find(parent: dict[int, int], a: int) -> int:
@@ -2306,8 +2106,7 @@ def _find(parent: dict[int, int], a: int) -> int:
 
 def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mapping, zoh: Mapping,
           buses: Mapping[str, Sequence[Port]],
-          declarations: Mapping[int, Optional[NetworkPlan]], *,
-          native: Optional[set[int]] = None
+          declarations: Mapping[int, Optional[NetworkPlan]]
           ) -> tuple[dict, dict, dict, Optional[Circuit]]:
     """Rewrite an assembled connection graph for a netlist circuit model.
 
@@ -2336,8 +2135,7 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
                 owned.append(port)
 
     probes = {id(sub): declaration.builder for sub in subs
-              if (native is None or id(sub) in native)
-              and (declaration := declarations.get(id(sub))) is not None}
+              if (declaration := declarations.get(id(sub))) is not None}
     missing = sorted(
         names.get(id(port.component), type(port.component).__name__)
         for group in members for port in group

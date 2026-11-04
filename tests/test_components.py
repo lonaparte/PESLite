@@ -65,6 +65,16 @@ def test_inherited_branch_behavior_uses_the_declared_netlist_equations():
     assert branch.rhs(0.0) == (-1.0,)
 
 
+def test_model_prepares_a_standalone_component_before_planning():
+    branch = RLBranch(1.0, 2.0, i0=3.0, phases=1)
+    branch.port1.voltage, branch.port2.voltage = 5.0, 1.0
+
+    model = peslite.Model({"branch": branch}, {})
+
+    assert branch._device_circuit is not None
+    assert model.rhs_list(0.0, [3.0]) == [-2.0]
+
+
 def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():
     p = peslite.load(
         EXAMPLES / "gfl-example.pes",

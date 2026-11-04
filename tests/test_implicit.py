@@ -428,4 +428,3 @@ def test_circuit_models_preserve_the_same_simulation_equations(method, tmp_path)
 def test_implicit_solver_settings_reject_ineffective_combinations(changes, message):
     with pytest.raises(ConfigError, match=message):
         peslite.load(EXAMPLES / "gfl-example.pes", **changes)
-

@@ -46,6 +46,9 @@ class NetworkComponent:
         return device_supplied_power(self)
 
 
+NetworkComponent.rhs._peslite_device_adapter = True
+
+
 def _phase_convention(phases: int, initial: complex | float = 0.0):
     """Power scale, zero and ``initial`` of peak complex space vectors (3) or real scalars (1)."""
     if phases not in (1, 3):
@@ -86,6 +89,7 @@ class RLBranch(NetworkComponent):
     state_names: ClassVar[tuple[str, ...]] = ("i",)
     outputs_need_inputs: ClassVar[bool] = False
     netlist_jumps: bool = False
+    conditional_equation_states: ClassVar[frozenset[str]] = frozenset(("breaker_open",))
     def __init__(self, L: float, R: float, i0: complex | float = 0j, *, phases: int = 3,
                  unilateral: bool = False) -> None:
         self.power_scale, self.zero, initial = _phase_convention(phases, i0)
@@ -145,6 +149,10 @@ class RLBranch(NetworkComponent):
     def diode_blocks_reverse_current(self) -> bool:
         """Return whether this branch represents a diode-bounded current path."""
         return self.unilateral
+
+    def equation_state_bindings(self) -> dict[str, tuple[Any, str]]:
+        """Return discrete physical state that generated backends must preserve."""
+        return {"breaker_open": (self, "breaker_open")}
 
     def _device_commutation_margin(self) -> float:
         from ..solver.netlist import device_commutation_margin
@@ -299,6 +307,11 @@ class ACVoltageSource(NetworkComponent):
         return getattr(method, "__func__", None) in (
             cls.set_outputs, cls._set_single_phase_outputs, cls._set_three_phase_outputs,
         )
+
+    def cpp_output_stage(self, generator: Any, method: Any):
+        """Use the configured native source scenario for the built-in waveform."""
+        return (generator.source_output_lines(self)
+                if self.uses_standard_outputs(method) else None)
 
     def rhs(self, t: float):
         return ()
@@ -497,9 +510,6 @@ class _ComponentNetwork:
 
     def mixture(self, cases: Callable, select: Callable) -> None:
         self.builder.mixture(cases, select)
-
-    def local_model(self) -> None:
-        self.builder.local_model()
 
     def commutation(self, **kwargs: Any) -> None:
         self.builder.commutation(self.component, **kwargs)
