@@ -10,6 +10,7 @@ import peslite
 from conftest import EXAMPLES
 from peslite.solver import (AdaptiveSolver, Bag, DormandPrince45, Empty, FixedStepSolver,
                             Model, MultirateSolver, OutputMethod, make_solver)
+from peslite.solver.integrators import TABLEAUS, combine
 from peslite.solver.multirate import parse_step
 
 QUIET = {"simulation.progress.enable": 0, "simulation.solver.linearisations": 0}
@@ -21,6 +22,71 @@ def test_solver_and_control_output_stage_names_do_not_collide():
     assert peslite.solver.OutputMethod is OutputMethod
     assert not hasattr(peslite.solver, "OutputStage")
     assert peslite.OutputStage is peslite.control.OutputStage
+
+
+def test_fixed_explicit_solver_uses_implicit_step_for_an_unstable_linear_mode():
+    class StiffMode:
+        @staticmethod
+        def explicit_stable(_method, _step):
+            return False
+
+    solver = FixedStepSolver(1e-5, model=StiffMode())
+    result = solver(lambda _t, y: -1e8 * y, 0.0, 1e-5, np.array([1.0]))
+
+    assert solver._implicit is not None
+    assert abs(result.y[0]) < 0.01
+
+
+def test_fixed_explicit_stability_is_reused_by_equation_mode():
+    class Modes:
+        explicit_stability_dynamic = False
+        equation_revision = 0
+        mode = "a"
+        checks = 0
+
+        def linear_mode_key(self):
+            return self.mode
+
+        def explicit_stable(self, _method, _step):
+            self.checks += 1
+            return True
+
+    model = Modes()
+    solver = FixedStepSolver(1e-5, model=model)
+    rhs = lambda _t, y: -y
+    state = np.array([1.0])
+
+    solver(rhs, 0.0, 1e-5, state)
+    model.equation_revision += 1
+    solver(rhs, 1e-5, 2e-5, state)
+    assert model.checks == 1
+
+    model.mode = "b"
+    model.equation_revision += 1
+    solver(rhs, 2e-5, 3e-5, state)
+    assert model.checks == 2
+
+    solver.parameters_changed()
+    solver(rhs, 3e-5, 4e-5, state)
+    assert model.checks == 3
+
+
+def test_continuous_linear_modes_recheck_explicit_stability():
+    class DynamicMode:
+        explicit_stability_dynamic = True
+        equation_revision = 0
+        checks = 0
+
+        def explicit_stable(self, _method, _step):
+            self.checks += 1
+            return True
+
+    model = DynamicMode()
+    solver = FixedStepSolver(1e-5, model=model)
+    state = np.array([1.0])
+    solver(lambda _t, y: -y, 0.0, 1e-5, state)
+    solver(lambda _t, y: -y, 1e-5, 2e-5, state)
+    assert model.checks == 2
 
 
 @pytest.mark.full
@@ -51,6 +117,13 @@ def test_make_solver_builds_the_configured_integrator():
         configured = settings.__class__(**{**vars(settings), "subsystems": subsystems})
         with pytest.raises(ValueError, match="share one ratio"):
             make_solver(configured, model)
+
+
+def test_fixed_step_combination_uses_the_registered_tableau_weights(monkeypatch):
+    monkeypatch.setitem(TABLEAUS, "midpoint", ((0.0, 0.5), ((0.5,),), (0.0, 1.0)))
+    state = np.array([1.0])
+    derivatives = [np.array([3.0]), np.array([5.0])]
+    np.testing.assert_allclose(combine("midpoint", state, 0.1, derivatives), [1.5])
 
 
 def test_dp45_float_model_path_matches_the_array_path():

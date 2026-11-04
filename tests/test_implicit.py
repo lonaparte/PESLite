@@ -12,7 +12,7 @@ from conftest import EXAMPLES
 from peslite.solver import AdaptiveSolver, AutoSolver, ConfigError, DormandPrince45, FixedStepSolver, make_solver
 from peslite.solver.integrators import integrator
 from peslite.solver.implicit import (ImplicitSolver, LinearSystem, ModeJacobian, Structure,
-                                     linear_system)
+                                     _increment, linear_system)
 
 
 A_OSCILLATOR = np.array([[-1.0, 10.0], [-10.0, -1.0]])
@@ -93,6 +93,23 @@ def test_auto_switches_for_stiffness_and_returns_when_the_dynamics_change():
     np.testing.assert_allclose(result.y, [math.cos(0.17)], rtol=1e-8, atol=1e-10)
 
 
+def test_auto_keeps_the_implicit_solver_on_a_stiff_cable(tmp_path):
+    params = peslite.load(EXAMPLES / "cable-gfl-example.pes", **QUIET, **{
+        "simulation.t_end": 0.002,
+        "simulation.energy_check": "off",
+        "elements.cable1.sections": 8,
+        "elements.cable1.length_km": 5.0,
+        "simulation.solver.type": "adaptive",
+        "simulation.solver.method": "auto",
+        "simulation.solver.rtol": 1e-4,
+        "simulation.solver.atol": 1e-6,
+    })
+    simulation = peslite.Simulation(params)
+    result = simulation.run(out_dir=tmp_path)
+    assert simulation.solver.stiff and simulation.solver.switches == 1
+    assert result.n_rhs < 2400
+
+
 def test_radau_damps_a_stiff_mode_while_trapezoidal_keeps_it_bounded():
     def f(t, y):
         return np.array([-1e7 * (y[0] - math.cos(t)) - math.sin(t)])
@@ -129,6 +146,69 @@ def test_linear_system_reuses_returning_jacobians():
     assert uncached.n_jacobians == 12
 
 
+def test_returning_mode_refreshes_its_exact_linear_block():
+    selected = {"mode": 0, "matrix": A_OSCILLATOR.copy()}
+    linear = LinearSystem(
+        mode_key=lambda: selected["mode"],
+        exact_blocks=lambda: ((np.arange(2), selected["matrix"]),),
+    )
+    y = np.array([1.0, 2.0])
+
+    for mode, scale in ((0, 1.0), (1, 2.0), (0, 3.0)):
+        selected["mode"] = mode
+        selected["matrix"] = scale * A_OSCILLATOR
+        rhs = lambda _t, state: selected["matrix"] @ state
+        linear.ensure(rhs, 0.0, y, rhs(0.0, y))
+
+    np.testing.assert_array_equal(linear.J, selected["matrix"])
+    assert linear.n_jacobians == 0
+
+
+def test_exact_submatrix_preserves_feedback_outside_the_netlist_block():
+    matrix = np.array([[-1.0, 0.0], [2.0, -3.0]])
+    linear = LinearSystem(
+        exact_blocks=lambda: ((
+            np.array([0]), np.array([[-1.0]]), np.array([0]), np.array([], dtype=int)
+        ),),
+    )
+    y = np.array([1.0, 2.0])
+    rhs = lambda _t, state: matrix @ state
+
+    linear.ensure(rhs, 0.0, y, rhs(0.0, y))
+
+    np.testing.assert_allclose(linear.J, matrix, rtol=1e-8, atol=1e-10)
+    assert linear.J[0, 0] == -1.0
+
+
+@pytest.mark.parametrize("form", ["device", "statewise", "nodal"])
+def test_exact_circuit_block_retains_continuous_control_feedback(form):
+    params = peslite.load(EXAMPLES / "gfl-example.pes", **{
+        "units.vsc.bridge.model": "averaging",
+        "simulation.solver.circuit_model": form,
+        "events.connect_vsc.t": 0.0,
+    })
+    model = peslite.System(params).model
+    y = model.get_initial_values()
+    f0 = model.rhs(0.0, y)
+    linear = linear_system(model)
+    linear.ensure(model.rhs, 0.0, y, f0)
+
+    circuit_states = np.asarray(model.linear_blocks()[0][0], dtype=int)
+    other_states = np.setdiff1d(np.arange(model.n_states), circuit_states)
+    increments = _increment(y)
+    numerical = np.column_stack([
+        (model.rhs(0.0, y + np.eye(1, model.n_states, index)[0] * increments[index]) - f0)
+        / increments[index]
+        for index in circuit_states
+    ])
+    feedback = numerical[other_states]
+
+    assert np.any(feedback != 0.0)
+    np.testing.assert_allclose(
+        linear.J[np.ix_(other_states, circuit_states)], feedback, rtol=1e-8, atol=1e-10
+    )
+
+
 @pytest.mark.parametrize("method", ["trapezoidal", "radau"])
 def test_returning_jacobian_reuses_its_newton_factorization(method):
     matrices = (A_OSCILLATOR, 100.0 * A_OSCILLATOR)
@@ -156,13 +236,14 @@ def test_returning_jacobian_reuses_its_newton_factorization(method):
             actual, fresh.factor(h, method).solve(residual), rtol=1e-12, atol=1e-12
         )
     assert linear.n_jacobians == 4
-    assert linear.n_factorizations == 2
+    stages = 1 if method == "trapezoidal" else 3
+    assert linear.n_factorizations == 2 * stages
 
     matrices = tuple(2.0 * matrix for matrix in matrices)
     linear.invalidate()
     linear.ensure(rhs, 0.0, y, rhs(0.0, y))
     assert linear.factor(h, method) is not factor
-    assert linear.n_factorizations == 3
+    assert linear.n_factorizations == 3 * stages
 
 
 def test_new_state_layout_discards_old_newton_factors():
@@ -284,7 +365,8 @@ def test_make_solver_uses_each_configured_circuit_model():
     assert type(nodal) is ImplicitSolver and nodal.linear.structure.interface.size
     assert type(adaptive) is AdaptiveSolver and type(adaptive.jac) is ModeJacobian
     step = adaptive(model.rhs, 0.0, 1e-6, model.get_initial_values())
-    assert np.all(np.isfinite(step.y)) and adaptive.jac.linear.n_jacobians > 0
+    assert np.all(np.isfinite(step.y))
+    assert adaptive.jac.linear.n_jacobians < model.n_states
 
 
 @pytest.mark.full

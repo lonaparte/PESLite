@@ -10,9 +10,11 @@ from scipy.linalg import expm
 
 import peslite
 from conftest import EXAMPLES, QUIET
-from peslite.assembly.circuit import Circuit, NetworkView, bind_device, compile_network
+from peslite.assembly.circuit import (Circuit, NetworkView, _live_statements, bind_device,
+                                      compile_network)
 from peslite.components.network import ACVoltageSource
 from peslite.solver import FixedStepSolver
+from peslite.solver import netlist as nl
 from peslite.solver.netlist import (Capacitor, CurrentSource, Diode, Inductor, Netlist, Node,
                                     Resistor, StateSpace, Switch, Transformer, VoltageSource)
 
@@ -27,6 +29,21 @@ def _affine(A, b, initial, t):
     augmented[:size, :size] = A
     augmented[:size, size] = b
     return (expm(augmented * t) @ np.append(initial, 1.0))[:size]
+
+
+@pytest.mark.parametrize("form", ("device", *FORMS))
+def test_behavioral_current_state_is_one_physical_branch(form):
+    net = Netlist(form)
+    node = Node()
+    state = net.add(nl.CurrentState(node, None, [0], lambda _t: 2.0))
+    net.add(Resistor(node, None, 4.0), nl.Dissipation(lambda _t: 3.0))
+
+    derivative = net.evaluate(0.0, np.array([1.5]))
+
+    np.testing.assert_allclose(derivative, [2.0])
+    np.testing.assert_allclose(net.branch_current(state), [1.5])
+    np.testing.assert_allclose(net.branch_voltage(state), [-6.0])
+    assert net.dissipated_power() == pytest.approx(12.0)
 
 
 @pytest.mark.parametrize("form", FORMS)
@@ -118,6 +135,17 @@ def test_grouped_nodal_selected_outputs_reuse_the_network_factorization():
         net.evaluate_outputs(0.0, states, selected), expected,
         rtol=1e-12, atol=1e-12,
     )
+
+
+def test_generated_equations_keep_only_statements_used_by_the_requested_values():
+    statements = ["    a = f(t)", "    b = g(t)", "    c = 2.0 * a", "    d = b + c"]
+    assert _live_statements(statements, ["c + 1.0"]) == [
+        "    a = f(t)", "    c = 2.0 * a",
+    ]
+    assert _live_statements(statements, ["d"]) == statements
+    assert _live_statements(["    x, y = pair(t)"], ["1.0"]) == [
+        "    x, y = pair(t)",
+    ]
 
 
 def test_selected_scalar_outputs_follow_a_dynamic_transformer_mode():
@@ -274,7 +302,9 @@ def _final(example: str, circuit_model: str, out_dir: Path) -> tuple[peslite.Sim
     return simulation, simulation.run(out_dir=out_dir).final_states()
 
 
-@pytest.mark.parametrize("example", ["gfl-example", "buck-open-loop-example", "wpt-example"])
+@pytest.mark.parametrize("example", [
+    "gfl-example", "buck-open-loop-example", "boost-example", "buck-boost-example", "wpt-example",
+])
 def test_rk4_netlist_circuit_models_match_device_equations(example, tmp_path):
     reference_sim, reference = _final(example, "device", tmp_path / example / "device")
     expected = np.asarray(list(reference.values()), dtype=float)
@@ -310,6 +340,30 @@ def test_numeric_circuit_stages_keep_the_declared_equation_dependencies(circuit_
 
     assert all(stage.method != "solve" for stage in circuit.output_stages)
     assert not simulation.system.model.algebraic_loops
+    assert "_circuit_numeric_output" not in simulation.system.model.compiled_source
+
+
+def test_device_ratio_changes_do_not_factorize_an_unused_numeric_network(
+        monkeypatch, tmp_path):
+    count = 0
+    original = nl._DenseSolve.__init__
+
+    def counting(self, *args, **kwargs):
+        nonlocal count
+        count += 1
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(nl._DenseSolve, "__init__", counting)
+    params = peslite.load(EXAMPLES / "gfl-example.pes", **QUIET, **{
+        "events.connect_vsc.t": 0.0,
+        "events.connect_vsc.ramp": 1e-3,
+        "simulation.t_end": 0.002,
+        "simulation.solver.circuit_model": "device",
+    })
+    simulation = peslite.Simulation(params)
+    simulation.run(out_dir=tmp_path)
+    steps = params.simulation.t_end / params.simulation.solver.dt
+    assert count < 0.05 * steps
 
 
 @pytest.mark.full

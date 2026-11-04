@@ -61,6 +61,9 @@ is no mode setting.
 | `averaging` | same cycle-mean conduction relation | same local DCM limit |
 
 The DCM step limit is inactive in CCM.
+An averaged DCM current is a cycle-mean state rather than an instantaneous inductor storage
+coordinate, so `energy_check: strict` rejects that reduced model instead of reporting a false
+instantaneous energy balance.
 
 ### Controllers and measurements
 

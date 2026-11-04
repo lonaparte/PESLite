@@ -298,12 +298,17 @@ class DiodeConduction:
         if not self.commutating:
             return state
         due = t + commutation_tolerance(t)
+        commutated = False
         for _ in range(_MAX_COMMUTATIONS):
             self.model.sync(t, state)
             pending = {sub for sub in self.commutating if sub.commutation_margin() < 0.0}
             pending.update(sub for sub in self._scheduled
                            if float(sub.next_commutation_time()) <= due)
             if not pending:
+                if commutated:
+                    invalidate = getattr(self.model, "invalidate_equations", None)
+                    if invalidate is not None:
+                        invalidate()
                 return state
             changed = False
             for sub in self.commutating:
@@ -317,6 +322,7 @@ class DiodeConduction:
                 sub.commutate(t)
                 state[:] = self.model.get_initial_values()
                 changed = True
+                commutated = True
         names = sorted(self.model.name_of(sub) for sub in pending)
         raise CommutationError(
             f"t = {t:.12g} s: {names} commutated {_MAX_COMMUTATIONS} times without time "

@@ -160,33 +160,17 @@ class RLBranch(NetworkComponent):
         from ..solver import netlist as nl
 
         if self.external_conduction:
-            nb.local_model()
-            current = nb.function(
-                lambda _t: max(0.0, self.state.i) if self.unilateral else self.state.i
-            )
-            branch = nb.add(nl.CurrentSource(
-                nb.node(self.port1), nb.node(self.port2), current
+            branch = nb.add(nl.CurrentState(
+                nb.node(self.port1), nb.node(self.port2), nb.state(self, "i"),
+                nb.function(lambda _t: self.input.di_dt, ("di_dt",), states=("i",)),
             ))
             nb.output(self, "i", ("branch_current", branch))
-            dynamic = nb.internal(*_node_kind(self.phases))
-            nb.add(
-                nl.VoltageSource(
-                    dynamic, None,
-                    nb.function(lambda _t: self.L * self.input.di_dt, ("di_dt",)),
-                ),
-                nl.Inductor(dynamic, None, self.L, nb.state(self, "i")),
-            )
             if self.R:
-                loss = nb.internal(1, self.power_scale)
-                loss_current = nb.function(
-                    lambda _t: max(0.0, self.input.loss_factor) ** 0.5
-                    * abs(self.state.i),
+                nb.add(nl.Dissipation(nb.function(
+                    lambda _t: self.power_scale * self.R
+                    * max(0.0, self.input.loss_factor) * abs(self.state.i) ** 2,
                     ("loss_factor",),
-                )
-                nb.add(
-                    nl.CurrentSource(None, loss, loss_current),
-                    nl.Resistor(loss, None, self.R),
-                )
+                )))
             nb.losses(self)
             return None
 
@@ -496,8 +480,8 @@ class _ComponentNetwork:
     def value(self, record: Any, field: str, factor: float = 1.0, *, invert: bool = False):
         return self.builder.value(record, field, factor, invert=invert)
 
-    def function(self, callback: Callable, inputs=()):
-        return self.builder.function(callback, inputs)
+    def function(self, callback: Callable, inputs=(), states=()):
+        return self.builder.function(callback, inputs, states)
 
     def add(self, *elements):
         return self.builder.add(*elements)

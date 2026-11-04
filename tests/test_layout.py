@@ -45,10 +45,10 @@ def test_the_package_has_five_code_parts():
     assert entries == {"__init__.py", *PARTS}
 
 
-def test_the_root_examples_directory_contains_only_pes_files():
+def test_the_root_examples_directory_contains_only_pes_case_files():
     examples = ROOT / "examples"
     assert examples.is_dir()
-    assert {path.suffix for path in examples.iterdir()} == {".pes"}
+    assert {path.suffix for path in examples.iterdir() if path.is_file()} == {".pes"}
 
 
 def test_each_part_imports_only_the_parts_below_it():

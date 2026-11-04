@@ -12,6 +12,7 @@ from __future__ import annotations
 import functools
 import linecache
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Protocol, runtime_checkable
 
@@ -106,7 +107,14 @@ def combine(method: str, y: NDArray[np.float64], h: float, ks: list) -> NDArray[
         return y + (h / 6.0) * (ks[0] + 2.0 * (ks[1] + ks[2]) + ks[3])
     if method == "heun":
         return y + 0.5 * h * (ks[0] + ks[1])
-    return y + h * ks[0]
+    if method == "euler":
+        return y + h * ks[0]
+    total = None
+    for weight, derivative in zip(TABLEAUS[method][2], ks):
+        if weight:
+            total = (weight * derivative if total is None
+                     else total + weight * derivative)
+    return y if total is None else y + h * total
 
 
 def stage_state(y: NDArray[np.float64], h: float, row: tuple[float, ...], ks: list) -> NDArray[np.float64]:
@@ -129,7 +137,7 @@ def integrator(method: str, dt: float, rtol: float = 1e-6, atol: float = 1e-9,
     """
     adaptive = isinstance(solver_type, str) and solver_type.casefold() == "adaptive"
     if method in EXPLICIT_FIXED_METHODS and not adaptive:
-        return FixedStepSolver(dt, method)
+        return FixedStepSolver(dt, method, rtol=rtol, atol=atol, model=model)
     if method == "DP45":
         return DormandPrince45(rtol, atol, max_step)
     if method == "auto":
@@ -152,12 +160,81 @@ class FixedStepSolver:
     ``method``: ``"euler"``, ``"heun"`` or ``"RK4"``.
     """
 
-    def __init__(self, dt: float, method: str = "RK4") -> None:
+    def __init__(self, dt: float, method: str = "RK4", *, rtol: float = 1e-6,
+                 atol: float = 1e-9, model=None) -> None:
         if method not in TABLEAUS:
             raise ValueError(f"unknown fixed-step method {method!r}")
         self.dt = float(dt)
         self.method = method
+        self.rtol, self.atol = float(rtol), float(atol)
+        self.model = model
+        self._implicit = None
+        self._stability_revision = -1
+        self._stability_mode = None
+        self._stable_step = 0.0
+        self._unstable_step = math.inf
+        self._stability_modes: OrderedDict[object, tuple[float, float]] = OrderedDict()
+        self._dynamic_stability = bool(
+            getattr(model, "explicit_stability_dynamic", False)
+        )
         self.n_rhs = 0
+
+    def parameters_changed(self) -> None:
+        """Discard the lazy stiff-mode factors after a parameter event."""
+        self._stability_revision = -1
+        self._stability_mode = None
+        self._stable_step = 0.0
+        self._unstable_step = math.inf
+        self._stability_modes.clear()
+        if self._implicit is not None:
+            self._implicit.parameters_changed()
+
+    def _stiff(self, step: float) -> bool:
+        stable = getattr(self.model, "explicit_stable", None)
+        if stable is None:
+            return False
+        revision = getattr(self.model, "equation_revision", 0)
+        if self._dynamic_stability:
+            return not stable(self.method, step)
+        if revision != self._stability_revision:
+            self._stability_revision = revision
+            mode_key = getattr(self.model, "linear_mode_key", lambda: None)()
+            self._stability_mode = mode_key
+            bounds = self._stability_modes.get(mode_key) if mode_key is not None else None
+            self._stable_step, self._unstable_step = bounds or (0.0, math.inf)
+            if bounds is not None:
+                self._stability_modes.move_to_end(mode_key)
+        if step <= self._stable_step:
+            return False
+        if step >= self._unstable_step:
+            return True
+        result = not stable(self.method, step)
+        if result:
+            self._unstable_step = min(self._unstable_step, step)
+        else:
+            self._stable_step = max(self._stable_step, step)
+        if self._stability_mode is not None:
+            self._stability_modes[self._stability_mode] = (
+                self._stable_step, self._unstable_step
+            )
+            self._stability_modes.move_to_end(self._stability_mode)
+            while len(self._stability_modes) > 32:
+                self._stability_modes.popitem(last=False)
+        return result
+
+    def _implicit_advance(self, f: RHS, t0: float, t1: float,
+                          y0: NDArray[np.float64], step: float) -> SolverStep:
+        """Use the shared implicit linear system for a mode outside the explicit stability region."""
+        if self._implicit is None:
+            from .implicit import ImplicitSolver, linear_system
+
+            self._implicit = ImplicitSolver(
+                self.dt, "radau", self.rtol, self.atol, linear_system(self.model)
+            )
+        before = self._implicit.n_rhs
+        result = self._implicit.advance(f, t0, t1, y0, max_step=step)
+        self.n_rhs += self._implicit.n_rhs - before
+        return SolverStep(result.t, result.y, self.n_rhs)
 
     def __call__(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64]) -> SolverStep:
         return self.advance(f, t0, t1, y0)
@@ -173,6 +250,8 @@ class FixedStepSolver:
             raise ValueError("max_step must be positive")
         n = subintervals(span, step)
         h = span / n
+        if self._stiff(h):
+            return self._implicit_advance(f, t0, t1, y0, h)
         c, a, _b = TABLEAUS[self.method]
         self.n_rhs += len(c) * n
         if self.method == "RK4":
@@ -218,6 +297,22 @@ class FixedStepSolver:
             raise ValueError("max_step must be positive")
         n = subintervals(span, step)
         h = span / n
+        if self._stiff(h):
+            y, t = np.asarray(y0, dtype=float), t0
+            previous_margin = None
+            for _ in range(n):
+                previous_t, previous_y = t, y
+                result = self._implicit_advance(f, t, t + h, y, h)
+                t, y = result.t, result.y
+                observe = synchronized_guard if synchronized_guard is not None else guard
+                margin = float(observe(t, y))
+                if margin < 0.0:
+                    return _GuardedStep(
+                        t, y, margin, previous_t, previous_y,
+                        previous_margin, True, self.n_rhs,
+                    )
+                previous_margin = margin
+            return _GuardedStep(t1, y, margin, t1, y, margin, False, self.n_rhs)
         lists = getattr(getattr(f, "__self__", None), "rhs_list", None)
         if self.method == "RK4" and lists is not None:
             result = _rk4_on_floats_guarded(len(y0), synchronized_guard is not None)(
@@ -425,8 +520,11 @@ class AdaptiveSolver:
         sol = self._solve_ivp(f, (t0, t1), y0, **kwargs)
         if not sol.success:
             raise RuntimeError(f"solve_ivp failed on [{t0}, {t1}]: {sol.message}")
-        if sol.t.size >= 2:
-            self._h_last = float(sol.t[-1] - sol.t[-2])
+        steps = np.diff(sol.t)
+        if steps.size > 1:
+            self._h_last = float(steps[-2])
+        elif steps.size == 1:
+            self._h_last = max(self._h_last or 0.0, float(steps[0]))
         self.n_rhs += int(sol.nfev) + getattr(self.jac, "n_rhs", 0) - jac_rhs
         return SolverStep(t1, sol.y[:, -1].copy(), self.n_rhs)
 
@@ -594,7 +692,6 @@ class AutoSolver:
         self.switches = 0
         self._backoff = 1
         self._stiff_steps = self._nonstiff_steps = self._nonstiff_intervals = 0
-        self._direction = None
 
     @functools.cached_property
     def _implicit(self):
@@ -635,20 +732,12 @@ class AutoSolver:
         return False
 
     def _spectral_radius(self) -> float:
+        """Return the smaller induced-norm upper bound of the Jacobian radius."""
         matrix = self._implicit.jac.linear.J
         if matrix is None or not matrix.size:
             return 0.0
-        if self._direction is None or self._direction.size != matrix.shape[0]:
-            self._direction = np.random.default_rng(matrix.shape[0]).uniform(-1.0, 1.0, matrix.shape[0])
-        vector, radius = self._direction, 0.0
-        for _ in range(4):
-            norm = float(np.linalg.norm(vector))
-            if norm == 0.0:
-                return 0.0
-            product = matrix @ vector
-            radius = float(np.linalg.norm(product)) / norm
-            vector = product
-        return radius
+        magnitude = np.abs(matrix)
+        return float(min(magnitude.sum(axis=1).max(), magnitude.sum(axis=0).max()))
 
     def __call__(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64]) -> SolverStep:
         return self.advance(f, t0, t1, y0)

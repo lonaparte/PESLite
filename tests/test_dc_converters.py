@@ -13,6 +13,7 @@ from peslite.components import HalfBridge, HalfBridgeDiodeConduction, PWMAveragi
 from peslite.assembly.conduction import DiodeConduction
 from peslite.control import (BridgeControlOutput, DCVoltageControl, GraphController,
                              InductorCurrentControl, Startup)
+from peslite.solver.netlist import CurrentState, Dissipation, Inductor, VoltageSource
 
 
 def _case(*, model="pwm_averaging", bridge_type="half_bridge",
@@ -390,12 +391,45 @@ def test_averaged_bridge_currents_follow_the_connected_converter_state(model, tm
     simulation.run(out_dir=tmp_path / model)
     unit = simulation.unit()
 
-    assert unit.bridge.input.u_dc == unit.dclink.output.u_dc
-    assert unit.bridge.input.i_c == unit.branch_f.output.i
     assert unit.bridge.output.i_dc == pytest.approx(
         unit.bridge.input.upper_current_ratio * unit.branch_f.output.i
     )
     assert unit.dclink.output.i_src == pytest.approx(unit.bridge.output.i_dc)
+    assert unit.bridge.output.u_c * unit.branch_f.output.i == pytest.approx(
+        unit.dclink.output.u_dc * unit.bridge.output.i_dc
+    )
+
+
+@pytest.mark.parametrize("model", ["pwm_averaging", "averaging"])
+@pytest.mark.parametrize("circuit_model", ["device", "statewise", "nodal"])
+def test_reverse_averaged_bridge_is_a_lossless_two_port(
+        model, circuit_model, tmp_path):
+    params = peslite.load(EXAMPLES / "boost-example.pes").replace(**{
+        "units.converter.bridge.model": model,
+        "simulation.solver.circuit_model": circuit_model,
+        "simulation.t_end": 2e-4,
+        "simulation.progress.enable": 0,
+        "simulation.output.signals": 0,
+    })
+    simulation = peslite.Simulation(params)
+    simulation.run(out_dir=tmp_path / f"{model}-{circuit_model}")
+    unit = simulation.unit()
+    assert abs(unit.bridge.output.u_c * unit.branch_f.output.i) == pytest.approx(
+        abs(unit.dclink.output.u_dc * unit.bridge.output.i_dc)
+    )
+    assert sum(port.power() for port in unit.bridge.ports) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_averaged_boost_regulates_its_output(tmp_path):
+    params = peslite.load(EXAMPLES / "boost-example.pes").replace(**{
+        "simulation.t_end": 0.02,
+        "simulation.progress.enable": 0,
+        "simulation.output.signals": 0,
+    })
+    result = peslite.Simulation(params).run(out_dir=tmp_path)
+    states = result.final_states()
+    assert states["converter.dclink.u_C"] == pytest.approx(48.0, abs=1.0)
+    assert 0.0 < states["converter.branch_f.i"] < 5.0
 
 
 def test_switching_diode_guard_is_derived_from_the_inductor_state():
@@ -419,6 +453,69 @@ def test_switching_diode_guard_is_derived_from_the_inductor_state():
     circuit.release_topology()
     _groups, guards = net.state_diode_guard_plan(net.topology())
     assert guards == ((1, -1.0),)
+
+
+def test_switching_boost_uses_the_existing_implicit_solver_for_its_stiff_startup():
+    """A diode Boost must start an empty, nearly ideal output without commutation chatter."""
+    base = peslite.load(EXAMPLES / "boost-example.pes")
+    final = []
+    for circuit_model in ("device", "statewise", "nodal"):
+        params = base.replace(**{
+            "units.converter.bridge.model": "switching",
+            "units.converter.bridge.on_resistance": 1e-6,
+            "units.converter.ctrl": {
+                "type": "open_loop",
+                "period": 50e-6,
+                "computation": 0.0,
+                "loops": {"DutyModulation": {}},
+                "references": {"duty": 0.5},
+            },
+            "simulation.initial.states.converter.dclink.u_C": 0.0,
+            "simulation.solver.dt": 0.125e-6,
+            "simulation.solver.circuit_model": circuit_model,
+            "simulation.t_end": 1e-4,
+            "simulation.energy_check": "strict",
+            "simulation.progress.enable": 0,
+            "simulation.output.states": 0,
+            "simulation.output.signals": 0,
+            "simulation.output.energy": 0,
+        })
+        simulation = peslite.Simulation(params)
+        result = simulation.run(out_dir=None)
+        states = result.final_states()
+
+        assert simulation.solver._implicit is not None
+        assert not simulation.energy_problems
+        assert all(np.isfinite(value) for value in states.values())
+        assert states["converter.dclink.u_C"] > 0.0
+        assert states["converter.branch_f.i"] > 0.0
+        bridge = simulation.unit().bridge
+        assert sum(port.power() for port in bridge.ports) == pytest.approx(
+            bridge.dissipated_power(), rel=1e-10, abs=1e-12
+        )
+        final.append([
+            states["input.u_C"],
+            states["converter.dclink.u_C"],
+            states["converter.branch_f.i"],
+        ])
+
+    np.testing.assert_allclose(final, np.broadcast_to(final[0], np.shape(final)),
+                               rtol=1e-12, atol=1e-12)
+
+
+def test_switching_boost_keeps_explicit_integration_for_its_ordinary_modes():
+    params = peslite.load(EXAMPLES / "boost-example.pes").replace(**{
+        "units.converter.bridge.model": "switching",
+        "simulation.t_end": 1e-4,
+        "simulation.progress.enable": 0,
+        "simulation.output.states": 0,
+        "simulation.output.signals": 0,
+        "simulation.output.energy": 0,
+    })
+    simulation = peslite.Simulation(params)
+    simulation.run(out_dir=None)
+
+    assert simulation.solver._implicit is None
 
 
 @pytest.mark.parametrize("load,expected_voltage,expected_total", [
@@ -482,6 +579,11 @@ def test_averaged_dcm_relation_drives_branch_current_loss_and_bridge_dc_current(
     assert circuit.netlist.elements
     assert unit.branch_f in circuit.components
     assert unit.bridge in circuit.components
+    branch_elements = circuit._loss_elements[id(unit.branch_f)]
+    assert sum(isinstance(element, CurrentState) for element in branch_elements) == 1
+    assert sum(isinstance(element, Dissipation) for element in branch_elements) == 1
+    assert not any(isinstance(element, (Inductor, VoltageSource))
+                   for element in branch_elements)
     copies = {(component, field): key for component, field, key in circuit.copies}
     assert connections[(circuit, copies[unit.branch_f, "di_dt"])] == (
         law, "derivative"
@@ -492,9 +594,7 @@ def test_averaged_dcm_relation_drives_branch_current_loss_and_bridge_dc_current(
     assert connections[(circuit, copies[unit.bridge, "upper_current_ratio"])] == (
         law, "upper_current_ratio"
     )
-    assert connections[(circuit, copies[unit.bridge, "lower_current_ratio"])] == (
-        law, "lower_current_ratio"
-    )
+    assert (unit.bridge, "lower_current_ratio") not in copies
 
     current = 32.0993023218081 / 600.0
     result = law.equations(current, 0.3, 48.0, 0.0, 32.0993023218081)

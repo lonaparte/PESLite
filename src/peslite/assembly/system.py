@@ -561,7 +561,8 @@ class System:
                     target = (unit.ctrl, channel)
                     claim_connections((target,), where)
                     connections[target] = (subsystem, output)
-        from .circuit import circuit_structure, compile_network
+        from .circuit import (circuit_explicit_stable, circuit_linear_blocks, circuit_mode_key,
+                              circuit_structure, compile_network)
         declarations = {id(subsystem): compile_network(subsystem)
                         for subsystem in subsystems.values()}
         if circuit_model == "device":
@@ -580,6 +581,14 @@ class System:
         self.model = Model(
             subsystems, connections, zoh,
             linear_structure=partial(circuit_structure, circuits=self.circuits),
+            linear_mode_key=partial(circuit_mode_key, circuits=self.circuits),
+            linear_blocks=partial(circuit_linear_blocks, circuits=self.circuits),
+            explicit_stability=partial(circuit_explicit_stable, circuits=self.circuits),
+            explicit_stability_dynamic=any(
+                transformer.constant is None
+                for circuit in self.circuits
+                for transformer in circuit.netlist._transformers
+            ),
         )
         self.event_subsystems = tuple(
             (name, subsystem)

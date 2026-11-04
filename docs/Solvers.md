@@ -51,6 +51,11 @@ exactly at scheduled boundaries. Fixed implicit methods use `rtol` and `atol` fo
 RK4 is the normal starting point for `switching` and `pwm_averaging`. Reduce `dt` until important
 outputs and event responses are insensitive to further reduction.
 
+Before a fixed explicit step in Python, PESLite checks the present linear circuit mode against that
+method's stability region. A mode outside the region uses the existing fixed Radau solver for that
+interval; this preserves the configured step grid without explicit-step divergence during stiff
+commutation.
+
 ## Adaptive solvers
 
 ```yaml
@@ -67,8 +72,10 @@ simulation:
 `DOP853`, `radau`, `BDF` and `LSODA` are also available in Python simulations. `auto` starts with DP45
 and switches to adaptive Radau when stiffness limits its steps, using existing stage values and
 Jacobians for the switching decisions. `LSODA` selects
-between nonstiff and stiff integration internally. Implicit methods share the assembled state
-partition and cache Jacobians of the complete continuous model across all circuit representations.
+between nonstiff and stiff integration internally. Python implicit methods take exact electrical
+blocks from the present netlist mode, retain full finite differences where states enter behavioral
+or cross-subsystem feedback, and reuse the assembled state partition and returning-mode cache across
+all circuit representations.
 
 `rtol` controls error relative to the current state scale, while `atol` supplies an absolute floor
 near zero. Smaller tolerances generally increase accepted steps and RHS evaluations. `max_step`

@@ -81,6 +81,9 @@ class Plant:
         yield
         if self.reconcile is not None:
             self.reconcile(t)
+        invalidate = getattr(self.model, "invalidate_equations", None)
+        if invalidate is not None:
+            invalidate()
         self.read_state()
         self.inputs_changed = True
 
@@ -927,18 +930,11 @@ class DCConverter(Unit):
                 (self.bridge, "upper_current_ratio"): (
                     self.conduction, "upper_current_ratio",
                 ),
-                (self.bridge, "lower_current_ratio"): (
-                    self.conduction, "lower_current_ratio",
-                ),
                 (self.bridge, "loss_factor"): (self.conduction, "resistance_factor"),
-                (self.bridge, "u_dc"): (self.dclink, "u_dc"),
                 (self.bridge, "i_c"): (self.branch_f, "i"),
             })
             if self._external_lower_rail:
-                connections.update({
-                    (self.conduction, "lower"): self._control_voltage_port,
-                    (self.bridge, "u_lower"): self._control_voltage_port,
-                })
+                connections[(self.conduction, "lower")] = self._control_voltage_port
             else:
                 connections[(self.conduction, "reference")] = (
                     self._control_supply_port

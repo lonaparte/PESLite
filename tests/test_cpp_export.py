@@ -504,7 +504,9 @@ def test_native_continuous_control_feedback_checks_convergence(tmp_path):
     tree["simulation"]["solver"].update(type="fixed", method="rk4", dt=1e-6,
                                         subsystems={}, linearisations=0)
     source, native, python = _run_generated(from_dict(tree), tmp_path / "feedback", compiler)
-    assert "if (!control_converged) throw" in source.read_text()
+    generated = source.read_text()
+    assert "if (!control_converged) throw" in generated
+    assert "class CsvStream" in generated and "CsvStream states" in generated
     actual, expected = _final_csv(native / "states.csv"), _final_csv(python / "states.csv")
     np.testing.assert_allclose(list(actual.values()), list(expected.values()),
                                rtol=2e-9, atol=2e-8)

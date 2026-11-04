@@ -57,6 +57,77 @@ _CONDITIONAL_DEPENDENCIES: ContextVar[tuple | None] = ContextVar(
 _SCALAR_TERMS: ContextVar[tuple | None] = ContextVar("peslite_cpp_scalar_terms", default=None)
 _TRACE_WORK_BUDGET = (1 << 13) - 1  # bound work instead of the depth of a narrow equation
 
+_CSV_STREAM = r'''class CsvStream {
+public:
+    CsvStream() = default;
+    explicit CsvStream(const std::filesystem::path& path) { open(path); }
+    CsvStream(const CsvStream&) = delete;
+    CsvStream& operator=(const CsvStream&) = delete;
+    ~CsvStream() { flush(); }
+
+    void open(const std::filesystem::path& path) {
+        file_.open(path, std::ios::out | std::ios::binary);
+        buffer_.reserve(capacity);
+    }
+    explicit operator bool() const { return static_cast<bool>(file_); }
+    bool operator!() const { return !file_; }
+    void precision(int digits) { precision_ = digits; }
+    void flush() {
+        if (!buffer_.empty()) {
+            file_.write(buffer_.data(), static_cast<std::streamsize>(buffer_.size()));
+            buffer_.clear();
+        }
+        file_.flush();
+    }
+    CsvStream& operator<<(double value) {
+        char text[64];
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+        const auto result = std::to_chars(
+            text, text + sizeof text, value, std::chars_format::general, precision_);
+        if (result.ec != std::errc{}) throw std::runtime_error("cannot format CSV value");
+        append(text, static_cast<std::size_t>(result.ptr - text));
+#else
+        const int length = std::snprintf(text, sizeof text, "%.*g", precision_, value);
+        if (length < 0 || static_cast<std::size_t>(length) >= sizeof text)
+            throw std::runtime_error("cannot format CSV value");
+        append(text, static_cast<std::size_t>(length));
+#endif
+        return *this;
+    }
+    CsvStream& operator<<(float value) { return *this << static_cast<double>(value); }
+    CsvStream& operator<<(bool value) { return *this << (value ? '1' : '0'); }
+    CsvStream& operator<<(char value) { buffer_.push_back(value); spill(); return *this; }
+    CsvStream& operator<<(const char* text) {
+        append(text, std::char_traits<char>::length(text));
+        return *this;
+    }
+    CsvStream& operator<<(std::string_view text) { append(text.data(), text.size()); return *this; }
+    CsvStream& operator<<(const std::string& text) { append(text.data(), text.size()); return *this; }
+    template <class T, std::enable_if_t<std::is_integral_v<T>
+                                        && !std::is_same_v<T, bool>
+                                        && !std::is_same_v<T, char>, int> = 0>
+    CsvStream& operator<<(T value) {
+        char text[32];
+        const auto result = std::to_chars(text, text + sizeof text, value);
+        if (result.ec != std::errc{}) throw std::runtime_error("cannot format CSV value");
+        append(text, static_cast<std::size_t>(result.ptr - text));
+        return *this;
+    }
+
+private:
+    static constexpr std::size_t capacity = std::size_t{1} << 16;
+    void append(const char* text, std::size_t size) { buffer_.append(text, size); spill(); }
+    void spill() {
+        if (buffer_.size() >= capacity) {
+            file_.write(buffer_.data(), static_cast<std::streamsize>(buffer_.size()));
+            buffer_.clear();
+        }
+    }
+    std::ofstream file_;
+    std::string buffer_;
+    int precision_ = 6;
+};'''
+
 _MOVING_WINDOW = r'''template <std::size_t N> struct MovingWindow {
     std::array<double, N> buf{};
     std::size_t index = 0, count = 0;
@@ -2634,7 +2705,9 @@ class _ModelGenerator:
                     elements = tuple(element for element in elements if id(element) in sources)
                     power = circuit.netlist.scalar_power(outputs, elements)
                 else:
-                    power = circuit.netlist.scalar_dissipated_power(outputs, elements)
+                    power = circuit.netlist.scalar_dissipated_power(
+                        outputs, elements, t=_Expression("t", "real")
+                    )
                 return -power if supplied else power
 
         return self._trace(run).code
@@ -6350,9 +6423,9 @@ class _CppGenerator:
         sampled_ctrl_rows: list[str] = []
         continuous_ctrl_rows: list[str] = []
         if output.signals:
-            signal_declarations += ["std::ofstream plant(out / \"plant.csv\");",
+            signal_declarations += ["CsvStream plant(out / \"plant.csv\");",
                                     "if (!plant) throw std::runtime_error(\"cannot open plant.csv\");",
-                                    "plant << std::setprecision(csv_precision); "]
+                                    "plant.precision(csv_precision);"]
             signal_headers.append(f"plant << {self._csv_header(plant_names)};")
             for name in unit_names:
                 generator = generators[name]
@@ -6360,9 +6433,9 @@ class _CppGenerator:
                     continue
                 stream = "ctrl_" + _identifier(name)
                 log_names = list(generator.ctrl.log_names())
-                signal_declarations += [f"std::ofstream {stream}(out / {_cpp_string('ctrl.' + name + '.csv')});",
+                signal_declarations += [f"CsvStream {stream}(out / {_cpp_string('ctrl.' + name + '.csv')});",
                                         f"if (!{stream}) throw std::runtime_error(\"cannot open ctrl.{name}.csv\");",
-                                        f"{stream} << std::setprecision(csv_precision);"]
+                                        f"{stream}.precision(csv_precision);"]
                 signal_headers.append(f"{stream} << {self._csv_header(log_names)};")
                 expressions = [generator.m("log_" + key) for key in log_names]
                 row = self._csv_values(stream, expressions, "                ")
@@ -6393,9 +6466,9 @@ class _CppGenerator:
         energy_row = ""
         if energy_on and output.energy:
             energy_declarations = [
-                'std::ofstream energy(out / "energy.csv");',
+                'CsvStream energy(out / "energy.csv");',
                 'if (!energy) throw std::runtime_error("cannot open energy.csv");',
-                'energy << std::setprecision(csv_precision);',
+                'energy.precision(csv_precision);',
             ]
             energy_header = f"energy << {self._csv_header(energy_columns)};"
             energy_row = self._csv_values(
@@ -6586,10 +6659,12 @@ class _CppGenerator:
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstddef>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -6600,6 +6675,7 @@ class _CppGenerator:
 #include <string_view>
 #include <sstream>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -6623,6 +6699,8 @@ constexpr double time_eps = {_number(TIME_EPS)};
 {_ALGEBRAIC_SOLVER if any(len(loop.tears) == 1 for loop in self.model.algebraic_loops) else ""}
 
 {_MOVING_WINDOW}
+
+{_CSV_STREAM}
 
 template <std::size_t N> struct RMSWindow {{
     MovingWindow<N> window;
@@ -6834,7 +6912,7 @@ public:
         const int csv_precision = static_cast<int>({output_precision});
         if (csv_precision < 1 || csv_precision > 17)
             throw std::runtime_error("simulation.output.precision must be between 1 and 17");
-        std::ofstream states;
+        CsvStream states;
         if constexpr ({'true' if output.states else 'false'}) {{
             states.open(out / "states.csv");
             if (!states) throw std::runtime_error("cannot open states.csv");
@@ -6867,7 +6945,7 @@ public:
                 {plant_snapshot}
             }}
             if constexpr ({'true' if output.states else 'false'}) {{
-                states << std::setprecision(final ? 17 : csv_precision);
+                states.precision(final ? 17 : csv_precision);
                 states << t;
                 {snapshot_values}
                 states << '\\n';

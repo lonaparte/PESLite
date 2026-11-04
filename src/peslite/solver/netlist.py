@@ -34,7 +34,7 @@ import copy
 import math
 import numbers
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
@@ -44,7 +44,7 @@ from scipy.linalg import lapack
 from scipy.sparse.linalg import splu
 
 __all__ = ["Node", "Element", "Resistor", "Inductor", "CoupledInductors", "Capacitor", "VoltageSource",
-           "CurrentSource", "Transformer", "Switch", "Diode", "Netlist", "Mode", "Topology", "StateSpace",
+           "CurrentSource", "CurrentState", "Dissipation", "Transformer", "Switch", "Diode", "Netlist", "Mode", "Topology", "StateSpace",
            "Grouping", "ConductionError", "FORMS", "QUANTITIES", "device_rhs", "device_outputs",
            "device_dissipated_power", "device_supplied_power",
            "device_commutation_margin", "device_commutate", "prepare_device",
@@ -105,7 +105,8 @@ Value = Callable[[float], ArrayLike]
 FORMS = ("device", "statewise", "nodal")
 QUANTITIES = ("node_voltage", "branch_voltage", "branch_current")
 _V, _C, _R, _L, _I = range(5)  # tree priority classes
-_PRIORITY = {"vsrc": _V, "short": _V, "p": _V, "cap": _C, "res": _R, "ind": _L, "isrc": _I, "s": _I}
+_PRIORITY = {"vsrc": _V, "short": _V, "p": _V, "cap": _C, "res": _R, "ind": _L,
+             "isrc": _I, "state_current": _I, "s": _I}
 _CACHE = 32  # compiled modes kept
 _DELTA_T = 1e-8  # half step (s) of the central difference of a source without a derivative
 _MAX_PATTERNS = 64  # diode conduction patterns tried at one instant
@@ -115,6 +116,7 @@ _NOOP_RTOL = 1e-13  # projections smaller than this, relative to the states, are
 _DENSE_ENTRIES = 1 << 14  # coupling matrices up to this size multiply as dense arrays (no sparse overhead)
 _GROUP_PARTS = 256  # factorized group blocks kept (least recently used first out)
 _DENSE_GROUP = 96  # systems and group blocks up to this size are factorized by LAPACK (faster than SuperLU)
+_PENDING = object()
 _DENSE_REUSE = 2  # direct solves before a repeated dense mode is expanded into state-space equations
 
 
@@ -124,6 +126,13 @@ class _Symbolic:
 
     operation: str
     arguments: tuple[Any, ...]
+    _hash: int = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_hash", hash((self.operation, self.arguments)))
+
+    def __hash__(self) -> int:
+        return self._hash
 
     @classmethod
     def value(cls, code: str) -> "_Symbolic":
@@ -362,7 +371,10 @@ def _symbolic_source(expressions: Sequence[Any]) -> tuple[list[str], tuple[str, 
     def count(value: Any) -> None:
         if not isinstance(value, _Symbolic) or value.operation == "value":
             return
-        uses[value] = uses.get(value, 0) + 1
+        seen = uses.get(value, 0)
+        uses[value] = seen + 1
+        if seen:
+            return
         if value.operation == "linear":
             for _coefficient, term in value.arguments[1]:
                 count(term)
@@ -646,6 +658,30 @@ class CurrentSource(Element):
         self.ports, self.name, self.value, self.derivative = ((a, b),), name, value, derivative
 
 
+class CurrentState(Element):
+    """Behavioral current port with ``i = x`` and ``dx/dt = derivative(t)``.
+
+    Unlike an inductor, the port voltage does not determine the derivative. This primitive retains
+    a reduced constitutive law as one physical netlist branch instead of an isolated helper circuit.
+    """
+
+    def __init__(self, a: Port, b: Port, state: ArrayLike, derivative: Value,
+                 name: str = "") -> None:
+        d, _ = _port(a, b)
+        self.ports, self.name = ((a, b),), name
+        self.state = _indices(state, d, "a current state")
+        self.value, self.derivative = derivative, None
+
+
+class Dissipation(Element):
+    """A nonnegative power loss ``value(t)`` without an artificial electrical branch."""
+
+    def __init__(self, value: Value, name: str = "") -> None:
+        if not callable(value):
+            raise TypeError("dissipation must be a callable of time")
+        self.name, self.value = name, value
+
+
 class Transformer(Element):
     """Lossless controlled two-port: ``v_p = N v_s`` and ``i_s = -(scale_p / scale_s) N^T i_p``.
 
@@ -745,7 +781,7 @@ class StateSpace:
     """``dx = A x + B u + B1 du/dt`` and ``out = C x + D u + D1 du/dt`` of one mode.
 
     ``x``: the netlist states (``Netlist.states`` order), ``u``: the source values
-    (``Netlist.sources`` order), ``out``: node voltages, branch voltages, branch currents
+    (``Netlist.sources`` driving-value order), ``out``: node voltages, branch voltages, branch currents
     (``Netlist.output_slice``). Columns of dependent states are zero.
     """
 
@@ -1207,7 +1243,8 @@ class Topology:
     """One compiled mode: the normal tree, the dependent states, the factorized derivative MNA and,
     on demand, the dense :class:`StateSpace` and the projections.
 
-    ``roles``: per branch ``"vsrc" "short" "p" "cap" "res" "ind" "isrc" "s"`` or ``None`` (open);
+    ``roles``: per branch ``"vsrc"``, ``"short"``, ``"p"``, ``"cap"``, ``"res"``, ``"ind"``,
+    ``"isrc"``, ``"state_current"``, ``"s"`` or ``None`` (open);
     ``tree``: whether each branch is a tree branch; ``dependent``: per netlist state.
     """
 
@@ -1338,6 +1375,13 @@ class Topology:
                 M.eye(row, int(i_off[k]), d)
                 Ku.eye(row, u_off[k], d)
                 row += d
+            elif role == "state_current":
+                M.eye(row, int(i_off[k]), d)
+                Ky.eye(row, br.x, d)
+                row += d
+                M.eye(row, int(xd_off[k]), d)
+                Ku.eye(row, u_off[k], d)
+                row += d
             elif role == "p":
                 M.incidence(row, br, e_off)
                 MN.incidence(row, brs[partner[k]], e_off, tindex[k], -1.0)
@@ -1415,6 +1459,8 @@ class Topology:
                     elif role == "isrc":
                         Kdu.eye(r, u_off[k], br.dim, -s)
                         needs[[j for j, (src, _) in enumerate(net._sources) if src is br.element]] = True
+                    elif role == "state_current":
+                        M.eye(r, int(xd_off[k]), br.dim, s)
                     else:  # pragma: no cover - excluded by the normal tree
                         raise AssertionError(f"{br.label} crosses an L/I cutset")
         if row != n_z:  # pragma: no cover - the classification guarantees a square system
@@ -1428,6 +1474,7 @@ class Topology:
         for j, (src, o) in enumerate(net._sources):
             self._rate_columns[o:o + brs[net._ports[id(src)][0]].dim] = needs[j]
         self._pattern = _Pattern(M, MN, n_z)
+        self._M = self._values = None
         self._dense = net.form != "nodal"  # device and statewise both form state space with LAPACK
         self._layout: Optional[_Layout] = None
         if not self._dense and n_z and net._grouping_used():
@@ -1480,17 +1527,14 @@ class Topology:
 
     def with_ratios(self, mode: Mode) -> "Topology":
         """This compiled mode with other transformer ratios (same switches and diodes): the
-        classification and matrix structure are shared, the network matrix is refilled and factorized."""
+        classification and matrix structure are shared; its matrix is factorized on first use."""
         top = copy.copy(self)
         top.mode = mode
         net, dep_c, dep_l, cd, partner, _ratio, w_off, sn_off, uf_s = self._store
         ratio = {k: mode.ratios[j] for k, j in self._tindex.items()}
         top._store = (net, dep_c, dep_l, cd, partner, ratio, w_off, sn_off, uf_s)
-        if self._dense:
-            top.M = self._pattern.dense(mode.ratios)
-            top.lu = _DenseSolve(top.M, "network", gauge=self.gauge_singular) if self.n_z else None
-        else:
-            top.lu = top._factorize(net, self._pattern.values(mode.ratios))
+        top._M = top._values = None
+        top._lu = _PENDING
         top._state_space = top._projectors = top._constraint_key = None
         top._evaluations = 0
         top._affine_equations = {}
@@ -1502,12 +1546,34 @@ class Topology:
         """The network matrix of the mode: an array in the dense form, CSC (formed on demand) in the sparse."""
         if self._M is None:
             p = self._pattern
-            self._M = sp.csc_matrix((self._values, p.indices, p.indptr), shape=(p.n, p.n))
+            if self._values is None:
+                self._values = p.values(self.mode.ratios)
+            self._M = (p.dense_values(self._values) if self._dense else
+                       sp.csc_matrix((self._values, p.indices, p.indptr), shape=(p.n, p.n)))
         return self._M
 
     @M.setter
     def M(self, value: NDArray[np.float64] | sp.csc_matrix) -> None:
         self._M = value
+
+    @property
+    def lu(self) -> object:
+        """Network factors, formed only when a consumer needs a solve."""
+        if self._lu is _PENDING:
+            values = (self._values if self._values is not None else
+                      self._pattern.values(self.mode.ratios))
+            if self._dense:
+                self._values = values
+                self._M = self._pattern.dense_values(values)
+                self._lu = (_DenseSolve(self._M, "network", gauge=self.gauge_singular)
+                            if self.n_z else None)
+            else:
+                self._lu = self._factorize(self._store[0], values)
+        return self._lu
+
+    @lu.setter
+    def lu(self, value: object) -> None:
+        self._lu = value
 
     def _factorize(self, net: "Netlist", values: NDArray[np.float64]) -> object:
         """The factors of the sparse network matrix with entries ``values``: grouped onto the interface
@@ -1759,7 +1825,7 @@ def _roles(net: "Netlist", mode: Mode) -> tuple[list[Optional[str]], dict[int, N
             role = "p" if br.port == 0 else "s"
         else:
             role = {Inductor: "ind", CoupledInductors: "ind", Capacitor: "cap", VoltageSource: "vsrc",
-                    CurrentSource: "isrc"}[type(el)]
+                    CurrentSource: "isrc", CurrentState: "state_current"}[type(el)]
         roles.append(role)
     return roles, resistance
 
@@ -2008,7 +2074,7 @@ class Netlist:
 
     @property
     def sources(self) -> list[Element]:
-        """The sources in the order of the input vector ``u``."""
+        """Elements supplying driving values in the order of the input vector ``u``."""
         return [src for src, _ in self._sources]
 
     def _vertex_of(self, node: Port) -> int:
@@ -2049,8 +2115,11 @@ class Netlist:
             if state is not None:
                 self.states = np.concatenate([self.states, state])
                 self._ordered = bool(np.array_equal(self.states, np.arange(self.states.size)))
-                (self._capacitors if isinstance(el, Capacitor) else self._inductors).append(el)
-            if isinstance(el, (VoltageSource, CurrentSource)):
+                if isinstance(el, Capacitor):
+                    self._capacitors.append(el)
+                elif not isinstance(el, CurrentState):
+                    self._inductors.append(el)
+            if isinstance(el, (VoltageSource, CurrentSource, CurrentState)):
                 self._u_off[ids[0]] = self.n_u
                 self._sources.append((el, self.n_u))
                 self._source_slots.append((el.value, self.n_u, self._branches[ids[0]].dim, el.name))
@@ -3440,14 +3509,22 @@ class Netlist:
         all) at the last evaluation."""
         self.outputs()
         roles = self._last.topology.roles
-        if elements is None:
-            return sum(self.power(br.element, br.port) for br, role in zip(self._branches, roles) if role == "res")
-        return sum(self.power(el, port) for el in elements for port, k in enumerate(self._ports[id(el)])
-                   if roles[k] == "res")
+        selected = self.elements if elements is None else elements
+        return sum(
+            self.power(el, port)
+            for el in selected
+            for port, k in enumerate(self._ports[id(el)])
+            if roles[k] == "res"
+        ) + sum(
+            float(el.value(self._last.t)) for el in selected if isinstance(el, Dissipation)
+        )
 
     def supplied_power(self) -> float:
         """Power delivered by the voltage and current sources at the last evaluation."""
-        return -sum(self.power(src) for src, _ in self._sources)
+        return -sum(
+            self.power(src) for src, _ in self._sources
+            if isinstance(src, (VoltageSource, CurrentSource))
+        )
 
     # ---------------------------------------------------------------- jumps and diodes
     def project(self, t: float, y: NDArray[np.float64], *,
@@ -3574,7 +3651,7 @@ class Netlist:
         return total
 
     def scalar_dissipated_power(
-        self, out: Sequence[Any], elements: Sequence[Element], *,
+        self, out: Sequence[Any], elements: Sequence[Element], *, t: Any = 0.0,
         topology: Optional[Topology] = None,
     ) -> Any:
         """Resistive power of selected elements from one scalar output vector."""
@@ -3584,6 +3661,8 @@ class Netlist:
             for element in elements
             for port, branch in enumerate(self._ports[id(element)])
             if roles[branch] == "res"
+        ) + sum(
+            element.value(t) for element in elements if isinstance(element, Dissipation)
         )
 
     def _output_scales(self, out: Sequence[Any]) -> tuple[Any, Any]:
@@ -3796,6 +3875,9 @@ class Netlist:
         self, t: float, y: NDArray[np.float64], topology: Optional[Topology] = None
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
         """Conduction margins, comparison tolerances and their physical scales."""
+        if not self._diodes:
+            empty = np.zeros(0)
+            return empty, empty, empty
         if topology is None:
             margin, out = self._margin_values(t, y)
         else:
@@ -3894,6 +3976,8 @@ class Netlist:
     def _impulses(self, t: float, y: NDArray[np.float64], topology: Topology) -> NDArray[np.intp]:
         """Diodes that the jump into the current mode would drive in reverse: a negative impulsive
         charge through a conducting ideal diode or a positive impulsive voltage across a blocking one."""
+        if not self._diodes:
+            return np.zeros(0, dtype=np.intp)
         return np.flatnonzero(np.asarray(
             self.impulse_flags(t, y, topology=topology), dtype=bool
         ))

@@ -12,6 +12,18 @@
   declare one netlist source compiled as direct scalar device equations, dense per-mode state
   equations or a sparse factorized modified nodal system. Time integrators consume all three
   representations through the same model interface.
+- Reused exact netlist blocks and assembly mode identities in Python implicit Jacobians, and reduced
+  Python Radau Newton solves from one stage-expanded system to one shifted state system per stage.
+  Fixed Python explicit methods hand numerically unstable linear modes to the same Radau path at the
+  configured boundaries.
+- Replaced isolated helper circuits for externally governed current states and losses with a physical
+  behavioral current port and a node-free dissipation primitive shared by every circuit model.
+- Reused the lossless transformer primitive for averaged one-way bridge transfer, restoring Boost
+  polarity and power conservation. Generated circuit stages now discard unused equations and
+  inline the same scalar output expressions for every circuit model.
+- Deferred unused ratio-dependent network factorization, cached symbolic hashes and skipped empty
+  diode work. Adaptive solvers retain the last full warm-start step, automatic stiffness detection uses
+  a conservative Jacobian bound, and native CSV histories use one buffered writer.
 - Added single-phase AC network sources through ordinary scalar power ports and assembly-time
   electrical-domain constraints on inherently AC or DC terminals. Also made ADC window integration
   follow the configured physical sampling grid, and added open-loop duty control, the traceable

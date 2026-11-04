@@ -36,6 +36,7 @@ import copy
 import itertools
 import math
 import re
+from collections import OrderedDict
 from types import MethodType
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -70,6 +71,29 @@ def _state_dimension(component: Any, name: str) -> int:
     return int(declared.get(name, 2 if isinstance(getattr(component.state, name), complex) else 1))
 
 
+_IDENTIFIERS = re.compile(r"\b[A-Za-z_]\w*\b")
+_ASSIGNMENT = re.compile(r"\s*([A-Za-z_]\w*)\s*=(?!=)\s*(.*)")
+
+
+def _live_statements(statements: Sequence[str], expressions: Sequence[str]) -> list[str]:
+    """Return generated statements needed by the requested expressions."""
+    used = {name for expression in expressions for name in _IDENTIFIERS.findall(expression)}
+    kept = []
+    for statement in reversed(statements):
+        match = _ASSIGNMENT.fullmatch(statement)
+        if match is None:
+            kept.append(statement)
+            used.update(_IDENTIFIERS.findall(statement))
+            continue
+        name, value = match.groups()
+        if name not in used:
+            continue
+        used.discard(name)
+        used.update(_IDENTIFIERS.findall(value))
+        kept.append(statement)
+    return list(reversed(kept))
+
+
 class _BoundValue:
     """A netlist value read directly from a component record."""
 
@@ -88,10 +112,12 @@ class _BoundValue:
 class _CallableValue:
     """A netlist callback with explicit component-input dependencies."""
 
-    __slots__ = ("callback", "inputs", "record")
+    __slots__ = ("callback", "inputs", "record", "state_dependencies")
 
-    def __init__(self, callback: Callable, inputs: Sequence[str], record: Any = None) -> None:
+    def __init__(self, callback: Callable, inputs: Sequence[str], record: Any = None,
+                 state_dependencies: Sequence[tuple[Any, str]] = ()) -> None:
         self.callback, self.inputs, self.record = callback, tuple(inputs), record
+        self.state_dependencies = tuple(state_dependencies)
 
     def __call__(self, *args: Any) -> Any:
         return self.callback(*args)
@@ -172,8 +198,9 @@ class NetlistBuilder:
             self.value_outputs[id(record), field] = self.owner, field
         return value
 
-    def function(self, callback: Callable, inputs: Sequence[str] = ()) -> Callable:
-        """A callback whose direct dependencies are named fields of the owner's input record."""
+    def function(self, callback: Callable, inputs: Sequence[str] = (),
+                 states: Sequence[str] = ()) -> Callable:
+        """A callback with named owner input and state dependencies."""
         if not callable(callback):
             raise TypeError("a netlist function value must be callable")
         record = None
@@ -183,7 +210,15 @@ class NetlistBuilder:
             if unknown:
                 raise ValueError(f"unknown netlist function input fields {sorted(unknown)}")
             record = self.owner.input
-        return _CallableValue(callback, inputs, record)
+            unknown_states = set(states) - set(self.owner.state_names)
+            if unknown_states:
+                raise ValueError(f"unknown netlist function states {sorted(unknown_states)}")
+        elif states:
+            raise ValueError("a netlist function cannot name states without an owner")
+        return _CallableValue(
+            callback, inputs, record,
+            tuple((self.owner, state) for state in states),
+        )
 
     def add(self, *elements: Element) -> Element:
         first = self.netlist.add(*elements)
@@ -485,6 +520,8 @@ class Circuit:
             tuple[int, tuple[tuple[int, float], ...]], ...
         ] = ()
         self._device_bindings: dict[tuple, tuple[Topology, Callable, Callable]] = {}
+        self._mode_eigenvalues: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+        self._explicit_stability: "OrderedDict[tuple, tuple[float, float]]" = OrderedDict()
         self.plan_changed = False
 
     # ---------------------------------------------------------------- assembly
@@ -608,6 +645,8 @@ class Circuit:
         self.locate_commutations = not self._mixtures and any(isinstance(el, Diode) for el in net.elements)
         self._state_diode_groups = ()
         self._device_bindings.clear()
+        self._mode_eigenvalues.clear()
+        self._explicit_stability.clear()
         self._consistent = None  # new parameters (a set event) may move the loops' and cutsets' constraints
         self._consistent_constraints = None
         transforms = []
@@ -793,7 +832,8 @@ class Circuit:
     def _program_dependencies(self, program: tuple) -> tuple[str, ...]:
         """Circuit input fields read by one generated scalar program."""
         statements, _result, namespace, expressions = program
-        active = "\n".join((*statements, *(expressions or ())))
+        expressions = expressions or ()
+        active = "\n".join((*_live_statements(statements, expressions), *expressions))
         copied = {
             (id(component.input), field): key
             for component, field, key in self.copies
@@ -897,7 +937,8 @@ class Circuit:
             return source[4:] if source.startswith("    ") else source
 
         body = self._copy_prelude(dependencies, namespace)
-        body.extend(bind(statement) for statement in statements)
+        body.extend(bind(statement)
+                    for statement in _live_statements(statements, expressions or ()))
         return body, tuple(bind(expression) for expression in expressions or ()), namespace
 
     def _generated_method(
@@ -1055,28 +1096,12 @@ class Circuit:
         for index, (dependencies, keys, selected) in enumerate(output_groups, 1):
             name = f"_{prefix}_outputs_{index}"
             positions = {position: offset for offset, position in enumerate(selected)}
-            if numeric:
-                namespace: dict[str, Any] = {}
-                body = self._copy_prelude(dependencies, namespace)
-                evaluator_name = f"_circuit_numeric_output_{index}"
-                selected_rows = tuple(selected)
-                namespace[evaluator_name] = (
-                    lambda t, rows=selected_rows: net.evaluate_outputs(
-                        t, self._states(), rows
-                    )
-                )
-                body.append(f"_circuit_values = {evaluator_name}(t)")
-                values = {
-                    position: f"_circuit_values[{offset}]"
-                    for position, offset in positions.items()
-                }
-            else:
-                program = output_evaluator(selected)._peslite_scalar_program
-                body, expressions, namespace = self._bind_program(program, dependencies)
-                values = {
-                    position: expressions[offset]
-                    for position, offset in positions.items()
-                }
+            program = output_evaluator(selected)._peslite_scalar_program
+            body, expressions, namespace = self._bind_program(program, dependencies)
+            values = {
+                position: expressions[offset]
+                for position, offset in positions.items()
+            }
             self._append_publications(
                 keys, values, body, namespace, f"{prefix}_{index}",
             )
@@ -1129,6 +1154,9 @@ class Circuit:
         self.netlist._last = None
         topology = self.netlist.topology() if topology is None else topology
         margin_key = self.netlist.scalar_margin_key(topology)
+        if (holder[1] is topology and holder[2] is not None
+                and getattr(self, "_margin_evaluator_key", None) == margin_key):
+            return True
         dynamic = any(
             transformer.constant is None for transformer in self.netlist._transformers
         )
@@ -1867,26 +1895,6 @@ class _DeviceRuntime:
             return (match.group(1) + replace_direct(match.group(2))
                     if match is not None else replace_direct(statement))
 
-        def live_statements(statements: Sequence[str], expressions: Sequence[str]) -> list[str]:
-            """Discard generated local assignments made obsolete by an already published output."""
-            identifiers = re.compile(r"\b[A-Za-z_]\w*\b")
-            assignment = re.compile(r"\s*([A-Za-z_]\w*)\s*=\s*(.*)")
-            used = {name for expression in expressions for name in identifiers.findall(expression)}
-            kept = []
-            for statement in reversed(statements):
-                match = assignment.fullmatch(statement)
-                if match is None:
-                    kept.append(statement)
-                    used.update(identifiers.findall(statement))
-                    continue
-                name, value = match.groups()
-                if name not in used:
-                    continue
-                used.remove(name)
-                used.update(identifiers.findall(value))
-                kept.append(statement)
-            return list(reversed(kept))
-
         def generated_inputs(field: str) -> tuple[str, ...]:
             """Direct component inputs used by one compiled netlist output."""
             fallback = direct_inputs.get(field, all_inputs)
@@ -1905,7 +1913,7 @@ class _DeviceRuntime:
             if program is None:
                 return fallback
             statements, _result, namespace, expressions = program
-            active = "\n".join((*live_statements(statements, expressions), *expressions))
+            active = "\n".join((*_live_statements(statements, expressions), *expressions))
             dependencies = set()
             for name, value in namespace.items():
                 if re.search(rf"\b{re.escape(name)}\b", active) is None:
@@ -2006,7 +2014,7 @@ class _DeviceRuntime:
                         substitute(replace_direct(expression), namespace, bound)
                         for expression in expressions
                     )
-                    bound_statements = live_statements(bound_statements, bound_expressions)
+                    bound_statements = _live_statements(bound_statements, bound_expressions)
                     bound_statements, inline_values = inline_single_use(
                         bound_statements, bound_expressions
                     )
@@ -2134,7 +2142,7 @@ class _DeviceRuntime:
                     substitute(replace_direct_statement(statement), namespace, state_values)
                     for statement in statements
                 ]
-                statements = live_statements(statements, expressions)
+                statements = _live_statements(statements, expressions)
                 statements, expressions = inline_single_use(statements, expressions)
                 rhs_lines.extend(statements)
                 items = []
@@ -2576,3 +2584,135 @@ def circuit_structure(model: Any, circuits: Sequence[Circuit]):
             groups.append(interior)
             labels.append(label)
     return Structure(groups, np.array(sorted(interface), dtype=np.intp), labels)
+
+
+def circuit_mode_key(model: Any, circuits: Sequence[Circuit]):
+    """Return the assembled circuits' exact structural modes for implicit-Jacobian reuse."""
+    del model
+    if not circuits:
+        return None
+    return tuple(
+        (id(circuit.netlist), (
+            circuit._bound_device_topology() or circuit.netlist.topology()
+        ).mode.key[:2])
+        for circuit in circuits
+    )
+
+
+def circuit_linear_blocks(model: Any, circuits: Sequence[Circuit]):
+    """Return exact present-mode circuit state blocks in the model's state coordinates."""
+    n = model.n_states
+    component_subsystem = {
+        id(subsystem.component if isinstance(subsystem, NetworkView) else subsystem): subsystem
+        for subsystem in model.subsystems
+    }
+    blocks = []
+    for circuit in circuits:
+        member_map = {
+            id(component_subsystem[id(component)]): component_subsystem[id(component)]
+            for component in circuit.components
+            if id(component) in component_subsystem
+        }
+        if id(circuit) in component_subsystem:
+            member_map[id(circuit)] = component_subsystem[id(circuit)]
+        members = tuple(member_map.values())
+        external_feedback = model.has_external_state_dependency(members)
+        local_to_model = np.empty(circuit.n_states, dtype=np.intp)
+        for component, name, complex_state, local in circuit.layout:
+            subsystem = component_subsystem[id(component)]
+            positions = tuple(range(*model.state_slice(subsystem, name).indices(n)))
+            if len(positions) != (2 if complex_state else 1):
+                raise RuntimeError("circuit and model state layouts differ")
+            local_to_model[local:local + len(positions)] = positions
+        local = circuit.n_states
+        transform = np.eye(local)
+        inverse = np.eye(local)
+        for index, matrix, inv in circuit._transforms:
+            transform[np.ix_(index, index)] = matrix
+            inverse[np.ix_(index, index)] = inv
+        states = np.asarray(circuit.netlist.states, dtype=np.intp)
+        net_matrix = circuit.netlist.topology().state_space.A
+        matrix = np.zeros((local, local))
+        matrix[np.ix_(states, states)] = net_matrix
+        unsafe = {
+            int(index)
+            for value, _offset, _dimension, _name in circuit.netlist._source_slots
+            for component, name in getattr(value, "state_dependencies", ())
+            for index in circuit._state_index[id(component), name]
+        }
+        for index, _matrix, _inverse in circuit._transforms:
+            if unsafe.intersection(map(int, index)):
+                unsafe.update(map(int, index))
+        exact = local_to_model[[index for index in range(local) if index not in unsafe]]
+        skipped = np.zeros(0, dtype=np.intp) if external_feedback else exact
+        blocks.append((local_to_model, inverse @ matrix @ transform, exact, skipped))
+    return tuple(blocks)
+
+
+def circuit_explicit_stable(model: Any, method: str, step: float, *,
+                            circuits: Sequence[Circuit]) -> bool:
+    """Whether every present linear circuit mode lies inside an explicit RK stability region."""
+    del model
+    from ..solver.integrators import TABLEAUS
+
+    _c, rows, weights = TABLEAUS[method]
+    for circuit in circuits:
+        topology = circuit.netlist.topology()
+        if (circuit.netlist.form == "device"
+                and topology._state_space is None
+                and any(transformer.constant is None
+                        for transformer in circuit.netlist._transformers)):
+            # The scalar device equations already consume these run-time ratios directly. Building
+            # a dense state space solely for this check would factorize an otherwise unused network.
+            continue
+        key = topology.mode.key
+        result_key = method, key
+        bounds = circuit._explicit_stability.get(result_key)
+        if bounds is not None:
+            circuit._explicit_stability.move_to_end(result_key)
+            stable_below, unstable_above = bounds
+            if step <= stable_below:
+                continue
+            if step >= unstable_above:
+                return False
+        eigenvalues = circuit._mode_eigenvalues.get(key)
+        if eigenvalues is None:
+            eigenvalues = np.linalg.eigvals(topology.state_space.A)
+            circuit._mode_eigenvalues[key] = eigenvalues
+            circuit._mode_eigenvalues.move_to_end(key)
+            while len(circuit._mode_eigenvalues) > circuit.netlist.cache_size:
+                circuit._mode_eigenvalues.popitem(last=False)
+        def stable_at(candidate: float) -> bool:
+            for eigenvalue in eigenvalues:
+                scale = max(1.0, abs(eigenvalue))
+                if eigenvalue.real > 1e-12 * scale:
+                    continue  # physical instability is not numerical stiffness
+                z = candidate * eigenvalue
+                stages = [1.0 + 0.0j]
+                for row in rows:
+                    stages.append(1.0 + z * sum(a * value for a, value in zip(row, stages)))
+                amplification = 1.0 + z * sum(
+                    b * value for b, value in zip(weights, stages)
+                )
+                if abs(amplification) > 1.0 + 1e-10:
+                    return False
+            return True
+
+        stable = stable_at(step)
+        previous_stable, previous_unstable = bounds or (0.0, math.inf)
+        if stable:
+            probe = 1.25 * step
+            probe_stable = stable_at(probe)
+            bounds = (
+                max(previous_stable, probe if probe_stable else step),
+                previous_unstable if probe_stable else min(previous_unstable, probe),
+            )
+        else:
+            bounds = previous_stable, min(previous_unstable, step)
+        circuit._explicit_stability[result_key] = bounds
+        circuit._explicit_stability.move_to_end(result_key)
+        while len(circuit._explicit_stability) > circuit.netlist.cache_size:
+            circuit._explicit_stability.popitem(last=False)
+        if not stable:
+            return False
+    return True

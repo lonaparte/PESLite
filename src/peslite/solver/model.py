@@ -1102,6 +1102,7 @@ class Model:
     ``connections``: ``(dst, input) -> (src, output[, gain])`` or a list of these (summed).
     ``zoh_connections``: ``(dst, input) -> label`` for held inputs set by :meth:`set_zoh_input`.
     ``linear_structure``: optional state-partition provider for implicit linear solves.
+    ``linear_mode_key``: optional exact equation-mode identity for Jacobian reuse.
     """
 
     def __init__(
@@ -1110,8 +1111,17 @@ class Model:
         connections: Mapping[Connection, Connection | Sequence[Connection]],
         zoh_connections: Mapping[Connection, str] | None = None,
         *, linear_structure: Callable[[Model], Any] | None = None,
+        linear_mode_key: Callable[[Model], Any] | None = None,
+        linear_blocks: Callable[[Model], Any] | None = None,
+        explicit_stability: Callable[[Model, str, float], bool] | None = None,
+        explicit_stability_dynamic: bool = False,
     ) -> None:
         self._linear_structure = linear_structure
+        self._linear_mode_key = linear_mode_key
+        self._linear_blocks = linear_blocks
+        self._explicit_stability = explicit_stability
+        self.explicit_stability_dynamic = bool(explicit_stability_dynamic)
+        self.equation_revision = 0
         if isinstance(subsystems, Mapping):
             names = [str(n) for n in subsystems]
             subsystems = list(subsystems.values())
@@ -1145,6 +1155,7 @@ class Model:
         self._check_connections()
         self._build_state_layout()
         self.plan_revision = 0
+        self._external_state_dependency_cache: dict[frozenset[int], bool] = {}
         self._build_evaluation_plan()
         self._compile()
         # energy declaration per subsystem (default if none declared)
@@ -1159,11 +1170,65 @@ class Model:
         self._build_evaluation_plan()
         self._compile()
         self._energy_balance_plan = None
+        self._external_state_dependency_cache.clear()
         self.plan_revision += 1
 
     def linear_structure(self):
         """Return the state partition supplied by assembly, or use the solver's dense default."""
         return self._linear_structure(self) if self._linear_structure is not None else None
+
+    def linear_mode_key(self):
+        """Return the current assembled equation mode, or ``None`` without a structural key."""
+        return self._linear_mode_key(self) if self._linear_mode_key is not None else None
+
+    def linear_blocks(self):
+        """Return present-mode exact circuit blocks for an implicit Newton matrix."""
+        return self._linear_blocks(self) if self._linear_blocks is not None else ()
+
+    def explicit_stable(self, method: str, step: float) -> bool:
+        """Return whether the assembled linear modes are stable at one explicit RK step."""
+        return (self._explicit_stability(self, method, step)
+                if self._explicit_stability is not None else True)
+
+    def invalidate_equations(self) -> None:
+        """Record a boundary change which may select different continuous equations."""
+        self.equation_revision += 1
+
+    def has_external_state_dependency(self, members: Sequence[Any]) -> bool:
+        """Whether outputs of ``members`` reach another stateful subsystem's RHS plan."""
+        member_ids = {id(member) for member in members}
+        key = frozenset(member_ids)
+        cached = self._external_state_dependency_cache.get(key)
+        if cached is not None:
+            return cached
+        external = {
+            id(subsystem) for subsystem in self.subsystems
+            if id(subsystem) not in member_ids and subsystem.state_names
+        }
+        if not member_ids or not external:
+            self._external_state_dependency_cache[key] = False
+            return False
+        successors = [[] for _ in self._plan]
+        for node, dependencies in enumerate(self._plan_dependencies):
+            for dependency in dependencies:
+                successors[dependency].append(node)
+        pending = [
+            node for node, (owners, _sources) in enumerate(self._plan_owners)
+            if any(id(owner) in member_ids for owner in owners)
+        ]
+        reached = set(pending)
+        while pending:
+            node = pending.pop()
+            owners, _sources = self._plan_owners[node]
+            if self._plan_rhs[node] and any(id(owner) in external for owner in owners):
+                self._external_state_dependency_cache[key] = True
+                return True
+            for successor in successors[node]:
+                if successor not in reached:
+                    reached.add(successor)
+                    pending.append(successor)
+        self._external_state_dependency_cache[key] = False
+        return False
 
     # ---------------------------------------------------------------- setup
     def _check_connections(self) -> None:
@@ -1734,6 +1799,7 @@ class Model:
             return
         for refresh in self._held_input_refresh:
             refresh(changed)
+        self.invalidate_equations()
 
     def evaluate_outputs(self, t: float) -> None:
         """Run the ordered output-method / input-copy plan for the current states."""

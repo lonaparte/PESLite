@@ -214,48 +214,18 @@ class _BridgeModel(NetworkComponent):
         if self.lower_port is not None:
             nb.port_output(self, "i_lower", self.lower_port, "current")
         if self._current_transfer:
-            nb.local_model()
-            ac = nb.node(self.power_port)
-            dc = nb.node(self.dc_port)
             lower = None if self.lower_port is None else nb.node(self.lower_port)
-
-            def voltage(_t):
-                q = topology.switching_state((self.input.q,))
-                return q * self.input.u_dc + (1.0 - q) * self.input.u_lower
-
-            nb.add(
-                nl.VoltageSource(
-                    ac, None,
-                    nb.function(voltage, ("q", "u_dc", "u_lower")),
-                ),
-                nl.CurrentSource(
-                    dc, None,
-                    nb.function(
-                        lambda _t: self.input.upper_current_ratio * self.input.i_c,
-                        ("upper_current_ratio", "i_c"),
-                    ),
-                ),
-            )
-            if lower is not None:
-                nb.add(nl.CurrentSource(
-                    lower, None,
-                    nb.function(
-                        lambda _t: self.input.lower_current_ratio * self.input.i_c,
-                        ("lower_current_ratio", "i_c"),
-                    ),
-                ))
+            nb.add(nl.Transformer(
+                nb.node(self.power_port), lower, nb.node(self.dc_port), lower,
+                nb.value(self.input, "upper_current_ratio"),
+            ))
             resistance = getattr(self, "resistance", 0.0)
             if resistance:
-                loss = nb.internal(1, topology.power_scale)
-                loss_current = nb.function(
-                    lambda _t: max(0.0, self.input.loss_factor) ** 0.5
-                    * abs(self.input.i_c),
+                nb.add(nl.Dissipation(nb.function(
+                    lambda _t: topology.power_scale * resistance
+                    * max(0.0, self.input.loss_factor) * abs(self.input.i_c) ** 2,
                     ("loss_factor", "i_c"),
-                )
-                nb.add(
-                    nl.CurrentSource(None, loss, loss_current),
-                    nl.Resistor(loss, None, resistance),
-                )
+                )))
             nb.losses(self)
             return None
         if self.state_names:
@@ -1152,7 +1122,8 @@ class DCLink(NetworkComponent):
                 node,
                 nb.function(
                     lambda t: 0.0 if self.tripped
-                    else self.source(t, self.capacitor.state.u_C)
+                    else self.source(t, self.capacitor.state.u_C),
+                    states=("u_C",),
                 ),
             ))
             nb.output(self, "i_src", ("branch_current", supply))
