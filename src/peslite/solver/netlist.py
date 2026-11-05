@@ -414,13 +414,22 @@ def _symbolic_relation(operation: str, left: Any, right: Any) -> Any:
 
 
 def _symbolic_solve(matrix: Sequence[Sequence[Any] | Mapping[int, Any]], right: list[Any],
-                    reference: NDArray[np.float64], *, gauge: bool = False) -> list[Any]:
+                    reference: NDArray[np.float64],
+                    varying: Optional[set[tuple[int, int]]] = None, *,
+                    gauge: bool = False) -> list[Any]:
     """Eliminate a generated sparse linear system using one valid numerical pivot pattern."""
     n = len(right)
     rows = [
         dict(row) if isinstance(row, Mapping) else
         {column: value for column, value in enumerate(row) if not _zero(value)}
         for row in matrix
+    ]
+    moving = [
+        {
+            column for column, value in row.items()
+            if ((index, column) in varying if varying is not None else not _constant(value))
+        }
+        for index, row in enumerate(rows)
     ]
     right = list(right)
     reference = np.array(reference, dtype=float, copy=True)
@@ -433,12 +442,14 @@ def _symbolic_solve(matrix: Sequence[Sequence[Any] | Mapping[int, Any]], right: 
             if gauge:
                 continue
             raise ValueError(f"the generated netlist equations are singular at column {column}")
-        constants = [row for row in active
-                     if _constant(rows[row][column])]
-        pivot = (max(constants, key=lambda row: abs(reference[row, column]))
-                 if constants else max(active, key=lambda row: abs(reference[row, column])))
+        stable = [row for row in active if column not in moving[row]]
+        candidates = stable or active
+        constants = [row for row in candidates if _constant(rows[row][column])]
+        candidates = constants or candidates
+        pivot = max(candidates, key=lambda row: abs(reference[row, column]))
         if pivot != pivot_row:
             rows[pivot_row], rows[pivot] = rows[pivot], rows[pivot_row]
+            moving[pivot_row], moving[pivot] = moving[pivot], moving[pivot_row]
             right[pivot_row], right[pivot] = right[pivot], right[pivot_row]
             reference[[pivot_row, pivot]] = reference[[pivot, pivot_row]]
         source = rows[pivot_row]
@@ -449,16 +460,28 @@ def _symbolic_solve(matrix: Sequence[Sequence[Any] | Mapping[int, Any]], right: 
             value = rows[row].pop(column, None)
             if value is None:
                 continue
+            factor_moves = column in moving[row] or column in moving[pivot_row]
+            moving[row].discard(column)
             factor = value / pivot_value
             numeric_factor = reference[row, column] / reference[pivot_row, column]
             reference[row, column] = 0.0
             target = rows[row]
             for entry, pivot_entry in trailing:
+                entry_moves = (
+                    entry in moving[row]
+                    or factor_moves
+                    or entry in moving[pivot_row]
+                )
                 updated = target.get(entry, 0.0) - factor * pivot_entry
                 if _zero(updated):
                     target.pop(entry, None)
+                    moving[row].discard(entry)
                 else:
                     target[entry] = updated
+                    if entry_moves:
+                        moving[row].add(entry)
+                    else:
+                        moving[row].discard(entry)
                 reference[row, entry] -= numeric_factor * reference[pivot_row, entry]
             right[row] -= factor * right[pivot_row]
         pivots.append((pivot_row, column))
@@ -2582,33 +2605,54 @@ class Netlist:
             return self._frozen_topology
         if mode is not None:
             return self._compiled(mode)
-        seen = set()
+        requested = self.mode()
+        topology = self.resolved_topology(
+            requested, self._gated(), excluded=self._recovery_excluded
+        )
+        if topology.mode.conducting != requested.conducting:
+            for diode, before, after in zip(
+                    self._diodes, requested.conducting, topology.mode.conducting):
+                if before != after:
+                    diode.conducting, diode.residual = after, 0.0
+            self._mode = topology.mode
+        return topology
+
+    def resolved_topology(
+        self, mode: Mode, gated: Sequence[bool] = (), *,
+        excluded: Sequence[tuple[bool, ...]] = (),
+    ) -> Topology:
+        """Resolve a singular ideal-device pattern by the ordinary diode recovery rule."""
+        gated = tuple(gated) or (False,) * len(self._diodes)
+        if len(gated) != len(self._diodes):
+            raise ValueError("the gated-device pattern has the wrong length")
+        seen: set[tuple[bool, ...]] = set()
+        excluded = set(excluded)
         for _ in range(_MAX_PATTERNS):
-            pattern = self.conducting
+            pattern = mode.conducting
             if pattern in seen:
                 break
             seen.add(pattern)
             try:
-                return self._compiled(self.mode())
+                return self._compiled(mode)
             except _Degenerate as degenerate:
-                gated = self._gated()
                 candidates = (
                     [j for j, diode in enumerate(self._diodes)
-                     if diode.conducting and not gated[j] and diode.R_on == 0.0
+                     if pattern[j] and not gated[j] and diode.R_on == 0.0
                      and self._ports[id(diode)][0] in degenerate.branches]
                     if degenerate.loop else
                     [j for j, diode in enumerate(self._diodes)
-                     if not diode.conducting and not gated[j]]
+                     if not pattern[j] and not gated[j]]
                 )
                 selected = next((j for j in candidates
                                  if (candidate := tuple(
                                      value if k != j else not value
                                      for k, value in enumerate(pattern)
-                                 )) not in seen and candidate not in self._recovery_excluded), None)
+                                 )) not in seen and candidate not in excluded), None)
                 if selected is None:
                     raise
-                diode = self._diodes[selected]
-                diode.conducting, diode.residual = not diode.conducting, 0.0
+                conducting = list(pattern)
+                conducting[selected] = not conducting[selected]
+                mode = Mode(mode.closed, conducting, mode.ratios)
         raise ConductionError("no nonsingular diode conduction pattern exists")
 
     def freeze_topology(self) -> None:

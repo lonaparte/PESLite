@@ -799,6 +799,9 @@ def test_generated_cpp_uses_public_ports_for_scalar_converters(
     # runtimes; their accumulated difference remains below six parts per million.
     tolerance = 6e-6 if bridge_type == "half_bridge" and load >= 600.0 else 2e-8
     assert max(abs(actual[key] - expected[key]) for key in expected) <= tolerance * scale
+    assert _summary(cpp_out)["converter.max_current_pu"] == pytest.approx(
+        _summary(python_out)["converter.max_current_pu"], rel=tolerance
+    )
 
 
 def test_generated_cpp_reuses_common_adc_and_protection_for_dc_converter(tmp_path):

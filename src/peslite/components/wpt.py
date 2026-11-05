@@ -434,7 +434,7 @@ class SwitchControlledCapacitor:
         return self._gate_cache[2]
 
     def _tracks_current(self) -> bool:
-        return self.sync == "current" or (self.on and self.gates[0] != self.gates[1])
+        return self.sync == "current" or (self.on & (self.gates[0] != self.gates[1]))
 
     def _flow(self, current) -> float:
         return (self.zero.sign if self.zero.sign and abs(self.zero.offset(current)) <= _CURRENT_TOL
@@ -621,8 +621,8 @@ class SwitchedCompensatedLink(CompensatedLink):
         netlist, devices = self._netlist_devices
         for scc, (positive, negative) in devices:
             conducting = (
-                (scc.positive_gate or netlist.conduction(positive)[0])
-                and (scc.negative_gate or netlist.conduction(negative)[0])
+                (scc.positive_gate | netlist.conduction(positive)[0])
+                & (scc.negative_gate | netlist.conduction(negative)[0])
             )
             scc.mirror(t, conducting, _real(before[scc.state_name]))
 

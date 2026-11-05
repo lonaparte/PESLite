@@ -780,6 +780,12 @@ class System:
         for circuit in changed:
             circuit.plan_changed = False
 
+    def plan_export(self) -> None:
+        """Build a fixed model schedule that covers all compiled circuit modes."""
+        for circuit in self.circuits:
+            circuit.plan_export()
+        self.refresh_circuit_plan()
+
     def check_events(self, p: Params) -> None:
         """Check that custom elements and replacement controllers support their requested events."""
         for change in p.changes:

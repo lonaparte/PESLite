@@ -361,6 +361,9 @@ def _capacitor(current, *, angle=1.2, drive="alternating", voltage=0.0):
             super().__init__(*args, **kwargs)
             self._commutation_t = 0.0
 
+        def set_outputs(self, t):
+            self._commutation_t = t
+
         def commutation_margin(self):
             t = self._commutation_t
             return switch.margin(t, current(t), self.state.u_C)

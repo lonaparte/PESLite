@@ -316,8 +316,12 @@ def _control_generator(node):
     return generator
 
 
-@pytest.mark.parametrize('initial', [None, 1.0])
-def test_loop_lowering_rejects_non_numeric_carried_state_instead_of_guessing(initial):
+@pytest.mark.parametrize(('initial', 'message'), [
+    (None, 'unsupported equation value None'),
+    (1.0, 'cannot add or remove an optional result'),
+])
+def test_loop_lowering_rejects_non_numeric_carried_state_instead_of_guessing(
+        initial, message):
     class TimeLatch(Loop):
         inputs = {}
         outputs = {"duty": DUTY_RATIO}
@@ -335,7 +339,7 @@ def test_loop_lowering_rejects_non_numeric_carried_state_instead_of_guessing(ini
 
     node = TimeLatch()
     generator = _control_generator(node)
-    with pytest.raises(TypeError, match='unsupported equation value None'):
+    with pytest.raises(TypeError, match=message):
         generator._loop_members()
         generator._loop_lines('node', node)
 

@@ -392,6 +392,7 @@ class Unit(ABC):
                else self.bridge.fast_edge(t))
         if self.tripped or not due:
             return False
+        plant.outputs(t)
         if not self.protection.check_fast(t, self._protection_currents()):
             return False
         event = self.protection.trip

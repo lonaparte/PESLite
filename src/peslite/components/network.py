@@ -47,6 +47,7 @@ class NetworkComponent:
 
 
 NetworkComponent.rhs._peslite_device_adapter = True
+NetworkComponent.set_outputs._peslite_device_adapter = True
 
 
 def _phase_convention(phases: int, initial: complex | float = 0.0):

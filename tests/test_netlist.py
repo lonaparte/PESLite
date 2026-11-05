@@ -10,8 +10,8 @@ from scipy.linalg import expm
 
 import peslite
 from conftest import EXAMPLES, QUIET
-from peslite.assembly.circuit import (Circuit, NetworkView, _live_statements, bind_device,
-                                      compile_network)
+from peslite.assembly.circuit import (Circuit, NetworkView, _live_statements, _ModeStructure,
+                                      bind_device, compile_network)
 from peslite.components.network import ACVoltageSource
 from peslite.solver import FixedStepSolver
 from peslite.solver import netlist as nl
@@ -34,6 +34,38 @@ def test_symbolic_solve_uses_a_free_reference_only_for_a_proven_gauge():
     solution = nl._symbolic_solve(matrix, right, reference, gauge=True)
     np.testing.assert_allclose(np.asarray(matrix) @ solution, right)
     assert solution[1] == 0.0
+
+
+def test_symbolic_solve_keeps_pivots_off_declared_varying_entries():
+    ratio, parameter, first, second = (
+        nl._Symbolic.value(name) for name in ("ratio", "parameter", "first", "second")
+    )
+    solution = nl._symbolic_solve(
+        [[ratio, 1.0], [parameter, 0.0]],
+        [first, second],
+        np.array([[10.0, 1.0], [1.0, 0.0]]),
+        {(0, 0)},
+    )
+    _shared, expressions = nl._symbolic_source(solution)
+    assert expressions[0] == "(second / parameter)"
+    assert "/ ratio" not in " ".join(expressions)
+
+
+def test_symbolic_solve_propagates_varying_entries_through_elimination():
+    ratio, parameter, first, second, third = (
+        nl._Symbolic.value(name)
+        for name in ("ratio", "parameter", "first", "second", "third")
+    )
+    solution = nl._symbolic_solve(
+        [[1.0, ratio, 0.0], [1.0, 1.0, 1.0], [0.0, parameter, 0.0]],
+        [first, second, third],
+        np.array([[1.0, -9.0, 0.0], [1.0, 1.0, 1.0], [0.0, 1.0, 0.0]]),
+        {(0, 1)},
+    )
+    shared, expressions = nl._symbolic_source(solution)
+    source = "\n".join((*shared, *expressions))
+    assert "third / parameter" in source
+    assert "/ (1 + (-(ratio)))" not in source
 
 
 def _affine(A, b, initial, t):
@@ -354,6 +386,88 @@ def test_numeric_circuit_stages_keep_the_declared_equation_dependencies(circuit_
     assert all(stage.method != "solve" for stage in circuit.output_stages)
     assert not simulation.system.model.algebraic_loops
     assert "_circuit_numeric_output" not in simulation.system.model.compiled_source
+
+
+def _derivative_row(net, element):
+    return net._branches[net._ports[id(element)][0]].x
+
+
+def _owned_devices(structure, owners, row):
+    return sorted(variable for cluster in owners[row] for variable in structure.clusters[cluster])
+
+
+def test_binary_mode_clusters_include_switches_and_diodes_from_connections():
+    net = Netlist("statewise")
+    bus, left, right, source = Node(), Node(), Node(), Node()
+    capacitor = Capacitor(bus, None, 1e-4, [0])
+    inductors = [
+        Inductor(source, left, 1e-3, [1]),
+        Inductor(source, right, 2e-3, [2]),
+    ]
+    net.add(
+        VoltageSource(source, None, lambda _t: 48.0), capacitor, *inductors,
+        Switch(left, bus, lambda: True), Diode(right, bus), Resistor(bus, None, 4.0),
+    )
+    structure = _ModeStructure(
+        net, (("closed", 0), ("conducting", 0)), nl.Mode((True,), (True,), ()),
+    )
+    owners = structure.equation_owners(net)
+
+    assert structure.clusters == [[0], [1]]
+    assert _owned_devices(structure, owners, _derivative_row(net, capacitor)) == [0, 1]
+    assert _owned_devices(structure, owners, _derivative_row(net, inductors[0])) == [0]
+    assert _owned_devices(structure, owners, _derivative_row(net, inductors[1])) == [1]
+
+
+def test_singular_diode_recovery_preserves_the_gated_device():
+    net = Netlist("device")
+    source, middle = Node(), Node()
+    net.add(
+        VoltageSource(source, None, lambda _t: 1.0),
+        Diode(source, middle),
+        Diode(middle, None),
+    )
+    mode = nl.Mode((), (True, True), ())
+
+    assert net.resolved_topology(mode, (True, False)).mode.conducting == (True, False)
+    assert net.resolved_topology(mode, (False, True)).mode.conducting == (False, True)
+
+
+def test_export_planning_covers_default_device_circuits_and_diode_modes():
+    direct = peslite.Simulation(peslite.load(
+        EXAMPLES / "gfl-example.pes", **QUIET,
+        **{"units.vsc.bridge.model": "pwm_averaging"},
+    ))
+    direct.system.plan_export()
+    circuit, = direct.system.circuits
+    decompositions = tuple(value for value in circuit._mode_decompositions.values() if value)
+    assert decompositions
+    assert decompositions[-1].variables == (("closed", 0), ("closed", 1))
+
+    diode = peslite.Simulation(peslite.load(
+        EXAMPLES / "buck-example.pes", **QUIET,
+        **{"units.converter.bridge.model": "switching"},
+    ))
+    diode.system.plan_export()
+    circuit, = diode.system.circuits
+    variables, = (key[0] for key in circuit._mode_decompositions)
+    assert set(variables) == {
+        ("closed", 0), ("conducting", 0), ("conducting", 1),
+    }
+    solve = next(stage for stage in circuit.output_stages if stage.rhs)
+    assert set(solve.inputs) == set(circuit.inputs)
+
+    numeric = peslite.Simulation(peslite.load(
+        EXAMPLES / "buck-example.pes", **QUIET,
+        **{
+            "units.converter.bridge.model": "switching",
+            "simulation.solver.circuit_model": "statewise",
+        },
+    ))
+    numeric.system.plan_export()
+    circuit, = numeric.system.circuits
+    solve = next(stage for stage in circuit.output_stages if stage.rhs)
+    assert set(solve.inputs) == set(circuit.inputs)
 
 
 def test_device_ratio_changes_do_not_factorize_an_unused_numeric_network(

@@ -152,6 +152,7 @@ class _BridgeModel(NetworkComponent):
         OutputMethod("set_dc_current", inputs=("q", "i_c"), outputs=("i_dc",)),
         OutputMethod("set_ac_voltage", inputs=("q", "u_dc"), outputs=("u_c",)),
     )
+    set_dc_current = set_ac_voltage = NetworkComponent.set_outputs
 
     def __init__(self, topology=None, *, parallel_capacitance: float = 0.0,
                  on_resistance: float = 0.0, switching: bool = False) -> None:
@@ -181,8 +182,6 @@ class _BridgeModel(NetworkComponent):
         initialize = getattr(self.topology, "initialize_model", None)
         if initialize is not None:
             initialize(self, parallel_capacitance)
-        self.set_dc_current = self._device_outputs
-        self.set_ac_voltage = self._device_outputs
         if (not math.isfinite(parallel_capacitance) or parallel_capacitance < 0.0
                 or not math.isfinite(on_resistance) or on_resistance < 0.0):
             raise ConfigError("bridge capacitance and on_resistance must be finite and >= 0")
@@ -351,16 +350,6 @@ class _BridgeModel(NetworkComponent):
         )
         self.dirac = False
         self.models_blocked_diodes = True
-
-    def _device_outputs(self, t: float) -> None:
-        from ..solver.netlist import device_outputs
-        device_outputs(self, t)
-
-    def set_ac_voltage(self, t: float) -> None:
-        self._device_outputs(t)
-
-    def set_outputs(self, t: float) -> None:
-        self._device_outputs(t)
 
     def set_power_loss(self, _t: float) -> None:
         self.output.power_loss = self.dissipated_power()
@@ -1058,6 +1047,7 @@ class DCLink(NetworkComponent):
         OutputMethod("set_stored_voltage", inputs=(), outputs=("u_C",)),
         OutputMethod("set_outputs", inputs=(), outputs=("u_dc", "i_src")),
     )
+    set_stored_voltage = NetworkComponent.set_outputs
 
     def __init__(self, capacitor: DCCapacitor | None = None,
                  source: DCCurrentSource | DCVoltageSource | None = None) -> None:
@@ -1110,14 +1100,6 @@ class DCLink(NetworkComponent):
             source.i_nom, source.k_dc = float(i), float(k)
         elif isinstance(source, DCVoltageSource):
             source.u_dc, source.R = float(v), float(r)
-
-    def set_stored_voltage(self, t: float) -> None:
-        from ..solver.netlist import device_outputs
-        device_outputs(self, t)
-
-    def set_outputs(self, t: float) -> None:
-        from ..solver.netlist import device_outputs
-        device_outputs(self, t)
 
     def network(self, nb):
         """Declare the DC-link capacitor, source and source breaker."""

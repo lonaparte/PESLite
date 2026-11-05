@@ -940,6 +940,7 @@ def test_sampled_only_protection_does_not_read_fast_current(monkeypatch, tmp_pat
 @pytest.mark.parametrize("name", ["buck", "gfl", "wpt-ss"])
 def test_plant_algebraic_loop_warning_reuses_the_existing_model(name, tmp_path):
     sim = _simulation(name)
+    sim.system.plan_export()
     loops = tuple(loop.labels for loop in sim.system.model.algebraic_loops)
     result = _export(sim, tmp_path)
     warnings = [item for item in result.diagnostics if item["code"] == "algebraic-loop"]

@@ -498,8 +498,10 @@ def test_finite_bridge_parameters_use_the_shared_native_equations(name, mode, se
     p = p.replace(**changes)
     binary = _compile(p, tmp_path / "model", (selection,))
     unit = names[0]
-    _compare_run(p, binary, {f"units.{unit}.bridge.parallel_capacitance": 1.2e-5,
-                             f"units.{unit}.bridge.on_resistance": 1.1}, tmp_path / "run")
+    runtime = ({f"units.{unit}.bridge.parallel_capacitance": 1.2e-5,
+                f"units.{unit}.bridge.on_resistance": 1.1}
+               if selection == "all" else {})
+    _compare_run(p, binary, runtime, tmp_path / "run")
 
 
 def test_fixed_finite_bridge_uses_the_compiled_structural_modes(tmp_path):
