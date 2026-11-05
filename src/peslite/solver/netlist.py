@@ -141,6 +141,7 @@ class _Symbolic:
     operation: str
     arguments: tuple[Any, ...]
     _hash: int = field(init=False, repr=False, compare=False)
+    __array_priority__ = 1000
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "_hash", hash((self.operation, self.arguments)))
@@ -180,6 +181,64 @@ class _Symbolic:
         if self.operation == "neg":
             return self.arguments[0]
         return _linear_scaled(self, -1.0)
+
+    def __abs__(self):
+        return _Symbolic("abs", (self,))
+
+    def __lt__(self, other):
+        return _symbolic_relation("<", self, other)
+
+    def __le__(self, other):
+        return _symbolic_relation("<=", self, other)
+
+    def __gt__(self, other):
+        return _symbolic_relation(">", self, other)
+
+    def __ge__(self, other):
+        return _symbolic_relation(">=", self, other)
+
+    def __and__(self, other):
+        return _symbolic_relation("and", self, other)
+
+    def __rand__(self, other):
+        return _symbolic_relation("and", other, self)
+
+    def __or__(self, other):
+        return _symbolic_relation("or", self, other)
+
+    def __ror__(self, other):
+        return _symbolic_relation("or", other, self)
+
+    def __bool__(self):
+        raise TypeError("a symbolic equation value cannot control a Python branch")
+
+    def __array_ufunc__(self, ufunc: Any, method: str, *inputs: Any, **kwargs: Any):
+        if method != "__call__" or kwargs:
+            return NotImplemented
+        name = ufunc.__name__
+        if name in {"add", "subtract", "multiply", "divide", "true_divide"}:
+            left, right = inputs
+            operation = {"add": "+", "subtract": "-", "multiply": "*",
+                         "divide": "/", "true_divide": "/"}[name]
+            return _symbolic_binary(operation, left, right)
+        if name in {"absolute", "fabs"}:
+            value, = inputs
+            return abs(value)
+        if name in {"maximum", "minimum"}:
+            return _symbolic_relation("max" if name == "maximum" else "min", *inputs)
+        comparisons = {"less": "<", "less_equal": "<=", "greater": ">",
+                       "greater_equal": ">=", "equal": "==", "not_equal": "!="}
+        if name in comparisons:
+            return _symbolic_relation(comparisons[name], *inputs)
+        return NotImplemented
+
+    def __array_function__(self, function: Any, types: Any, args: tuple, kwargs: dict):
+        if function.__name__ == "where" and len(args) == 3 and not kwargs:
+            condition, when_true, when_false = args
+            if isinstance(condition, (bool, np.bool_)):
+                return when_true if condition else when_false
+            return _Symbolic("select", (condition, when_true, when_false))
+        return NotImplemented
 
     @property
     def real(self):
@@ -275,6 +334,8 @@ def _linear_scaled(value: Any, factor: Any) -> Any:
 
 
 def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
+    left = left.item() if getattr(left, "shape", None) == () else left
+    right = right.item() if getattr(right, "shape", None) == () else right
     if _constant(left) and _constant(right):
         return {"+": lambda: left + right, "-": lambda: left - right,
                 "*": lambda: left * right, "/": lambda: left / right}[operation]()
@@ -291,7 +352,7 @@ def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
             return left
         if _zero(left):
             return -right
-        if left == right:
+        if isinstance(left, _Symbolic) and isinstance(right, _Symbolic) and left == right:
             return 0.0
         if isinstance(right, _Symbolic) and right.operation == "neg":
             return _symbolic_binary("+", left, right.arguments[0])
@@ -323,8 +384,37 @@ def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
     return _Symbolic(operation, (left, right))
 
 
+def _symbolic_relation(operation: str, left: Any, right: Any) -> Any:
+    """Build a scalar comparison, reduction or logical node with constant folding."""
+    left = left.item() if getattr(left, "shape", None) == () else left
+    right = right.item() if getattr(right, "shape", None) == () else right
+    if _constant(left) and _constant(right):
+        return {
+            "max": lambda: max(left, right), "min": lambda: min(left, right),
+            "<": lambda: left < right, "<=": lambda: left <= right,
+            ">": lambda: left > right, ">=": lambda: left >= right,
+            "==": lambda: left == right, "!=": lambda: left != right,
+            "and": lambda: bool(left and right), "or": lambda: bool(left or right),
+        }[operation]()
+    if operation == "and":
+        if left is False or right is False:
+            return False
+        if left is True:
+            return right
+        if right is True:
+            return left
+    elif operation == "or":
+        if left is True or right is True:
+            return True
+        if left is False:
+            return right
+        if right is False:
+            return left
+    return _Symbolic(operation, (left, right))
+
+
 def _symbolic_solve(matrix: Sequence[Sequence[Any] | Mapping[int, Any]], right: list[Any],
-                    reference: NDArray[np.float64]) -> list[Any]:
+                    reference: NDArray[np.float64], *, gauge: bool = False) -> list[Any]:
     """Eliminate a generated sparse linear system using one valid numerical pivot pattern."""
     n = len(right)
     rows = [
@@ -334,30 +424,33 @@ def _symbolic_solve(matrix: Sequence[Sequence[Any] | Mapping[int, Any]], right: 
     ]
     right = list(right)
     reference = np.array(reference, dtype=float, copy=True)
+    pivots: list[tuple[int, int]] = []
+    pivot_row = 0
     for column in range(n):
-        active = [row for row in range(column, n) if column in rows[row]]
+        active = [row for row in range(pivot_row, n)
+                  if column in rows[row] and reference[row, column] != 0.0]
         if not active:
-            raise ValueError("the generated netlist equations are singular")
+            if gauge:
+                continue
+            raise ValueError(f"the generated netlist equations are singular at column {column}")
         constants = [row for row in active
                      if _constant(rows[row][column])]
         pivot = (max(constants, key=lambda row: abs(reference[row, column]))
                  if constants else max(active, key=lambda row: abs(reference[row, column])))
-        if reference[pivot, column] == 0.0:
-            raise ValueError("the generated netlist equations are singular")
-        if pivot != column:
-            rows[column], rows[pivot] = rows[pivot], rows[column]
-            right[column], right[pivot] = right[pivot], right[column]
-            reference[[column, pivot]] = reference[[pivot, column]]
-        pivot_row = rows[column]
-        pivot_value = pivot_row[column]
-        trailing = tuple((entry, value) for entry, value in pivot_row.items()
+        if pivot != pivot_row:
+            rows[pivot_row], rows[pivot] = rows[pivot], rows[pivot_row]
+            right[pivot_row], right[pivot] = right[pivot], right[pivot_row]
+            reference[[pivot_row, pivot]] = reference[[pivot, pivot_row]]
+        source = rows[pivot_row]
+        pivot_value = source[column]
+        trailing = tuple((entry, value) for entry, value in source.items()
                          if entry > column)
-        for row in range(column + 1, n):
+        for row in range(pivot_row + 1, n):
             value = rows[row].pop(column, None)
             if value is None:
                 continue
             factor = value / pivot_value
-            numeric_factor = reference[row, column] / reference[column, column]
+            numeric_factor = reference[row, column] / reference[pivot_row, column]
             reference[row, column] = 0.0
             target = rows[row]
             for entry, pivot_entry in trailing:
@@ -366,15 +459,17 @@ def _symbolic_solve(matrix: Sequence[Sequence[Any] | Mapping[int, Any]], right: 
                     target.pop(entry, None)
                 else:
                     target[entry] = updated
-                reference[row, entry] -= numeric_factor * reference[column, entry]
-            right[row] -= factor * right[column]
+                reference[row, entry] -= numeric_factor * reference[pivot_row, entry]
+            right[row] -= factor * right[pivot_row]
+        pivots.append((pivot_row, column))
+        pivot_row += 1
     solution: list[Any] = [0.0] * n
-    for row in range(n - 1, -1, -1):
+    for row, column in reversed(pivots):
         residual = right[row] - sum(
-            value * solution[column]
-            for column, value in rows[row].items() if column > row
+            value * solution[entry]
+            for entry, value in rows[row].items() if entry > column
         )
-        solution[row] = residual / rows[row][row]
+        solution[column] = residual / rows[row][column]
     return solution
 
 
@@ -422,14 +517,22 @@ def _symbolic_source(expressions: Sequence[Any]) -> tuple[list[str], tuple[str, 
             for coefficient, term in terms:
                 expression = render(term)
                 parts.append(expression if _one(coefficient) else
-                             f"(-{expression})" if _minus_one(coefficient) else
+                             f"(-({expression}))" if _minus_one(coefficient) else
                              f"({_literal(coefficient)} * {expression})")
             return "(" + " + ".join(parts) + ")"
         arguments = tuple(render(argument) for argument in value.arguments)
         if value.operation == "neg":
-            return f"(-{arguments[0]})"
+            return f"(-({arguments[0]}))"
+        if value.operation == "abs":
+            return f"abs({arguments[0]})"
         if value.operation in ("real", "imag"):
             return f"({arguments[0]}).{value.operation}"
+        if value.operation in ("max", "min"):
+            return f"{value.operation}({arguments[0]}, {arguments[1]})"
+        if value.operation == "select":
+            return f"({arguments[1]} if {arguments[0]} else {arguments[2]})"
+        if value.operation in ("and", "or"):
+            return f"({arguments[0]} {value.operation} {arguments[1]})"
         return f"({arguments[0]} {value.operation} {arguments[1]})"
 
     results = tuple(render(expression) for expression in expressions)
@@ -440,6 +543,8 @@ def _maximum(left: Any, right: Any) -> Any:
     """Scalar maximum which remains one arithmetic expression during equation lowering."""
     if isinstance(left, numbers.Real) and isinstance(right, numbers.Real):
         return max(left, right)
+    if hasattr(left, "__array_ufunc__") or hasattr(right, "__array_ufunc__"):
+        return np.maximum(left, right)
     return 0.5 * (left + right + abs(left - right))
 
 
@@ -447,6 +552,8 @@ def _minimum(left: Any, right: Any) -> Any:
     """Scalar minimum paired with :func:`_maximum`."""
     if isinstance(left, numbers.Real) and isinstance(right, numbers.Real):
         return min(left, right)
+    if hasattr(left, "__array_ufunc__") or hasattr(right, "__array_ufunc__"):
+        return np.minimum(left, right)
     return 0.5 * (left + right - abs(left - right))
 
 
@@ -2149,6 +2256,8 @@ class Netlist:
             elif isinstance(el, Transformer):
                 self._transformers.append(el)
         self._plan = None
+        self._diode_branches = None
+        self._diode_output_bases = None
         self.invalidate()
         return elements[0] if elements else None
 
@@ -2713,278 +2822,6 @@ class Netlist:
                 output_rows.update((self.n_e + branch.output, self.n_e + self.n_bd + branch.output))
         return complex_variables, derivative_rows, output_rows
 
-    def _causal_series_evaluators(self) -> Optional[tuple[Callable, Callable, Callable]]:
-        """Reduce a voltage-fed series R-L network without assembling its nodal equations at run time."""
-        inductors = [element for element in self.elements if isinstance(element, Inductor)]
-        sources = [element for element in self.elements if isinstance(element, VoltageSource)]
-        allowed = (Inductor, Resistor, Switch, VoltageSource)
-        if (len(inductors) != 1 or len(sources) != 2
-                or any(not isinstance(element, allowed) for element in self.elements)):
-            return None
-        inductor = inductors[0]
-        dimension = inductor.L.shape[0]
-        if dimension not in (1, 2) or any(source.ports[0][1] is not None for source in sources):
-            return None
-
-        path = [element for element in self.elements if not isinstance(element, VoltageSource)]
-        adjacent: dict[int, set[int]] = {}
-        for element in path:
-            a, b = element.ports[0]
-            if a is None or b is None:
-                return None
-            adjacent.setdefault(id(a), set()).add(id(b))
-            adjacent.setdefault(id(b), set()).add(id(a))
-        endpoints = {id(source.ports[0][0]) for source in sources}
-        if (len(endpoints) != 2 or len(path) != len(adjacent) - 1
-                or any(len(neighbours) != (1 if node in endpoints else 2)
-                       for node, neighbours in adjacent.items())):
-            return None
-        pending, connected = [next(iter(endpoints))], set()
-        while pending:
-            node = pending.pop()
-            if node in connected:
-                continue
-            connected.add(node)
-            pending.extend(adjacent[node] - connected)
-        if len(connected) != len(adjacent):
-            return None
-
-        without_inductor = {node: set(neighbours) for node, neighbours in adjacent.items()}
-        a, b = inductor.ports[0]
-        without_inductor[id(a)].remove(id(b))
-        without_inductor[id(b)].remove(id(a))
-
-        def reaches(start: Port, target: Port) -> bool:
-            if start is target:
-                return True
-            if start is None or target is None:
-                return False
-            pending, seen = [id(start)], {id(start)}
-            while pending:
-                for neighbour in without_inductor.get(pending.pop(), ()):
-                    if neighbour == id(target):
-                        return True
-                    if neighbour not in seen:
-                        seen.add(neighbour)
-                        pending.append(neighbour)
-            return False
-
-        left = next((source for source in sources
-                     if reaches(source.ports[0][0], inductor.ports[0][0])), None)
-        right = next((source for source in sources
-                      if reaches(source.ports[0][0], inductor.ports[0][1])), None)
-        if left is None or right is None or left is right:
-            return None
-
-        resistance = sum((element.R for element in self.elements if isinstance(element, Resistor)),
-                         np.zeros_like(inductor.L))
-        dynamics = np.linalg.solve(
-            inductor.L, np.hstack((np.eye(dimension), -np.eye(dimension), -resistance))
-        )
-        switches = tuple(element.closed for element in self.elements if isinstance(element, Switch))
-        left_current = self.output_slice("branch_current", left)
-        right_current = self.output_slice("branch_current", right)
-        env: dict[str, Any] = {"left": left.value, "right": right.value, "_complex": _complex}
-        closed = []
-        for index, callback in enumerate(switches):
-            env[f"closed_{index}"] = callback
-            closed.append(f"closed_{index}()")
-        condition = " and ".join(closed) or "True"
-        lines = ["def derivatives(t, y):", "    ul = left(t)", "    ur = right(t)"]
-        isotropic = (dimension == 2
-                     and np.allclose(inductor.L, inductor.L[0, 0] * np.eye(2), rtol=1e-14, atol=0.0)
-                     and np.allclose(resistance, resistance[0, 0] * np.eye(2), rtol=1e-14, atol=0.0))
-        if isotropic:
-            lines.append(
-                f"    derivative = ((ul - ur - {float(resistance[0, 0])!r} * "
-                f"_complex(y[0], y[1])) / {float(inductor.L[0, 0])!r} "
-                f"if ({condition}) else 0j)"
-            )
-            result = ["derivative.real", "derivative.imag"]
-        else:
-            variables = (["ul"] if dimension == 1 else ["ul.real", "ul.imag"]) \
-                + (["ur"] if dimension == 1 else ["ur.real", "ur.imag"]) \
-                + [f"y[{index}]" for index in range(dimension)]
-            result = [f"({_linear_expression(row, variables)}) if ({condition}) else 0.0"
-                      for row in dynamics]
-        expression = "(" + ", ".join(result) + ("," if dimension == 1 else "") + ")"
-        statements = tuple(lines[1:])
-        lines.append("    return " + expression)
-        exec(compile("\n".join(lines) + "\n", "<peslite series circuit>", "exec"), env)
-        derivatives = env["derivatives"]
-        derivatives._peslite_scalar_program = (
-            statements, expression,
-            {key: value for key, value in env.items()
-             if key not in ("derivatives", "__builtins__")},
-            tuple(result),
-        )
-
-        values = ({
-            left_current.start: "-current.real", left_current.start + 1: "-current.imag",
-            right_current.start: "current.real", right_current.start + 1: "current.imag",
-        } if dimension == 2 else {
-            left_current.start: "-current", right_current.start: "current",
-        })
-
-        def compile_outputs(selected: Optional[Sequence[int]]) -> Callable:
-            indices = tuple(range(self.n_out)) if selected is None else tuple(selected)
-            active = [values.get(index, "0.0") for index in indices]
-            expressions = tuple(active)
-            result = "(" + ", ".join(expressions) \
-                + ("," if len(active) == 1 else "") + ")"
-            statements = ((f"    current = _complex(y[0], y[1]) if ({condition}) else 0j",)
-                          if dimension == 2 else
-                          (f"    current = y[0] if ({condition}) else 0.0",))
-            source = "\n".join(("def outputs(_t, y):", *statements,
-                                 f"    return {result}")) + "\n"
-            namespace = dict(env)
-            exec(compile(source, "<peslite series circuit>", "exec"), namespace)
-            outputs = namespace["outputs"]
-            outputs._peslite_scalar_program = (
-                statements, result,
-                {key: value for key, value in namespace.items()
-                 if key not in ("outputs", "derivatives", "__builtins__")},
-                expressions,
-            )
-            return outputs
-
-        outputs = compile_outputs(None)
-        return derivatives, outputs, compile_outputs
-
-    def _causal_transformer_outputs(self) -> Optional[Callable[[Optional[Sequence[int]]], Callable]]:
-        """Reduce an ideal transformer between voltage and current source boundaries."""
-        if (self.n_x or len(self._transformers) != 1
-                or any(not isinstance(element, (Transformer, VoltageSource, CurrentSource))
-                       for element in self.elements)):
-            return None
-        transformer = self._transformers[0]
-        primary, secondary = transformer.ports
-        reference = primary[1]
-        if secondary[1] is not reference:
-            return None
-        voltage = next((element for element in self.elements
-                        if isinstance(element, VoltageSource)
-                        and element.ports[0] == (secondary[0], None)), None)
-        current = next((element for element in self.elements
-                        if isinstance(element, CurrentSource)
-                        and element.ports[0] == (primary[0], None)), None)
-        reference_voltage = (None if reference is None else
-                             next((element for element in self.elements
-                                   if isinstance(element, VoltageSource)
-                                   and element.ports[0] == (reference, None)), None))
-        expected = {id(element) for element in (transformer, voltage, current, reference_voltage)
-                    if element is not None}
-        if (voltage is None or current is None or transformer.shape[0] not in (1, 2)
-                or transformer.shape[1] not in (1, 2)
-                or (reference is not None and (reference_voltage is None
-                                                or transformer.shape[0] != transformer.shape[1]))
-                or len(expected) != len(self.elements)
-                or any(id(element) not in expected for element in self.elements)):
-            return None
-
-        primary_dimension, secondary_dimension = transformer.shape
-        primary_voltage = self.output_slice("node_voltage", primary[0])
-        source_current = self.output_slice("branch_current", voltage)
-        reference_current = (None if reference_voltage is None else
-                             self.output_slice("branch_current", reference_voltage))
-        compact_ratio = False
-        if transformer.constant is None:
-            ratio_sample = transformer.N()
-            transformer._ratio(ratio_sample)  # validate the representation while compiling the equations
-            compact_ratio = np.ndim(ratio_sample) == 0
-
-        def compile_outputs(selected: Optional[Sequence[int]]) -> Callable:
-            indices = tuple(range(self.n_out)) if selected is None else tuple(selected)
-            requested = set(indices)
-            voltage_rows = [row for row in range(primary_dimension)
-                            if primary_voltage.start + row in requested]
-            current_rows = [column for column in range(secondary_dimension)
-                            if source_current.start + column in requested]
-            reference_rows = ([] if reference_current is None else
-                              [column for column in range(primary_dimension)
-                               if reference_current.start + column in requested])
-            env = {"ratio": transformer.N, "voltage": voltage.value, "current": current.value}
-            if reference_voltage is not None:
-                env["reference_voltage"] = reference_voltage.value
-            ratio_name = "ratio_value" if compact_ratio else "N"
-            lines = ["def outputs(t, y):", f"    {ratio_name} = ratio()"]
-            if voltage_rows:
-                lines.append("    v = voltage(t)")
-                if reference_voltage is not None:
-                    lines.append("    v_reference = reference_voltage(t)")
-            if current_rows or reference_rows:
-                lines.append("    i = current(t)")
-            values: dict[int, str] = {}
-            high_current: dict[int, str] = {}
-            if compact_ratio:
-                if transformer.shape == (1, 1):
-                    secondary_value = "v" if reference_voltage is None else "(v - v_reference)"
-                    reference_value = "" if reference_voltage is None else " + v_reference"
-                    values[primary_voltage.start] = f"ratio_value * {secondary_value}{reference_value}"
-                    high_current[0] = (
-                        f"{transformer.current_scale!r} * ratio_value * -i"
-                    )
-                else:  # a complex scalar is the compact form of a 2 x 1 ratio
-                    if voltage_rows:
-                        lines.append("    converted_voltage = ratio_value * v")
-                    for row, part in enumerate(("real", "imag")):
-                        values[primary_voltage.start + row] = f"converted_voltage.{part}"
-                    high_current[0] = (
-                        f"-{transformer.current_scale!r} * "
-                        "(ratio_value * i.conjugate()).real"
-                    )
-            else:
-                secondary_voltage = ["v" if secondary_dimension == 1 else "v.real", "v.imag"][
-                    :secondary_dimension]
-                if reference_voltage is not None:
-                    reference_values = ["v_reference" if primary_dimension == 1 else
-                                        "v_reference.real", "v_reference.imag"][:primary_dimension]
-                    secondary_voltage = [f"({value} - {reference_values[k]})"
-                                         for k, value in enumerate(secondary_voltage)]
-                else:
-                    reference_values = ["0.0"] * primary_dimension
-                primary_current = ["-i" if primary_dimension == 1 else "-i.real", "-i.imag"][
-                    :primary_dimension]
-                for row in voltage_rows:
-                    expression = " + ".join(
-                        f"N[{row}][{column}] * {secondary_voltage[column]}"
-                        for column in range(secondary_dimension)
-                    )
-                    values[primary_voltage.start + row] = f"({expression}) + {reference_values[row]}"
-                for column in sorted(set(current_rows) | set(reference_rows)):
-                    expression = " + ".join(
-                        f"N[{row}][{column}] * {primary_current[row]}"
-                        for row in range(primary_dimension)
-                    )
-                    high_current[column] = (
-                        f"{transformer.current_scale!r} * ({expression})"
-                    )
-            for column in current_rows:
-                values[source_current.start + column] = high_current[column]
-            if reference_current is not None:
-                primary_current = ["i" if primary_dimension == 1 else "i.real", "i.imag"][
-                    :primary_dimension]
-                for column in reference_rows:
-                    values[reference_current.start + column] = (
-                        f"-{primary_current[column]} - ({high_current[column]})"
-                    )
-            expressions = tuple(values.get(index, "0.0") for index in indices)
-            result = "(" + ", ".join(expressions) \
-                + ("," if len(indices) == 1 else "") + ")"
-            statements = tuple(lines[1:])
-            lines.append("    return " + result)
-            exec(compile("\n".join(lines) + "\n", "<peslite transformer circuit>", "exec"), env)
-            outputs = env["outputs"]
-            outputs._peslite_scalar_program = (
-                statements, result,
-                {key: value for key, value in env.items()
-                 if key not in ("outputs", "__builtins__")},
-                expressions,
-            )
-            return outputs
-
-        return compile_outputs
-
     def _compile_scalar(self, top: Topology, part: str = "all",
                         selected: Optional[tuple[int, ...]] = None) -> Callable:
         """Compile one topology to straight-line scalar state and output equations."""
@@ -3145,17 +2982,9 @@ class Netlist:
     def scalar_evaluators(self) -> tuple[Callable, Callable, Callable]:
         """Compile scalar derivatives, all outputs and a selected-output factory.
 
-        Causal reductions are selected from the primitive graph here, so every scalar consumer uses
-        the same structural optimization. General fixed topologies use the compiled state space;
-        mode-dependent networks retain the ordinary topology evaluator.
+        Fixed topologies use the compiled state space; mode-dependent networks retain the ordinary
+        topology evaluator. Every circuit therefore uses the same primitive equations.
         """
-        series = self._causal_series_evaluators()
-        if series is not None:
-            return series
-        transformer = self._causal_transformer_outputs()
-        if transformer is not None:
-            outputs = transformer(None)
-            return lambda _t, _y: (), outputs, transformer
         if (not self._switches and not self._diodes
                 and all(item.constant is not None for item in self._transformers)):
             top = self._scalar_topology_at()
@@ -3191,9 +3020,18 @@ class Netlist:
             return self._dynamic_scalar_function(top)(t, y)[1]
         return self._scalar_function(top, "outputs")(t, y)
 
+    def _dynamic_structure_key(self, top: Topology) -> tuple:
+        """Return the discrete mode and numeric sparsity selecting symbolic pivots."""
+        key = getattr(top, "_dynamic_structure_key", None)
+        if key is None:
+            values = top._pattern.values(top.mode.ratios)
+            key = top.mode.key[:2], np.packbits(values != 0.0).tobytes()
+            top._dynamic_structure_key = key
+        return key
+
     def _dynamic_scalar_equations(self, top: Topology) -> tuple:
         """Return one symbolic equation set shared by all scalar stages of a structural mode."""
-        key = top.mode.key[:2]
+        key = self._dynamic_structure_key(top)
         equations = self._dynamic_scalar_equation_cache.get(key)
         if equations is None:
             equations = self._build_dynamic_scalar_equations(top)
@@ -3287,7 +3125,8 @@ class Netlist:
         coefficients = top._K.toarray() if hasattr(top._K, "toarray") else top._K
         right = [sum((coefficient * value for coefficient, value in zip(row, variables)
                       if coefficient != 0.0), 0.0) for row in coefficients]
-        solution = (_symbolic_solve(matrix, right, pattern.dense(top.mode.ratios))
+        solution = (_symbolic_solve(matrix, right, pattern.dense(top.mode.ratios),
+                                    gauge=top.gauge_singular)
                     if pattern.n else [])
         derivatives = [solution[int(index)] for index in top.xd_index]
         output_matrix = top.S_out.toarray()
@@ -3353,7 +3192,7 @@ class Netlist:
         self, top: Topology, part: str = "all", selected: Optional[Sequence[int]] = None,
     ) -> Callable:
         selected_key = None if selected is None else tuple(sorted(set(map(int, selected))))
-        key = top.mode.key[:2], part, selected_key
+        key = self._dynamic_structure_key(top), part, selected_key
         evaluate = self._dynamic_scalar_functions.get(key)
         if evaluate is None:
             evaluate = self._dynamic_scalar_functions[key] = self._compile_dynamic_scalar(
@@ -3801,40 +3640,33 @@ class Netlist:
             return np.asarray(output, dtype=float), inputs
         return np.asarray(topology._S @ topology.solve(x, inputs, rates), dtype=float), inputs
 
-    def impulse_flags(self, t: Any, y: Sequence[Any], *,
-                      topology: Optional[Topology] = None) -> tuple[Any, ...]:
-        """Per-diode reverse impulse flags for a jump into the present topology."""
-        top = topology or self.topology()
+    def _scalar_impulse_flags(
+        self, top: Topology, y: Sequence[Any], inputs: Sequence[Any], output: Sequence[Any],
+        projections: Optional[Mapping[int, tuple[Sequence[Any], Sequence[Any]]]] = None,
+    ) -> tuple[Any, ...]:
+        """Per-diode reverse impulse flags from one already evaluated scalar topology."""
         capacitor, inductor = top.projectors()
         if capacitor is None and inductor is None:
             return (False,) * len(self._diodes)
-        numeric = all(isinstance(value, numbers.Real) for value in y)
-        if numeric:
-            y_numeric = np.asarray(y, dtype=float)
-            output, inputs = self._outputs_in_topology(top, float(t), y_numeric)
-            voltage_scale, current_scale = self._output_scales(output)
-        else:
-            inputs = self.source_values(t)
-            output = self._scalar_function(top, "outputs")(t, y)
-            voltage_scale, current_scale = self._output_scales(output)
+        voltage_scale, current_scale = self._output_scales(output)
+        projections = {} if projections is None else projections
         flags: list[Any] = [False] * len(self._diodes)
         gated = self._gated()
+
+        def projected(projector: _Projector) -> tuple[Sequence[Any], Sequence[Any]]:
+            return projections.get(id(projector), projector.values(y, inputs))
+
         if capacitor is not None:
-            if numeric:
-                projected, multipliers, _loss = capacitor(y_numeric, inputs)
-                changed = capacitor.significant(y_numeric, projected, voltage_scale)
-                tolerance = _MARGIN_RTOL * float(np.max(np.abs(multipliers), initial=0.0))
-            else:
-                projected, multipliers = capacitor.values(y, inputs)
-                reference = _maximum(
-                    voltage_scale, _maximum_all([abs(y[int(index)]) for index in capacitor.index])
+            values, multipliers = projected(capacitor)
+            reference = _maximum(
+                voltage_scale, _maximum_all([abs(y[int(index)]) for index in capacitor.index])
+            )
+            changed: Any = False
+            for index, value in zip(capacitor.index, values):
+                changed = _logical_or(
+                    changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
                 )
-                changed = False
-                for index, value in zip(capacitor.index, projected):
-                    changed = _logical_or(
-                        changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
-                    )
-                tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
+            tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
             rows = dict(top._wrows)
             for index, diode in enumerate(self._diodes):
                 branch = self._ports[id(diode)][0]
@@ -3844,21 +3676,65 @@ class Netlist:
                         _logical_and(changed, multipliers[rows[branch]] < -tolerance),
                     )
         if inductor is not None:
-            if numeric:
-                projected, multipliers, _loss = inductor(y_numeric, inputs)
-                changed = inductor.significant(y_numeric, projected, current_scale)
-                tolerance = _MARGIN_RTOL * float(np.max(np.abs(multipliers), initial=0.0))
-            else:
-                projected, multipliers = inductor.values(y, inputs)
-                reference = _maximum(
-                    current_scale, _maximum_all([abs(y[int(index)]) for index in inductor.index])
+            values, multipliers = projected(inductor)
+            reference = _maximum(
+                current_scale, _maximum_all([abs(y[int(index)]) for index in inductor.index])
+            )
+            changed = False
+            for index, value in zip(inductor.index, values):
+                changed = _logical_or(
+                    changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
                 )
-                changed = False
-                for index, value in zip(inductor.index, projected):
-                    changed = _logical_or(
-                        changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
+            tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
+            _net, _c, _l, _cd, _p, _r, _w, offsets, supernodes = top._store
+            potential = [multipliers[offsets[root]] if offsets[root] >= 0 else 0.0
+                         for root in map(supernodes.find, range(self.n_vertices))]
+            blocking = self._blocking_voltages(top, potential)
+            for index, diode in enumerate(self._diodes):
+                branch = self._ports[id(diode)][0]
+                if top.roles[branch] is None:
+                    primitive = self._branches[branch]
+                    voltage = blocking.get(
+                        branch, potential[primitive.a] - potential[primitive.b]
                     )
-                tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
+                    flags[index] = _logical_or(
+                        flags[index], _logical_and(changed, voltage > tolerance)
+                    )
+        return tuple(flags)
+
+    def impulse_flags(self, t: Any, y: Sequence[Any], *,
+                      topology: Optional[Topology] = None) -> tuple[Any, ...]:
+        """Per-diode reverse impulse flags for a jump into the present topology."""
+        top = topology or self.topology()
+        capacitor, inductor = top.projectors()
+        if capacitor is None and inductor is None:
+            return (False,) * len(self._diodes)
+        numeric = all(isinstance(value, numbers.Real) for value in y)
+        if not numeric:
+            inputs = self.source_values(t)
+            output = self._scalar_function(top, "outputs")(t, y)
+            return self._scalar_impulse_flags(top, y, inputs, output)
+        y_numeric = np.asarray(y, dtype=float)
+        output, inputs = self._outputs_in_topology(top, float(t), y_numeric)
+        voltage_scale, current_scale = self._output_scales(output)
+        flags: list[Any] = [False] * len(self._diodes)
+        gated = self._gated()
+        if capacitor is not None:
+            projected, multipliers, _loss = capacitor(y_numeric, inputs)
+            changed = capacitor.significant(y_numeric, projected, voltage_scale)
+            tolerance = _MARGIN_RTOL * float(np.max(np.abs(multipliers), initial=0.0))
+            rows = dict(top._wrows)
+            for index, diode in enumerate(self._diodes):
+                branch = self._ports[id(diode)][0]
+                if top.roles[branch] == "short" and not gated[index]:
+                    flags[index] = _logical_or(
+                        flags[index],
+                        _logical_and(changed, multipliers[rows[branch]] < -tolerance),
+                    )
+        if inductor is not None:
+            projected, multipliers, _loss = inductor(y_numeric, inputs)
+            changed = inductor.significant(y_numeric, projected, current_scale)
+            tolerance = _MARGIN_RTOL * float(np.max(np.abs(multipliers), initial=0.0))
             _net, _c, _l, _cd, _p, _r, _w, offsets, supernodes = top._store
             potential = [multipliers[offsets[root]] if offsets[root] >= 0 else 0.0
                          for root in map(supernodes.find, range(self.n_vertices))]

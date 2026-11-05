@@ -559,6 +559,7 @@ def test_independent_snapshot_outputs_survive_a_different_provider_failure(tmp_p
                         "simulation.output.states": True,
                         "simulation.output.signals": True,
                         "simulation.output.energy": True,
+                        "simulation.output.precision": 17,
                         "simulation.energy_check": "warn", "simulation.solver.phs_check_step": 1})
     plain = peslite.Simulation(params)
     expected = plain.run(out_dir=tmp_path / "plain")

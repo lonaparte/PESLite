@@ -1699,14 +1699,24 @@ def load(path: str | Path, initial: str | Path | None = None,
 def _read(path: Path) -> Any:
     """Read YAML or JSON configuration text."""
     if path.suffix.lower() == ".json":
-        return json.loads(path.read_text(encoding="utf-8"))
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"{path}: {exc.msg} at line {exc.lineno}, column {exc.colno}") from None
     try:
         import yaml  # type: ignore
     except ImportError as exc:  # pragma: no cover - exercised only without PyYAML
         raise ConfigError(f"{path}: reading YAML needs PyYAML (pip install PyYAML), or write the "
                           f"configuration as .json") from exc
-    with path.open("r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh)
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        location = (f" at line {mark.line + 1}, column {mark.column + 1}"
+                    if mark is not None else "")
+        message = getattr(exc, "problem", None) or str(exc).splitlines()[0]
+        raise ConfigError(f"{path}: {message}{location}") from None
 
 
 def read_initial(path: str | Path, t: Optional[float] = None) -> dict:

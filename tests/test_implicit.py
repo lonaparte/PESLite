@@ -236,14 +236,14 @@ def test_returning_jacobian_reuses_its_newton_factorization(method):
             actual, fresh.factor(h, method).solve(residual), rtol=1e-12, atol=1e-12
         )
     assert linear.n_jacobians == 4
-    stages = 1 if method == "trapezoidal" else 3
-    assert linear.n_factorizations == 2 * stages
+    factors = 1 if method == "trapezoidal" else 2
+    assert linear.n_factorizations == 2 * factors
 
     matrices = tuple(2.0 * matrix for matrix in matrices)
     linear.invalidate()
     linear.ensure(rhs, 0.0, y, rhs(0.0, y))
     assert linear.factor(h, method) is not factor
-    assert linear.n_factorizations == 3 * stages
+    assert linear.n_factorizations == 3 * factors
 
 
 def test_new_state_layout_discards_old_newton_factors():

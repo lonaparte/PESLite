@@ -111,7 +111,7 @@ def test_switch_controlled_capacitor_matches_independent_reference(case, tmp_pat
     assert summary[prefix + "turn_on_energy"] + conduction_energy == pytest.approx(
         energy, rel=5e-3, abs=1e-7)
     energy_table = result.energy
-    column = "charger.link.dissipated_impulsive_J"
+    column = "circuit.dissipated_impulsive_J"
     assert np.asarray(energy_table[column])[-1] == pytest.approx(summary[prefix + "turn_on_energy"])
 
 
@@ -357,18 +357,19 @@ def _capacitor(current, *, angle=1.2, drive="alternating", voltage=0.0):
     switch.bind_bridge(_Clock())
 
     class Capacitor(RCNode):
-        def set_outputs(self, t):
-            self.t = t
-            self.input.i = 0.0 if switch.on else current(t)
-            super().set_outputs(t)
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._commutation_t = 0.0
 
         def commutation_margin(self):
-            return switch.margin(self.t, current(self.t), self.state.u_C)
+            t = self._commutation_t
+            return switch.margin(t, current(t), self.state.u_C)
 
         def next_commutation_time(self):
-            return switch.next_time(self.t)
+            return switch.next_time(self._commutation_t)
 
         def commutate(self, t):
+            self._commutation_t = t
             switch.commutate(self, t, current(t), self.state.u_C)
 
     capacitor = Capacitor(60e-9, 0.0, u0=voltage, phases=1)

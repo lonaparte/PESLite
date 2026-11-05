@@ -425,7 +425,7 @@ def test_normal_run_does_not_construct_a_map_or_compute_modes(monkeypatch):
         raise AssertionError("ordinary simulations must not invoke stability analysis")
 
     monkeypatch.setattr("peslite.solver.simulation.SystemLoop", forbidden)
-    monkeypatch.setattr(np.linalg, "eigvals", forbidden)
+    monkeypatch.setattr("peslite.addons.functions.small_signal.linearize_loop", forbidden)
     sim = peslite.Simulation(_params())
     sim.run(out_dir=None)
     assert sim.result.summary["t_stop"] == sim.p.simulation.t_end

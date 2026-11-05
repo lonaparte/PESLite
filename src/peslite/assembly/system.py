@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Mapping, Optional
 
-from ..components.network import ACVoltageSource, ELEMENT_TYPES, RCNode, RLBranch, Port
+from ..components.network import ACVoltageSource, Bus, ELEMENT_TYPES, RCNode, RLBranch, Port
 from ..components.adc import _PortMeasurement
 from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
@@ -393,7 +393,7 @@ class System:
         def make_bus(values):
             cfg, system_base = values
             if cfg.c is None:
-                return _PortMeasurement(phases=cfg.phases)
+                return Bus(phases=cfg.phases)
             return RCNode(
                 cfg.c,
                 cfg.r_d,
@@ -472,23 +472,43 @@ class System:
                                   for name, branch in self.branches.items())
         elements = (*branch_assemblies, *self.sources.values(), *self.units.values(),
                     *self.named_elements.values())
-        element_ports = tuple((element, tuple(element.port_bindings())) for element in elements)
+        element_ports = tuple(
+            (element, tuple(element.port_bindings()),
+             dict(getattr(element, "series_connections", lambda: {})()))
+            for element in elements
+        )
         for element in elements:
             _merge_unique(subsystems, element.subsystems(), "subsystem name")
         physical_bindings = assembled.attached_ports + tuple(
-            binding for _element, bindings in element_ports for binding in bindings
+            binding for _element, bindings, _series in element_ports for binding in bindings
         )
         passive_groups = tuple(
-            bindings for element, bindings in element_ports
+            bindings for element, bindings, _series in element_ports
             if getattr(element, "domain_transparent", False)
         )
         _validate_electrical_domains(
             assembled.endpoints, passive_groups, physical_bindings, resolve_bus
         )
+
+        def attach_bindings(element: Any, bindings: tuple[tuple[str, Port], ...]) -> None:
+            for bus_name, port in bindings:
+                if not isinstance(port, Port):
+                    raise TypeError(
+                        f"{type(element).__name__}.port_bindings() returned "
+                        f"{type(port).__name__}, not Port"
+                    )
+                bus_ports.setdefault(resolve_bus(bus_name), []).append(port)
+
         for bus_name, port in assembled.attached_ports:
             bus_ports.setdefault(bus_name, []).append(port)
-        for element, element_bindings in element_ports:
-            for bus, inlet in getattr(element, "series_connections", lambda: {})().items():
+        configured_elements = {id(element) for element in self.named_elements.values()}
+        for element, element_bindings, series_connections in element_ports:
+            if not series_connections and id(element) not in configured_elements:
+                attach_bindings(element, element_bindings)
+        for element, element_bindings, series_connections in element_ports:
+            if not series_connections:
+                continue
+            for bus, inlet in series_connections.items():
                 attached = bus_ports.setdefault(resolve_bus(bus), [])
                 if len(attached) != 2:
                     raise ConfigError(
@@ -496,22 +516,17 @@ class System:
                         f"got {len(attached)}"
                     )
                 bus_ports.setdefault(resolve_bus(inlet), []).append(attached.pop())
-            for bus_name, port in element_bindings:
-                if not isinstance(port, Port):
-                    raise TypeError(
-                        f"{type(element).__name__}.port_bindings() returned "
-                        f"{type(port).__name__}, not Port"
-                    )
-                bus_ports.setdefault(resolve_bus(bus_name), []).append(port)
+            attach_bindings(element, element_bindings)
+        for element, element_bindings, series_connections in element_ports:
+            if not series_connections and id(element) in configured_elements:
+                attach_bindings(element, element_bindings)
         for name, bus in self.buses.items():
-            if bus.port is not None:
-                continue
-            if bus_ports[name]:
-                bus.observe(bus_ports[name][0])
-                if id(bus) not in continuous_bus_signals:
-                    subsystems.pop(name)
-            else:
+            attached = bus_ports[name]
+            if (len(attached) == 1 and attached[0] is bus.port
+                    and not bus.state_names and id(bus) not in continuous_bus_signals):
                 subsystems.pop(name)
+                attached.clear()
+                bus.port = None
         circuit_model = p.simulation.solver.circuit_model
         for element in elements:
             own_connections = element.connections()
@@ -817,8 +832,6 @@ class System:
             add(branch, {f"{name}.i": branch.output.i})
         for name, node in self.buses.items():
             if node.port is not None:
-                value = (node.port.voltage if node.voltage_field == "voltage"
-                         else node.output.u)
-                add(node, {f"{name}.u": value})
+                add(node, {f"{name}.u": getattr(node.output, node.voltage_field)})
         self._signal_names_checked = True
         return out

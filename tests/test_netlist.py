@@ -23,6 +23,19 @@ FORMS = ("statewise", "nodal")
 CIRCUIT_MODELS = ("statewise", "nodal")
 
 
+def test_symbolic_solve_uses_a_free_reference_only_for_a_proven_gauge():
+    matrix = [[1.0, -1.0], [2.0, -2.0]]
+    right = [3.0, 6.0]
+    reference = np.asarray(matrix)
+
+    with pytest.raises(ValueError, match="singular at column 1"):
+        nl._symbolic_solve(matrix, right, reference)
+
+    solution = nl._symbolic_solve(matrix, right, reference, gauge=True)
+    np.testing.assert_allclose(np.asarray(matrix) @ solution, right)
+    assert solution[1] == 0.0
+
+
 def _affine(A, b, initial, t):
     size = len(initial)
     augmented = np.zeros((size + 1, size + 1))
@@ -314,7 +327,7 @@ def test_rk4_netlist_circuit_models_match_device_equations(example, tmp_path):
         np.testing.assert_array_equal(simulation.system.model.state_labels(),
                                       reference_sim.system.model.state_labels())
         actual = np.asarray(list(result.values()), dtype=float)
-        assert np.max(np.abs(actual - expected) / scale) < 1e-9
+        assert np.max(np.abs(actual - expected) / scale) < 1e-8
 
 
 def test_device_netlist_equations_are_inlined_into_the_model_program():

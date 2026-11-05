@@ -773,22 +773,15 @@ class CarrierComparison(Modulator):
 
     @staticmethod
     def state_fractions(duties):
-        """Integrate a complete common-carrier cycle without allocating a timer or events.
-
-        Sorting duty thresholds gives at most n+1 states instead of enumerating 2**n gate
-        combinations. Scalar operations retain parameter expressions for standalone export.
-        """
-        ordered = list(duties)
-        for end in range(len(ordered) - 1, 0, -1):
-            for index in range(end):
-                first, second = ordered[index:index + 2]
-                ordered[index] = np.minimum(first, second).item()
-                ordered[index + 1] = np.maximum(first, second).item()
-        bounds = (0.0, *ordered, 1.0)
-        return tuple((upper - lower,
-                      tuple(np.where(value > 0.5 * (lower + upper), 1.0, 0.0).item()
-                            for value in duties))
-                     for lower, upper in zip(bounds[:-1], bounds[1:]))
+        """Integrate the at-most ``n + 1`` states of one complete common-carrier cycle."""
+        duties = tuple(duties)
+        ordered = sorted(range(len(duties)), key=duties.__getitem__)
+        bounds = (0.0, *(duties[index] for index in ordered), 1.0)
+        return tuple(
+            (upper - lower, tuple(index not in ordered[:position]
+                                  for index in range(len(duties))))
+            for position, (lower, upper) in enumerate(zip(bounds[:-1], bounds[1:]))
+        )
 
     def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence:

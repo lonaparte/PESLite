@@ -17,7 +17,7 @@ from ..solver.energy import Port, StoragePort
 from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _complex, _real
 
 __all__ = [
-    "Port", "ACVoltageSource", "RLBranch", "RCNode", "register_component_type",
+    "Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode", "register_component_type",
     "element_buses", "Load", "Resistor", "VoltageSource",
 ]
 
@@ -89,7 +89,6 @@ class RLBranch(NetworkComponent):
     state_names: ClassVar[tuple[str, ...]] = ("i",)
     outputs_need_inputs: ClassVar[bool] = False
     netlist_jumps: bool = False
-    conditional_equation_states: ClassVar[frozenset[str]] = frozenset(("breaker_open",))
     def __init__(self, L: float, R: float, i0: complex | float = 0j, *, phases: int = 3,
                  unilateral: bool = False) -> None:
         self.power_scale, self.zero, initial = _phase_convention(phases, i0)
@@ -169,7 +168,10 @@ class RLBranch(NetworkComponent):
         if self.external_conduction:
             branch = nb.add(nl.CurrentState(
                 nb.node(self.port1), nb.node(self.port2), nb.state(self, "i"),
-                nb.function(lambda _t: self.input.di_dt, ("di_dt",), states=("i",)),
+                nb.function(
+                    lambda _t: self.zero if self.breaker_open else self.input.di_dt,
+                    ("di_dt",), states=("i",),
+                ),
             ))
             nb.output(self, "i", ("branch_current", branch))
             if self.R:
@@ -201,6 +203,36 @@ class _NodeState(Bag):
 
 class _NodeOutput(Bag):
     __slots__ = ("u",)
+
+
+class Bus(NetworkComponent):
+    """A non-loading electrical connection point with a published voltage."""
+
+    state_names: ClassVar[tuple[str, ...]] = ()
+    voltage_field: ClassVar[str] = "u"
+    outputs_need_inputs: ClassVar[bool] = False
+    observer: ClassVar[bool] = True
+
+    def __init__(self, *, phases: int = 3) -> None:
+        self.power_scale, zero, _initial = _phase_convention(phases)
+        self.phases = phases
+        self.state = Empty()
+        self.input = Empty()
+        self.output = _NodeOutput(u=zero)
+        self.port: Port | None = Port(
+            self, "power", voltage=zero, current=zero,
+            scale=self.power_scale,
+            electrical_domain="ac" if phases == 3 else None,
+        )
+        self.ports = (self.port,)
+
+    def network(self, nb):
+        """Publish the voltage of the node joined to this bus."""
+        if self.port is None:
+            return NotImplemented
+        nb.node(self.port)
+        nb.port_output(self, "u", self.port, "voltage")
+
 
 class RCNode(NetworkComponent):
     """Node with a shunt capacitor ``C`` (F) in series with ``R_d`` (ohm) to ground.

@@ -175,9 +175,17 @@ def test_dag_and_additive_parameters_do_not_request_scc_analysis(monkeypatch):
 def test_export_finds_feedback_parameters_without_a_name_list(gain, tmp_path):
     p = _feedback_case(gain=gain)
     result = peslite.export(p, "cpp", tmp_path, variables=("all",))
-    assert {path for item in result.diagnostics for path in item["parameters"]} == {
+    feedback = [item for item in result.diagnostics
+                if item["code"] == "conditional-algebraic-dependency"]
+    assert {path for item in feedback for path in item["parameters"]} == {
         "elements.feedback.gain"}
-    assert all(item["dependencies"] for item in result.diagnostics)
+    assert all(item["dependencies"] for item in feedback)
+    structure = [item for item in result.diagnostics
+                 if item["code"] == "conditional-network-structure"]
+    assert {path for item in structure for path in item["parameters"]} == {
+        "buses.output.r_d", "units.converter.dclink.source.r",
+        "units.converter.filter.r_f",
+    }
     assert tuple(path.name for path in result.files) == ("peslite.cpp",)
 
 
@@ -208,7 +216,7 @@ def test_common_is_exactly_all_minus_the_existing_diagnostics(name, mode, tmp_pa
 
 
 @pytest.mark.parametrize("feedback", [False, True])
-def test_common_does_not_repeat_analysis_without_exclusions(feedback, tmp_path, monkeypatch):
+def test_common_rebuilds_once_after_detecting_exclusions(feedback, tmp_path, monkeypatch):
     original = cpp._ModelGenerator
     calls = []
 
@@ -220,7 +228,7 @@ def test_common_does_not_repeat_analysis_without_exclusions(feedback, tmp_path, 
     monkeypatch.setattr(cpp, "_ModelGenerator", Counted)
     p = _feedback_case() if feedback else _case("buck", "pwm_averaging")
     peslite.export(p, "cpp", tmp_path, variables=("common",))
-    assert len(calls) == 1 + int(feedback)
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])

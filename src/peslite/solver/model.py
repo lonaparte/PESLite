@@ -891,7 +891,7 @@ class _AlgebraicLoop:
 
     def __init__(self, operations: tuple, tears: tuple, owners: tuple,
                  labels: tuple[str, ...],
-                 max_sweeps: int = 16, rtol: float = 1e-14, atol: float = 1e-16) -> None:
+                 max_sweeps: int = 16, rtol: float = 1e-8, atol: float = 1e-10) -> None:
         self.tears = tears
         torn = {id(item) for item in tears}
         self.operations = tuple(operation for operation in operations
@@ -927,10 +927,12 @@ class _AlgebraicLoop:
         y0 = sweep(t, x0)
         r0 = y0 - x0
         scale = max(1.0, abs(x0), abs(y0))
-        if abs(r0) <= atol + rtol * scale:
-            return
-
         inverse = self._inverse
+        if abs(r0) <= atol + rtol * scale and inverse is not None:
+            corrected = x0 - inverse * r0
+            if cmath.isfinite(corrected) and abs(corrected - x0) <= limit * scale:
+                sweep(t, corrected)
+            return
         x1 = x0 - inverse * r0 if inverse is not None else y0
         if not cmath.isfinite(x1) or abs(x1 - x0) > limit * scale:
             x1 = y0
@@ -944,6 +946,10 @@ class _AlgebraicLoop:
                     self._inverse = estimate
             scale = max(1.0, abs(x1), abs(y1))
             if abs(r1) <= atol + rtol * scale:
+                inverse = self._inverse
+                corrected = x1 - inverse * r1 if inverse is not None else x1
+                if cmath.isfinite(corrected) and abs(corrected - x1) <= limit * scale:
+                    sweep(t, corrected)
                 return
             inverse = self._inverse
             x2 = x1 - inverse * r1 if inverse is not None else y1

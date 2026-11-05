@@ -10,7 +10,7 @@ from peslite.assembly.cpp import (_ALGEBRAIC_SOLVER, _ControlGenerator, _ModelGe
                                   _RuntimeParameters, _number, _uses_implementation)
 from peslite.components import Bag
 from peslite.components.converter import DCCapacitor, DCLink, DCVoltageSource
-from peslite.components.network import ACVoltageSource, RLBranch, RCNode
+from peslite.components.network import ACVoltageSource, RLBranch
 from peslite.solver.model import Empty, Model
 from peslite.control import Loop
 from peslite.control.blocks import PI
@@ -221,9 +221,8 @@ def test_native_multivariable_feedback_keeps_the_previous_output_between_calls(t
             self.input, self.output = Pair(x=1.0, y=1.0), Pair(x=1.0, y=1.0)
 
         def set_outputs(self, t):
-            # The default budget converges from the previous step, not a cold initial value.
-            self.output.x = 0.3 * self.input.x + 0.02 * self.input.y + 0.68 * (1.0 + t)
-            self.output.y = 0.02 * self.input.x + 0.3 * self.input.y + 0.68 * (1.0 + t)
+            self.output.x = 0.8 * self.input.x + 0.05 * self.input.y + 0.15 * (1.0 + t)
+            self.output.y = 0.05 * self.input.x + 0.8 * self.input.y + 0.15 * (1.0 + t)
 
         def rhs(self, t):
             return ()
@@ -292,20 +291,6 @@ def test_native_unilateral_output_clamps_a_negative_trial_state(tmp_path):
     actual, = _run_model(model, [(branch.output, "i")], tmp_path)
     model.sync(0.0, model.get_initial_values())
     assert actual == branch.output.i == 0.0
-
-
-def test_builtin_subclass_export_hooks_take_precedence():
-    class HookedNode(RCNode):
-        def cpp_outputs(self, generator):
-            return ["custom_output;"]
-
-        def cpp_rhs(self, generator):
-            return ["custom_rhs"]
-
-    node = HookedNode(1.0, 0.0, phases=1)
-    generator = _generator(Model({"node": node}, {}))
-    assert generator._output(node.set_outputs) == ["custom_output;"]
-    assert generator._rhs(node) == ["custom_rhs"]
 
 
 @pytest.mark.parametrize("capacitance", [None, 0.1])

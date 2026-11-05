@@ -92,20 +92,26 @@ class _Block:
         rng = np.random.default_rng(seed)
         self.direction = np.zeros(n)
         self.direction[cols] = rng.uniform(0.5, 1.5, cols.size) * rng.choice((-1.0, 1.0), cols.size)
-        self.cache: "OrderedDict[int, tuple[NDArray[np.float64], NDArray[np.float64]]]" = OrderedDict()
+        self.cache: "OrderedDict[int, tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]]" = OrderedDict()
         self.version = 0
-        self._keys = 0
+        self._revision = 0
 
-    def store(self, columns: NDArray[np.float64], signature: NDArray[np.float64]) -> None:
-        self._keys += 1
-        self.version = self._keys
-        self.cache[self._keys] = (columns.copy(), signature.copy())
+    def touch(self) -> None:
+        """Assign a new identity to the active matrix contents."""
+        self._revision += 1
+        self.version = self._revision
+
+    def store(self, columns: NDArray[np.float64], signature: NDArray[np.float64],
+              exact: NDArray[np.float64]) -> None:
+        self.touch()
+        self.cache[self.version] = (columns.copy(), signature.copy(), exact.copy())
         while len(self.cache) > _MODE_CACHE:
             self.cache.popitem(last=False)
 
-    def find(self, probe: NDArray[np.float64]) -> Optional[tuple[int, NDArray[np.float64]]]:
-        for key, (columns, signature) in reversed(self.cache.items()):
-            if _same(probe, signature):
+    def find(self, probe: NDArray[np.float64], exact: NDArray[np.float64]
+             ) -> Optional[tuple[int, NDArray[np.float64]]]:
+        for key, (columns, signature, stored_exact) in reversed(self.cache.items()):
+            if _same(probe, signature) and np.array_equal(exact, stored_exact):
                 self.cache.move_to_end(key)
                 return key, columns
         return None
@@ -159,7 +165,7 @@ class LinearSystem:
         self._modes.clear()
         for block in self._blocks:
             block.cache.clear()
-            block.version += 1
+            block.touch()
 
     def _setup(self, n: int) -> None:
         self._factors.clear()
@@ -202,7 +208,7 @@ class LinearSystem:
         if changed:
             for block in self._blocks:
                 if np.any(self._exact[block.cols]):
-                    block.version += 1
+                    block.touch()
         return changed
 
     def _columns(self, f: RHS, t: float, y: NDArray[np.float64], f0: NDArray[np.float64],
@@ -230,7 +236,7 @@ class LinearSystem:
             self._modes.move_to_end(mode)
             self._mode = mode
             for block in self._blocks:
-                block.version += 1
+                block.touch()
             self._refresh_exact()
             self._modes[mode] = self.J.copy()
             return
@@ -280,7 +286,8 @@ class LinearSystem:
             probe = self._probe(f, t, y, f0, block)
             if _same(probe, self.J[:, finite] @ block.direction[finite]):
                 continue
-            found = block.find(probe)
+            exact = block.cols[self._exact[block.cols]]
+            found = block.find(probe, self.J[:, exact])
             if found is not None:
                 block.version, columns = found
                 self.J[:, finite] = columns
@@ -304,9 +311,14 @@ class LinearSystem:
         columns = self._columns(f, t, y, f0, finite)
         self.J[:, finite] = columns
         if self.cache:
-            block.store(columns, columns @ block.direction[finite] if probe is None else probe)
+            exact = block.cols[self._exact[block.cols]]
+            block.store(
+                columns,
+                columns @ block.direction[finite] if probe is None else probe,
+                self.J[:, exact],
+            )
         else:
-            block.version += 1
+            block.touch()
 
     def _check_structure(self) -> None:
         """Merge groups whose interior states turn out to be coupled directly."""
@@ -331,7 +343,12 @@ class LinearSystem:
             if self.cache:
                 for block in self._blocks:
                     finite = block.cols[~self._exact[block.cols]]
-                    block.store(self.J[:, finite], self.J[:, finite] @ block.direction[finite])
+                    exact = block.cols[self._exact[block.cols]]
+                    block.store(
+                        self.J[:, finite],
+                        self.J[:, finite] @ block.direction[finite],
+                        self.J[:, exact],
+                    )
 
     def jacobian(self) -> NDArray[np.float64]:
         return self.J
@@ -422,16 +439,48 @@ class _Factor:
         values, vectors = np.linalg.eig(A)
         self.vectors = vectors
         self.inverse = np.linalg.inv(vectors)
-        self.parts = [
-            _ShiftFactor(J, structure, h * value, owner, (h, method, stage))
-            for stage, value in enumerate(values)
-        ]
+        self.parts: list[_ShiftFactor] = [None] * self.s
+        self.real: set[int] = set()
+        self.conjugate: set[int] = set()
+        pending = set(range(self.s))
+        factor_index = 0
+        while pending:
+            stage = min(pending)
+            pending.remove(stage)
+            value = values[stage]
+            if abs(value.imag) <= 1e-14 * max(1.0, abs(value.real)):
+                shift: complex | float = h * float(value.real)
+                self.real.add(stage)
+            else:
+                partner = next(
+                    (index for index in pending
+                     if abs(values[index] - value.conjugate())
+                     <= 1e-12 * max(1.0, abs(value))),
+                    None,
+                )
+                if partner is None:
+                    raise RuntimeError("a real implicit tableau has an unpaired complex eigenvalue")
+                pending.remove(partner)
+                shift = h * value
+            factor = _ShiftFactor(
+                J, structure, shift, owner, (h, method, factor_index)
+            )
+            factor_index += 1
+            self.parts[stage] = factor
+            if not isinstance(shift, float):
+                self.parts[partner] = factor
+                self.conjugate.add(partner)
 
     def solve(self, r: NDArray[np.float64]) -> NDArray[np.float64]:
         """Solve ``(I - h A kron J) x = r`` in the tableau eigenbasis."""
         transformed = self.inverse @ np.asarray(r, dtype=complex)
         for stage, factor in enumerate(self.parts):
-            transformed[stage] = factor.solve(transformed[stage])
+            if stage in self.real:
+                transformed[stage] = factor.solve(transformed[stage].real)
+            elif stage in self.conjugate:
+                transformed[stage] = np.conj(factor.solve(np.conj(transformed[stage])))
+            else:
+                transformed[stage] = factor.solve(transformed[stage])
         result = self.vectors @ transformed
         return np.asarray(result.real, dtype=float)
 

@@ -96,12 +96,9 @@ class Unit(ABC):
         self.name, self.cfg, self.bus = name, cfg, bus
         if bus is None:
             self._bus_voltage_field, self._bus_voltage = None, None
-        elif bus.voltage_field == "voltage":
-            self._bus_voltage_field = bus.voltage_field
-            self._bus_voltage = lambda: bus.port.voltage
         else:
             self._bus_voltage_field = bus.voltage_field
-            self._bus_voltage = lambda: bus.output.u
+            self._bus_voltage = lambda: getattr(bus.output, bus.voltage_field)
         self._current_channel = unit_type(cfg.type).current_channel
         self.scenario = Scenario(cfg.events, f"units.{name}", initial=cfg.connected)
         self.dclink = _parameterized(lambda c: make_dclink(c.dclink), cfg)
@@ -842,7 +839,7 @@ class DCConverter(Unit):
             phases=1,
             unilateral=self.bridge.diode_blocks_reverse_current(),
         ), cfg.filter)
-        controlled = getattr(topology, "controlled", True)
+        controlled = topology.controlled
         self._blocked_warned = False
         self._external_lower_rail = getattr(topology, "external_port", None) == "lower_rail"
         if self._external_lower_rail and self.branch_f is not None:

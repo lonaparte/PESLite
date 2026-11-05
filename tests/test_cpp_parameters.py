@@ -428,6 +428,10 @@ def test_omitted_primitive_keeps_the_compiled_structure(name, path, changed_valu
     binary = _compile(params, tmp_path / "model", (selection,))
     baseline = subprocess.run([binary, "--set", f"{path}=0", "--out", tmp_path / "zero"],
                               capture_output=True, text=True)
+    if selection == "common":
+        assert baseline.returncode == 1
+        assert "is not variable" in baseline.stderr
+        return
     assert baseline.returncode == 0
     changed = subprocess.run([binary, "--set", f"{path}={changed_value}", "--out", tmp_path / "changed"],
                              capture_output=True, text=True)
@@ -496,6 +500,22 @@ def test_finite_bridge_parameters_use_the_shared_native_equations(name, mode, se
     unit = names[0]
     _compare_run(p, binary, {f"units.{unit}.bridge.parallel_capacitance": 1.2e-5,
                              f"units.{unit}.bridge.on_resistance": 1.1}, tmp_path / "run")
+
+
+def test_fixed_finite_bridge_uses_the_compiled_structural_modes(tmp_path):
+    p = _case("gfl", "switching").replace(**{
+        "simulation.t_end": 30e-6,
+        "simulation.solver.dt": 0.25e-6,
+        "simulation.output.period": 0.25e-6,
+        "simulation.output.record_every": 1,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+        "units.vsc.bridge.parallel_capacitance": 1e-5,
+        "units.vsc.bridge.on_resistance": 1.0,
+        "units.vsc.protection.overcurrent.enable": False,
+    })
+    binary = _compile(p, tmp_path / "model", ())
+    _compare_run(p, binary, {}, tmp_path / "run", rtol=2e-9, atol=2e-9)
 
 
 def test_parameter_selection_rejects_structural_paths_before_writing(tmp_path):
