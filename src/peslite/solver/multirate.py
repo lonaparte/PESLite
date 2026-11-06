@@ -37,8 +37,9 @@ def make_solver(cfg: Any, model: Optional[Any] = None, ratings: Any = None):
         if model is None:
             raise ConfigError("simulation.solver.subsystems needs the model whose subsystems it names")
         try:
-            parsed = {name: parse_step(value)[0] for name, value in cfg.subsystems.items()}
-            if any(ratio != 1.0 for ratio in parsed.values()):
+            parsed = {name: parse_step(value) for name, value in cfg.subsystems.items()}
+            if any(ratio != 1.0 or (own is not None and own != method)
+                   for ratio, own in parsed.values()):
                 if method not in EXPLICIT_FIXED_METHODS:
                     raise ConfigError(
                         "simulation.solver.subsystems needs an explicit system method, got "
@@ -116,8 +117,8 @@ class MultirateSolver:
     """Explicit RK with system step ``dt`` (s) and, per named subsystem, a step relative to it.
 
     ``steps``: ``{name: ratio}`` or ``{name: {"step": ratio, "method": ...}}``, ratio ``1/N`` or an
-    integer ``M``; ``method``: ``"euler"``, ``"heun"`` or ``"RK4"``; ``sweeps``: coupling sweeps
-    for ``1/N`` steps (>= 1); ``rtol`` / ``atol``: for an adaptive windowed method; ``ratings``:
+    integer ``M``; ``method``: the explicit system method; ``sweeps``: coupling sweeps for ``1/N``
+    steps (>= 1); ``rtol`` / ``atol``: for an inner or windowed adaptive method; ``ratings``:
     as in :func:`make_solver`. ``n_system``, ``n_inner`` and ``n_outer`` count RHS evaluations;
     ``groups``: the ``{label: GroupPlan}`` of the split (see :meth:`~peslite.solver.model.Model.groups`).
     """
@@ -144,16 +145,15 @@ class MultirateSolver:
         inner: dict[str, float] = {}
         outer: dict[str, float] = {}
         outer_method: Optional[str] = None
+        inner_methods: set[str] = set()
         for name, value in steps.items():
             try:
                 r, meth = parse_step(value)
             except ValueError as exc:
                 raise ValueError(f"subsystem {name!r}: {exc}") from None
-            if r < 1.0:
-                if meth is not None and meth != method:
-                    raise ValueError(f"subsystem {name!r}: a step inside the system step shares the system "
-                                     f"method ({method!r}); it cannot use {meth!r}")
+            if r < 1.0 or (r == 1.0 and meth is not None and meth != method):
                 inner[name] = r
+                inner_methods.add(meth or method)
             elif r > 1.0:
                 outer[name] = r
                 if meth is not None:
@@ -166,6 +166,12 @@ class MultirateSolver:
             if len({count(r) for r in group.values()}) > 1:
                 raise ValueError(f"subsystems {where} share one ratio, got "
                                  + ", ".join(f"{name}: {steps[name]}" for name in group))
+        if len(inner_methods) > 1:
+            raise ValueError(
+                "subsystems inside the system step share one method, got "
+                + ", ".join(sorted(inner_methods))
+            )
+        self.inner_method = inner_methods.pop() if inner_methods else method
         self.ratio = int(round(1.0 / min(inner.values()))) if inner else 1  # steps per system step
         self.window_steps = int(round(min(outer.values()))) if outer else 1  # system steps per window
         assignment = {n: "inner" for n in inner}
@@ -177,6 +183,10 @@ class MultirateSolver:
         self.outer_method = outer_method or method
         self._outer_solver = (integrator(self.outer_method, self.window, rtol, atol)
                               if self.outer is not None else None)
+        self._inner_solver = (
+            integrator(self.inner_method, self.dt / self.ratio, rtol, atol)
+            if self.inner is not None and self.inner_method != method else None
+        )
         # window bookkeeping (outer group)
         self._anchor: Optional[NDArray[np.float64]] = None  # outer states at the last window close
         self._slope: Optional[NDArray[np.float64]] = None
@@ -299,6 +309,11 @@ class MultirateSolver:
     def parameters_changed(self) -> None:
         """Refresh storage declarations after a ``set`` event changed parameters."""
         self.model_plan_changed()
+        for solver in (getattr(self, "_inner_solver", None),
+                       getattr(self, "_outer_solver", None)):
+            changed = getattr(solver, "parameters_changed", None)
+            if changed is not None:
+                changed()
         self._storage_of = {
             self.model.state_slice(sub, st.state).start: (sub, st)
             for sub in self.model.subsystems for st in getattr(sub, "storage", ())
@@ -544,6 +559,8 @@ class MultirateSolver:
         return k
 
     def _macro_step(self, t0: float, H: float, y0: NDArray[np.float64]) -> NDArray[np.float64]:
+        if self._inner_solver is not None:
+            return self._partitioned_step(t0, H, y0)
         c, a, b = TABLEAUS[self.method]
         m = self.ratio
         h = H / m
@@ -595,6 +612,85 @@ class MultirateSolver:
         self._steps += 1
         self._track_flow(t0 + H)
         return np.where(moving, out, y0) if self._anchor is not None else out
+
+    def _partitioned_step(
+        self, t0: float, H: float, y0: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        """Advance one group with its own solver against the system's Hermite path."""
+        c, a, b = TABLEAUS[self.method]
+        mask_i = self._mask_inner
+        trajectory: Optional[list[NDArray[np.float64]]] = None
+        m = self.ratio
+        h = H / m
+        for sweep in range(1, self.sweeps + 1):
+            final_sweep = sweep == self.sweeps
+            ks: list[NDArray[np.float64]] = []
+            for j, node in enumerate(c):
+                t = t0 + node * H
+                state = y0 if j == 0 else stage_state(y0, H, a[j - 1], ks)
+                if trajectory is not None:
+                    state = np.where(mask_i, self._inner_at(trajectory, t0, h, t), state)
+                seen = state
+                ks.append(self._f_system(
+                    t, self._place_outer(t, state), b[j] * H if final_sweep else 0.0
+                ))
+            system_end = combine(self.method, y0, H, ks)
+            if trajectory is not None:
+                system_end = np.where(mask_i, trajectory[-1], system_end)
+            end_rate = self._f_system(
+                t0 + H, self._place_outer(t0 + H, system_end), 0.0
+            )
+            trajectory = self._solve_inner(
+                t0, h, m, y0, system_end, ks[0], end_rate
+            )
+        assert trajectory is not None
+        out = np.where(mask_i, trajectory[-1], system_end)
+        self._note_error(mask_i, y0, seen, out, H, t0 + H)
+        self._steps += 1
+        self._track_flow(t0 + H)
+        return np.where(self._mask_moving, out, y0) if self._anchor is not None else out
+
+    def _solve_inner(
+        self,
+        t0: float,
+        h: float,
+        count: int,
+        y0: NDArray[np.float64],
+        y1: NDArray[np.float64],
+        k0: NDArray[np.float64],
+        k1: NDArray[np.float64],
+    ) -> list[NDArray[np.float64]]:
+        """Integrate the inner state vector while interpolating every other state."""
+        assert self._inner_solver is not None
+        mask = self._mask_inner
+        indices = np.flatnonzero(mask)
+        span = count * h
+        start = np.where(mask, 0.0, y0)
+        end = np.where(mask, 0.0, y1)
+        slope0 = np.where(mask, 0.0, span * k0)
+        slope1 = np.where(mask, 0.0, span * k1)
+
+        def derivatives(t: float, inner: NDArray[np.float64]) -> NDArray[np.float64]:
+            fraction = (t - t0) / span
+            square, cube = fraction * fraction, fraction * fraction * fraction
+            state = (
+                (2 * cube - 3 * square + 1) * start
+                + (cube - 2 * square + fraction) * slope0
+                + (-2 * cube + 3 * square) * end
+                + (cube - square) * slope1
+            )
+            state[indices] = inner
+            return self._f_inner(t, self._place_outer(t, state))[indices]
+
+        trajectory = [y0]
+        values, t = y0[indices], t0
+        for _ in range(count):
+            values = self._inner_solver(derivatives, t, t + h, values).y
+            t += h
+            state = np.array(y1, dtype=float)
+            state[indices] = values
+            trajectory.append(state)
+        return trajectory
 
     def _track_flow(self, t: float) -> None:
         """Record the running flow integral of each windowed storage at the end of a system step."""

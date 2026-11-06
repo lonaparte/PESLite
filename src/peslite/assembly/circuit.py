@@ -47,8 +47,8 @@ from ..components.network import Port
 from ..solver.energy import Energetic, spec_of
 from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _InlineProgram
 from ..solver.netlist import (QUANTITIES, CoupledInductors, CurrentSource, Diode, Element, Mode,
-                              Netlist, Node, Topology, VoltageSource, _Degenerate, _Evaluation,
-                              _linear_expression, _numeric_values, _roles, _UnionFind)
+                              Netlist, Node, Topology, VoltageSource, _DENSE_GROUP, _Degenerate,
+                              _Evaluation, _linear_expression, _numeric_values, _roles, _UnionFind)
 
 __all__ = ["NetlistBuilder", "NetworkPlan", "Circuit", "NetworkView", "circuit_structure",
            "circuit_mode_key", "circuit_linear_blocks", "circuit_linear_modes",
@@ -516,7 +516,6 @@ class Circuit:
         self._mode_targets: set[tuple[int, str]] = set()
         self._discrete_mode_targets: set[tuple[int, str]] = set()
         self._held_input_keys: set[str] = set()
-        self._ratios_held = True
         self.requires_topology_freeze = False
         self._direct_dynamic = False
         self._direct_mode_key: Optional[tuple] = None
@@ -672,7 +671,6 @@ class Circuit:
         self._mode_targets, self._discrete_mode_targets, held_ratios = (
             self._mode_input_targets(net)
         )
-        self._ratios_held = held_ratios
         self.requires_topology_freeze = self.commutation_active or held_ratios
         self._direct_dynamic = False
         self._direct_mode_key = None
@@ -827,29 +825,74 @@ class Circuit:
             function = getattr(method, "__func__", method)
             self._output_stage_fields[function] = tuple(stage.outputs)
 
+    def _input_names(
+        self, value: Any, copied: Mapping[tuple[int, str], str]
+    ) -> Optional[set[str]]:
+        """Return declared circuit inputs of a netlist value, or ``None`` if unknown."""
+        declared = _record_dependencies(value)
+        if declared is None:
+            return None
+        record, fields = declared
+        if record is None:
+            return set()
+        return {
+            key for field in fields
+            if (key := field if record is self.input else copied.get((id(record), field)))
+            is not None
+        }
+
+    def _copied_inputs(self) -> dict[tuple[int, str], str]:
+        """Map component input fields copied by this circuit to circuit input names."""
+        return {
+            (id(component.input), field): key
+            for component, field, key in self.copies
+        }
+
     def _program_dependencies(self, program: tuple) -> tuple[str, ...]:
         """Circuit input fields read by one generated scalar program."""
         statements, _result, namespace, expressions = program
         expressions = expressions or ()
         active = "\n".join((*_live_statements(statements, expressions), *expressions))
-        copied = {
-            (id(component.input), field): key
-            for component, field, key in self.copies
-        }
+        copied = self._copied_inputs()
         dependencies = set()
         for name, value in namespace.items():
             if re.search(rf"\b{re.escape(name)}\b", active) is None:
                 continue
-            declared = _record_dependencies(value)
-            if declared is None or declared[0] is None:
-                continue
-            record, fields = declared
-            dependencies.update(
-                key for field in fields
-                if (key := (field if record is self.input else
-                            copied.get((id(record), field)))) is not None
-            )
+            names = self._input_names(value, copied)
+            if names is None:
+                return tuple(self.inputs)
+            dependencies.update(names)
         return tuple(name for name in self.inputs if name in dependencies)
+
+    def _structural_dependencies(
+        self, topology: Topology
+    ) -> Optional[tuple[Callable[[Sequence[int]], tuple[str, ...]], tuple[str, ...]]]:
+        """Return conservative circuit-input dependencies from the numeric network structure."""
+        reach = topology.input_reach()
+        if reach is None:
+            return None
+        derivatives, outputs = reach
+        net, copied = self.netlist, self._copied_inputs()
+        names: list[set[str]] = []
+        values = [
+            (source.value, getattr(source, "derivative", None))
+            for source, _offset in net._sources
+        ] + [(transformer.N, None) for transformer in net._transformers]
+        for value, derivative in values:
+            current = self._input_names(value, copied)
+            rate = set() if derivative is None else self._input_names(derivative, copied)
+            if current is None or rate is None:
+                return None
+            names.append(current | rate)
+
+        def ordered(indices: Sequence[int]) -> tuple[str, ...]:
+            found = set().union(*(names[int(index)] for index in indices)) if len(indices) else set()
+            return tuple(name for name in self.inputs if name in found)
+
+        return (
+            lambda selected: ordered(np.flatnonzero(outputs[:, list(selected)].any(axis=1))),
+            ordered(np.flatnonzero(derivatives)) if self.n_states else (),
+        )
 
     def _copy_prelude(
         self, dependencies: Sequence[str], namespace: dict[str, Any]
@@ -1052,9 +1095,9 @@ class Circuit:
         return tuple(key for key in self.inputs if key in dependencies)
 
     def _output_stage_groups(
-        self, output_evaluators: Sequence[Callable],
+        self,
         publications: Mapping[str, tuple[int, Sequence[tuple[float, slice]]]],
-        *, conservative: bool = False,
+        input_dependencies: Callable[[list[int]], Optional[tuple[str, ...]]],
     ) -> Optional[list[tuple[tuple[str, ...], list[str], list[int]]]]:
         """Group public rows by every input their equations may read in any planned mode."""
         groups: dict[tuple[str, ...], tuple[list[str], set[int]]] = {}
@@ -1064,15 +1107,7 @@ class Circuit:
                 index for key in keys for _factor, output in publications[key][1]
                 for index in range(output.start, output.stop)
             })
-            programs = [
-                getattr(evaluator(selected), "_peslite_scalar_program", None)
-                for evaluator in output_evaluators
-            ]
-            if programs[0] is None or programs[0][3] is None:
-                return None
-            dependencies = (
-                tuple(self.inputs) if conservative else self._mode_dependencies(programs)
-            )
+            dependencies = input_dependencies(selected)
             if dependencies is None:
                 return None
             grouped_keys, rows = groups.setdefault(dependencies, ([], set()))
@@ -1106,38 +1141,68 @@ class Circuit:
         if self._mixtures:
             return False
         numeric = self.form != "device"
-        dynamic = any(transformer.constant is None for transformer in net._transformers)
-        if not numeric and (net._diodes or (dynamic and not self._ratios_held)):
+        if not numeric and net._diodes:
             return False
-        topology, dynamic, derivatives, output_evaluator = self._stage_programs()
-        planned = () if dependency_topologies is None else tuple(dependency_topologies)
-        dependency_programs = tuple(self._stage_programs(item) for item in planned)
-        output_evaluators = (output_evaluator, *(item[3] for item in dependency_programs))
         publications = {key: (dimension, terms)
                         for key, dimension, terms in self.publications}
         if set(publications) | {output for _input, output in self.passthrough} != set(self.outputs):
             return False
-        output_groups = self._output_stage_groups(
-            output_evaluators, publications, conservative=dependency_topologies is None
-        )
-        derivative_program = getattr(derivatives, "_peslite_scalar_program", None)
-        if (output_groups is None or (self.n_states and
-                                      (derivative_program is None or derivative_program[3] is None))):
-            return False
-        if self.n_states:
-            mode_derivatives = (
+        conservative = dependency_topologies is None
+        planned = () if conservative else tuple(dependency_topologies)
+        topology = net.topology()
+        structural = None
+        if numeric and topology.n_z > _DENSE_GROUP:
+            structural = tuple(
+                self._structural_dependencies(item) for item in (topology, *planned)
+            )
+            if any(item is None for item in structural):
+                structural = None
+        if structural:
+            dynamic = any(transformer.constant is None for transformer in net._transformers)
+            derivative_dependencies = tuple(
+                key for key in self.inputs
+                if any(key in dependencies for _outputs, dependencies in structural)
+            )
+
+            def output_dependencies(selected: list[int]) -> tuple[str, ...]:
+                found = {
+                    key
+                    for outputs, _derivatives in structural
+                    for key in outputs(selected)
+                }
+                return tuple(key for key in self.inputs if key in found)
+        else:
+            topology, dynamic, derivatives, output_evaluator = self._stage_programs()
+            dependency_programs = tuple(self._stage_programs(item) for item in planned)
+            output_evaluators = (output_evaluator, *(item[3] for item in dependency_programs))
+            derivative_program = getattr(derivatives, "_peslite_scalar_program", None)
+            if self.n_states and (derivative_program is None or derivative_program[3] is None):
+                return False
+            derivative_dependencies = self._mode_dependencies((
                 derivative_program,
                 *(getattr(item[2], "_peslite_scalar_program", None)
                   for item in dependency_programs),
-            )
-            derivative_dependencies = (
-                tuple(self.inputs) if dependency_topologies is None
-                else self._mode_dependencies(mode_derivatives)
-            )
-            if derivative_dependencies is None:
-                return False
-        else:
-            derivative_dependencies = ()
+            )) if self.n_states else ()
+
+            def output_dependencies(selected: list[int]) -> Optional[tuple[str, ...]]:
+                programs = [
+                    getattr(evaluator(selected), "_peslite_scalar_program", None)
+                    for evaluator in output_evaluators
+                ]
+                return self._mode_dependencies(programs)
+
+        if conservative:
+            precise_output_dependencies = output_dependencies
+
+            def output_dependencies(selected: list[int]) -> Optional[tuple[str, ...]]:
+                return (None if precise_output_dependencies(selected) is None
+                        else tuple(self.inputs))
+
+            if derivative_dependencies is not None and self.n_states:
+                derivative_dependencies = tuple(self.inputs)
+        output_groups = self._output_stage_groups(publications, output_dependencies)
+        if output_groups is None or derivative_dependencies is None:
+            return False
         signature = (
             tuple((dependencies, tuple(keys), tuple(selected))
                   for dependencies, keys, selected in output_groups),
@@ -1150,8 +1215,21 @@ class Circuit:
         for index, (dependencies, keys, selected) in enumerate(output_groups, 1):
             name = f"_{prefix}_outputs_{index}"
             positions = {position: offset for offset, position in enumerate(selected)}
-            program = output_evaluator(selected)._peslite_scalar_program
-            body, expressions, namespace = self._bind_program(program, dependencies)
+            if structural:
+                namespace = {
+                    "_circuit_numeric_rows": (
+                        lambda t, rows=tuple(selected):
+                        net.evaluate_outputs(t, self._states(), rows).tolist()
+                    )
+                }
+                body = self._copy_prelude(dependencies, namespace)
+                body.append("_circuit_rows = _circuit_numeric_rows(t)")
+                expressions = tuple(
+                    f"_circuit_rows[{offset}]" for offset in range(len(selected))
+                )
+            else:
+                program = output_evaluator(selected)._peslite_scalar_program
+                body, expressions, namespace = self._bind_program(program, dependencies)
             values = {
                 position: expressions[offset]
                 for position, offset in positions.items()
@@ -1170,7 +1248,7 @@ class Circuit:
                 namespace = {}
                 body = self._copy_prelude(dependencies, namespace)
                 namespace["_circuit_numeric_derivatives"] = (
-                    lambda t: net.evaluate(t, self._states())
+                    lambda t: net.evaluate(t, self._states()).tolist()
                 )
                 body.append("_circuit_values = _circuit_numeric_derivatives(t)")
                 values = tuple(
@@ -1256,6 +1334,7 @@ class Circuit:
         holder[:] = self.netlist, topology, evaluate
         self._margin_evaluator_key = margin_key
         self._margin_evaluator = margin
+        self._device_commands = self._boundary_mode()
         return True
 
     def _compile_device_runtime(self) -> bool:
@@ -1319,6 +1398,44 @@ class Circuit:
         for index, T, _inverse in self._transforms:
             y[index] = T @ y[index]
         return y
+
+    def linear_mode(self) -> tuple[tuple, Callable[[], np.ndarray]]:
+        """Return the present linear-mode identity and a lazy state-matrix builder."""
+        net = self.netlist
+        if self.form == "device" and self._direct_dynamic:
+            mode = net.mode()
+            derivative = next(
+                (getattr(self, stage.method) for stage in self.output_stages or ()
+                 if stage.rhs and not stage.outputs),
+                None,
+            )
+            if derivative is not None:
+                return mode.key, lambda: self._direct_state_matrix(derivative)
+        topology = self._bound_device_topology() or net.topology()
+        return topology.mode.key, lambda: topology.state_space.A
+
+    def _direct_state_matrix(self, derivative: Callable[[float], None]) -> np.ndarray:
+        """Form the matrix of the already compiled direct device equations."""
+        saved_states = self.gather()
+        saved_derivatives = self.derivatives.copy()
+        saved_t, saved_storage = self.t, self._stored
+        zero = [0.0] * self.n_states
+        try:
+            self.scatter(zero)
+            derivative(saved_t)
+            base = np.asarray(self.derivatives, dtype=float)
+            matrix = np.empty((self.n_states, self.n_states))
+            for column in range(self.n_states):
+                state = zero.copy()
+                state[column] = 1.0
+                self.scatter(state)
+                derivative(saved_t)
+                matrix[:, column] = np.asarray(self.derivatives, dtype=float) - base
+            return matrix
+        finally:
+            self.scatter(saved_states)
+            self.derivatives[:] = saved_derivatives
+            self.t, self._stored = saved_t, saved_storage
 
     def _store(self, y: np.ndarray) -> None:
         """Write a netlist state vector back into the components."""
@@ -1527,6 +1644,10 @@ class Circuit:
         a diode must commutate or a component has not mirrored the conduction yet; read after the model
         was synchronized. A change of transformer ratios alone keeps constraints that do not involve them."""
         net = self.netlist
+        runtime = getattr(self, "_device_runtime", None)
+        if (runtime is not None and runtime[1] is not None
+                and self._boundary_mode() != getattr(self, "_device_commands", None)):
+            self._refresh_device_evaluator()
         evaluation = net._last
         topology = evaluation.topology if evaluation is not None and evaluation.t == self.t else net.topology()
         mode = topology.mode
@@ -1745,7 +1866,7 @@ class NetworkView:
         for stage, remaining in _component_stages_beside_netlist(component, stages, outputs):
             kept.append(OutputMethod(
                 stage.method, tuple(stage.inputs), remaining,
-                rhs=stage.rhs or not remaining or bool(set(remaining) & set(inputs)),
+                rhs=not remaining or bool(set(remaining) & set(inputs)),
             ))
             setattr(self, stage.method, getattr(component, stage.method))
         self.declared = tuple(outputs)
@@ -2623,19 +2744,12 @@ def circuit_linear_blocks(circuits: Sequence[Circuit]):
 
 
 def circuit_linear_modes(circuits: Sequence[Circuit]):
-    """Return materialized linear circuit matrices for explicit-stability checks.
-
-    Direct compiled equations need no numeric network factorization. Their continuously varying
-    form therefore remains direct instead of constructing a second representation solely for this
-    optional check.
-    """
-    modes = []
-    for circuit in circuits:
-        topology = circuit.netlist.topology()
-        if circuit._direct_dynamic:
-            continue
-        modes.append(((id(circuit.netlist), topology.mode.key), topology.state_space.A))
-    return tuple(modes)
+    """Return the exact present-mode state matrix of every assembled circuit."""
+    return tuple(
+        ((id(circuit.netlist), key), matrix)
+        for circuit in circuits
+        for key, matrix in (circuit.linear_mode(),)
+    )
 
 
 def circuit_linear_dynamic(circuits: Sequence[Circuit]) -> bool:
@@ -2850,6 +2964,25 @@ class _ModeStructure:
                     ).add(vertex)
         return attached
 
+    def _short_loops(self) -> dict[int, dict[int, set[int]]]:
+        """Return voltage-defined paths closed by each short-device cluster."""
+        ends: dict[int, dict[int, set[int]]] = {}
+        for index, (vertices, variable, _branches) in enumerate(self.edges):
+            if variable is None or self.positions[variable][0] != "short":
+                continue
+            cluster = self.index[self.part.find(self.edge_part[index])]
+            for vertex in vertices:
+                ends.setdefault(cluster, {}).setdefault(
+                    self.supernode.find(vertex), set()
+                ).add(vertex)
+        return {
+            cluster: {
+                node: self._paths(node, attached)
+                for node, attached in by_node.items()
+            }
+            for cluster, by_node in ends.items()
+        }
+
     def _constrained(self) -> dict[int, set[int]]:
         constrained: dict[int, set[int]] = {}
         for root, crossing in self.cutsets.items():
@@ -2878,15 +3011,30 @@ class _ModeStructure:
                 for entry in entries:
                     edge_owners.setdefault(entry, set()).add(number)
 
+        clamped: dict[int, set[int]] = {}
+        for cluster, loops in self._short_loops().items():
+            for node, path in loops.items():
+                if path:
+                    clamped.setdefault(node, set()).add(cluster)
+
         def node_owners(vertex: int) -> set[int]:
-            return set() if vertex == 0 else set(self._cluster_of_part(self._vertex_part(vertex)))
+            if vertex == 0:
+                return set()
+            return clamped.get(self.supernode.find(vertex), set()) | set(
+                self._cluster_of_part(self._vertex_part(vertex))
+            )
+
+        def voltage_owners_between(a: int, b: int) -> set[int]:
+            """Return clusters that can change the voltage between two vertices."""
+            if self.supernode.find(a) == self.supernode.find(b):
+                return set(clamped.get(self.supernode.find(a), ()))
+            return node_owners(a) | node_owners(b)
 
         def current_owners(index: int) -> set[int]:
             owners: set[int] = set()
             for entry in self._element_branches(net, index):
                 branch = branches[entry]
-                if self.supernode.find(branch.a) != self.supernode.find(branch.b):
-                    owners |= node_owners(branch.a) | node_owners(branch.b)
+                owners |= voltage_owners_between(branch.a, branch.b)
                 owners |= {
                     number for number, entries in constrained.items() if entry in entries
                 }
@@ -2910,11 +3058,9 @@ class _ModeStructure:
             if branch.x >= 0:
                 for offset in range(branch.dim):
                     rows[branch.x + offset] |= owners
-            if self.supernode.find(branch.a) != self.supernode.find(branch.b):
-                across = node_owners(branch.a) | node_owners(branch.b)
-                for offset in range(branch.dim):
-                    rows[net.n_x + net.n_e + branch.output + offset] |= across
+            voltage = voltage_owners_between(branch.a, branch.b)
             for offset in range(branch.dim):
+                rows[net.n_x + net.n_e + branch.output + offset] |= voltage
                 rows[net.n_x + net.n_e + net.n_bd + branch.output + offset] |= owners
         for vertex in range(1, net.n_vertices):
             for offset in range(net._vertex_dim[vertex]):
@@ -2925,19 +3071,10 @@ class _ModeStructure:
         """Return the clusters that can change projected states and jump energies."""
         branches = self.branches
         entries: list[set[int]] = [set() for _ in range(size + 2)]
-        short_ends: dict[int, dict[int, set[int]]] = {}
-        for index, (vertices, variable, _branches) in enumerate(self.edges):
-            if variable is None or self.positions[variable][0] != "short":
-                continue
-            number = self.index[self.part.find(self.edge_part[index])]
-            for vertex in vertices:
-                short_ends.setdefault(number, {}).setdefault(
-                    self.supernode.find(vertex), set()
-                ).add(vertex)
         changed: set[int] = set()
-        for number, by_node in short_ends.items():
-            for node, ends in by_node.items():
-                for index in self._paths(node, ends):
+        for number, loops in self._short_loops().items():
+            for path in loops.values():
+                for index in path:
                     if branches[index].x >= 0:
                         for offset in range(branches[index].dim):
                             entries[int(net.states[branches[index].x + offset])].add(number)
@@ -3001,18 +3138,3 @@ def _mode_decomposition(
         return None
     cache[key] = decomposition
     return decomposition
-
-
-def _switch_decomposition(
-    circuit: Circuit,
-    free: Sequence[int],
-    closed: Sequence[bool],
-    conducting: Sequence[bool],
-) -> Optional[_ModeDecomposition]:
-    """Find exact independent mode families for run-time switches."""
-    free = tuple(map(int, free))
-    return _mode_decomposition(
-        circuit,
-        tuple(("closed", index) for index in free),
-        Mode(closed, conducting, ()),
-    )

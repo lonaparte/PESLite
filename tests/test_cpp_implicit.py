@@ -72,6 +72,16 @@ def test_native_export_keeps_python_adaptive_methods_explicit(tmp_path):
         peslite.export(params, "cpp", tmp_path / "unsupported")
 
 
+def test_native_adaptive_commutation_requires_a_finite_observation_step(tmp_path):
+    params = peslite.load(EXAMPLES / "wpt-phase-shift-example.pes", **{
+        "simulation.solver.type": "adaptive",
+        "simulation.solver.method": "DP45",
+        "simulation.solver.max_step": float("inf"),
+    })
+    with pytest.raises(ValueError, match="max_step must be finite"):
+        peslite.export(params, "cpp", tmp_path / "unbounded")
+
+
 def test_native_fixed_explicit_reuses_the_stiff_mode_fallback(tmp_path):
     params = peslite.load(EXAMPLES / "boost-example.pes").replace(**{
         "units.converter.bridge.model": "switching",
@@ -105,6 +115,26 @@ def test_native_fixed_explicit_reuses_the_stiff_mode_fallback(tmp_path):
         list(actual.values()), list(expected.values()), rtol=2e-8, atol=2e-9
     )
     assert actual["converter.dclink.u_C"] > 0.0
+
+
+@pytest.mark.parametrize("method", ["radau", "RK4"])
+def test_native_stiff_cable_matches_python(method, tmp_path):
+    params = peslite.load(EXAMPLES / "cable-gfl-example.pes", **{
+        "elements.cable1.sections": 10,
+        "elements.cable1.length_km": 5.0,
+        "simulation.solver.type": "fixed",
+        "simulation.solver.method": method,
+        "simulation.solver.circuit_model": "statewise",
+        "simulation.solver.rtol": 1e-8,
+        "simulation.solver.atol": 1e-9,
+        "simulation.t_end": 5e-4,
+        "simulation.progress.enable": 0,
+        "simulation.energy_check": "off",
+        "simulation.output.states": True,
+        "simulation.output.signals": False,
+        "simulation.output.energy": False,
+    })
+    _compare_native(params, tmp_path)
 
 
 @pytest.mark.parametrize("method", ["trapezoidal", "radau"])

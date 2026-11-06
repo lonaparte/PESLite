@@ -1286,6 +1286,9 @@ class Simulation:
             if callable(report):
                 summary.update({f"{name}.{k}": v for k, v in report().items()})
         summary["tripped"] = int(any(unit.tripped for unit in units))
+        solver_notes = tuple(dict.fromkeys(getattr(solver, "notes", ())))
+        if solver_notes:
+            summary["solver_notes"] = list(solver_notes)
         summary["t_start"] = t_start
         summary["t_stop"] = rec.last_t if rec.last_t is not None else t_start
         if termination == "completed" and summary["t_stop"] < t_final - TIME_EPS:

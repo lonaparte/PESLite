@@ -12,9 +12,10 @@ from __future__ import annotations
 import functools
 import linecache
 import math
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -77,6 +78,7 @@ IMPLICIT_FIXED_METHODS = ("trapezoidal", "radau")
 FIXED_METHODS = EXPLICIT_FIXED_METHODS + IMPLICIT_FIXED_METHODS
 ADAPTIVE_METHODS = ("RK23", "RK45", "DOP853", "radau", "BDF", "LSODA", "DP45", "auto")
 IMPLICIT_ADAPTIVE_METHODS = ("radau", "BDF", "LSODA")
+MULTISTEP_ADAPTIVE_METHODS = ("BDF", "LSODA")
 
 
 def canonical_method(method: str, solver_type: str | None = None) -> str:
@@ -171,22 +173,16 @@ class FixedStepSolver:
         self._implicit = None
         self._stability_revision = -1
         self._stability_mode = None
-        self._stable_step = 0.0
-        self._unstable_step = math.inf
-        self._stability_modes: OrderedDict[object, tuple[float, float]] = OrderedDict()
+        self._stability_results: OrderedDict[tuple[object, float], bool] = OrderedDict()
+        self._dynamic_stability = bool(getattr(model, "explicit_stability_dynamic", False))
         self._mode_eigenvalues: OrderedDict[object, NDArray[np.complex128]] = OrderedDict()
-        self._dynamic_stability = bool(
-            getattr(model, "explicit_stability_dynamic", False)
-        )
         self.n_rhs = 0
 
     def parameters_changed(self) -> None:
         """Discard the lazy stiff-mode factors after a parameter event."""
         self._stability_revision = -1
         self._stability_mode = None
-        self._stable_step = 0.0
-        self._unstable_step = math.inf
-        self._stability_modes.clear()
+        self._stability_results.clear()
         self._mode_eigenvalues.clear()
         if self._implicit is not None:
             self._implicit.parameters_changed()
@@ -200,7 +196,7 @@ class FixedStepSolver:
         for key, matrix in modes():
             eigenvalues = self._mode_eigenvalues.get(key)
             if eigenvalues is None:
-                eigenvalues = np.linalg.eigvals(matrix)
+                eigenvalues = np.linalg.eigvals(matrix() if callable(matrix) else matrix)
                 self._mode_eigenvalues[key] = eigenvalues
                 self._mode_eigenvalues.move_to_end(key)
                 while len(self._mode_eigenvalues) > 64:
@@ -227,34 +223,23 @@ class FixedStepSolver:
     def _stiff(self, step: float) -> bool:
         if not callable(getattr(self.model, "linear_modes", None)):
             return False
-        revision = getattr(self.model, "equation_revision", 0)
         if self._dynamic_stability:
             return not self._explicit_stable(step)
+        revision = getattr(self.model, "equation_revision", 0)
         if revision != self._stability_revision:
             self._stability_revision = revision
-            mode_key = getattr(self.model, "linear_mode_key", lambda: None)()
-            self._stability_mode = mode_key
-            bounds = self._stability_modes.get(mode_key) if mode_key is not None else None
-            self._stable_step, self._unstable_step = bounds or (0.0, math.inf)
-            if bounds is not None:
-                self._stability_modes.move_to_end(mode_key)
-        if step <= self._stable_step:
-            return False
-        if step >= self._unstable_step:
-            return True
-        result = not self._explicit_stable(step)
-        if result:
-            self._unstable_step = min(self._unstable_step, step)
+            self._stability_mode = getattr(self.model, "linear_mode_key", lambda: None)()
+        key = self._stability_mode, step
+        stable = self._stability_results.get(key)
+        if stable is None:
+            stable = self._explicit_stable(step)
+            self._stability_results[key] = stable
+            self._stability_results.move_to_end(key)
+            while len(self._stability_results) > 64:
+                self._stability_results.popitem(last=False)
         else:
-            self._stable_step = max(self._stable_step, step)
-        if self._stability_mode is not None:
-            self._stability_modes[self._stability_mode] = (
-                self._stable_step, self._unstable_step
-            )
-            self._stability_modes.move_to_end(self._stability_mode)
-            while len(self._stability_modes) > 32:
-                self._stability_modes.popitem(last=False)
-        return result
+            self._stability_results.move_to_end(key)
+        return not stable
 
     def _implicit_advance(self, f: RHS, t0: float, t1: float,
                           y0: NDArray[np.float64], step: float) -> SolverStep:
@@ -495,7 +480,7 @@ def _rk4_float_program(size: int, observation: str):
 
 
 class AdaptiveSolver:
-    """SciPy ``solve_ivp`` behind the common signature, warm-started across intervals."""
+    """A SciPy adaptive stepper behind the common interface, warm-started across intervals."""
 
     def __init__(
         self,
@@ -507,9 +492,6 @@ class AdaptiveSolver:
         jac: Callable | None = None,
         *, model=None,
     ) -> None:
-        from scipy.integrate import solve_ivp  # Load SciPy only when this solver is selected.
-
-        self._solve_ivp = solve_ivp
         self.method = canonical_method(method, "adaptive")
         self.rtol, self.atol, self.max_step = rtol, atol, max_step
         self.warm_start = warm_start
@@ -518,8 +500,33 @@ class AdaptiveSolver:
 
             jac = ModeJacobian(getattr(model, "rhs", None), linear_system(model))
         self.jac = jac if self.method in IMPLICIT_ADAPTIVE_METHODS else None
+        self.model = model
+        self._modes_checked = self.method not in MULTISTEP_ADAPTIVE_METHODS
+        self.notes: list[str] = []
         self._h_last: float | None = None
         self.n_rhs = 0
+
+    def _check_modes(self) -> None:
+        """Report lightly damped circuit modes once for multistep integration."""
+        self._modes_checked = True
+        modes = getattr(self.model, "linear_modes", None)
+        if not callable(modes):
+            return
+        damping: list[float] = []
+        for _key, matrix in modes():
+            values = np.linalg.eigvals(matrix() if callable(matrix) else matrix)
+            oscillatory = values[np.abs(values.imag) > 0.0]
+            if oscillatory.size:
+                damping.append(float(np.min(-oscillatory.real / np.abs(oscillatory))))
+        if not damping or min(damping) >= 0.1:
+            return
+        note = (
+            f"{self.method} is integrating lightly damped circuit modes "
+            f"(minimum damping ratio {min(damping):.2g}); a one-step implicit method such as "
+            "radau or auto is usually better suited to frequent sampled boundaries"
+        )
+        self.notes.append(note)
+        warnings.warn(note, RuntimeWarning, stacklevel=4)
 
     def __call__(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64]) -> SolverStep:
         return self.advance(f, t0, t1, y0)
@@ -533,16 +540,48 @@ class AdaptiveSolver:
     def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
                 max_step: float = math.inf) -> SolverStep:
         """Integrate with an optional per-call maximum step without changing configuration."""
+        return self._advance(f, t0, t1, y0, max_step=max_step)
+
+    def advance_guarded(
+        self,
+        f: RHS,
+        t0: float,
+        t1: float,
+        y0: NDArray[np.float64],
+        guard: Callable[[float, NDArray[np.float64] | list[float]], float],
+        *,
+        max_step: float = math.inf,
+        synchronized_guard: Callable | None = None,
+    ) -> _GuardedStep:
+        """Stop after the first accepted step whose generic boundary guard is negative."""
+        return self._advance(f, t0, t1, y0, max_step=max_step, guard=guard)
+
+    def _advance(
+        self,
+        f: RHS,
+        t0: float,
+        t1: float,
+        y0: NDArray[np.float64],
+        *,
+        max_step: float,
+        guard: Callable[[float, NDArray[np.float64] | list[float]], float] | None = None,
+    ) -> SolverStep | _GuardedStep:
+        """Run one SciPy stepper; an optional observer sees every accepted step."""
         span = t1 - t0
         if span <= 0.0:
-            return SolverStep(t1, y0, 0)
+            if guard is None:
+                return SolverStep(t1, y0, self.n_rhs)
+            margin = float(guard(t1, y0))
+            return _GuardedStep(t1, y0, margin, t1, y0, margin, margin < 0.0, self.n_rhs)
+        if not self._modes_checked:
+            self._check_modes()
+        import scipy.integrate
+
         scipy_method = "Radau" if self.method == "radau" else self.method
-        kwargs = dict(method=scipy_method, rtol=self.rtol, atol=self.atol)
         step = min(self.max_step, max_step)
         if step <= 0.0:
             raise ValueError("max_step must be positive")
-        if math.isfinite(step):
-            kwargs["max_step"] = step
+        kwargs = dict(rtol=self.rtol, atol=self.atol, max_step=step)
         if self.warm_start and self._h_last is not None:
             kwargs["first_step"] = min(self._h_last, span, step)
         jac_rhs = getattr(self.jac, "n_rhs", 0)
@@ -551,16 +590,40 @@ class AdaptiveSolver:
             if bind is not None:
                 bind(f)
             kwargs["jac"] = self.jac
-        sol = self._solve_ivp(f, (t0, t1), y0, **kwargs)
-        if not sol.success:
-            raise RuntimeError(f"solve_ivp failed on [{t0}, {t1}]: {sol.message}")
-        steps = np.diff(sol.t)
-        if steps.size > 1:
-            self._h_last = float(steps[-2])
-        elif steps.size == 1:
-            self._h_last = max(self._h_last or 0.0, float(steps[0]))
-        self.n_rhs += int(sol.nfev) + getattr(self.jac, "n_rhs", 0) - jac_rhs
-        return SolverStep(t1, sol.y[:, -1].copy(), self.n_rhs)
+        stepper = getattr(scipy.integrate, scipy_method)(f, t0, np.asarray(y0, dtype=float), t1,
+                                                        **kwargs)
+        t, y, margin = t0, np.asarray(y0, dtype=float), None
+        sizes: list[float] = []
+        while stepper.status == "running":
+            message = stepper.step()
+            if stepper.status == "failed":
+                raise RuntimeError(
+                    f"{scipy_method} failed on [{t0}, {t1}] at t = {stepper.t}: {message}"
+                )
+            previous_t, previous_y, previous_margin = t, y, margin
+            t, y = float(stepper.t), np.array(stepper.y, dtype=float)
+            sizes.append(t - previous_t)
+            if guard is not None:
+                margin = float(guard(t, y))
+                if margin < 0.0:
+                    self._finish_stepper(stepper, jac_rhs, sizes)
+                    return _GuardedStep(
+                        t, y, margin, previous_t, previous_y, previous_margin, True, self.n_rhs
+                    )
+        self._finish_stepper(stepper, jac_rhs, sizes)
+        if guard is None:
+            return SolverStep(t1, y, self.n_rhs)
+        if margin is None:
+            margin = float(guard(t1, y))
+        return _GuardedStep(t1, y, margin, t1, y, margin, False, self.n_rhs)
+
+    def _finish_stepper(self, stepper: Any, jac_rhs: int, sizes: list[float]) -> None:
+        """Update warm-start and evaluation counters from the common stepping path."""
+        if len(sizes) > 1:
+            self._h_last = float(sizes[-2])
+        elif sizes:
+            self._h_last = max(self._h_last or 0.0, float(sizes[0]))
+        self.n_rhs += int(stepper.nfev) + getattr(self.jac, "n_rhs", 0) - jac_rhs
 
 
 class DormandPrince45:
@@ -638,6 +701,48 @@ class DormandPrince45:
             h = h_next
         self._h = h
         return SolverStep(t1, y, self.n_rhs)
+
+    def advance_guarded(
+        self,
+        f: RHS,
+        t0: float,
+        t1: float,
+        y0: NDArray[np.float64],
+        guard: Callable[[float, NDArray[np.float64] | list[float]], float],
+        *,
+        max_step: float = math.inf,
+        synchronized_guard: Callable | None = None,
+        step_callback: Callable | None = None,
+    ) -> _GuardedStep:
+        """Observe a generic guard after each accepted Dormand--Prince step."""
+        y0 = np.asarray(y0, dtype=float)
+        if t1 <= t0:
+            margin = float(guard(t1, y0))
+            return _GuardedStep(t1, y0, margin, t1, y0, margin, margin < 0.0, self.n_rhs)
+        seen_t, seen_y, seen_margin = t0, y0, None
+        crossed = None
+
+        def observe(h, y6, y1, k6, k7) -> bool:
+            nonlocal seen_t, seen_y, seen_margin, crossed
+            t = seen_t + h
+            y = np.asarray(y1, dtype=float)
+            margin = float(guard(t, y))
+            if margin < 0.0:
+                crossed = t, y, margin, seen_t, seen_y, seen_margin
+                return True
+            seen_t, seen_y, seen_margin = t, y, margin
+            return step_callback is not None and bool(step_callback(h, y6, y1, k6, k7))
+
+        result = self.advance(f, t0, t1, y0, max_step=max_step, step_callback=observe)
+        if crossed is not None:
+            t, y, margin, previous_t, previous_y, previous_margin = crossed
+            return _GuardedStep(
+                t, y, margin, previous_t, previous_y, previous_margin, True, self.n_rhs
+            )
+        margin = seen_margin if seen_margin is not None else float(guard(result.t, result.y))
+        return _GuardedStep(
+            result.t, result.y, margin, result.t, result.y, margin, False, self.n_rhs
+        )
 
     def _control(self, h: float, err: float, max_step: float) -> tuple[bool, float]:
         """Whether a step ``h`` with scaled error ``err`` is accepted, and the next step (PI control)."""
@@ -776,17 +881,39 @@ class AutoSolver:
     def __call__(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64]) -> SolverStep:
         return self.advance(f, t0, t1, y0)
 
-    def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
-                max_step: float = math.inf) -> SolverStep:
-        if t1 <= t0:
-            return SolverStep(t1, y0, self.n_rhs)
-        if not self.stiff:
-            result = self._dp.advance(f, t0, t1, y0, max_step=max_step,
-                                      step_callback=self._accepted_step)
-            if not self.stiff or result.t >= t1 - commutation_tolerance(t1):
-                return SolverStep(t1, result.y, self.n_rhs)
-            t0, y0 = result.t, result.y
-        result = self._implicit.advance(f, t0, t1, y0, max_step=max_step)
+    def advance_guarded(
+        self,
+        f: RHS,
+        t0: float,
+        t1: float,
+        y0: NDArray[np.float64],
+        guard: Callable[[float, NDArray[np.float64] | list[float]], float],
+        *,
+        max_step: float = math.inf,
+        synchronized_guard: Callable | None = None,
+    ) -> _GuardedStep:
+        """Observe the same guard while the automatic solver changes integrators."""
+        t, y = t0, np.asarray(y0, dtype=float)
+        while True:
+            if self.stiff:
+                result = self._implicit.advance_guarded(
+                    f, t, t1, y, guard, max_step=max_step,
+                    synchronized_guard=synchronized_guard,
+                )
+                self._maybe_leave_stiff()
+            else:
+                result = self._dp.advance_guarded(
+                    f, t, t1, y, guard, max_step=max_step,
+                    synchronized_guard=synchronized_guard,
+                    step_callback=self._accepted_step,
+                )
+            if result.crossed or result.t >= t1 - commutation_tolerance(t1):
+                result.n_rhs = self.n_rhs
+                return result
+            t, y = result.t, result.y
+
+    def _maybe_leave_stiff(self) -> None:
+        """Return to DP45 after Radau remains inside DP45's stability region."""
         h = self._implicit._h_last
         if h is not None and h * self._spectral_radius() <= 3.25:
             self._nonstiff_intervals += 1
@@ -799,6 +926,19 @@ class AutoSolver:
                 self._dp._err_prev = 1.0
         else:
             self._nonstiff_intervals = 0
+
+    def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
+                max_step: float = math.inf) -> SolverStep:
+        if t1 <= t0:
+            return SolverStep(t1, y0, self.n_rhs)
+        if not self.stiff:
+            result = self._dp.advance(f, t0, t1, y0, max_step=max_step,
+                                      step_callback=self._accepted_step)
+            if not self.stiff or result.t >= t1 - commutation_tolerance(t1):
+                return SolverStep(t1, result.y, self.n_rhs)
+            t0, y0 = result.t, result.y
+        result = self._implicit.advance(f, t0, t1, y0, max_step=max_step)
+        self._maybe_leave_stiff()
         return SolverStep(t1, result.y, self.n_rhs)
 
 

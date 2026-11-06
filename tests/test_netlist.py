@@ -165,7 +165,7 @@ def test_selected_netlist_outputs_match_the_full_equations(form):
 
 def test_grouped_nodal_selected_outputs_reuse_the_network_factorization():
     simulation = peslite.Simulation(peslite.load(
-        EXAMPLES / "wpt-ss-example.pes",
+        EXAMPLES / "two-converters-example.pes",
         **QUIET,
         **{"simulation.solver.circuit_model": "nodal"},
     ))
@@ -180,6 +180,94 @@ def test_grouped_nodal_selected_outputs_reuse_the_network_factorization():
         net.evaluate_outputs(0.0, states, selected), expected,
         rtol=1e-12, atol=1e-12,
     )
+
+
+def test_a_small_nodal_network_is_factorized_whole():
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "wpt-ss-example.pes",
+        **QUIET,
+        **{"simulation.solver.circuit_model": "nodal"},
+    ))
+    circuit, = simulation.system.circuits
+    circuit.receive()
+    topology = circuit.netlist.topology()
+
+    assert circuit.netlist._grouping_used()
+    assert topology.n_z <= nl._DENSE_GROUP
+    assert topology._layout is None
+
+
+def _numeric_input_reach(topology):
+    """Measure which source and ratio values affect derivatives and output rows."""
+    net, state_space = topology._store[0], topology.state_space
+    effects = []
+    for source, offset in net._sources:
+        columns = slice(offset, offset + net._branch(source).dim)
+        effects.append((
+            np.hstack((state_space.B[:, columns], state_space.B1[:, columns])),
+            np.hstack((state_space.D[:, columns], state_space.D1[:, columns])),
+        ))
+    rng = np.random.default_rng(7)
+    for index, ratio in enumerate(topology.mode.ratios):
+        ratios = list(topology.mode.ratios)
+        ratios[index] = np.asarray(ratio) + 0.1 + 0.05 * rng.standard_normal(np.shape(ratio))
+        other = topology.with_ratios(nl.Mode(
+            topology.mode.closed, topology.mode.conducting, ratios,
+        ))
+        matrix = other.M.toarray() if hasattr(other.M, "toarray") else np.asarray(other.M)
+        other.lu = nl._DenseSolve(matrix, "network")
+        changed = other.state_space
+        effects.append((
+            np.hstack((changed.A - state_space.A, changed.B - state_space.B,
+                       changed.B1 - state_space.B1)),
+            np.hstack((changed.C - state_space.C, changed.D - state_space.D,
+                       changed.D1 - state_space.D1)),
+        ))
+    scale = max(
+        np.abs(matrix).max(initial=0.0)
+        for matrix in (state_space.A, state_space.B, state_space.C, state_space.D)
+    )
+    threshold = 1e-9 * max(scale, 1.0)
+    return (
+        np.asarray([np.abs(rows).max(initial=0.0) > threshold
+                    for rows, _outputs in effects]),
+        np.asarray([np.abs(rows).max(axis=1, initial=0.0) > threshold
+                    for _derivatives, rows in effects]),
+    )
+
+
+@pytest.mark.full
+@pytest.mark.parametrize("form", FORMS)
+def test_large_numeric_stage_dependencies_follow_the_network_structure(
+        form, monkeypatch):
+    symbolic_calls = 0
+    original = nl._symbolic_solve
+
+    def counted(*args, **kwargs):
+        nonlocal symbolic_calls
+        symbolic_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(nl, "_symbolic_solve", counted)
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "cable-gfl-example.pes",
+        **QUIET,
+        **{
+            "elements.cable1.sections": 24,
+            "simulation.solver.circuit_model": form,
+        },
+    ))
+    assert symbolic_calls == 0
+    for circuit in simulation.system.circuits:
+        topology = circuit.netlist.topology()
+        assert topology.n_z > nl._DENSE_GROUP
+        structural = topology.input_reach()
+        assert structural is not None
+        derivatives, outputs = structural
+        numeric_derivatives, numeric_outputs = _numeric_input_reach(topology)
+        np.testing.assert_array_equal(derivatives, numeric_derivatives)
+        assert np.all(outputs | ~numeric_outputs)
+    assert not simulation.system.model.algebraic_loops
 
 
 def test_generated_equations_keep_only_statements_used_by_the_requested_values():
@@ -256,8 +344,21 @@ def test_dynamic_transformer_update_matches_a_directly_factorized_ratio(form):
     ratio = [0.2]
     dynamic = circuit(lambda: ratio[0])
     dynamic.state_space()
+    base = dynamic.topology()
+    selected = base.selected_outputs((0,))
     ratio[0] = 0.7
     updated = dynamic.state_space()
+    topology = dynamic.topology()
+    assert isinstance(topology.lu, nl._RatioUpdate)
+    assert topology.selected_outputs((0,)) is selected
+    right = np.arange(1.0, topology.n_z + 1.0)
+    np.testing.assert_allclose(
+        topology.M @ topology.lu.solve(right), right, rtol=1e-12, atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        topology.M.T @ topology.lu.solve_transpose(right), right,
+        rtol=1e-12, atol=1e-12,
+    )
     direct = circuit(((0.7,),)).state_space()
     for field in StateSpace.__dataclass_fields__:
         np.testing.assert_allclose(getattr(updated, field), getattr(direct, field),
@@ -359,7 +460,7 @@ def test_rk4_netlist_circuit_models_match_device_equations(example, tmp_path):
         np.testing.assert_array_equal(simulation.system.model.state_labels(),
                                       reference_sim.system.model.state_labels())
         actual = np.asarray(list(result.values()), dtype=float)
-        assert np.max(np.abs(actual - expected) / scale) < 1e-8
+        assert np.max(np.abs(actual - expected) / scale) < 1e-9
 
 
 def test_device_netlist_equations_are_inlined_into_the_model_program():
@@ -386,6 +487,17 @@ def test_numeric_circuit_stages_keep_the_declared_equation_dependencies(circuit_
     assert all(stage.method != "solve" for stage in circuit.output_stages)
     assert not simulation.system.model.algebraic_loops
     assert "_circuit_numeric_output" not in simulation.system.model.compiled_source
+
+
+@pytest.mark.parametrize("example", [
+    "buck-example", "boost-example", "buck-boost-example",
+])
+def test_continuously_varying_device_ratios_do_not_create_algebraic_loops(example):
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / f"{example}.pes", **QUIET,
+    ))
+
+    assert not simulation.system.model.algebraic_loops
 
 
 def _derivative_row(net, element):
@@ -417,6 +529,37 @@ def test_binary_mode_clusters_include_switches_and_diodes_from_connections():
     assert _owned_devices(structure, owners, _derivative_row(net, capacitor)) == [0, 1]
     assert _owned_devices(structure, owners, _derivative_row(net, inductors[0])) == [0]
     assert _owned_devices(structure, owners, _derivative_row(net, inductors[1])) == [1]
+
+
+def test_short_device_loop_owns_every_changed_equation_row():
+    net = Netlist("statewise")
+    bus, middle, source = Node(), Node(), Node()
+    net.add(
+        VoltageSource(source, None, lambda _t: 48.0),
+        Capacitor(bus, None, 1e-4, [0]),
+        Inductor(source, middle, 1e-3, [1]),
+        Diode(middle, bus),
+        Diode(None, middle),
+        Resistor(bus, None, 4.0),
+    )
+    structure = _ModeStructure(
+        net, (("conducting", 0), ("conducting", 1)),
+        nl.Mode((), (False, False), ()),
+    )
+    owners = structure.equation_owners(net)
+
+    def rows(conducting):
+        space = net._compiled(nl.Mode((), conducting, ())).state_space
+        return np.vstack((
+            np.hstack((space.A, space.B, space.B1)),
+            np.hstack((space.C, space.D, space.D1)),
+        ))
+
+    changed = np.flatnonzero(np.any(
+        rows((True, True)) != rows((False, False)), axis=1,
+    ))
+    assert structure.clusters == [[0, 1]]
+    assert all(owners[row] == [0] for row in changed)
 
 
 def test_singular_diode_recovery_preserves_the_gated_device():
@@ -491,6 +634,22 @@ def test_device_ratio_changes_do_not_factorize_an_unused_numeric_network(
     simulation.run(out_dir=tmp_path)
     steps = params.simulation.t_end / params.simulation.solver.dt
     assert count < 0.05 * steps
+
+
+@pytest.mark.parametrize("example", [
+    "gfl-example", "buck-example", "wpt-scc-example",
+])
+def test_device_stability_matrix_matches_the_current_netlist_mode(example):
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / f"{example}.pes", **QUIET,
+    ))
+    for circuit in simulation.system.circuits:
+        circuit.receive()
+        _key, build = circuit.linear_mode()
+        np.testing.assert_allclose(
+            build(), circuit.netlist.topology().state_space.A,
+            rtol=1e-10, atol=1e-9,
+        )
 
 
 @pytest.mark.full

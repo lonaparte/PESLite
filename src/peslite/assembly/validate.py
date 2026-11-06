@@ -521,7 +521,8 @@ def _solver(s) -> None:
             ratio, method = parse_step(value)
         except ValueError as exc:
             raise ConfigError(f"{where}: {exc}") from None
-        if ratio != 1.0 and s.method not in EXPLICIT_FIXED_METHODS:
+        if (ratio != 1.0 or (method is not None and method != s.method)) \
+                and s.method not in EXPLICIT_FIXED_METHODS:
             raise ConfigError(
                 f"{where}: a subsystem on its own step needs an explicit system method "
                 f"{EXPLICIT_FIXED_METHODS}, got {s.method!r}"

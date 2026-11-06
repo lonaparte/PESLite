@@ -273,7 +273,9 @@ Controllerless Units retain their electrical equations and independently clocked
 diode full bridges and switch-controlled capacitors participate through the ordinary
 `commutation_margin()`, `commutate(t)` and optional `next_commutation_time()` component methods.
 The native dispatcher shares scheduled boundaries, margin location, simultaneous transitions,
-state resets and the no-progress guard. Adaptive commutations require a finite `max_step`.
+state resets and the no-progress guard. Native adaptive commutations require a finite `max_step`;
+export rejects an unbounded configuration because the generated solver has no accepted-step
+observation interface.
 Component-owned state projections, discharge-energy columns and diagnostics are exported too.
 
 Custom electrical components are exported from the same declarative `network()` primitives used by

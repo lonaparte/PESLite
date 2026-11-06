@@ -119,6 +119,59 @@ def test_make_solver_builds_the_configured_integrator():
             make_solver(configured, model)
 
 
+@pytest.mark.full
+@pytest.mark.parametrize("method", ["radau", "trapezoidal"])
+def test_a_stiff_inner_group_can_use_an_implicit_method(method, tmp_path):
+    common = {
+        **QUIET,
+        "elements.cable1.sections": 8,
+        "elements.cable1.length_km": 5.0,
+        "simulation.t_end": 0.002,
+    }
+    reference = peslite.Simulation(peslite.load(
+        EXAMPLES / "cable-gfl-example.pes",
+        **common,
+        **{
+            "simulation.solver.type": "adaptive",
+            "simulation.solver.method": "radau",
+            "simulation.solver.rtol": 1e-10,
+            "simulation.solver.atol": 1e-10,
+        },
+    )).run(out_dir=tmp_path / "reference").final_states()
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "cable-gfl-example.pes",
+        **common,
+        **{"simulation.solver.subsystems": {
+            "cable1": {"step": 1, "method": method},
+        }},
+    ))
+    result = simulation.run(out_dir=tmp_path / "split")
+
+    assert isinstance(simulation.solver, MultirateSolver)
+    assert simulation.solver.inner_method == method
+    assert not result.tripped
+    assert result.summary["t_stop"] == pytest.approx(0.002)
+    actual = result.final_states()
+    assert max(
+        abs(actual[name] - value) / max(1.0, abs(value))
+        for name, value in reference.items()
+    ) < 3e-2
+
+
+def test_one_inner_group_uses_one_method():
+    params = peslite.load(EXAMPLES / "gfl-example.pes")
+    model = peslite.System(params).model
+    with pytest.raises(ValueError, match="share one method"):
+        MultirateSolver(
+            model,
+            {
+                "pcc": {"step": 1, "method": "radau"},
+                "vsc.branch_f": {"step": 1, "method": "trapezoidal"},
+            },
+            25e-6,
+        )
+
+
 def test_fixed_step_combination_uses_the_registered_tableau_weights(monkeypatch):
     monkeypatch.setitem(TABLEAUS, "midpoint", ((0.0, 0.5), ((0.5,),), (0.0, 1.0)))
     state = np.array([1.0])
@@ -306,3 +359,35 @@ def test_solver_kernel_does_not_import_application_layers():
                 if target:
                     imported.add(target[0])
         assert not imported.intersection(forbidden), f"{path.name} imports {sorted(imported & forbidden)}"
+
+
+def test_multistep_methods_report_lightly_damped_circuit_modes(tmp_path):
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "gfl-example.pes",
+        **QUIET,
+        **{
+            "simulation.t_end": 5e-4,
+            "simulation.solver.type": "adaptive",
+            "simulation.solver.method": "BDF",
+        },
+    ))
+    with pytest.warns(RuntimeWarning, match="lightly damped circuit modes"):
+        result = simulation.run(out_dir=tmp_path)
+    assert "lightly damped" in " ".join(result.summary["solver_notes"])
+
+
+@pytest.mark.full
+def test_device_equations_follow_commands_changed_at_a_commutation(tmp_path):
+    counts = {}
+    for circuit_model in ("device", "statewise"):
+        params = peslite.load(EXAMPLES / "wpt-scc-example.pes", **QUIET, **{
+            "simulation.solver.circuit_model": circuit_model,
+            "simulation.t_end": 1e-4,
+            "simulation.solver.subsystems": {},
+            "simulation.solver.type": "fixed",
+            "simulation.solver.method": "RK4",
+            "simulation.energy_check": "off",
+        })
+        result = peslite.Simulation(params).run(out_dir=tmp_path / circuit_model)
+        counts[circuit_model] = result.n_rhs
+    assert counts["device"] == counts["statewise"]

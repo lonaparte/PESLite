@@ -248,18 +248,9 @@ class _BridgeModel(NetworkComponent):
         three_phase = isinstance(topology.zero, complex)
         ac = nb.node(self.power_port)
         resistance = getattr(self, "resistance", 0.0)
-        unilateral = topology.unilateral
-        pole = (nb.internal(*((2, 1.5) if three_phase else (1, 1.0)))
-                if resistance or unilateral else ac)
-        terminal = nb.internal() if resistance and unilateral else pole
+        pole = nb.internal(*((2, 1.5) if three_phase else (1, 1.0))) if resistance else ac
         if resistance:
-            nb.add(nl.Resistor(pole, terminal if unilateral else ac, resistance))
-        if unilateral:
-            if three_phase:
-                raise TypeError("a unilateral averaged bridge requires a scalar power port")
-            start, end = ((ac, terminal) if topology.reverse_port
-                          else (terminal, ac))
-            nb.add(nl.Diode(start, end))
+            nb.add(nl.Resistor(pole, ac, resistance))
         lower = nb.node(self.lower_port) if self.lower_port is not None else None
         nb.add(nl.Transformer(
             pole, lower, nb.node(self.dc_port), lower, nb.value(self.input, "q")

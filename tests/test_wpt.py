@@ -119,6 +119,7 @@ def test_wpt_assembly_flattens_only_once_and_shares_one_link():
     link_view = subsystems["charger.link"]
     assert isinstance(link_view.component, CompensatedLink)
     assert not any(side.lcc for side in link_view.sides.values())
+    assert link_view.component.output_stages == ()
     assert "charger" not in simulation.units
     link = link_view.component
     for side, unit in (("primary", simulation.units["charger.primary"]),
