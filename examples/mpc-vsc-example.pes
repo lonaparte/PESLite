@@ -1,0 +1,41 @@
+# PESLite 0.5.0
+# Finite-control-set current regulation on a stiff three-phase grid.
+# References use peak-phase per-unit bases; predictor currents are SI amperes.
+base: {s_base: 10000.0, v_ll_rms: 400.0, f0: 50.0}
+buses:
+  pcc: {c_pu: 0.02, r_d_pu: 0.5}
+sources:
+  grid: {bus: pcc, x_pu: 0.02, r_pu: 0.002}
+units:
+  vsc:
+    type: vsc
+    bus: pcc
+    ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
+    dclink: {vdc_ref: 750.0, source: {type: voltage}}
+    # bridge: {model: pwm_averaging}
+    pwm: {f_sw: 20000.0}
+    ctrl:
+      type: mpc_vsc
+      period: 50.0e-6
+      computation: 1.0e-6
+      references: {id_ref_pu: 0.4}
+      options:
+        algorithm: fcs
+        # prediction_horizon: 3
+        control_horizon: 2
+        rate_weight: 0.02
+        current_min: -25.0
+        current_max: 25.0
+        max_evaluations: 64
+        # fallback: hold
+    protection:
+      overcurrent: {enable: true, limit_pu: 1.4}
+events:
+  current_step: {type: set, t: 0.01, set: {units.vsc.ctrl.references.id_ref_pu: 0.7}}
+simulation:
+  t_end: 0.025
+  solver: {dt: 2.5e-6, linearisations: 0}
+  output: {period: 50.0e-6, signals: 1}
+meta:
+  title: Finite-set three-phase current control
+  description: Binary bridge commands through the normal PWM registers with a two-move search and three-step prediction.

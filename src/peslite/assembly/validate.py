@@ -148,8 +148,9 @@ def _timing(c, pwm, where: str, continuous: bool = False) -> None:
 
 
 def _control(c, pwm, where: str, continuous: bool = False) -> None:
-    """Check typed control loops."""
-    if not c.loops:
+    """Check shared controller fields and the registered controller configuration."""
+    profile = control_type(c.type, f"{where}.type")
+    if profile.requires_loops and not c.loops:
         raise ConfigError(f"{where}.loops must contain at least one loop")
     T_c = None if continuous else _period(c, pwm)
     for name, cfg in c.loops.items():
@@ -176,9 +177,11 @@ def _control(c, pwm, where: str, continuous: bool = False) -> None:
             continue
         if not isinstance(name, str) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ConfigError(f"{where}.references: expected finite scalar references")
-    reference_validator = control_type(c.type, f"{where}.type").reference_validator
+    reference_validator = profile.reference_validator
     if reference_validator is not None:
         reference_validator(c.references, f"{where}.references")
+    if profile.validator is not None:
+        profile.validator(c, where)
 
 
 def _measurement(m, T_c: Optional[float], where: str,
@@ -258,6 +261,12 @@ def _converter(u, base, where: str):
     _dclink(u.dclink, f"{where}.dclink")
     continuous = u.ctrl is None or u.bridge.model == "averaging"
     if u.ctrl is not None:
+        profile = control_type(u.ctrl.type, f"{where}.ctrl.type")
+        if profile.supported_models is not None and u.bridge.model not in profile.supported_models:
+            raise ConfigError(
+                f"{where}.bridge.model: control type {u.ctrl.type!r} supports only "
+                f"{sorted(profile.supported_models)}, got {u.bridge.model!r}"
+            )
         dead_time_active = not continuous and not topology.unilateral
         _pwm(u.pwm, base, f"{where}.pwm", continuous,
              dead_time_active=dead_time_active)

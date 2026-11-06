@@ -431,17 +431,19 @@ class ControlParams:
 
     ``type`` selects the reference-field schema and default wiring. ``connections`` and ``outputs``
     override that wiring. A ``loops`` key names a registered loop class. The optional
-    ``ClassName[label]`` form distinguishes repeated uses of the same class.
+    ``ClassName[label]`` form distinguishes repeated uses of the same class. Standalone
+    control types may omit loops and declare a typed ``options`` section in their registry entry.
     """
 
     type: str
     period: Optional[float] = None  # s; default: one carrier period
     offset: Optional[float] = None  # s; default: the PWM load-clock offset
     computation: Optional[float] = None  # s; sampled default 1 us; ignored by continuous averaging
-    loops: dict[str, Any] = field(metadata={"entries": "loop"})
+    loops: dict[str, Any] = field(default_factory=dict, metadata={"entries": "loop"})
     connections: dict = field(default_factory=dict)
     outputs: dict = field(default_factory=dict)
     references: Any = None  # built from the schema selected by type
+    options: Optional[Any] = None  # built from the optional schema selected by type
 
 
 @dataclass(frozen=True)
@@ -623,7 +625,8 @@ class UnitParams:
             if not continuous and ctrl.computation is None:
                 ctrl = replace(ctrl, computation=1.0e-6)
                 derived.add("ctrl.computation")
-            if unit_type(self.type).defaults_grid_frequency and ctrl.references.omega is None:
+            if (unit_type(self.type).defaults_grid_frequency
+                    and hasattr(ctrl.references, "omega") and ctrl.references.omega is None):
                 references = replace(ctrl.references, omega=system_base.w0)
                 ctrl = replace(ctrl, references=references)
                 derived.add("ctrl.references.omega")
@@ -1176,7 +1179,7 @@ _TYPED = {
 
 def _build_control_params(data: Any, path: str, base: BaseValues,
                           scales: dict[str, float], unit_type: str) -> ControlParams:
-    """Build the single controller parameter type using its selected reference schema."""
+    """Build common controller parameters with registered reference and option schemas."""
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: expected a mapping, got {type(data).__name__}")
     kind = data.get("type")
@@ -1193,6 +1196,12 @@ def _build_control_params(data: Any, path: str, base: BaseValues,
         base,
         scales,
     )
+    if spec.options is not None:
+        values["options"] = _build(
+            spec.options, values.get("options", {}), f"{path}.options", base, scales,
+        )
+    elif values.get("options") is not None:
+        raise ConfigError(f"{path}.options: control type {kind!r} does not accept options")
     return _build(ControlParams, values, path, base, scales)
 
 
@@ -1495,6 +1504,7 @@ RUNTIME = (
     "sources.*.v", "sources.*.f", "sources.*.angle", "sources.*.l", "sources.*.r",
     "units.*.ctrl.references.*",
     "units.*.ctrl.loops.*.** (not type, period or declared structural fields)",
+    "units.*.ctrl.options.** (not declared structural fields)",
     "units.*.protection.**",
     "units.*.dclink.source.* (not type)",
     "elements.*.* (not type, bus or declared structural fields)",
@@ -1538,10 +1548,13 @@ def runtime_changeable(path: str, p: Params) -> bool:
             return True
         if keys[:2] == ["dclink", "source"]:
             return len(keys) == 3 and keys[2] != "type"
-        if keys[:2] != ["ctrl", "loops"] or len(keys) < 4:
-            return False
-        owner, keys = p.unit(name).ctrl.loops[keys[2]], keys[3:]
-        if len(keys) == 1 and keys[0] in ("type", "period"):
+        if keys[:2] == ["ctrl", "options"] and len(keys) >= 3:
+            owner, keys = p.unit(name).ctrl.options, keys[2:]
+        elif keys[:2] == ["ctrl", "loops"] and len(keys) >= 4:
+            owner, keys = p.unit(name).ctrl.loops[keys[2]], keys[3:]
+            if len(keys) == 1 and keys[0] in ("type", "period"):
+                return False
+        else:
             return False
     elif section == "elements":
         owner = p.elements.get(name)
@@ -1549,9 +1562,13 @@ def runtime_changeable(path: str, p: Params) -> bool:
             return False
     else:
         return False
-    # Type-specific loop and element fields are writable unless declared structural.
+    # Type-specific fields are writable unless they or a containing section are structural.
     for key in keys[:-1]:
-        owner = getattr(owner, key) if is_dataclass(owner) else None
+        field = owner.__dataclass_fields__.get(key) if is_dataclass(owner) else None
+        if (field is None or not field.metadata.get("runtime", True)
+                or field.metadata.get("structural", False)):
+            return False
+        owner = getattr(owner, key)
     field = owner.__dataclass_fields__.get(keys[-1]) if is_dataclass(owner) else None
     return (field is not None and field.metadata.get("runtime", True)
             and not field.metadata.get("structural", False))

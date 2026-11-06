@@ -24,6 +24,9 @@ from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, Cont
                          GraphController, Measurement,
                          Startup, VSCController, default_wiring,
                          make_controller)
+from .mpc import CCSMPC, FCSMPC, LinearModel, MPCResult, QuadraticProblem, SolverResult, solve_slsqp
+from .mpc_controller import MPCCurrentController, MPCCurrentReferences, MPCOptions
+from .profiles import register_control_type
 
 __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter",
            "complex_power", "unit_delay", "SignalType", "ConfigError",
@@ -39,4 +42,6 @@ __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter",
            "ControlGraph", "default_wiring",
            "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
            "BridgeControlOutput", "ConverterMeasurement", "Controller", "Startup", "VSCController", "GraphController",
-           "make_controller"]
+           "make_controller", "register_control_type", "LinearModel", "CCSMPC", "FCSMPC",
+           "MPCResult", "QuadraticProblem", "SolverResult", "solve_slsqp",
+           "MPCCurrentController", "MPCCurrentReferences", "MPCOptions"]
