@@ -575,12 +575,70 @@ def _explicit_stability(
         std::vector<Complex> eigenvalues;
         bool converged;
     }};
+    struct ExplicitStabilityBlock {{
+        std::vector<Complex> matrix;
+        std::vector<Complex> eigenvalues;
+        bool converged;
+    }};
+    struct ExplicitStabilityPattern {{
+        std::vector<unsigned char> nonzero;
+        std::vector<std::vector<std::size_t>> components;
+        bool decomposed;
+    }};
+    std::vector<ExplicitStabilityBlock> explicit_stability_blocks;
+    std::vector<ExplicitStabilityPattern> explicit_stability_patterns;
     {joined_members}
+
+    static std::vector<std::vector<std::size_t>> stability_components(
+            const std::vector<Complex>& matrix, std::size_t n) {{
+        const std::size_t missing = std::numeric_limits<std::size_t>::max();
+        std::vector<std::size_t> index(n, missing), low(n), stack;
+        std::vector<bool> active(n, false);
+        std::vector<std::vector<std::size_t>> components;
+        std::size_t next = 0;
+        std::function<void(std::size_t)> visit = [&](std::size_t node) {{
+            index[node] = low[node] = next++;
+            stack.push_back(node);
+            active[node] = true;
+            for (std::size_t dependency = 0; dependency < n; ++dependency) {{
+                if (matrix[node * n + dependency] == Complex{{}}) continue;
+                if (index[dependency] == missing) {{
+                    visit(dependency);
+                    low[node] = std::min(low[node], low[dependency]);
+                }} else if (active[dependency]) {{
+                    low[node] = std::min(low[node], index[dependency]);
+                }}
+            }}
+            if (low[node] != index[node]) return;
+            components.emplace_back();
+            while (true) {{
+                const std::size_t member = stack.back();
+                stack.pop_back();
+                active[member] = false;
+                components.back().push_back(member);
+                if (member == node) break;
+            }}
+        }};
+        for (std::size_t node = 0; node < n; ++node)
+            if (index[node] == missing) visit(node);
+        return components;
+    }}
 
     static bool explicit_eigenvalues(std::vector<Complex> matrix, std::size_t n,
                                      std::vector<Complex>& eigenvalues) {{
         eigenvalues.clear();
         eigenvalues.reserve(n);
+        if (n == 0) return true;
+        if (n == 1) {{ eigenvalues.push_back(matrix[0]); return true; }}
+        if (n == 2) {{
+            const Complex root = std::sqrt(
+                (matrix[0] - matrix[3]) * (matrix[0] - matrix[3])
+                + 4.0 * matrix[1] * matrix[2]
+            );
+            eigenvalues.push_back(0.5 * (matrix[0] + matrix[3] + root));
+            eigenvalues.push_back(0.5 * (matrix[0] + matrix[3] - root));
+            return true;
+        }}
         double scale = 0.0;
         for (const auto& value : matrix) scale = std::max(scale, std::abs(value));
         std::vector<Complex> vector(n), cosine(n), sine(n);
@@ -702,9 +760,59 @@ def _explicit_stability(
             if (modes.size() >= 64) modes.erase(modes.begin());
             modes.push_back({{implicit_epoch, key, {{}}, false}});
             found = modes.end() - 1;
-            found->converged = explicit_eigenvalues(
-                std::move(matrix), n, found->eigenvalues
+            std::vector<unsigned char> pattern(matrix.size());
+            std::transform(matrix.begin(), matrix.end(), pattern.begin(),
+                           [](Complex value) {{ return value != Complex{{}}; }});
+            auto structure = std::find_if(
+                explicit_stability_patterns.begin(), explicit_stability_patterns.end(),
+                [&](const auto& item) {{ return item.nonzero == pattern; }}
             );
+            if (structure == explicit_stability_patterns.end()) {{
+                if (explicit_stability_patterns.size() >= 64)
+                    explicit_stability_patterns.erase(explicit_stability_patterns.begin());
+                explicit_stability_patterns.push_back({{std::move(pattern), {{}}, false}});
+                found->converged = explicit_eigenvalues(
+                    std::move(matrix), n, found->eigenvalues
+                );
+                return explicit_mode_stable(*found, h);
+            }}
+            if (!structure->decomposed) {{
+                structure->components = stability_components(matrix, n);
+                structure->decomposed = true;
+            }}
+            if (structure->components.size() == 1
+                    && structure->components.front().size() == n) {{
+                found->converged = explicit_eigenvalues(
+                    std::move(matrix), n, found->eigenvalues
+                );
+                return explicit_mode_stable(*found, h);
+            }}
+            found->converged = true;
+            for (const auto& component : structure->components) {{
+                std::vector<Complex> block(component.size() * component.size());
+                for (std::size_t row = 0; row < component.size(); ++row)
+                    for (std::size_t column = 0; column < component.size(); ++column)
+                        block[row * component.size() + column]
+                            = matrix[component[row] * n + component[column]];
+                auto cached = std::find_if(
+                    explicit_stability_blocks.begin(), explicit_stability_blocks.end(),
+                    [&](const auto& item) {{
+                        return item.matrix == block;
+                    }}
+                );
+                if (cached == explicit_stability_blocks.end()) {{
+                    if (explicit_stability_blocks.size() >= 256)
+                        explicit_stability_blocks.erase(explicit_stability_blocks.begin());
+                    explicit_stability_blocks.push_back({{block, {{}}, false}});
+                    cached = explicit_stability_blocks.end() - 1;
+                    cached->converged = explicit_eigenvalues(
+                        std::move(block), component.size(), cached->eigenvalues
+                    );
+                }}
+                found->converged = found->converged && cached->converged;
+                found->eigenvalues.insert(found->eigenvalues.end(),
+                                          cached->eigenvalues.begin(), cached->eigenvalues.end());
+            }}
         }}
         return explicit_mode_stable(*found, h);
     }}
@@ -1498,7 +1606,10 @@ class _RuntimeParameter:
 class _RuntimeParameters:
     """Scalar parameters and unit commands selected through the shared export interface."""
 
-    def __init__(self, p: Any, requested: tuple[str, ...], *, exclude=()) -> None:
+    def __init__(self, p: Any, requested: tuple[str, ...], *, internal=(), exclude=()) -> None:
+        self.source = p
+        internal = tuple(internal)
+        self.internal = frozenset(internal)
         available = {path: _RuntimeParameter(path, "param_" + _identifier(path), value, derived)
                      for path, value, derived in parameter_leaves(p)}
         if requested:
@@ -1518,11 +1629,24 @@ class _RuntimeParameters:
                 f"parameter {unknown[0]!r} is not variable"
                 + (f"; available: {known}" if known else "")
             )
-        self.available = available
         self.selected = tuple(available[path] for path in selected if path not in exclude)
-        if len({item.member for item in self.selected}) != len(self.selected):
+        for path in internal:
+            value = self.at(p, path)
+            if path not in available and isinstance(value, bool):
+                available[path] = _RuntimeParameter(
+                    path, "param_" + _identifier(path), value
+                )
+        self.available = available
+        unknown_internal = [path for path in internal if path not in available]
+        if unknown_internal:
+            raise ValueError(f"event parameter {unknown_internal[0]!r} is not variable")
+        self.tracked = tuple(dict.fromkeys((
+            *self.selected,
+            *(available[path] for path in internal),
+        )))
+        if len({item.member for item in self.tracked}) != len(self.tracked):
             raise ValueError("exported parameter names collide after C++ identifier normalization")
-        self.by_path = {item.path: item for item in self.selected}
+        self.by_path = {item.path: item for item in self.tracked}
         self.guards = {}
         self.structural_guards = {}
         self.initializers = {}
@@ -1536,7 +1660,7 @@ class _RuntimeParameters:
         self.checking_layout = False
         self.base = getattr(p, "base", None)
         self.p = self.copy(p)
-        if self.selected:
+        if self.tracked:
             assignments, changes, before = {}, [], self.p
             for change in p.changes:
                 after = self.copy(change.params) if change.params is not None else before
@@ -1611,10 +1735,19 @@ class _RuntimeParameters:
         return [f"{_CPP_TYPES[kind]} {member} = {code};"
                 for (code, kind), member in self.initializers.items()]
 
+    def refresh_assignments(self, paths) -> list[str]:
+        """Refresh cached derived expressions affected by changed root parameters."""
+        changed = set(paths)
+        return [
+            f"{member} = {code};"
+            for (code, _kind), member in self.initializers.items()
+            if changed.intersection(self.parameter_dependencies((code,))[code] or ())
+        ]
+
     @cached_property
     def _parameter_members(self):
-        members = {item.member: item.path for item in self.selected}
-        members.update({"given_" + item.member: item.path for item in self.selected if item.derived})
+        members = {item.member: item.path for item in self.tracked}
+        members.update({"given_" + item.member: item.path for item in self.tracked if item.derived})
         return members
 
     def expression_symbols(self, code):
@@ -1843,7 +1976,7 @@ class _RuntimeParameters:
     def value(self, path: str, value: Any) -> str:
         item = self.by_path.get(path)
         if item is None:
-            return _number(value)
+            return _literal(value) if isinstance(value, bool) else _number(value)
         if isinstance(item.default, bool):
             return "parameters." + item.member
         stored = self.at(self.initial_p, path)
@@ -1852,10 +1985,12 @@ class _RuntimeParameters:
     def declarations(self) -> str:
         members = "\n    ".join(
             f"{'long long' if isinstance(item.default, int) else 'double'} "
-            f"{item.member} = {_number(item.default)};"
+            f"{item.member} = {_number(self.at(self.initial_p, item.path)
+                                      if isinstance(item.default, bool)
+                                      and item.path in self.internal else item.default)};"
             + (f"\n    bool given_{item.member} = false;"
                if item.derived or isinstance(item.default, bool) else "")
-            for item in self.selected
+            for item in self.tracked
         )
         return f"struct RuntimeParameters {{\n    {members}\n}};" if members else "struct RuntimeParameters {};"
 
@@ -1896,11 +2031,15 @@ class _RuntimeParameters:
 
     def resolved_template(self) -> tuple[str, list[tuple[str, str]]]:
         if not self.selected:
-            return dumps(self.p), []
+            return dumps(self.source), []
         replacements: list[tuple[str, str]] = []
+        public = {item.path for item in self.selected}
 
         def written(value):
             if isinstance(value, _InitializationExpression):
+                dependencies = self.parameter_dependencies((value.code,))[value.code] or ()
+                if public.isdisjoint(dependencies):
+                    return value.default
                 marker = f"__PESLITE_RUNTIME_PARAMETER_{len(replacements)}__"
                 replacements.append((marker, f"yaml_number({value.code})"))
                 return marker
@@ -1964,11 +2103,10 @@ class _ModelGenerator:
         }
         self.zoh_fields: dict[tuple[int, str], str] = {}
         self.zoh_initial: dict[str, Any] = {}
-        self.element_parameters: dict[str, tuple[str, Any, str]] = {}
-        self._parameter_attributes: dict[int, dict[str, _Expression]] = {}
         self._coefficient_plans = {}
         self._coefficient_topologies = {}
         self._dynamic_netlist_traces = {}
+        self.event_parameter_bindings: dict[str, tuple[bool, str | None]] = {}
         self._runtime_networks = {}
         self.equation_bindings = {}
         self.equation_members = {}
@@ -2008,17 +2146,6 @@ class _ModelGenerator:
                 runtime.object(getattr(owner, "equation_owner", owner)), "storage", ()
             )
         }
-        changed_paths = {path for change in self.p.changes for path in change.paths}
-        for name, element in self.system.named_elements.items():
-            for field, (subsystem, attribute) in getattr(
-                    element, "parameter_bindings", lambda: {})().items():
-                path = f"elements.{name}.{field}"
-                if path in changed_paths:
-                    member = "element_" + _identifier(name + "_" + field)
-                    self.element_parameters[path] = (member, subsystem, attribute)
-                    self._parameter_attributes.setdefault(id(subsystem), {})[attribute] = (
-                        _Expression(member, "real")
-                    )
         for label, targets in self.model._zoh_targets.items():
             member = f"hold_{_identifier(label)}"
             record, field = targets[0]
@@ -2472,8 +2599,7 @@ class _ModelGenerator:
                 setattr(target, name, scoped.__get__(target, type(target)))
         if bound is not None:
             bound.update(copies)
-        for name, value in {**self._parameter_attributes.get(id(owner), {}),
-                            **(attributes or {})}.items():
+        for name, value in (attributes or {}).items():
             setattr(clone, name, value)
         return clone
 
@@ -2850,6 +2976,10 @@ class _ModelGenerator:
         if wrapper is None:
             return _number(source.e_peak), "0.0"
         source_name = entry[0]
+        self.event_parameter_bindings.update(
+            (f"sources.{source_name}.{field}", (False, None))
+            for field in ("v", "f", "angle")
+        )
         scenario = _source_scenario(self.p, f"sources.{source_name}",
                                     lambda q: q.sources[source_name])
 
@@ -3125,10 +3255,6 @@ class _ModelGenerator:
                     nested(original, value)
                 else:
                     coefficients.append((owner, name, self.runtime.object(value)))
-            for name, expression in self._parameter_attributes.get(id(owner), {}).items():
-                coefficients.append((owner, name, _InitializationExpression.make(
-                    expression, getattr(owner, name), self.runtime
-                )))
 
         for owner in circuit.components:
             restored = []
@@ -3138,10 +3264,6 @@ class _ModelGenerator:
                           and not isinstance(getattr(clone, name), Port)
                           and not inspect.isroutine(getattr(clone, name))
                           and getattr(clone, name) is not getattr(owner, name)}
-            for name, expression in self._parameter_attributes.get(id(owner), {}).items():
-                attributes[name] = _InitializationExpression.make(
-                    expression, getattr(owner, name), self.runtime
-                )
             try:
                 for name, value in attributes.items():
                     restored.append((name, getattr(owner, name)))
@@ -4421,7 +4543,7 @@ class _ModelGenerator:
         straight = self._algebraic_plan(loop)
         if straight is not None:
             return [indent + line for line in straight]
-        if self.runtime.selected:
+        if self.runtime.tracked:
             coefficients = {}
             token = _ZERO_COEFFICIENTS.set(coefficients)
             try:
@@ -4493,7 +4615,7 @@ class _ModelGenerator:
                 coefficients.update(required_zeroes)
             return plan
         self._algebraic_plans[key] = None, {}
-        diagnose = bool(self.runtime.selected) and coefficients is None
+        diagnose = bool(self.runtime.tracked) and coefficients is None
         plan = self._assignment_plan(loop, diagnose)
         self._algebraic_plans[key] = plan, dict(coefficients or {})
         return plan
@@ -4865,9 +4987,6 @@ class _ModelGenerator:
                           f"{_literal(0.0 if inverse is None else inverse)};",
                           f"bool algebraic_has_inverse_{index} = "
                           f"{'false' if inverse is None else 'true'};"]
-        for member, subsystem, attribute in self.element_parameters.values():
-            lines.append(f"double {member} = "
-                         f"{_number(getattr(self.runtime.object(subsystem), attribute))};")
         for label, targets in self.model._zoh_targets.items():
             record, field = targets[0]
             value = self.zoh_initial[label]
@@ -5699,6 +5818,14 @@ class _ControlGenerator:
         path = f"units.{self.name}.ctrl.references.{name}"
         return self.model.runtime.value(path, getattr(self.cfg.ctrl.references, name))
 
+    def event_parameter_bindings(self) -> dict[str, tuple[bool, str | None]]:
+        """Bind event parameters to their ordinary store and persistent controller state."""
+        prefix = f"units.{self.name}.ctrl.references."
+        return {
+            prefix + name: (True, self._reference(name))
+            for name in self._changing_references
+        }
+
     def reference_members(self) -> list[str]:
         """Only event-modified references need storage, updated at the actual event boundary.
 
@@ -6213,7 +6340,7 @@ class _ControlGenerator:
                    *(f"{self.m('adc_rms_' + channel)}.last = {_number(window.last)};"
                      for channel, window in adc.rms.items())]
                   if adc.accumulating and restored else [])
-        if ((not self.model.runtime.selected and not adc.independent)
+        if ((not self.model.runtime.tracked and not adc.independent)
                 or self.continuous and not adc.clocked
                 or not (adc.accumulating or adc.independent or adc.samples > 1)):
             return anchor
@@ -6823,8 +6950,10 @@ class _ProtectionGenerator:
         period = self.protection.T
         has_frequency = self._observes_rocof()
 
-        def enabled(item: Any) -> str:
-            return "true" if item.enable else "false"
+        def enabled(name: str, item: Any) -> str:
+            return self.model.runtime.value(
+                f"units.{self.name}.protection.{name}.enable", item.enable
+            )
 
         def limit(item: Any, field: str) -> str:
             value = getattr(item, field)
@@ -6835,8 +6964,10 @@ class _ProtectionGenerator:
 
         def timed(item: Any, condition: str, name: str, alarm: str, timer: str,
                   cause: str) -> list[str]:
-            if not item.enable:
+            active = enabled(name, item)
+            if active == "false":
                 return []
+            condition = f"({active}) && ({condition})"
             return [
                 f"if ({condition}) {{",
                 f"    if (!std::isfinite({first(name)})) {first(name)} = t;",
@@ -6864,7 +6995,7 @@ class _ProtectionGenerator:
                 "        if (had_old) {",
                 f"            const double rocof = (freq_dev - old) / {_number(self.protection._rocof_window)};",
                 f"            {self.m('rocof_max')} = std::max({self.m('rocof_max')}, std::abs(rocof));",
-                f"            if ({enabled(cfg.rocof)} && std::abs(rocof) >= {limit(cfg.rocof, 'limit')} && startup_complete) {{",
+                f"            if ({enabled('rocof', cfg.rocof)} && std::abs(rocof) >= {limit(cfg.rocof, 'limit')} && startup_complete) {{",
                 f"                if (!std::isfinite({first('rocof')})) {first('rocof')} = t;",
                 f"                alarm_{self.tag}(\"ROCOF\");",
                 "            }",
@@ -6872,7 +7003,7 @@ class _ProtectionGenerator:
                 "    }",
             ]
         sampled.append(f"    if ({self.m('tripped')} || !startup_complete) return false;")
-        if cfg.rms_current.enable:
+        if enabled("rms_current", cfg.rms_current) != "false":
             channel = unit_type(self.cfg.type).current_channel
             rms = f"({self._rms_value(channel)} / {_number(self.protection.i_base)})"
             sampled += ["    " + line for line in timed(
@@ -6930,7 +7061,7 @@ class _ProtectionGenerator:
             fast += [
                 f"    const double peak = peak_current / {_number(self.protection.i_base)};",
                 f"    if (std::isfinite(peak)) {self.m('max_current')} = std::max({self.m('max_current')}, peak);",
-                f"    if ({self.m('tripped')} || !{enabled(cfg.overcurrent)} || !(peak > {limit(cfg.overcurrent, 'limit_pu')})) return false;",
+                f"    if ({self.m('tripped')} || !{enabled('overcurrent', cfg.overcurrent)} || !(peak > {limit(cfg.overcurrent, 'limit_pu')})) return false;",
                 f"    if (!std::isfinite({first('overcurrent')})) {first('overcurrent')} = t;",
                 f"    alarm_{self.tag}(\"OVERCURRENT\");",
                 f"    latch_{self.tag}(t, \"overcurrent\", true);",
@@ -7505,8 +7636,16 @@ class _CppGenerator:
             for label, targets in self.model._zoh_targets.items()
         }
         self.name = name
-        self.runtime = _RuntimeParameters(self.p, variables, exclude=exclude)
-        if self.runtime.selected:
+        internal = tuple(dict.fromkeys(
+            path
+            for change in self.p.changes
+            for path in change.values
+            if path not in change.connections
+        ))
+        self.runtime = _RuntimeParameters(
+            self.p, variables, internal=internal, exclude=exclude
+        )
+        if self.runtime.tracked:
             from .validate import validate
 
             restored = simulation._initial_values(simulation.p.simulation.initial.t)
@@ -7534,7 +7673,7 @@ class _CppGenerator:
 
     def _initial_values(self, model):
         """Resolve the ordinary initial-state contract against parameterized source values."""
-        if not self.runtime.selected:
+        if not self.runtime.tracked:
             return self.simulation._initial_values(self.p.simulation.initial.t)
         system = copy.copy(self.system)
         system.units = {}
@@ -7620,10 +7759,16 @@ class _CppGenerator:
 
     def _actions(self, model: _ModelGenerator,
                  generators: dict[str, _ControlGenerator]) -> tuple[list[float], str]:
-        """Remaining file events, specialised to direct member assignments."""
+        """Lower checked file events through the shared runtime-parameter bindings."""
         t0 = self.p.simulation.initial.t
         actions = [action for action in self.simulation._actions() if action[0] > t0 + TIME_EPS]
         changes = {change.event: change for change in self.p.changes}
+        consumers = dict(model.event_parameter_bindings)
+        consumers.update({
+            path: binding
+            for generator in generators.values()
+            for path, binding in generator.event_parameter_bindings().items()
+        })
         cases: list[str] = []
         for index, (_at, _order, action) in enumerate(actions):
             action = changes[action.event]
@@ -7658,22 +7803,26 @@ class _CppGenerator:
                         for branch in breakers
                         for line in model.breaker_lines(branch, "false" if on else "true")
                     ]
-            for path in action.paths:
+            changed: list[str] = []
+            for path, value in action.values.items():
                 if path in action.connections:
                     continue
-                if path in model.element_parameters:
-                    member, _, _ = model.element_parameters[path]
-                    _, element, field = path.split(".")
-                    value = getattr(action.params.elements[element], field)
-                    lines.append(f"{member} = {_number(value)};")
-                    continue
-                owner, separator, reference = path.removeprefix("units.").partition(".ctrl.references.")
-                if separator and path.startswith("units."):
-                    generator = generators[owner]
-                    value = getattr(action.params.unit(owner).ctrl.references, reference)
-                    lines.append(f"{generator._reference(reference)} = {_literal(value)};")
-                elif not (path.startswith("sources.") and path.rsplit(".", 1)[-1] in {"v", "f", "angle"}):
-                    raise TypeError(f"C++ export: event {action.event!r} writes unsupported variable {path!r}")
+                item = self.runtime.by_path.get(path)
+                if item is None:
+                    raise TypeError(
+                        f"C++ export: event {action.event!r} writes unsupported variable {path!r}"
+                    )
+                write_parameter, member = consumers.get(path, (True, None))
+                if write_parameter:
+                    lines.append(f"parameters.{item.member} = {_literal(value)};")
+                    if item.derived or isinstance(item.default, bool):
+                        lines.append(f"parameters.given_{item.member} = true;")
+                    changed.append(path)
+                if member is not None:
+                    lines.append(f"{member} = {_literal(value)};")
+            lines.extend(self.runtime.refresh_assignments(changed))
+            if changed and self.runtime.guards:
+                lines.append("validate_parameters();")
             cases += [f"        case {index}:", *["            " + line for line in lines],
                       "            break;"]
         times = [item[0] for item in actions]
@@ -7908,7 +8057,6 @@ class _CppGenerator:
                              else _make_unit_generator(name, unit, model))
                       for name, unit in self.system.units.items() if unit.continuous}
         generators = {**sampled, **continuous}
-        action_times, action_cases = self._actions(model, generators)
         for sub in self.model.subsystems:
             if id(sub) in model.equation_bindings and id(sub) not in model.equation_references:
                 model.equation_references[id(sub)] = model._equation_clone(sub)
@@ -8162,7 +8310,6 @@ class _CppGenerator:
             # Share one model body; each instantiation retains only its required stores.
             sync_update = ("if constexpr (seed_adc) {\n" + "\n".join(adc_seed)
                            + "\n} else {\n" + observations + "\n}")
-        times = ", ".join(_number(value) for value in action_times)
         snapshot_values = "\n            ".join(f"states << ',' << ({value});" for value in state_values)
         output = self.p.simulation.output
         output_precision = self.runtime.value("simulation.output.precision", output.precision)
@@ -8445,6 +8592,8 @@ class _CppGenerator:
     double adaptive_error = {_number(self.simulation.solver._err_prev)};''' if not fixed else "")
         # The execution backend is deliberately emitted as one TU: whole-program optimisation can
         # inline the configured RHS and remove unused output paths without crossing a library ABI.
+        action_times, action_cases = self._actions(model, generators)
+        times = ", ".join(_number(value) for value in action_times)
         return f'''// Generated by PESLite.  Do not edit: regenerate from the source simulation file.
 // Standalone C++17; no Python, NumPy, SciPy or YAML dependency at run time.
 #include <algorithm>
@@ -8458,6 +8607,7 @@ class _CppGenerator:
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -8651,6 +8801,7 @@ constexpr std::array<std::string_view, {len(public_names)}> state_names{{
 
 class Simulator {{
 public:
+    RuntimeParameters configured_parameters;
     RuntimeParameters parameters;
     double event_time = {_number(self.p.simulation.initial.t)};
     {chr(10).join('    ' + line for line in self.runtime.initialization_members())}
@@ -8659,8 +8810,13 @@ public:
     {adaptive_members}
     {members}
 
-    explicit Simulator(RuntimeParameters configured = {{}}) : parameters(std::move(configured)) {{
+    void validate_parameters() const {{
         {self.runtime.validation()}
+    }}
+
+    explicit Simulator(RuntimeParameters configured = {{}})
+            : configured_parameters(configured), parameters(std::move(configured)) {{
+        validate_parameters();
         {' '.join(discrete_initialization)}
         {chr(10).join(connection_initialization)}
         {'reconcile_circuits<false>(' + _number(self.p.simulation.initial.t) + ');' if boundary_method else ''}
@@ -8814,7 +8970,7 @@ public:
         {energy_summary}
         summary << "\\n}}\\n";
         std::ofstream resolved(out / "simulation.pes");
-        resolved << resolved_parameters(parameters);
+        resolved << resolved_parameters(configured_parameters);
         return 0;
     }}
 }};
@@ -8884,12 +9040,19 @@ def _prepare_export(simulation, variables, reusable, *, params=None):
         raise TypeError(
             "C++ export cannot safely reconstruct supplied instances; use parts factories instead"
         )
+    p = simulation.p if params is None else params
+    event_parameters = {
+        path
+        for change in p.changes
+        for path in change.values
+        if path not in change.connections
+    }
+    parameterized = bool(variables or event_parameters)
     initializations = []
     recorder = lambda part, factory, parameters: initializations.append((part, factory, parameters))
-    token = _PARAMETER_RECORDER.set(recorder if variables else None)
+    token = _PARAMETER_RECORDER.set(recorder if parameterized else None)
     try:
-        p = simulation.p if params is None else params
-        prepared = (simulation if reusable and not variables and p is simulation.p else
+        prepared = (simulation if reusable and not parameterized and p is simulation.p else
                     Simulation(p, parts=simulation._factories))
     finally:
         _PARAMETER_RECORDER.reset(token)

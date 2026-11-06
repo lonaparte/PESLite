@@ -57,6 +57,8 @@ outputs and event responses are insensitive to further reduction.
 Before a fixed explicit step, Python and generated C++ check each present circuit matrix against
 that method's stability region. The check uses the exact switch, diode and transformer-ratio mode;
 an unstable mode uses fixed Radau for that interval without changing the configured step grid.
+Repeated matrix structures are decomposed into strongly connected state blocks, and unchanged
+block spectra are reused without approximating the stability decision.
 
 ## Adaptive solvers
 

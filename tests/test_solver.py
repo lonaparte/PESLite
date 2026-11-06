@@ -1,6 +1,7 @@
 """The solver kernel and its integration with the existing assembly layer."""
 
 import ast
+import cmath
 from pathlib import Path
 
 import numpy as np
@@ -87,6 +88,49 @@ def test_continuous_linear_modes_recheck_explicit_stability():
     model.mode = 1
     solver(lambda _t, y: -y, 1e-5, 2e-5, state)
     assert model.builds == 2
+
+
+def test_stability_reuses_unchanged_strongly_connected_blocks(monkeypatch):
+    first = np.array([
+        [-2.0, 1.0, 0.0, 0.0],
+        [-1.0, -2.0, 0.0, 0.0],
+        [0.0, 0.0, -4.0, 2.0],
+        [0.0, 0.0, -2.0, -4.0],
+    ])
+    second = first.copy()
+    second[:2, :2] *= 1.5
+    calls = []
+    roots = []
+    eigvals = np.linalg.eigvals
+    sqrt = cmath.sqrt
+
+    def counted(matrix):
+        calls.append(matrix.copy())
+        return eigvals(matrix)
+
+    def counted_sqrt(value):
+        roots.append(value)
+        return sqrt(value)
+
+    monkeypatch.setattr(np.linalg, "eigvals", counted)
+    monkeypatch.setattr(cmath, "sqrt", counted_sqrt)
+    solver = FixedStepSolver(1e-5)
+    expected_first = eigvals(first)
+    expected_second = eigvals(second)
+    calls.clear()
+
+    actual_first = solver._eigenvalues(first)
+    assert tuple(solver._block_components.values()) == (None,)
+    solver._eigenvalues(first)
+    actual_second = solver._eigenvalues(second)
+    solver.parameters_changed()
+    solver._eigenvalues(second)
+
+    np.testing.assert_allclose(np.sort_complex(actual_first), np.sort_complex(expected_first))
+    np.testing.assert_allclose(np.sort_complex(actual_second), np.sort_complex(expected_second))
+    assert len(calls) == 1
+    assert len(roots) == 3
+    assert len(solver._block_eigenvalues) == 3
 
 
 @pytest.mark.parametrize("method", ["euler", "heun", "RK4"])

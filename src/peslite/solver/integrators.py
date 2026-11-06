@@ -9,6 +9,7 @@ interval is recomputed on arrays.
 
 from __future__ import annotations
 
+import cmath
 import functools
 import linecache
 import math
@@ -20,7 +21,7 @@ from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
-from .model import commutation_tolerance
+from .model import _component_plan, commutation_tolerance
 from .netlist import FORMS as CIRCUIT_MODELS
 
 __all__ = ["RHS", "SolverStep", "Solver", "FIXED_METHODS", "ADAPTIVE_METHODS", "EXPLICIT_FIXED_METHODS",
@@ -208,6 +209,10 @@ class FixedStepSolver:
         self._implicit = None
         self._stability_results: OrderedDict[tuple[object, float], bool] = OrderedDict()
         self._mode_eigenvalues: OrderedDict[object, NDArray[np.complex128]] = OrderedDict()
+        self._block_components: OrderedDict[
+            tuple, tuple[tuple[int, ...], ...] | None
+        ] = OrderedDict()
+        self._block_eigenvalues: OrderedDict[tuple, NDArray[np.complex128]] = OrderedDict()
         self.n_rhs = 0
 
     def parameters_changed(self) -> None:
@@ -217,13 +222,67 @@ class FixedStepSolver:
         if self._implicit is not None:
             self._implicit.parameters_changed()
 
+    def _eigenvalues(self, matrix: NDArray[np.float64]) -> NDArray[np.complex128]:
+        """Return exact eigenvalues while reusing unchanged diagonal SCC blocks."""
+        matrix = np.asarray(matrix)
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+            raise ValueError("a linear mode must be a square matrix")
+        pattern = matrix != 0.0
+        pattern_key = matrix.shape, np.packbits(pattern).tobytes()
+        if pattern_key not in self._block_components:
+            self._block_components[pattern_key] = None
+            self._block_components.move_to_end(pattern_key)
+            while len(self._block_components) > 64:
+                self._block_components.popitem(last=False)
+            return np.linalg.eigvals(matrix)
+        components = self._block_components[pattern_key]
+        if components is None:
+            dependencies = tuple(
+                tuple(map(int, np.flatnonzero(pattern[row])))
+                for row in range(matrix.shape[0])
+            )
+            components = _component_plan(dependencies)
+            self._block_components[pattern_key] = components
+            self._block_components.move_to_end(pattern_key)
+            while len(self._block_components) > 64:
+                self._block_components.popitem(last=False)
+        else:
+            self._block_components.move_to_end(pattern_key)
+        if len(components) == 1 and len(components[0]) == matrix.shape[0]:
+            return np.linalg.eigvals(matrix)
+        values = []
+        for component in components:
+            selected = np.asarray(component, dtype=np.intp)
+            block = np.ascontiguousarray(matrix[np.ix_(selected, selected)])
+            if block.shape == (1, 1):
+                values.append(np.asarray((complex(block[0, 0]),)))
+                continue
+            key = block.shape, block.dtype.str, block.tobytes()
+            eigenvalues = self._block_eigenvalues.get(key)
+            if eigenvalues is None:
+                if block.shape == (2, 2):
+                    a, b, c, d = map(float, block.ravel())
+                    root = cmath.sqrt((a - d) ** 2 + 4.0 * b * c)
+                    eigenvalues = np.asarray(((a + d + root) / 2.0,
+                                              (a + d - root) / 2.0))
+                else:
+                    eigenvalues = np.linalg.eigvals(block)
+                self._block_eigenvalues[key] = eigenvalues
+                self._block_eigenvalues.move_to_end(key)
+                while len(self._block_eigenvalues) > 256:
+                    self._block_eigenvalues.popitem(last=False)
+            else:
+                self._block_eigenvalues.move_to_end(key)
+            values.append(eigenvalues)
+        return np.concatenate(values) if values else np.empty(0, dtype=complex)
+
     def _explicit_stable(self, step: float, modes: Sequence[tuple]) -> bool:
         """Check assembled linear modes against this Runge-Kutta stability region."""
         _c, rows, weights = TABLEAUS[self.method]
         for key, build in modes:
             eigenvalues = self._mode_eigenvalues.get(key)
             if eigenvalues is None:
-                eigenvalues = np.linalg.eigvals(build())
+                eigenvalues = self._eigenvalues(build())
                 self._mode_eigenvalues[key] = eigenvalues
                 self._mode_eigenvalues.move_to_end(key)
                 while len(self._mode_eigenvalues) > 64:
