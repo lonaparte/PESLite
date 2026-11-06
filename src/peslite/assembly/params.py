@@ -652,7 +652,7 @@ class UnitParams:
         return self.base.dc(self.dclink.vdc_ref)
 
 
-def _unit_items(units: Mapping[str, UnitParams], *, leaves_only: bool = True,
+def _unit_items(units: _Mapping[str, UnitParams], *, leaves_only: bool = True,
                 prefix: str = ""):
     """Iterate the configured unit tree without storing a second flattened mapping."""
     for name, unit in units.items():
@@ -665,7 +665,7 @@ def _unit_items(units: Mapping[str, UnitParams], *, leaves_only: bool = True,
             yield from _unit_items(children, leaves_only=leaves_only, prefix=path)
 
 
-def _unit_at(units: Mapping[str, UnitParams], path: str) -> Optional[UnitParams]:
+def _unit_at(units: _Mapping[str, UnitParams], path: str) -> Optional[UnitParams]:
     """Return one node from the configured unit tree, or ``None`` when absent."""
     parts = path.split(".")
     unit = units.get(parts[0]) if parts and parts[0] else None
@@ -676,7 +676,7 @@ def _unit_at(units: Mapping[str, UnitParams], path: str) -> Optional[UnitParams]
     return unit
 
 
-def _unit_path(units: Mapping[str, UnitParams], value: str) -> Optional[str]:
+def _unit_path(units: _Mapping[str, UnitParams], value: str) -> Optional[str]:
     """Return the longest configured unit path which prefixes ``value``."""
     return next(
         (name for name, _unit in sorted(
@@ -693,7 +693,7 @@ def _split_path(p: Params, path: str) -> tuple[str, str, str]:
     return section, name, rest[len(name) + 1:]
 
 
-def _unit_leaves(units: Mapping[str, UnitParams], path: str) -> tuple[str, ...]:
+def _unit_leaves(units: _Mapping[str, UnitParams], path: str) -> tuple[str, ...]:
     """Return leaf paths below ``path`` directly from the authoritative unit tree."""
     unit = _unit_at(units, path)
     if unit is None:

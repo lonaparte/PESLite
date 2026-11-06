@@ -201,6 +201,7 @@ def _numeric_input_reach(topology):
     """Measure which source and ratio values affect derivatives and output rows."""
     net, state_space = topology._store[0], topology.state_space
     effects = []
+    state_ratios = []
     for source, offset in net._sources:
         columns = slice(offset, offset + net._branch(source).dim)
         effects.append((
@@ -223,6 +224,7 @@ def _numeric_input_reach(topology):
             np.hstack((changed.C - state_space.C, changed.D - state_space.D,
                        changed.D1 - state_space.D1)),
         ))
+        state_ratios.append(np.abs(changed.A - state_space.A).max(initial=0.0))
     scale = max(
         np.abs(matrix).max(initial=0.0)
         for matrix in (state_space.A, state_space.B, state_space.C, state_space.D)
@@ -233,6 +235,7 @@ def _numeric_input_reach(topology):
                     for rows, _outputs in effects]),
         np.asarray([np.abs(rows).max(axis=1, initial=0.0) > threshold
                     for _derivatives, rows in effects]),
+        np.asarray(state_ratios) > threshold,
     )
 
 
@@ -263,10 +266,11 @@ def test_large_numeric_stage_dependencies_follow_the_network_structure(
         assert topology.n_z > nl._DENSE_GROUP
         structural = topology.input_reach()
         assert structural is not None
-        derivatives, outputs = structural
-        numeric_derivatives, numeric_outputs = _numeric_input_reach(topology)
+        derivatives, outputs, state_ratios = structural
+        numeric_derivatives, numeric_outputs, numeric_state_ratios = _numeric_input_reach(topology)
         np.testing.assert_array_equal(derivatives, numeric_derivatives)
         assert np.all(outputs | ~numeric_outputs)
+        assert np.all(state_ratios | ~numeric_state_ratios)
     assert not simulation.system.model.algebraic_loops
 
 
@@ -434,29 +438,44 @@ def test_circuit_freezes_only_when_its_runtime_has_not_bound_the_topology(
     circuit.release_topology()
 
 
-def _final(example: str, circuit_model: str, out_dir: Path) -> tuple[peslite.Simulation, dict]:
-    changes = ({"events.connect_vsc.t": 0.0, "events.connect_vsc.ramp": 5e-3}
-               if example == "gfl-example" else {})
+def _final(example: str, changes: dict, circuit_model: str,
+           out_dir: Path) -> tuple[peslite.Simulation, dict]:
     params = peslite.load(
         EXAMPLES / f"{example}.pes",
         **QUIET,
-        **{"simulation.t_end": 2e-4,
-           "simulation.solver.circuit_model": circuit_model,
-           **changes},
+        **{"simulation.t_end": 2e-4, "simulation.solver.circuit_model": circuit_model},
     )
+    # Every converter connects at once, so the short run exercises its circuit.
+    params = params.replace(**{
+        f"events.{name}.{key}": value for name, event in params.events.items()
+        if event.type == "connect" for key, value in (("t", 0.0), ("ramp", 5e-3))
+    }, **changes)
     simulation = peslite.Simulation(params)
     return simulation, simulation.run(out_dir=out_dir).final_states()
 
 
-@pytest.mark.parametrize("example", [
-    "gfl-example", "buck-open-loop-example", "boost-example", "buck-boost-example", "wpt-example",
-])
-def test_rk4_netlist_circuit_models_match_device_equations(example, tmp_path):
-    reference_sim, reference = _final(example, "device", tmp_path / example / "device")
+_SWITCHING = {"simulation.t_end": 1e-3, "simulation.solver.subsystems": {}}
+
+
+@pytest.mark.parametrize("example, changes", [
+    ("gfl-example", {}), ("buck-open-loop-example", {}), ("boost-example", {}),
+    ("buck-boost-example", {}), ("wpt-example", {}), ("wpt-scc-example", {}),
+    ("cable-gfl-example", {}), ("two-converters-example", {}), ("gfm-vsg-example", {}),
+    ("boost-example", {**_SWITCHING, "units.converter.bridge.model": "switching"}),
+    ("buck-example", {**_SWITCHING, "simulation.t_end": 2e-3, "elements.load.r": 200.0,
+                      "units.converter.bridge.model": "switching"}),
+    ("gfl-example", {**_SWITCHING, "units.vsc.bridge.model": "switching"}),
+    ("two-converters-example", {**_SWITCHING, "simulation.t_end": 5e-4,
+                                "units.vsc_1.bridge.model": "switching",
+                                "units.vsc_2.bridge.model": "switching"}),
+], ids=lambda value: value if isinstance(value, str) else
+       "-".join(sorted({str(v) for k, v in value.items() if k.endswith("bridge.model")})) or "default")
+def test_rk4_netlist_circuit_models_match_device_equations(example, changes, tmp_path):
+    reference_sim, reference = _final(example, changes, "device", tmp_path / "device")
     expected = np.asarray(list(reference.values()), dtype=float)
     scale = np.maximum(np.abs(expected), max(np.max(np.abs(expected)), 1.0) * 1e-12)
     for circuit_model in CIRCUIT_MODELS:
-        simulation, result = _final(example, circuit_model, tmp_path / example / circuit_model)
+        simulation, result = _final(example, changes, circuit_model, tmp_path / circuit_model)
         np.testing.assert_array_equal(simulation.system.model.state_labels(),
                                       reference_sim.system.model.state_labels())
         actual = np.asarray(list(result.values()), dtype=float)

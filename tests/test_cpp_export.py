@@ -813,6 +813,8 @@ def test_generated_cpp_reuses_common_adc_and_protection_for_dc_converter(tmp_pat
         "units.converter.meas.window": 50.0e-6,
         "units.converter.protection.overcurrent.enable": 1,
         "units.converter.protection.overcurrent.limit_pu": 0.05,
+        # The trip lands inside the start-up ramp, so the stop command must also clear it.
+        "events.start": {"type": "connect", "target": "converter", "t": 0.0, "ramp": 0.01},
         "simulation.stop_on_trip": 0,
         "simulation.t_end": 0.001,
         "simulation.output.states": True,

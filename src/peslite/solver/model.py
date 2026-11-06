@@ -1165,6 +1165,60 @@ def _no_linear_data():
     return ()
 
 
+class _LinearModelView:
+    """Solver metadata projected onto a fixed subset of an assembled model's states."""
+
+    def __init__(self, model: "Model", selected: NDArray[np.bool_]) -> None:
+        self.model = model
+        indices = np.flatnonzero(selected)
+        self.positions = np.full(model.n_states, -1, dtype=np.intp)
+        self.positions[indices] = np.arange(indices.size)
+        self._mode_positions = tuple(
+            self._selected_positions(block[0]) for block in model.linear_blocks()
+        )
+
+    def _selected_positions(self, indices: Sequence[int]) -> NDArray[np.intp]:
+        mapped = self.positions[np.asarray(indices, dtype=np.intp)]
+        return np.flatnonzero(mapped >= 0)
+
+    def _project(self, block: Sequence[Any]) -> tuple:
+        indices = np.asarray(block[0], dtype=np.intp)
+        selected = self._selected_positions(indices)
+        compact = self.positions[indices[selected]]
+        matrix = np.asarray(block[1], dtype=float)[np.ix_(selected, selected)]
+        entries = indices if len(block) == 2 else np.asarray(block[2], dtype=np.intp)
+        skipped = entries if len(block) < 4 else np.asarray(block[3], dtype=np.intp)
+        return (
+            compact,
+            matrix,
+            self.positions[entries[self.positions[entries] >= 0]],
+            self.positions[skipped[self.positions[skipped] >= 0]],
+        )
+
+    def linear_structure(self):
+        return None
+
+    def linear_mode_key(self):
+        return self.model.linear_mode_key()
+
+    def linear_blocks(self) -> tuple:
+        return tuple(
+            projected for block in self.model.linear_blocks()
+            if (projected := self._project(block))[0].size
+        )
+
+    def linear_modes(self) -> tuple:
+        modes = self.model.linear_modes()
+        if len(modes) != len(self._mode_positions):
+            raise RuntimeError("linear modes and blocks describe different circuits")
+        return tuple(
+            (key, lambda build=build, selected=selected:
+             np.asarray(build())[np.ix_(selected, selected)])
+            for (key, build), selected in zip(modes, self._mode_positions)
+            if selected.size
+        )
+
+
 class Model:
     """Connected subsystems evaluated as ``rhs(t, y)`` on a flat real state vector.
 
@@ -1184,13 +1238,11 @@ class Model:
         linear_mode_key: Callable[[], Any] | None = None,
         linear_blocks: Callable[[], Sequence[Any]] | None = None,
         linear_modes: Callable[[], Sequence[Any]] | None = None,
-        linear_dynamic: bool = False,
     ) -> None:
         self._linear_structure_builder = linear_structure
         self.linear_mode_key = linear_mode_key or _no_linear_mode
         self.linear_blocks = linear_blocks or _no_linear_data
         self.linear_modes = linear_modes or _no_linear_data
-        self._linear_dynamic = bool(linear_dynamic)
         self.equation_revision = 0
         if isinstance(subsystems, Mapping):
             names = [str(n) for n in subsystems]
@@ -1254,10 +1306,12 @@ class Model:
         """Return the state partition supplied by assembly, or use the solver's dense default."""
         return self._structure
 
-    @property
-    def explicit_stability_dynamic(self) -> bool:
-        """Whether continuously varying network ratios require a stability check every step."""
-        return self._linear_dynamic
+    def linear_view(self, selected: NDArray[np.bool_]) -> _LinearModelView:
+        """Return solver metadata projected onto ``selected`` state entries."""
+        selected = np.asarray(selected, dtype=bool)
+        if selected.shape != (self.n_states,):
+            raise ValueError("a linear model view needs one selection flag per model state")
+        return _LinearModelView(self, selected)
 
     def invalidate_equations(self) -> None:
         """Record a boundary change which may select different continuous equations."""

@@ -2038,8 +2038,10 @@ class Topology:
             shared = self._shared[key] = selected, coupling
         return shared
 
-    def input_reach(self) -> Optional[tuple[NDArray[np.bool_], NDArray[np.bool_]]]:
-        """Return structural source and transformer reach to derivatives and output rows."""
+    def input_reach(
+        self,
+    ) -> Optional[tuple[NDArray[np.bool_], NDArray[np.bool_], NDArray[np.bool_]]]:
+        """Return structural input reach and which transformer ratios can change the state matrix."""
         reach = self._shared.get("input_reach", _PENDING)
         if reach is not _PENDING:
             return reach
@@ -2078,7 +2080,8 @@ class Topology:
                     Ku.indices[Ku.indptr[offset]:Ku.indptr[stop]],
                     Kdu.indices[Kdu.indptr[offset]:Kdu.indptr[stop]],
                 )))
-            state_rows = self.Ky.tocoo().row
+            state_rows = self.Ky.tocoo().row.astype(np.intp)
+            state_live = reached(state_rows)
             live = reached(np.concatenate([state_rows, *entered]).astype(np.intp))
             owner = np.repeat(
                 np.arange(len(self.mode.ratios)),
@@ -2086,6 +2089,7 @@ class Topology:
             )[pattern.slot_flat]
             slot_rows = rows[pattern.slot_pos]
             slot_live = live[columns[pattern.slot_pos]]
+            state_slot_live = state_live[columns[pattern.slot_pos]]
             entered.extend(
                 slot_rows[(owner == index) & slot_live]
                 for index in range(len(self.mode.ratios))
@@ -2098,9 +2102,24 @@ class Topology:
                     found = reached(equations)
                     derivatives[index] = bool(found[self.xd_index].any())
                     reached_outputs[index] = outputs @ found.astype(float) > 0.0
-            reach = derivatives, reached_outputs
+            state_ratios = np.zeros(len(self.mode.ratios), dtype=bool)
+            for index in range(len(state_ratios)):
+                equations = slot_rows[(owner == index) & state_slot_live]
+                if equations.size:
+                    state_ratios[index] = bool(reached(equations)[self.xd_index].any())
+            reach = derivatives, reached_outputs, state_ratios
         self._shared["input_reach"] = reach
         return reach
+
+    def state_matrix_key(self) -> tuple:
+        """Mode identity containing only transformer ratios that can change ``A``."""
+        reach = self.input_reach()
+        relevant = (np.ones(len(self.mode.ratios), dtype=bool)
+                    if reach is None else reach[2])
+        ratios = b"".join(
+            ratio.tobytes() for ratio, used in zip(self.mode.ratios, relevant) if used
+        )
+        return self.mode.closed, self.mode.conducting, ratios
 
     def selected_outputs(self, selected: Sequence[int]) -> NDArray[np.float64]:
         """Cached ratio-independent rows of the network output map."""
@@ -2996,6 +3015,24 @@ class Netlist:
             else:
                 values[offset:offset + dimension] = source
         return tuple(values)
+
+    def source_rates(self, t: Any, needed: Optional[Sequence[bool]] = None) -> tuple[Any, ...]:
+        """Source derivatives without coercing equation values to numbers (zero where ``needed``
+        is false); a source without a derivative is differentiated centrally."""
+        rates: list[Any] = [0.0] * self.n_u
+        for index, (source, offset) in enumerate(self._sources):
+            if needed is not None and not needed[index]:
+                continue
+            dimension = self._branch(source).dim
+            value = (source.derivative(t) if source.derivative is not None else
+                     (source.value(t + _DELTA_T) - source.value(t - _DELTA_T)) / (2.0 * _DELTA_T))
+            if dimension == 1:
+                rates[offset] = value
+            elif dimension == 2:
+                rates[offset:offset + 2] = (value.real, value.imag)
+            else:
+                rates[offset:offset + dimension] = value
+        return tuple(rates)
 
     def rates(self, t: float, needed: Optional[NDArray[np.bool_]] = None) -> NDArray[np.float64]:
         """The source derivatives ``du/dt`` at ``t`` (zero where ``needed`` is false)."""

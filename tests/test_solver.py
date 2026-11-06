@@ -28,7 +28,7 @@ def test_fixed_explicit_solver_uses_implicit_step_for_an_unstable_linear_mode():
     class StiffMode:
         @staticmethod
         def linear_modes():
-            return (("stiff", np.array([[-1e8]])),)
+            return (("stiff", lambda: np.array([[-1e8]])),)
 
     solver = FixedStepSolver(1e-5, model=StiffMode())
     result = solver(lambda _t, y: -1e8 * y, 0.0, 1e-5, np.array([1.0]))
@@ -39,17 +39,17 @@ def test_fixed_explicit_solver_uses_implicit_step_for_an_unstable_linear_mode():
 
 def test_fixed_explicit_stability_is_reused_by_equation_mode():
     class Modes:
-        explicit_stability_dynamic = False
-        equation_revision = 0
         mode = "a"
-        checks = 0
+        builds = 0
 
         def linear_mode_key(self):
             return self.mode
 
         def linear_modes(self):
-            self.checks += 1
-            return ((self.mode, np.array([[-1.0]])),)
+            def build():
+                self.builds += 1
+                return np.array([[-1.0]])
+            return ((self.mode, build),)
 
     model = Modes()
     solver = FixedStepSolver(1e-5, model=model)
@@ -57,36 +57,109 @@ def test_fixed_explicit_stability_is_reused_by_equation_mode():
     state = np.array([1.0])
 
     solver(rhs, 0.0, 1e-5, state)
-    model.equation_revision += 1
     solver(rhs, 1e-5, 2e-5, state)
-    assert model.checks == 1
+    assert model.builds == 1
 
     model.mode = "b"
-    model.equation_revision += 1
     solver(rhs, 2e-5, 3e-5, state)
-    assert model.checks == 2
+    assert model.builds == 2
 
     solver.parameters_changed()
     solver(rhs, 3e-5, 4e-5, state)
-    assert model.checks == 3
+    assert model.builds == 3
 
 
 def test_continuous_linear_modes_recheck_explicit_stability():
     class DynamicMode:
-        explicit_stability_dynamic = True
-        equation_revision = 0
-        checks = 0
+        mode = 0
+        builds = 0
 
         def linear_modes(self):
-            self.checks += 1
-            return ((self.checks, np.array([[-1.0]])),)
+            def build():
+                self.builds += 1
+                return np.array([[-1.0]])
+            return ((self.mode, build),)
 
     model = DynamicMode()
     solver = FixedStepSolver(1e-5, model=model)
     state = np.array([1.0])
     solver(lambda _t, y: -y, 0.0, 1e-5, state)
+    model.mode = 1
     solver(lambda _t, y: -y, 1e-5, 2e-5, state)
-    assert model.checks == 2
+    assert model.builds == 2
+
+
+def test_linear_model_view_projects_solver_metadata():
+    class State(Bag):
+        __slots__ = ("x",)
+
+    class Decay:
+        state_names = ("x",)
+        outputs_need_inputs = False
+
+        def __init__(self, rate):
+            self.rate = rate
+            self.state, self.input, self.output = State(x=1.0), Empty(), Empty()
+
+        def set_outputs(self, _t):
+            pass
+
+        def rhs(self, _t):
+            return (-self.rate * self.state.x,)
+
+    matrix = np.diag([-2.0, -4.0])
+    model = Model(
+        {"first": Decay(2.0), "second": Decay(4.0)}, {},
+        linear_mode_key=lambda: "mode",
+        linear_blocks=lambda: ((np.array([0, 1]), matrix, np.array([0, 1]), np.array([0, 1])),),
+        linear_modes=lambda: (("mode", lambda: matrix),),
+    )
+    view = model.linear_view(np.array([False, True]))
+
+    block, = view.linear_blocks()
+    mode, = view.linear_modes()
+    np.testing.assert_array_equal(block[0], [0])
+    np.testing.assert_array_equal(block[1], [[-4.0]])
+    np.testing.assert_array_equal(block[2], [0])
+    np.testing.assert_array_equal(block[3], [0])
+    assert mode[0] == "mode"
+    np.testing.assert_array_equal(mode[1](), [[-4.0]])
+    assert view.linear_mode_key() == "mode"
+
+
+def test_custom_inner_explicit_method_uses_the_projected_stability_model():
+    class State(Bag):
+        __slots__ = ("x",)
+
+    class Decay:
+        state_names = ("x",)
+        outputs_need_inputs = False
+
+        def __init__(self, rate):
+            self.rate = rate
+            self.state, self.input, self.output = State(x=1.0), Empty(), Empty()
+
+        def set_outputs(self, _t):
+            pass
+
+        def rhs(self, _t):
+            return (-self.rate * self.state.x,)
+
+    matrix = np.diag([-1.0, -1e5])
+    model = Model(
+        {"slow": Decay(1.0), "stiff": Decay(1e5)}, {},
+        linear_mode_key=lambda: "mode",
+        linear_blocks=lambda: ((np.array([0, 1]), matrix, np.array([0, 1]), np.array([0, 1])),),
+        linear_modes=lambda: (("mode", lambda: matrix),),
+    )
+    solver = MultirateSolver(
+        model, {"stiff": {"step": 1, "method": "heun"}}, 1e-3, "RK4", sweeps=2
+    )
+    result = solver(model.rhs, 0.0, 1e-3, np.ones(2))
+
+    assert solver._inner_solver._implicit is not None
+    assert np.all(np.isfinite(result.y))
+    assert abs(result.y[1]) < 0.1
 
 
 @pytest.mark.full
@@ -223,6 +296,40 @@ def test_fixed_solver_observes_a_guard_inside_its_internal_step_loop():
     assert result.y[0] == pytest.approx(0.6)
     # Six complete RK4 steps and only the first stage of the next step are needed.
     assert ramp.calls == result.n_rhs == 25
+
+
+def test_stiff_fixed_solver_uses_the_full_guard_at_the_interval_end():
+    class State(Bag):
+        __slots__ = ("x",)
+
+    class Decay:
+        state_names = ("x",)
+        outputs_need_inputs = False
+
+        def __init__(self):
+            self.state, self.input, self.output = State(x=1.0), Empty(), Empty()
+
+        def set_outputs(self, _t):
+            pass
+
+        def rhs(self, _t):
+            return (-1e5 * self.state.x,)
+
+    matrix = np.array([[-1e5]])
+    model = Model(
+        {"decay": Decay()}, {},
+        linear_blocks=lambda: ((np.array([0]), matrix, np.array([0]), np.array([0])),),
+        linear_modes=lambda: (("mode", lambda: matrix),),
+    )
+    result = FixedStepSolver(1e-3, "heun", model=model).advance_guarded(
+        model.rhs, 0.0, 1e-3, np.ones(1),
+        lambda t, _y: 5e-4 - t,
+        synchronized_guard=lambda _t, _y: 1.0,
+    )
+
+    assert result.crossed
+    assert result.t == pytest.approx(1e-3)
+    assert result.margin < 0.0
 
 
 def test_model_automatically_solves_an_algebraic_output_loop():

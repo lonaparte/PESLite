@@ -15,7 +15,7 @@ import math
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -57,6 +57,41 @@ class _GuardedStep:
     previous_margin: float | None
     crossed: bool
     n_rhs: int = 0
+
+    @classmethod
+    def at(cls, guard: Callable[[float, NDArray[np.float64]], float], t: float,
+           y: NDArray[np.float64], n_rhs: int) -> "_GuardedStep":
+        """The guard observed at a single instant (an empty interval)."""
+        margin = float(guard(t, y))
+        return cls(t, y, margin, t, y, margin, margin < 0.0, n_rhs)
+
+
+class _GuardWatch:
+    """Observe a guard at accepted steps: the first negative margin after the last valid point."""
+
+    def __init__(self, guard: Callable[[float, NDArray[np.float64]], float],
+                 t: float, y: NDArray[np.float64]) -> None:
+        self.guard = guard
+        self.last: tuple[float, NDArray[np.float64], float | None] = (t, y, None)
+        self.crossing: tuple[float, NDArray[np.float64], float] | None = None
+
+    def accept(self, t: float, y: NDArray[np.float64]) -> bool:
+        """Observe an accepted step; true when its margin is negative."""
+        margin = float(self.guard(t, y))
+        if margin < 0.0:
+            self.crossing = t, y, margin
+            return True
+        self.last = t, y, margin
+        return False
+
+    def result(self, t: float, y: NDArray[np.float64], n_rhs: int) -> _GuardedStep:
+        """The crossing step, or the settled state ``y`` at the interval end ``t``."""
+        if self.crossing is not None:
+            return _GuardedStep(*self.crossing, *self.last, True, n_rhs)
+        margin = self.last[2]
+        if margin is None:
+            margin = float(self.guard(t, y))
+        return _GuardedStep(t, y, margin, t, y, margin, False, n_rhs)
 
 
 @runtime_checkable
@@ -171,32 +206,24 @@ class FixedStepSolver:
         self.rtol, self.atol = float(rtol), float(atol)
         self.model = model
         self._implicit = None
-        self._stability_revision = -1
-        self._stability_mode = None
         self._stability_results: OrderedDict[tuple[object, float], bool] = OrderedDict()
-        self._dynamic_stability = bool(getattr(model, "explicit_stability_dynamic", False))
         self._mode_eigenvalues: OrderedDict[object, NDArray[np.complex128]] = OrderedDict()
         self.n_rhs = 0
 
     def parameters_changed(self) -> None:
         """Discard the lazy stiff-mode factors after a parameter event."""
-        self._stability_revision = -1
-        self._stability_mode = None
         self._stability_results.clear()
         self._mode_eigenvalues.clear()
         if self._implicit is not None:
             self._implicit.parameters_changed()
 
-    def _explicit_stable(self, step: float) -> bool:
+    def _explicit_stable(self, step: float, modes: Sequence[tuple]) -> bool:
         """Check assembled linear modes against this Runge-Kutta stability region."""
-        modes = getattr(self.model, "linear_modes", None)
-        if not callable(modes):
-            return True
         _c, rows, weights = TABLEAUS[self.method]
-        for key, matrix in modes():
+        for key, build in modes:
             eigenvalues = self._mode_eigenvalues.get(key)
             if eigenvalues is None:
-                eigenvalues = np.linalg.eigvals(matrix() if callable(matrix) else matrix)
+                eigenvalues = np.linalg.eigvals(build())
                 self._mode_eigenvalues[key] = eigenvalues
                 self._mode_eigenvalues.move_to_end(key)
                 while len(self._mode_eigenvalues) > 64:
@@ -221,18 +248,14 @@ class FixedStepSolver:
         return True
 
     def _stiff(self, step: float) -> bool:
-        if not callable(getattr(self.model, "linear_modes", None)):
+        provider = getattr(self.model, "linear_modes", None)
+        if not callable(provider):
             return False
-        if self._dynamic_stability:
-            return not self._explicit_stable(step)
-        revision = getattr(self.model, "equation_revision", 0)
-        if revision != self._stability_revision:
-            self._stability_revision = revision
-            self._stability_mode = getattr(self.model, "linear_mode_key", lambda: None)()
-        key = self._stability_mode, step
+        modes = tuple(provider())
+        key = tuple(mode for mode, _build in modes), step
         stable = self._stability_results.get(key)
         if stable is None:
-            stable = self._explicit_stable(step)
+            stable = self._explicit_stable(step, modes)
             self._stability_results[key] = stable
             self._stability_results.move_to_end(key)
             while len(self._stability_results) > 64:
@@ -309,8 +332,7 @@ class FixedStepSolver:
         """
         span = t1 - t0
         if span <= 0.0:
-            margin = float(guard(t1, y0))
-            return _GuardedStep(t1, y0, margin, t1, y0, margin, margin < 0.0, self.n_rhs)
+            return _GuardedStep.at(guard, t1, y0, self.n_rhs)
         step = min(self.dt, max_step)
         if step <= 0.0:
             raise ValueError("max_step must be positive")
@@ -318,20 +340,16 @@ class FixedStepSolver:
         h = span / n
         if self._stiff(h):
             y, t = np.asarray(y0, dtype=float), t0
-            previous_margin = None
-            for _ in range(n):
-                previous_t, previous_y = t, y
+            watch = _GuardWatch(synchronized_guard if synchronized_guard is not None else guard,
+                                t, y)
+            for completed in range(n):
                 result = self._implicit_advance(f, t, t + h, y, h)
                 t, y = result.t, result.y
-                observe = synchronized_guard if synchronized_guard is not None else guard
-                margin = float(observe(t, y))
-                if margin < 0.0:
-                    return _GuardedStep(
-                        t, y, margin, previous_t, previous_y,
-                        previous_margin, True, self.n_rhs,
-                    )
-                previous_margin = margin
-            return _GuardedStep(t1, y, margin, t1, y, margin, False, self.n_rhs)
+                if completed + 1 == n:
+                    watch.guard = guard
+                if watch.accept(t, y):
+                    break
+            return watch.result(t1, y, self.n_rhs)
         lists = getattr(getattr(f, "__self__", None), "rhs_list", None)
         if self.method == "RK4" and lists is not None:
             result = _rk4_on_floats_guarded(len(y0), synchronized_guard is not None)(
@@ -350,44 +368,27 @@ class FixedStepSolver:
 
         c, a, _b = TABLEAUS[self.method]
         y, t = np.asarray(y0, dtype=float), t0
-        previous_margin = None
+        watch = _GuardWatch(guard if synchronized_guard is None else synchronized_guard, t, y)
         calls = 0
-        for completed in range(1, n + 1):
-            previous_t, previous_y = t, y
-            ks = []
-            ks.append(f(t, y))
+        for completed in range(n):
+            ks = [f(t, y)]
             calls += 1
-            if synchronized_guard is not None and completed > 1:
-                margin = float(synchronized_guard(t, y))
-                if margin < 0.0:
-                    self.n_rhs += calls
-                    return _GuardedStep(
-                        t, y, margin, last_t, last_y, previous_margin, True, self.n_rhs,
-                    )
-                previous_margin = margin
-            last_t, last_y = previous_t, previous_y
+            # A synchronized guard observes each interior point after its first stage refreshed it.
+            if synchronized_guard is not None and completed and watch.accept(t, y):
+                break
             for j in range(1, len(c)):
                 ks.append(f(t + c[j] * h, stage_state(y, h, a[j - 1], ks)))
                 calls += 1
             y = combine(self.method, y, h, ks)
             t += h
-            if synchronized_guard is None:
-                margin = float(guard(t, y))
-                if margin < 0.0:
-                    self.n_rhs += calls
-                    return _GuardedStep(
-                        t, y, margin, previous_t, previous_y, previous_margin, True, self.n_rhs,
-                    )
-                previous_margin = margin
-        if synchronized_guard is not None:
-            margin = float(guard(t, y))
-            if margin < 0.0:
-                self.n_rhs += calls
-                return _GuardedStep(
-                    t, y, margin, previous_t, previous_y, previous_margin, True, self.n_rhs,
-                )
+            if synchronized_guard is None and watch.accept(t, y):
+                break
+        else:
+            if synchronized_guard is not None:
+                watch.guard = guard  # no stage refreshes the interval end
+                watch.accept(t, y)
         self.n_rhs += calls
-        return _GuardedStep(t1, y, margin, t1, y, margin, False, self.n_rhs)
+        return watch.result(t1, y, self.n_rhs)
 
 
 def _rk4_on_floats(size: int):
@@ -513,8 +514,8 @@ class AdaptiveSolver:
         if not callable(modes):
             return
         damping: list[float] = []
-        for _key, matrix in modes():
-            values = np.linalg.eigvals(matrix() if callable(matrix) else matrix)
+        for _key, build in modes():
+            values = np.linalg.eigvals(build())
             oscillatory = values[np.abs(values.imag) > 0.0]
             if oscillatory.size:
                 damping.append(float(np.min(-oscillatory.real / np.abs(oscillatory))))
@@ -569,10 +570,8 @@ class AdaptiveSolver:
         """Run one SciPy stepper; an optional observer sees every accepted step."""
         span = t1 - t0
         if span <= 0.0:
-            if guard is None:
-                return SolverStep(t1, y0, self.n_rhs)
-            margin = float(guard(t1, y0))
-            return _GuardedStep(t1, y0, margin, t1, y0, margin, margin < 0.0, self.n_rhs)
+            return (SolverStep(t1, y0, self.n_rhs) if guard is None
+                    else _GuardedStep.at(guard, t1, y0, self.n_rhs))
         if not self._modes_checked:
             self._check_modes()
         import scipy.integrate
@@ -592,7 +591,8 @@ class AdaptiveSolver:
             kwargs["jac"] = self.jac
         stepper = getattr(scipy.integrate, scipy_method)(f, t0, np.asarray(y0, dtype=float), t1,
                                                         **kwargs)
-        t, y, margin = t0, np.asarray(y0, dtype=float), None
+        t, y = t0, np.asarray(y0, dtype=float)
+        watch = None if guard is None else _GuardWatch(guard, t, y)
         sizes: list[float] = []
         while stepper.status == "running":
             message = stepper.step()
@@ -600,22 +600,12 @@ class AdaptiveSolver:
                 raise RuntimeError(
                     f"{scipy_method} failed on [{t0}, {t1}] at t = {stepper.t}: {message}"
                 )
-            previous_t, previous_y, previous_margin = t, y, margin
+            sizes.append(float(stepper.t) - t)
             t, y = float(stepper.t), np.array(stepper.y, dtype=float)
-            sizes.append(t - previous_t)
-            if guard is not None:
-                margin = float(guard(t, y))
-                if margin < 0.0:
-                    self._finish_stepper(stepper, jac_rhs, sizes)
-                    return _GuardedStep(
-                        t, y, margin, previous_t, previous_y, previous_margin, True, self.n_rhs
-                    )
+            if watch is not None and watch.accept(t, y):
+                break
         self._finish_stepper(stepper, jac_rhs, sizes)
-        if guard is None:
-            return SolverStep(t1, y, self.n_rhs)
-        if margin is None:
-            margin = float(guard(t1, y))
-        return _GuardedStep(t1, y, margin, t1, y, margin, False, self.n_rhs)
+        return SolverStep(t1, y, self.n_rhs) if watch is None else watch.result(t1, y, self.n_rhs)
 
     def _finish_stepper(self, stepper: Any, jac_rhs: int, sizes: list[float]) -> None:
         """Update warm-start and evaluation counters from the common stepping path."""
@@ -717,32 +707,16 @@ class DormandPrince45:
         """Observe a generic guard after each accepted Dormand--Prince step."""
         y0 = np.asarray(y0, dtype=float)
         if t1 <= t0:
-            margin = float(guard(t1, y0))
-            return _GuardedStep(t1, y0, margin, t1, y0, margin, margin < 0.0, self.n_rhs)
-        seen_t, seen_y, seen_margin = t0, y0, None
-        crossed = None
+            return _GuardedStep.at(guard, t1, y0, self.n_rhs)
+        watch = _GuardWatch(guard, t0, y0)
 
         def observe(h, y6, y1, k6, k7) -> bool:
-            nonlocal seen_t, seen_y, seen_margin, crossed
-            t = seen_t + h
-            y = np.asarray(y1, dtype=float)
-            margin = float(guard(t, y))
-            if margin < 0.0:
-                crossed = t, y, margin, seen_t, seen_y, seen_margin
+            if watch.accept(watch.last[0] + h, np.asarray(y1, dtype=float)):
                 return True
-            seen_t, seen_y, seen_margin = t, y, margin
             return step_callback is not None and bool(step_callback(h, y6, y1, k6, k7))
 
         result = self.advance(f, t0, t1, y0, max_step=max_step, step_callback=observe)
-        if crossed is not None:
-            t, y, margin, previous_t, previous_y, previous_margin = crossed
-            return _GuardedStep(
-                t, y, margin, previous_t, previous_y, previous_margin, True, self.n_rhs
-            )
-        margin = seen_margin if seen_margin is not None else float(guard(result.t, result.y))
-        return _GuardedStep(
-            result.t, result.y, margin, result.t, result.y, margin, False, self.n_rhs
-        )
+        return watch.result(result.t, result.y, self.n_rhs)
 
     def _control(self, h: float, err: float, max_step: float) -> tuple[bool, float]:
         """Whether a step ``h`` with scaled error ``err`` is accepted, and the next step (PI control)."""

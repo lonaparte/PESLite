@@ -20,7 +20,7 @@ from ..control.profiles import control_type
 from ..solver.integrators import (ADAPTIVE_METHODS, EXPLICIT_FIXED_METHODS, FIXED_METHODS,
                                   IMPLICIT_ADAPTIVE_METHODS, IMPLICIT_FIXED_METHODS)
 from ..solver.model import ConfigError
-from ..solver.multirate import parse_step
+from ..solver.multirate import own_schedule, parse_step
 from ..solver.timing import TIME_EPS, PeriodicClock, control_clock_offset
 from .events import NAMED, SWITCHABLE, SWITCHING
 from .types import unit_type
@@ -521,8 +521,7 @@ def _solver(s) -> None:
             ratio, method = parse_step(value)
         except ValueError as exc:
             raise ConfigError(f"{where}: {exc}") from None
-        if (ratio != 1.0 or (method is not None and method != s.method)) \
-                and s.method not in EXPLICIT_FIXED_METHODS:
+        if own_schedule(ratio, method, s.method) and s.method not in EXPLICIT_FIXED_METHODS:
             raise ConfigError(
                 f"{where}: a subsystem on its own step needs an explicit system method "
                 f"{EXPLICIT_FIXED_METHODS}, got {s.method!r}"

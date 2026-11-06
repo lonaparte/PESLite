@@ -9,7 +9,7 @@ import math
 import numbers
 import warnings
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Iterator, Mapping, Optional, Protocol, NamedTuple, runtime_checkable
+from typing import Any, Callable, Iterator, Mapping, Protocol, NamedTuple, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray

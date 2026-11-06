@@ -502,12 +502,14 @@ class System:
         for bus_name, port in assembled.attached_ports:
             bus_ports.setdefault(bus_name, []).append(port)
         configured_elements = {id(element) for element in self.named_elements.values()}
-        for element, element_bindings, series_connections in element_ports:
-            if not series_connections and id(element) not in configured_elements:
-                attach_bindings(element, element_bindings)
-        for element, element_bindings, series_connections in element_ports:
-            if not series_connections:
-                continue
+
+        def attach_order(entry: tuple) -> int:
+            """Plain elements attach first, so a series inlet finds the two ports it joins, then
+            series elements, then configured elements."""
+            element, _bindings, series_connections = entry
+            return 1 if series_connections else 2 if id(element) in configured_elements else 0
+
+        for element, element_bindings, series_connections in sorted(element_ports, key=attach_order):
             for bus, inlet in series_connections.items():
                 attached = bus_ports.setdefault(resolve_bus(bus), [])
                 if len(attached) != 2:
@@ -517,9 +519,6 @@ class System:
                     )
                 bus_ports.setdefault(resolve_bus(inlet), []).append(attached.pop())
             attach_bindings(element, element_bindings)
-        for element, element_bindings, series_connections in element_ports:
-            if not series_connections and id(element) in configured_elements:
-                attach_bindings(element, element_bindings)
         for name, bus in self.buses.items():
             attached = bus_ports[name]
             if (len(attached) == 1 and attached[0] is bus.port
@@ -602,8 +601,7 @@ class System:
                     target = (unit.ctrl, channel)
                     claim_connections((target,), where)
                     connections[target] = (subsystem, output)
-        from .circuit import (circuit_linear_blocks, circuit_linear_dynamic,
-                              circuit_linear_modes, circuit_mode_key,
+        from .circuit import (circuit_linear_blocks, circuit_linear_modes, circuit_mode_key,
                               circuit_structure, compile_network, lower)
         declarations = {id(subsystem): compile_network(subsystem)
                         for subsystem in subsystems.values()}
@@ -617,7 +615,6 @@ class System:
             linear_mode_key=partial(circuit_mode_key, circuits=self.circuits),
             linear_blocks=partial(circuit_linear_blocks, circuits=self.circuits),
             linear_modes=partial(circuit_linear_modes, circuits=self.circuits),
-            linear_dynamic=circuit_linear_dynamic(self.circuits),
         )
         self.event_subsystems = tuple(
             (name, subsystem)

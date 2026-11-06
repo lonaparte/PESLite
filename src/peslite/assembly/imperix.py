@@ -91,7 +91,7 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
         ]
 
     def _trip_body(self):
-        return [f"{self.m('startup_run')} = false;"]
+        return self._controller_command_lines(False, 0.0)
 
     def header(self):
         startup = self.ctrl.startup

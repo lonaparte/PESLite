@@ -36,7 +36,6 @@ import copy
 import itertools
 import math
 import re
-from collections import OrderedDict
 from contextvars import ContextVar
 from types import MethodType
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -52,7 +51,7 @@ from ..solver.netlist import (QUANTITIES, CoupledInductors, CurrentSource, Diode
 
 __all__ = ["NetlistBuilder", "NetworkPlan", "Circuit", "NetworkView", "circuit_structure",
            "circuit_mode_key", "circuit_linear_blocks", "circuit_linear_modes",
-           "circuit_linear_dynamic", "lower", "bind_device", "compile_network"]
+           "lower", "bind_device", "compile_network"]
 
 
 _NETWORK_DECLARATION: ContextVar[bool] = ContextVar(
@@ -519,6 +518,7 @@ class Circuit:
         self.requires_topology_freeze = False
         self._direct_dynamic = False
         self._direct_mode_key: Optional[tuple] = None
+        self._linear_basis: Optional[tuple[np.ndarray, ...]] = None
         self._numeric_stages = False
         self._stage_signature: Optional[tuple] = None
         self._standalone_runtime = False
@@ -526,6 +526,8 @@ class Circuit:
             tuple[int, tuple[tuple[int, float], ...]], ...
         ] = ()
         self._device_bindings: dict[tuple, tuple[Topology, Callable, Callable]] = {}
+        self._device_runtime: Optional[list] = None  # [netlist, topology, evaluator] once compiled
+        self._device_commands: Optional[tuple] = None  # boundary commands the runtime was bound for
         self._structure_plan: Optional["_CircuitPlan"] = None
         self._mode_decompositions: dict[tuple, Optional["_ModeDecomposition"]] = {}
         self.plan_changed = False
@@ -871,7 +873,7 @@ class Circuit:
         reach = topology.input_reach()
         if reach is None:
             return None
-        derivatives, outputs = reach
+        derivatives, outputs, _state_ratios = reach
         net, copied = self.netlist, self._copied_inputs()
         names: list[set[str]] = []
         values = [
@@ -1308,14 +1310,14 @@ class Circuit:
 
     def _refresh_device_evaluator(self, topology: Optional[Topology] = None) -> bool:
         """Select the compiled scalar evaluator for the current structural mode."""
-        holder = getattr(self, "_device_runtime", None)
+        holder = self._device_runtime
         if holder is None:
             return False
         self.netlist._last = None
         topology = self.netlist.topology() if topology is None else topology
         margin_key = self.netlist.scalar_margin_key(topology)
         if (holder[1] is topology and holder[2] is not None
-                and getattr(self, "_margin_evaluator_key", None) == margin_key):
+                and self._margin_evaluator_key == margin_key):
             return True
         dynamic = any(
             transformer.constant is None for transformer in self.netlist._transformers
@@ -1341,8 +1343,7 @@ class Circuit:
         """Bind the current compiled mode; mode selection remains at physical boundaries."""
         if self._mixtures:
             return False
-        holder = getattr(self, "_device_runtime", None)
-        if holder is not None:
+        if self._device_runtime is not None:
             self._refresh_device_evaluator()
             self._use_runtime_stages()
             return True
@@ -1402,29 +1403,41 @@ class Circuit:
     def linear_mode(self) -> tuple[tuple, Callable[[], np.ndarray]]:
         """Return the present linear-mode identity and a lazy state-matrix builder."""
         net = self.netlist
+        topology = self._bound_device_topology() or net.topology()
+        key = topology.state_matrix_key()
         if self.form == "device" and self._direct_dynamic:
-            mode = net.mode()
             derivative = next(
                 (getattr(self, stage.method) for stage in self.output_stages or ()
                  if stage.rhs and not stage.outputs),
                 None,
             )
             if derivative is not None:
-                return mode.key, lambda: self._direct_state_matrix(derivative)
-        topology = self._bound_device_topology() or net.topology()
-        return topology.mode.key, lambda: topology.state_space.A
+                return key, lambda: self._direct_state_matrix(derivative)
+        return key, lambda: topology.state_space.A
 
     def _direct_state_matrix(self, derivative: Callable[[float], None]) -> np.ndarray:
-        """Form the matrix of the already compiled direct device equations."""
+        """Form the direct-equation matrix, evaluating all basis states together when possible."""
         saved_states = self.gather()
         saved_derivatives = self.derivatives.copy()
         saved_t, saved_storage = self.t, self._stored
         zero = [0.0] * self.n_states
         try:
+            try:
+                if self._linear_basis is None:
+                    basis = np.zeros((self.n_states, self.n_states + 1))
+                    basis[:, 1:] = np.eye(self.n_states)
+                    self._linear_basis = tuple(basis)
+                self.scatter(self._linear_basis)
+                derivative(saved_t)
+                values = np.asarray(self.derivatives, dtype=float)
+                if values.shape != (self.n_states, self.n_states + 1):
+                    raise ValueError("vectorized circuit derivatives changed shape")
+                return values[:, 1:] - values[:, :1]
+            except (TypeError, ValueError):
+                matrix = np.empty((self.n_states, self.n_states))
             self.scatter(zero)
             derivative(saved_t)
-            base = np.asarray(self.derivatives, dtype=float)
-            matrix = np.empty((self.n_states, self.n_states))
+            base = np.asarray(self.derivatives, dtype=float).copy()
             for column in range(self.n_states):
                 state = zero.copy()
                 state[column] = 1.0
@@ -1591,7 +1604,7 @@ class Circuit:
 
     def _bound_device_topology(self) -> Optional[Topology]:
         """Return the fixed topology already selected by the device runtime, if any."""
-        runtime = getattr(self, "_device_runtime", None)
+        runtime = self._device_runtime
         if (runtime is None or runtime[1] is None
                 or any(transformer.constant is None for transformer in self.netlist._transformers)):
             return None
@@ -1644,9 +1657,9 @@ class Circuit:
         a diode must commutate or a component has not mirrored the conduction yet; read after the model
         was synchronized. A change of transformer ratios alone keeps constraints that do not involve them."""
         net = self.netlist
-        runtime = getattr(self, "_device_runtime", None)
+        runtime = self._device_runtime
         if (runtime is not None and runtime[1] is not None
-                and self._boundary_mode() != getattr(self, "_device_commands", None)):
+                and self._boundary_mode() != self._device_commands):
             self._refresh_device_evaluator()
         evaluation = net._last
         topology = evaluation.topology if evaluation is not None and evaluation.t == self.t else net.topology()
@@ -2516,10 +2529,10 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
             voltage_key, current_key = port_sources[id(port)]
             if (effort_record, flow_record) == ("input", "output"):
                 source_field, target_field = flow_field, effort_field
-                source_key, target_key, kind = current_key, voltage_key, "current"
+                target_key, kind = voltage_key, "current"
             elif (effort_record, flow_record) == ("output", "input"):
                 source_field, target_field = effort_field, flow_field
-                source_key, target_key, kind = voltage_key, current_key, "voltage"
+                target_key, kind = current_key, "voltage"
             else:
                 raise ConfigError(
                     f"{owner}.{port.name}: a behavioral electrical port needs either "
@@ -2735,29 +2748,36 @@ def circuit_linear_blocks(circuits: Sequence[Circuit]):
         plan = circuit._structure_plan
         if plan is None:
             raise RuntimeError("circuit_structure must run before linear block evaluation")
-        matrix = np.zeros((circuit.n_states, circuit.n_states))
-        matrix[np.ix_(plan.states, plan.states)] = circuit.netlist.topology().state_space.A
         blocks.append((plan.local_to_model,
-                       plan.inverse @ matrix @ plan.transform,
+                       _placed_linear_matrix(circuit, circuit.netlist.topology().state_space.A),
                        plan.exact, plan.skipped))
     return tuple(blocks)
 
 
+def _placed_linear_matrix(circuit: Circuit, matrix: np.ndarray) -> np.ndarray:
+    """Place a netlist or full-circuit matrix in the assembled circuit state coordinates."""
+    plan = circuit._structure_plan
+    if plan is None:
+        raise RuntimeError("circuit_structure must run before linear matrix evaluation")
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.shape == (circuit.n_states, circuit.n_states):
+        placed = matrix
+    elif matrix.shape == (plan.states.size, plan.states.size):
+        placed = np.zeros((circuit.n_states, circuit.n_states))
+        placed[np.ix_(plan.states, plan.states)] = matrix
+    else:
+        raise ValueError("a circuit linear matrix does not match its state layout")
+    return plan.inverse @ placed @ plan.transform
+
+
 def circuit_linear_modes(circuits: Sequence[Circuit]):
-    """Return the exact present-mode state matrix of every assembled circuit."""
+    """Return each assembled circuit's present-mode identity and the builder of its exact state
+    matrix (a solver builds it only for a mode it has not seen)."""
     return tuple(
-        ((id(circuit.netlist), key), matrix)
+        ((id(circuit.netlist), key),
+         lambda circuit=circuit, matrix=matrix: _placed_linear_matrix(circuit, matrix()))
         for circuit in circuits
         for key, matrix in (circuit.linear_mode(),)
-    )
-
-
-def circuit_linear_dynamic(circuits: Sequence[Circuit]) -> bool:
-    """Whether circuit coefficients may vary without a discrete mode change."""
-    return any(
-        transformer.constant is None
-        for circuit in circuits
-        for transformer in circuit.netlist._transformers
     )
 
 

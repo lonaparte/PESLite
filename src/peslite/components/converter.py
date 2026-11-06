@@ -289,18 +289,18 @@ class _BridgeModel(NetworkComponent):
         if (self.lower_port is None and not isinstance(topology.zero, complex)
                 and len(topology.voltage_factors) > 1):
             high, low = nb.internal(), nb.internal()
-            supply = nb.add(nl.Transformer(high, low, dc, None, ((1.0,),)))
+            nb.add(nl.Transformer(high, low, dc, None, ((1.0,),)))
             devices = (*leg(ac, high, low, 0), *leg(None, high, low, 1))
             if getattr(self, "_current", None) is not None:
                 nb.bind(self._bind_netlist_devices, devices)
                 nb.commutation(self, after=self._mirror_netlist_conduction, diodes=devices)
         else:
             high = nb.internal()
-            upper_feed = nb.add(nl.Resistor(dc, high, 0.0))
+            nb.add(nl.Resistor(dc, high, 0.0))
             if self.lower_port is not None:
                 low = nb.internal()
                 lower_node = nb.node(self.lower_port)
-                lower_feed = nb.add(nl.Resistor(lower_node, low, 0.0))
+                nb.add(nl.Resistor(lower_node, low, 0.0))
                 leg(ac, high, low, 0)
             else:
                 count = len(topology.voltage_factors)

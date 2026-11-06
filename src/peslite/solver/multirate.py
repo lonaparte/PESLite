@@ -38,8 +38,7 @@ def make_solver(cfg: Any, model: Optional[Any] = None, ratings: Any = None):
             raise ConfigError("simulation.solver.subsystems needs the model whose subsystems it names")
         try:
             parsed = {name: parse_step(value) for name, value in cfg.subsystems.items()}
-            if any(ratio != 1.0 or (own is not None and own != method)
-                   for ratio, own in parsed.values()):
+            if any(own_schedule(ratio, own, method) for ratio, own in parsed.values()):
                 if method not in EXPLICIT_FIXED_METHODS:
                     raise ConfigError(
                         "simulation.solver.subsystems needs an explicit system method, got "
@@ -54,6 +53,11 @@ def make_solver(cfg: Any, model: Optional[Any] = None, ratings: Any = None):
             raise ConfigError(f"simulation.solver.subsystems: {exc.args[0]}") from None
     return integrator(method, cfg.dt, cfg.rtol, cfg.atol, cfg.max_step, cfg.warm_start,
                       model=model, solver_type=solver_type)
+
+
+def own_schedule(ratio: float, method: Optional[str], system_method: str) -> bool:
+    """Whether a parsed subsystem step leaves the system schedule: another step or method."""
+    return ratio != 1.0 or (method is not None and method != system_method)
 
 
 def parse_step(value: Any) -> tuple[float, Optional[str]]:
@@ -151,7 +155,7 @@ class MultirateSolver:
                 r, meth = parse_step(value)
             except ValueError as exc:
                 raise ValueError(f"subsystem {name!r}: {exc}") from None
-            if r < 1.0 or (r == 1.0 and meth is not None and meth != method):
+            if r <= 1.0 and own_schedule(r, meth, method):
                 inner[name] = r
                 inner_methods.add(meth or method)
             elif r > 1.0:
@@ -184,7 +188,8 @@ class MultirateSolver:
         self._outer_solver = (integrator(self.outer_method, self.window, rtol, atol)
                               if self.outer is not None else None)
         self._inner_solver = (
-            integrator(self.inner_method, self.dt / self.ratio, rtol, atol)
+            integrator(self.inner_method, self.dt / self.ratio, rtol, atol,
+                       model=model.linear_view(self._mask_inner))
             if self.inner is not None and self.inner_method != method else None
         )
         # window bookkeeping (outer group)
@@ -309,8 +314,7 @@ class MultirateSolver:
     def parameters_changed(self) -> None:
         """Refresh storage declarations after a ``set`` event changed parameters."""
         self.model_plan_changed()
-        for solver in (getattr(self, "_inner_solver", None),
-                       getattr(self, "_outer_solver", None)):
+        for solver in (self._inner_solver, self._outer_solver):
             changed = getattr(solver, "parameters_changed", None)
             if changed is not None:
                 changed()
@@ -619,31 +623,32 @@ class MultirateSolver:
         """Advance one group with its own solver against the system's Hermite path."""
         c, a, b = TABLEAUS[self.method]
         mask_i = self._mask_inner
-        trajectory: Optional[list[NDArray[np.float64]]] = None
         m = self.ratio
         h = H / m
+        initial_rate = self._f_inner(t0, self._place_outer(t0, y0))
+        trajectory = [
+            np.where(mask_i, y0 + step * h * initial_rate, y0)
+            for step in range(m + 1)
+        ]
         for sweep in range(1, self.sweeps + 1):
             final_sweep = sweep == self.sweeps
             ks: list[NDArray[np.float64]] = []
             for j, node in enumerate(c):
                 t = t0 + node * H
                 state = y0 if j == 0 else stage_state(y0, H, a[j - 1], ks)
-                if trajectory is not None:
-                    state = np.where(mask_i, self._inner_at(trajectory, t0, h, t), state)
+                state = np.where(mask_i, self._inner_at(trajectory, t0, h, t), state)
                 seen = state
                 ks.append(self._f_system(
                     t, self._place_outer(t, state), b[j] * H if final_sweep else 0.0
                 ))
             system_end = combine(self.method, y0, H, ks)
-            if trajectory is not None:
-                system_end = np.where(mask_i, trajectory[-1], system_end)
+            system_end = np.where(mask_i, trajectory[-1], system_end)
             end_rate = self._f_system(
                 t0 + H, self._place_outer(t0 + H, system_end), 0.0
             )
             trajectory = self._solve_inner(
                 t0, h, m, y0, system_end, ks[0], end_rate
             )
-        assert trajectory is not None
         out = np.where(mask_i, trajectory[-1], system_end)
         self._note_error(mask_i, y0, seen, out, H, t0 + H)
         self._steps += 1

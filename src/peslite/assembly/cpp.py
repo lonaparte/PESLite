@@ -36,7 +36,7 @@ from ..solver.implicit import (ImplicitSolver, _JACOBIAN_STEP, _MAX_SPLITS, _TAB
                                _NEWTON_ITERATIONS, _NEWTON_SCALE, _THETA_MAX)
 from ..solver.model import _dependency_plan, commutation_tolerance
 from ..solver.netlist import (Element as NetlistElement, Mode, Netlist, Topology,
-                              _DELTA_T, _Degenerate, _FLOAT_RTOL, _MARGIN_RTOL, _MAX_PATTERNS,
+                              _Degenerate, _FLOAT_RTOL, _MARGIN_RTOL, _MAX_PATTERNS,
                               _Symbolic, _constant, _symbolic_solve, _symbolic_source)
 from ..solver.timing import TIME_EPS
 from .conduction import DiodeConduction, _LOCATOR_ITERATIONS, _MAX_COMMUTATIONS
@@ -1279,6 +1279,19 @@ def _without_terms(code: str) -> str:
         code = expanded
 
 
+def _symbolic_node(value: Any) -> Any:
+    """One traced scalar as a symbolic-DAG leaf; constants stay plain Python numbers."""
+    if isinstance(value, _Expression):
+        return _Symbolic.value(_without_terms(value.code))
+    return value.item() if isinstance(value, np.generic) else value
+
+
+def _while_gated(gates: Mapping[int, Any], values: Sequence[Any], gated: Any) -> tuple:
+    """Per diode position: the value it takes while its controlled device is gated on."""
+    return tuple(np.where(gates[index], gated, value) if index in gates else value
+                 for index, value in enumerate(values))
+
+
 class _InitializationExpression(_Expression):
     """Numerical initialization with both its default and its generated expression.
 
@@ -1957,13 +1970,12 @@ class _ModelGenerator:
         self._coefficient_topologies = {}
         self._dynamic_netlist_traces = {}
         self._runtime_networks = {}
-        self._runtime_network_order = []
         self.equation_bindings = {}
         self.equation_members = {}
         self.equation_references = {}
         self._equation_method_plans = {}
         self._equation_method_roots = {}
-        for circuit in getattr(self.system, "circuits", ()):
+        for circuit in self.system.circuits:
             for component, callback in circuit._hooks:
                 owner = self.component_subsystem.get(id(component), component)
                 self._equation_method_roots.setdefault(id(owner), set()).add(callback.__name__)
@@ -2044,7 +2056,7 @@ class _ModelGenerator:
 
         # Network declarations are already required for native equation lowering. Replay their
         # parameter bindings now so structural guards participate in the same diagnostics pass.
-        for circuit in getattr(self.system, "circuits", ()):
+        for circuit in self.system.circuits:
             self._circuit_coefficients(circuit)
         self.resolve_equations()
 
@@ -2120,7 +2132,7 @@ class _ModelGenerator:
                 record = getattr(sub, role)
                 mapped = self.record_fields.setdefault(id(record), {})
                 for field in _fields(record):
-                    name = mapped.setdefault(field, f"{tag}_{role}_{_identifier(field)}")
+                    mapped.setdefault(field, f"{tag}_{role}_{_identifier(field)}")
                     value = getattr(record, field)
                     self.record_types[id(record), field] = (
                         "bool" if isinstance(value, bool) else
@@ -2196,11 +2208,8 @@ class _ModelGenerator:
             return tuple(_ModelGenerator._merge_trace(condition, left, right)
                          for left, right in zip(when_false, when_true))
         if isinstance(when_false, _Symbolic) or isinstance(when_true, _Symbolic):
-            selected = _Symbolic.value(_without_terms(condition.code))
-            def node(value: Any) -> Any:
-                return (_Symbolic.value(_without_terms(value.code))
-                        if isinstance(value, _Expression) else value)
-            return np.where(selected, node(when_true), node(when_false))
+            return np.where(_symbolic_node(condition), _symbolic_node(when_true),
+                            _symbolic_node(when_false))
         left, right = _Expression.of(when_false), _Expression.of(when_true)
         if (left.code, left.kind) == (right.code, right.kind):
             return left
@@ -3253,11 +3262,6 @@ class _ModelGenerator:
     @classmethod
     def _symbolic_netlist_matrix(cls, circuit: Any, topology=None, ratios=None):
         """Build the selected netlist matrix once from its ordinary stamped equations."""
-        def symbolic(value: Any) -> Any:
-            if isinstance(value, _Expression):
-                return _Symbolic.value(value.code)
-            return value.item() if isinstance(value, np.generic) else value
-
         net = circuit.netlist
         ratios = (tuple(cls._ratio_matrix(transformer) for transformer in net._transformers)
                   if ratios is None else ratios)
@@ -3270,12 +3274,12 @@ class _ModelGenerator:
         matrix = [[0.0] * pattern.n for _ in range(pattern.n)]
         varying: set[tuple[int, int]] = set()
         for row, column, value in zip(matrices["M"].r, matrices["M"].c, matrices["M"].v):
-            matrix[row][column] += symbolic(value)
+            matrix[row][column] += _symbolic_node(value)
         for position, flat, coefficient in zip(
                 pattern.slot_pos, pattern.slot_flat, pattern.slot_coef):
             row, column = int(pattern.indices[position]), int(columns[position])
             ratio = flat_ratios[int(flat)]
-            matrix[row][column] += coefficient * symbolic(ratio)
+            matrix[row][column] += coefficient * _symbolic_node(ratio)
             if not _constant(ratio):
                 varying.add((row, column))
         return topology, matrices, matrix, pattern.dense(topology.mode.ratios), varying
@@ -3423,12 +3427,7 @@ class _ModelGenerator:
         for switch in net._switches:
             flag = self._switch_flag(switch)
             closed.append(self._trace(switch.closed) if flag is None else flag)
-        gates = {index: self._trace(gate) for index, gate in net._gates}
-        conducting = tuple(
-            _Expression.of(diode.conducting) | gates[index]
-            if index in gates else _Expression.of(diode.conducting)
-            for index, diode in enumerate(net._diodes)
-        )
+        gates, conducting = self._gated_conduction(net)
         gate_indices = tuple(gates)
         mode_values = tuple(
             _Expression.of(value)
@@ -3464,19 +3463,12 @@ class _ModelGenerator:
                    tuple(transformer.ratio() for transformer in net._transformers))
         physical_count = net.n_x + net.n_out
         count = physical_count + 2 * len(net._diodes) + net.n_x + 1
-        descriptor = self._runtime_networks.get(id(circuit))
-        if descriptor is None:
-            name = f"network_{self.prefix[id(circuit)]}"
-            descriptor = self._runtime_networks[id(circuit)] = {
-                "name": name, "count": count, "modes": {},
-                "n_x": net.n_x, "n_u": net.n_u, "bits": len(mode_values),
-                "physical_count": physical_count,
-            }
-            self._runtime_network_order.append(id(circuit))
-        elif (descriptor["count"], descriptor["n_x"], descriptor["n_u"], descriptor["bits"],
-              descriptor["physical_count"]) != (
-                count, net.n_x, net.n_u, len(mode_values), physical_count):
-            raise RuntimeError("C++ export: a circuit changed its generated netlist layout")
+        descriptor = self._runtime_network(
+            circuit, count=count, bits=len(mode_values), physical_count=physical_count,
+            parameters=(*(f"x{index}" for index in range(net.n_x)),
+                        *(f"u{index}" for index in range(net.n_u)),
+                        *(f"du{index}" for index in range(net.n_u))),
+        )
 
         for mode_closed, mode_conducting, mode_gated in reachable:
             selected = (
@@ -3501,26 +3493,14 @@ class _ModelGenerator:
                 _TRACE_CONTROL.reset(control)
 
         inputs = tuple(_Expression.of(value) for value in net.source_values(t))
-        rates: list[Any] = [_Expression("0.0", "real", pure=True)] * net.n_u
-        for source, offset in net._sources:
-            dimension = net._branch(source).dim
-            value = (source.derivative(t) if source.derivative is not None else
-                     (source.value(t + _DELTA_T) - source.value(t - _DELTA_T))
-                     / (2.0 * _DELTA_T))
-            if dimension == 1:
-                rates[offset] = _Expression.of(value)
-            elif dimension == 2:
-                value = _Expression.of(value)
-                rates[offset:offset + 2] = (value.real, value.imag)
-            else:
-                rates[offset:offset + dimension] = tuple(map(_Expression.of, value))
+        rates = tuple(_Expression.of(value) for value in net.source_rates(t))
         state_values = tuple(_Expression.of(states[int(index)]) for index in net.states)
         key = " | ".join(
             f"(static_cast<std::size_t>({value.code}) << {index})"
             for index, value in enumerate(mode_values)
         ) or "0"
         arguments = ", ".join(
-            value.code for value in (*state_values, *inputs, *map(_Expression.of, rates))
+            value.code for value in (*state_values, *inputs, *rates)
         )
         method = descriptor["name"] if postprocess else descriptor["name"] + "_physical"
         call = f"{method}({key}{', ' if arguments else ''}{arguments})"
@@ -3544,6 +3524,16 @@ class _ModelGenerator:
         return (net._place_scalar_derivatives(values[:net.n_x], len(states)),
                 values[net.n_x:physical_count], margins, projected, impulses, values[-1])
 
+    def _runtime_network(self, circuit: Any, **layout: Any) -> dict:
+        """The circuit's generated network function: its value count, mode bits, physical
+        rows and parameters, with the mode programs registered so far."""
+        descriptor = self._runtime_networks.setdefault(
+            id(circuit), {"name": f"network_{self.prefix[id(circuit)]}", "modes": {}, **layout}
+        )
+        if any(descriptor[key] != value for key, value in layout.items()):
+            raise RuntimeError("C++ export: a circuit changed its generated netlist layout")
+        return descriptor
+
     def _trace_runtime_netlist(self, circuit: Any, t: Any, states: Sequence[Any]):
         """Evaluate derivatives and outputs for the current exact network mode."""
         return self._trace_runtime_values(circuit, t, states, postprocess=False)
@@ -3552,11 +3542,6 @@ class _ModelGenerator:
         self, circuit: Any, t: Any, states: list[Any], *, topology=None, raw=False,
     ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
         """Eliminate the shared netlist equations through the netlist's expression DAG."""
-        def symbolic(value: Any) -> Any:
-            if isinstance(value, _Expression):
-                return _Symbolic.value(_without_terms(value.code) if raw else value.code)
-            return value.item() if isinstance(value, np.generic) else value
-
         def generated(values: Sequence[Any]) -> tuple[_Expression, ...]:
             shared, rendered = _symbolic_source(values)
             names: dict[str, str] = {}
@@ -3598,26 +3583,13 @@ class _ModelGenerator:
         pattern = topology._pattern
 
         inputs = net.source_values(t)
-        rates: list[Any] = [0.0] * net.n_u
-        for needed, (source, offset) in zip(topology.needs_rate, net._sources):
-            if not needed:
-                continue
-            dimension = net._branch(source).dim
-            value = (source.derivative(t) if source.derivative is not None else
-                     (source.value(t + _DELTA_T) - source.value(t - _DELTA_T))
-                     / (2.0 * _DELTA_T))
-            if dimension == 1:
-                rates[offset] = value
-            elif dimension == 2:
-                rates[offset:offset + 2] = (value.real, value.imag)
-            else:
-                rates[offset:offset + dimension] = value
+        rates = net.source_rates(t, topology.needs_rate)
         state_values = tuple(states[int(index)] for index in net.states)
         right = [0.0] * pattern.n
         for name, vector in (("y", state_values), ("u", inputs), ("du", rates)):
             stamps = matrices[name]
             for row, column, coefficient in zip(stamps.r, stamps.c, stamps.v):
-                right[row] += symbolic(coefficient) * symbolic(vector[column])
+                right[row] += _symbolic_node(coefficient) * _symbolic_node(vector[column])
         solution = _symbolic_solve(
             matrix, right, reference, varying, gauge=topology.gauge_singular
         ) if pattern.n else []
@@ -3673,6 +3645,12 @@ class _ModelGenerator:
             circuit._cpp_topologies[mode.key] = topology
         return circuit._cpp_topologies[mode.key]
 
+    def _gated_conduction(self, net: Any) -> tuple[dict[int, Any], tuple[_Expression, ...]]:
+        """Trace each controlled device's gate, and every diode's conduction under its gate."""
+        gates = {index: self._trace(gate) for index, gate in net._gates}
+        return gates, tuple(_Expression.of(diode.conducting) | gates.get(index, False)
+                            for index, diode in enumerate(net._diodes))
+
     @staticmethod
     def _switch_flag(switch: Any) -> _Expression | None:
         """Return one run-time switch position without asking the tracer to branch."""
@@ -3703,12 +3681,8 @@ class _ModelGenerator:
             flags.append(flag)
             closed.append(True)
 
-        gates = {index: self._trace(gate) for index, gate in net._gates}
         conducting: list[bool] = []
-        for index, diode in enumerate(net._diodes):
-            effective = _Expression.of(diode.conducting)
-            if index in gates:
-                effective = effective | gates[index]
+        for index, effective in enumerate(self._gated_conduction(net)[1]):
             if effective.kind == "bool" and effective.code in ("true", "false"):
                 conducting.append(effective.code == "true")
                 continue
@@ -3813,10 +3787,6 @@ class _ModelGenerator:
         roots_by_mode: dict[int, tuple[Any, ...] | str] = {}
         inputs: dict[Any, None] = {}
 
-        def as_symbolic(value: Any) -> Any:
-            return (_Symbolic.value(_without_terms(value.code))
-                    if isinstance(value, _Expression) else value)
-
         control, terms = _TRACE_CONTROL.set(None), _SCALAR_TERMS.set(None)
         try:
             for changed, mode in decomposition.modes.items():
@@ -3827,7 +3797,7 @@ class _ModelGenerator:
                             circuit, t, states, topology=net._compiled(mode), raw=True,
                         )
                     )
-                    roots = tuple(as_symbolic(value) for value in (*derivatives, *outputs))
+                    roots = tuple(_symbolic_node(value) for value in (*derivatives, *outputs))
                     roots_by_mode[encoded] = roots
                     inputs.update(dict.fromkeys(self._symbolic_inputs(roots)))
                 except (_Degenerate, ValueError, np.linalg.LinAlgError) as exc:
@@ -3839,23 +3809,10 @@ class _ModelGenerator:
         arguments = tuple(inputs)
         input_index = {value: index for index, value in enumerate(arguments)}
         count = net.n_x + net.n_out
-        descriptor = self._runtime_networks.get(id(circuit))
-        if descriptor is None:
-            descriptor = self._runtime_networks[id(circuit)] = {
-                "name": f"network_{self.prefix[id(circuit)]}",
-                "count": count,
-                "modes": {},
-                "n_x": net.n_x,
-                "n_u": net.n_u,
-                "bits": len(flags),
-                "physical_count": 0,
-                "arguments": arguments,
-            }
-            self._runtime_network_order.append(id(circuit))
-        elif (
-            descriptor["count"], descriptor["bits"], len(descriptor.get("arguments", ()))
-        ) != (count, len(flags), len(arguments)):
-            raise RuntimeError("C++ export: a circuit changed its generated netlist program")
+        descriptor = self._runtime_network(
+            circuit, count=count, bits=len(flags), physical_count=0,
+            parameters=tuple(f"value{index}" for index in range(len(arguments))),
+        )
 
         for encoded, roots in roots_by_mode.items():
             compiled = (
@@ -4178,33 +4135,35 @@ class _ModelGenerator:
 
     def structural_mode_values(
         self,
-    ) -> tuple[tuple[Any, tuple[_Expression, ...]], ...]:
-        """Return each circuit and its exact discrete-and-ratio mode values."""
+    ) -> tuple[tuple[Any, tuple[_Expression, ...], tuple[bool, ...]], ...]:
+        """Return circuit mode values and those which can change its state matrix."""
         modes = []
         for circuit in self.system.circuits:
             with self._netlist_symbols(circuit):
-                gates = {index: self._trace(gate)
-                         for index, gate in circuit.netlist._gates}
+                gates, conduction = self._gated_conduction(circuit.netlist)
                 values: list[_Expression] = []
+                stability: list[bool] = []
                 for switch in circuit.netlist._switches:
                     flag = self._switch_flag(switch)
                     if flag is None:
                         flag = self._trace(switch.closed)
                     if flag.code not in ("true", "false"):
                         values.append(flag)
-                for index, diode in enumerate(circuit.netlist._diodes):
-                    conducting = _Expression.of(diode.conducting)
-                    values.append(conducting | gates[index] if index in gates else conducting)
-                values.extend(gates[index] for index in gates)
+                        stability.append(True)
+                values.extend(conduction)
+                values.extend(gates.values())
+                stability.extend([True] * (len(conduction) + len(gates)))
                 for transformer in circuit.netlist._transformers:
                     if transformer.constant is None:
-                        values.extend(
+                        ratio = tuple(
                             _Expression.of(value)
                             for value in np.asarray(
                                 self._ratio_matrix(transformer), dtype=object
                             ).flat
                         )
-            modes.append((circuit, tuple(values)))
+                        values.extend(ratio)
+                        stability.extend([True] * len(ratio))
+            modes.append((circuit, tuple(values), tuple(stability)))
         return tuple(modes)
 
     def trace_circuit_commutation_margin(self, circuit: Any) -> str:
@@ -4223,11 +4182,8 @@ class _ModelGenerator:
                     return None
                 (_derivatives, _outputs, raw_margins, _projected,
                  _impulses, projection_changed) = values
-                gates = {index: self._trace(gate) for index, gate in net._gates}
-                margins = tuple(
-                    np.where(gates[index], math.inf, value) if index in gates else value
-                    for index, value in enumerate(raw_margins)
-                )
+                gates, effective = self._gated_conduction(net)
+                margins = _while_gated(gates, raw_margins, math.inf)
                 margin = math.inf
                 for diode in diodes:
                     index = net._diodes.index(diode)
@@ -4237,10 +4193,7 @@ class _ModelGenerator:
                     valid = _Expression.of(circuit._mirrored_valid)
                     changed = _Expression(f"!({valid.code})", "bool", pure=valid.pure)
                     for index in circuit._watched:
-                        effective = (_Expression.of(net._diodes[index].conducting)
-                                     | gates[index] if index in gates
-                                     else _Expression.of(net._diodes[index].conducting))
-                        changed |= effective != net._diodes[index].mirrored
+                        changed |= effective[index] != net._diodes[index].mirrored
                 elif net._switches or net._gates or any(
                         transformer.constant is None for transformer in net._transformers):
                     changed |= projection_changed != 0.0
@@ -4323,33 +4276,16 @@ class _ModelGenerator:
                     projected = list(states)
                     for local, position in enumerate(net.states):
                         projected[int(position)] = local_projected[local]
-                    gates = {index: self._trace(gate) for index, gate in net._gates}
-                    effective = tuple(
-                        (_Expression.of(diode.conducting) | gates[index]
-                         if index in gates else _Expression.of(diode.conducting))
-                        for index, diode in enumerate(net._diodes)
-                    )
-                    margins = tuple(
-                        np.where(gates[index], math.inf, value)
-                        if index in gates else value
-                        for index, value in enumerate(raw_margins)
-                    )
+                    gates, effective = self._gated_conduction(net)
+                    margins = _while_gated(gates, raw_margins, math.inf)
                     voltage_scale, current_scale = net._output_scales(outputs)
-                    raw_scales = tuple(
+                    scales = _while_gated(gates, tuple(
                         np.where(value, current_scale, voltage_scale) for value in effective
-                    )
-                    scales = tuple(
-                        np.where(gates[index], 0.0, value)
-                        if index in gates else value
-                        for index, value in enumerate(raw_scales)
-                    )
-                    impulses = tuple(
-                        np.where(gates[index], False, value != 0.0)
-                        if index in gates else value != 0.0
-                        for index, value in enumerate(raw_impulses)
+                    ), 0.0)
+                    impulses = _while_gated(
+                        gates, tuple(value != 0.0 for value in raw_impulses), False
                     )
                     tolerances = tuple(_MARGIN_RTOL * value for value in scales)
-                    conducting = tuple(diode.conducting for diode in net._diodes)
                     delta = tuple(value - previous
                                   for value, previous in zip(projected, states))
                     jump_loss = net._scalar_energy(delta)
@@ -4357,32 +4293,21 @@ class _ModelGenerator:
                         net._scalar_energy(projected) - net._scalar_energy(states)
                         + jump_loss
                     )
-                    if circuit._transforms:
-                        component = np.asarray(projected, dtype=object)
-                        for index, _transform, inverse in reversed(circuit._transforms):
-                            component[index] = inverse @ component[index]
-                        projected = component.tolist()
-                    return (tuple(projected), margins, tolerances, scales, impulses,
-                            effective, conducting, jump_loss, jump_supply)
-                switched = self._switched_jump(circuit, states)
-                if switched is None:
-                    impulses = net.impulse_flags(_Expression("t", "real"), states)
-                    projected, jump_loss, jump_supply = net.projected_jump(
-                        _Expression("t", "real"), states
-                    )
                 else:
-                    impulses = ()
-                    projected, jump_loss, jump_supply = switched
-                projected = list(projected)
-                margins, tolerances, scales = net.scalar_margins(
-                    _Expression("t", "real"), projected
-                )
-                gates = {index: self._trace(gate) for index, gate in net._gates}
-                effective = tuple(
-                    (_Expression.of(diode.conducting) | gates[index]
-                     if index in gates else _Expression.of(diode.conducting))
-                    for index, diode in enumerate(net._diodes)
-                )
+                    switched = self._switched_jump(circuit, states)
+                    if switched is None:
+                        impulses = net.impulse_flags(_Expression("t", "real"), states)
+                        projected, jump_loss, jump_supply = net.projected_jump(
+                            _Expression("t", "real"), states
+                        )
+                    else:
+                        impulses = ()
+                        projected, jump_loss, jump_supply = switched
+                    projected = list(projected)
+                    margins, tolerances, scales = net.scalar_margins(
+                        _Expression("t", "real"), projected
+                    )
+                    _gates, effective = self._gated_conduction(net)
                 conducting = tuple(diode.conducting for diode in net._diodes)
                 if circuit._transforms:
                     component = np.asarray(projected, dtype=object)
@@ -4752,18 +4677,9 @@ class _ModelGenerator:
             "and": 16, "or": 17, "select": 18,
         }
         methods = []
-        for circuit_id in self._runtime_network_order:
-            descriptor = self._runtime_networks[circuit_id]
-            arguments = (
-                [f"double value{index}" for index in range(len(descriptor["arguments"]))]
-                if "arguments" in descriptor else
-                [
-                    *(f"double x{index}" for index in range(descriptor["n_x"])),
-                    *(f"double u{index}" for index in range(descriptor["n_u"])),
-                    *(f"double du{index}" for index in range(descriptor["n_u"])),
-                ]
-            )
-            argument_names = [argument.split()[-1] for argument in arguments]
+        for descriptor in self._runtime_networks.values():
+            argument_names = list(descriptor["parameters"])
+            arguments = [f"double {name}" for name in argument_names]
             mode_keys = tuple(sorted(descriptor["modes"]))
             mode_count = len(mode_keys)
             physical_offsets, positions, physical_values = [0], [], []
@@ -5429,7 +5345,7 @@ class _CarrierModulatorGenerator:
         """Generate one topology-driven carrier-comparison implementation."""
         if isinstance(generator.bridge.modulator, ZOH):
             return ""
-        hold = generator._hold()
+        generator._hold()  # validates the single held bridge command
         values = tuple(f"q[{index}]" for index in range(generator.bridge.modulation_width))
         encoded = generator._topology_expression(generator.topology.switching_state, values)
         q_kind = _CPP_TYPES[_Expression.of(generator.topology.zero).kind]
@@ -6843,7 +6759,7 @@ class _ProtectionGenerator:
         return [
             f"const bool tripped_now = {self.m('sampled_trip_due')};",
             f"if (tripped_now) {{ {self.m('sampled_trip_due')} = false; "
-            f"apply_trip_{self.tag}(); }}",
+            f"apply_trip_{self.tag}(t); }}",
         ]
 
     @cached_property
@@ -6857,10 +6773,10 @@ class _ProtectionGenerator:
 
     def actuate_method(self) -> str:
         """Apply a sampled trip for a continuous converter."""
-        return f'''bool actuate_{self.tag}(double) {{
+        return f'''bool actuate_{self.tag}(double t) {{
     if (!{self.m('sampled_trip_due')}) return false;
     {self.m('sampled_trip_due')} = false;
-    apply_trip_{self.tag}();
+    apply_trip_{self.tag}(t);
     return true;
 }}'''
 
@@ -6890,7 +6806,8 @@ class _ProtectionGenerator:
 
     def _trip_body(self) -> list[str]:
         link = self.model._equation_attributes(self.unit.dclink)["tripped"].code
-        lines = ([f"{self.m('startup_run')} = false;"] if self.ctrl is not None else []) + [
+        # Unit._shutdown: the controller takes the ordinary stop command, then the power stage opens.
+        lines = (self._controller_command_lines(False, 0.0) if self.ctrl is not None else []) + [
                  f"{self.m('gates')} = false;",
                  f"{self.m('breaker')} = false;"]
         if self.unit.branch_f is not None:
@@ -6988,7 +6905,8 @@ class _ProtectionGenerator:
             "overvoltage", "VOLTAGE_OVER", "hold_ov", "voltage_ov")]
         sampled += ["    return false;", "}"]
 
-        apply = [f"void apply_trip_{self.tag}() {{", *["    " + line for line in self._trip_body()], "}"]
+        apply = [f"void apply_trip_{self.tag}(double t) {{",
+                 *["    " + line for line in self._trip_body()], "}"]
         sections = [self._protection_helpers(), apply, sampled]
         if not sampled_only:
             current = f"obs_{_identifier(self.name + '.i_c')}"
@@ -7016,7 +6934,7 @@ class _ProtectionGenerator:
                 f"    if (!std::isfinite({first('overcurrent')})) {first('overcurrent')} = t;",
                 f"    alarm_{self.tag}(\"OVERCURRENT\");",
                 f"    latch_{self.tag}(t, \"overcurrent\", true);",
-                f"    apply_trip_{self.tag}();",
+                f"    apply_trip_{self.tag}(t);",
                 "    return true;",
                 "}",
             ]
@@ -8124,6 +8042,8 @@ class _CppGenerator:
         sync_body = "\n        ".join(model.body(derivatives=False))
         native_implicit = isinstance(self.simulation.solver, ImplicitSolver)
         structure = self.model.linear_structure()
+        # A custom model without an assembled partition factors its Newton matrix whole.
+        groups, interface = ((), ()) if structure is None else (structure.groups, structure.interface)
         circuit_plans = tuple(
             circuit._structure_plan for circuit in self.system.circuits
             if circuit._structure_plan is not None
@@ -8140,19 +8060,24 @@ class _CppGenerator:
         mode_size = 0
         mode_lines: list[str] = []
         mode_layout: dict[int, list[int]] = {}
+        stability_mode_layout: dict[int, list[int]] = {}
         stability_equations: dict[int, list[str]] = {}
         if uses_implicit_linearization:
             entries: list[str] = []
-            for circuit, mode_values in model.structural_mode_values():
+            for circuit, mode_values, stability_values in model.structural_mode_values():
                 positions = mode_layout[id(circuit.netlist)] = []
-                for value in mode_values:
+                stability_positions = stability_mode_layout[id(circuit.netlist)] = []
+                for value, affects_stability in zip(mode_values, stability_values):
                     code = model.solver_expression(value.code)
-                    positions.append(len(entries))
+                    selected = [len(entries)]
                     if value.kind == "complex":
                         entries.extend((f"std::real({code})", f"std::imag({code})"))
-                        positions.append(len(entries) - 1)
+                        selected.append(len(entries) - 1)
                     else:
                         entries.append(f"static_cast<double>({code})")
+                    positions.extend(selected)
+                    if affects_stability:
+                        stability_positions.extend(selected)
             mode_size = len(entries)
             if stiff_fallback:
                 stability_equations = {
@@ -8366,8 +8291,7 @@ class _CppGenerator:
                                            fixed_dt, adaptive_atol, adaptive_rtol, raw_projection_call,
                                            n_states=self.model.n_states,
                                            mode_size=mode_size,
-                                           groups=() if structure is None else structure.groups,
-                                           interface=() if structure is None else structure.interface)
+                                           groups=groups, interface=interface)
         elif fixed:
             step_code = _fixed_step(solver.method)
             if stiff_fallback:
@@ -8376,14 +8300,13 @@ class _CppGenerator:
                     fixed_dt, adaptive_atol, adaptive_rtol, raw_projection_call,
                     n_states=self.model.n_states,
                     mode_size=mode_size,
-                    groups=() if structure is None else structure.groups,
-                    interface=() if structure is None else structure.interface,
+                    groups=groups, interface=interface,
                 )
                 stability_code = _explicit_stability(solver.method, [
                     (
                         plan.circuit.n_states,
                         stability_equations[id(plan)],
-                        mode_layout[id(plan.circuit.netlist)],
+                        stability_mode_layout[id(plan.circuit.netlist)],
                     )
                     for plan in stability_plans
                 ])
