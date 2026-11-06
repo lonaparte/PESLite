@@ -815,7 +815,8 @@ class VSC(Unit):
             ),
             dc_voltage_error_pu=(
                 measurement.u_dc / self.cfg.dc_base.v
-                - self.cfg.ctrl.references.vdc_ref_pu
+                # Standalone controllers without a DC reference use the rated DC voltage.
+                - getattr(self.cfg.ctrl.references, "vdc_ref_pu", 1.0)
             ),
             startup_complete=self._startup_complete(output),
         )
