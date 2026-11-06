@@ -230,21 +230,18 @@ class FixedStepSolver:
                     self._mode_eigenvalues.popitem(last=False)
             else:
                 self._mode_eigenvalues.move_to_end(key)
-            for eigenvalue in eigenvalues:
-                scale = max(1.0, abs(eigenvalue))
-                if eigenvalue.real > 1e-12 * scale:
-                    continue
-                z = step * eigenvalue
-                stages = [1.0 + 0.0j]
-                for row in rows:
-                    stages.append(1.0 + z * sum(
-                        coefficient * value for coefficient, value in zip(row, stages)
-                    ))
-                amplification = 1.0 + z * sum(
-                    coefficient * value for coefficient, value in zip(weights, stages)
-                )
-                if abs(amplification) > 1.0 + 1e-10:
-                    return False
+            scale = np.maximum(1.0, np.abs(eigenvalues))
+            z = step * eigenvalues[eigenvalues.real <= 1e-12 * scale]
+            stages = [np.ones_like(z)]
+            for row in rows:
+                stages.append(1.0 + z * sum(
+                    coefficient * value for coefficient, value in zip(row, stages)
+                ))
+            amplification = 1.0 + z * sum(
+                coefficient * value for coefficient, value in zip(weights, stages)
+            )
+            if np.any(np.abs(amplification) > 1.0 + 1e-10):
+                return False
         return True
 
     def _stiff(self, step: float) -> bool:

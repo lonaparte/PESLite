@@ -89,6 +89,34 @@ def test_continuous_linear_modes_recheck_explicit_stability():
     assert model.builds == 2
 
 
+@pytest.mark.parametrize("method", ["euler", "heun", "RK4"])
+@pytest.mark.parametrize("step", [1e-4, 1e-2])
+def test_vectorized_stability_matches_the_scalar_tableau(method, step):
+    eigenvalues = np.array([-1.0, -100.0, -1.0 + 50.0j, -1.0 - 50.0j, 2.0])
+    solver = FixedStepSolver(step, method)
+    solver._mode_eigenvalues["mode"] = eigenvalues
+
+    _c, rows, weights = TABLEAUS[method]
+    expected = True
+    for eigenvalue in eigenvalues:
+        if eigenvalue.real > 1e-12 * max(1.0, abs(eigenvalue)):
+            continue
+        z = step * eigenvalue
+        stages = [1.0 + 0.0j]
+        for row in rows:
+            stages.append(1.0 + z * sum(
+                coefficient * value for coefficient, value in zip(row, stages)
+            ))
+        amplification = 1.0 + z * sum(
+            coefficient * value for coefficient, value in zip(weights, stages)
+        )
+        expected &= abs(amplification) <= 1.0 + 1e-10
+
+    assert solver._explicit_stable(
+        step, (("mode", lambda: np.empty((0, 0))),)
+    ) is bool(expected)
+
+
 def test_linear_model_view_projects_solver_metadata():
     class State(Bag):
         __slots__ = ("x",)

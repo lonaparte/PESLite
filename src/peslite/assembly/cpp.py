@@ -8064,17 +8064,22 @@ class _CppGenerator:
         stability_equations: dict[int, list[str]] = {}
         if uses_implicit_linearization:
             entries: list[str] = []
+
+            def entry(value: _Expression) -> tuple[int, ...]:
+                """Register one structural value and return its real-valued positions."""
+                code = model.solver_expression(value.code)
+                start = len(entries)
+                if value.kind == "complex":
+                    entries.extend((f"std::real({code})", f"std::imag({code})"))
+                else:
+                    entries.append(f"static_cast<double>({code})")
+                return tuple(range(start, len(entries)))
+
             for circuit, mode_values, stability_values in model.structural_mode_values():
                 positions = mode_layout[id(circuit.netlist)] = []
                 stability_positions = stability_mode_layout[id(circuit.netlist)] = []
                 for value, affects_stability in zip(mode_values, stability_values):
-                    code = model.solver_expression(value.code)
-                    selected = [len(entries)]
-                    if value.kind == "complex":
-                        entries.extend((f"std::real({code})", f"std::imag({code})"))
-                        selected.append(len(entries) - 1)
-                    else:
-                        entries.append(f"static_cast<double>({code})")
+                    selected = entry(value)
                     positions.extend(selected)
                     if affects_stability:
                         stability_positions.extend(selected)
