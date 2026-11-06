@@ -1,4 +1,4 @@
-# PESLite 0.5.0
+# PESLite 0.5.1
 """Voltage PI control-loop template using the shared sampled and continuous PI block."""
 
 from dataclasses import dataclass

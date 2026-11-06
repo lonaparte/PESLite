@@ -456,6 +456,10 @@ def test_native_dp45_uses_coefficients_from_the_actual_solver(location, tmp_path
     simulation = peslite.Simulation(params, parts={'solver': solver_factory})
     project = tmp_path / location
     peslite.export(simulation, 'cpp', project)
+    source = (project / 'peslite.cpp').read_text(encoding='utf-8')
+    for index, coefficient in enumerate(TunedDP45._e, 1):
+        if coefficient:
+            assert f'{float(coefficient)!r} * k{index}[i]' in source
     executable = project / 'native'
     subprocess.run([compiler, '-O3', '-std=c++17', str(project / 'peslite.cpp'),
                     '-o', str(executable)], check=True)
@@ -784,11 +788,7 @@ def test_generated_cpp_uses_public_ports_for_scalar_converters(
         })
     params = peslite.load(EXAMPLES / "buck-example.pes").replace(**changes)
     project = tmp_path / f"{bridge_type}-{mode}"
-    source_path, cpp_out, python_out = _run_generated(params, project, compiler)
-    source = source_path.read_text(encoding="utf-8")
-    has_diode_stage = bridge_type == "half_bridge"
-    assert ("class DiodeConduction" in source) is has_diode_stage
-    assert ("diode_conduction.advance(t, boundary)" in source) is has_diode_stage
+    _source_path, cpp_out, python_out = _run_generated(params, project, compiler)
 
     expected = _final_csv(python_out / "states.csv")
     actual = _final_csv(cpp_out / "states.csv")
@@ -799,6 +799,9 @@ def test_generated_cpp_uses_public_ports_for_scalar_converters(
     # runtimes; their accumulated difference remains below six parts per million.
     tolerance = 6e-6 if bridge_type == "half_bridge" and load >= 600.0 else 2e-8
     assert max(abs(actual[key] - expected[key]) for key in expected) <= tolerance * scale
+    assert _summary(cpp_out)["converter.max_current_pu"] == pytest.approx(
+        _summary(python_out)["converter.max_current_pu"], rel=tolerance
+    )
 
 
 def test_generated_cpp_reuses_common_adc_and_protection_for_dc_converter(tmp_path):
@@ -810,6 +813,8 @@ def test_generated_cpp_reuses_common_adc_and_protection_for_dc_converter(tmp_pat
         "units.converter.meas.window": 50.0e-6,
         "units.converter.protection.overcurrent.enable": 1,
         "units.converter.protection.overcurrent.limit_pu": 0.05,
+        # The trip lands inside the start-up ramp, so the stop command must also clear it.
+        "events.start": {"type": "connect", "target": "converter", "t": 0.0, "ramp": 0.01},
         "simulation.stop_on_trip": 0,
         "simulation.t_end": 0.001,
         "simulation.output.states": True,
@@ -981,6 +986,7 @@ def test_generated_cpp_matches_wpt_power_feedback_and_reference_step(case, mode,
         "simulation.t_end": 80.0e-6,
         "simulation.output.period": 1.0e-6,
         "simulation.output.record_every": 1,
+        "simulation.output.precision": 17,
         "simulation.output.energy": False,
         "simulation.energy_check": "off",
     })

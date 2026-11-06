@@ -867,12 +867,20 @@ class Simulation:
         for name, _subsystem in system.event_subsystems:
             if not values.keys().isdisjoint(self._states.read([name])):
                 self._continued.add(name)
-        # A commutating circuit must select its mode from the restored state before projection.
-        # Circuits without a commutation owner already have a defined initial topology.
-        for circuit in system.circuits:
+        # Select every initial command mode before any natural-commutation projection can
+        # change states shared with another circuit.
+        circuits = getattr(system, "circuits", ())
+        for circuit in circuits:
+            if circuit.netlist.has_discrete_topology:
+                circuit.initialize_mode()
+        # Natural-conduction circuits select their consistent diode pattern through the
+        # commutation dispatcher; every other circuit may project its prescribed initial mode.
+        for circuit in circuits:
             if not circuit.commutation_active:
                 circuit.consistent_state(t0)
-        system.refresh_circuit_plan()
+        refresh_circuit_plan = getattr(system, "refresh_circuit_plan", None)
+        if refresh_circuit_plan is not None:
+            refresh_circuit_plan()
         model_plan_changed = getattr(self.solver, "model_plan_changed", None)
         if model_plan_changed is not None:
             model_plan_changed()
@@ -955,7 +963,7 @@ class Simulation:
         progress_every = (t_final - t_start) / 100.0 if progress.enable else 0.0
         plant = Plant(mdl, self._apply_initial(t_start), project=project,
                       synchronize=diode_conduction.synchronize if diode_conduction.commutating else None,
-                      reconcile=system.reconcile_circuits)
+                      reconcile=getattr(system, "reconcile_circuits", None))
         if diode_conduction.commutating:
             plant.outputs(t_start)
         if project is not None:
@@ -1278,6 +1286,9 @@ class Simulation:
             if callable(report):
                 summary.update({f"{name}.{k}": v for k, v in report().items()})
         summary["tripped"] = int(any(unit.tripped for unit in units))
+        solver_notes = tuple(dict.fromkeys(getattr(solver, "notes", ())))
+        if solver_notes:
+            summary["solver_notes"] = list(solver_notes)
         summary["t_start"] = t_start
         summary["t_stop"] = rec.last_t if rec.last_t is not None else t_start
         if termination == "completed" and summary["t_stop"] < t_final - TIME_EPS:
@@ -1731,6 +1742,11 @@ _BRIDGE_PRESETS = {"switching": ("fixed", "RK4"), "pwm_averaging": ("fixed", "RK
                    "averaging": ("adaptive", "DP45")}
 
 
+def _command_parser(*args, **kwargs) -> argparse.ArgumentParser:
+    """Build a command parser with exact, stable option names."""
+    return argparse.ArgumentParser(*args, allow_abbrev=False, **kwargs)
+
+
 def _add_configuration_arguments(ap: argparse.ArgumentParser, *, optional: bool = False) -> None:
     ap.add_argument("config", nargs="?" if optional else None,
                     help="simulation file path or bundled example name"
@@ -1811,7 +1827,7 @@ def _load_command_params(args, extra_overrides: Mapping[str, Any] | None = None
 
 def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
     """Run a simulation file and save its states, summary and configured signals."""
-    ap = argparse.ArgumentParser(
+    ap = _command_parser(
         prog=prog, description=_run_main.__doc__,
         epilog="commands: run, create, validate, inspect, export; a simulation file without a command implies run",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1989,7 +2005,7 @@ def _open_file(path: Path) -> None:
 
 def _create_main(argv=None) -> int | _CommandOutcome:
     """Create a simulation file or project add-on from a bundled template."""
-    ap = argparse.ArgumentParser(prog="peslite create", description=_create_main.__doc__)
+    ap = _command_parser(prog="peslite create", description=_create_main.__doc__)
     ap.add_argument("name", help="file name to create (.pes or .py)")
     ap.add_argument("--open", action="store_true",
                     help="open the created file with the configured editor or default application")
@@ -2036,7 +2052,7 @@ def _create_main(argv=None) -> int | _CommandOutcome:
 
 def _validate_main(argv=None) -> int | _CommandOutcome:
     """Validate and assemble one configuration without running it."""
-    ap = argparse.ArgumentParser(prog="peslite validate", description=_validate_main.__doc__)
+    ap = _command_parser(prog="peslite validate", description=_validate_main.__doc__)
     _add_configuration_arguments(ap)
     ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
     args = _parse_command_args(ap, argv)
@@ -2063,7 +2079,7 @@ def _validate_main(argv=None) -> int | _CommandOutcome:
 
 def _inspect_main(argv=None) -> int | _CommandOutcome:
     """Inspect parameters, states, electrical groups and the port-Hamiltonian structure without running."""
-    ap = argparse.ArgumentParser(prog="peslite inspect", description=_inspect_main.__doc__)
+    ap = _command_parser(prog="peslite inspect", description=_inspect_main.__doc__)
     _add_configuration_arguments(ap)
     ap.add_argument("--resolved", action="store_true", help="show the complete resolved configuration")
     ap.add_argument("--states", action="store_true", help="show the generated state names")
@@ -2111,7 +2127,7 @@ def _inspect_main(argv=None) -> int | _CommandOutcome:
 
 def _export_main(argv=None) -> int | _CommandOutcome:
     """Export a standalone C++ simulator or an Imperix ELF executable."""
-    ap = argparse.ArgumentParser(prog="peslite export", description=_export_main.__doc__)
+    ap = _command_parser(prog="peslite export", description=_export_main.__doc__)
     _add_configuration_arguments(ap)
     ap.add_argument("parameters", nargs="*", metavar="PARAM",
                     help="variable parameter path, common or all")

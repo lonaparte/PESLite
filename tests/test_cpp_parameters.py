@@ -147,6 +147,43 @@ def test_runtime_load_binding_is_shared_with_a_scheduled_set_event(at, tmp_path)
                                _table(python / "states.csv")[1], rtol=2e-8, atol=2e-8)
 
 
+def test_scheduled_events_share_runtime_dependencies_across_parameter_owners(tmp_path):
+    p = _case("gfl", "pwm_averaging").replace(**{
+        "units.vsc.protection.overcurrent.enable": False,
+        "units.vsc.protection.overcurrent.limit_pu": 1e-9,
+    })
+    p = p.replace(**{
+        "simulation.t_end": 0.001,
+        "simulation.energy_check": "off",
+        "events.retune": {"type": "set", "t": 0.0005, "set": {
+            "sources.grid.l": 1.2 * p.sources["grid"].l,
+            "units.vsc.ctrl.loops.CurrentLoop.bandwidth": 250.0,
+            "units.vsc.protection.hold": 0.01,
+            "units.vsc.protection.overcurrent.enable": True,
+        }},
+    })
+    binary = _compile(p, tmp_path / "model", ())
+    listed = subprocess.run([binary, "--list-params"], check=True, capture_output=True, text=True)
+    assert not listed.stdout.strip()
+    _compare_run(p, binary, {}, tmp_path / "run", rtol=2e-7, atol=2e-7)
+
+
+def test_scheduled_event_rejects_a_changed_network_specialization(tmp_path):
+    p = _case("gfl", "pwm_averaging").replace(**{
+        "simulation.t_end": 2e-4,
+        "simulation.energy_check": "off",
+        "events.remove_resistance": {
+            "type": "set", "t": 1e-4, "set": {"sources.grid.r": 0.0},
+        },
+    })
+    binary = _compile(p, tmp_path / "model", ())
+    result = subprocess.run(
+        [binary, "--out", tmp_path / "run"], capture_output=True, text=True
+    )
+    assert result.returncode == 1
+    assert "changed structural specialization" in result.stderr
+
+
 @pytest.mark.parametrize("name, unit, reference", [
     ("buck", "converter", {"voltage": 12.0}),
     ("gfl", "vsc", {"vdc_ref_pu": 1.02}),
@@ -157,9 +194,11 @@ def test_initial_control_events_match_direct_configuration_and_python(
         name, unit, reference, mode, variables, tmp_path):
     changes = {f"units.{unit}.ctrl.references.{key}": value for key, value in reference.items()}
     changes[f"units.{unit}.ctrl.loops.DCVoltageControl.ki"] = 160.0
+    changes[f"units.{unit}.protection.overcurrent.enable"] = False
     p = _case(name, mode).replace(**{
         "simulation.t_end": 0.001,
         "simulation.energy_check": "off",
+        f"units.{unit}.protection.overcurrent.limit_pu": 1e-9,
         "events.initial_control": {"type": "set", "t": 0.0, "set": changes},
     })
     binary = _compile(p, tmp_path / "model", variables)
@@ -428,6 +467,10 @@ def test_omitted_primitive_keeps_the_compiled_structure(name, path, changed_valu
     binary = _compile(params, tmp_path / "model", (selection,))
     baseline = subprocess.run([binary, "--set", f"{path}=0", "--out", tmp_path / "zero"],
                               capture_output=True, text=True)
+    if selection == "common":
+        assert baseline.returncode == 1
+        assert "is not variable" in baseline.stderr
+        return
     assert baseline.returncode == 0
     changed = subprocess.run([binary, "--set", f"{path}={changed_value}", "--out", tmp_path / "changed"],
                              capture_output=True, text=True)
@@ -494,8 +537,26 @@ def test_finite_bridge_parameters_use_the_shared_native_equations(name, mode, se
     p = p.replace(**changes)
     binary = _compile(p, tmp_path / "model", (selection,))
     unit = names[0]
-    _compare_run(p, binary, {f"units.{unit}.bridge.parallel_capacitance": 1.2e-5,
-                             f"units.{unit}.bridge.on_resistance": 1.1}, tmp_path / "run")
+    runtime = ({f"units.{unit}.bridge.parallel_capacitance": 1.2e-5,
+                f"units.{unit}.bridge.on_resistance": 1.1}
+               if selection == "all" else {})
+    _compare_run(p, binary, runtime, tmp_path / "run")
+
+
+def test_fixed_finite_bridge_uses_the_compiled_structural_modes(tmp_path):
+    p = _case("gfl", "switching").replace(**{
+        "simulation.t_end": 30e-6,
+        "simulation.solver.dt": 0.25e-6,
+        "simulation.output.period": 0.25e-6,
+        "simulation.output.record_every": 1,
+        "simulation.output.energy": False,
+        "simulation.energy_check": "off",
+        "units.vsc.bridge.parallel_capacitance": 1e-5,
+        "units.vsc.bridge.on_resistance": 1.0,
+        "units.vsc.protection.overcurrent.enable": False,
+    })
+    binary = _compile(p, tmp_path / "model", ())
+    _compare_run(p, binary, {}, tmp_path / "run", rtol=2e-9, atol=2e-9)
 
 
 def test_parameter_selection_rejects_structural_paths_before_writing(tmp_path):

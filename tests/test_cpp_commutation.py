@@ -220,7 +220,9 @@ def test_generic_commutation_locates_plateaus_and_resets_complex_states(adaptive
     tree['simulation'].update(energy_check='off')
     tree['simulation']['solver'].update(dt=.08, type='adaptive' if adaptive else 'fixed',
                                         method='DP45' if adaptive else 'rk4', max_step=.08)
-    tree['simulation']['output'].update(period=.1, states=True)
+    # Do not sample exactly at the end of a valid zero-margin plateau: either side of the
+    # discontinuity is solver-roundoff dependent, while the located transition is not.
+    tree['simulation']['output'].update(period=.11, states=True)
     params = from_dict(tree)
     parts = {'system': _reset_system}
     simulation = peslite.Simulation(params, parts=parts)

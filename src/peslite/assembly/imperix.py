@@ -91,7 +91,7 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
         ]
 
     def _trip_body(self):
-        return [f"{self.m('startup_run')} = false;"]
+        return self._controller_command_lines(False, 0.0)
 
     def header(self):
         startup = self.ctrl.startup
@@ -599,7 +599,9 @@ def _export_imperix(simulation, out_dir, name, variables, reusable, *,
     if missing := set(event_targets) - runtime.by_path.keys():
         raise ValueError("Imperix event target variables must remain tunable: "
                          + ", ".join(sorted(missing)))
-    model = model if model is not None else _ModelGenerator(prepared, runtime)
+    model = model if model is not None else _ModelGenerator(
+        prepared, runtime, zoh_initial=generator.zoh_initial
+    )
     bindings, adc, clocks, timing, phase, assigned = _bindings(
         prepared, config, model, events=simulation.p.changes)
     period = timing["interrupt_period"]

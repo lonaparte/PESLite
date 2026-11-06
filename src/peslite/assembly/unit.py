@@ -96,12 +96,9 @@ class Unit(ABC):
         self.name, self.cfg, self.bus = name, cfg, bus
         if bus is None:
             self._bus_voltage_field, self._bus_voltage = None, None
-        elif bus.voltage_field == "voltage":
-            self._bus_voltage_field = bus.voltage_field
-            self._bus_voltage = lambda: bus.port.voltage
         else:
             self._bus_voltage_field = bus.voltage_field
-            self._bus_voltage = lambda: bus.output.u
+            self._bus_voltage = lambda: getattr(bus.output, bus.voltage_field)
         self._current_channel = unit_type(cfg.type).current_channel
         self.scenario = Scenario(cfg.events, f"units.{name}", initial=cfg.connected)
         self.dclink = _parameterized(lambda c: make_dclink(c.dclink), cfg)
@@ -311,18 +308,23 @@ class Unit(ABC):
         elif self.branch_f is None:
             self._set_gates(effective and self.bridge.on)
 
-    def retune(self, cfg: Any, paths: list[str], t: float) -> None:
+    def retune(self, cfg: Any, paths: list[str], t: float) -> bool:
+        """Apply unit parameters and report whether the electrical network changed."""
+        network_changed = False
         if any(path.startswith("protection.") for path in paths):
             self.protection.retune(cfg.protection)
         self.cfg = cfg
         if any(path.startswith("dclink.source.") for path in paths):
             source = cfg.dclink.source
-            self.dclink.retune_source(source.i, source.k, source.v, source.r)
+            network_changed = self.dclink.retune_source(
+                source.i, source.k, source.v, source.r
+            )
         rest = [path for path in paths if not path.startswith(("dclink.", "protection."))]
         if rest:
             if self.ctrl is None:
                 raise ValueError(f"{self.name}: no controller to retune")
             self.ctrl.retune(cfg, rest, t)
+        return network_changed
 
     def trip(self, t: float, cause: str, plant: Optional[Plant] = None,
              detail: str = "") -> None:
@@ -395,6 +397,7 @@ class Unit(ABC):
                else self.bridge.fast_edge(t))
         if self.tripped or not due:
             return False
+        plant.outputs(t)
         if not self.protection.check_fast(t, self._protection_currents()):
             return False
         event = self.protection.trip
@@ -842,7 +845,7 @@ class DCConverter(Unit):
             phases=1,
             unilateral=self.bridge.diode_blocks_reverse_current(),
         ), cfg.filter)
-        controlled = getattr(topology, "controlled", True)
+        controlled = topology.controlled
         self._blocked_warned = False
         self._external_lower_rail = getattr(topology, "external_port", None) == "lower_rail"
         if self._external_lower_rail and self.branch_f is not None:

@@ -22,7 +22,7 @@ from numpy.typing import NDArray
 
 from ..solver.model import (Bag, ConfigError, _complex, _component_plan, _dependency_plan,
                             _real, gather, scatter)
-from ..solver.energy import Port, port_power
+from ..solver.energy import Port
 from ..solver.timing import control_clock_offset
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,

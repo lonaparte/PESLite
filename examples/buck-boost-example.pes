@@ -1,4 +1,4 @@
-# PESLite 0.5.0
+# PESLite 0.5.1
 # Closed-loop Buck-Boost application using one open DCConverter. The half bridge exposes its lower
 # rail as the negative output, while the filter inductor connects the midpoint to the common point.
 # The upper controlled device charges the inductor from the input; the lower diode transfers its

@@ -13,7 +13,7 @@ stages never cross a model-changing boundary.
 | Value | Implementation |
 |---|---|
 | `device` | netlist primitives compiled into direct scalar device equations |
-| `statewise` | the same netlist compiled to a dense state equation for each circuit mode |
+| `statewise` | the same netlist compiled to a state equation for each circuit mode |
 | `nodal` | the same netlist solved as a sparse, factorized modified nodal system |
 
 ```yaml
@@ -28,8 +28,9 @@ The default is `device`. Electrical components declare R, L, C, source, transfor
 primitives; controls remain in the sampled control graph. A component law without an instantaneous
 primitive representation connects to the same network through a behavioral voltage or current port.
 All three circuit models work with explicit and implicit time integrators.
-For explicit integration of small circuits, `device` usually has the lowest per-stage overhead;
-`statewise` and `nodal` are selected for their network formulation rather than assumed speedups.
+For explicit integration of small circuits, `device` usually has the lowest per-stage overhead.
+Larger numeric circuits retain sparse factors and derive stage dependencies from the network
+structure instead of symbolically eliminating the whole network.
 Assembly builds the dependency order, algebraic-loop SCCs, electrical state partition, exact
 Jacobian columns and mode signature once; Python simulation and C++ export reuse that plan.
 
@@ -53,9 +54,11 @@ exactly at scheduled boundaries. Fixed implicit methods use `rtol` and `atol` fo
 RK4 is the normal starting point for `switching` and `pwm_averaging`. Reduce `dt` until important
 outputs and event responses are insensitive to further reduction.
 
-Before a fixed explicit step, Python and generated C++ check the present linear circuit mode against
-that method's stability region. A mode outside the region uses fixed Radau for that interval; this
-preserves the configured step grid without explicit-step divergence during stiff commutation.
+Before a fixed explicit step, Python and generated C++ check each present circuit matrix against
+that method's stability region. The check uses the exact switch, diode and transformer-ratio mode;
+an unstable mode uses fixed Radau for that interval without changing the configured step grid.
+Repeated matrix structures are decomposed into strongly connected state blocks, and unchanged
+block spectra are reused without approximating the stability decision.
 
 ## Adaptive solvers
 
@@ -84,6 +87,10 @@ near zero. Smaller tolerances generally increase accepted steps and RHS evaluati
 limits how far the solver may advance even when the error estimate would permit more. Defaults are
 `rtol: 1e-6`, `atol: 1e-9`, `max_step: .inf` and `warm_start: 1` (reuse the last step size).
 
+Python adaptive solvers check commutation margins after every accepted internal step, so diode
+circuits do not require a finite `max_step`. `BDF` and `LSODA` report a solver note when the current
+circuit contains lightly damped modes; the note is also stored in `summary.json`.
+
 Adaptive DP45 is the normal starting point for ideal `averaging`, where no PWM time grid forces
 small intervals. Sampled modes are supported with adaptive integration, but the solver still stops
 at every controller, register and switching boundary, which can remove much of the adaptive-speed
@@ -99,10 +106,9 @@ values for solver type or method take priority over them.
 
 A solver is called only for the interval presented by `Simulation`; shared `settle()` and
 `parameters_changed()` hooks are described under [Custom solvers](Extending-PESLite.md#custom-solvers).
-Built-in solvers also provide `advance(f, t0, t1, y0, max_step=...)`, which lets a physical
-subsystem request a local resolution limit without changing the configured solver step. When a
-user solver provides only the callable interface, the diode-conduction stage enforces such a limit
-by dividing the requested interval before calling it.
+Built-in solvers also provide `advance(f, t0, t1, y0, max_step=...)` and an accepted-step
+`advance_guarded(...)` interface used to locate state-dependent boundaries. A user solver without
+accepted-step observation must use a finite local limit for commutation detection.
 
 ## Energy checks and diagnostics
 

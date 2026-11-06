@@ -1,4 +1,4 @@
-# PESLite 0.5.0
+# PESLite 0.5.1
 """Series R-L component template; resistance is in ohm and inductance is in H."""
 
 from dataclasses import dataclass

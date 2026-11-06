@@ -40,9 +40,8 @@ class DiodeConduction:
     The margin is checked against the state *after* every probe interval, so a margin which an
     outer event (a bridge edge, a register load) makes negative at the start of an interval is
     handled exactly like one which crosses zero inside it. Between commutations the model is
-    smooth and the solver keeps its order. The probe interval is the fixed step ``dt`` or, for an
-    adaptive solver, its ``max_step``, which must then be finite: the checks must not depend on how
-    far apart the outer events (output, control and PWM instants) happen to be.
+    smooth and the solver keeps its order. Built-in solvers observe the guard at their own accepted
+    steps; a user solver without that interface needs a finite local check interval.
     """
 
     def __init__(self, model: Any, solver: Any = None) -> None:
@@ -95,13 +94,16 @@ class DiodeConduction:
         if self.located and solver is not None:
             dt = getattr(solver, "dt", None)
             probe = dt if dt is not None and dt > 0.0 else getattr(solver, "max_step", math.inf)
-            if not math.isfinite(probe) or probe <= 0.0:
+            if math.isfinite(probe) and probe > 0.0:
+                self._probe = float(probe)
+            elif not callable(getattr(solver, "advance_guarded", None)):
                 raise ConfigError(
-                    "simulation.solver.max_step must be finite with an adaptive solver: it is the "
+                    "simulation.solver.max_step must be finite with this solver: it is the "
                     "interval at which commutating subsystems "
                     f"{sorted(model.name_of(sub) for sub in self.commutating)} are checked"
                 )
-            self._probe = float(probe)
+        guarded = getattr(solver, "advance_guarded", None)
+        self._guarded_advance = guarded if callable(guarded) else None
         validate = getattr(solver, "validate_local_step", None)
         if validate is not None:
             validate(self.resolution_subsystems)
@@ -140,7 +142,7 @@ class DiodeConduction:
         end = t1 - commutation_tolerance(t1)
         stalled = 0
         while t < end:
-            guarded_advance = getattr(self.solver, "advance_guarded", None)
+            guarded_advance = self._guarded_advance
             if initial_guarded is None:
                 guarded, located = self._guard_plan(state)
             else:
@@ -246,7 +248,8 @@ class DiodeConduction:
         for subsystem in self._topology_owners:
             subsystem.freeze_topology()
         try:
-            return self.solver.advance_guarded(
+            assert self._guarded_advance is not None
+            return self._guarded_advance(
                 self.model.rhs, t0, t1, state,
                 lambda t, y: self._margin(t, y, guarded, located),
                 max_step=maximum_step,

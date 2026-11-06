@@ -17,7 +17,7 @@ from ..solver.energy import Port, StoragePort
 from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _complex, _real
 
 __all__ = [
-    "Port", "ACVoltageSource", "RLBranch", "RCNode", "register_component_type",
+    "Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode", "register_component_type",
     "element_buses", "Load", "Resistor", "VoltageSource",
 ]
 
@@ -47,6 +47,7 @@ class NetworkComponent:
 
 
 NetworkComponent.rhs._peslite_device_adapter = True
+NetworkComponent.set_outputs._peslite_device_adapter = True
 
 
 def _phase_convention(phases: int, initial: complex | float = 0.0):
@@ -89,7 +90,6 @@ class RLBranch(NetworkComponent):
     state_names: ClassVar[tuple[str, ...]] = ("i",)
     outputs_need_inputs: ClassVar[bool] = False
     netlist_jumps: bool = False
-    conditional_equation_states: ClassVar[frozenset[str]] = frozenset(("breaker_open",))
     def __init__(self, L: float, R: float, i0: complex | float = 0j, *, phases: int = 3,
                  unilateral: bool = False) -> None:
         self.power_scale, self.zero, initial = _phase_convention(phases, i0)
@@ -131,10 +131,12 @@ class RLBranch(NetworkComponent):
         """Close the breaker; current resumes from zero after an opening."""
         self.breaker_open = False
 
-    def retune(self, L: float, R: float) -> None:
-        """Change inductance and resistance without changing the current state."""
+    def retune(self, L: float, R: float) -> bool:
+        """Change impedance without changing current; report a network change."""
+        changed = self.L != L or self.R != R
         self.L, self.R = L, R
         self.storage = (replace(self.storage[0], value=L),)
+        return changed
 
     def use_external_conduction(self) -> None:
         """Take derivative and copper-loss factor from a connected constitutive subsystem."""
@@ -169,7 +171,10 @@ class RLBranch(NetworkComponent):
         if self.external_conduction:
             branch = nb.add(nl.CurrentState(
                 nb.node(self.port1), nb.node(self.port2), nb.state(self, "i"),
-                nb.function(lambda _t: self.input.di_dt, ("di_dt",), states=("i",)),
+                nb.function(
+                    lambda _t: self.zero if self.breaker_open else self.input.di_dt,
+                    ("di_dt",), states=("i",),
+                ),
             ))
             nb.output(self, "i", ("branch_current", branch))
             if self.R:
@@ -202,6 +207,36 @@ class _NodeState(Bag):
 class _NodeOutput(Bag):
     __slots__ = ("u",)
 
+
+class Bus(NetworkComponent):
+    """A non-loading electrical connection point with a published voltage."""
+
+    state_names: ClassVar[tuple[str, ...]] = ()
+    voltage_field: ClassVar[str] = "u"
+    outputs_need_inputs: ClassVar[bool] = False
+    observer: ClassVar[bool] = True
+
+    def __init__(self, *, phases: int = 3) -> None:
+        self.power_scale, zero, _initial = _phase_convention(phases)
+        self.phases = phases
+        self.state = Empty()
+        self.input = Empty()
+        self.output = _NodeOutput(u=zero)
+        self.port: Port | None = Port(
+            self, "power", voltage=zero, current=zero,
+            scale=self.power_scale,
+            electrical_domain="ac" if phases == 3 else None,
+        )
+        self.ports = (self.port,)
+
+    def network(self, nb):
+        """Publish the voltage of the node joined to this bus."""
+        if self.port is None:
+            return NotImplemented
+        nb.node(self.port)
+        nb.port_output(self, "u", self.port, "voltage")
+
+
 class RCNode(NetworkComponent):
     """Node with a shunt capacitor ``C`` (F) in series with ``R_d`` (ohm) to ground.
 
@@ -227,10 +262,12 @@ class RCNode(NetworkComponent):
             "u_C", C, self.power_scale, ((self.port, "current", 1.0),)
         ),)
 
-    def retune(self, C: float, R_d: float) -> None:
-        """Change capacitance and damping resistance without changing voltage."""
+    def retune(self, C: float, R_d: float) -> bool:
+        """Change impedance without changing voltage; report a network change."""
+        changed = self.C != C or self.R_d != R_d
         self.C, self.R_d = C, R_d
         self.storage = (replace(self.storage[0], value=C),)
+        return changed
 
     def network(self, nb):
         """Declare the damping resistance and shunt capacitor."""
@@ -342,9 +379,10 @@ class Element:
     source is another subsystem output or a configured physical-output path resolved by assembly.
     Each binding joins a configured bus name to a :class:`Port`; one- and multi-port
     elements use the same interface. Optional ``breakers`` or ``connect()`` enable switching;
-    optional ``retune()`` enables runtime parameter changes. Optional ``series_connections()`` maps
-    a bus to an inlet bus: assembly moves the original voltage driver to that inlet, inserting a
-    two-port element before the bus's followers without adding an artificial energy-storage state.
+    optional ``retune()`` enables runtime parameter changes and returns whether its network
+    declaration changed. Optional ``series_connections()`` maps a bus to an inlet bus: assembly
+    moves the original voltage driver to that inlet, inserting a two-port element before the bus's
+    followers without adding an artificial energy-storage state.
     Optional ``parameter_bindings()`` maps retunable scalar fields to ``(subsystem, attribute)``
     pairs so native export uses the same parameters as Python, including energy equations.
     """
@@ -623,8 +661,10 @@ class _ConfiguredComponent(Element):
             outputs[f"{prefix}.current"] = port.current
         return outputs
 
-    def retune(self, cfg: Any) -> None:
+    def retune(self, cfg: Any) -> bool:
+        changed = self.cfg != cfg
         self.cfg = cfg
+        return changed
 
 
 def register_component_type(cls: type) -> type:
@@ -682,10 +722,10 @@ class Load(Element):
     def signals(self) -> dict[str, complex]:
         return {f"{self.name}.i": self.branch.output.i}
 
-    def retune(self, cfg: Any) -> None:
+    def retune(self, cfg: Any) -> bool:
         """Take new load parameters while preserving branch current."""
         self.cfg = cfg
-        self.branch.retune(cfg.l, cfg.r)
+        return self.branch.retune(cfg.l, cfg.r)
 
 
 class _ResistorOutput(Bag):
@@ -786,10 +826,12 @@ class Resistor(Element):
         return {f"{self.name}.i": self.resistor.output.i,
                 f"{self.name}.power": self.resistor.output.power}
 
-    def retune(self, cfg: Any) -> None:
+    def retune(self, cfg: Any) -> bool:
+        changed = self.cfg.r != cfg.r
         self.cfg = cfg
         for name, (subsystem, attribute) in self.parameter_bindings().items():
             setattr(subsystem, attribute, getattr(cfg, name))
+        return changed
 
 
 class _VoltageSourceOutput(Bag):
@@ -868,6 +910,8 @@ class VoltageSource(Element):
     def signals(self) -> dict[str, float]:
         return {f"{self.name}.i": self.source.output.i}
 
-    def retune(self, cfg: Any) -> None:
+    def retune(self, cfg: Any) -> bool:
+        changed = self.cfg.r != cfg.r
         self.cfg = cfg
         self.source.voltage, self.source.resistance = cfg.v, cfg.r
+        return changed

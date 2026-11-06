@@ -1,6 +1,7 @@
 """The solver kernel and its integration with the existing assembly layer."""
 
 import ast
+import cmath
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +29,7 @@ def test_fixed_explicit_solver_uses_implicit_step_for_an_unstable_linear_mode():
     class StiffMode:
         @staticmethod
         def linear_modes():
-            return (("stiff", np.array([[-1e8]])),)
+            return (("stiff", lambda: np.array([[-1e8]])),)
 
     solver = FixedStepSolver(1e-5, model=StiffMode())
     result = solver(lambda _t, y: -1e8 * y, 0.0, 1e-5, np.array([1.0]))
@@ -39,17 +40,17 @@ def test_fixed_explicit_solver_uses_implicit_step_for_an_unstable_linear_mode():
 
 def test_fixed_explicit_stability_is_reused_by_equation_mode():
     class Modes:
-        explicit_stability_dynamic = False
-        equation_revision = 0
         mode = "a"
-        checks = 0
+        builds = 0
 
         def linear_mode_key(self):
             return self.mode
 
         def linear_modes(self):
-            self.checks += 1
-            return ((self.mode, np.array([[-1.0]])),)
+            def build():
+                self.builds += 1
+                return np.array([[-1.0]])
+            return ((self.mode, build),)
 
     model = Modes()
     solver = FixedStepSolver(1e-5, model=model)
@@ -57,36 +58,196 @@ def test_fixed_explicit_stability_is_reused_by_equation_mode():
     state = np.array([1.0])
 
     solver(rhs, 0.0, 1e-5, state)
-    model.equation_revision += 1
     solver(rhs, 1e-5, 2e-5, state)
-    assert model.checks == 1
+    assert model.builds == 1
 
     model.mode = "b"
-    model.equation_revision += 1
     solver(rhs, 2e-5, 3e-5, state)
-    assert model.checks == 2
+    assert model.builds == 2
 
     solver.parameters_changed()
     solver(rhs, 3e-5, 4e-5, state)
-    assert model.checks == 3
+    assert model.builds == 3
 
 
 def test_continuous_linear_modes_recheck_explicit_stability():
     class DynamicMode:
-        explicit_stability_dynamic = True
-        equation_revision = 0
-        checks = 0
+        mode = 0
+        builds = 0
 
         def linear_modes(self):
-            self.checks += 1
-            return ((self.checks, np.array([[-1.0]])),)
+            def build():
+                self.builds += 1
+                return np.array([[-1.0]])
+            return ((self.mode, build),)
 
     model = DynamicMode()
     solver = FixedStepSolver(1e-5, model=model)
     state = np.array([1.0])
     solver(lambda _t, y: -y, 0.0, 1e-5, state)
+    model.mode = 1
     solver(lambda _t, y: -y, 1e-5, 2e-5, state)
-    assert model.checks == 2
+    assert model.builds == 2
+
+
+def test_stability_reuses_unchanged_strongly_connected_blocks(monkeypatch):
+    first = np.array([
+        [-2.0, 1.0, 0.0, 0.0],
+        [-1.0, -2.0, 0.0, 0.0],
+        [0.0, 0.0, -4.0, 2.0],
+        [0.0, 0.0, -2.0, -4.0],
+    ])
+    second = first.copy()
+    second[:2, :2] *= 1.5
+    calls = []
+    roots = []
+    eigvals = np.linalg.eigvals
+    sqrt = cmath.sqrt
+
+    def counted(matrix):
+        calls.append(matrix.copy())
+        return eigvals(matrix)
+
+    def counted_sqrt(value):
+        roots.append(value)
+        return sqrt(value)
+
+    monkeypatch.setattr(np.linalg, "eigvals", counted)
+    monkeypatch.setattr(cmath, "sqrt", counted_sqrt)
+    solver = FixedStepSolver(1e-5)
+    expected_first = eigvals(first)
+    expected_second = eigvals(second)
+    calls.clear()
+
+    actual_first = solver._eigenvalues(first)
+    assert tuple(solver._block_components.values()) == (None,)
+    solver._eigenvalues(first)
+    actual_second = solver._eigenvalues(second)
+    solver.parameters_changed()
+    solver._eigenvalues(second)
+
+    np.testing.assert_allclose(np.sort_complex(actual_first), np.sort_complex(expected_first))
+    np.testing.assert_allclose(np.sort_complex(actual_second), np.sort_complex(expected_second))
+    assert len(calls) == 1
+    assert len(roots) == 3
+    assert len(solver._block_eigenvalues) == 3
+
+
+@pytest.mark.parametrize("example", ["gfl-example", "wpt-lcc-example"])
+def test_explicit_stability_and_linearization_share_the_exact_circuit_matrix(example):
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / f"{example}.pes",
+        **QUIET,
+        **{"simulation.solver.circuit_model": "device"},
+    ))
+
+    modes = simulation.system.model.linear_modes()
+    blocks = simulation.system.model.linear_blocks()
+
+    assert len(modes) == len(blocks)
+    for (_key, build), (_positions, matrix, _exact, _skipped) in zip(modes, blocks):
+        np.testing.assert_array_equal(build(), matrix)
+
+
+@pytest.mark.parametrize("method", ["euler", "heun", "RK4"])
+@pytest.mark.parametrize("step", [1e-4, 1e-2])
+def test_vectorized_stability_matches_the_scalar_tableau(method, step):
+    eigenvalues = np.array([-1.0, -100.0, -1.0 + 50.0j, -1.0 - 50.0j, 2.0])
+    solver = FixedStepSolver(step, method)
+    solver._mode_eigenvalues["mode"] = eigenvalues
+
+    _c, rows, weights = TABLEAUS[method]
+    expected = True
+    for eigenvalue in eigenvalues:
+        if eigenvalue.real > 1e-12 * max(1.0, abs(eigenvalue)):
+            continue
+        z = step * eigenvalue
+        stages = [1.0 + 0.0j]
+        for row in rows:
+            stages.append(1.0 + z * sum(
+                coefficient * value for coefficient, value in zip(row, stages)
+            ))
+        amplification = 1.0 + z * sum(
+            coefficient * value for coefficient, value in zip(weights, stages)
+        )
+        expected &= abs(amplification) <= 1.0 + 1e-10
+
+    assert solver._explicit_stable(
+        step, (("mode", lambda: np.empty((0, 0))),)
+    ) is bool(expected)
+
+
+def test_linear_model_view_projects_solver_metadata():
+    class State(Bag):
+        __slots__ = ("x",)
+
+    class Decay:
+        state_names = ("x",)
+        outputs_need_inputs = False
+
+        def __init__(self, rate):
+            self.rate = rate
+            self.state, self.input, self.output = State(x=1.0), Empty(), Empty()
+
+        def set_outputs(self, _t):
+            pass
+
+        def rhs(self, _t):
+            return (-self.rate * self.state.x,)
+
+    matrix = np.diag([-2.0, -4.0])
+    model = Model(
+        {"first": Decay(2.0), "second": Decay(4.0)}, {},
+        linear_mode_key=lambda: "mode",
+        linear_blocks=lambda: ((np.array([0, 1]), matrix, np.array([0, 1]), np.array([0, 1])),),
+        linear_modes=lambda: (("mode", lambda: matrix),),
+    )
+    view = model.linear_view(np.array([False, True]))
+
+    block, = view.linear_blocks()
+    mode, = view.linear_modes()
+    np.testing.assert_array_equal(block[0], [0])
+    np.testing.assert_array_equal(block[1], [[-4.0]])
+    np.testing.assert_array_equal(block[2], [0])
+    np.testing.assert_array_equal(block[3], [0])
+    assert mode[0] == "mode"
+    np.testing.assert_array_equal(mode[1](), [[-4.0]])
+    assert view.linear_mode_key() == "mode"
+
+
+def test_custom_inner_explicit_method_uses_the_projected_stability_model():
+    class State(Bag):
+        __slots__ = ("x",)
+
+    class Decay:
+        state_names = ("x",)
+        outputs_need_inputs = False
+
+        def __init__(self, rate):
+            self.rate = rate
+            self.state, self.input, self.output = State(x=1.0), Empty(), Empty()
+
+        def set_outputs(self, _t):
+            pass
+
+        def rhs(self, _t):
+            return (-self.rate * self.state.x,)
+
+    matrix = np.diag([-1.0, -1e5])
+    model = Model(
+        {"slow": Decay(1.0), "stiff": Decay(1e5)}, {},
+        linear_mode_key=lambda: "mode",
+        linear_blocks=lambda: ((np.array([0, 1]), matrix, np.array([0, 1]), np.array([0, 1])),),
+        linear_modes=lambda: (("mode", lambda: matrix),),
+    )
+    solver = MultirateSolver(
+        model, {"stiff": {"step": 1, "method": "heun"}}, 1e-3, "RK4", sweeps=2
+    )
+    result = solver(model.rhs, 0.0, 1e-3, np.ones(2))
+
+    assert solver._inner_solver._implicit is not None
+    assert np.all(np.isfinite(result.y))
+    assert abs(result.y[1]) < 0.1
 
 
 @pytest.mark.full
@@ -117,6 +278,59 @@ def test_make_solver_builds_the_configured_integrator():
         configured = settings.__class__(**{**vars(settings), "subsystems": subsystems})
         with pytest.raises(ValueError, match="share one ratio"):
             make_solver(configured, model)
+
+
+@pytest.mark.full
+@pytest.mark.parametrize("method", ["radau", "trapezoidal"])
+def test_a_stiff_inner_group_can_use_an_implicit_method(method, tmp_path):
+    common = {
+        **QUIET,
+        "elements.cable1.sections": 8,
+        "elements.cable1.length_km": 5.0,
+        "simulation.t_end": 0.002,
+    }
+    reference = peslite.Simulation(peslite.load(
+        EXAMPLES / "cable-gfl-example.pes",
+        **common,
+        **{
+            "simulation.solver.type": "adaptive",
+            "simulation.solver.method": "radau",
+            "simulation.solver.rtol": 1e-10,
+            "simulation.solver.atol": 1e-10,
+        },
+    )).run(out_dir=tmp_path / "reference").final_states()
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "cable-gfl-example.pes",
+        **common,
+        **{"simulation.solver.subsystems": {
+            "cable1": {"step": 1, "method": method},
+        }},
+    ))
+    result = simulation.run(out_dir=tmp_path / "split")
+
+    assert isinstance(simulation.solver, MultirateSolver)
+    assert simulation.solver.inner_method == method
+    assert not result.tripped
+    assert result.summary["t_stop"] == pytest.approx(0.002)
+    actual = result.final_states()
+    assert max(
+        abs(actual[name] - value) / max(1.0, abs(value))
+        for name, value in reference.items()
+    ) < 3e-2
+
+
+def test_one_inner_group_uses_one_method():
+    params = peslite.load(EXAMPLES / "gfl-example.pes")
+    model = peslite.System(params).model
+    with pytest.raises(ValueError, match="share one method"):
+        MultirateSolver(
+            model,
+            {
+                "pcc": {"step": 1, "method": "radau"},
+                "vsc.branch_f": {"step": 1, "method": "trapezoidal"},
+            },
+            25e-6,
+        )
 
 
 def test_fixed_step_combination_uses_the_registered_tableau_weights(monkeypatch):
@@ -170,6 +384,40 @@ def test_fixed_solver_observes_a_guard_inside_its_internal_step_loop():
     assert result.y[0] == pytest.approx(0.6)
     # Six complete RK4 steps and only the first stage of the next step are needed.
     assert ramp.calls == result.n_rhs == 25
+
+
+def test_stiff_fixed_solver_uses_the_full_guard_at_the_interval_end():
+    class State(Bag):
+        __slots__ = ("x",)
+
+    class Decay:
+        state_names = ("x",)
+        outputs_need_inputs = False
+
+        def __init__(self):
+            self.state, self.input, self.output = State(x=1.0), Empty(), Empty()
+
+        def set_outputs(self, _t):
+            pass
+
+        def rhs(self, _t):
+            return (-1e5 * self.state.x,)
+
+    matrix = np.array([[-1e5]])
+    model = Model(
+        {"decay": Decay()}, {},
+        linear_blocks=lambda: ((np.array([0]), matrix, np.array([0]), np.array([0])),),
+        linear_modes=lambda: (("mode", lambda: matrix),),
+    )
+    result = FixedStepSolver(1e-3, "heun", model=model).advance_guarded(
+        model.rhs, 0.0, 1e-3, np.ones(1),
+        lambda t, _y: 5e-4 - t,
+        synchronized_guard=lambda _t, _y: 1.0,
+    )
+
+    assert result.crossed
+    assert result.t == pytest.approx(1e-3)
+    assert result.margin < 0.0
 
 
 def test_model_automatically_solves_an_algebraic_output_loop():
@@ -306,3 +554,35 @@ def test_solver_kernel_does_not_import_application_layers():
                 if target:
                     imported.add(target[0])
         assert not imported.intersection(forbidden), f"{path.name} imports {sorted(imported & forbidden)}"
+
+
+def test_multistep_methods_report_lightly_damped_circuit_modes(tmp_path):
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "gfl-example.pes",
+        **QUIET,
+        **{
+            "simulation.t_end": 5e-4,
+            "simulation.solver.type": "adaptive",
+            "simulation.solver.method": "BDF",
+        },
+    ))
+    with pytest.warns(RuntimeWarning, match="lightly damped circuit modes"):
+        result = simulation.run(out_dir=tmp_path)
+    assert "lightly damped" in " ".join(result.summary["solver_notes"])
+
+
+@pytest.mark.full
+def test_device_equations_follow_commands_changed_at_a_commutation(tmp_path):
+    counts = {}
+    for circuit_model in ("device", "statewise"):
+        params = peslite.load(EXAMPLES / "wpt-scc-example.pes", **QUIET, **{
+            "simulation.solver.circuit_model": circuit_model,
+            "simulation.t_end": 1e-4,
+            "simulation.solver.subsystems": {},
+            "simulation.solver.type": "fixed",
+            "simulation.solver.method": "RK4",
+            "simulation.energy_check": "off",
+        })
+        result = peslite.Simulation(params).run(out_dir=tmp_path / circuit_model)
+        counts[circuit_model] = result.n_rhs
+    assert counts["device"] == counts["statewise"]

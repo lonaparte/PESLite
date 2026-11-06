@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1
+
+- Unified exact circuit-mode stability checks across Python, C++ and all circuit models, corrected
+  native dense-LU pivoting and identifier substitution, and added accepted-step commutation checks.
+- Reused sparse network factors, low-rank transformer-ratio updates, output rows, structural stage
+  dependencies and impulse analysis while keeping small network solves dense.
+- Allowed a multirate inner group to select one implicit or adaptive method, refreshed device
+  equations after same-boundary command changes and reported multistep solver notes.
+
 ## 0.5.0
 
 - Added `run`, `validate`, `inspect` and `export` commands with a shared strict JSON result envelope,

@@ -652,7 +652,7 @@ class UnitParams:
         return self.base.dc(self.dclink.vdc_ref)
 
 
-def _unit_items(units: Mapping[str, UnitParams], *, leaves_only: bool = True,
+def _unit_items(units: _Mapping[str, UnitParams], *, leaves_only: bool = True,
                 prefix: str = ""):
     """Iterate the configured unit tree without storing a second flattened mapping."""
     for name, unit in units.items():
@@ -665,7 +665,7 @@ def _unit_items(units: Mapping[str, UnitParams], *, leaves_only: bool = True,
             yield from _unit_items(children, leaves_only=leaves_only, prefix=path)
 
 
-def _unit_at(units: Mapping[str, UnitParams], path: str) -> Optional[UnitParams]:
+def _unit_at(units: _Mapping[str, UnitParams], path: str) -> Optional[UnitParams]:
     """Return one node from the configured unit tree, or ``None`` when absent."""
     parts = path.split(".")
     unit = units.get(parts[0]) if parts and parts[0] else None
@@ -676,7 +676,7 @@ def _unit_at(units: Mapping[str, UnitParams], path: str) -> Optional[UnitParams]
     return unit
 
 
-def _unit_path(units: Mapping[str, UnitParams], value: str) -> Optional[str]:
+def _unit_path(units: _Mapping[str, UnitParams], value: str) -> Optional[str]:
     """Return the longest configured unit path which prefixes ``value``."""
     return next(
         (name for name, _unit in sorted(
@@ -693,7 +693,7 @@ def _split_path(p: Params, path: str) -> tuple[str, str, str]:
     return section, name, rest[len(name) + 1:]
 
 
-def _unit_leaves(units: Mapping[str, UnitParams], path: str) -> tuple[str, ...]:
+def _unit_leaves(units: _Mapping[str, UnitParams], path: str) -> tuple[str, ...]:
     """Return leaf paths below ``path`` directly from the authoritative unit tree."""
     unit = _unit_at(units, path)
     if unit is None:
@@ -1699,14 +1699,24 @@ def load(path: str | Path, initial: str | Path | None = None,
 def _read(path: Path) -> Any:
     """Read YAML or JSON configuration text."""
     if path.suffix.lower() == ".json":
-        return json.loads(path.read_text(encoding="utf-8"))
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"{path}: {exc.msg} at line {exc.lineno}, column {exc.colno}") from None
     try:
         import yaml  # type: ignore
     except ImportError as exc:  # pragma: no cover - exercised only without PyYAML
         raise ConfigError(f"{path}: reading YAML needs PyYAML (pip install PyYAML), or write the "
                           f"configuration as .json") from exc
-    with path.open("r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh)
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        location = (f" at line {mark.line + 1}, column {mark.column + 1}"
+                    if mark is not None else "")
+        message = getattr(exc, "problem", None) or str(exc).splitlines()[0]
+        raise ConfigError(f"{path}: {message}{location}") from None
 
 
 def read_initial(path: str | Path, t: Optional[float] = None) -> dict:

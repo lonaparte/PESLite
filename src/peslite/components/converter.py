@@ -46,23 +46,24 @@ class _HalfBridgeOutput(Bag):
 
 
 class _LegGates:
-    """Read complementary leg gates from the held switching state."""
+    """Read complementary leg gates from the held or selected switching state."""
 
-    __slots__ = ("model", "q", "gates")
+    __slots__ = ("model", "q", "gates", "selected")
 
     def __init__(self, model) -> None:
-        self.model, self.q, self.gates = model, None, ()
+        self.model, self.q, self.gates, self.selected = model, None, (), None
+
+    def select(self, pattern) -> None:
+        """Select one averaged gate pattern during mixture evaluation."""
+        self.selected = None if pattern is None else tuple(pattern)
 
     def __call__(self, leg: int) -> bool:
-        selected = getattr(self.model, "_netlist_gate_pattern", None)
-        if selected is not None:
-            return bool(selected[leg])
+        if self.selected is not None:
+            return self.selected[leg]
         q = self.model.input.q
-        if not isinstance(q, (int, float, complex, np.number)):
-            return tuple(
-                gate > 0.5 for gate in self.model.topology.pole_gates(q, True)
-            )[leg]
-        if self.q is None or q != self.q:
+        same = (q == self.q if isinstance(q, (int, float, complex, np.number))
+                and isinstance(self.q, (int, float, complex, np.number)) else q is self.q)
+        if not same:
             self.q = q
             self.gates = tuple(
                 gate > 0.5 for gate in self.model.topology.pole_gates(q, True)
@@ -81,6 +82,7 @@ class ThreePhaseBridge:
     neutral_duty = 0.5
     reverse_port = False
     unilateral = False
+    controlled = True
     upper_controlled = lower_controlled = True
     config_fields = frozenset()
     voltage_factors = (1.0, A120.conjugate(), A120)
@@ -150,6 +152,7 @@ class _BridgeModel(NetworkComponent):
         OutputMethod("set_dc_current", inputs=("q", "i_c"), outputs=("i_dc",)),
         OutputMethod("set_ac_voltage", inputs=("q", "u_dc"), outputs=("u_c",)),
     )
+    set_dc_current = set_ac_voltage = NetworkComponent.set_outputs
 
     def __init__(self, topology=None, *, parallel_capacitance: float = 0.0,
                  on_resistance: float = 0.0, switching: bool = False) -> None:
@@ -179,11 +182,10 @@ class _BridgeModel(NetworkComponent):
         initialize = getattr(self.topology, "initialize_model", None)
         if initialize is not None:
             initialize(self, parallel_capacitance)
-        self.set_dc_current = self._device_outputs
-        self.set_ac_voltage = self._device_outputs
         if (not math.isfinite(parallel_capacitance) or parallel_capacitance < 0.0
                 or not math.isfinite(on_resistance) or on_resistance < 0.0):
             raise ConfigError("bridge capacitance and on_resistance must be finite and >= 0")
+        self.parallel_capacitance = _real(parallel_capacitance)
         self.device_on_resistance = _real(on_resistance)
         if parallel_capacitance > 0.0:
             if on_resistance <= 0.0:
@@ -228,20 +230,19 @@ class _BridgeModel(NetworkComponent):
                 )))
             nb.losses(self)
             return None
-        if self.state_names:
+        if self.parallel_capacitance > 0.0:
             capacitor = nb.add(nl.Capacitor(
                 nb.node(self.power_port), None, self.capacitor.C,
                 nb.state(self, "u_C"),
             ))
             if not self._switching_poles:
-                nb.mixture(self._gate_patterns, self._select_gate_pattern)
+                nb.mixture(self._gate_patterns, self._leg_gates.select)
             self._netlist_legs(nb)
             nb.node_current_output(
                 self, "i_device", nb.node(self.power_port), exclude=(capacitor,)
             )
             return None
-        if (not getattr(topology, "controlled", True)
-                or not (topology.upper_controlled and topology.lower_controlled)):
+        if not topology.controlled or not (topology.upper_controlled and topology.lower_controlled):
             return self._netlist_legs(nb)
 
         three_phase = isinstance(topology.zero, complex)
@@ -262,9 +263,9 @@ class _BridgeModel(NetworkComponent):
 
         topology = self.topology
         on = self.device_on_resistance
-        gate = _LegGates(self)
-        upper = topology.upper_controlled and getattr(topology, "controlled", True)
-        lower = topology.lower_controlled and getattr(topology, "controlled", True)
+        gate = self._leg_gates if self.state_names else _LegGates(self)
+        upper = topology.upper_controlled and topology.controlled
+        lower = topology.lower_controlled and topology.controlled
 
         def leg(midpoint, high, low, index):
             pair = (
@@ -288,18 +289,18 @@ class _BridgeModel(NetworkComponent):
         if (self.lower_port is None and not isinstance(topology.zero, complex)
                 and len(topology.voltage_factors) > 1):
             high, low = nb.internal(), nb.internal()
-            supply = nb.add(nl.Transformer(high, low, dc, None, ((1.0,),)))
+            nb.add(nl.Transformer(high, low, dc, None, ((1.0,),)))
             devices = (*leg(ac, high, low, 0), *leg(None, high, low, 1))
             if getattr(self, "_current", None) is not None:
                 nb.bind(self._bind_netlist_devices, devices)
                 nb.commutation(self, after=self._mirror_netlist_conduction, diodes=devices)
         else:
             high = nb.internal()
-            upper_feed = nb.add(nl.Resistor(dc, high, 0.0))
+            nb.add(nl.Resistor(dc, high, 0.0))
             if self.lower_port is not None:
                 low = nb.internal()
                 lower_node = nb.node(self.lower_port)
-                lower_feed = nb.add(nl.Resistor(lower_node, low, 0.0))
+                nb.add(nl.Resistor(lower_node, low, 0.0))
                 leg(ac, high, low, 0)
             else:
                 count = len(topology.voltage_factors)
@@ -323,7 +324,7 @@ class _BridgeModel(NetworkComponent):
     def _capacitive_devices(self, capacitance, resistance, switching) -> None:
         """Compose finite device conductances with the existing capacitor and algebraic solver."""
         self._switching_poles = switching
-        self._netlist_gate_pattern = None
+        self._leg_gates = _LegGates(self)
         self.capacitor = RCNode(capacitance, 0.0, phases=3 if isinstance(self.topology.zero, complex) else 1)
         self.state, self.state_names = self.capacitor.state, self.capacitor.state_names
         self.storage = tuple(replace(port, power_terms=()) for port in self.capacitor.storage)
@@ -341,25 +342,12 @@ class _BridgeModel(NetworkComponent):
         self.dirac = False
         self.models_blocked_diodes = True
 
-    def _device_outputs(self, t: float) -> None:
-        from ..solver.netlist import device_outputs
-        device_outputs(self, t)
-
-    def set_ac_voltage(self, t: float) -> None:
-        self._device_outputs(t)
-
-    def set_outputs(self, t: float) -> None:
-        self._device_outputs(t)
-
     def set_power_loss(self, _t: float) -> None:
         self.output.power_loss = self.dissipated_power()
 
     def _gate_patterns(self):
         duties = self.topology.pole_gates(self.input.q, False)
         return CarrierComparison.state_fractions(duties)
-
-    def _select_gate_pattern(self, pattern) -> None:
-        self._netlist_gate_pattern = pattern
 
     def use_current_transfer_ratios(self) -> None:
         """Drive both half-bridge rail currents from explicit conduction ratios."""
@@ -583,7 +571,7 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None) -> 
     pwm = cfg.pwm
     impedance = {"parallel_capacitance": cfg.bridge.parallel_capacitance,
                  "on_resistance": cfg.bridge.on_resistance}
-    if not getattr(topology, "controlled", True):
+    if not topology.controlled:
         if modulator is not None:
             raise ValueError("a diode full-bridge rectifier does not use a PWM modulator")
         if pwm is not None and (pwm.dead_time > 0.0 or pwm.dead_time_compensation):
@@ -651,6 +639,7 @@ class HalfBridge:
     ))
     voltage_factors = (1.0,)
     series_devices = 1
+    controlled = True
 
     @staticmethod
     def pole_gates(q, switching):
@@ -1049,6 +1038,7 @@ class DCLink(NetworkComponent):
         OutputMethod("set_stored_voltage", inputs=(), outputs=("u_C",)),
         OutputMethod("set_outputs", inputs=(), outputs=("u_dc", "i_src")),
     )
+    set_stored_voltage = NetworkComponent.set_outputs
 
     def __init__(self, capacitor: DCCapacitor | None = None,
                  source: DCCurrentSource | DCVoltageSource | None = None) -> None:
@@ -1085,34 +1075,26 @@ class DCLink(NetworkComponent):
         """Return discrete physical state that generated backends must preserve."""
         return {"tripped": (self, "tripped")}
 
-    def cpp_equation_attributes(self, generator: Any) -> dict[str, Any]:
-        """Return native values needed by the declared source equation."""
-        return {"source": generator.ramped_equation_value(self, self.source)}
-
-    def cpp_equation_members(self, generator: Any, controllers=()) -> list[str]:
-        """Return native source-ramp members for this link."""
-        return generator.ramp_equation_members(self, self.source, controllers)
+    def equation_objects(self) -> dict[str, Any]:
+        """Objects referenced by equations and therefore retained by generated backends."""
+        return {"source": self.source}
 
     def connect(self, on: bool, t: float, ramp: float = 0.0) -> None:
         """Connect or disconnect the unit's source; current sources honor the connection ramp."""
         if isinstance(self.source, DCCurrentSource):
             self.source.connect(on, t, ramp)
 
-    def retune_source(self, i: float, k: float, v: float, r: float) -> None:
-        """Apply new settings to the existing DC source without replacing its state."""
+    def retune_source(self, i: float, k: float, v: float, r: float) -> bool:
+        """Retune the source and report whether its network declaration changed."""
         source = self.source
         if isinstance(source, DCCurrentSource):
             source.i_nom, source.k_dc = float(i), float(k)
+            return False
         elif isinstance(source, DCVoltageSource):
+            changed = source.R != r
             source.u_dc, source.R = float(v), float(r)
-
-    def set_stored_voltage(self, t: float) -> None:
-        from ..solver.netlist import device_outputs
-        device_outputs(self, t)
-
-    def set_outputs(self, t: float) -> None:
-        from ..solver.netlist import device_outputs
-        device_outputs(self, t)
+            return changed
+        return False
 
     def network(self, nb):
         """Declare the DC-link capacitor, source and source breaker."""

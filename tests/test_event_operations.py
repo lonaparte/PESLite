@@ -279,6 +279,45 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     assert stored == pytest.approx(0.5 * bus.power_scale * current.buses["pcc"].c * 25.0)
 
 
+def test_parameter_events_rebuild_only_changed_network_declarations(monkeypatch):
+    tree = _tree()
+    tree["units"]["vsc"]["bridge"] = {"model": "pwm_averaging"}
+    tree["events"] = {
+        "reference": {"type": "set", "t": 1e-4, "set": {
+            "units.vsc.ctrl.references.p_ref_pu": 0.4,
+        }},
+        "voltage": {"type": "set", "t": 2e-4, "set": {
+            "sources.grid.v_pu": 0.9,
+        }},
+        "supply": {"type": "set", "t": 3e-4, "set": {
+            "units.vsc.dclink.source.i_pu": 0.5,
+        }},
+        "impedance": {"type": "set", "t": 4e-4, "set": {
+            "sources.grid.x_pu": 0.8,
+        }},
+    }
+    p = from_dict(tree)
+    system = peslite.System(p)
+    circuit, calls = system.circuits[0], []
+    original = type(circuit).build
+
+    def counted(instance):
+        calls.append(instance)
+        return original(instance)
+
+    monkeypatch.setattr(type(circuit), "build", counted)
+    changes = {change.event: change for change in p.changes}
+    specs = system.model.energy_specs
+    for name in ("reference", "voltage", "supply"):
+        system.apply(changes[name])
+        assert not calls
+        assert system.model.energy_specs is specs
+
+    system.apply(changes["impedance"])
+    assert calls == [circuit]
+    assert system.model.energy_specs is not specs
+
+
 def test_continuous_controller_retune_rebinds_its_ode_states(tmp_path):
     tree = _tree()
     tree["events"]["connect_vsc"].update(t=0.0, ramp=0.0)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import itertools
 import json
 import math
 import numbers
@@ -16,7 +17,7 @@ import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields, is_dataclass, replace
-from functools import cached_property
+from functools import cached_property, partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -31,15 +32,17 @@ from ..control.blocks import OutputLimit
 from ..control.controller import GraphController, VSCController
 from ..solver.energy import Port, re_product
 from ..solver.integrators import DormandPrince45, FixedStepSolver, TABLEAUS
-from ..solver.implicit import (ImplicitSolver, _JACOBIAN_STEP, _MAX_SPLITS,
+from ..solver.implicit import (ImplicitSolver, _JACOBIAN_STEP, _MAX_SPLITS, _TABLEAUX,
                                _NEWTON_ITERATIONS, _NEWTON_SCALE, _THETA_MAX)
 from ..solver.model import _dependency_plan, commutation_tolerance
-from ..solver.netlist import Mode, Topology, _DELTA_T, _FLOAT_RTOL, _MAX_PATTERNS, _symbolic_solve
+from ..solver.netlist import (Element as NetlistElement, Mode, Netlist, Topology,
+                              _Degenerate, _FLOAT_RTOL, _MARGIN_RTOL, _MAX_PATTERNS,
+                              _Symbolic, _constant, _symbolic_solve, _symbolic_source)
 from ..solver.timing import TIME_EPS
 from .conduction import DiodeConduction, _LOCATOR_ITERATIONS, _MAX_COMMUTATIONS
-from .circuit import NetworkView, _BoundValue, _switch_decomposition, compile_network
+from .circuit import _BoundValue, _NETWORK_DECLARATION, _mode_decomposition, compile_network
 from .protection import ProtectionStats
-from .params import (BaseValues, SourceParams, UnitParams, _PARAMETER_RECORDER, _event_assignments,
+from .params import (BaseValues, ConfigError, SourceParams, UnitParams, _PARAMETER_RECORDER, _event_assignments,
                      _written_out, connection_defaults, dumps, parameter_leaves)
 from .exporter import ExportResult, _exporter, _signal_names
 from .system import _source_scenario
@@ -138,6 +141,52 @@ _MOVING_WINDOW = r'''template <std::size_t N> struct MovingWindow {
     }
 };'''
 
+_DENSE_SOLVER = r'''struct DenseFactor {
+    std::size_t n = 0;
+    std::vector<double> lu;
+    std::vector<std::size_t> pivots;
+};
+
+inline DenseFactor dense_factor(std::vector<double> matrix, std::size_t n) {
+    DenseFactor factor{n, std::move(matrix), std::vector<std::size_t>(n)};
+    for (std::size_t column = 0; column < n; ++column) {
+        std::size_t pivot = column;
+        for (std::size_t row = column + 1; row < n; ++row)
+            if (std::abs(factor.lu[row * n + column])
+                    > std::abs(factor.lu[pivot * n + column])) pivot = row;
+        factor.pivots[column] = pivot;
+        if (!(std::abs(factor.lu[pivot * n + column])
+                > std::numeric_limits<double>::epsilon()))
+            throw std::runtime_error("singular dense linear system");
+        if (pivot != column)
+            for (std::size_t entry = 0; entry < n; ++entry)
+                std::swap(factor.lu[column * n + entry], factor.lu[pivot * n + entry]);
+        const double diagonal = factor.lu[column * n + column];
+        for (std::size_t row = column + 1; row < n; ++row) {
+            const double multiplier = factor.lu[row * n + column] /= diagonal;
+            for (std::size_t entry = column + 1; entry < n; ++entry)
+                factor.lu[row * n + entry] -= multiplier * factor.lu[column * n + entry];
+        }
+    }
+    return factor;
+}
+
+template <class Values>
+inline void dense_solve(const DenseFactor& factor, Values& value) {
+    const std::size_t n = factor.n;
+    for (std::size_t column = 0; column < n; ++column)
+        if (factor.pivots[column] != column)
+            std::swap(value[column], value[factor.pivots[column]]);
+    for (std::size_t column = 0; column < n; ++column)
+        for (std::size_t row = column + 1; row < n; ++row)
+            value[row] -= factor.lu[row * n + column] * value[column];
+    for (std::size_t row = n; row-- > 0;) {
+        for (std::size_t column = row + 1; column < n; ++column)
+            value[row] -= factor.lu[row * n + column] * value[column];
+        value[row] /= factor.lu[row * n + row];
+    }
+}'''
+
 _CONTROL_MATH = r'''inline double smoothstep(double x) noexcept {
     x = std::clamp(x, 0.0, 1.0);
     return x * x * (3.0 - 2.0 * x);
@@ -187,7 +236,15 @@ PESLITE_FORCEINLINE void solve_algebraic(Sweep sweep, Value& current, Value& inv
         return std::abs(a - b) <= atol + rtol * std::max({1.0, std::abs(a), std::abs(b)});
     };
     Value x0 = current, y0 = sweep(x0), r0 = y0 - x0;
-    if (close(y0, x0)) return;
+    if (close(y0, x0)) {
+        if (has_inverse) {
+            const Value corrected = x0 - inverse * r0;
+            if (finite(corrected)
+                    && std::abs(corrected - x0) <= step_limit * std::max({1.0, std::abs(x0), std::abs(y0)}))
+                sweep(corrected);
+        }
+        return;
+    }
     Value x1 = has_inverse ? x0 - inverse * r0 : y0;
     if (!finite(x1) || std::abs(x1 - x0) > step_limit * std::max({1.0, std::abs(x0), std::abs(y0)}))
         x1 = y0;
@@ -197,7 +254,13 @@ PESLITE_FORCEINLINE void solve_algebraic(Sweep sweep, Value& current, Value& inv
             const Value estimate = (x1 - x0) / denominator;
             if (finite(estimate)) { inverse = estimate; has_inverse = true; }
         }
-        if (close(y1, x1)) { current = x1; return; }
+        if (close(y1, x1)) {
+            const Value corrected = has_inverse ? x1 - inverse * r1 : x1;
+            if (finite(corrected)
+                    && std::abs(corrected - x1) <= step_limit * std::max({1.0, std::abs(x1), std::abs(y1)}))
+                sweep(corrected);
+            return;
+        }
         Value x2 = has_inverse ? x1 - inverse * r1 : y1;
         if (!finite(x2) || std::abs(x2 - x1) > step_limit * std::max({1.0, std::abs(x1), std::abs(y1)}))
             x2 = y1;
@@ -478,145 +541,301 @@ def _stability_polynomial(method: str) -> tuple[float, ...]:
     return tuple(add([1.0], [0.0, *contribution]))
 
 
-def _explicit_stability(method: str, blocks: Sequence[Sequence[int]]) -> str:
-    """Emit the Python solver's eigenvalue RK stability test over electrical state blocks."""
-    blocks = tuple(tuple(map(int, block)) for block in blocks if len(block))
+def _explicit_stability(
+    method: str,
+    plans: Sequence[tuple[int, Sequence[str], Sequence[int]]],
+) -> str:
+    """Emit the same exact circuit-mode RK stability check used by Python."""
     coefficients = ", ".join(_number(value) for value in _stability_polynomial(method))
-    checks = "\n        ".join(
-        "if (!block_stable({" + ", ".join(map(str, block)) + "})) result = false;"
-        for block in blocks
-    )
-    return f'''
-    struct ExplicitStabilityMode {{
+    members, checks = [], []
+    for number, (size, lines, positions) in enumerate(plans):
+        key = ", ".join(f"selected[{int(index)}]" for index in positions)
+        held = f"ExplicitStabilityMode<{len(positions)}>"
+        members.append(f"""std::vector<{held}> explicit_stability_modes_{number};
+
+    void stability_derivatives_{number}(double t, const double* x, double* out) {{
+        (void)t;
+        (void)x;
+        std::fill(out, out + {int(size)}, 0.0);
+        {chr(10).join(lines)}
+    }}""")
+        checks.append(
+            f"if (!explicit_circuit_stable(explicit_stability_modes_{number}, "
+            f"{held}::Key{{{{{key}}}}}, {int(size)}, h, "
+            f"[&](const double* x, double* out) "
+            f"{{ stability_derivatives_{number}(t, x, out); }})) return false;"
+        )
+    joined_members = "\n\n    ".join(members)
+    joined_checks = "\n        ".join(checks)
+    return f"""
+    template <std::size_t Positions> struct ExplicitStabilityMode {{
+        using Key = std::array<double, Positions>;
         std::size_t epoch;
-        StructuralMode key;
-        double step;
-        bool stable;
+        Key key;
+        std::vector<Complex> eigenvalues;
+        bool converged;
     }};
-    std::vector<ExplicitStabilityMode> explicit_stability_modes;
+    struct ExplicitStabilityBlock {{
+        std::vector<Complex> matrix;
+        std::vector<Complex> eigenvalues;
+        bool converged;
+    }};
+    struct ExplicitStabilityPattern {{
+        std::vector<unsigned char> nonzero;
+        std::vector<std::vector<std::size_t>> components;
+        bool decomposed;
+    }};
+    std::vector<ExplicitStabilityBlock> explicit_stability_blocks;
+    std::vector<ExplicitStabilityPattern> explicit_stability_patterns;
+    {joined_members}
+
+    static std::vector<std::vector<std::size_t>> stability_components(
+            const std::vector<Complex>& matrix, std::size_t n) {{
+        const std::size_t missing = std::numeric_limits<std::size_t>::max();
+        std::vector<std::size_t> index(n, missing), low(n), stack;
+        std::vector<bool> active(n, false);
+        std::vector<std::vector<std::size_t>> components;
+        std::size_t next = 0;
+        std::function<void(std::size_t)> visit = [&](std::size_t node) {{
+            index[node] = low[node] = next++;
+            stack.push_back(node);
+            active[node] = true;
+            for (std::size_t dependency = 0; dependency < n; ++dependency) {{
+                if (matrix[node * n + dependency] == Complex{{}}) continue;
+                if (index[dependency] == missing) {{
+                    visit(dependency);
+                    low[node] = std::min(low[node], low[dependency]);
+                }} else if (active[dependency]) {{
+                    low[node] = std::min(low[node], index[dependency]);
+                }}
+            }}
+            if (low[node] != index[node]) return;
+            components.emplace_back();
+            while (true) {{
+                const std::size_t member = stack.back();
+                stack.pop_back();
+                active[member] = false;
+                components.back().push_back(member);
+                if (member == node) break;
+            }}
+        }};
+        for (std::size_t node = 0; node < n; ++node)
+            if (index[node] == missing) visit(node);
+        return components;
+    }}
+
+    static bool explicit_eigenvalues(std::vector<Complex> matrix, std::size_t n,
+                                     std::vector<Complex>& eigenvalues) {{
+        eigenvalues.clear();
+        eigenvalues.reserve(n);
+        if (n == 0) return true;
+        if (n == 1) {{ eigenvalues.push_back(matrix[0]); return true; }}
+        if (n == 2) {{
+            const Complex root = std::sqrt(
+                (matrix[0] - matrix[3]) * (matrix[0] - matrix[3])
+                + 4.0 * matrix[1] * matrix[2]
+            );
+            eigenvalues.push_back(0.5 * (matrix[0] + matrix[3] + root));
+            eigenvalues.push_back(0.5 * (matrix[0] + matrix[3] - root));
+            return true;
+        }}
+        double scale = 0.0;
+        for (const auto& value : matrix) scale = std::max(scale, std::abs(value));
+        std::vector<Complex> vector(n), cosine(n), sine(n);
+        for (std::size_t k = 0; k + 2 < n; ++k) {{
+            double norm = 0.0;
+            for (std::size_t i = k + 1; i < n; ++i)
+                norm += std::norm(matrix[i * n + k]);
+            if (norm <= 0.0) continue;
+            const Complex head = matrix[(k + 1) * n + k];
+            const double size = std::abs(head);
+            for (std::size_t i = k + 1; i < n; ++i)
+                vector[i] = matrix[i * n + k];
+            vector[k + 1] += (size > 0.0 ? head / size : Complex{{1.0}}) * std::sqrt(norm);
+            double weight = 0.0;
+            for (std::size_t i = k + 1; i < n; ++i) weight += std::norm(vector[i]);
+            weight = 2.0 / weight;
+            for (std::size_t j = k; j < n; ++j) {{
+                Complex dot{{}};
+                for (std::size_t i = k + 1; i < n; ++i)
+                    dot += std::conj(vector[i]) * matrix[i * n + j];
+                dot *= weight;
+                for (std::size_t i = k + 1; i < n; ++i)
+                    matrix[i * n + j] -= vector[i] * dot;
+            }}
+            for (std::size_t i = 0; i < n; ++i) {{
+                Complex dot{{}};
+                for (std::size_t j = k + 1; j < n; ++j)
+                    dot += matrix[i * n + j] * vector[j];
+                dot *= weight;
+                for (std::size_t j = k + 1; j < n; ++j)
+                    matrix[i * n + j] -= dot * std::conj(vector[j]);
+            }}
+            for (std::size_t i = k + 2; i < n; ++i) matrix[i * n + k] = Complex{{}};
+        }}
+        std::size_t active = n, stalled = 0;
+        for (std::size_t iteration = 0; active > 0 && iteration < 64 * n; ++iteration) {{
+            if (active == 1) {{
+                eigenvalues.push_back(matrix[0]);
+                active = 0;
+                break;
+            }}
+            const Complex p = matrix[(active - 2) * n + active - 2];
+            const Complex q = matrix[(active - 2) * n + active - 1];
+            const Complex r = matrix[(active - 1) * n + active - 2];
+            const Complex d = matrix[(active - 1) * n + active - 1];
+            const double coupling = std::abs(r);
+            if (coupling <= 1e-14 * (std::abs(p) + std::abs(d))
+                    || coupling <= 1e-15 * scale) {{
+                eigenvalues.push_back(d);
+                --active;
+                stalled = 0;
+                continue;
+            }}
+            const Complex root = std::sqrt((p - d) * (p - d) + 4.0 * q * r);
+            const Complex left = 0.5 * (p + d + root);
+            const Complex right = 0.5 * (p + d - root);
+            Complex shift = std::abs(left - d) < std::abs(right - d) ? left : right;
+            if (++stalled % 10 == 0) shift = d + coupling * Complex{{0.4, 0.75}};
+            for (std::size_t i = 0; i < active; ++i) matrix[i * n + i] -= shift;
+            for (std::size_t k = 0; k + 1 < active; ++k) {{
+                const Complex x = matrix[k * n + k];
+                const Complex y = matrix[(k + 1) * n + k];
+                const double length = std::hypot(std::abs(x), std::abs(y));
+                cosine[k] = length > 0.0 ? x / length : Complex{{1.0}};
+                sine[k] = length > 0.0 ? y / length : Complex{{}};
+                for (std::size_t j = k; j < active; ++j) {{
+                    const Complex upper = matrix[k * n + j];
+                    const Complex lower = matrix[(k + 1) * n + j];
+                    matrix[k * n + j] = std::conj(cosine[k]) * upper
+                        + std::conj(sine[k]) * lower;
+                    matrix[(k + 1) * n + j] = cosine[k] * lower - sine[k] * upper;
+                }}
+            }}
+            for (std::size_t k = 0; k + 1 < active; ++k)
+                for (std::size_t i = 0; i <= std::min(k + 1, active - 1); ++i) {{
+                    const Complex left_value = matrix[i * n + k];
+                    const Complex right_value = matrix[i * n + k + 1];
+                    matrix[i * n + k] = left_value * cosine[k] + right_value * sine[k];
+                    matrix[i * n + k + 1] = right_value * std::conj(cosine[k])
+                        - left_value * std::conj(sine[k]);
+                }}
+            for (std::size_t i = 0; i < active; ++i) matrix[i * n + i] += shift;
+        }}
+        return active == 0;
+    }}
+
+    template <class Held> static bool explicit_mode_stable(const Held& held, double h) {{
+        if (!held.converged) return false;
+        static constexpr double coefficients[] = {{{coefficients}}};
+        for (const Complex eigenvalue : held.eigenvalues) {{
+            const double size = std::max(1.0, std::abs(eigenvalue));
+            if (std::real(eigenvalue) > 1e-12 * size) continue;
+            const Complex z = h * eigenvalue;
+            Complex amplification = coefficients[std::size(coefficients) - 1];
+            for (std::size_t degree = std::size(coefficients) - 1; degree-- > 0;)
+                amplification = amplification * z + coefficients[degree];
+            if (std::abs(amplification) > 1.0 + 1e-10) return false;
+        }}
+        return true;
+    }}
+
+    template <class Held, class Evaluate>
+    bool explicit_circuit_stable(std::vector<Held>& modes, const typename Held::Key& key,
+                                 std::size_t n, double h, Evaluate&& evaluate) {{
+        auto found = std::find_if(modes.begin(), modes.end(), [&](const auto& item) {{
+            return item.epoch == implicit_epoch && item.key == key;
+        }});
+        if (found == modes.end()) {{
+            std::vector<double> state(n), base(n), column(n);
+            std::vector<Complex> matrix(n * n);
+            evaluate(state.data(), base.data());
+            for (std::size_t j = 0; j < n; ++j) {{
+                state[j] = 1.0;
+                evaluate(state.data(), column.data());
+                state[j] = 0.0;
+                for (std::size_t i = 0; i < n; ++i)
+                    matrix[i * n + j] = column[i] - base[i];
+            }}
+            if (modes.size() >= 64) modes.erase(modes.begin());
+            modes.push_back({{implicit_epoch, key, {{}}, false}});
+            found = modes.end() - 1;
+            std::vector<unsigned char> pattern(matrix.size());
+            std::transform(matrix.begin(), matrix.end(), pattern.begin(),
+                           [](Complex value) {{ return value != Complex{{}}; }});
+            auto structure = std::find_if(
+                explicit_stability_patterns.begin(), explicit_stability_patterns.end(),
+                [&](const auto& item) {{ return item.nonzero == pattern; }}
+            );
+            if (structure == explicit_stability_patterns.end()) {{
+                if (explicit_stability_patterns.size() >= 64)
+                    explicit_stability_patterns.erase(explicit_stability_patterns.begin());
+                explicit_stability_patterns.push_back({{std::move(pattern), {{}}, false}});
+                found->converged = explicit_eigenvalues(
+                    std::move(matrix), n, found->eigenvalues
+                );
+                return explicit_mode_stable(*found, h);
+            }}
+            if (!structure->decomposed) {{
+                structure->components = stability_components(matrix, n);
+                structure->decomposed = true;
+            }}
+            if (structure->components.size() == 1
+                    && structure->components.front().size() == n) {{
+                found->converged = explicit_eigenvalues(
+                    std::move(matrix), n, found->eigenvalues
+                );
+                return explicit_mode_stable(*found, h);
+            }}
+            found->converged = true;
+            for (const auto& component : structure->components) {{
+                std::vector<Complex> block(component.size() * component.size());
+                for (std::size_t row = 0; row < component.size(); ++row)
+                    for (std::size_t column = 0; column < component.size(); ++column)
+                        block[row * component.size() + column]
+                            = matrix[component[row] * n + component[column]];
+                auto cached = std::find_if(
+                    explicit_stability_blocks.begin(), explicit_stability_blocks.end(),
+                    [&](const auto& item) {{
+                        return item.matrix == block;
+                    }}
+                );
+                if (cached == explicit_stability_blocks.end()) {{
+                    if (explicit_stability_blocks.size() >= 256)
+                        explicit_stability_blocks.erase(explicit_stability_blocks.begin());
+                    explicit_stability_blocks.push_back({{block, {{}}, false}});
+                    cached = explicit_stability_blocks.end() - 1;
+                    cached->converged = explicit_eigenvalues(
+                        std::move(block), component.size(), cached->eigenvalues
+                    );
+                }}
+                found->converged = found->converged && cached->converged;
+                found->eigenvalues.insert(found->eigenvalues.end(),
+                                          cached->eigenvalues.begin(), cached->eigenvalues.end());
+            }}
+        }}
+        return explicit_mode_stable(*found, h);
+    }}
 
     bool explicit_stable(double t, double h) {{
         const StructuralMode selected = structural_mode();
-        auto held = std::find_if(
-            explicit_stability_modes.begin(), explicit_stability_modes.end(),
-            [&](const auto& item) {{
-                return item.epoch == implicit_epoch && item.key == selected
-                    && item.step == h;
-            }}
-        );
-        if (held != explicit_stability_modes.end()) return held->stable;
-        State stability_rhs{{}};
-        rhs(t, y, stability_rhs);
-        implicit_select(t, y, stability_rhs);
-        static constexpr double coefficients[] = {{{coefficients}}};
-        const auto block_stable = [&](std::initializer_list<std::size_t> listed) {{
-            const std::vector<std::size_t> index(listed);
-            const std::size_t n = index.size();
-            std::vector<Complex> matrix(n * n), q(n * n), r(n * n), vector(n);
-            for (std::size_t row = 0; row < n; ++row)
-                for (std::size_t column = 0; column < n; ++column)
-                    matrix[row * n + column] =
-                        implicit_jacobian[index[row] * state_count + index[column]];
-            for (std::size_t iteration = 0; iteration < 64 * n; ++iteration) {{
-                double lower = 0.0, scale = 1.0;
-                for (std::size_t row = 0; row < n; ++row)
-                    for (std::size_t column = 0; column < n; ++column) {{
-                        scale = std::max(scale, std::abs(matrix[row * n + column]));
-                        if (row > column) lower = std::max(
-                            lower, std::abs(matrix[row * n + column]));
-                    }}
-                if (lower <= 1e-12 * scale) break;
-                Complex shift = matrix[(n - 1) * n + n - 1];
-                if (n > 1) {{
-                    const Complex a = matrix[(n - 2) * n + n - 2];
-                    const Complex b = matrix[(n - 2) * n + n - 1];
-                    const Complex c = matrix[(n - 1) * n + n - 2];
-                    const Complex d = shift;
-                    const Complex root = std::sqrt((a - d) * (a - d) + 4.0 * b * c);
-                    const Complex left = 0.5 * (a + d + root);
-                    const Complex right = 0.5 * (a + d - root);
-                    shift = std::abs(left - d) < std::abs(right - d) ? left : right;
-                }}
-                std::fill(q.begin(), q.end(), Complex{{}});
-                std::fill(r.begin(), r.end(), Complex{{}});
-                for (std::size_t column = 0; column < n; ++column) {{
-                    for (std::size_t row = 0; row < n; ++row)
-                        vector[row] = matrix[row * n + column]
-                            - (row == column ? shift : Complex{{}});
-                    for (std::size_t previous = 0; previous < column; ++previous) {{
-                        Complex product{{}};
-                        for (std::size_t row = 0; row < n; ++row)
-                            product += std::conj(q[row * n + previous]) * vector[row];
-                        r[previous * n + column] = product;
-                        for (std::size_t row = 0; row < n; ++row)
-                            vector[row] -= product * q[row * n + previous];
-                    }}
-                    double length = 0.0;
-                    for (const auto& value : vector) length += std::norm(value);
-                    length = std::sqrt(length);
-                    if (length <= 1e-15 * scale) {{
-                        for (std::size_t candidate = 0; candidate < n; ++candidate) {{
-                            std::fill(vector.begin(), vector.end(), Complex{{}});
-                            vector[candidate] = 1.0;
-                            for (std::size_t previous = 0; previous < column; ++previous) {{
-                                Complex product{{}};
-                                for (std::size_t row = 0; row < n; ++row)
-                                    product += std::conj(q[row * n + previous]) * vector[row];
-                                for (std::size_t row = 0; row < n; ++row)
-                                    vector[row] -= product * q[row * n + previous];
-                            }}
-                            length = 0.0;
-                            for (const auto& value : vector) length += std::norm(value);
-                            length = std::sqrt(length);
-                            if (length > 1e-15 * scale) break;
-                        }}
-                    }}
-                    r[column * n + column] = length;
-                    for (std::size_t row = 0; row < n; ++row)
-                        q[row * n + column] = vector[row] / length;
-                }}
-                std::fill(matrix.begin(), matrix.end(), Complex{{}});
-                for (std::size_t row = 0; row < n; ++row)
-                    for (std::size_t column = 0; column < n; ++column) {{
-                        for (std::size_t inner = 0; inner < n; ++inner)
-                            matrix[row * n + column] += r[row * n + inner] * q[inner * n + column];
-                        if (row == column) matrix[row * n + column] += shift;
-                    }}
-            }}
-            for (std::size_t index = 0; index < n; ++index) {{
-                const Complex eigenvalue = matrix[index * n + index];
-                const double scale = std::max(1.0, std::abs(eigenvalue));
-                if (std::real(eigenvalue) > 1e-12 * scale) continue;
-                Complex amplification = coefficients[std::size(coefficients) - 1];
-                for (std::size_t degree = std::size(coefficients) - 1; degree-- > 0;)
-                    amplification = amplification * (h * eigenvalue) + coefficients[degree];
-                if (std::abs(amplification) > 1.0 + 1e-10) return false;
-            }}
-            return true;
-        }};
-        bool result = true;
-        {checks}
-        if (explicit_stability_modes.size() >= 64)
-            explicit_stability_modes.erase(explicit_stability_modes.begin());
-        explicit_stability_modes.push_back({{implicit_epoch, selected, h, result}});
-        return result;
-    }}'''
+        {joined_checks}
+        return true;
+    }}"""
 
 
-def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
+def _implicit_solver(method: str, name: str, arguments: str,
                      dt: str, atol: str, rtol: str, projection: str, *,
-                     exact_columns: Sequence[bool] = (), exact_lines: Sequence[str] = (),
-                     mode: str = "structural_mode()", mode_size: int = 0,
+                     n_states: int,
+                     mode_size: int = 0,
                      groups: Sequence[Sequence[int]] = (),
                      interface: Sequence[int] = ()) -> str:
     """Lower the configured implicit tableau and Newton controls over the ordinary generated RHS."""
-    stages = solver._c.size
-    rows = ", ".join("{" + ", ".join(_number(v) for v in row) + "}" for row in solver._A)
-    nodes = ", ".join(_number(v) for v in solver._c)
-    initial = ", ".join(_number(v) for v in solver._e0)
-    exact = ", ".join("true" if value else "false" for value in exact_columns)
-    exact_body = "\n        ".join(exact_lines)
-    n_states = len(exact_columns)
+    tableau, c, e0 = _TABLEAUX[method]
+    stages = c.size
+    rows = ", ".join("{" + ", ".join(_number(v) for v in row) + "}" for row in tableau)
+    nodes = ", ".join(_number(v) for v in c)
+    initial = ", ".join(_number(v) for v in e0)
     state_groups = [tuple(map(int, group)) for group in groups if len(group)]
     interface = tuple(map(int, interface))
     if not state_groups or sum(map(len, state_groups)) + len(interface) != n_states:
@@ -629,7 +848,7 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
     group_values = ", ".join("{" + ", ".join(map(str, group)) + "}"
                              for group in expanded_groups)
     interface_values = ", ".join(map(str, expanded_interface))
-    select_body = f'''const StructuralMode selected = {mode};
+    select_body = '''const StructuralMode selected = structural_mode();
         if (!implicit_jacobian.empty() && implicit_mode_valid && selected == implicit_mode) return;
         auto found = std::find_if(implicit_modes.begin(), implicit_modes.end(),
             [&](const auto& item) {{ return item.key == selected; }});
@@ -650,11 +869,6 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
     using ImplicitVector = std::array<double, implicit_size>;
     using StructuralMode = std::array<double, {mode_size}>;
 
-    struct DenseFactor {{
-        std::size_t n = 0;
-        std::vector<double> lu;
-        std::vector<std::size_t> pivots;
-    }};
     struct ImplicitGroupFactor {{
         std::vector<std::size_t> index;
         DenseFactor factor;
@@ -674,7 +888,6 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
     StructuralMode implicit_mode{{}};
     bool implicit_mode_valid = false;
     std::size_t implicit_epoch = 0;
-    static constexpr std::array<bool, state_count> implicit_exact_columns = {{{exact}}};
 
     void implicit_invalidate() {{
         implicit_jacobian.clear();
@@ -687,19 +900,17 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
     void implicit_linearize(double t, const State& state, const State& f0) {{
         implicit_jacobian.assign(state_count * state_count, 0.0);
         implicit_factors.clear();
-        auto& matrix = implicit_jacobian;
-        State probe = state, value{{}};
+        const StructuralMode selected_mode = structural_mode();
+        State probe{{}}, value{{}};
         for (std::size_t j = 0; j < state_count; ++j) {{
-            if (implicit_exact_columns[j]) continue;
             const double increment = {_number(_JACOBIAN_STEP)} * std::max(std::abs(state[j]), 1.0);
+            probe = state;
             probe[j] = state[j] + increment;
             rhs(t, probe, value);
-            probe[j] = state[j];
             for (std::size_t i = 0; i < state_count; ++i)
                 implicit_jacobian[i * state_count + j] = (value[i] - f0[i]) / increment;
         }}
-        {exact_body}
-        implicit_mode = {mode};
+        implicit_mode = selected_mode;
         implicit_mode_valid = true;
         auto found = std::find_if(implicit_modes.begin(), implicit_modes.end(),
             [&](const auto& item) {{ return item.key == implicit_mode; }});
@@ -713,39 +924,6 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
 
     void implicit_select(double t, const State& state, const State& f0) {{
         {select_body}
-    }}
-
-    static DenseFactor implicit_dense_factor(std::vector<double> matrix, std::size_t n) {{
-        DenseFactor factor{{n, std::move(matrix), std::vector<std::size_t>(n)}};
-        for (std::size_t k = 0; k < n; ++k) {{
-            std::size_t pivot = k;
-            for (std::size_t i = k + 1; i < n; ++i)
-                if (std::abs(factor.lu[i * n + k]) > std::abs(factor.lu[pivot * n + k])) pivot = i;
-            factor.pivots[k] = pivot;
-            if (pivot != k)
-                std::swap_ranges(factor.lu.begin() + k * n, factor.lu.begin() + (k + 1) * n,
-                                 factor.lu.begin() + pivot * n);
-            const double diagonal = factor.lu[k * n + k];
-            if (diagonal == 0.0) throw std::runtime_error("singular implicit Newton matrix");
-            for (std::size_t i = k + 1; i < n; ++i) {{
-                const double multiplier = factor.lu[i * n + k] /= diagonal;
-                for (std::size_t j = k + 1; j < n; ++j)
-                    factor.lu[i * n + j] -= multiplier * factor.lu[k * n + j];
-            }}
-        }}
-        return factor;
-    }}
-
-    static void implicit_dense_solve(const DenseFactor& factor, std::vector<double>& value) {{
-        const std::size_t n = factor.n;
-        for (std::size_t k = 0; k < n; ++k)
-            if (factor.pivots[k] != k) std::swap(value[k], value[factor.pivots[k]]);
-        for (std::size_t i = 0; i < n; ++i)
-            for (std::size_t j = 0; j < i; ++j) value[i] -= factor.lu[i * n + j] * value[j];
-        for (std::size_t i = n; i-- > 0;) {{
-            for (std::size_t j = i + 1; j < n; ++j) value[i] -= factor.lu[i * n + j] * value[j];
-            value[i] /= factor.lu[i * n + i];
-        }}
     }}
 
     const ImplicitFactor& implicit_factor(double h) {{
@@ -777,12 +955,12 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
             for (std::size_t row = 0; row < ni; ++row)
                 for (std::size_t column = 0; column < ng; ++column)
                     coupling[row * ng + column] = matrix[factor.interface[row] * n + index[column]];
-            auto local = implicit_dense_factor(std::move(diagonal), ng);
+            auto local = dense_factor(std::move(diagonal), ng);
             for (std::size_t column = 0; column < ni; ++column) {{
                 std::vector<double> rhs(ng);
                 for (std::size_t row = 0; row < ng; ++row)
                     rhs[row] = matrix[index[row] * n + factor.interface[column]];
-                implicit_dense_solve(local, rhs);
+                dense_solve(local, rhs);
                 for (std::size_t row = 0; row < ng; ++row) response[row * ni + column] = rhs[row];
             }}
             for (std::size_t row = 0; row < ni; ++row)
@@ -792,7 +970,7 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
                             coupling[row * ng + inner] * response[inner * ni + column];
             factor.groups.push_back({{index, std::move(local), std::move(coupling), std::move(response)}});
         }}
-        if (ni) factor.schur = implicit_dense_factor(std::move(schur), ni);
+        if (ni) factor.schur = dense_factor(std::move(schur), ni);
         implicit_factors.push_back(std::move(factor));
         return implicit_factors.back();
     }}
@@ -807,14 +985,14 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
             std::vector<double> local(group.index.size());
             for (std::size_t row = 0; row < group.index.size(); ++row)
                 local[row] = value[group.index[row]];
-            implicit_dense_solve(group.factor, local);
+            dense_solve(group.factor, local);
             for (std::size_t row = 0; row < ni; ++row)
                 for (std::size_t column = 0; column < group.index.size(); ++column)
                     interface_value[row] -= group.coupling[row * group.index.size() + column]
                                             * local[column];
             local_values.push_back(std::move(local));
         }}
-        if (ni) implicit_dense_solve(factor.schur, interface_value);
+        if (ni) dense_solve(factor.schur, interface_value);
         for (std::size_t row = 0; row < ni; ++row)
             value[factor.interface[row]] = interface_value[row];
         for (std::size_t group_index = 0; group_index < factor.groups.size(); ++group_index) {{
@@ -889,7 +1067,7 @@ def _implicit_solver(solver: ImplicitSolver, name: str, arguments: str,
         }}
         if (depth >= {_MAX_SPLITS}) {{
             std::ostringstream message;
-            message << std::setprecision(12) << "{solver.method}: the Newton iteration does not converge at t = " << t << " s";
+            message << std::setprecision(12) << "{method}: the Newton iteration does not converge at t = " << t << " s";
             throw std::runtime_error(message.str());
         }}
         implicit_step(t, state, 0.5 * h, f0, depth + 1);
@@ -948,7 +1126,7 @@ class _Expression:
                 if code not in terms:
                     name = f"{prefix}{len(terms)}"
                     # Partial expressions are evaluated once, on their first guarded use.
-                    terms[code] = name, kind == "bool" or "/" in code or not calls <= total, kind
+                    terms[code] = name, kind == "bool" or not calls <= total, kind
                     runtime._expression_dependencies[name] = code
                 name, lazy, _kind = terms[code]
                 code = name + "()" if lazy else name
@@ -1060,6 +1238,12 @@ class _Expression:
         right = self.of(other)
         if self.kind != "bool" or right.kind != "bool":
             return NotImplemented
+        if self.code == "false" or right.code == "false":
+            return _Expression("false", "bool", pure=True)
+        if self.code == "true" or self.code == right.code:
+            return right
+        if right.code == "true":
+            return self
         return _Expression(f"(({self.code}) && ({right.code}))", "bool",
                            pure=self.pure and right.pure)
 
@@ -1069,6 +1253,12 @@ class _Expression:
         right = self.of(other)
         if self.kind != "bool" or right.kind != "bool":
             return NotImplemented
+        if self.code == "true" or right.code == "true":
+            return _Expression("true", "bool", pure=True)
+        if self.code == "false" or self.code == right.code:
+            return right
+        if right.code == "false":
+            return self
         return _Expression(f"(({self.code}) || ({right.code}))", "bool",
                            pure=self.pure and right.pure)
 
@@ -1085,11 +1275,9 @@ class _Expression:
         )
         if condition.code in control.known:
             return control.known[condition.code]
-        index = control.index
-        control.index += 1
-        if index >= len(control.decisions):
+        if condition.code not in control.decisions:
             raise _TraceBranch(condition)
-        value = control.decisions[index]
+        value = control.decisions[condition.code]
         control.known[condition.code] = value
         return value
 
@@ -1159,9 +1347,57 @@ class _Expression:
             return getattr(self.of(args[0]), function.__name__)
         if function.__name__ == "where" and len(args) == 3 and not kwargs:
             condition, left, right = (self.of(value) for value in args)
+            if condition.code == "true":
+                return left
+            if condition.code == "false" or left.code == right.code:
+                return right
+            if condition.kind == left.kind == right.kind == "bool":
+                if left.code == "true" and right.code == "false":
+                    return condition
+                if left.code == "false" and right.code == "true":
+                    return _Expression(f"!({condition.code})", "bool", pure=condition.pure)
+                if right.code == condition.code:
+                    return condition if left.code == "true" else left
+                if left.code == condition.code:
+                    return condition if right.code == "false" else right
+            kind = left.kind if left.kind == right.kind else self._result(left, right)
             return _Expression(f"(({condition.code}) ? ({left.code}) : ({right.code}))",
-                               self._result(left, right), pure=condition.pure and left.pure and right.pure)
+                               kind, pure=condition.pure and left.pure and right.pure)
         return NotImplemented
+
+
+def _without_terms(code: str) -> str:
+    """Expand trace-local shared terms before persisting or comparing an expression."""
+    pool = _SCALAR_TERMS.get()
+    if pool is None:
+        return code
+    prefix, terms, _runtime, _results = pool
+    expressions = {name: expression for expression, (name, _lazy, _kind) in terms.items()}
+    reference = re.compile(rf"\b{re.escape(prefix)}\d+\b(?:\(\))?")
+    while True:
+        expanded = reference.sub(
+            lambda match: (
+                f"({expressions[match[0].removesuffix('()')]})"
+                if match[0].removesuffix("()") in expressions else match[0]
+            ),
+            code,
+        )
+        if expanded == code:
+            return code
+        code = expanded
+
+
+def _symbolic_node(value: Any) -> Any:
+    """One traced scalar as a symbolic-DAG leaf; constants stay plain Python numbers."""
+    if isinstance(value, _Expression):
+        return _Symbolic.value(_without_terms(value.code))
+    return value.item() if isinstance(value, np.generic) else value
+
+
+def _while_gated(gates: Mapping[int, Any], values: Sequence[Any], gated: Any) -> tuple:
+    """Per diode position: the value it takes while its controlled device is gated on."""
+    return tuple(np.where(gates[index], gated, value) if index in gates else value
+                 for index, value in enumerate(values))
 
 
 class _InitializationExpression(_Expression):
@@ -1240,9 +1476,14 @@ class _InitializationExpression(_Expression):
 
     def __bool__(self):
         expected = bool(self.default)
-        condition = self.code if self.kind == "bool" else f"(({self.code}) != 0.0)"
-        # Construction already guarded layout-changing choices. Preserve that same choice
-        # while tracing equations instead of exploring an incompatible state layout.
+        code = _without_terms(self.code)
+        condition = code if self.kind == "bool" else f"(({code}) != 0.0)"
+        # A network declaration selects one physical layout. Record that choice and trace it
+        # once; retained values are validated against the same choice in the executable.
+        if _NETWORK_DECLARATION.get():
+            self.runtime.guards.setdefault((condition, expected), None)
+            self.runtime.structural_guards.setdefault((condition, expected), None)
+            return expected
         control = _TRACE_CONTROL.get()
         if control is not None and (condition, expected) not in control.guards:
             return super().__bool__()
@@ -1256,25 +1497,36 @@ class _InitializationExpression(_Expression):
         value = round(self.default)
         if not self.runtime.checking_layout:
             return self.wrap(_Expression(f"std::nearbyint({self.code})", "real"), value)
-        self.runtime.guards.setdefault((f"(std::nearbyint({self.code}) == {value})", True), None)
+        self.runtime.guards.setdefault(
+            (f"(std::nearbyint({_without_terms(self.code)}) == {value})", True), None
+        )
         return value
 
     def __int__(self):
         value = int(self.default)
         if self.runtime.checking_layout:
-            self.runtime.guards.setdefault((f"(std::trunc({self.code}) == {value})", True), None)
+            self.runtime.guards.setdefault(
+                (f"(std::trunc({_without_terms(self.code)}) == {value})", True), None
+            )
         return value
 
     def __float__(self):
         # Unlike a layout count, a converted number keeps no expression the replayed part can
-        # pair with: specialize it in construction too, so a changed value is rejected.
+        # pair with: specialize it during construction, so a changed value is rejected. Numeric
+        # analysis of an already paired model may use the nominal value without fixing it again.
         value = float(self.default)
-        self.runtime.guards.setdefault((f"(({self.code}) == {_number(value)})", True), None)
+        if not self.runtime.checking_layout:
+            self.runtime.guards.setdefault(
+                (f"(({_without_terms(self.code)}) == {_number(value)})", True), None
+            )
         return value
 
     def __complex__(self):
         value = complex(self.default)
-        self.runtime.guards.setdefault((f"(({self.code}) == {_complex(value)})", True), None)
+        if not self.runtime.checking_layout:
+            self.runtime.guards.setdefault(
+                (f"(({_without_terms(self.code)}) == {_complex(value)})", True), None
+            )
         return value
 
     def __trunc__(self):
@@ -1323,9 +1575,8 @@ class _ParameterComplex(_InitializationExpression, complex):
 
 @dataclass
 class _TraceControl:
-    decisions: tuple[bool, ...]
+    decisions: Mapping[str, bool]
     guards: frozenset
-    index: int = 0
     known: dict[str, bool] = field(default_factory=dict)
 
 
@@ -1355,7 +1606,10 @@ class _RuntimeParameter:
 class _RuntimeParameters:
     """Scalar parameters and unit commands selected through the shared export interface."""
 
-    def __init__(self, p: Any, requested: tuple[str, ...], *, exclude=()) -> None:
+    def __init__(self, p: Any, requested: tuple[str, ...], *, internal=(), exclude=()) -> None:
+        self.source = p
+        internal = tuple(internal)
+        self.internal = frozenset(internal)
         available = {path: _RuntimeParameter(path, "param_" + _identifier(path), value, derived)
                      for path, value, derived in parameter_leaves(p)}
         if requested:
@@ -1375,12 +1629,26 @@ class _RuntimeParameters:
                 f"parameter {unknown[0]!r} is not variable"
                 + (f"; available: {known}" if known else "")
             )
-        self.available = available
         self.selected = tuple(available[path] for path in selected if path not in exclude)
-        if len({item.member for item in self.selected}) != len(self.selected):
+        for path in internal:
+            value = self.at(p, path)
+            if path not in available and isinstance(value, bool):
+                available[path] = _RuntimeParameter(
+                    path, "param_" + _identifier(path), value
+                )
+        self.available = available
+        unknown_internal = [path for path in internal if path not in available]
+        if unknown_internal:
+            raise ValueError(f"event parameter {unknown_internal[0]!r} is not variable")
+        self.tracked = tuple(dict.fromkeys((
+            *self.selected,
+            *(available[path] for path in internal),
+        )))
+        if len({item.member for item in self.tracked}) != len(self.tracked):
             raise ValueError("exported parameter names collide after C++ identifier normalization")
-        self.by_path = {item.path: item for item in self.selected}
+        self.by_path = {item.path: item for item in self.tracked}
         self.guards = {}
+        self.structural_guards = {}
         self.initializers = {}
         self._expression_dependencies = {}
         self._equation_counter = 0
@@ -1392,7 +1660,7 @@ class _RuntimeParameters:
         self.checking_layout = False
         self.base = getattr(p, "base", None)
         self.p = self.copy(p)
-        if self.selected:
+        if self.tracked:
             assignments, changes, before = {}, [], self.p
             for change in p.changes:
                 after = self.copy(change.params) if change.params is not None else before
@@ -1467,10 +1735,19 @@ class _RuntimeParameters:
         return [f"{_CPP_TYPES[kind]} {member} = {code};"
                 for (code, kind), member in self.initializers.items()]
 
+    def refresh_assignments(self, paths) -> list[str]:
+        """Refresh cached derived expressions affected by changed root parameters."""
+        changed = set(paths)
+        return [
+            f"{member} = {code};"
+            for (code, _kind), member in self.initializers.items()
+            if changed.intersection(self.parameter_dependencies((code,))[code] or ())
+        ]
+
     @cached_property
     def _parameter_members(self):
-        members = {item.member: item.path for item in self.selected}
-        members.update({"given_" + item.member: item.path for item in self.selected if item.derived})
+        members = {item.member: item.path for item in self.tracked}
+        members.update({"given_" + item.member: item.path for item in self.tracked if item.derived})
         return members
 
     def expression_symbols(self, code):
@@ -1492,6 +1769,7 @@ class _RuntimeParameters:
         Unknown run-time symbols are rejected rather than treated as constants. No parameter
         values are tried, and cached initializers are visited at most once per expression.
         """
+        expressions = tuple(expressions)
         members = self._parameter_members
         def resolve(code):
             paths = set()
@@ -1513,8 +1791,24 @@ class _RuntimeParameters:
             f"{_cpp_string('invalid parameter combination or changed structural specialization: ' + code)});"
             for code, condition in self.validation_conditions())
 
+    def _validation_expression(self, code: str) -> str:
+        """Expand equation-local DAG names to expressions visible during initialization."""
+        local = re.compile(r"\b(equation_\d+_\d+)\b(?:\(\))?")
+
+        def expand(text: str, active: frozenset[str] = frozenset()) -> str:
+            def replace(match: re.Match) -> str:
+                name = match.group(1)
+                dependency = self._expression_dependencies.get(name)
+                if dependency is None or name in active:
+                    return match.group(0)
+                return f"({expand(dependency, active | {name})})"
+
+            return local.sub(replace, text)
+
+        return expand(code)
+
     def validation_conditions(self):
-        return [(code, f"{'!' if expected else ''}({code})")
+        return [(code, f"{'!' if expected else ''}({self._validation_expression(code)})")
                 for code, expected in self.guards]
 
     def contains_parameters(self, value):
@@ -1542,6 +1836,8 @@ class _RuntimeParameters:
             seen = set()
         if isinstance(initialized, _InitializationExpression):
             return self.cached(initialized)
+        if isinstance(original, (Netlist, NetlistElement, Port)):
+            return original
         if not self.contains_parameters(initialized):
             return original
         if isinstance(original, (tuple, list)) and isinstance(initialized, type(original)):
@@ -1680,7 +1976,7 @@ class _RuntimeParameters:
     def value(self, path: str, value: Any) -> str:
         item = self.by_path.get(path)
         if item is None:
-            return _number(value)
+            return _literal(value) if isinstance(value, bool) else _number(value)
         if isinstance(item.default, bool):
             return "parameters." + item.member
         stored = self.at(self.initial_p, path)
@@ -1689,10 +1985,12 @@ class _RuntimeParameters:
     def declarations(self) -> str:
         members = "\n    ".join(
             f"{'long long' if isinstance(item.default, int) else 'double'} "
-            f"{item.member} = {_number(item.default)};"
+            f"{item.member} = {_number(self.at(self.initial_p, item.path)
+                                      if isinstance(item.default, bool)
+                                      and item.path in self.internal else item.default)};"
             + (f"\n    bool given_{item.member} = false;"
                if item.derived or isinstance(item.default, bool) else "")
-            for item in self.selected
+            for item in self.tracked
         )
         return f"struct RuntimeParameters {{\n    {members}\n}};" if members else "struct RuntimeParameters {};"
 
@@ -1733,11 +2031,15 @@ class _RuntimeParameters:
 
     def resolved_template(self) -> tuple[str, list[tuple[str, str]]]:
         if not self.selected:
-            return dumps(self.p), []
+            return dumps(self.source), []
         replacements: list[tuple[str, str]] = []
+        public = {item.path for item in self.selected}
 
         def written(value):
             if isinstance(value, _InitializationExpression):
+                dependencies = self.parameter_dependencies((value.code,))[value.code] or ()
+                if public.isdisjoint(dependencies):
+                    return value.default
                 marker = f"__PESLITE_RUNTIME_PARAMETER_{len(replacements)}__"
                 replacements.append((marker, f"yaml_number({value.code})"))
                 return marker
@@ -1770,7 +2072,7 @@ class _ModelGenerator:
     """Turn Model's fixed state and connection plans into straight-line C++."""
 
     def __init__(self, simulation: Any, runtime: _RuntimeParameters, *,
-                 defer_equations: bool = False) -> None:
+                 zoh_initial: Mapping[str, Any] | None = None) -> None:
         runtime = runtime if runtime is not None else _RuntimeParameters(simulation.p, ())
         self.simulation = simulation
         self.p = runtime.p
@@ -1781,8 +2083,8 @@ class _ModelGenerator:
         self.prefix = {id(sub): f"s{index}" for index, sub in enumerate(self.model.subsystems)}
         self.component_subsystem = {}
         for sub in self.model.subsystems:
-            component = getattr(sub, "component", None)
-            if component is not None:
+            component = getattr(sub, "equation_owner", sub)
+            if component is not sub:
                 self.component_subsystem[id(component)] = sub
                 self.subsystem_name.setdefault(id(component), self.subsystem_name[id(sub)])
                 self.prefix.setdefault(id(component), self.prefix[id(sub)])
@@ -1794,21 +2096,27 @@ class _ModelGenerator:
         self._algebraic_index = {id(loop): index
                                  for index, loop in enumerate(self.model.algebraic_loops)}
         self._algebraic_plans = {}
-        self._lifecycle_writes: set[tuple[int, str]] | None = None
         self.diagnostics = []
         self.state_index: dict[tuple[int, str], tuple[int, bool]] = {
             (id(state), name): (index, is_complex)
             for state, name, index, is_complex in self.model._state_ops
         }
         self.zoh_fields: dict[tuple[int, str], str] = {}
-        self.element_parameters: dict[str, tuple[str, Any, str]] = {}
-        self._parameter_attributes: dict[int, dict[str, _Expression]] = {}
+        self.zoh_initial: dict[str, Any] = {}
         self._coefficient_plans = {}
         self._coefficient_topologies = {}
+        self._dynamic_netlist_traces = {}
+        self.event_parameter_bindings: dict[str, tuple[bool, str | None]] = {}
+        self._runtime_networks = {}
         self.equation_bindings = {}
         self.equation_members = {}
         self.equation_references = {}
         self._equation_method_plans = {}
+        self._equation_method_roots = {}
+        for circuit in self.system.circuits:
+            for component, callback in circuit._hooks:
+                owner = self.component_subsystem.get(id(component), component)
+                self._equation_method_roots.setdefault(id(owner), set()).add(callback.__name__)
         for sub in self.model.subsystems:
             read = getattr(sub, "equation_state_bindings", None)
             if read is None:
@@ -1817,15 +2125,12 @@ class _ModelGenerator:
             if not bindings:
                 continue
             self.equation_bindings[id(sub)] = bindings
-            component = getattr(sub, "component", None)
-            if component is not None:
-                if isinstance(sub, NetworkView):
-                    component_read = getattr(component, "equation_state_bindings", None)
-                    self.equation_bindings[id(component)] = (
-                        {} if component_read is None else component_read()
-                    )
-                else:
-                    self.equation_bindings[id(component)] = bindings
+            component = getattr(sub, "equation_owner", sub)
+            if component is not sub:
+                component_read = getattr(component, "equation_state_bindings", None)
+                self.equation_bindings[id(component)] = (
+                    {} if component_read is None else component_read()
+                )
             for owner, attribute in bindings.values():
                 key = id(owner), attribute
                 value = getattr(owner, attribute)
@@ -1837,21 +2142,16 @@ class _ModelGenerator:
         self.storage_coefficients = {
             (id(owner.state), storage.state): storage.scale * storage.value
             for owner in self.model.subsystems
-            for storage in getattr(runtime.object(getattr(owner, "component", owner)), "storage", ())
+            for storage in getattr(
+                runtime.object(getattr(owner, "equation_owner", owner)), "storage", ()
+            )
         }
-        changed_paths = {path for change in self.p.changes for path in change.paths}
-        for name, element in self.system.named_elements.items():
-            for field, (subsystem, attribute) in getattr(
-                    element, "parameter_bindings", lambda: {})().items():
-                path = f"elements.{name}.{field}"
-                if path in changed_paths:
-                    member = "element_" + _identifier(name + "_" + field)
-                    self.element_parameters[path] = (member, subsystem, attribute)
-                    self._parameter_attributes.setdefault(id(subsystem), {})[attribute] = (
-                        _Expression(member, "real")
-                    )
         for label, targets in self.model._zoh_targets.items():
             member = f"hold_{_identifier(label)}"
+            record, field = targets[0]
+            self.zoh_initial[label] = (
+                getattr(record, field) if zoh_initial is None else zoh_initial[label]
+            )
             for record, field in targets:
                 self.zoh_fields[id(record), field] = member
         self._discover_records()
@@ -1881,8 +2181,11 @@ class _ModelGenerator:
             for field in sub.get_state()
         }
 
-        if not defer_equations:
-            self.resolve_equations()
+        # Network declarations are already required for native equation lowering. Replay their
+        # parameter bindings now so structural guards participate in the same diagnostics pass.
+        for circuit in self.system.circuits:
+            self._circuit_coefficients(circuit)
+        self.resolve_equations()
 
     def resolve_equations(self) -> None:
         """Lower equations after native lifecycle writers have been bound."""
@@ -1897,11 +2200,22 @@ class _ModelGenerator:
                 self._algebraic_fields[id(record), name] = record
         for key in self.state_index.keys() | self.zoh_fields.keys():
             self._algebraic_fields.pop(key, None)
+        structural = self.runtime.parameter_dependencies(
+            condition for condition, _expected in self.runtime.structural_guards
+        )
+        parameters = tuple(sorted({
+            path for paths in structural.values() if paths is not None for path in paths
+        }))
+        if parameters:
+            self.diagnostics.append({
+                "code": "conditional-network-structure",
+                "parameters": parameters,
+                "message": "Retained parameters " + ", ".join(parameters)
+                + " control the declared circuit structure.",
+            })
 
     def breaker_lines(self, branch: RLBranch, open_expression: str) -> list[str]:
         """Render the state transition implemented by ``RLBranch`` breaker methods."""
-        if self._lifecycle_writes is not None:
-            self._lifecycle_writes.add((id(branch), "breaker_open"))
         flag = self._equation_attributes(branch)["breaker_open"].code
 
         def transition(owner):
@@ -1918,8 +2232,9 @@ class _ModelGenerator:
 
     def ramp_member_names(self, owner: Any, source: Any) -> tuple[str, str, str] | None:
         """Return native member names for a source with a connection ramp."""
-        if source is None or not hasattr(source, "i_nom"):
+        if source is None or not callable(source) or not hasattr(source, "ramp"):
             return None
+        owner = getattr(owner, "equation_owner", owner)
         tag = self.prefix[id(owner)]
         return "source_start_" + tag, "source_duration_" + tag, "source_ramp_" + tag
 
@@ -1944,7 +2259,7 @@ class _ModelGenerator:
                 record = getattr(sub, role)
                 mapped = self.record_fields.setdefault(id(record), {})
                 for field in _fields(record):
-                    name = mapped.setdefault(field, f"{tag}_{role}_{_identifier(field)}")
+                    mapped.setdefault(field, f"{tag}_{role}_{_identifier(field)}")
                     value = getattr(record, field)
                     self.record_types[id(record), field] = (
                         "bool" if isinstance(value, bool) else
@@ -1964,11 +2279,15 @@ class _ModelGenerator:
 
     @staticmethod
     def _normalise_trace(value: Any) -> Any:
+        if value is None:
+            return None
         if isinstance(value, dict):
             return {str(key): _ModelGenerator._normalise_trace(item)
                     for key, item in value.items()}
         if isinstance(value, (tuple, list)):
             return tuple(_ModelGenerator._normalise_trace(item) for item in value)
+        if isinstance(value, _Symbolic):
+            return value
         if isinstance(value, (_Expression, numbers.Number)):
             return _Expression.of(value)
         if hasattr(value, "shape") and hasattr(value, "flat"):
@@ -1977,6 +2296,10 @@ class _ModelGenerator:
 
     @staticmethod
     def _merge_trace(condition: _Expression, when_false: Any, when_true: Any) -> Any:
+        if when_false is None or when_true is None:
+            if when_false is when_true:
+                return None
+            raise TypeError("an equation branch cannot add or remove an optional result")
         if isinstance(when_false, _TraceFailure) and isinstance(when_true, _TraceFailure):
             return when_false
         def failure_like(value, failure):
@@ -1991,16 +2314,29 @@ class _ModelGenerator:
             when_false = failure_like(when_true, when_false)
         if isinstance(when_true, _TraceFailure):
             when_true = failure_like(when_false, when_true)
+
+        def structural_choice(message: str):
+            if not isinstance(condition, _InitializationExpression):
+                raise TypeError(message)
+            expected = bool(condition.default)
+            code = (condition.code if condition.kind == "bool"
+                    else f"(({condition.code}) != 0.0)")
+            condition.runtime.guards.setdefault((code, expected), None)
+            return when_true if expected else when_false
+
         if isinstance(when_false, dict) and isinstance(when_true, dict):
             if when_false.keys() != when_true.keys():
-                raise TypeError("a symbolic branch changes the equation output names")
+                return structural_choice("a symbolic branch changes the equation output names")
             return {key: _ModelGenerator._merge_trace(condition, when_false[key], when_true[key])
                     for key in when_false}
         if isinstance(when_false, tuple) and isinstance(when_true, tuple):
             if len(when_false) != len(when_true):
-                raise TypeError("a symbolic branch changes the number of state derivatives")
+                return structural_choice("a symbolic branch changes the number of state derivatives")
             return tuple(_ModelGenerator._merge_trace(condition, left, right)
                          for left, right in zip(when_false, when_true))
+        if isinstance(when_false, _Symbolic) or isinstance(when_true, _Symbolic):
+            return np.where(_symbolic_node(condition), _symbolic_node(when_true),
+                            _symbolic_node(when_false))
         left, right = _Expression.of(when_false), _Expression.of(when_true)
         if (left.code, left.kind) == (right.code, right.kind):
             return left
@@ -2009,6 +2345,10 @@ class _ModelGenerator:
                 return condition
             if (left.code, right.code) == ("true", "false"):
                 return _Expression(f"!({condition.code})", "bool", pure=condition.pure)
+            if left.code == condition.code:
+                return condition if right.code == "true" else right
+            if right.code == condition.code:
+                return condition if left.code == "false" else left
         kind = "complex" if "complex" in (left.kind, right.kind) else (
             "bool" if left.kind == right.kind == "bool" else "real"
         )
@@ -2028,8 +2368,10 @@ class _ModelGenerator:
                              (f"!({condition.code})", left.code, replacement))
         return _Expression(code, kind, pure=condition.pure and left.pure and right.pure)
 
-    def _trace(self, run: Any, decisions: tuple[bool, ...] = (), *, budget=None, guards=None) -> Any:
+    def _trace(self, run: Any, decisions: Mapping[str, bool] | None = None, *,
+               budget=None, guards=None) -> Any:
         """Trace pure scalar arithmetic, exploring state-dependent Python branches."""
+        decisions = {} if decisions is None else decisions
         budget = [0] if budget is None else budget
         budget[0] += 1
         if budget[0] > _TRACE_WORK_BUDGET:
@@ -2050,20 +2392,54 @@ class _ModelGenerator:
         finally:
             _TRACE_CONTROL.reset(token)
         assert branch is not None
-        when_false = self._trace(run, (*decisions, False), budget=budget, guards=guards)
-        when_true = self._trace(run, (*decisions, True), budget=budget, guards=guards)
+        when_false = self._trace(
+            run, {**decisions, branch.condition.code: False}, budget=budget, guards=guards
+        )
+        when_true = self._trace(
+            run, {**decisions, branch.condition.code: True}, budget=budget, guards=guards
+        )
         result = self._merge_trace(branch.condition, when_false, when_true)
         if not decisions and isinstance(result, _TraceFailure):
             raise result.error
         return result
 
+    def _trace_alternatives(self, run: Any) -> list[tuple[_Expression, Any]]:
+        """Retain correlated branch leaves for declarations whose cases must stay concrete."""
+        alternatives: list[tuple[_Expression, Any]] = []
+        budget = [0]
+
+        def explore(decisions: Mapping[str, bool]) -> None:
+            budget[0] += 1
+            if budget[0] > _TRACE_WORK_BUDGET:
+                raise TypeError("declaration tracing exceeds its branch-work budget")
+            token = _TRACE_CONTROL.set(_TraceControl(decisions, frozenset(self.runtime.guards)))
+            branch = None
+            try:
+                value = run()
+            except _TraceBranch as exc:
+                branch = exc
+            finally:
+                _TRACE_CONTROL.reset(token)
+            if branch is not None:
+                explore({**decisions, branch.condition.code: False})
+                explore({**decisions, branch.condition.code: True})
+                return
+            terms = [code if selected else f"!({code})"
+                     for code, selected in decisions.items()]
+            alternatives.append((_Expression(" && ".join(terms) or "true", "bool"), value))
+
+        explore({})
+        return alternatives
+
     def _equation_method_plan(self, owner, bindings):
         """Use ordinary annotated method boundaries to keep independent branches separate."""
         if id(owner) not in self._equation_method_plans:
             objects = {id(owner): owner, **{id(part): part for part, _attribute in bindings.values()}}
-            pending = ['rhs', 'set_outputs', 'set_ac_voltage', 'set_dc_current', 'get_state',
-                       'commutation_margin', 'commutate', 'next_commutation_time', 'project_state',
-                       'diagnostics']
+            pending = [
+                'rhs', 'set_outputs', 'set_ac_voltage', 'set_dc_current', 'get_state',
+                'commutation_margin', 'commutate', 'next_commutation_time', 'project_state',
+                'diagnostics', *self._equation_method_roots.get(id(owner), ()),
+            ]
             visited, plan = set(), []
             while pending:
                 name = pending.pop()
@@ -2223,8 +2599,7 @@ class _ModelGenerator:
                 setattr(target, name, scoped.__get__(target, type(target)))
         if bound is not None:
             bound.update(copies)
-        for name, value in {**self._parameter_attributes.get(id(owner), {}),
-                            **(attributes or {})}.items():
+        for name, value in (attributes or {}).items():
             setattr(clone, name, value)
         return clone
 
@@ -2280,13 +2655,22 @@ class _ModelGenerator:
         for code, name, lazy, kind in reversed(retained):
             code = bind(code)
             if lazy and name not in eager:
-                scalar = _CPP_TYPES[kind]
-                declarations.append(
-                    f"bool {name}_ready = false; {scalar} {name}_value{{}}; "
-                    f"const auto {name} = [&]() -> {scalar} {{ "
-                    f"if (!{name}_ready) {{ {name}_value = {code}; {name}_ready = true; }} "
-                    f"return {name}_value; }};"
-                )
+                if kind.startswith("array:"):
+                    scalar = f"std::array<double, {kind.partition(':')[2]}>"
+                    declarations.append(
+                        f"bool {name}_ready = false; {scalar} {name}_value{{}}; "
+                        f"const auto {name} = [&]() -> const {scalar}& {{ "
+                        f"if (!{name}_ready) {{ {name}_value = {code}; {name}_ready = true; }} "
+                        f"return {name}_value; }};"
+                    )
+                else:
+                    scalar = _CPP_TYPES[kind]
+                    declarations.append(
+                        f"bool {name}_ready = false; {scalar} {name}_value{{}}; "
+                        f"const auto {name} = [&]() -> {scalar} {{ "
+                        f"if (!{name}_ready) {{ {name}_value = {code}; {name}_ready = true; }} "
+                        f"return {name}_value; }};"
+                    )
             else:
                 declarations.append(f"const auto {name} = {code};")
         return [*declarations, *(bind(line) for line in lines)]
@@ -2317,7 +2701,13 @@ class _ModelGenerator:
             target = self.equation_members[id(part), attribute][0]
             if value.code != target:
                 lines.append(f"{target} = {value.code};")
-        if not lines and fields:
+        subsystem = self.component_subsystem.get(id(owner), owner)
+        produced = next((
+            stage.outputs
+            for stage in getattr(subsystem, "output_stages", None) or ()
+            if getattr(subsystem, stage.method) == method
+        ), fields)
+        if not lines and produced:
             raise TypeError("output equation did not assign an output field")
         return self._term_declarations(prefix, terms, lines)
 
@@ -2353,26 +2743,27 @@ class _ModelGenerator:
         return self.solver_expression(self.trace_scalar_method(sub, name, attributes))
 
     def solver_expression(self, code):
-        """Translate an equation expression to persistent solver-scope values."""
-        for record_id, field in self.state_index:
-            local = self.record_fields[record_id][field]
-            value = self.state_value((record_id, field))
-            code = code.replace(local, value)
-        for (record_id, field), held in self.zoh_fields.items():
-            code = code.replace(self.record_fields[record_id][field], held)
+        """Translate whole local identifiers to persistent solver-scope values."""
+        values: dict[str, Callable[[], str]] = {}
         for subsystem in self.model.subsystems:
             subsystem_name = self.subsystem_name[id(subsystem)]
             for role in ("input", "output"):
                 record = getattr(subsystem, role)
                 for field in _fields(record):
-                    local = self.record_fields[id(record)][field]
-                    if local not in code:
-                        continue
-                    code = code.replace(
-                        local,
-                        self.solver_observation(record, field, subsystem_name, role),
+                    values[self.record_fields[id(record)][field]] = partial(
+                        self.solver_observation, record, field, subsystem_name, role
                     )
-        return code
+        for (record_id, field), held in self.zoh_fields.items():
+            values[self.record_fields[record_id][field]] = partial(str, held)
+        for record_id, field in self.state_index:
+            values[self.record_fields[record_id][field]] = partial(
+                self.state_value, (record_id, field)
+            )
+        return re.sub(
+            r"\b[A-Za-z_]\w*\b",
+            lambda match: values[match.group(0)]() if match.group(0) in values else match.group(0),
+            code,
+        )
 
     def _trace_transition_call(self, sub, callback, arguments, label, *, bind_callback_owner=False):
         """Trace one state-changing callback with its explicit arguments."""
@@ -2387,7 +2778,8 @@ class _ModelGenerator:
             )
             target = (bound.get(id(getattr(callback, "__self__", None)), clone)
                       if bind_callback_owner else clone)
-            self._rebind(callback, target)(*arguments)
+            traced = getattr(target, getattr(callback, "__name__", ""), None)
+            (traced if callable(traced) else self._rebind(callback, target))(*arguments)
             return (*[getattr(bound[id(part)], attribute) for part, attribute in bindings.values()],
                     *[getattr(clone.state, field) for field in sub.state_names])
 
@@ -2422,7 +2814,7 @@ class _ModelGenerator:
             arguments,
             f"transition_{self.prefix[id(sub)]}",
             bind_callback_owner=(
-                isinstance(sub, NetworkView)
+                getattr(sub, "equation_owner", sub) is not sub
                 and getattr(callback, "__self__", sub) is not sub
             ),
         )
@@ -2584,6 +2976,10 @@ class _ModelGenerator:
         if wrapper is None:
             return _number(source.e_peak), "0.0"
         source_name = entry[0]
+        self.event_parameter_bindings.update(
+            (f"sources.{source_name}.{field}", (False, None))
+            for field in ("v", "f", "angle")
+        )
         scenario = _source_scenario(self.p, f"sources.{source_name}",
                                     lambda q: q.sources[source_name])
 
@@ -2631,9 +3027,6 @@ class _ModelGenerator:
             rendered = stage_hook(self, method)
             if rendered is not None:
                 return list(rendered)
-        hook = getattr(owner, "cpp_outputs", None)
-        if hook is not None:
-            return list(hook(self))
         generator = self.continuous_units.get(id(owner))
         if generator is not None:
             return generator.output_lines()
@@ -2652,18 +3045,17 @@ class _ModelGenerator:
         enabled = self.enabled_by.get(id(owner))
         if enabled is not None:
             attributes["enabled"] = _Expression(enabled, "bool")
-        conditional = getattr(owner, "conditional_equation_states", ())
         for name, (record, field) in self.equation_bindings.get(id(owner), {}).items():
             if record is not owner or name != field or not name.isidentifier():
                 continue
-            if (name in conditional and self._lifecycle_writes is not None
-                    and (id(record), field) not in self._lifecycle_writes):
-                continue
             member, kind, _record, _field = self.equation_members[id(record), field]
             attributes[name] = _Expression(member, kind)
-        hook = getattr(owner, "cpp_equation_attributes", None)
-        if hook is not None:
-            attributes.update(hook(self))
+        equation_objects = getattr(owner, "equation_objects", None)
+        if equation_objects is not None:
+            attributes.update(
+                (name, self.ramped_equation_value(owner, value))
+                for name, value in equation_objects().items()
+            )
         return attributes
 
     def source_output_lines(self, source: ACVoltageSource) -> list[str]:
@@ -2684,6 +3076,7 @@ class _ModelGenerator:
 
     def ramp_equation_members(self, owner: Any, source: Any, controllers=()) -> list[str]:
         """Render the optional native ramp state of one source-like equation value."""
+        owner = getattr(owner, "equation_owner", owner)
         ramp = self.ramp_member_names(owner, source)
         if ramp is None:
             return []
@@ -2725,6 +3118,27 @@ class _ModelGenerator:
             net.scalar_output_values = lambda t, y, topology=None: self._trace_dynamic_netlist(
                 circuit, t, y, topology=topology
             )[1]
+
+            def remap_netlist(value):
+                if value is original:
+                    return net
+                if isinstance(value, (tuple, list)):
+                    items = tuple(remap_netlist(item) for item in value)
+                    return (value if all(left is right for left, right in zip(value, items))
+                            else _sequence_like(value, items))
+                if isinstance(value, dict):
+                    items = {key: remap_netlist(item) for key, item in value.items()}
+                    return (value if all(items[key] is item for key, item in value.items())
+                            else items)
+                return value
+
+            for component in circuit.components:
+                for field in _fields(component):
+                    before = getattr(component, field)
+                    after = remap_netlist(before)
+                    if after is not before:
+                        restored.append((component, field, before))
+                        setattr(component, field, after)
         circuit._cpp_coefficients = coefficients
         circuit._cpp_topologies = self._coefficient_topologies.setdefault(id(circuit), {})
         records = []
@@ -2806,6 +3220,42 @@ class _ModelGenerator:
         coefficients, offset, transform_offset = [], 0, 0
         transforms = list(circuit._transforms)
         changed_transforms = False
+        overlaid: set[int] = set()
+
+        def graph_objects(value):
+            if isinstance(value, (Netlist, NetlistElement, Port)):
+                return True
+            if isinstance(value, (tuple, list)):
+                return any(graph_objects(item) for item in value)
+            if isinstance(value, dict):
+                return any(graph_objects(item) for item in value.values())
+            return (not is_dataclass(value)
+                    and (hasattr(value, "state") or id(value) in self.runtime.object_updates))
+
+        def nested(original, replacement):
+            if isinstance(original, (Netlist, NetlistElement, Port)):
+                return
+            if isinstance(original, (tuple, list)) and isinstance(replacement, type(original)):
+                for left, right in zip(original, replacement):
+                    nested(left, right)
+                return
+            if isinstance(original, dict) and isinstance(replacement, dict):
+                for key, left in original.items():
+                    nested(left, replacement[key])
+                return
+            overlays(original)
+
+        def overlays(owner):
+            if id(owner) in overlaid:
+                return
+            overlaid.add(id(owner))
+            for name, value in self.runtime.object_updates.get(id(owner), {}).items():
+                original = getattr(owner, name)
+                if graph_objects(original):
+                    nested(original, value)
+                else:
+                    coefficients.append((owner, name, self.runtime.object(value)))
+
         for owner in circuit.components:
             restored = []
             clone = self.runtime.object(owner)
@@ -2814,10 +3264,6 @@ class _ModelGenerator:
                           and not isinstance(getattr(clone, name), Port)
                           and not inspect.isroutine(getattr(clone, name))
                           and getattr(clone, name) is not getattr(owner, name)}
-            for name, expression in self._parameter_attributes.get(id(owner), {}).items():
-                attributes[name] = _InitializationExpression.make(
-                    expression, getattr(owner, name), self.runtime
-                )
             try:
                 for name, value in attributes.items():
                     restored.append((name, getattr(owner, name)))
@@ -2827,8 +3273,8 @@ class _ModelGenerator:
                 for name, value in reversed(restored):
                     setattr(owner, name, value)
             # Source callbacks close over the same component attributes as its declaration.
-            # Keep their parameters bound together with the stamped primitive coefficients.
-            coefficients.extend((owner, name, value) for name, value in attributes.items())
+            # Overlay their parameter leaves while preserving every live graph/state identity.
+            overlays(owner)
             original = circuit.declarations[id(owner)]
             if declaration is None or len(declaration.elements) != len(original.elements):
                 raise TypeError("parameter initialization changes a component's netlist layout")
@@ -2892,57 +3338,419 @@ class _ModelGenerator:
             )
         return array.reshape(transformer.shape)
 
-    @classmethod
-    def _trace_dynamic_netlist(cls, circuit: Any, t: Any,
-                               states: list[Any], *, topology=None) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
-        """Eliminate the same netlist while retaining parameter and transformer expressions."""
+    def _resolved_equation_topology(self, circuit: Any, topology: Topology,
+                                    ratios: Sequence[np.ndarray]):
+        """Compile one exact structural mode with the run-time ratio sparsity retained."""
         net = circuit.netlist
-        ratios = tuple(cls._ratio_matrix(transformer) for transformer in net._transformers)
+        zero_ratios = tuple(
+            transformer.constant if transformer.constant is not None
+            else np.zeros(transformer.shape)
+            for transformer in net._transformers
+        )
+        try:
+            resolved_topology = self._equation_topology(circuit, Mode(
+                topology.mode.closed, topology.mode.conducting, zero_ratios,
+            ))
+            return resolved_topology, tuple(ratios)
+        except (_Degenerate, ValueError, np.linalg.LinAlgError):
+            samples = list(topology.mode.ratios)
+            resolved = []
+            for transformer_index, (transformer, ratio) in enumerate(
+                    zip(net._transformers, ratios)):
+                if transformer.constant is not None:
+                    resolved.append(ratio)
+                    continue
+                ratio = np.array(ratio, dtype=object, copy=True)
+                sample = np.array(samples[transformer_index], dtype=float, copy=True)
+                for flat, value in enumerate(ratio.flat):
+                    present = (value != 0.0 if not isinstance(value, _Expression) else
+                               bool(_Expression(
+                                   f"(std::abs({value.code}) != 0.0)", "bool", pure=value.pure,
+                               )))
+                    if not present:
+                        ratio.flat[flat] = 0.0
+                        sample.flat[flat] = 0.0
+                    elif sample.flat[flat] == 0.0:
+                        row, column = np.unravel_index(flat, ratio.shape)
+                        sample.flat[flat] = (1.0 if row == column else
+                                             1.0 / (8.0 + row + 2.0 * column))
+                resolved.append(ratio)
+                samples[transformer_index] = sample
+            resolved_topology = self._equation_topology(circuit, Mode(
+                topology.mode.closed, topology.mode.conducting, tuple(samples),
+            ))
+            return resolved_topology, tuple(resolved)
+
+    @classmethod
+    def _symbolic_netlist_matrix(cls, circuit: Any, topology=None, ratios=None):
+        """Build the selected netlist matrix once from its ordinary stamped equations."""
+        net = circuit.netlist
+        ratios = (tuple(cls._ratio_matrix(transformer) for transformer in net._transformers)
+                  if ratios is None else ratios)
         topology = net.topology() if topology is None else topology
         topology = cls._equation_topology(circuit, topology.mode)
-        samples = topology.mode.ratios
         matrices = topology._equation_stamps
-
         pattern = topology._pattern
         columns = np.repeat(np.arange(pattern.n), np.diff(pattern.indptr))
         flat_ratios = tuple(value for ratio in ratios for value in ratio.reshape(-1))
         matrix = [[0.0] * pattern.n for _ in range(pattern.n)]
+        varying: set[tuple[int, int]] = set()
         for row, column, value in zip(matrices["M"].r, matrices["M"].c, matrices["M"].v):
-            matrix[row][column] += value
-        for position, flat, coefficient in zip(pattern.slot_pos, pattern.slot_flat, pattern.slot_coef):
-            matrix[int(pattern.indices[position])][int(columns[position])] += (
-                coefficient * flat_ratios[int(flat)]
+            matrix[row][column] += _symbolic_node(value)
+        for position, flat, coefficient in zip(
+                pattern.slot_pos, pattern.slot_flat, pattern.slot_coef):
+            row, column = int(pattern.indices[position]), int(columns[position])
+            ratio = flat_ratios[int(flat)]
+            matrix[row][column] += coefficient * _symbolic_node(ratio)
+            if not _constant(ratio):
+                varying.add((row, column))
+        return topology, matrices, matrix, pattern.dense(topology.mode.ratios), varying
+
+    def _runtime_network_case(self, circuit: Any, topology: Topology) -> tuple[np.ndarray, tuple]:
+        """Compile one mode into its affine physical map and shared post-processing program."""
+        net = circuit.netlist
+        state_space = topology.state_space
+        affine = np.vstack((
+            np.hstack((state_space.A, state_space.B, state_space.B1)),
+            np.hstack((state_space.C, state_space.D, state_space.D1)),
+        ))
+        argument_count = net.n_x + 2 * net.n_u
+        arguments = tuple(_Symbolic.value(str(index)) for index in range(argument_count))
+        physical = tuple(
+            _Symbolic.value(str(argument_count + index))
+            for index in range(affine.shape[0])
+        )
+        output_values = physical[net.n_x:]
+        state_extent = max(map(int, net.states), default=-1) + 1
+        initial: list[Any] = [0.0] * state_extent
+        for index, position in enumerate(net.states):
+            initial[int(position)] = arguments[index]
+        input_values = arguments[net.n_x:net.n_x + net.n_u]
+        projected = list(initial)
+        projection_values = {}
+        for projector in topology.projectors():
+            if projector is None:
+                continue
+            values, multipliers = projector.values(projected, input_values)
+            projection_values[id(projector)] = values, multipliers
+            for position, value in zip(projector.index, values):
+                projected[int(position)] = value
+
+        previous_conduction = tuple(diode.conducting for diode in net._diodes)
+        previous_gated = net._gated_state
+        try:
+            for diode, conducting in zip(net._diodes, topology.mode.conducting):
+                diode.conducting = conducting
+            net._gated_state = (False,) * len(net._diodes)
+            margins = net._diode_margins(topology, output_values)
+            impulses = net._scalar_impulse_flags(
+                topology, initial, input_values, output_values, projection_values
             )
+        finally:
+            net._gated_state = previous_gated
+            for diode, conducting in zip(net._diodes, previous_conduction):
+                diode.conducting = conducting
+
+        local_state = {int(position): index for index, position in enumerate(net.states)}
+        inconsistent: Any = False
+        for projector in topology.projectors():
+            if projector is None:
+                continue
+            reference: Any = 0.0
+            for position in projector.index:
+                reference = np.maximum(reference, abs(arguments[local_state[int(position)]]))
+            tolerance = _MARGIN_RTOL * reference
+            for position in projector.index:
+                index = local_state[int(position)]
+                inconsistent |= abs(projected[int(position)] - arguments[index]) > tolerance
+        post = (*margins, *(projected[int(position)] for position in net.states),
+                *impulses, inconsistent)
+        return affine, tuple(post)
+
+    @staticmethod
+    def _runtime_program(
+        values: Sequence[Any], inputs: Mapping[Any, int] | None = None,
+    ) -> tuple[tuple, tuple[int, ...]]:
+        """Lower expression roots to a compact, topologically ordered scalar program."""
+        instructions: list[tuple] = []
+        indices: dict[Any, int] = {}
+        emitted: dict[tuple, int] = {}
+
+        def emit(instruction: tuple) -> int:
+            if instruction not in emitted:
+                emitted[instruction] = len(instructions)
+                instructions.append(instruction)
+            return emitted[instruction]
+
+        def lower(value: Any) -> int:
+            value = value.item() if isinstance(value, np.generic) else value
+            if not isinstance(value, (_Symbolic, bool, numbers.Real)):
+                raise TypeError(f"unsupported run-time program value {value!r}")
+            key = value if isinstance(value, _Symbolic) else ("constant", float(value))
+            if key in indices:
+                return indices[key]
+            if isinstance(value, _Symbolic):
+                if value.operation == "value":
+                    source = value.arguments[0]
+                    result = emit(("input", int(source) if inputs is None else inputs[source]))
+                elif value.operation == "linear":
+                    constant, terms = value.arguments
+                    result = None if constant == 0.0 else lower(constant)
+                    for coefficient, term in terms:
+                        contribution = lower(term)
+                        if coefficient != 1.0:
+                            contribution = emit(("*", lower(coefficient), contribution))
+                        result = (contribution if result is None
+                                  else emit(("+", result, contribution)))
+                    result = lower(0.0) if result is None else result
+                else:
+                    result = emit((value.operation, *(lower(item) for item in value.arguments)))
+            else:
+                result = emit(("constant", float(value)))
+            indices[key] = result
+            return result
+
+        roots = tuple(lower(value) for value in values)
+        return tuple(instructions), roots
+
+    @staticmethod
+    def _symbolic_inputs(values: Sequence[Any]) -> tuple[Any, ...]:
+        """Return scalar leaves in first-use order from an equation expression DAG."""
+        inputs: dict[Any, None] = {}
+        visited: set[int] = set()
+
+        def visit(value: Any) -> None:
+            if isinstance(value, (tuple, list)):
+                for item in value:
+                    visit(item)
+                return
+            if not isinstance(value, _Symbolic) or id(value) in visited:
+                return
+            visited.add(id(value))
+            if value.operation == "value":
+                inputs.setdefault(value.arguments[0], None)
+                return
+            for argument in value.arguments:
+                visit(argument)
+
+        for value in values:
+            visit(value)
+        return tuple(inputs)
+
+    def _trace_runtime_values(
+        self, circuit: Any, t: Any, states: Sequence[Any], *, postprocess: bool = True,
+    ):
+        """Select Python-compiled affine maps for the current exact network mode."""
+        net = circuit.netlist
+        if (not net._diodes or circuit._cpp_coefficients
+                or any(transformer.constant is None for transformer in net._transformers)):
+            return None
+        closed: list[Any] = []
+        for switch in net._switches:
+            flag = self._switch_flag(switch)
+            closed.append(self._trace(switch.closed) if flag is None else flag)
+        gates, conducting = self._gated_conduction(net)
+        gate_indices = tuple(gates)
+        mode_values = tuple(
+            _Expression.of(value)
+            for value in (*closed, *conducting, *(gates[index] for index in gate_indices))
+        )
+        if all(value.code in ("true", "false") for value in mode_values):
+            return None
+        if len(mode_values) >= 8 * np.dtype(np.uintp).itemsize:
+            raise TypeError("C++ export: a circuit has too many binary structural states")
+
+        gate_callbacks = dict(net._gates)
+
+        def current_mode():
+            selected_closed = tuple(bool(switch.closed()) for switch in net._switches)
+            selected_gated = tuple(
+                bool(gate_callbacks[index]()) if index in gate_callbacks else False
+                for index in range(len(net._diodes))
+            )
+            selected_conducting = tuple(
+                True if selected_gated[index]
+                else bool(diode.conducting)
+                for index, diode in enumerate(net._diodes)
+            )
+            return selected_closed, selected_conducting, selected_gated
+
+        reachable = tuple(dict.fromkeys(
+            (tuple(mode_closed), tuple(mode_conducting), tuple(mode_gated))
+            for _guard, (mode_closed, mode_conducting, mode_gated)
+            in self._trace_alternatives(current_mode)
+        ))
+
+        samples = (net._ratio_override if net._ratio_override is not None else
+                   tuple(transformer.ratio() for transformer in net._transformers))
+        physical_count = net.n_x + net.n_out
+        count = physical_count + 2 * len(net._diodes) + net.n_x + 1
+        descriptor = self._runtime_network(
+            circuit, count=count, bits=len(mode_values), physical_count=physical_count,
+            parameters=(*(f"x{index}" for index in range(net.n_x)),
+                        *(f"u{index}" for index in range(net.n_u)),
+                        *(f"du{index}" for index in range(net.n_u))),
+        )
+
+        for mode_closed, mode_conducting, mode_gated in reachable:
+            selected = (
+                *mode_closed, *mode_conducting,
+                *(mode_gated[index] for index in gate_indices),
+            )
+            encoded = sum(int(value) << index for index, value in enumerate(selected))
+            if encoded in descriptor["modes"]:
+                continue
+            mode = Mode(mode_closed, mode_conducting, samples)
+            control, terms = _TRACE_CONTROL.set(None), _SCALAR_TERMS.set(None)
+            try:
+                topology = net.resolved_topology(mode, mode_gated)
+                affine, post = self._runtime_network_case(circuit, topology)
+                descriptor["modes"][encoded] = (
+                    affine, *self._runtime_program(post)
+                )
+            except (_Degenerate, ValueError, np.linalg.LinAlgError) as exc:
+                descriptor["modes"][encoded] = str(exc)
+            finally:
+                _SCALAR_TERMS.reset(terms)
+                _TRACE_CONTROL.reset(control)
+
+        inputs = tuple(_Expression.of(value) for value in net.source_values(t))
+        rates = tuple(_Expression.of(value) for value in net.source_rates(t))
+        state_values = tuple(_Expression.of(states[int(index)]) for index in net.states)
+        key = " | ".join(
+            f"(static_cast<std::size_t>({value.code}) << {index})"
+            for index, value in enumerate(mode_values)
+        ) or "0"
+        arguments = ", ".join(
+            value.code for value in (*state_values, *inputs, *rates)
+        )
+        method = descriptor["name"] if postprocess else descriptor["name"] + "_physical"
+        call = f"{method}({key}{', ' if arguments else ''}{arguments})"
+        value_count = count if postprocess else physical_count
+        pool = _SCALAR_TERMS.get()
+        if pool is not None:
+            prefix, terms, _runtime, _results = pool
+            if call not in terms:
+                terms[call] = f"{prefix}{len(terms)}", True, f"array:{value_count}"
+            call = terms[call][0] + "()"
+        values = tuple(_Expression(f"{call}[{index}]", "real", pure=True)
+                       for index in range(value_count))
+        if not postprocess:
+            return (net._place_scalar_derivatives(values[:net.n_x], len(states)),
+                    values[net.n_x:physical_count])
+        margins = values[physical_count:physical_count + len(net._diodes)]
+        projected_start = physical_count + len(net._diodes)
+        projected = values[projected_start:projected_start + net.n_x]
+        impulses_start = projected_start + net.n_x
+        impulses = values[impulses_start:impulses_start + len(net._diodes)]
+        return (net._place_scalar_derivatives(values[:net.n_x], len(states)),
+                values[net.n_x:physical_count], margins, projected, impulses, values[-1])
+
+    def _runtime_network(self, circuit: Any, **layout: Any) -> dict:
+        """The circuit's generated network function: its value count, mode bits, physical
+        rows and parameters, with the mode programs registered so far."""
+        descriptor = self._runtime_networks.setdefault(
+            id(circuit), {"name": f"network_{self.prefix[id(circuit)]}", "modes": {}, **layout}
+        )
+        if any(descriptor[key] != value for key, value in layout.items()):
+            raise RuntimeError("C++ export: a circuit changed its generated netlist layout")
+        return descriptor
+
+    def _trace_runtime_netlist(self, circuit: Any, t: Any, states: Sequence[Any]):
+        """Evaluate derivatives and outputs for the current exact network mode."""
+        return self._trace_runtime_values(circuit, t, states, postprocess=False)
+
+    def _trace_dynamic_netlist(
+        self, circuit: Any, t: Any, states: list[Any], *, topology=None, raw=False,
+    ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        """Eliminate the shared netlist equations through the netlist's expression DAG."""
+        def generated(values: Sequence[Any]) -> tuple[_Expression, ...]:
+            shared, rendered = _symbolic_source(values)
+            names: dict[str, str] = {}
+
+            def resolve(code: str) -> str:
+                return re.sub(r"\bv\d+\b", lambda match: names[match.group(0)], code)
+
+            def expression(code: str) -> _Expression:
+                code = resolve(code)
+                return (_Expression(_number(float(code)), "real")
+                        if re.fullmatch(r"[+-]?\d+", code) else _Expression(code, "real"))
+
+            for assignment in shared:
+                name, code = assignment.split(" = ", 1)
+                names[name] = expression(code).code
+            return tuple(expression(code) for code in rendered)
+
+        net = circuit.netlist
+        ratios = tuple(self._ratio_matrix(transformer) for transformer in net._transformers)
+        topology = net.topology() if topology is None else topology
+        pool = _SCALAR_TERMS.get()
+        control = _TRACE_CONTROL.get()
+        cache_key = (
+            None if pool is None else pool[0], id(circuit), topology.mode.key,
+            _Expression.of(t).code,
+            tuple(_Expression.of(value).code for value in states),
+            None if control is None else tuple(sorted(control.decisions.items())),
+            bool(raw),
+        )
+        cached = self._dynamic_netlist_traces.get(cache_key)
+        if cached is not None:
+            return cached
+        topology, resolved = self._resolved_equation_topology(
+            circuit, topology, ratios
+        )
+        topology, matrices, matrix, reference, varying = self._symbolic_netlist_matrix(
+            circuit, topology, tuple(resolved)
+        )
+        pattern = topology._pattern
 
         inputs = net.source_values(t)
-        rates: list[Any] = [0.0] * net.n_u
-        for needed, (source, offset) in zip(topology.needs_rate, net._sources):
-            if not needed:
-                continue
-            dimension = net._branch(source).dim
-            value = (source.derivative(t) if source.derivative is not None else
-                     (source.value(t + _DELTA_T) - source.value(t - _DELTA_T))
-                     / (2.0 * _DELTA_T))
-            if dimension == 1:
-                rates[offset] = value
-            elif dimension == 2:
-                rates[offset:offset + 2] = (value.real, value.imag)
-            else:
-                rates[offset:offset + dimension] = value
+        rates = net.source_rates(t, topology.needs_rate)
         state_values = tuple(states[int(index)] for index in net.states)
         right = [0.0] * pattern.n
         for name, vector in (("y", state_values), ("u", inputs), ("du", rates)):
             stamps = matrices[name]
             for row, column, coefficient in zip(stamps.r, stamps.c, stamps.v):
-                right[row] += coefficient * vector[column]
+                right[row] += _symbolic_node(coefficient) * _symbolic_node(vector[column])
         solution = _symbolic_solve(
-            matrix, right, topology._pattern.dense(samples)
+            matrix, right, reference, varying, gauge=topology.gauge_singular
         ) if pattern.n else []
         derivative = tuple(solution[int(index)] for index in topology.xd_index)
         output = tuple(sum(coefficient * value for coefficient, value in zip(row, solution)
                            if coefficient != 0.0)
                        for row in topology.S_out.toarray())
-        return net._place_scalar_derivatives(derivative, len(states)), output
+        if raw:
+            result = tuple(derivative), tuple(output)
+        else:
+            values = generated((*derivative, *output))
+            count = len(derivative)
+            result = net._place_scalar_derivatives(values[:count], len(states)), values[count:]
+        self._dynamic_netlist_traces[cache_key] = result
+        return result
+
+    @staticmethod
+    @contextmanager
+    def _effective_gate_topology(circuit: Any):
+        """Select controlled devices and their parallel diodes through one topology state."""
+        net = circuit.netlist
+        gates = net._gates
+        raw_conduction = tuple(
+            (index, net._diodes[index].conducting) for index, _gate in gates
+        )
+        gated_state = net._gated_state
+        try:
+            for index, gate in gates:
+                diode = net._diodes[index]
+                diode.conducting = _Expression.of(diode.conducting) | _Expression.of(gate())
+            net._gates = []
+            net._mode = None
+            yield
+        finally:
+            net._gates = gates
+            net._gated_state = gated_state
+            net._mode = None
+            for index, conducting in raw_conduction:
+                net._diodes[index].conducting = conducting
 
     @staticmethod
     def _equation_topology(circuit, mode):
@@ -2959,6 +3767,12 @@ class _ModelGenerator:
             circuit._cpp_topologies[mode.key] = topology
         return circuit._cpp_topologies[mode.key]
 
+    def _gated_conduction(self, net: Any) -> tuple[dict[int, Any], tuple[_Expression, ...]]:
+        """Trace each controlled device's gate, and every diode's conduction under its gate."""
+        gates = {index: self._trace(gate) for index, gate in net._gates}
+        return gates, tuple(_Expression.of(diode.conducting) | gates.get(index, False)
+                            for index, diode in enumerate(net._diodes))
+
     @staticmethod
     def _switch_flag(switch: Any) -> _Expression | None:
         """Return one run-time switch position without asking the tracer to branch."""
@@ -2974,42 +3788,41 @@ class _ModelGenerator:
         return (_Expression(f"!({flag.code})", "bool", pure=flag.pure)
                 if closed.invert else flag)
 
-    @classmethod
-    def _switched_decomposition(cls, circuit: Any):
-        """Split independently acting run-time switches from the lowered circuit."""
-        flags = tuple(cls._switch_flag(switch) for switch in circuit.netlist._switches)
-        free = tuple(index for index, flag in enumerate(flags) if flag is not None)
-        if len(free) < 2:
-            return None
-        closed = tuple(True if flag is not None else bool(switch.closed())
-                       for flag, switch in zip(flags, circuit.netlist._switches))
-        conducting = list(circuit.netlist.conducting)
-        for index, gate in circuit.netlist._gates:
-            if bool(gate()):
-                conducting[index] = True
-        decomposition = _switch_decomposition(circuit, free, closed, tuple(conducting))
-        return None if decomposition is None else (decomposition, flags)
-
-    @classmethod
-    def _switched_roles(cls, circuit: Any, elements: Iterable[Any]):
-        """Return one topology when the requested elements keep the same dissipative role."""
-        selected = cls._switched_decomposition(circuit)
-        if selected is None:
-            return None
-        decomposition, _flags = selected
+    def _runtime_mode_decomposition(self, circuit: Any):
+        """Return exact local families for all run-time structural mode variables."""
         net = circuit.netlist
-        branches = [branch for element in elements for branch in net._ports[id(element)]]
-        first, *others = decomposition.topologies
-        if all((topology.roles[branch] == "res") == (first.roles[branch] == "res")
-               for topology in others for branch in branches):
-            return first
-        return None
+        variables: list[tuple[str, int]] = []
+        flags: list[_Expression] = []
+        closed: list[bool] = []
+        for index, switch in enumerate(net._switches):
+            flag = self._switch_flag(switch)
+            if flag is None:
+                closed.append(bool(switch.closed()))
+                continue
+            variables.append(("closed", index))
+            flags.append(flag)
+            closed.append(True)
+
+        conducting: list[bool] = []
+        for index, effective in enumerate(self._gated_conduction(net)[1]):
+            if effective.kind == "bool" and effective.code in ("true", "false"):
+                conducting.append(effective.code == "true")
+                continue
+            variables.append(("conducting", index))
+            # The reference mode is blocking; this flag is true while it remains selected.
+            flags.append(_Expression(f"!({effective.code})", "bool", pure=effective.pure))
+            conducting.append(False)
+
+        decomposition = _mode_decomposition(
+            circuit, variables, Mode(closed, conducting, ()),
+        )
+        return None if decomposition is None else (decomposition, tuple(flags))
 
     @classmethod
     def _select_switch_clusters(cls, decomposition: Any, flags: Sequence[Any],
                                 owners: Sequence[Sequence[int]],
                                 variants: Mapping[frozenset[int], tuple]) -> list[Any]:
-        """Select local cluster equations and add only independently verified changes."""
+        """Select verified local mode families without forming their global product."""
         base = variants[frozenset()]
 
         def select(cluster: Sequence[int], value: Callable[[frozenset[int]], Any]) -> Any:
@@ -3024,33 +3837,40 @@ class _ModelGenerator:
                 )
             return build(0, frozenset())
 
-        combined = []
+        groups: dict[tuple[int, ...], list[int]] = {}
         for entry, entry_owners in enumerate(owners):
+            groups.setdefault(tuple(entry_owners), []).append(entry)
+        combined = list(base)
+        for entry_owners, entries in groups.items():
             if not entry_owners:
-                combined.append(base[entry])
-            elif len(entry_owners) == 1:
+                continue
+            if len(entry_owners) == 1:
                 owner = entry_owners[0]
-                combined.append(select(
+                values = select(
                     decomposition.clusters[owner],
-                    lambda opened, entry=entry: variants[opened][entry],
-                ))
+                    lambda opened, entries=entries: tuple(
+                        variants[opened][entry] for entry in entries
+                    ),
+                )
             else:
-                total = base[entry]
+                values = tuple(base[entry] for entry in entries)
                 for owner in entry_owners:
-                    total = total + select(
+                    delta = select(
                         decomposition.clusters[owner],
-                        lambda opened, entry=entry: (
+                        lambda opened, entries=entries: tuple(
                             variants[opened][entry] - base[entry] if opened else 0.0
+                            for entry in entries
                         ),
                     )
-                combined.append(total)
+                    values = tuple(value + change for value, change in zip(values, delta))
+            for entry, value in zip(entries, values):
+                combined[entry] = value
         return combined
 
-    @classmethod
-    def _trace_switched_netlist(cls, circuit: Any, t: Any, states: list[Any],
+    def _trace_switched_netlist(self, circuit: Any, t: Any, states: list[Any],
                                 dynamic: bool):
-        """Trace independently selected local mode families instead of their global product."""
-        selected = cls._switched_decomposition(circuit)
+        """Trace verified local mode families instead of their global Cartesian product."""
+        selected = self._runtime_mode_decomposition(circuit)
         if selected is None:
             return None
         decomposition, flags = selected
@@ -3059,7 +3879,7 @@ class _ModelGenerator:
         for opened, mode in decomposition.modes.items():
             topology = net._compiled(mode)
             if dynamic:
-                placed, outputs = cls._trace_dynamic_netlist(
+                placed, outputs = self._trace_dynamic_netlist(
                     circuit, t, states, topology=topology
                 )
                 derivative = tuple(placed[int(index)] for index in net.states)
@@ -3068,99 +3888,159 @@ class _ModelGenerator:
                     topology, "all"
                 )(t, states)
             variants[opened] = (*derivative, *outputs)
-        rows = cls._select_switch_clusters(
+        rows = self._select_switch_clusters(
             decomposition, flags, decomposition.owners, variants
         )
         return (net._place_scalar_derivatives(rows[:net.n_x], len(states)),
                 tuple(rows[net.n_x:]))
 
-    @classmethod
-    def _switched_jump(cls, circuit: Any, states: list[Any]):
-        """Select charge and flux projections from the same independent local mode families."""
-        selected = cls._switched_decomposition(circuit)
+    def _trace_program_netlist(self, circuit: Any, t: Any, states: list[Any]):
+        """Lower one connected run-time mode family to a shared scalar instruction table."""
+        if not circuit._cpp_coefficients:
+            return None
+        selected = self._runtime_mode_decomposition(circuit)
         if selected is None:
             return None
         decomposition, flags = selected
+        if len(decomposition.clusters) != 1:
+            return None
+
+        net = circuit.netlist
+        roots_by_mode: dict[int, tuple[Any, ...] | str] = {}
+        inputs: dict[Any, None] = {}
+
+        control, terms = _TRACE_CONTROL.set(None), _SCALAR_TERMS.set(None)
+        try:
+            for changed, mode in decomposition.modes.items():
+                encoded = sum(1 << variable for variable in changed)
+                try:
+                    derivatives, outputs = self._trace(
+                        lambda mode=mode: self._trace_dynamic_netlist(
+                            circuit, t, states, topology=net._compiled(mode), raw=True,
+                        )
+                    )
+                    roots = tuple(_symbolic_node(value) for value in (*derivatives, *outputs))
+                    roots_by_mode[encoded] = roots
+                    inputs.update(dict.fromkeys(self._symbolic_inputs(roots)))
+                except (_Degenerate, ValueError, np.linalg.LinAlgError) as exc:
+                    roots_by_mode[encoded] = str(exc)
+        finally:
+            _SCALAR_TERMS.reset(terms)
+            _TRACE_CONTROL.reset(control)
+
+        arguments = tuple(inputs)
+        input_index = {value: index for index, value in enumerate(arguments)}
+        count = net.n_x + net.n_out
+        descriptor = self._runtime_network(
+            circuit, count=count, bits=len(flags), physical_count=0,
+            parameters=tuple(f"value{index}" for index in range(len(arguments))),
+        )
+
+        for encoded, roots in roots_by_mode.items():
+            compiled = (
+                np.zeros((0, len(arguments))),
+                *self._runtime_program(roots, input_index),
+            ) if not isinstance(roots, str) else roots
+            if encoded in descriptor["modes"]:
+                previous = descriptor["modes"][encoded]
+                comparable = (
+                    isinstance(previous, str) and previous == compiled
+                    or isinstance(previous, tuple) and isinstance(compiled, tuple)
+                    and previous[1:] == compiled[1:]
+                )
+                if not comparable:
+                    raise RuntimeError("C++ export: a circuit changed its generated netlist program")
+                continue
+            descriptor["modes"][encoded] = compiled
+
+        key = " | ".join(
+            f"(static_cast<std::size_t>(!({flag.code})) << {index})"
+            for index, flag in enumerate(flags)
+        ) or "0"
+        call = f"{descriptor['name']}({key}{', ' if arguments else ''}{', '.join(arguments)})"
+        pool = _SCALAR_TERMS.get()
+        if pool is not None:
+            prefix, shared, _runtime, _results = pool
+            if call not in shared:
+                shared[call] = f"{prefix}{len(shared)}", True, f"array:{count}"
+            call = shared[call][0] + "()"
+        values = tuple(
+            _Expression(f"{call}[{index}]", "real", pure=True) for index in range(count)
+        )
+        return (
+            net._place_scalar_derivatives(values[:net.n_x], len(states)),
+            values[net.n_x:],
+        )
+
+    def _mixture_terms(self, circuit: Any):
+        """Yield normalized declared mixture cases without a topology-specific case table."""
+        sources = []
+        for cases, select in circuit._mixtures:
+            combined = {}
+            for guard, declared in self._trace_alternatives(cases):
+                for weight, case in declared:
+                    positive = _Expression.of(np.maximum(weight, 0.0).item())
+                    gated = _Expression(f"(({guard.code}) ? ({positive.code}) : (0.0))", "real")
+                    key = tuple(
+                        (value.kind, value.code) if isinstance(value, _Expression) else value
+                        for value in np.asarray(case, dtype=object).flat
+                    )
+                    if key in combined:
+                        original, previous = combined[key]
+                        combined[key] = original, previous + gated
+                    else:
+                        combined[key] = case, gated
+            values = tuple((weight, case) for case, weight in combined.values())
+            total = sum((weight for weight, _case in values), _Expression("0.0", "real"))
+            sources.append((tuple((weight / total, case) for weight, case in values), select))
+        try:
+            for selected in itertools.product(*(values for values, _select in sources)):
+                weight = _Expression("1.0", "real")
+                cases = []
+                for (fraction, case), (_values, select) in zip(selected, sources):
+                    weight = weight * fraction
+                    cases.append(case)
+                    select(case)
+                yield weight, tuple(cases)
+        finally:
+            for _values, select in sources:
+                select(None)
+
+    def _trace_mixture_netlist(self, circuit: Any, t: Any, states: list[Any]):
+        """Trace the same product of declared averaged circuit cases used by Python."""
+        derivatives = [_Expression("0.0", "real") for _ in states]
+        outputs = [_Expression("0.0", "real") for _ in range(circuit.netlist.n_out)]
+        details = []
+        for weight, cases in self._mixture_terms(circuit):
+            values = self._trace_runtime_netlist(circuit, t, states)
+            if values is None:
+                values = self._trace_program_netlist(circuit, t, states)
+            if values is None:
+                values = self._trace_switched_netlist(circuit, t, states, True)
+            if values is None:
+                with self._effective_gate_topology(circuit):
+                    values = self._trace_dynamic_netlist(circuit, t, states)
+            case_derivatives, case_outputs = values
+            derivatives = [total + weight * value
+                           for total, value in zip(derivatives, case_derivatives)]
+            outputs = [total + weight * value
+                       for total, value in zip(outputs, case_outputs)]
+            details.append((weight, cases, tuple(case_outputs)))
+        _SCALAR_TERMS.get()[3][("mixture", id(circuit))] = tuple(details)
+        return tuple(derivatives), tuple(outputs)
+
+    def _switched_jump(self, circuit: Any, states: list[Any]):
+        """Select projections and impulsive energies from structural local mode families."""
         net = circuit.netlist
         if net._diodes:
             return None
+        selected = self._runtime_mode_decomposition(circuit)
+        if selected is None:
+            return None
+        decomposition, flags = selected
         modes = decomposition.modes
-        n_y, n_u = len(states), net.n_u
-        reference_mode = modes[frozenset()]
-
-        def topology(opened: frozenset[int]):
-            mode = modes.get(opened)
-            if mode is None:
-                mode = Mode(
-                    tuple(False if index in opened else value
-                          for index, value in enumerate(reference_mode.closed)),
-                    reference_mode.conducting, reference_mode.ratios,
-                )
-            return net._compiled(mode)
-
-        def maps(top: Topology) -> tuple[np.ndarray, ...]:
-            total = n_y + n_u
-            projected = np.zeros((n_y, total))
-            projected[:, :n_y] = np.eye(n_y)
-            loss = np.zeros((total, total))
-            for projector in top.projectors():
-                if projector is None:
-                    continue
-                state, inputs, _multipliers_state, _multipliers_input = projector._affine_maps()
-                rows = np.asarray(projector.index, dtype=np.intp)
-                projected[rows] = 0.0
-                projected[np.ix_(rows, rows)] = state
-                projected[np.ix_(rows, np.arange(n_y, total))] = inputs
-                delta = projected[rows].copy()
-                delta[np.arange(rows.size), rows] -= 1.0
-                loss += delta.T @ np.asarray(projector.W.toarray(), dtype=float) @ delta
-            storage = np.zeros((n_y, n_y))
-            for element in (*net._capacitors, *net._inductors):
-                branch = net._branch(element)
-                coefficient = element.C if hasattr(element, "C") else element.L
-                storage[np.ix_(element.state, element.state)] += (
-                    branch.scale * np.asarray(coefficient, dtype=float)
-                )
-            extended = np.zeros((total, total))
-            extended[:n_y, :n_y] = storage
-            supply = projected.T @ storage @ projected - extended + loss
-            return projected, loss, supply
-
-        try:
-            signatures = {opened: maps(topology(opened)) for opened in modes}
-            base = signatures[frozenset()]
-            owners: list[list[int]] = [[] for _ in range(n_y + 2)]
-            for owner, cluster in enumerate(decomposition.clusters):
-                choices = [opened for opened in modes if opened and opened <= set(cluster)]
-                for entry in range(n_y):
-                    if any(not np.allclose(signatures[opened][0][entry], base[0][entry],
-                                           rtol=1e-10, atol=1e-13)
-                           for opened in choices):
-                        owners[entry].append(owner)
-                for entry, matrix in enumerate((1, 2), start=n_y):
-                    if any(not np.allclose(signatures[opened][matrix], base[matrix],
-                                           rtol=1e-10, atol=1e-13)
-                           for opened in choices):
-                        owners[entry].append(owner)
-            for left in range(len(decomposition.clusters)):
-                a = decomposition.clusters[left]
-                for right in range(left + 1, len(decomposition.clusters)):
-                    b = decomposition.clusters[right]
-                    choices_a = [frozenset()] + [opened for opened in modes
-                                                  if opened and opened <= set(a)]
-                    choices_b = [frozenset()] + [opened for opened in modes
-                                                  if opened and opened <= set(b)]
-                    for opened_a in choices_a:
-                        for opened_b in choices_b:
-                            actual = maps(topology(opened_a | opened_b))
-                            for value, reference, value_a, value_b in zip(
-                                    actual, base, signatures[opened_a], signatures[opened_b]):
-                                if not np.allclose(
-                                    value, value_a + value_b - reference,
-                                    rtol=1e-10, atol=1e-12,
-                                ):
-                                    return None
-        except (ValueError, np.linalg.LinAlgError):
+        owners = decomposition.structure.jump_owners(net, len(states))
+        if any(len(entry) > 1 for entry in owners[:len(states)]):
             return None
 
         variants = {}
@@ -3175,30 +4055,41 @@ class _ModelGenerator:
                 variants[opened] = (*projected, loss, supply)
         finally:
             net._frozen_mode, net._frozen_topology = frozen
-        combined = cls._select_switch_clusters(decomposition, flags, owners, variants)
+        combined = self._select_switch_clusters(decomposition, flags, owners, variants)
         return tuple(combined[:-2]), combined[-2], combined[-1]
 
-    @classmethod
-    def _trace_circuit_solve(cls, circuit: Any, t: Any):
+    def _trace_circuit_equations(
+        self, circuit: Any, t: Any, states: Sequence[Any]
+    ) -> tuple[Sequence[Any], Sequence[Any]]:
+        """Trace the selected netlist equations before coordinate and publication mapping."""
+        direct = (circuit._stage_signature is not None and not circuit._numeric_stages
+                  and not circuit._direct_dynamic and circuit._direct_mode_key is None)
+        if circuit._mixtures:
+            switched = self._trace_mixture_netlist(circuit, t, states)
+        else:
+            switched = self._trace_runtime_netlist(circuit, t, states)
+            if switched is None:
+                switched = self._trace_program_netlist(circuit, t, states)
+            if switched is None:
+                switched = self._trace_switched_netlist(circuit, t, states, not direct)
+        if switched is not None:
+            derivatives, all_outputs = switched
+        elif direct:
+            # Reuse the direct scalar program selected by assembly.  It was compiled from this
+            # same netlist and preserves the Python execution order in the native backend.
+            derivatives = circuit.scalar_derivatives(t, states)
+            all_outputs = circuit.scalar_outputs(t, states)
+        else:
+            with self._effective_gate_topology(circuit):
+                derivatives, all_outputs = self._trace_dynamic_netlist(circuit, t, states)
+        return derivatives, all_outputs
+
+    def _trace_circuit_solve(self, circuit: Any, t: Any):
         """Evaluate the circuit's selected netlist execution form with symbolic values."""
         circuit.receive()
         states = circuit._states() if circuit._transforms else circuit.gather()
-        dynamic = bool(circuit._cpp_coefficients) or any(
-            transformer.constant is None for transformer in circuit.netlist._transformers
-        )
-        switched = cls._trace_switched_netlist(circuit, t, states, dynamic)
-        if switched is not None:
-            derivatives, all_outputs = switched
-            outputs = tuple(all_outputs[index] for index in circuit.output_indices)
-        elif dynamic:
-            derivatives, all_outputs = cls._trace_dynamic_netlist(circuit, t, states)
-            outputs = tuple(all_outputs[index] for index in circuit.output_indices)
-        elif circuit.form == "device":
-            derivatives = circuit.scalar_derivatives(t, states)
-            outputs = all_outputs = circuit.scalar_outputs(t, states)
-        else:
-            derivatives, all_outputs = circuit.netlist.evaluate_scalar_raw(t, states, record=False)
-            outputs = tuple(all_outputs[index] for index in circuit.output_indices)
+        derivatives, all_outputs = self._trace_circuit_equations(circuit, t, states)
+        outputs = tuple(all_outputs[index] for index in circuit.output_indices)
         if circuit._transforms:
             derivatives = np.asarray(derivatives)
             for index, _transform, inverse in reversed(circuit._transforms):
@@ -3209,6 +4100,30 @@ class _ModelGenerator:
         circuit.publish(outputs)
         circuit.t = t
         return tuple(circuit.derivatives), tuple(all_outputs)
+
+    def trace_stability_derivatives(self, circuit: Any) -> list[str]:
+        """Lower the exact present-mode circuit derivative matrix source for native checks."""
+        def run():
+            with self._netlist_symbols(circuit):
+                circuit.receive()
+                states = [
+                    _Expression(f"x[{index}]", "real")
+                    for index in range(circuit.n_states)
+                ]
+                derivatives, _outputs = self._trace_circuit_equations(
+                    circuit, _Expression("t", "real"), states
+                )
+                return tuple(_Expression.of(value) for value in derivatives)
+
+        with self._shared_terms() as (prefix, terms):
+            values = self._trace(run)
+            lines = [
+                f"out[{index}] = {value.code};"
+                for index, value in enumerate(values)
+                if value.code not in ("0.0", "0", "-0.0")
+            ]
+            body = self._term_declarations(prefix, terms, lines)
+        return [self.solver_expression(line) for line in body]
 
     def _circuit_values(self, circuit):
         """Share one electrical evaluation across the roots of the current function scope."""
@@ -3245,21 +4160,77 @@ class _ModelGenerator:
 
         def run():
             with self._netlist_symbols(circuit):
+                circuit.receive()
                 elements = (circuit._supply_elements if supplied else circuit._loss_elements).get(
                     id(component), ()
                 )
                 if supplied:
                     sources = {id(element) for element, _offset in circuit.netlist._sources}
                     elements = tuple(element for element in elements if id(element) in sources)
-                    power = circuit.netlist.scalar_power(outputs, elements)
+                details = _SCALAR_TERMS.get()[3].get(("mixture", id(circuit)))
+                if details is None:
+                    power = (circuit.netlist.scalar_power(outputs, elements) if supplied else
+                             self._mode_dissipated_power(circuit, outputs, elements))
                 else:
-                    power = circuit.netlist.scalar_dissipated_power(
-                        outputs, elements, t=_Expression("t", "real"),
-                        topology=self._switched_roles(circuit, elements),
-                    )
+                    power = _Expression("0.0", "real")
+                    selectors = tuple(select for _cases, select in circuit._mixtures)
+                    try:
+                        for weight, cases, case_outputs in details:
+                            for case, select in zip(cases, selectors):
+                                select(case)
+                            value = (circuit.netlist.scalar_power(case_outputs, elements)
+                                     if supplied else self._mode_dissipated_power(
+                                         circuit, case_outputs, elements
+                                     ))
+                            power = power + weight * value
+                    finally:
+                        for select in selectors:
+                            select(None)
                 return -power if supplied else power
 
         return self._trace(run).code
+
+    def _mode_dissipated_power(self, circuit: Any, outputs: Sequence[Any],
+                               elements: Sequence[Any]) -> Any:
+        """Select mode-dependent resistive roles within their verified local clusters."""
+        net = circuit.netlist
+        selected = self._runtime_mode_decomposition(circuit)
+        if selected is None:
+            return net.scalar_dissipated_power(
+                outputs, elements, t=_Expression("t", "real")
+            )
+        decomposition, flags = selected
+        branches = tuple(branch for element in elements for branch in net._ports[id(element)])
+        base = decomposition.topologies[0]
+        relevant: list[int] = []
+        for owner, cluster in enumerate(decomposition.clusters):
+            choices = (opened for opened in decomposition.modes
+                       if opened and opened <= set(cluster))
+            if any(
+                any(net._compiled(decomposition.modes[opened]).roles[branch]
+                    != base.roles[branch] for branch in branches)
+                for opened in choices
+            ):
+                relevant.extend(cluster)
+        if not relevant:
+            return net.scalar_dissipated_power(
+                outputs, elements, t=_Expression("t", "real"), topology=base
+            )
+
+        def select(position: int, changed: frozenset[int]) -> Any:
+            if position == len(relevant):
+                return net.scalar_dissipated_power(
+                    outputs, elements, t=_Expression("t", "real"),
+                    topology=net._compiled(decomposition.mode(changed)),
+                )
+            variable = relevant[position]
+            return self._merge_trace(
+                flags[variable],
+                select(position + 1, changed | {variable}),
+                select(position + 1, changed),
+            )
+
+        return select(0, frozenset())
 
     def trace_netlist_outputs(self, owner: Any, method: Any, circuit: Any,
                               fields: tuple[str, ...]) -> list[str]:
@@ -3284,98 +4255,81 @@ class _ModelGenerator:
         return [(values[index] + 1j * values[index + 1] if complex_state else values[index]).code
                 for index, complex_state in entries]
 
-    def implicit_linearization(self) -> tuple[tuple[bool, ...], list[str]]:
-        """Lower exact circuit columns selected while building the circuit structure."""
-        exact = np.zeros(self.model.n_states, dtype=bool)
-        lines: list[str] = []
-        for circuit in self.system.circuits:
-            plan = circuit._structure_plan
-            if plan is None:
-                raise RuntimeError("circuit structure is unavailable during C++ export")
-            circuit = plan.circuit
-            exact[plan.skipped] = True
-            model_to_local = {
-                int(model_index): local_index
-                for local_index, model_index in enumerate(plan.local_to_model)
-            }
-            local_columns = {
-                model_to_local[int(model_index)]: int(model_index)
-                for model_index in plan.exact
-            }
-            if not local_columns:
-                continue
-            with self._netlist_symbols(circuit):
-                state_fields = [(component.state, name, complex_state, local)
-                                for component, name, complex_state, local in circuit.layout]
-                saved = [(record, name, getattr(record, name))
-                         for record, name, _complex, _local in state_fields]
-
-                def set_basis(position: int | None) -> None:
-                    for record, name, complex_state, local in state_fields:
-                        value: Any = 0j if complex_state else 0.0
-                        if position is not None and local <= position < local + (2 if complex_state else 1):
-                            value = (1.0 if not complex_state or position == local else 1j)
-                        setattr(record, name, value)
-                    circuit._stored = None
-
-                try:
-                    set_basis(None)
-                    baseline, _outputs = self._trace(
-                        lambda: self._trace_circuit_solve(circuit, _Expression("t", "real"))
-                    )
-                    for local_column, model_column in local_columns.items():
-                        set_basis(local_column)
-                        values, _outputs = self._trace(
-                            lambda: self._trace_circuit_solve(circuit, _Expression("t", "real"))
-                        )
-                        assignments = []
-                        for local_row, (value, base) in enumerate(zip(values, baseline)):
-                            if (value.code, value.kind) == (base.code, base.kind):
-                                continue
-                            coefficient = value - base
-                            if coefficient.code in ("0.0", "0"):
-                                continue
-                            model_row = int(plan.local_to_model[local_row])
-                            assignments.append(
-                                f"matrix[{model_row} * state_count + {model_column}] = "
-                                f"{self.solver_expression(coefficient.code)};"
-                            )
-                        lines.extend(assignments)
-                finally:
-                    for record, name, value in saved:
-                        setattr(record, name, value)
-                    circuit._stored = None
-        return tuple(map(bool, exact)), lines
-
-    def structural_mode_values(self) -> tuple[_Expression, ...]:
-        """C++ values forming the netlist's complete discrete-and-ratio mode identity."""
-        values: list[_Expression] = []
+    def structural_mode_values(
+        self,
+    ) -> tuple[tuple[Any, tuple[_Expression, ...], tuple[bool, ...]], ...]:
+        """Return circuit mode values and those which can change its state matrix."""
+        modes = []
         for circuit in self.system.circuits:
             with self._netlist_symbols(circuit):
-                gates = {index: self._trace(gate)
-                         for index, gate in circuit.netlist._gates}
+                gates, conduction = self._gated_conduction(circuit.netlist)
+                values: list[_Expression] = []
+                stability: list[bool] = []
                 for switch in circuit.netlist._switches:
                     flag = self._switch_flag(switch)
                     if flag is None:
                         flag = self._trace(switch.closed)
                     if flag.code not in ("true", "false"):
                         values.append(flag)
-                for index, diode in enumerate(circuit.netlist._diodes):
-                    conducting = _Expression.of(diode.conducting)
-                    values.append(conducting | gates[index] if index in gates else conducting)
+                        stability.append(True)
+                values.extend(conduction)
+                values.extend(gates.values())
+                stability.extend([True] * (len(conduction) + len(gates)))
                 for transformer in circuit.netlist._transformers:
                     if transformer.constant is None:
-                        values.extend(
+                        ratio = tuple(
                             _Expression.of(value)
                             for value in np.asarray(
                                 self._ratio_matrix(transformer), dtype=object
                             ).flat
                         )
-        return tuple(values)
+                        values.extend(ratio)
+                        stability.extend([True] * len(ratio))
+            modes.append((circuit, tuple(values), tuple(stability)))
+        return tuple(modes)
 
     def trace_circuit_commutation_margin(self, circuit: Any) -> str:
         """Trace the minimum diode guard from the circuit's own netlist primitives."""
         diodes = circuit.commutating_diodes
+
+        def runtime_value():
+            with self._netlist_symbols(circuit):
+                net = circuit.netlist
+                circuit.receive()
+                states = circuit._states()
+                values = self._trace_runtime_values(
+                    circuit, _Expression("t", "real"), states
+                )
+                if values is None:
+                    return None
+                (_derivatives, _outputs, raw_margins, _projected,
+                 _impulses, projection_changed) = values
+                gates, effective = self._gated_conduction(net)
+                margins = _while_gated(gates, raw_margins, math.inf)
+                margin = math.inf
+                for diode in diodes:
+                    index = net._diodes.index(diode)
+                    margin = np.minimum(margin, margins[index] - diode.residual)
+                changed = _Expression("false", "bool", pure=True)
+                if circuit._hooks:
+                    valid = _Expression.of(circuit._mirrored_valid)
+                    changed = _Expression(f"!({valid.code})", "bool", pure=valid.pure)
+                    for index in circuit._watched:
+                        changed |= effective[index] != net._diodes[index].mirrored
+                elif net._switches or net._gates or any(
+                        transformer.constant is None for transformer in net._transformers):
+                    changed |= projection_changed != 0.0
+                return np.where(changed, -math.inf, margin)
+
+        with self._shared_terms() as (runtime_prefix, runtime_terms):
+            runtime_margin = self._trace(runtime_value)
+        if runtime_margin is not None:
+            runtime_lines = self._term_declarations(
+                runtime_prefix, runtime_terms, [f"return {runtime_margin.code};"]
+            )
+            runtime_code = (runtime_margin.code if len(runtime_lines) == 1 else
+                            f"([&]() {{ {' '.join(runtime_lines)} }}())")
+            return self.solver_expression(runtime_code)
 
         def run():
             with self._netlist_symbols(circuit):
@@ -3385,18 +4339,24 @@ class _ModelGenerator:
                 t = _Expression("t", "real")
                 previous = tuple(diode.conducting for diode in net._diodes)
                 topology = net.topology()
-                mode_changed = any(before != diode.conducting
-                                   for before, diode in zip(previous, net._diodes))
+                mode_changed = _Expression("false", "bool", pure=True)
+                for before, diode in zip(previous, net._diodes):
+                    mode_changed |= _Expression.of(before != diode.conducting)
                 outputs = net.scalar_output_values(t, states, topology=topology)
                 margins = net._diode_margins(topology, outputs)
                 margin = math.inf
                 for index, diode in enumerate(diodes):
                     margin = np.minimum(margin, margins[index] - diode.residual)
-                mirror_changed = circuit._hooks and (
-                    not circuit._mirrored_valid
-                    or any(topology.mode.conducting[index] != net._diodes[index].mirrored
-                           for index in circuit._watched)
-                )
+                mirror_changed = _Expression("false", "bool", pure=True)
+                if circuit._hooks:
+                    valid = _Expression.of(circuit._mirrored_valid)
+                    mirror_changed = _Expression(
+                        f"!({valid.code})", "bool", pure=valid.pure
+                    )
+                    for index in circuit._watched:
+                        mirror_changed |= _Expression.of(
+                            topology.mode.conducting[index] != net._diodes[index].mirrored
+                        )
                 externally_switched = bool(
                     net._switches or net._gates
                     or any(transformer.constant is None for transformer in net._transformers)
@@ -3405,7 +4365,8 @@ class _ModelGenerator:
                     net.projection_inconsistent(t, states)
                     if externally_switched and not circuit._hooks else False
                 )
-                return -math.inf if mode_changed or mirror_changed or inconsistent else margin
+                changed = mode_changed | mirror_changed | _Expression.of(inconsistent)
+                return np.where(changed, -math.inf, margin)
 
         with self._shared_terms() as (prefix, terms):
             value = self._trace(run)
@@ -3428,20 +4389,47 @@ class _ModelGenerator:
                 net = circuit.netlist
                 for diode, name in zip(net._diodes, previous):
                     diode.conducting = _Expression(name, "bool")
-                switched = self._switched_jump(circuit, states)
-                if switched is None:
-                    impulses = net.impulse_flags(_Expression("t", "real"), states)
-                    projected, jump_loss, jump_supply = net.projected_jump(
-                        _Expression("t", "real"), states
+                runtime = self._trace_runtime_values(
+                    circuit, _Expression("t", "real"), states
+                )
+                if runtime is not None:
+                    (_derivatives, outputs, raw_margins, local_projected,
+                     raw_impulses, _projection_changed) = runtime
+                    projected = list(states)
+                    for local, position in enumerate(net.states):
+                        projected[int(position)] = local_projected[local]
+                    gates, effective = self._gated_conduction(net)
+                    margins = _while_gated(gates, raw_margins, math.inf)
+                    voltage_scale, current_scale = net._output_scales(outputs)
+                    scales = _while_gated(gates, tuple(
+                        np.where(value, current_scale, voltage_scale) for value in effective
+                    ), 0.0)
+                    impulses = _while_gated(
+                        gates, tuple(value != 0.0 for value in raw_impulses), False
+                    )
+                    tolerances = tuple(_MARGIN_RTOL * value for value in scales)
+                    delta = tuple(value - previous
+                                  for value, previous in zip(projected, states))
+                    jump_loss = net._scalar_energy(delta)
+                    jump_supply = (
+                        net._scalar_energy(projected) - net._scalar_energy(states)
+                        + jump_loss
                     )
                 else:
-                    impulses = ()
-                    projected, jump_loss, jump_supply = switched
-                projected = list(projected)
-                margins, tolerances, scales = net.scalar_margins(
-                    _Expression("t", "real"), projected
-                )
-                effective = tuple(net.mode().conducting) if net._diodes else ()
+                    switched = self._switched_jump(circuit, states)
+                    if switched is None:
+                        impulses = net.impulse_flags(_Expression("t", "real"), states)
+                        projected, jump_loss, jump_supply = net.projected_jump(
+                            _Expression("t", "real"), states
+                        )
+                    else:
+                        impulses = ()
+                        projected, jump_loss, jump_supply = switched
+                    projected = list(projected)
+                    margins, tolerances, scales = net.scalar_margins(
+                        _Expression("t", "real"), projected
+                    )
+                    _gates, effective = self._gated_conduction(net)
                 conducting = tuple(diode.conducting for diode in net._diodes)
                 if circuit._transforms:
                     component = np.asarray(projected, dtype=object)
@@ -3555,7 +4543,7 @@ class _ModelGenerator:
         straight = self._algebraic_plan(loop)
         if straight is not None:
             return [indent + line for line in straight]
-        if self.runtime.selected:
+        if self.runtime.tracked:
             coefficients = {}
             token = _ZERO_COEFFICIENTS.set(coefficients)
             try:
@@ -3627,7 +4615,7 @@ class _ModelGenerator:
                 coefficients.update(required_zeroes)
             return plan
         self._algebraic_plans[key] = None, {}
-        diagnose = bool(self.runtime.selected) and coefficients is None
+        diagnose = bool(self.runtime.tracked) and coefficients is None
         plan = self._assignment_plan(loop, diagnose)
         self._algebraic_plans[key] = plan, dict(coefficients or {})
         return plan
@@ -3638,10 +4626,9 @@ class _ModelGenerator:
         for kind, item in loop.operations:
             if kind == "algebraic":
                 return None
-            if kind == "output":
-                owner = item.__self__
-                if getattr(owner, "cpp_outputs", None) is not None:
-                    return None
+            function = getattr(item, "__func__", item) if kind == "output" else None
+            if getattr(function, "_peslite_atomic_equation", False):
+                return None
             # Observe the existing trace once, only for retained-parameter candidate groups.
             conditional = {} if diagnose else None
             token = _CONDITIONAL_DEPENDENCIES.set(
@@ -3796,8 +4783,195 @@ class _ModelGenerator:
             persistent_fields.intersection_update(self._algebraic_fields)
         return self.declarations(persistent_fields) + lines
 
+    def runtime_network_methods(self) -> list[str]:
+        """Render one data-driven evaluator shared by every compiled structural mode."""
+        def initializer(values: Sequence[Any], render=str, width: int = 16) -> str:
+            rendered = [render(value) for value in values]
+            return ",\n        ".join(
+                ", ".join(rendered[start:start + width])
+                for start in range(0, len(rendered), width)
+            )
+
+        operations = {
+            "constant": 0, "input": 1, "neg": 2, "abs": 3,
+            "+": 4, "-": 5, "*": 6, "/": 7, "max": 8, "min": 9,
+            "<": 10, "<=": 11, ">": 12, ">=": 13, "==": 14, "!=": 15,
+            "and": 16, "or": 17, "select": 18,
+        }
+        methods = []
+        for descriptor in self._runtime_networks.values():
+            argument_names = list(descriptor["parameters"])
+            arguments = [f"double {name}" for name in argument_names]
+            mode_keys = tuple(sorted(descriptor["modes"]))
+            mode_count = len(mode_keys)
+            physical_offsets, positions, physical_values = [0], [], []
+            program_offsets, opcodes, first, second, third = [0], [], [], [], []
+            roots, errors = [], []
+            coefficient_values: list[float] = []
+            coefficient_indices: dict[float, int] = {}
+
+            def coefficient(value: Any) -> int:
+                numeric = float(value)
+                if numeric not in coefficient_indices:
+                    coefficient_indices[numeric] = len(coefficient_values)
+                    coefficient_values.append(numeric)
+                return coefficient_indices[numeric]
+
+            post_count = descriptor["count"] - descriptor["physical_count"]
+            maximum_program = 0
+            for mode in mode_keys:
+                compiled = descriptor["modes"][mode]
+                usable = isinstance(compiled, tuple)
+                errors.append(
+                    "" if usable else str(compiled or "unregistered netlist structural mode")
+                )
+                if usable:
+                    matrix, program, mode_roots = compiled
+                    row, column = np.nonzero(matrix)
+                    positions.extend(
+                        int(r) * len(argument_names) + int(c)
+                        for r, c in zip(row, column)
+                    )
+                    physical_values.extend(
+                        coefficient(matrix[r, c]) for r, c in zip(row, column)
+                    )
+                    for instruction in program:
+                        operation, *operands = instruction
+                        opcodes.append(operations[operation])
+                        if operation == "constant":
+                            operands = [coefficient(operands[0])]
+                        first.append(int(operands[0]) if operands else 0)
+                        second.append(int(operands[1]) if len(operands) > 1 else 0)
+                        third.append(int(operands[2]) if len(operands) > 2 else 0)
+                    roots.extend(map(int, mode_roots))
+                    maximum_program = max(maximum_program, len(program))
+                else:
+                    roots.extend([0] * post_count)
+                physical_offsets.append(len(positions))
+                program_offsets.append(len(opcodes))
+            entry_count, instruction_count = len(positions), len(opcodes)
+            error_values = ",\n        ".join(_cpp_string(value) for value in errors)
+            coefficients_method = "\n".join([
+                f"double {descriptor['name']}_coefficient(std::size_t index) {{",
+                f"    static constexpr std::array<double, {len(coefficient_values)}> values{{{{",
+                f"        {initializer(coefficient_values, _number, 8)}",
+                "    }};",
+                "    return values[index];",
+                "}",
+            ])
+            methods.append(coefficients_method)
+            methods.append("\n".join([
+                f"std::size_t {descriptor['name']}_slot(std::size_t mode) {{",
+                f"    static constexpr std::array<std::size_t, {mode_count}> modes{{{{",
+                f"        {initializer(mode_keys)}",
+                "    }};",
+                "    const auto found = std::lower_bound(modes.begin(), modes.end(), mode);",
+                "    if (found == modes.end() || *found != mode)",
+                "        throw std::runtime_error(\"unregistered netlist structural mode\");",
+                "    return static_cast<std::size_t>(found - modes.begin());",
+                "}",
+            ]))
+            column_count = max(1, len(argument_names))
+            methods.append("\n".join([
+                f"std::array<double, {descriptor['physical_count']}> "
+                f"{descriptor['name']}_physical(std::size_t mode"
+                f"{', ' if arguments else ''}{', '.join(arguments)}) {{",
+                f"    static constexpr std::array<std::size_t, {len(physical_offsets)}> offsets{{{{",
+                f"        {initializer(physical_offsets)}",
+                "    }};",
+                f"    static constexpr std::array<std::size_t, {entry_count}> positions{{{{",
+                f"        {initializer(positions)}",
+                "    }};",
+                f"    static constexpr std::array<std::size_t, {entry_count}> coefficients{{{{",
+                f"        {initializer(physical_values)}",
+                "    }};",
+                f"    const std::size_t slot = {descriptor['name']}_slot(mode);",
+                f"    const std::array<double, {len(argument_names)}> inputs{{{{"
+                f"{', '.join(argument_names)}}}}};",
+                f"    std::array<double, {descriptor['physical_count']}> result{{}};",
+                "    for (std::size_t index = offsets[slot]; index < offsets[slot + 1]; ++index) {",
+                f"        const std::size_t row = positions[index] / {column_count};",
+                f"        const std::size_t column = positions[index] % {column_count};",
+                f"        result[row] += {descriptor['name']}_coefficient(coefficients[index])",
+                "            * inputs[column];",
+                "    }",
+                "    return result;",
+                "}",
+            ]))
+            methods.append("\n".join([
+                f"std::array<double, {descriptor['count']}> {descriptor['name']}("
+                f"std::size_t mode{', ' if arguments else ''}{', '.join(arguments)}) {{",
+                f"    static constexpr std::array<std::size_t, {len(program_offsets)}> offsets{{{{",
+                f"        {initializer(program_offsets)}",
+                "    }};",
+                f"    static constexpr std::array<unsigned char, {instruction_count}> operations{{{{",
+                f"        {initializer(opcodes)}",
+                "    }};",
+                f"    static constexpr std::array<std::size_t, {instruction_count}> first{{{{",
+                f"        {initializer(first)}",
+                "    }};",
+                f"    static constexpr std::array<std::size_t, {instruction_count}> second{{{{",
+                f"        {initializer(second)}",
+                "    }};",
+                f"    static constexpr std::array<std::size_t, {instruction_count}> third{{{{",
+                f"        {initializer(third)}",
+                "    }};",
+                f"    static constexpr std::array<std::size_t, {len(roots)}> roots{{{{",
+                f"        {initializer(roots)}",
+                "    }};",
+                f"    static constexpr std::array<const char*, {mode_count}> errors{{{{",
+                f"        {error_values}",
+                "    }};",
+                f"    const std::size_t slot = {descriptor['name']}_slot(mode);",
+                "    if (*errors[slot]) throw std::runtime_error(errors[slot]);",
+                f"    const std::array<double, {len(argument_names)}> inputs{{{{"
+                f"{', '.join(argument_names)}}}}};",
+                f"    const auto physical = {descriptor['name']}_physical(mode"
+                f"{', ' if argument_names else ''}{', '.join(argument_names)});",
+                f"    std::array<double, {max(1, maximum_program)}> values{{}};",
+                "    const std::size_t begin = offsets[slot];",
+                "    for (std::size_t absolute = begin; absolute < offsets[slot + 1]; ++absolute) {",
+                "        const std::size_t index = absolute - begin;",
+                "        const auto a = first[absolute], b = second[absolute], c = third[absolute];",
+                "        switch (operations[absolute]) {",
+                f"        case 0: values[index] = {descriptor['name']}_coefficient(a); break;",
+                f"        case 1: values[index] = a < {len(argument_names)} ? inputs[a]",
+                f"            : physical[a - {len(argument_names)}]; break;",
+                "        case 2: values[index] = -values[a]; break;",
+                "        case 3: values[index] = std::abs(values[a]); break;",
+                "        case 4: values[index] = values[a] + values[b]; break;",
+                "        case 5: values[index] = values[a] - values[b]; break;",
+                "        case 6: values[index] = values[a] * values[b]; break;",
+                "        case 7: values[index] = values[a] / values[b]; break;",
+                "        case 8: values[index] = std::max(values[a], values[b]); break;",
+                "        case 9: values[index] = std::min(values[a], values[b]); break;",
+                "        case 10: values[index] = values[a] < values[b]; break;",
+                "        case 11: values[index] = values[a] <= values[b]; break;",
+                "        case 12: values[index] = values[a] > values[b]; break;",
+                "        case 13: values[index] = values[a] >= values[b]; break;",
+                "        case 14: values[index] = values[a] == values[b]; break;",
+                "        case 15: values[index] = values[a] != values[b]; break;",
+                "        case 16: values[index] = values[a] != 0.0 && values[b] != 0.0; break;",
+                "        case 17: values[index] = values[a] != 0.0 || values[b] != 0.0; break;",
+                "        case 18: values[index] = values[a] != 0.0 ? values[b] : values[c]; break;",
+                "        default: throw std::runtime_error(\"invalid netlist instruction\");",
+                "        }",
+                "    }",
+                f"    std::array<double, {descriptor['count']}> result{{}};",
+                "    std::copy(physical.begin(), physical.end(), result.begin());",
+                f"    for (std::size_t index = 0; index < {post_count}; ++index)",
+                f"        result[{descriptor['physical_count']} + index] = "
+                f"values[roots[slot * {post_count} + index]];",
+                "    return result;",
+                "}",
+            ]))
+        return methods
+
     def members(self, controllers=()) -> list[str]:
-        persistent = {**self._algebraic_fields, **self._discrete_fields}
+        persistent = {
+            **self._algebraic_fields,
+            **self._discrete_fields,
+        }
         lines = [f"{_CPP_TYPES[self.record_types[key]]} {self.value(record, key[1])} = "
                  f"{_literal(getattr(record, key[1]))};"
                  for key, record in persistent.items()]
@@ -3813,20 +4987,17 @@ class _ModelGenerator:
                           f"{_literal(0.0 if inverse is None else inverse)};",
                           f"bool algebraic_has_inverse_{index} = "
                           f"{'false' if inverse is None else 'true'};"]
-        for member, subsystem, attribute in self.element_parameters.values():
-            lines.append(f"double {member} = "
-                         f"{_number(getattr(self.runtime.object(subsystem), attribute))};")
         for label, targets in self.model._zoh_targets.items():
             record, field = targets[0]
-            value = getattr(record, field)
+            value = self.zoh_initial[label]
             lines.append(
                 f"{_CPP_TYPES[self.record_types[id(record), field]]} hold_{_identifier(label)} = {_literal(value)};"
             )
         for sub in self.model.subsystems:
-            owner = getattr(sub, "component", sub)
-            hook = getattr(owner, "cpp_equation_members", None)
-            if hook is not None:
-                lines.extend(hook(self, controllers))
+            equation_objects = getattr(sub, "equation_objects", None)
+            if equation_objects is not None:
+                for source in equation_objects().values():
+                    lines.extend(self.ramp_equation_members(sub, source, controllers))
         for generator in self.continuous_units.values():
             lines.extend(generator.members())
         return lines
@@ -4293,7 +5464,7 @@ class _CarrierModulatorGenerator:
         """Generate one topology-driven carrier-comparison implementation."""
         if isinstance(generator.bridge.modulator, ZOH):
             return ""
-        hold = generator._hold()
+        generator._hold()  # validates the single held bridge command
         values = tuple(f"q[{index}]" for index in range(generator.bridge.modulation_width))
         encoded = generator._topology_expression(generator.topology.switching_state, values)
         q_kind = _CPP_TYPES[_Expression.of(generator.topology.zero).kind]
@@ -4646,6 +5817,14 @@ class _ControlGenerator:
             return self.m("reference_" + name)
         path = f"units.{self.name}.ctrl.references.{name}"
         return self.model.runtime.value(path, getattr(self.cfg.ctrl.references, name))
+
+    def event_parameter_bindings(self) -> dict[str, tuple[bool, str | None]]:
+        """Bind event parameters to their ordinary store and persistent controller state."""
+        prefix = f"units.{self.name}.ctrl.references."
+        return {
+            prefix + name: (True, self._reference(name))
+            for name in self._changing_references
+        }
 
     def reference_members(self) -> list[str]:
         """Only event-modified references need storage, updated at the actual event boundary.
@@ -5161,7 +6340,7 @@ class _ControlGenerator:
                    *(f"{self.m('adc_rms_' + channel)}.last = {_number(window.last)};"
                      for channel, window in adc.rms.items())]
                   if adc.accumulating and restored else [])
-        if ((not self.model.runtime.selected and not adc.independent)
+        if ((not self.model.runtime.tracked and not adc.independent)
                 or self.continuous and not adc.clocked
                 or not (adc.accumulating or adc.independent or adc.samples > 1)):
             return anchor
@@ -5707,7 +6886,7 @@ class _ProtectionGenerator:
         return [
             f"const bool tripped_now = {self.m('sampled_trip_due')};",
             f"if (tripped_now) {{ {self.m('sampled_trip_due')} = false; "
-            f"apply_trip_{self.tag}(); }}",
+            f"apply_trip_{self.tag}(t); }}",
         ]
 
     @cached_property
@@ -5721,10 +6900,10 @@ class _ProtectionGenerator:
 
     def actuate_method(self) -> str:
         """Apply a sampled trip for a continuous converter."""
-        return f'''bool actuate_{self.tag}(double) {{
+        return f'''bool actuate_{self.tag}(double t) {{
     if (!{self.m('sampled_trip_due')}) return false;
     {self.m('sampled_trip_due')} = false;
-    apply_trip_{self.tag}();
+    apply_trip_{self.tag}(t);
     return true;
 }}'''
 
@@ -5754,7 +6933,8 @@ class _ProtectionGenerator:
 
     def _trip_body(self) -> list[str]:
         link = self.model._equation_attributes(self.unit.dclink)["tripped"].code
-        lines = ([f"{self.m('startup_run')} = false;"] if self.ctrl is not None else []) + [
+        # Unit._shutdown: the controller takes the ordinary stop command, then the power stage opens.
+        lines = (self._controller_command_lines(False, 0.0) if self.ctrl is not None else []) + [
                  f"{self.m('gates')} = false;",
                  f"{self.m('breaker')} = false;"]
         if self.unit.branch_f is not None:
@@ -5770,8 +6950,10 @@ class _ProtectionGenerator:
         period = self.protection.T
         has_frequency = self._observes_rocof()
 
-        def enabled(item: Any) -> str:
-            return "true" if item.enable else "false"
+        def enabled(name: str, item: Any) -> str:
+            return self.model.runtime.value(
+                f"units.{self.name}.protection.{name}.enable", item.enable
+            )
 
         def limit(item: Any, field: str) -> str:
             value = getattr(item, field)
@@ -5782,8 +6964,10 @@ class _ProtectionGenerator:
 
         def timed(item: Any, condition: str, name: str, alarm: str, timer: str,
                   cause: str) -> list[str]:
-            if not item.enable:
+            active = enabled(name, item)
+            if active == "false":
                 return []
+            condition = f"({active}) && ({condition})"
             return [
                 f"if ({condition}) {{",
                 f"    if (!std::isfinite({first(name)})) {first(name)} = t;",
@@ -5811,7 +6995,7 @@ class _ProtectionGenerator:
                 "        if (had_old) {",
                 f"            const double rocof = (freq_dev - old) / {_number(self.protection._rocof_window)};",
                 f"            {self.m('rocof_max')} = std::max({self.m('rocof_max')}, std::abs(rocof));",
-                f"            if ({enabled(cfg.rocof)} && std::abs(rocof) >= {limit(cfg.rocof, 'limit')} && startup_complete) {{",
+                f"            if ({enabled('rocof', cfg.rocof)} && std::abs(rocof) >= {limit(cfg.rocof, 'limit')} && startup_complete) {{",
                 f"                if (!std::isfinite({first('rocof')})) {first('rocof')} = t;",
                 f"                alarm_{self.tag}(\"ROCOF\");",
                 "            }",
@@ -5819,7 +7003,7 @@ class _ProtectionGenerator:
                 "    }",
             ]
         sampled.append(f"    if ({self.m('tripped')} || !startup_complete) return false;")
-        if cfg.rms_current.enable:
+        if enabled("rms_current", cfg.rms_current) != "false":
             channel = unit_type(self.cfg.type).current_channel
             rms = f"({self._rms_value(channel)} / {_number(self.protection.i_base)})"
             sampled += ["    " + line for line in timed(
@@ -5852,7 +7036,8 @@ class _ProtectionGenerator:
             "overvoltage", "VOLTAGE_OVER", "hold_ov", "voltage_ov")]
         sampled += ["    return false;", "}"]
 
-        apply = [f"void apply_trip_{self.tag}() {{", *["    " + line for line in self._trip_body()], "}"]
+        apply = [f"void apply_trip_{self.tag}(double t) {{",
+                 *["    " + line for line in self._trip_body()], "}"]
         sections = [self._protection_helpers(), apply, sampled]
         if not sampled_only:
             current = f"obs_{_identifier(self.name + '.i_c')}"
@@ -5876,11 +7061,11 @@ class _ProtectionGenerator:
             fast += [
                 f"    const double peak = peak_current / {_number(self.protection.i_base)};",
                 f"    if (std::isfinite(peak)) {self.m('max_current')} = std::max({self.m('max_current')}, peak);",
-                f"    if ({self.m('tripped')} || !{enabled(cfg.overcurrent)} || !(peak > {limit(cfg.overcurrent, 'limit_pu')})) return false;",
+                f"    if ({self.m('tripped')} || !{enabled('overcurrent', cfg.overcurrent)} || !(peak > {limit(cfg.overcurrent, 'limit_pu')})) return false;",
                 f"    if (!std::isfinite({first('overcurrent')})) {first('overcurrent')} = t;",
                 f"    alarm_{self.tag}(\"OVERCURRENT\");",
                 f"    latch_{self.tag}(t, \"overcurrent\", true);",
-                f"    apply_trip_{self.tag}();",
+                f"    apply_trip_{self.tag}(t);",
                 "    return true;",
                 "}",
             ]
@@ -6446,9 +7631,21 @@ class _CppGenerator:
         self.p = simulation.p
         self.system = simulation.system
         self.model = self.system.model
+        self.zoh_initial = {
+            label: getattr(targets[0][0], targets[0][1])
+            for label, targets in self.model._zoh_targets.items()
+        }
         self.name = name
-        self.runtime = _RuntimeParameters(self.p, variables, exclude=exclude)
-        if self.runtime.selected:
+        internal = tuple(dict.fromkeys(
+            path
+            for change in self.p.changes
+            for path in change.values
+            if path not in change.connections
+        ))
+        self.runtime = _RuntimeParameters(
+            self.p, variables, internal=internal, exclude=exclude
+        )
+        if self.runtime.tracked:
             from .validate import validate
 
             restored = simulation._initial_values(simulation.p.simulation.initial.t)
@@ -6476,7 +7673,7 @@ class _CppGenerator:
 
     def _initial_values(self, model):
         """Resolve the ordinary initial-state contract against parameterized source values."""
-        if not self.runtime.selected:
+        if not self.runtime.tracked:
             return self.simulation._initial_values(self.p.simulation.initial.t)
         system = copy.copy(self.system)
         system.units = {}
@@ -6519,8 +7716,8 @@ class _CppGenerator:
                 continue
             states = model.named_equation_state(subsystem)
             equation_states[id(subsystem)] = states
-            component = getattr(subsystem, "component", None)
-            if component is not None:
+            component = getattr(subsystem, "equation_owner", subsystem)
+            if component is not subsystem:
                 equation_states[id(component)] = states
         for group in self.simulation._states._groups:
             part = group.part
@@ -6562,10 +7759,16 @@ class _CppGenerator:
 
     def _actions(self, model: _ModelGenerator,
                  generators: dict[str, _ControlGenerator]) -> tuple[list[float], str]:
-        """Remaining file events, specialised to direct member assignments."""
+        """Lower checked file events through the shared runtime-parameter bindings."""
         t0 = self.p.simulation.initial.t
         actions = [action for action in self.simulation._actions() if action[0] > t0 + TIME_EPS]
         changes = {change.event: change for change in self.p.changes}
+        consumers = dict(model.event_parameter_bindings)
+        consumers.update({
+            path: binding
+            for generator in generators.values()
+            for path, binding in generator.event_parameter_bindings().items()
+        })
         cases: list[str] = []
         for index, (_at, _order, action) in enumerate(actions):
             action = changes[action.event]
@@ -6600,22 +7803,26 @@ class _CppGenerator:
                         for branch in breakers
                         for line in model.breaker_lines(branch, "false" if on else "true")
                     ]
-            for path in action.paths:
+            changed: list[str] = []
+            for path, value in action.values.items():
                 if path in action.connections:
                     continue
-                if path in model.element_parameters:
-                    member, _, _ = model.element_parameters[path]
-                    _, element, field = path.split(".")
-                    value = getattr(action.params.elements[element], field)
-                    lines.append(f"{member} = {_number(value)};")
-                    continue
-                owner, separator, reference = path.removeprefix("units.").partition(".ctrl.references.")
-                if separator and path.startswith("units."):
-                    generator = generators[owner]
-                    value = getattr(action.params.unit(owner).ctrl.references, reference)
-                    lines.append(f"{generator._reference(reference)} = {_literal(value)};")
-                elif not (path.startswith("sources.") and path.rsplit(".", 1)[-1] in {"v", "f", "angle"}):
-                    raise TypeError(f"C++ export: event {action.event!r} writes unsupported variable {path!r}")
+                item = self.runtime.by_path.get(path)
+                if item is None:
+                    raise TypeError(
+                        f"C++ export: event {action.event!r} writes unsupported variable {path!r}"
+                    )
+                write_parameter, member = consumers.get(path, (True, None))
+                if write_parameter:
+                    lines.append(f"parameters.{item.member} = {_literal(value)};")
+                    if item.derived or isinstance(item.default, bool):
+                        lines.append(f"parameters.given_{item.member} = true;")
+                    changed.append(path)
+                if member is not None:
+                    lines.append(f"{member} = {_literal(value)};")
+            lines.extend(self.runtime.refresh_assignments(changed))
+            if changed and self.runtime.guards:
+                lines.append("validate_parameters();")
             cases += [f"        case {index}:", *["            " + line for line in lines],
                       "            break;"]
         times = [item[0] for item in actions]
@@ -6676,8 +7883,10 @@ class _CppGenerator:
         """Lower the same command-boundary reconciliation as System.reconcile_circuits."""
         members, body = [], []
         for circuit in self.system.circuits:
-            if circuit.commutation_active:
-                continue  # its existing continuous commutation dispatcher owns projection
+            if circuit.commutation_active or circuit._mixtures:
+                # Continuous commutation and declared averaged mode families each own their
+                # topology transitions; neither has one outer command mode to project here.
+                continue
 
             with model._netlist_symbols(circuit):
                 flags = tuple(model._switch_flag(switch)
@@ -6745,9 +7954,10 @@ class _CppGenerator:
         def powers(check: Any) -> tuple[str, str]:
             sub = check.subsystem
             try:
-                circuit = getattr(sub, "_circuit", None)
-                component = getattr(sub, "component", None)
-                if circuit is not None and component is not None:
+                owner = model.component_subsystem.get(id(sub), sub)
+                circuit = getattr(owner, "_circuit", None)
+                component = getattr(owner, "equation_owner", owner)
+                if circuit is not None and component is not owner:
                     return (
                         model.trace_circuit_component_power(circuit, component, supplied=True),
                         model.trace_circuit_component_power(circuit, component, supplied=False),
@@ -6837,7 +8047,9 @@ class _CppGenerator:
     def source(self, model: _ModelGenerator | None = None) -> str:
         """Return the complete generated translation unit."""
         if model is None:
-            model = _ModelGenerator(self.simulation, self.runtime, defer_equations=True)
+            model = _ModelGenerator(
+                self.simulation, self.runtime, zoh_initial=self.zoh_initial
+            )
         self.diagnostics = model.diagnostics
         sampled = {name: _make_unit_generator(name, unit, model)
                    for name, unit in self.system.units.items() if not unit.continuous}
@@ -6845,11 +8057,6 @@ class _CppGenerator:
                              else _make_unit_generator(name, unit, model))
                       for name, unit in self.system.units.items() if unit.continuous}
         generators = {**sampled, **continuous}
-        model._lifecycle_writes = set()
-        for generator in generators.values():
-            generator._terminal_lines
-        action_times, action_cases = self._actions(model, generators)
-        model.resolve_equations()
         for sub in self.model.subsystems:
             if id(sub) in model.equation_bindings and id(sub) not in model.equation_references:
                 model.equation_references[id(sub)] = model._equation_clone(sub)
@@ -6927,6 +8134,12 @@ class _CppGenerator:
         )
         projection_call = "project_state();" if projection_lines else ""
         diode_conduction = DiodeConduction(self.model, self.simulation.solver)
+        if (diode_conduction.located and self.p.simulation.solver.type != "fixed"
+                and not math.isfinite(self.p.simulation.solver.max_step)):
+            raise ConfigError(
+                "simulation.solver.max_step must be finite to export an adaptive solver with "
+                "commutating subsystems"
+            )
         diode_current_states = diode_conduction.current_states
         diode_blocking_guards = []
         for subsystem, _index in diode_current_states:
@@ -6962,7 +8175,6 @@ class _CppGenerator:
             member_lines.extend(generator.members())
         for generator in generators.values():
             member_lines.extend(generator.reference_members())
-        members = "\n    ".join(member_lines)
         direct_guards = {}
         rhs = "\n        ".join(model.body(direct_guards=direct_guards))
         fallback_method = ""
@@ -6978,30 +8190,53 @@ class _CppGenerator:
         sync_body = "\n        ".join(model.body(derivatives=False))
         native_implicit = isinstance(self.simulation.solver, ImplicitSolver)
         structure = self.model.linear_structure()
+        # A custom model without an assembled partition factors its Newton matrix whole.
+        groups, interface = ((), ()) if structure is None else (structure.groups, structure.interface)
         circuit_plans = tuple(
             circuit._structure_plan for circuit in self.system.circuits
             if circuit._structure_plan is not None
         )
+        stability_plans = tuple(
+            plan for plan in circuit_plans
+            if plan.local_to_model.size
+        )
         stiff_fallback = (
             isinstance(self.simulation.solver, FixedStepSolver)
-            and any(plan.local_to_model.size for plan in circuit_plans)
+            and bool(stability_plans)
         )
         uses_implicit_linearization = native_implicit or stiff_fallback
-        implicit_exact_columns: tuple[bool, ...] = ()
-        implicit_exact_lines: list[str] = []
         mode_size = 0
         mode_lines: list[str] = []
+        mode_layout: dict[int, list[int]] = {}
+        stability_mode_layout: dict[int, list[int]] = {}
+        stability_equations: dict[int, list[str]] = {}
         if uses_implicit_linearization:
-            implicit_exact_columns, implicit_exact_lines = model.implicit_linearization()
-            mode_values = model.structural_mode_values()
-            entries = []
-            for value in mode_values:
+            entries: list[str] = []
+
+            def entry(value: _Expression) -> tuple[int, ...]:
+                """Register one structural value and return its real-valued positions."""
                 code = model.solver_expression(value.code)
+                start = len(entries)
                 if value.kind == "complex":
-                    entries += [f"std::real({code})", f"std::imag({code})"]
+                    entries.extend((f"std::real({code})", f"std::imag({code})"))
                 else:
                     entries.append(f"static_cast<double>({code})")
+                return tuple(range(start, len(entries)))
+
+            for circuit, mode_values, stability_values in model.structural_mode_values():
+                positions = mode_layout[id(circuit.netlist)] = []
+                stability_positions = stability_mode_layout[id(circuit.netlist)] = []
+                for value, affects_stability in zip(mode_values, stability_values):
+                    selected = entry(value)
+                    positions.extend(selected)
+                    if affects_stability:
+                        stability_positions.extend(selected)
             mode_size = len(entries)
+            if stiff_fallback:
+                stability_equations = {
+                    id(plan): model.trace_stability_derivatives(plan.circuit)
+                    for plan in stability_plans
+                }
             mode_lines = [
                 "StructuralMode structural_mode() {",
                 "    return {{" + ", ".join(entries) + "}};",
@@ -7015,7 +8250,6 @@ class _CppGenerator:
                             for generator in generators.values()
                             if tracking[generator.name] and generator.name not in self.simulation._continued]
         observations = "\n        ".join(observation_assignments)
-        members = "\n    ".join([members, *observation_members])
         methods = [boundary_method, *tracking.values()]
         for generator in sampled.values():
             methods += [generator.controller_method(), generator.switching_method(),
@@ -7030,6 +8264,8 @@ class _CppGenerator:
         energy_method, energy_columns = self._energy_method(model)
         if energy_method:
             methods.append(energy_method)
+        methods.extend(model.runtime_network_methods())
+        members = "\n    ".join([*member_lines, *observation_members])
         methods_text = "\n\n    ".join(method.replace("\n", "\n    ") for method in methods if method)
         circuit_times = [
             f"next_{tag}()"
@@ -7074,7 +8310,6 @@ class _CppGenerator:
             # Share one model body; each instantiation retains only its required stores.
             sync_update = ("if constexpr (seed_adc) {\n" + "\n".join(adc_seed)
                            + "\n} else {\n" + observations + "\n}")
-        times = ", ".join(_number(value) for value in action_times)
         snapshot_values = "\n            ".join(f"states << ',' << ({value});" for value in state_values)
         output = self.p.simulation.output
         output_precision = self.runtime.value("simulation.output.precision", output.precision)
@@ -7204,30 +8439,29 @@ class _CppGenerator:
             fixed_dt = f"std::min({fixed_dt}, maximum_step)"
             adaptive_max_step = f"std::min({adaptive_max_step}, maximum_step)"
         if implicit:
-            solver_code = _implicit_solver(self.simulation.solver, integration_name, integration_args,
+            solver_code = _implicit_solver(solver.method, integration_name, integration_args,
                                            fixed_dt, adaptive_atol, adaptive_rtol, raw_projection_call,
-                                           exact_columns=implicit_exact_columns,
-                                           exact_lines=implicit_exact_lines,
+                                           n_states=self.model.n_states,
                                            mode_size=mode_size,
-                                           groups=() if structure is None else structure.groups,
-                                           interface=() if structure is None else structure.interface)
+                                           groups=groups, interface=interface)
         elif fixed:
             step_code = _fixed_step(solver.method)
             if stiff_fallback:
-                fallback = ImplicitSolver(
-                    solver.dt, "radau", solver.rtol, solver.atol
-                )
                 implicit_code = _implicit_solver(
-                    fallback, "integrate_stiff", integration_args,
+                    "radau", "integrate_stiff", integration_args,
                     fixed_dt, adaptive_atol, adaptive_rtol, raw_projection_call,
-                    exact_columns=implicit_exact_columns,
-                    exact_lines=implicit_exact_lines,
+                    n_states=self.model.n_states,
                     mode_size=mode_size,
-                    groups=structure.groups,
-                    interface=structure.interface,
+                    groups=groups, interface=interface,
                 )
-                blocks = tuple(plan.local_to_model for plan in circuit_plans)
-                stability_code = _explicit_stability(solver.method, blocks)
+                stability_code = _explicit_stability(solver.method, [
+                    (
+                        plan.circuit.n_states,
+                        stability_equations[id(plan)],
+                        stability_mode_layout[id(plan.circuit.netlist)],
+                    )
+                    for plan in stability_plans
+                ])
                 stiff_call = (
                     "integrate_stiff(t, target, maximum_step);"
                     if local_limit else "integrate_stiff(t, target);"
@@ -7358,6 +8592,8 @@ class _CppGenerator:
     double adaptive_error = {_number(self.simulation.solver._err_prev)};''' if not fixed else "")
         # The execution backend is deliberately emitted as one TU: whole-program optimisation can
         # inline the configured RHS and remove unused output paths without crossing a library ABI.
+        action_times, action_cases = self._actions(model, generators)
+        times = ", ".join(_number(value) for value in action_times)
         return f'''// Generated by PESLite.  Do not edit: regenerate from the source simulation file.
 // Standalone C++17; no Python, NumPy, SciPy or YAML dependency at run time.
 #include <algorithm>
@@ -7371,6 +8607,7 @@ class _CppGenerator:
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -7405,6 +8642,8 @@ constexpr double time_eps = {_number(TIME_EPS)};
 {_MOVING_WINDOW}
 
 {_CSV_STREAM}
+
+{_DENSE_SOLVER}
 
 template <std::size_t N> struct RMSWindow {{
     MovingWindow<N> window;
@@ -7562,6 +8801,7 @@ constexpr std::array<std::string_view, {len(public_names)}> state_names{{
 
 class Simulator {{
 public:
+    RuntimeParameters configured_parameters;
     RuntimeParameters parameters;
     double event_time = {_number(self.p.simulation.initial.t)};
     {chr(10).join('    ' + line for line in self.runtime.initialization_members())}
@@ -7570,8 +8810,13 @@ public:
     {adaptive_members}
     {members}
 
-    explicit Simulator(RuntimeParameters configured = {{}}) : parameters(std::move(configured)) {{
+    void validate_parameters() const {{
         {self.runtime.validation()}
+    }}
+
+    explicit Simulator(RuntimeParameters configured = {{}})
+            : configured_parameters(configured), parameters(std::move(configured)) {{
+        validate_parameters();
         {' '.join(discrete_initialization)}
         {chr(10).join(connection_initialization)}
         {'reconcile_circuits<false>(' + _number(self.p.simulation.initial.t) + ');' if boundary_method else ''}
@@ -7725,7 +8970,7 @@ public:
         {energy_summary}
         summary << "\\n}}\\n";
         std::ofstream resolved(out / "simulation.pes");
-        resolved << resolved_parameters(parameters);
+        resolved << resolved_parameters(configured_parameters);
         return 0;
     }}
 }};
@@ -7795,12 +9040,19 @@ def _prepare_export(simulation, variables, reusable, *, params=None):
         raise TypeError(
             "C++ export cannot safely reconstruct supplied instances; use parts factories instead"
         )
+    p = simulation.p if params is None else params
+    event_parameters = {
+        path
+        for change in p.changes
+        for path in change.values
+        if path not in change.connections
+    }
+    parameterized = bool(variables or event_parameters)
     initializations = []
     recorder = lambda part, factory, parameters: initializations.append((part, factory, parameters))
-    token = _PARAMETER_RECORDER.set(recorder if variables else None)
+    token = _PARAMETER_RECORDER.set(recorder if parameterized else None)
     try:
-        p = simulation.p if params is None else params
-        prepared = (simulation if reusable and not variables and p is simulation.p else
+        prepared = (simulation if reusable and not parameterized and p is simulation.p else
                     Simulation(p, parts=simulation._factories))
     finally:
         _PARAMETER_RECORDER.reset(token)
@@ -7809,6 +9061,7 @@ def _prepare_export(simulation, variables, reusable, *, params=None):
 
 def _parameter_generator(prepared, name, variables, initializations, *, constants=None):
     """Combine target constants and common specialization in one shared parameter rebuild."""
+    prepared.system.plan_export()
     common = "common" in variables
     variables = tuple("all" if path == "common" else path for path in variables)
     generator = _CppGenerator(prepared, name, variables, initializations)
@@ -7816,7 +9069,9 @@ def _parameter_generator(prepared, name, variables, initializations, *, constant
     model = None
     diagnostics = []
     if common:
-        model = _ModelGenerator(prepared, generator.runtime)
+        model = _ModelGenerator(
+            prepared, generator.runtime, zoh_initial=generator.zoh_initial
+        )
         sensitive = {path for item in model.diagnostics for path in item["parameters"]}
         if sensitive:
             diagnostics.append({
@@ -7864,8 +9119,13 @@ def _export_cpp(simulation: Any, out_dir: Path, name: str,
     plant.read_state()
     plant.outputs(t0)
 
-    generator, model, diagnostics = _parameter_generator(prepared, name, variables, initializations)
-    code = generator.source(model)
+    # Capture held inputs only after the ordinary Python initialization contract has restored
+    # states, selected circuit modes and refreshed every same-time sampled value.
+    generator, generated_model, diagnostics = _parameter_generator(
+        prepared, name, variables, initializations
+    )
+
+    code = generator.source(generated_model)
     out_dir.mkdir(parents=True, exist_ok=True)
     source = out_dir / "peslite.cpp"
     source.write_text(code, encoding="utf-8")

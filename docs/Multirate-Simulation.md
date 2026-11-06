@@ -4,8 +4,8 @@ Multirate integration lets named subsystems advance on a step different from the
 useful when one part of a connected model is much faster or slower than the rest and a single global
 step would waste evaluations.
 
-Multirate schedules currently require an explicit fixed-step system method: `euler`, `heun` or
-`RK4`.
+Multirate schedules require an explicit fixed-step system method: `euler`, `heun` or `RK4`. A group
+inside the system step may select one method of its own, including `trapezoidal` or `radau`.
 
 ## Step definition
 
@@ -38,9 +38,18 @@ subsystems remain on the system step.
 
 ## Fast subsystems
 
-A subsystem with ratio `1/N` is sub-stepped inside each system interval. It shares the system's
-fixed integration method. `sweeps` controls coupling sweeps between the fast group and the rest of
-the system; increasing it can reduce split error but increases RHS evaluations.
+A subsystem with ratio `1/N` is sub-stepped inside each system interval. It shares the system method
+unless the group declares another one; `step: 1` may therefore isolate a stiff group on an implicit
+method without changing its period:
+
+```yaml
+subsystems:
+  cable1: {step: 1, method: radau}
+```
+
+All subsystems inside the system step share one group method. `sweeps` controls coupling sweeps
+between that group and the rest of the system; increasing it can reduce split error but increases
+RHS evaluations.
 
 Fast sub-stepping helps only when it replaces an otherwise smaller global `dt`. Assigning many
 strongly coupled subsystems to the fast group may cost more than a single-rate run.
@@ -144,7 +153,7 @@ diagnostics, not as a replacement for convergence against a tighter reference ru
 ## Limitations
 
 - Multirate schedules are supported only with `simulation.solver.type: fixed`.
-- A fast group uses the system fixed method; a windowed group uses one method.
+- Each fast or windowed group uses one method.
 - A system with commutating subsystems, such as diode rectifiers or switch-controlled capacitors,
   cannot use a windowed group because it cannot locate their commutation instants.
 - The filter of an averaged unilateral half bridge requests a state-dependent local step in DCM

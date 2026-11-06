@@ -219,8 +219,7 @@ def test_hold_voltage_uses_the_link_terminal_behind_a_series_element(tmp_path):
 
 
 def test_adaptive_solver_locates_the_same_discontinuous_conduction(tmp_path):
-    """The margins are checked every ``max_step``, whatever the output grid: a coarse output
-    period (the only outer events here) must not hide commutations."""
+    """Accepted solver steps locate commutations independently of the output grid."""
     fixed = _tree(SS, 200.0, 0.2e-3)
     fixed["simulation"]["output"]["period"] = 2e-5
     adaptive = copy.deepcopy(fixed)
@@ -245,12 +244,47 @@ def test_adaptive_solver_locates_the_same_discontinuous_conduction(tmp_path):
         assert max(abs(fixed_i[t] - other[t]) for t in fixed_i) < 1e-6 * scale
 
 
-def test_adaptive_solver_needs_a_finite_check_interval():
+@pytest.mark.parametrize("method", ["DOP853", "DP45", "radau", "auto"])
+def test_adaptive_solver_observes_commutations_at_its_own_steps(method, tmp_path):
+    fixed = _tree(SS, 200.0, 0.2e-3)
+    fixed["simulation"]["output"]["period"] = 2e-5
+    adaptive = copy.deepcopy(fixed)
+    adaptive["simulation"]["solver"] = {
+        "type": "adaptive", "method": method, "rtol": 1e-10,
+        "atol": 1e-12, "linearisations": 0,
+    }
+    results = []
+    for name, tree in (("fixed", fixed), ("adaptive", adaptive)):
+        simulation = peslite.Simulation(from_dict(copy.deepcopy(tree)))
+        result = simulation.run(out_dir=tmp_path / name)
+        bridge, = (
+            sub for sub in simulation.system.model.subsystems
+            if isinstance(getattr(sub, "topology", None), FullBridge)
+            and not sub.topology.controlled
+        )
+        values = dict(zip(
+            np.round(np.asarray(result.t), 12),
+            np.asarray(result.columns()["charger.link.i_secondary_coil"]),
+        ))
+        results.append((values, bridge.commutations))
+    (fixed_i, fixed_n), (adaptive_i, adaptive_n) = results
+    assert fixed_n == adaptive_n > 50
+    scale = max(map(abs, fixed_i.values()))
+    assert max(abs(fixed_i[t] - adaptive_i[t]) for t in fixed_i) < 1e-6 * scale
+
+
+def test_a_solver_without_step_observation_still_needs_a_finite_check_interval():
+    class Unobserved:
+        max_step = math.inf
+
     tree = _tree(SS, 200.0, 1e-5)
     tree["simulation"]["solver"] = {"type": "adaptive", "method": "DOP853", "linearisations": 0}
     tree["simulation"]["output"]["signals"] = False
+    simulation = peslite.Simulation(from_dict(tree))
+    from peslite.assembly.conduction import DiodeConduction
+
     with pytest.raises(ConfigError, match="max_step must be finite"):
-        peslite.Simulation(from_dict(tree)).run(out_dir=None)
+        DiodeConduction(simulation.system.model, Unobserved())
 
 
 def test_continuation_from_saved_states_reproduces_the_run(tmp_path):

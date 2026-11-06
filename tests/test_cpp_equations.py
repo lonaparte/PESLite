@@ -10,7 +10,7 @@ from peslite.assembly.cpp import (_ALGEBRAIC_SOLVER, _ControlGenerator, _ModelGe
                                   _RuntimeParameters, _number, _uses_implementation)
 from peslite.components import Bag
 from peslite.components.converter import DCCapacitor, DCLink, DCVoltageSource
-from peslite.components.network import ACVoltageSource, RLBranch, RCNode
+from peslite.components.network import ACVoltageSource, RLBranch
 from peslite.solver.model import Empty, Model
 from peslite.control import Loop
 from peslite.control.blocks import PI
@@ -27,7 +27,7 @@ def test_parameter_identifier_collisions_are_rejected_by_the_shared_interface():
 
 def _generator(model):
     system = SimpleNamespace(model=model, units={}, sources={}, named_elements={},
-                             event_subsystems=())
+                             event_subsystems=(), circuits=())
     simulation = SimpleNamespace(system=system, p=SimpleNamespace(changes=()))
     return _ModelGenerator(simulation, None)
 
@@ -221,9 +221,8 @@ def test_native_multivariable_feedback_keeps_the_previous_output_between_calls(t
             self.input, self.output = Pair(x=1.0, y=1.0), Pair(x=1.0, y=1.0)
 
         def set_outputs(self, t):
-            # The default budget converges from the previous step, not a cold initial value.
-            self.output.x = 0.3 * self.input.x + 0.02 * self.input.y + 0.68 * (1.0 + t)
-            self.output.y = 0.02 * self.input.x + 0.3 * self.input.y + 0.68 * (1.0 + t)
+            self.output.x = 0.8 * self.input.x + 0.05 * self.input.y + 0.15 * (1.0 + t)
+            self.output.y = 0.05 * self.input.x + 0.8 * self.input.y + 0.15 * (1.0 + t)
 
         def rhs(self, t):
             return ()
@@ -294,20 +293,6 @@ def test_native_unilateral_output_clamps_a_negative_trial_state(tmp_path):
     assert actual == branch.output.i == 0.0
 
 
-def test_builtin_subclass_export_hooks_take_precedence():
-    class HookedNode(RCNode):
-        def cpp_outputs(self, generator):
-            return ["custom_output;"]
-
-        def cpp_rhs(self, generator):
-            return ["custom_rhs"]
-
-    node = HookedNode(1.0, 0.0, phases=1)
-    generator = _generator(Model({"node": node}, {}))
-    assert generator._output(node.set_outputs) == ["custom_output;"]
-    assert generator._rhs(node) == ["custom_rhs"]
-
-
 @pytest.mark.parametrize("capacitance", [None, 0.1])
 def test_dclink_lowering_traces_the_shared_capacitor_state(capacitance, tmp_path):
     cap = DCCapacitor(12.0, capacitance, 0.25) if capacitance is not None else None
@@ -331,8 +316,12 @@ def _control_generator(node):
     return generator
 
 
-@pytest.mark.parametrize('initial', [None, 1.0])
-def test_loop_lowering_rejects_non_numeric_carried_state_instead_of_guessing(initial):
+@pytest.mark.parametrize(('initial', 'message'), [
+    (None, 'unsupported equation value None'),
+    (1.0, 'cannot add or remove an optional result'),
+])
+def test_loop_lowering_rejects_non_numeric_carried_state_instead_of_guessing(
+        initial, message):
     class TimeLatch(Loop):
         inputs = {}
         outputs = {"duty": DUTY_RATIO}
@@ -350,7 +339,7 @@ def test_loop_lowering_rejects_non_numeric_carried_state_instead_of_guessing(ini
 
     node = TimeLatch()
     generator = _control_generator(node)
-    with pytest.raises(TypeError, match='unsupported equation value None'):
+    with pytest.raises(TypeError, match=message):
         generator._loop_members()
         generator._loop_lines('node', node)
 

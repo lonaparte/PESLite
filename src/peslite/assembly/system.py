@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Mapping, Optional
 
-from ..components.network import ACVoltageSource, ELEMENT_TYPES, RCNode, RLBranch, Port
+from ..components.network import ACVoltageSource, Bus, ELEMENT_TYPES, RCNode, RLBranch, Port
 from ..components.adc import _PortMeasurement
 from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
@@ -226,17 +226,19 @@ class _Source:
         self.branch.port2.electrical_domain = "ac"
         self.port = self.branch.port2
 
-    def retune(self, cfg, paths: list[str], t: float) -> None:
-        """Apply changed source impedance, magnitude, frequency or angle at ``t``."""
+    def retune(self, cfg, paths: list[str], t: float) -> bool:
+        """Apply source parameters and report whether its network declaration changed."""
         self.cfg = cfg
+        network_changed = False
         if "l" in paths or "r" in paths:
-            self.branch.retune(cfg.l, cfg.r)
+            network_changed = self.branch.retune(cfg.l, cfg.r)
         if "v" in paths or "f" in paths or "angle" in paths:
             voltage, phase = self.scenario.law(t)
             if "v" in paths:
                 self.emf.e_peak = voltage
             if "f" in paths or "angle" in paths:
                 self.emf.phi = phase
+        return network_changed
 
     def subsystems(self) -> dict[str, Any]:
         return {f"{self.name}.emf": self.emf, f"{self.name}.branch": self.branch}
@@ -393,7 +395,7 @@ class System:
         def make_bus(values):
             cfg, system_base = values
             if cfg.c is None:
-                return _PortMeasurement(phases=cfg.phases)
+                return Bus(phases=cfg.phases)
             return RCNode(
                 cfg.c,
                 cfg.r_d,
@@ -472,23 +474,45 @@ class System:
                                   for name, branch in self.branches.items())
         elements = (*branch_assemblies, *self.sources.values(), *self.units.values(),
                     *self.named_elements.values())
-        element_ports = tuple((element, tuple(element.port_bindings())) for element in elements)
+        element_ports = tuple(
+            (element, tuple(element.port_bindings()),
+             dict(getattr(element, "series_connections", lambda: {})()))
+            for element in elements
+        )
         for element in elements:
             _merge_unique(subsystems, element.subsystems(), "subsystem name")
         physical_bindings = assembled.attached_ports + tuple(
-            binding for _element, bindings in element_ports for binding in bindings
+            binding for _element, bindings, _series in element_ports for binding in bindings
         )
         passive_groups = tuple(
-            bindings for element, bindings in element_ports
+            bindings for element, bindings, _series in element_ports
             if getattr(element, "domain_transparent", False)
         )
         _validate_electrical_domains(
             assembled.endpoints, passive_groups, physical_bindings, resolve_bus
         )
+
+        def attach_bindings(element: Any, bindings: tuple[tuple[str, Port], ...]) -> None:
+            for bus_name, port in bindings:
+                if not isinstance(port, Port):
+                    raise TypeError(
+                        f"{type(element).__name__}.port_bindings() returned "
+                        f"{type(port).__name__}, not Port"
+                    )
+                bus_ports.setdefault(resolve_bus(bus_name), []).append(port)
+
         for bus_name, port in assembled.attached_ports:
             bus_ports.setdefault(bus_name, []).append(port)
-        for element, element_bindings in element_ports:
-            for bus, inlet in getattr(element, "series_connections", lambda: {})().items():
+        configured_elements = {id(element) for element in self.named_elements.values()}
+
+        def attach_order(entry: tuple) -> int:
+            """Plain elements attach first, so a series inlet finds the two ports it joins, then
+            series elements, then configured elements."""
+            element, _bindings, series_connections = entry
+            return 1 if series_connections else 2 if id(element) in configured_elements else 0
+
+        for element, element_bindings, series_connections in sorted(element_ports, key=attach_order):
+            for bus, inlet in series_connections.items():
                 attached = bus_ports.setdefault(resolve_bus(bus), [])
                 if len(attached) != 2:
                     raise ConfigError(
@@ -496,22 +520,14 @@ class System:
                         f"got {len(attached)}"
                     )
                 bus_ports.setdefault(resolve_bus(inlet), []).append(attached.pop())
-            for bus_name, port in element_bindings:
-                if not isinstance(port, Port):
-                    raise TypeError(
-                        f"{type(element).__name__}.port_bindings() returned "
-                        f"{type(port).__name__}, not Port"
-                    )
-                bus_ports.setdefault(resolve_bus(bus_name), []).append(port)
+            attach_bindings(element, element_bindings)
         for name, bus in self.buses.items():
-            if bus.port is not None:
-                continue
-            if bus_ports[name]:
-                bus.observe(bus_ports[name][0])
-                if id(bus) not in continuous_bus_signals:
-                    subsystems.pop(name)
-            else:
+            attached = bus_ports[name]
+            if (len(attached) == 1 and attached[0] is bus.port
+                    and not bus.state_names and id(bus) not in continuous_bus_signals):
                 subsystems.pop(name)
+                attached.clear()
+                bus.port = None
         circuit_model = p.simulation.solver.circuit_model
         for element in elements:
             own_connections = element.connections()
@@ -587,8 +603,7 @@ class System:
                     target = (unit.ctrl, channel)
                     claim_connections((target,), where)
                     connections[target] = (subsystem, output)
-        from .circuit import (circuit_linear_blocks, circuit_linear_dynamic,
-                              circuit_linear_modes, circuit_mode_key,
+        from .circuit import (circuit_linear_blocks, circuit_linear_modes, circuit_mode_key,
                               circuit_structure, compile_network, lower)
         declarations = {id(subsystem): compile_network(subsystem)
                         for subsystem in subsystems.values()}
@@ -602,7 +617,6 @@ class System:
             linear_mode_key=partial(circuit_mode_key, circuits=self.circuits),
             linear_blocks=partial(circuit_linear_blocks, circuits=self.circuits),
             linear_modes=partial(circuit_linear_modes, circuits=self.circuits),
-            linear_dynamic=circuit_linear_dynamic(self.circuits),
         )
         self.event_subsystems = tuple(
             (name, subsystem)
@@ -719,7 +733,7 @@ class System:
 
     def apply(self, change: Change) -> None:
         """Write one checked event's parameters and connection commands through existing owners."""
-        p, done, connections_changed = change.params, set(), False
+        p, done, connections_changed, network_changed = change.params, set(), False, False
         for path in change.paths:
             if path in change.connections:
                 self.switch(path.removesuffix(".connected"), change.values[path], change.t, change.ramp)
@@ -730,18 +744,23 @@ class System:
                 continue
             done.add((section, name))
             if section == "buses":
-                self.buses[name].retune(p.buses[name].c, p.buses[name].r_d)
+                network_changed |= self.buses[name].retune(
+                    p.buses[name].c, p.buses[name].r_d
+                )
             elif section == "branches":
-                self.branches[name].retune(p.branches[name].l, p.branches[name].r)
+                network_changed |= self.branches[name].retune(
+                    p.branches[name].l, p.branches[name].r
+                )
             elif section == "sources":
-                self.sources[name].retune(
+                network_changed |= self.sources[name].retune(
                     p.sources[name], change.touches(f"sources.{name}."), change.t)
             elif section == "units":
-                self.units[name].retune(
+                network_changed |= self.units[name].retune(
                     p.unit(name), change.touches(f"units.{name}."), change.t)
             elif section == "elements":
-                self.named_elements[name].retune(p.elements[name])
-        if done:
+                result = self.named_elements[name].retune(p.elements[name])
+                network_changed |= True if result is None else bool(result)
+        if network_changed:
             for circuit in self.circuits:
                 circuit.build()
             model = self.model
@@ -764,6 +783,12 @@ class System:
         self.model.rebuild_evaluation_plan()
         for circuit in changed:
             circuit.plan_changed = False
+
+    def plan_export(self) -> None:
+        """Build a fixed model schedule that covers all compiled circuit modes."""
+        for circuit in self.circuits:
+            circuit.plan_export()
+        self.refresh_circuit_plan()
 
     def check_events(self, p: Params) -> None:
         """Check that custom elements and replacement controllers support their requested events."""
@@ -817,8 +842,6 @@ class System:
             add(branch, {f"{name}.i": branch.output.i})
         for name, node in self.buses.items():
             if node.port is not None:
-                value = (node.port.voltage if node.voltage_field == "voltage"
-                         else node.output.u)
-                add(node, {f"{name}.u": value})
+                add(node, {f"{name}.u": getattr(node.output, node.voltage_field)})
         self._signal_names_checked = True
         return out

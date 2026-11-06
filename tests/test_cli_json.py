@@ -121,6 +121,25 @@ def test_json_configuration_error_has_a_stable_envelope(capsys):
     assert payload["output"] is None and payload["simulation"] is None
 
 
+def test_json_malformed_configuration_is_an_input_error(capsys, tmp_path):
+    config = tmp_path / "broken.pes"
+    config.write_text("simulation: [\n", encoding="utf-8")
+
+    code, payload = _command(capsys, "validate", str(config))
+
+    assert code == payload["exit_code"] == 2
+    assert payload["error"]["code"] == "configuration_error"
+    assert "line 2" in payload["error"]["message"]
+
+
+def test_command_options_are_not_abbreviated(capsys):
+    with pytest.raises(SystemExit, match="2"):
+        peslite.main(["validate", "gfl-example", "--jso"])
+
+    captured = capsys.readouterr()
+    assert "unrecognized arguments: --jso" in captured.err
+
+
 def test_timeout_closes_output_and_reports_the_partial_run(capsys, tmp_path):
     out = tmp_path / "limited"
     code, payload = _command(

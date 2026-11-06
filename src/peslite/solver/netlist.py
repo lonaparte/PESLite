@@ -41,6 +41,7 @@ import numpy as np
 import scipy.sparse as sp
 from numpy.typing import ArrayLike, NDArray
 from scipy.linalg import lapack
+from scipy.sparse import csgraph
 from scipy.sparse.linalg import splu
 
 __all__ = ["Node", "Element", "Resistor", "Inductor", "CoupledInductors", "Capacitor", "VoltageSource",
@@ -128,9 +129,12 @@ _MARGIN_RTOL = 1e-9  # margins within this fraction of the circuit's scale count
 _FLOAT_RTOL = 64.0 * np.finfo(float).eps  # equivalent scalar/matrix evaluations of the same zero
 _NOOP_RTOL = 1e-13  # projections smaller than this, relative to the states, are no jump
 _DENSE_ENTRIES = 1 << 14  # coupling matrices up to this size multiply as dense arrays (no sparse overhead)
+_SPARSE_SHARE = 0.1  # large matrices below this nonzero share multiply as sparse arrays
 _GROUP_PARTS = 256  # factorized group blocks kept (least recently used first out)
 _DENSE_GROUP = 96  # systems and group blocks up to this size are factorized by LAPACK (faster than SuperLU)
 _PENDING = object()
+_RATIO_RANK = 0.25  # largest low-rank correction relative to the network unknown count
+_RATIO_CONDITION = 1e8  # worse-conditioned corrections are factorized normally
 _DENSE_REUSE = 2  # direct solves before a repeated dense mode is expanded into state-space equations
 
 
@@ -141,6 +145,7 @@ class _Symbolic:
     operation: str
     arguments: tuple[Any, ...]
     _hash: int = field(init=False, repr=False, compare=False)
+    __array_priority__ = 1000
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "_hash", hash((self.operation, self.arguments)))
@@ -180,6 +185,64 @@ class _Symbolic:
         if self.operation == "neg":
             return self.arguments[0]
         return _linear_scaled(self, -1.0)
+
+    def __abs__(self):
+        return _Symbolic("abs", (self,))
+
+    def __lt__(self, other):
+        return _symbolic_relation("<", self, other)
+
+    def __le__(self, other):
+        return _symbolic_relation("<=", self, other)
+
+    def __gt__(self, other):
+        return _symbolic_relation(">", self, other)
+
+    def __ge__(self, other):
+        return _symbolic_relation(">=", self, other)
+
+    def __and__(self, other):
+        return _symbolic_relation("and", self, other)
+
+    def __rand__(self, other):
+        return _symbolic_relation("and", other, self)
+
+    def __or__(self, other):
+        return _symbolic_relation("or", self, other)
+
+    def __ror__(self, other):
+        return _symbolic_relation("or", other, self)
+
+    def __bool__(self):
+        raise TypeError("a symbolic equation value cannot control a Python branch")
+
+    def __array_ufunc__(self, ufunc: Any, method: str, *inputs: Any, **kwargs: Any):
+        if method != "__call__" or kwargs:
+            return NotImplemented
+        name = ufunc.__name__
+        if name in {"add", "subtract", "multiply", "divide", "true_divide"}:
+            left, right = inputs
+            operation = {"add": "+", "subtract": "-", "multiply": "*",
+                         "divide": "/", "true_divide": "/"}[name]
+            return _symbolic_binary(operation, left, right)
+        if name in {"absolute", "fabs"}:
+            value, = inputs
+            return abs(value)
+        if name in {"maximum", "minimum"}:
+            return _symbolic_relation("max" if name == "maximum" else "min", *inputs)
+        comparisons = {"less": "<", "less_equal": "<=", "greater": ">",
+                       "greater_equal": ">=", "equal": "==", "not_equal": "!="}
+        if name in comparisons:
+            return _symbolic_relation(comparisons[name], *inputs)
+        return NotImplemented
+
+    def __array_function__(self, function: Any, types: Any, args: tuple, kwargs: dict):
+        if function.__name__ == "where" and len(args) == 3 and not kwargs:
+            condition, when_true, when_false = args
+            if isinstance(condition, (bool, np.bool_)):
+                return when_true if condition else when_false
+            return _Symbolic("select", (condition, when_true, when_false))
+        return NotImplemented
 
     @property
     def real(self):
@@ -275,6 +338,8 @@ def _linear_scaled(value: Any, factor: Any) -> Any:
 
 
 def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
+    left = left.item() if getattr(left, "shape", None) == () else left
+    right = right.item() if getattr(right, "shape", None) == () else right
     if _constant(left) and _constant(right):
         return {"+": lambda: left + right, "-": lambda: left - right,
                 "*": lambda: left * right, "/": lambda: left / right}[operation]()
@@ -291,7 +356,7 @@ def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
             return left
         if _zero(left):
             return -right
-        if left == right:
+        if isinstance(left, _Symbolic) and isinstance(right, _Symbolic) and left == right:
             return 0.0
         if isinstance(right, _Symbolic) and right.operation == "neg":
             return _symbolic_binary("+", left, right.arguments[0])
@@ -323,8 +388,39 @@ def _symbolic_binary(operation: str, left: Any, right: Any) -> Any:
     return _Symbolic(operation, (left, right))
 
 
+def _symbolic_relation(operation: str, left: Any, right: Any) -> Any:
+    """Build a scalar comparison, reduction or logical node with constant folding."""
+    left = left.item() if getattr(left, "shape", None) == () else left
+    right = right.item() if getattr(right, "shape", None) == () else right
+    if _constant(left) and _constant(right):
+        return {
+            "max": lambda: max(left, right), "min": lambda: min(left, right),
+            "<": lambda: left < right, "<=": lambda: left <= right,
+            ">": lambda: left > right, ">=": lambda: left >= right,
+            "==": lambda: left == right, "!=": lambda: left != right,
+            "and": lambda: bool(left and right), "or": lambda: bool(left or right),
+        }[operation]()
+    if operation == "and":
+        if left is False or right is False:
+            return False
+        if left is True:
+            return right
+        if right is True:
+            return left
+    elif operation == "or":
+        if left is True or right is True:
+            return True
+        if left is False:
+            return right
+        if right is False:
+            return left
+    return _Symbolic(operation, (left, right))
+
+
 def _symbolic_solve(matrix: Sequence[Sequence[Any] | Mapping[int, Any]], right: list[Any],
-                    reference: NDArray[np.float64]) -> list[Any]:
+                    reference: NDArray[np.float64],
+                    varying: Optional[set[tuple[int, int]]] = None, *,
+                    gauge: bool = False) -> list[Any]:
     """Eliminate a generated sparse linear system using one valid numerical pivot pattern."""
     n = len(right)
     rows = [
@@ -332,49 +428,75 @@ def _symbolic_solve(matrix: Sequence[Sequence[Any] | Mapping[int, Any]], right: 
         {column: value for column, value in enumerate(row) if not _zero(value)}
         for row in matrix
     ]
+    moving = [
+        {
+            column for column, value in row.items()
+            if ((index, column) in varying if varying is not None else not _constant(value))
+        }
+        for index, row in enumerate(rows)
+    ]
     right = list(right)
     reference = np.array(reference, dtype=float, copy=True)
+    pivots: list[tuple[int, int]] = []
+    pivot_row = 0
     for column in range(n):
-        active = [row for row in range(column, n) if column in rows[row]]
+        active = [row for row in range(pivot_row, n)
+                  if column in rows[row] and reference[row, column] != 0.0]
         if not active:
-            raise ValueError("the generated netlist equations are singular")
-        constants = [row for row in active
-                     if _constant(rows[row][column])]
-        pivot = (max(constants, key=lambda row: abs(reference[row, column]))
-                 if constants else max(active, key=lambda row: abs(reference[row, column])))
-        if reference[pivot, column] == 0.0:
-            raise ValueError("the generated netlist equations are singular")
-        if pivot != column:
-            rows[column], rows[pivot] = rows[pivot], rows[column]
-            right[column], right[pivot] = right[pivot], right[column]
-            reference[[column, pivot]] = reference[[pivot, column]]
-        pivot_row = rows[column]
-        pivot_value = pivot_row[column]
-        trailing = tuple((entry, value) for entry, value in pivot_row.items()
+            if gauge:
+                continue
+            raise ValueError(f"the generated netlist equations are singular at column {column}")
+        stable = [row for row in active if column not in moving[row]]
+        candidates = stable or active
+        constants = [row for row in candidates if _constant(rows[row][column])]
+        candidates = constants or candidates
+        pivot = max(candidates, key=lambda row: abs(reference[row, column]))
+        if pivot != pivot_row:
+            rows[pivot_row], rows[pivot] = rows[pivot], rows[pivot_row]
+            moving[pivot_row], moving[pivot] = moving[pivot], moving[pivot_row]
+            right[pivot_row], right[pivot] = right[pivot], right[pivot_row]
+            reference[[pivot_row, pivot]] = reference[[pivot, pivot_row]]
+        source = rows[pivot_row]
+        pivot_value = source[column]
+        trailing = tuple((entry, value) for entry, value in source.items()
                          if entry > column)
-        for row in range(column + 1, n):
+        for row in range(pivot_row + 1, n):
             value = rows[row].pop(column, None)
             if value is None:
                 continue
+            factor_moves = column in moving[row] or column in moving[pivot_row]
+            moving[row].discard(column)
             factor = value / pivot_value
-            numeric_factor = reference[row, column] / reference[column, column]
+            numeric_factor = reference[row, column] / reference[pivot_row, column]
             reference[row, column] = 0.0
             target = rows[row]
             for entry, pivot_entry in trailing:
+                entry_moves = (
+                    entry in moving[row]
+                    or factor_moves
+                    or entry in moving[pivot_row]
+                )
                 updated = target.get(entry, 0.0) - factor * pivot_entry
                 if _zero(updated):
                     target.pop(entry, None)
+                    moving[row].discard(entry)
                 else:
                     target[entry] = updated
-                reference[row, entry] -= numeric_factor * reference[column, entry]
-            right[row] -= factor * right[column]
+                    if entry_moves:
+                        moving[row].add(entry)
+                    else:
+                        moving[row].discard(entry)
+                reference[row, entry] -= numeric_factor * reference[pivot_row, entry]
+            right[row] -= factor * right[pivot_row]
+        pivots.append((pivot_row, column))
+        pivot_row += 1
     solution: list[Any] = [0.0] * n
-    for row in range(n - 1, -1, -1):
+    for row, column in reversed(pivots):
         residual = right[row] - sum(
-            value * solution[column]
-            for column, value in rows[row].items() if column > row
+            value * solution[entry]
+            for entry, value in rows[row].items() if entry > column
         )
-        solution[row] = residual / rows[row][row]
+        solution[column] = residual / rows[row][column]
     return solution
 
 
@@ -422,14 +544,22 @@ def _symbolic_source(expressions: Sequence[Any]) -> tuple[list[str], tuple[str, 
             for coefficient, term in terms:
                 expression = render(term)
                 parts.append(expression if _one(coefficient) else
-                             f"(-{expression})" if _minus_one(coefficient) else
+                             f"(-({expression}))" if _minus_one(coefficient) else
                              f"({_literal(coefficient)} * {expression})")
             return "(" + " + ".join(parts) + ")"
         arguments = tuple(render(argument) for argument in value.arguments)
         if value.operation == "neg":
-            return f"(-{arguments[0]})"
+            return f"(-({arguments[0]}))"
+        if value.operation == "abs":
+            return f"abs({arguments[0]})"
         if value.operation in ("real", "imag"):
             return f"({arguments[0]}).{value.operation}"
+        if value.operation in ("max", "min"):
+            return f"{value.operation}({arguments[0]}, {arguments[1]})"
+        if value.operation == "select":
+            return f"({arguments[1]} if {arguments[0]} else {arguments[2]})"
+        if value.operation in ("and", "or"):
+            return f"({arguments[0]} {value.operation} {arguments[1]})"
         return f"({arguments[0]} {value.operation} {arguments[1]})"
 
     results = tuple(render(expression) for expression in expressions)
@@ -440,6 +570,8 @@ def _maximum(left: Any, right: Any) -> Any:
     """Scalar maximum which remains one arithmetic expression during equation lowering."""
     if isinstance(left, numbers.Real) and isinstance(right, numbers.Real):
         return max(left, right)
+    if hasattr(left, "__array_ufunc__") or hasattr(right, "__array_ufunc__"):
+        return np.maximum(left, right)
     return 0.5 * (left + right + abs(left - right))
 
 
@@ -447,6 +579,8 @@ def _minimum(left: Any, right: Any) -> Any:
     """Scalar minimum paired with :func:`_maximum`."""
     if isinstance(left, numbers.Real) and isinstance(right, numbers.Real):
         return min(left, right)
+    if hasattr(left, "__array_ufunc__") or hasattr(right, "__array_ufunc__"):
+        return np.minimum(left, right)
     return 0.5 * (left + right - abs(left - right))
 
 
@@ -553,7 +687,19 @@ def _matrix(value: ArrayLike, d: int, what: str) -> NDArray[np.float64]:
 
 def _block_weights(blocks: Sequence[tuple[float, NDArray]]) -> sp.csc_matrix:
     """The same block-diagonal storage weights, retaining equation-valued coefficients."""
-    result = sp.block_diag([scale * _numeric_values(matrix) for scale, matrix in blocks], format="csc")
+    data, rows, columns = [], [], []
+    offset = 0
+    for scale, matrix in blocks:
+        numeric = scale * _numeric_values(matrix)
+        row, column = np.nonzero(numeric)
+        data.append(numeric[row, column])
+        rows.append(row + offset)
+        columns.append(column + offset)
+        offset += matrix.shape[0]
+    result = sp.csc_matrix(
+        (np.concatenate(data), (np.concatenate(rows), np.concatenate(columns))),
+        shape=(offset, offset),
+    )
     if any(matrix.dtype.kind == "O" for _scale, matrix in blocks):
         expressions = np.zeros(result.shape, dtype=object)
         offset = 0
@@ -1005,6 +1151,111 @@ def _solve_transpose(factor: object, b: NDArray[np.float64]) -> NDArray[np.float
     """Solve a transposed dense, sparse or grouped factorization."""
     solve = getattr(factor, "solve_transpose", None)
     return solve(b) if solve is not None else factor.solve(b, trans="T")
+
+
+class _RatioPlan:
+    """Low-rank transformer-ratio changes shared by one network structure."""
+
+    def __init__(self, pattern: "_Pattern", base_values: NDArray[np.float64], factor: object) -> None:
+        positions = np.unique(pattern.slot_pos)
+        columns = np.repeat(np.arange(pattern.n), np.diff(pattern.indptr))
+        rows, cols = pattern.indices[positions].astype(np.intp), columns[positions]
+        self.positions, self.base = positions, base_values[positions]
+        self.rows, self.cols = np.unique(rows), np.unique(cols)
+        self.row_index = np.searchsorted(self.rows, rows)
+        self.col_index = np.searchsorted(self.cols, cols)
+        self.factor = factor
+        unit = np.zeros((pattern.n, self.rows.size))
+        unit[self.rows, np.arange(self.rows.size)] = 1.0
+        self.Z = factor.solve(unit)
+        self.ZC = self.Z[self.cols]
+        self._Zt: Optional[NDArray[np.float64]] = None
+        self.solutions: dict[object, NDArray[np.float64]] = {}
+
+    @property
+    def Zt(self) -> NDArray[np.float64]:
+        """Return ``M0^-T E_C``, formed only when corrected rows need it."""
+        if self._Zt is None:
+            unit = np.zeros((self.Z.shape[0], self.cols.size))
+            unit[self.cols, np.arange(self.cols.size)] = 1.0
+            self._Zt = _solve_transpose(self.factor, unit)
+        return self._Zt
+
+    def update(self, values: NDArray[np.float64]) -> Optional["_RatioUpdate"]:
+        """Return a stable Woodbury update for ``values``, otherwise request refactorization."""
+        change = np.zeros((self.rows.size, self.cols.size))
+        np.add.at(
+            change,
+            (self.row_index, self.col_index),
+            values[self.positions] - self.base,
+        )
+        correction = np.eye(self.cols.size) + self.ZC @ change
+        if not np.all(np.isfinite(correction)):
+            return None
+        try:
+            inverse = np.linalg.inv(correction)
+        except np.linalg.LinAlgError:
+            return None
+        condition = (
+            np.abs(correction).sum(axis=0).max(initial=0.0)
+            * np.abs(inverse).sum(axis=0).max(initial=0.0)
+        )
+        return None if condition > _RATIO_CONDITION else _RatioUpdate(self, change, inverse)
+
+    def shared(self, key: object, right: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Return one structure solve shared by all of its ratio copies."""
+        solution = self.solutions.get(key)
+        if solution is None:
+            solution = self.solutions[key] = self.factor.solve(right)
+        return solution
+
+
+class _RatioUpdate:
+    """Solve a transformer-ratio copy through its structure's Woodbury correction."""
+
+    __slots__ = ("plan", "change", "inverse", "left")
+
+    def __init__(self, plan: _RatioPlan, change: NDArray[np.float64],
+                 inverse: NDArray[np.float64]) -> None:
+        self.plan, self.change, self.inverse = plan, change, inverse
+        self.left = plan.Z @ change
+
+    def solve(self, right: NDArray[np.float64],
+              base: Optional[NDArray[np.float64]] = None) -> NDArray[np.float64]:
+        value = self.plan.factor.solve(right) if base is None else base
+        return value - self.left @ (self.inverse @ value[self.plan.cols])
+
+    def solve_transpose(self, right: NDArray[np.float64],
+                        base: Optional[NDArray[np.float64]] = None) -> NDArray[np.float64]:
+        """Solve the transposed corrected system from the same Woodbury factors."""
+        value = _solve_transpose(self.plan.factor, right) if base is None else base
+        correction = self.inverse.T @ (self.change.T @ value[self.plan.rows])
+        return value - self.plan.Zt @ correction
+
+
+def _compact(matrix: NDArray[np.float64]) -> NDArray[np.float64] | sp.csr_matrix:
+    """Store a large mostly-zero equation matrix sparsely."""
+    if (matrix.size > _DENSE_ENTRIES
+            and np.count_nonzero(matrix) <= _SPARSE_SHARE * matrix.size):
+        return sp.csr_matrix(matrix)
+    return matrix
+
+
+class _AffineEquations:
+    """Derivative and output rows, optionally corrected for another transformer ratio."""
+
+    __slots__ = ("matrix", "left", "right")
+
+    def __init__(self, matrix: NDArray[np.float64] | sp.csr_matrix,
+                 left: Optional[NDArray[np.float64]] = None,
+                 right: Optional[NDArray[np.float64]] = None) -> None:
+        self.matrix, self.left, self.right = matrix, left, right
+
+    def __call__(self, values: NDArray[np.float64]) -> NDArray[np.float64]:
+        result = self.matrix @ values
+        if self.left is not None:
+            result -= self.left @ (self.right @ values)
+        return result
 
 
 class _Layout:
@@ -1489,9 +1740,10 @@ class Topology:
             self._rate_columns[o:o + brs[net._ports[id(src)][0]].dim] = needs[j]
         self._pattern = _Pattern(M, MN, n_z)
         self._M = self._values = None
-        self._dense = net.form != "nodal"  # device and statewise both form state space with LAPACK
+        self._state_equations = net.form != "nodal"
+        self._dense = self._state_equations and n_z <= _DENSE_GROUP
         self._layout: Optional[_Layout] = None
-        if not self._dense and n_z and net._grouping_used():
+        if n_z > _DENSE_GROUP and net._grouping_used():
             row_group, col_group = self._labels(net, active, spans, (i_off, xd_off, zd_off, w_off, kcl),
                                                 (forest, uf_w, w0), (cut_tree, uf_s, sn_off, c0))
             G = len(net.grouping().elements)
@@ -1526,14 +1778,12 @@ class Topology:
         self._couplings()
         self._state_space: Optional[StateSpace] = None
         self._evaluations = 0
-        self._affine_equations: dict[
-            tuple[bool, tuple[int, ...]], tuple[NDArray[np.float64], ...]
-        ] = {}
+        self._affine_equations: dict[tuple[bool, tuple[int, ...]], _AffineEquations] = {}
         self._selected_outputs: dict[tuple[int, ...], NDArray[np.float64]] = {}
         self._projectors: Optional[tuple[Optional[_Projector], Optional[_Projector]]] = None
         self._constraint_key: Optional[object] = None
         self._store = (net, dep_c, dep_l, cd, partner, ratio, w_off, sn_off, uf_s)
-        self._shared: dict[str, object] = {}  # ratio-independent results shared with with_ratios() copies
+        self._shared: dict[str, object] = {"ratio_base": self}
         # no transformer primary on the derivative V/C forest and no secondary across an L/I cutset: the loop and
         # cutset constraints (and their projections) do not depend on the transformer ratios
         self.ratio_free = (all(roles[k] != "p" for k, _o in self._wrows)
@@ -1572,11 +1822,15 @@ class Topology:
 
     @property
     def lu(self) -> object:
-        """Network factors, formed only when a consumer needs a solve."""
+        """Network factors or a stable low-rank update of the structure's factors."""
         if self._lu is _PENDING:
             values = (self._values if self._values is not None else
                       self._pattern.values(self.mode.ratios))
-            if self._dense:
+            plan = self._ratio_plan()
+            update = plan.update(values) if plan is not None else None
+            if update is not None:
+                self._values, self._M, self._lu = values, None, update
+            elif self._dense:
                 self._values = values
                 self._M = self._pattern.dense_values(values)
                 self._lu = (_DenseSolve(self._M, "network", gauge=self.gauge_singular)
@@ -1588,6 +1842,29 @@ class Topology:
     @lu.setter
     def lu(self, value: object) -> None:
         self._lu = value
+
+    def _ratio_plan(self) -> Optional[_RatioPlan]:
+        """Return the structure's shared low-rank ratio plan when it is ready and useful."""
+        cached = self._shared.get("ratio_plan", _PENDING)
+        if cached is not _PENDING:
+            return cached
+        base = self._shared["ratio_base"]
+        factor = getattr(base, "_lu", _PENDING)
+        if factor is _PENDING:
+            return None
+        pattern = self._pattern
+        eligible = (
+            factor is not None
+            and pattern.slot_pos.size
+            and (pattern.n > _DENSE_GROUP or self._store[0].form != "device")
+            and getattr(factor, "inverse", None) is None
+        )
+        plan = _RatioPlan(pattern, pattern.values(base.mode.ratios), factor) if eligible else None
+        if plan is not None and max(plan.rows.size, plan.cols.size) > max(
+                4, _RATIO_RANK * pattern.n):
+            plan = None
+        self._shared["ratio_plan"] = plan
+        return plan
 
     def _factorize(self, net: "Netlist", values: NDArray[np.float64]) -> object:
         """The factors of the sparse network matrix with entries ``values``: grouped onto the interface
@@ -1680,7 +1957,11 @@ class Topology:
             if "K" not in self._shared:
                 self._shared["K"] = sp.hstack([self.Ky, self.Ku, self.Kdu]).toarray()
             K = self._shared["K"]
-            T = self.lu.solve(K) if self.n_z else np.zeros((0, K.shape[1]))
+            lu = self.lu
+            if isinstance(lu, _RatioUpdate):
+                T = lu.solve(K, lu.plan.shared("state_space", K))
+            else:
+                T = lu.solve(K) if self.n_z else np.zeros((0, K.shape[1]))
             T[:, n_x + n_u:][:, ~self._rate_columns] = 0.0
             X, O = T[self.xd_index], self.S_out @ T
             a, b = slice(0, n_x), slice(n_x, n_x + n_u)
@@ -1688,53 +1969,167 @@ class Topology:
             self._state_space = StateSpace(X[:, a], X[:, b], X[:, c], O[:, a], O[:, b], O[:, c])
         return self._state_space
 
-    def affine_equations(
-        self, selected: Sequence[int], *, derivatives: bool = True
-    ) -> tuple[NDArray[np.float64], ...]:
-        """Cached affine equations for derivatives, selected outputs, or both."""
+    def affine_equations(self, selected: Sequence[int], *, derivatives: bool = True
+                         ) -> _AffineEquations:
+        """Cached derivative and output rows over ``[x, u, du]``."""
         rows = tuple(map(int, selected))
         key = derivatives, rows
         equations = self._affine_equations.get(key)
-        if equations is None:
-            if self._dense:
-                ss = self.state_space
-                output_rows = list(rows)
-                output = (ss.C[output_rows], ss.D[output_rows], ss.D1[output_rows])
-                if derivatives and output_rows:
-                    equations = (
-                        np.vstack((ss.A, output[0])),
-                        np.vstack((ss.B, output[1])),
-                        np.vstack((ss.B1, output[2])),
-                    )
-                elif derivatives:
-                    equations = ss.A, ss.B, ss.B1
-                else:
-                    equations = output
-            elif derivatives:
-                raise ValueError("sparse affine equations apply only to electrical outputs")
-            elif not rows or not self.n_z:
-                n_x, n_u = self._net_shape
-                equations = (np.zeros((len(rows), n_x)),) + (
-                    np.zeros((len(rows), n_u)),
-                    np.zeros((len(rows), n_u)),
-                )
+        if equations is not None:
+            return equations
+        base = self._shared["ratio_base"]
+        update = self.lu if base is not self else None
+        if isinstance(update, _RatioUpdate):
+            matrix = base.affine_equations(rows, derivatives=derivatives).matrix
+            selected_rows, coupling = self._ratio_rows(rows, derivatives, update.plan)
+            left = selected_rows @ (update.change @ update.inverse)
+            if matrix.shape[0] * matrix.shape[1] <= _DENSE_ENTRIES:
+                dense = matrix.toarray() if sp.issparse(matrix) else np.asarray(matrix)
+                equations = _AffineEquations(dense - left @ coupling)
             else:
-                selected = self.selected_outputs(rows)
-                right = selected.T.toarray() if sp.issparse(selected) else selected.T
-                dual = _solve_transpose(self.lu, np.asarray(right))
-                equations = tuple(
-                    np.asarray(matrix.T @ dual).T
-                    for matrix in (self.Ky, self.Ku, self.Kdu)
-                )
-            self._affine_equations[key] = equations
+                equations = _AffineEquations(matrix, left, coupling)
+        elif self._state_equations:
+            state_space = self.state_space
+            blocks = [np.hstack((state_space.A, state_space.B, state_space.B1))] \
+                if derivatives else []
+            if rows:
+                output_rows = list(rows)
+                blocks.append(np.hstack((state_space.C[output_rows],
+                                         state_space.D[output_rows],
+                                         state_space.D1[output_rows])))
+            width = self._net_shape[0] + 2 * self._net_shape[1]
+            matrix = np.vstack(blocks) if blocks else np.zeros((0, width))
+            equations = _AffineEquations(_compact(matrix))
+        elif derivatives:
+            raise ValueError("nodal affine equations apply only to electrical outputs")
+        elif not rows or not self.n_z:
+            n_x, n_u = self._net_shape
+            equations = _AffineEquations(np.zeros((len(rows), n_x + 2 * n_u)))
+        else:
+            selected = self.selected_outputs(rows)
+            right = selected.T.toarray() if sp.issparse(selected) else selected.T
+            dual = _solve_transpose(self.lu, np.asarray(right))
+            equations = _AffineEquations(
+                _compact(np.asarray(self._all_couplings().T @ dual).T)
+            )
+        self._affine_equations[key] = equations
         return equations
 
+    def _all_couplings(self) -> sp.csr_matrix:
+        """Return the shared right-hand side map over ``[x, u, du]``."""
+        couplings = self._shared.get("couplings")
+        if couplings is None:
+            couplings = self._shared["couplings"] = sp.hstack(
+                [self.Ky, self.Ku, self.Kdu], format="csr"
+            )
+        return couplings
+
+    def _ratio_rows(self, rows: tuple[int, ...], derivatives: bool,
+                    plan: _RatioPlan) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return the structure rows and couplings needed by every ratio correction."""
+        key = "ratio_rows", derivatives, rows
+        shared = self._shared.get(key)
+        if shared is None:
+            parts = [plan.Z[self.xd_index]] if derivatives else []
+            if rows:
+                parts.append(np.asarray(self.selected_outputs(rows) @ plan.Z))
+            selected = np.vstack(parts) if parts else np.zeros((0, plan.Z.shape[1]))
+            coupling = np.asarray(self._all_couplings().T @ plan.Zt).T
+            shared = self._shared[key] = selected, coupling
+        return shared
+
+    def input_reach(
+        self,
+    ) -> Optional[tuple[NDArray[np.bool_], NDArray[np.bool_], NDArray[np.bool_]]]:
+        """Return structural input reach and which transformer ratios can change the state matrix."""
+        reach = self._shared.get("input_reach", _PENDING)
+        if reach is not _PENDING:
+            return reach
+        net, pattern = self._store[0], self._pattern
+        n = pattern.n
+        rows = pattern.indices.astype(np.intp)
+        columns = np.repeat(np.arange(n), np.diff(pattern.indptr))
+        matching = csgraph.maximum_bipartite_matching(
+            sp.csr_matrix((np.ones(rows.size), (rows, columns)), shape=(n, n)),
+            perm_type="column",
+        )
+        reach = None
+        if not np.any(matching < 0):
+            graph = sp.csr_matrix(
+                (np.ones(rows.size), (columns, matching[rows])),
+                shape=(n + 1, n + 1),
+            )
+
+            def reached(equations: NDArray[np.intp]) -> NDArray[np.bool_]:
+                seeds = np.unique(matching[equations])
+                root = sp.csr_matrix(
+                    (np.ones(seeds.size), (np.full(seeds.size, n), seeds)),
+                    shape=(n + 1, n + 1),
+                )
+                found = np.zeros(n + 1, dtype=bool)
+                found[csgraph.breadth_first_order(
+                    graph + root, n, directed=True, return_predecessors=False
+                )] = True
+                return found[:n]
+
+            Ku, Kdu = self.Ku.tocsc(), self.Kdu.tocsc()
+            entered = []
+            for source, offset in net._sources:
+                stop = offset + net._branch(source).dim
+                entered.append(np.concatenate((
+                    Ku.indices[Ku.indptr[offset]:Ku.indptr[stop]],
+                    Kdu.indices[Kdu.indptr[offset]:Kdu.indptr[stop]],
+                )))
+            state_rows = self.Ky.tocoo().row.astype(np.intp)
+            state_live = reached(state_rows)
+            live = reached(np.concatenate([state_rows, *entered]).astype(np.intp))
+            owner = np.repeat(
+                np.arange(len(self.mode.ratios)),
+                [np.size(ratio) for ratio in self.mode.ratios],
+            )[pattern.slot_flat]
+            slot_rows = rows[pattern.slot_pos]
+            slot_live = live[columns[pattern.slot_pos]]
+            state_slot_live = state_live[columns[pattern.slot_pos]]
+            entered.extend(
+                slot_rows[(owner == index) & slot_live]
+                for index in range(len(self.mode.ratios))
+            )
+            outputs = abs(self.S_out).tocsr()
+            derivatives = np.zeros(len(entered), dtype=bool)
+            reached_outputs = np.zeros((len(entered), self.S_out.shape[0]), dtype=bool)
+            for index, equations in enumerate(entered):
+                if equations.size:
+                    found = reached(equations)
+                    derivatives[index] = bool(found[self.xd_index].any())
+                    reached_outputs[index] = outputs @ found.astype(float) > 0.0
+            state_ratios = np.zeros(len(self.mode.ratios), dtype=bool)
+            for index in range(len(state_ratios)):
+                equations = slot_rows[(owner == index) & state_slot_live]
+                if equations.size:
+                    state_ratios[index] = bool(reached(equations)[self.xd_index].any())
+            reach = derivatives, reached_outputs, state_ratios
+        self._shared["input_reach"] = reach
+        return reach
+
+    def state_matrix_key(self) -> tuple:
+        """Mode identity containing only transformer ratios that can change ``A``."""
+        reach = self.input_reach()
+        relevant = (np.ones(len(self.mode.ratios), dtype=bool)
+                    if reach is None else reach[2])
+        ratios = b"".join(
+            ratio.tobytes() for ratio, used in zip(self.mode.ratios, relevant) if used
+        )
+        return self.mode.closed, self.mode.conducting, ratios
+
     def selected_outputs(self, selected: Sequence[int]) -> NDArray[np.float64]:
-        """Cached rows of the network output map."""
+        """Cached ratio-independent rows of the network output map."""
         key = tuple(map(int, selected))
         output = self._selected_outputs.get(key)
         if output is None:
-            output = self._S[list(key)]
+            shared = self._shared.setdefault("selected_outputs", {})
+            output = shared.get(key)
+            if output is None:
+                output = shared[key] = self._S[list(key)]
             self._selected_outputs[key] = output
         return output
 
@@ -2149,6 +2544,8 @@ class Netlist:
             elif isinstance(el, Transformer):
                 self._transformers.append(el)
         self._plan = None
+        self._diode_branches = None
+        self._diode_output_bases = None
         self.invalidate()
         return elements[0] if elements else None
 
@@ -2473,33 +2870,54 @@ class Netlist:
             return self._frozen_topology
         if mode is not None:
             return self._compiled(mode)
-        seen = set()
+        requested = self.mode()
+        topology = self.resolved_topology(
+            requested, self._gated(), excluded=self._recovery_excluded
+        )
+        if topology.mode.conducting != requested.conducting:
+            for diode, before, after in zip(
+                    self._diodes, requested.conducting, topology.mode.conducting):
+                if before != after:
+                    diode.conducting, diode.residual = after, 0.0
+            self._mode = topology.mode
+        return topology
+
+    def resolved_topology(
+        self, mode: Mode, gated: Sequence[bool] = (), *,
+        excluded: Sequence[tuple[bool, ...]] = (),
+    ) -> Topology:
+        """Resolve a singular ideal-device pattern by the ordinary diode recovery rule."""
+        gated = tuple(gated) or (False,) * len(self._diodes)
+        if len(gated) != len(self._diodes):
+            raise ValueError("the gated-device pattern has the wrong length")
+        seen: set[tuple[bool, ...]] = set()
+        excluded = set(excluded)
         for _ in range(_MAX_PATTERNS):
-            pattern = self.conducting
+            pattern = mode.conducting
             if pattern in seen:
                 break
             seen.add(pattern)
             try:
-                return self._compiled(self.mode())
+                return self._compiled(mode)
             except _Degenerate as degenerate:
-                gated = self._gated()
                 candidates = (
                     [j for j, diode in enumerate(self._diodes)
-                     if diode.conducting and not gated[j] and diode.R_on == 0.0
+                     if pattern[j] and not gated[j] and diode.R_on == 0.0
                      and self._ports[id(diode)][0] in degenerate.branches]
                     if degenerate.loop else
                     [j for j, diode in enumerate(self._diodes)
-                     if not diode.conducting and not gated[j]]
+                     if not pattern[j] and not gated[j]]
                 )
                 selected = next((j for j in candidates
                                  if (candidate := tuple(
                                      value if k != j else not value
                                      for k, value in enumerate(pattern)
-                                 )) not in seen and candidate not in self._recovery_excluded), None)
+                                 )) not in seen and candidate not in excluded), None)
                 if selected is None:
                     raise
-                diode = self._diodes[selected]
-                diode.conducting, diode.residual = not diode.conducting, 0.0
+                conducting = list(pattern)
+                conducting[selected] = not conducting[selected]
+                mode = Mode(mode.closed, conducting, mode.ratios)
         raise ConductionError("no nonsingular diode conduction pattern exists")
 
     def freeze_topology(self) -> None:
@@ -2597,6 +3015,24 @@ class Netlist:
             else:
                 values[offset:offset + dimension] = source
         return tuple(values)
+
+    def source_rates(self, t: Any, needed: Optional[Sequence[bool]] = None) -> tuple[Any, ...]:
+        """Source derivatives without coercing equation values to numbers (zero where ``needed``
+        is false); a source without a derivative is differentiated centrally."""
+        rates: list[Any] = [0.0] * self.n_u
+        for index, (source, offset) in enumerate(self._sources):
+            if needed is not None and not needed[index]:
+                continue
+            dimension = self._branch(source).dim
+            value = (source.derivative(t) if source.derivative is not None else
+                     (source.value(t + _DELTA_T) - source.value(t - _DELTA_T)) / (2.0 * _DELTA_T))
+            if dimension == 1:
+                rates[offset] = value
+            elif dimension == 2:
+                rates[offset:offset + 2] = (value.real, value.imag)
+            else:
+                rates[offset:offset + dimension] = value
+        return tuple(rates)
 
     def rates(self, t: float, needed: Optional[NDArray[np.bool_]] = None) -> NDArray[np.float64]:
         """The source derivatives ``du/dt`` at ``t`` (zero where ``needed`` is false)."""
@@ -2712,278 +3148,6 @@ class Netlist:
             if branch.dim == 2:
                 output_rows.update((self.n_e + branch.output, self.n_e + self.n_bd + branch.output))
         return complex_variables, derivative_rows, output_rows
-
-    def _causal_series_evaluators(self) -> Optional[tuple[Callable, Callable, Callable]]:
-        """Reduce a voltage-fed series R-L network without assembling its nodal equations at run time."""
-        inductors = [element for element in self.elements if isinstance(element, Inductor)]
-        sources = [element for element in self.elements if isinstance(element, VoltageSource)]
-        allowed = (Inductor, Resistor, Switch, VoltageSource)
-        if (len(inductors) != 1 or len(sources) != 2
-                or any(not isinstance(element, allowed) for element in self.elements)):
-            return None
-        inductor = inductors[0]
-        dimension = inductor.L.shape[0]
-        if dimension not in (1, 2) or any(source.ports[0][1] is not None for source in sources):
-            return None
-
-        path = [element for element in self.elements if not isinstance(element, VoltageSource)]
-        adjacent: dict[int, set[int]] = {}
-        for element in path:
-            a, b = element.ports[0]
-            if a is None or b is None:
-                return None
-            adjacent.setdefault(id(a), set()).add(id(b))
-            adjacent.setdefault(id(b), set()).add(id(a))
-        endpoints = {id(source.ports[0][0]) for source in sources}
-        if (len(endpoints) != 2 or len(path) != len(adjacent) - 1
-                or any(len(neighbours) != (1 if node in endpoints else 2)
-                       for node, neighbours in adjacent.items())):
-            return None
-        pending, connected = [next(iter(endpoints))], set()
-        while pending:
-            node = pending.pop()
-            if node in connected:
-                continue
-            connected.add(node)
-            pending.extend(adjacent[node] - connected)
-        if len(connected) != len(adjacent):
-            return None
-
-        without_inductor = {node: set(neighbours) for node, neighbours in adjacent.items()}
-        a, b = inductor.ports[0]
-        without_inductor[id(a)].remove(id(b))
-        without_inductor[id(b)].remove(id(a))
-
-        def reaches(start: Port, target: Port) -> bool:
-            if start is target:
-                return True
-            if start is None or target is None:
-                return False
-            pending, seen = [id(start)], {id(start)}
-            while pending:
-                for neighbour in without_inductor.get(pending.pop(), ()):
-                    if neighbour == id(target):
-                        return True
-                    if neighbour not in seen:
-                        seen.add(neighbour)
-                        pending.append(neighbour)
-            return False
-
-        left = next((source for source in sources
-                     if reaches(source.ports[0][0], inductor.ports[0][0])), None)
-        right = next((source for source in sources
-                      if reaches(source.ports[0][0], inductor.ports[0][1])), None)
-        if left is None or right is None or left is right:
-            return None
-
-        resistance = sum((element.R for element in self.elements if isinstance(element, Resistor)),
-                         np.zeros_like(inductor.L))
-        dynamics = np.linalg.solve(
-            inductor.L, np.hstack((np.eye(dimension), -np.eye(dimension), -resistance))
-        )
-        switches = tuple(element.closed for element in self.elements if isinstance(element, Switch))
-        left_current = self.output_slice("branch_current", left)
-        right_current = self.output_slice("branch_current", right)
-        env: dict[str, Any] = {"left": left.value, "right": right.value, "_complex": _complex}
-        closed = []
-        for index, callback in enumerate(switches):
-            env[f"closed_{index}"] = callback
-            closed.append(f"closed_{index}()")
-        condition = " and ".join(closed) or "True"
-        lines = ["def derivatives(t, y):", "    ul = left(t)", "    ur = right(t)"]
-        isotropic = (dimension == 2
-                     and np.allclose(inductor.L, inductor.L[0, 0] * np.eye(2), rtol=1e-14, atol=0.0)
-                     and np.allclose(resistance, resistance[0, 0] * np.eye(2), rtol=1e-14, atol=0.0))
-        if isotropic:
-            lines.append(
-                f"    derivative = ((ul - ur - {float(resistance[0, 0])!r} * "
-                f"_complex(y[0], y[1])) / {float(inductor.L[0, 0])!r} "
-                f"if ({condition}) else 0j)"
-            )
-            result = ["derivative.real", "derivative.imag"]
-        else:
-            variables = (["ul"] if dimension == 1 else ["ul.real", "ul.imag"]) \
-                + (["ur"] if dimension == 1 else ["ur.real", "ur.imag"]) \
-                + [f"y[{index}]" for index in range(dimension)]
-            result = [f"({_linear_expression(row, variables)}) if ({condition}) else 0.0"
-                      for row in dynamics]
-        expression = "(" + ", ".join(result) + ("," if dimension == 1 else "") + ")"
-        statements = tuple(lines[1:])
-        lines.append("    return " + expression)
-        exec(compile("\n".join(lines) + "\n", "<peslite series circuit>", "exec"), env)
-        derivatives = env["derivatives"]
-        derivatives._peslite_scalar_program = (
-            statements, expression,
-            {key: value for key, value in env.items()
-             if key not in ("derivatives", "__builtins__")},
-            tuple(result),
-        )
-
-        values = ({
-            left_current.start: "-current.real", left_current.start + 1: "-current.imag",
-            right_current.start: "current.real", right_current.start + 1: "current.imag",
-        } if dimension == 2 else {
-            left_current.start: "-current", right_current.start: "current",
-        })
-
-        def compile_outputs(selected: Optional[Sequence[int]]) -> Callable:
-            indices = tuple(range(self.n_out)) if selected is None else tuple(selected)
-            active = [values.get(index, "0.0") for index in indices]
-            expressions = tuple(active)
-            result = "(" + ", ".join(expressions) \
-                + ("," if len(active) == 1 else "") + ")"
-            statements = ((f"    current = _complex(y[0], y[1]) if ({condition}) else 0j",)
-                          if dimension == 2 else
-                          (f"    current = y[0] if ({condition}) else 0.0",))
-            source = "\n".join(("def outputs(_t, y):", *statements,
-                                 f"    return {result}")) + "\n"
-            namespace = dict(env)
-            exec(compile(source, "<peslite series circuit>", "exec"), namespace)
-            outputs = namespace["outputs"]
-            outputs._peslite_scalar_program = (
-                statements, result,
-                {key: value for key, value in namespace.items()
-                 if key not in ("outputs", "derivatives", "__builtins__")},
-                expressions,
-            )
-            return outputs
-
-        outputs = compile_outputs(None)
-        return derivatives, outputs, compile_outputs
-
-    def _causal_transformer_outputs(self) -> Optional[Callable[[Optional[Sequence[int]]], Callable]]:
-        """Reduce an ideal transformer between voltage and current source boundaries."""
-        if (self.n_x or len(self._transformers) != 1
-                or any(not isinstance(element, (Transformer, VoltageSource, CurrentSource))
-                       for element in self.elements)):
-            return None
-        transformer = self._transformers[0]
-        primary, secondary = transformer.ports
-        reference = primary[1]
-        if secondary[1] is not reference:
-            return None
-        voltage = next((element for element in self.elements
-                        if isinstance(element, VoltageSource)
-                        and element.ports[0] == (secondary[0], None)), None)
-        current = next((element for element in self.elements
-                        if isinstance(element, CurrentSource)
-                        and element.ports[0] == (primary[0], None)), None)
-        reference_voltage = (None if reference is None else
-                             next((element for element in self.elements
-                                   if isinstance(element, VoltageSource)
-                                   and element.ports[0] == (reference, None)), None))
-        expected = {id(element) for element in (transformer, voltage, current, reference_voltage)
-                    if element is not None}
-        if (voltage is None or current is None or transformer.shape[0] not in (1, 2)
-                or transformer.shape[1] not in (1, 2)
-                or (reference is not None and (reference_voltage is None
-                                                or transformer.shape[0] != transformer.shape[1]))
-                or len(expected) != len(self.elements)
-                or any(id(element) not in expected for element in self.elements)):
-            return None
-
-        primary_dimension, secondary_dimension = transformer.shape
-        primary_voltage = self.output_slice("node_voltage", primary[0])
-        source_current = self.output_slice("branch_current", voltage)
-        reference_current = (None if reference_voltage is None else
-                             self.output_slice("branch_current", reference_voltage))
-        compact_ratio = False
-        if transformer.constant is None:
-            ratio_sample = transformer.N()
-            transformer._ratio(ratio_sample)  # validate the representation while compiling the equations
-            compact_ratio = np.ndim(ratio_sample) == 0
-
-        def compile_outputs(selected: Optional[Sequence[int]]) -> Callable:
-            indices = tuple(range(self.n_out)) if selected is None else tuple(selected)
-            requested = set(indices)
-            voltage_rows = [row for row in range(primary_dimension)
-                            if primary_voltage.start + row in requested]
-            current_rows = [column for column in range(secondary_dimension)
-                            if source_current.start + column in requested]
-            reference_rows = ([] if reference_current is None else
-                              [column for column in range(primary_dimension)
-                               if reference_current.start + column in requested])
-            env = {"ratio": transformer.N, "voltage": voltage.value, "current": current.value}
-            if reference_voltage is not None:
-                env["reference_voltage"] = reference_voltage.value
-            ratio_name = "ratio_value" if compact_ratio else "N"
-            lines = ["def outputs(t, y):", f"    {ratio_name} = ratio()"]
-            if voltage_rows:
-                lines.append("    v = voltage(t)")
-                if reference_voltage is not None:
-                    lines.append("    v_reference = reference_voltage(t)")
-            if current_rows or reference_rows:
-                lines.append("    i = current(t)")
-            values: dict[int, str] = {}
-            high_current: dict[int, str] = {}
-            if compact_ratio:
-                if transformer.shape == (1, 1):
-                    secondary_value = "v" if reference_voltage is None else "(v - v_reference)"
-                    reference_value = "" if reference_voltage is None else " + v_reference"
-                    values[primary_voltage.start] = f"ratio_value * {secondary_value}{reference_value}"
-                    high_current[0] = (
-                        f"{transformer.current_scale!r} * ratio_value * -i"
-                    )
-                else:  # a complex scalar is the compact form of a 2 x 1 ratio
-                    if voltage_rows:
-                        lines.append("    converted_voltage = ratio_value * v")
-                    for row, part in enumerate(("real", "imag")):
-                        values[primary_voltage.start + row] = f"converted_voltage.{part}"
-                    high_current[0] = (
-                        f"-{transformer.current_scale!r} * "
-                        "(ratio_value * i.conjugate()).real"
-                    )
-            else:
-                secondary_voltage = ["v" if secondary_dimension == 1 else "v.real", "v.imag"][
-                    :secondary_dimension]
-                if reference_voltage is not None:
-                    reference_values = ["v_reference" if primary_dimension == 1 else
-                                        "v_reference.real", "v_reference.imag"][:primary_dimension]
-                    secondary_voltage = [f"({value} - {reference_values[k]})"
-                                         for k, value in enumerate(secondary_voltage)]
-                else:
-                    reference_values = ["0.0"] * primary_dimension
-                primary_current = ["-i" if primary_dimension == 1 else "-i.real", "-i.imag"][
-                    :primary_dimension]
-                for row in voltage_rows:
-                    expression = " + ".join(
-                        f"N[{row}][{column}] * {secondary_voltage[column]}"
-                        for column in range(secondary_dimension)
-                    )
-                    values[primary_voltage.start + row] = f"({expression}) + {reference_values[row]}"
-                for column in sorted(set(current_rows) | set(reference_rows)):
-                    expression = " + ".join(
-                        f"N[{row}][{column}] * {primary_current[row]}"
-                        for row in range(primary_dimension)
-                    )
-                    high_current[column] = (
-                        f"{transformer.current_scale!r} * ({expression})"
-                    )
-            for column in current_rows:
-                values[source_current.start + column] = high_current[column]
-            if reference_current is not None:
-                primary_current = ["i" if primary_dimension == 1 else "i.real", "i.imag"][
-                    :primary_dimension]
-                for column in reference_rows:
-                    values[reference_current.start + column] = (
-                        f"-{primary_current[column]} - ({high_current[column]})"
-                    )
-            expressions = tuple(values.get(index, "0.0") for index in indices)
-            result = "(" + ", ".join(expressions) \
-                + ("," if len(indices) == 1 else "") + ")"
-            statements = tuple(lines[1:])
-            lines.append("    return " + result)
-            exec(compile("\n".join(lines) + "\n", "<peslite transformer circuit>", "exec"), env)
-            outputs = env["outputs"]
-            outputs._peslite_scalar_program = (
-                statements, result,
-                {key: value for key, value in env.items()
-                 if key not in ("outputs", "__builtins__")},
-                expressions,
-            )
-            return outputs
-
-        return compile_outputs
 
     def _compile_scalar(self, top: Topology, part: str = "all",
                         selected: Optional[tuple[int, ...]] = None) -> Callable:
@@ -3145,17 +3309,9 @@ class Netlist:
     def scalar_evaluators(self) -> tuple[Callable, Callable, Callable]:
         """Compile scalar derivatives, all outputs and a selected-output factory.
 
-        Causal reductions are selected from the primitive graph here, so every scalar consumer uses
-        the same structural optimization. General fixed topologies use the compiled state space;
-        mode-dependent networks retain the ordinary topology evaluator.
+        Fixed topologies use the compiled state space; mode-dependent networks retain the ordinary
+        topology evaluator. Every circuit therefore uses the same primitive equations.
         """
-        series = self._causal_series_evaluators()
-        if series is not None:
-            return series
-        transformer = self._causal_transformer_outputs()
-        if transformer is not None:
-            outputs = transformer(None)
-            return lambda _t, _y: (), outputs, transformer
         if (not self._switches and not self._diodes
                 and all(item.constant is not None for item in self._transformers)):
             top = self._scalar_topology_at()
@@ -3191,9 +3347,18 @@ class Netlist:
             return self._dynamic_scalar_function(top)(t, y)[1]
         return self._scalar_function(top, "outputs")(t, y)
 
+    def _dynamic_structure_key(self, top: Topology) -> tuple:
+        """Return the discrete mode and numeric sparsity selecting symbolic pivots."""
+        key = getattr(top, "_dynamic_structure_key", None)
+        if key is None:
+            values = top._pattern.values(top.mode.ratios)
+            key = top.mode.key[:2], np.packbits(values != 0.0).tobytes()
+            top._dynamic_structure_key = key
+        return key
+
     def _dynamic_scalar_equations(self, top: Topology) -> tuple:
         """Return one symbolic equation set shared by all scalar stages of a structural mode."""
-        key = top.mode.key[:2]
+        key = self._dynamic_structure_key(top)
         equations = self._dynamic_scalar_equation_cache.get(key)
         if equations is None:
             equations = self._build_dynamic_scalar_equations(top)
@@ -3287,7 +3452,8 @@ class Netlist:
         coefficients = top._K.toarray() if hasattr(top._K, "toarray") else top._K
         right = [sum((coefficient * value for coefficient, value in zip(row, variables)
                       if coefficient != 0.0), 0.0) for row in coefficients]
-        solution = (_symbolic_solve(matrix, right, pattern.dense(top.mode.ratios))
+        solution = (_symbolic_solve(matrix, right, pattern.dense(top.mode.ratios),
+                                    gauge=top.gauge_singular)
                     if pattern.n else [])
         derivatives = [solution[int(index)] for index in top.xd_index]
         output_matrix = top.S_out.toarray()
@@ -3353,7 +3519,7 @@ class Netlist:
         self, top: Topology, part: str = "all", selected: Optional[Sequence[int]] = None,
     ) -> Callable:
         selected_key = None if selected is None else tuple(sorted(set(map(int, selected))))
-        key = top.mode.key[:2], part, selected_key
+        key = self._dynamic_structure_key(top), part, selected_key
         evaluate = self._dynamic_scalar_functions.get(key)
         if evaluate is None:
             evaluate = self._dynamic_scalar_functions[key] = self._compile_dynamic_scalar(
@@ -3415,13 +3581,14 @@ class Netlist:
         du = self.rates(t, top.needs_rate) if top.any_rate else np.zeros(self.n_u)
         affine = (
             self.form == "statewise"
-            and (top._evaluations >= _DENSE_REUSE or top._state_space is not None)
-        ) or (self.form == "nodal" and not derivatives)
+            and (top._evaluations >= _DENSE_REUSE or top._state_space is not None
+                 or isinstance(top.lu, _RatioUpdate))
+        ) or (self.form == "nodal" and not derivatives
+              and (top._evaluations >= len(selected) or isinstance(top.lu, _RatioUpdate)))
         if affine:
-            equations = top.affine_equations(selected, derivatives=derivatives)
-            values = equations[0] @ x + equations[1] @ u
-            if top.any_rate:
-                values += equations[2] @ du
+            values = top.affine_equations(selected, derivatives=derivatives)(
+                np.concatenate((x, u, du))
+            )
             if derivatives:
                 dx, output = values[:self.n_x], values[self.n_x:]
             else:
@@ -3801,40 +3968,33 @@ class Netlist:
             return np.asarray(output, dtype=float), inputs
         return np.asarray(topology._S @ topology.solve(x, inputs, rates), dtype=float), inputs
 
-    def impulse_flags(self, t: Any, y: Sequence[Any], *,
-                      topology: Optional[Topology] = None) -> tuple[Any, ...]:
-        """Per-diode reverse impulse flags for a jump into the present topology."""
-        top = topology or self.topology()
+    def _scalar_impulse_flags(
+        self, top: Topology, y: Sequence[Any], inputs: Sequence[Any], output: Sequence[Any],
+        projections: Optional[Mapping[int, tuple[Sequence[Any], Sequence[Any]]]] = None,
+    ) -> tuple[Any, ...]:
+        """Per-diode reverse impulse flags from one already evaluated scalar topology."""
         capacitor, inductor = top.projectors()
         if capacitor is None and inductor is None:
             return (False,) * len(self._diodes)
-        numeric = all(isinstance(value, numbers.Real) for value in y)
-        if numeric:
-            y_numeric = np.asarray(y, dtype=float)
-            output, inputs = self._outputs_in_topology(top, float(t), y_numeric)
-            voltage_scale, current_scale = self._output_scales(output)
-        else:
-            inputs = self.source_values(t)
-            output = self._scalar_function(top, "outputs")(t, y)
-            voltage_scale, current_scale = self._output_scales(output)
+        voltage_scale, current_scale = self._output_scales(output)
+        projections = {} if projections is None else projections
         flags: list[Any] = [False] * len(self._diodes)
         gated = self._gated()
+
+        def projected(projector: _Projector) -> tuple[Sequence[Any], Sequence[Any]]:
+            return projections.get(id(projector), projector.values(y, inputs))
+
         if capacitor is not None:
-            if numeric:
-                projected, multipliers, _loss = capacitor(y_numeric, inputs)
-                changed = capacitor.significant(y_numeric, projected, voltage_scale)
-                tolerance = _MARGIN_RTOL * float(np.max(np.abs(multipliers), initial=0.0))
-            else:
-                projected, multipliers = capacitor.values(y, inputs)
-                reference = _maximum(
-                    voltage_scale, _maximum_all([abs(y[int(index)]) for index in capacitor.index])
+            values, multipliers = projected(capacitor)
+            reference = _maximum(
+                voltage_scale, _maximum_all([abs(y[int(index)]) for index in capacitor.index])
+            )
+            changed: Any = False
+            for index, value in zip(capacitor.index, values):
+                changed = _logical_or(
+                    changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
                 )
-                changed = False
-                for index, value in zip(capacitor.index, projected):
-                    changed = _logical_or(
-                        changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
-                    )
-                tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
+            tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
             rows = dict(top._wrows)
             for index, diode in enumerate(self._diodes):
                 branch = self._ports[id(diode)][0]
@@ -3844,21 +4004,16 @@ class Netlist:
                         _logical_and(changed, multipliers[rows[branch]] < -tolerance),
                     )
         if inductor is not None:
-            if numeric:
-                projected, multipliers, _loss = inductor(y_numeric, inputs)
-                changed = inductor.significant(y_numeric, projected, current_scale)
-                tolerance = _MARGIN_RTOL * float(np.max(np.abs(multipliers), initial=0.0))
-            else:
-                projected, multipliers = inductor.values(y, inputs)
-                reference = _maximum(
-                    current_scale, _maximum_all([abs(y[int(index)]) for index in inductor.index])
+            values, multipliers = projected(inductor)
+            reference = _maximum(
+                current_scale, _maximum_all([abs(y[int(index)]) for index in inductor.index])
+            )
+            changed = False
+            for index, value in zip(inductor.index, values):
+                changed = _logical_or(
+                    changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
                 )
-                changed = False
-                for index, value in zip(inductor.index, projected):
-                    changed = _logical_or(
-                        changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
-                    )
-                tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
+            tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
             _net, _c, _l, _cd, _p, _r, _w, offsets, supernodes = top._store
             potential = [multipliers[offsets[root]] if offsets[root] >= 0 else 0.0
                          for root in map(supernodes.find, range(self.n_vertices))]
@@ -3874,6 +4029,21 @@ class Netlist:
                         flags[index], _logical_and(changed, voltage > tolerance)
                     )
         return tuple(flags)
+
+    def impulse_flags(self, t: Any, y: Sequence[Any], *,
+                      topology: Optional[Topology] = None) -> tuple[Any, ...]:
+        """Per-diode reverse impulse flags for a jump into the present topology."""
+        top = topology or self.topology()
+        capacitor, inductor = top.projectors()
+        if capacitor is None and inductor is None:
+            return (False,) * len(self._diodes)
+        if all(isinstance(value, numbers.Real) for value in y):
+            y = np.asarray(y, dtype=float)
+            output, inputs = self._outputs_in_topology(top, float(t), y)
+        else:
+            inputs = self.source_values(t)
+            output = self._scalar_function(top, "outputs")(t, y)
+        return self._scalar_impulse_flags(top, y, inputs, output)
 
     def _margin_values(self, t: float, y: NDArray[np.float64], *, evaluated: bool = False
                        ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:

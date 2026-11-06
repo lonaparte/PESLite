@@ -120,7 +120,7 @@ class CompensatedLink(NetworkComponent):
                    *self._coil_outputs, *capacitor_outputs,
                    *(f"{scc.side}_scc_on" for scc in switched))
         self.output = type("_LinkOutput", (Bag,), {"__slots__": outputs})()
-        self.output_stages = (OutputMethod("set_outputs", inputs=(), outputs=outputs),)
+        self.output_stages = ()
         self.input = Empty()
         self.primary_port = Port(
             self, "primary", electrical_domain="ac", standalone="voltage",
@@ -137,11 +137,6 @@ class CompensatedLink(NetworkComponent):
         side = self.coil_sides[coil]
         name = f"u_{side}_series" if self.sides[side].lcc else f"u_{side}_cap"
         return f"{name}_{self._module(coil) + 1}" if multi else name
-
-    def set_outputs(self, t: float) -> None:
-        self._t = t
-        for scc in self.switched:
-            setattr(self.output, f"{scc.side}_scc_on", _real(scc.on))
 
     def coil_currents(self) -> tuple[float, ...]:
         """Coil currents obtained from the stored modal coordinates."""
@@ -434,7 +429,7 @@ class SwitchControlledCapacitor:
         return self._gate_cache[2]
 
     def _tracks_current(self) -> bool:
-        return self.sync == "current" or (self.on and self.gates[0] != self.gates[1])
+        return self.sync == "current" or (self.on & (self.gates[0] != self.gates[1]))
 
     def _flow(self, current) -> float:
         return (self.zero.sign if self.zero.sign and abs(self.zero.offset(current)) <= _CURRENT_TOL
@@ -582,6 +577,15 @@ class SwitchedCompensatedLink(CompensatedLink):
         super().__init__(**kwargs)
         self._t = 0.0
         self._netlist_devices = None
+        self.output_stages = (OutputMethod(
+            "set_outputs", inputs=(),
+            outputs=tuple(f"{scc.side}_scc_on" for scc in self.switched),
+        ),)
+
+    def set_outputs(self, t: float) -> None:
+        self._t = t
+        for scc in self.switched:
+            setattr(self.output, f"{scc.side}_scc_on", _real(scc.on))
 
     def _scc_values(self):
         coils = self.coil_currents()
@@ -621,8 +625,8 @@ class SwitchedCompensatedLink(CompensatedLink):
         netlist, devices = self._netlist_devices
         for scc, (positive, negative) in devices:
             conducting = (
-                (scc.positive_gate or netlist.conduction(positive)[0])
-                and (scc.negative_gate or netlist.conduction(negative)[0])
+                (scc.positive_gate | netlist.conduction(positive)[0])
+                & (scc.negative_gate | netlist.conduction(negative)[0])
             )
             scc.mirror(t, conducting, _real(before[scc.state_name]))
 

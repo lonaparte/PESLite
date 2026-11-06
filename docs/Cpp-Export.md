@@ -231,8 +231,8 @@ Their primary and secondary remain ordinary `DCConverter` units with independent
 shared compensated link uses the same netlist lowering as other electrical components.
 
 Named measurement bindings, independent series/shunt resistors and configured RMS windows use
-the same assembly as Python. Supported element `set` targets use the same generated parameter in
-their output, energy and event equations, so a load step does not recreate electrical or controller
+the same assembly as Python. Scheduled `set` events use the generated parameter dependencies for
+network, source, controller, protection and element values without recreating physical or controller
 state. Starting a new run with different parameters is distinct from changing them during a run:
 event changes retain their existing state-continuity restrictions. RMS protection uses the common
 trip path, not a WPT phase override.
@@ -254,15 +254,9 @@ trip path, not a WPT phase override.
   complex values). `None` and transitions to nonnumeric values are rejected; the exporter does not
   infer an optional-value protocol from a field's initial value. Built-in first-occurrence times
   use numeric sentinels internally and report absent occurrences as JSON `null`.
-- Only parameters reported by `--list-params` can change in the compiled simulator.
-- Scheduled `set` events are lowered for controller references
-  (`units.<unit>.ctrl.references.<name>`), source `v`, `f` and `angle`, connection commands and
-  supported element parameters. Export refuses the other `set` targets that a Python run accepts,
-  with `event '<name>' writes unsupported variable '<path>'`: bus `c` and
-  `r_d`, branch and source `l` and `r`, controller loop parameters
-  (`units.<unit>.ctrl.loops.<loop>.<field>`), protection settings (`units.<unit>.protection.*`),
-  DC-link source values (`units.<unit>.dclink.source.*`) and element fields without a binding.
-  A retained parameter can still start a run with another value through `--set`.
+- Only parameters reported by `--list-params` accept a run-start `--set`; scheduled events retain
+  their configured writable paths internally. An event that changes the compiled circuit layout or
+  another structural specialization is rejected when applied instead of using stale equations.
 
 The exporter supports the built-in switching, PWM-period-averaged and ideal averaged bridge models,
 including square-wave phase-shift modulation in the switching model.
@@ -273,7 +267,9 @@ Controllerless Units retain their electrical equations and independently clocked
 diode full bridges and switch-controlled capacitors participate through the ordinary
 `commutation_margin()`, `commutate(t)` and optional `next_commutation_time()` component methods.
 The native dispatcher shares scheduled boundaries, margin location, simultaneous transitions,
-state resets and the no-progress guard. Adaptive commutations require a finite `max_step`.
+state resets and the no-progress guard. Native adaptive commutations require a finite `max_step`;
+export rejects an unbounded configuration because the generated solver has no accepted-step
+observation interface.
 Component-owned state projections, discharge-energy columns and diagnostics are exported too.
 
 Custom electrical components are exported from the same declarative `network()` primitives used by

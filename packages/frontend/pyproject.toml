@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "peslite-frontend"
-version = "0.5.0"
+version = "0.5.1"
 description = "CodeSim frontend integration for PESLite."
 readme = "README.md"
 requires-python = ">=3.10.1"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
-dependencies = ["peslite==0.5.0"]
+dependencies = ["peslite==0.5.1"]
 
 [project.urls]
 Homepage = "https://github.com/lonaparte/PESLite"

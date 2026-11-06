@@ -7,7 +7,7 @@ models use the ADC (:mod:`.adc`) and own their PWM timing/register implementatio
 """
 
 from ..solver import Bag, ConfigError, Empty, Port, StoragePort
-from .network import (ACVoltageSource, Load, Resistor, RCNode, RLBranch,
+from .network import (ACVoltageSource, Bus, Load, Resistor, RCNode, RLBranch,
                       VoltageSource, register_component_type)
 from .converter import (AveragingModel, PWMAveragingModel, SwitchingModel,
                         ThreePhaseBridge,
@@ -22,7 +22,7 @@ from .wpt import (CompensatedLink, SwitchControlledCapacitor, SwitchedCompensate
                   make_wpt_link)
 from .onnx import ONNXModel, ONNXStateParams
 
-__all__ = ["Port", "ACVoltageSource", "RLBranch", "RCNode",
+__all__ = ["Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode",
            "Bag", "Empty", "ConfigError", "StoragePort",
            "register_component_type", "Load", "Resistor", "VoltageSource",
            "ThreePhaseBridge", "SwitchingModel",
