@@ -133,6 +133,22 @@ def test_stability_reuses_unchanged_strongly_connected_blocks(monkeypatch):
     assert len(solver._block_eigenvalues) == 3
 
 
+@pytest.mark.parametrize("example", ["gfl-example", "wpt-lcc-example"])
+def test_explicit_stability_and_linearization_share_the_exact_circuit_matrix(example):
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / f"{example}.pes",
+        **QUIET,
+        **{"simulation.solver.circuit_model": "device"},
+    ))
+
+    modes = simulation.system.model.linear_modes()
+    blocks = simulation.system.model.linear_blocks()
+
+    assert len(modes) == len(blocks)
+    for (_key, build), (_positions, matrix, _exact, _skipped) in zip(modes, blocks):
+        np.testing.assert_array_equal(build(), matrix)
+
+
 @pytest.mark.parametrize("method", ["euler", "heun", "RK4"])
 @pytest.mark.parametrize("step", [1e-4, 1e-2])
 def test_vectorized_stability_matches_the_scalar_tableau(method, step):

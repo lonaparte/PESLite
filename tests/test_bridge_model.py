@@ -10,7 +10,9 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import ConfigError
+from peslite.assembly.params import ConfigError, _unit_items
+from peslite.components.pwm import modulator_type
+from peslite.control.profiles import control_type
 
 
 SHORT = ["--set", "simulation.t_end=0.004",
@@ -29,6 +31,14 @@ def _models(*args):
     """Return ``{unit: bridge model}`` after resolving command-line arguments."""
     units = _resolved(*args)["units"]
     return {name: unit["bridge"]["model"] for name, unit in units.items()}
+
+
+def _supports_model(unit, model):
+    """Whether the unit's configured modulation supports ``model``."""
+    if unit.pwm is None:
+        return True
+    kind = control_type(unit.ctrl.type).modulator if unit.ctrl is not None else None
+    return model in modulator_type(unit.pwm, model, kind).supported_models
 
 
 def test_pwm_averaging_is_the_default_bridge_model():
@@ -131,14 +141,20 @@ def test_bridge_flags_are_mutually_exclusive(capsys):
 
 @pytest.mark.full
 @pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda path: path.stem)
-def test_every_bundled_file_runs_with_its_configured_model(path, tmp_path):
+@pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
+def test_every_bundled_file_runs_with_every_supported_model(path, model, tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         params = peslite.load(path, **{"simulation.solver.linearisations": 0})
+        units = tuple(_unit_items(params.units))
+        if not all(_supports_model(unit, model) for _name, unit in units):
+            pytest.skip(f"{model} is not supported by every configured modulator")
         duration = min(0.004, params.simulation.t_end)
-        params = params.replace(**{"simulation.t_end": duration,
-                                   "simulation.output.states": True})
-    result = peslite.Simulation(params).run(out_dir=tmp_path / path.stem)
+        params = params.replace(
+            **{"simulation.t_end": duration, "simulation.output.states": True},
+            **{f"units.{name}.bridge.model": model for name, _unit in units},
+        )
+    result = peslite.Simulation(params).run(out_dir=tmp_path / f"{path.stem}-{model}")
     assert np.isfinite(result.states["t"]).all()
     assert result.states["t"][-1] == pytest.approx(duration)
 

@@ -12,8 +12,8 @@ from conftest import EXAMPLES
 from peslite.assembly.params import from_dict, read_tree, runtime_changeable, to_dict
 from peslite.control import (ANGLE, CONTROL_INTERFACE, DUTY_RATIO, FREQUENCY, I, I_AB, I_DQ,
                              LOOP_TYPES, POWER, V, V_AB, V_DQ, Filter, Integrator, Loop,
-                             Measurement, PI, SignalType, SyncLaw, complex_power,
-                             register_loop_type, unit_delay)
+                             Measurement, ModulationLimiter, OutputStage, PI, SignalType, SyncLaw,
+                             complex_power, register_loop_type, unit_delay)
 from peslite.solver.model import ConfigError
 
 CONTROL = Path(peslite.control.__file__).parent
@@ -188,6 +188,22 @@ def test_continuous_control_graph_automatically_solves_feedback_between_loops():
 
     assert controller.graph.values["_AffineFeedback[a].y"] == pytest.approx(12.0 / 7.0)
     assert controller.graph.values["_AffineFeedback[b].y"] == pytest.approx(20.0 / 7.0)
+
+
+def test_output_stage_reuses_an_inherited_standard_limiter(gfl):
+    class InheritedLimiter(ModulationLimiter):
+        pass
+
+    class ModifiedLimiter(ModulationLimiter):
+        def __call__(self, values):
+            return np.zeros(3)
+
+    cfg = gfl().unit("vsc")
+    inherited = OutputStage(cfg, limiter=InheritedLimiter(0.8))
+    modified = OutputStage(cfg, limiter=ModifiedLimiter(0.8))
+
+    assert inherited.command_limit(1.0) is not None
+    assert modified.command_limit(1.0) is None
 
 
 def test_repeated_loop_class_uses_qualified_names_without_type_fields():

@@ -518,7 +518,6 @@ class Circuit:
         self.requires_topology_freeze = False
         self._direct_dynamic = False
         self._direct_mode_key: Optional[tuple] = None
-        self._linear_basis: Optional[tuple[np.ndarray, ...]] = None
         self._numeric_stages = False
         self._stage_signature: Optional[tuple] = None
         self._standalone_runtime = False
@@ -1402,53 +1401,8 @@ class Circuit:
 
     def linear_mode(self) -> tuple[tuple, Callable[[], np.ndarray]]:
         """Return the present linear-mode identity and a lazy state-matrix builder."""
-        net = self.netlist
-        topology = self._bound_device_topology() or net.topology()
-        key = topology.state_matrix_key()
-        if self.form == "device" and self._direct_dynamic:
-            derivative = next(
-                (getattr(self, stage.method) for stage in self.output_stages or ()
-                 if stage.rhs and not stage.outputs),
-                None,
-            )
-            if derivative is not None:
-                return key, lambda: self._direct_state_matrix(derivative)
-        return key, lambda: topology.state_space.A
-
-    def _direct_state_matrix(self, derivative: Callable[[float], None]) -> np.ndarray:
-        """Form the direct-equation matrix, evaluating all basis states together when possible."""
-        saved_states = self.gather()
-        saved_derivatives = self.derivatives.copy()
-        saved_t, saved_storage = self.t, self._stored
-        zero = [0.0] * self.n_states
-        try:
-            try:
-                if self._linear_basis is None:
-                    basis = np.zeros((self.n_states, self.n_states + 1))
-                    basis[:, 1:] = np.eye(self.n_states)
-                    self._linear_basis = tuple(basis)
-                self.scatter(self._linear_basis)
-                derivative(saved_t)
-                values = np.asarray(self.derivatives, dtype=float)
-                if values.shape != (self.n_states, self.n_states + 1):
-                    raise ValueError("vectorized circuit derivatives changed shape")
-                return values[:, 1:] - values[:, :1]
-            except (TypeError, ValueError):
-                matrix = np.empty((self.n_states, self.n_states))
-            self.scatter(zero)
-            derivative(saved_t)
-            base = np.asarray(self.derivatives, dtype=float).copy()
-            for column in range(self.n_states):
-                state = zero.copy()
-                state[column] = 1.0
-                self.scatter(state)
-                derivative(saved_t)
-                matrix[:, column] = np.asarray(self.derivatives, dtype=float) - base
-            return matrix
-        finally:
-            self.scatter(saved_states)
-            self.derivatives[:] = saved_derivatives
-            self.t, self._stored = saved_t, saved_storage
+        topology = self._bound_device_topology() or self.netlist.topology()
+        return topology.state_matrix_key(), lambda: topology.state_space.A
 
     def _store(self, y: np.ndarray) -> None:
         """Write a netlist state vector back into the components."""

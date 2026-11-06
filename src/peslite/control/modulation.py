@@ -107,7 +107,10 @@ class OutputStage:
         if self.limiter is not None and not callable(self.limiter):
             raise TypeError("limiter must be callable or None")
         self._trusted_pwm = any(self.pwm_method is method for method in PWM_METHODS.values())
-        self._standard_limiter = type(self.limiter) is ModulationLimiter
+        self._standard_limiter = (
+            isinstance(self.limiter, ModulationLimiter)
+            and type(self.limiter).__call__ is ModulationLimiter.__call__
+        )
         self.n_updates = 0
         self.n_saturated = 0
         self.first_saturation_t: float | None = None
