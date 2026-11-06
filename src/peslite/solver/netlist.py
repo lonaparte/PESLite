@@ -687,7 +687,19 @@ def _matrix(value: ArrayLike, d: int, what: str) -> NDArray[np.float64]:
 
 def _block_weights(blocks: Sequence[tuple[float, NDArray]]) -> sp.csc_matrix:
     """The same block-diagonal storage weights, retaining equation-valued coefficients."""
-    result = sp.block_diag([scale * _numeric_values(matrix) for scale, matrix in blocks], format="csc")
+    data, rows, columns = [], [], []
+    offset = 0
+    for scale, matrix in blocks:
+        numeric = scale * _numeric_values(matrix)
+        row, column = np.nonzero(numeric)
+        data.append(numeric[row, column])
+        rows.append(row + offset)
+        columns.append(column + offset)
+        offset += matrix.shape[0]
+    result = sp.csc_matrix(
+        (np.concatenate(data), (np.concatenate(rows), np.concatenate(columns))),
+        shape=(offset, offset),
+    )
     if any(matrix.dtype.kind == "O" for _scale, matrix in blocks):
         expressions = np.zeros(result.shape, dtype=object)
         offset = 0

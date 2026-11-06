@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1
 
 - Unified exact circuit-mode stability checks across Python, C++ and all circuit models, corrected
   native dense-LU pivoting and identifier substitution, and added accepted-step commutation checks.
