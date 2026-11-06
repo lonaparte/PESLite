@@ -226,17 +226,19 @@ class _Source:
         self.branch.port2.electrical_domain = "ac"
         self.port = self.branch.port2
 
-    def retune(self, cfg, paths: list[str], t: float) -> None:
-        """Apply changed source impedance, magnitude, frequency or angle at ``t``."""
+    def retune(self, cfg, paths: list[str], t: float) -> bool:
+        """Apply source parameters and report whether its network declaration changed."""
         self.cfg = cfg
+        network_changed = False
         if "l" in paths or "r" in paths:
-            self.branch.retune(cfg.l, cfg.r)
+            network_changed = self.branch.retune(cfg.l, cfg.r)
         if "v" in paths or "f" in paths or "angle" in paths:
             voltage, phase = self.scenario.law(t)
             if "v" in paths:
                 self.emf.e_peak = voltage
             if "f" in paths or "angle" in paths:
                 self.emf.phi = phase
+        return network_changed
 
     def subsystems(self) -> dict[str, Any]:
         return {f"{self.name}.emf": self.emf, f"{self.name}.branch": self.branch}
@@ -731,7 +733,7 @@ class System:
 
     def apply(self, change: Change) -> None:
         """Write one checked event's parameters and connection commands through existing owners."""
-        p, done, connections_changed = change.params, set(), False
+        p, done, connections_changed, network_changed = change.params, set(), False, False
         for path in change.paths:
             if path in change.connections:
                 self.switch(path.removesuffix(".connected"), change.values[path], change.t, change.ramp)
@@ -742,18 +744,23 @@ class System:
                 continue
             done.add((section, name))
             if section == "buses":
-                self.buses[name].retune(p.buses[name].c, p.buses[name].r_d)
+                network_changed |= self.buses[name].retune(
+                    p.buses[name].c, p.buses[name].r_d
+                )
             elif section == "branches":
-                self.branches[name].retune(p.branches[name].l, p.branches[name].r)
+                network_changed |= self.branches[name].retune(
+                    p.branches[name].l, p.branches[name].r
+                )
             elif section == "sources":
-                self.sources[name].retune(
+                network_changed |= self.sources[name].retune(
                     p.sources[name], change.touches(f"sources.{name}."), change.t)
             elif section == "units":
-                self.units[name].retune(
+                network_changed |= self.units[name].retune(
                     p.unit(name), change.touches(f"units.{name}."), change.t)
             elif section == "elements":
-                self.named_elements[name].retune(p.elements[name])
-        if done:
+                result = self.named_elements[name].retune(p.elements[name])
+                network_changed |= True if result is None else bool(result)
+        if network_changed:
             for circuit in self.circuits:
                 circuit.build()
             model = self.model

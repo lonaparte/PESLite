@@ -1084,13 +1084,17 @@ class DCLink(NetworkComponent):
         if isinstance(self.source, DCCurrentSource):
             self.source.connect(on, t, ramp)
 
-    def retune_source(self, i: float, k: float, v: float, r: float) -> None:
-        """Apply new settings to the existing DC source without replacing its state."""
+    def retune_source(self, i: float, k: float, v: float, r: float) -> bool:
+        """Retune the source and report whether its network declaration changed."""
         source = self.source
         if isinstance(source, DCCurrentSource):
             source.i_nom, source.k_dc = float(i), float(k)
+            return False
         elif isinstance(source, DCVoltageSource):
+            changed = source.R != r
             source.u_dc, source.R = float(v), float(r)
+            return changed
+        return False
 
     def network(self, nb):
         """Declare the DC-link capacitor, source and source breaker."""

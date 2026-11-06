@@ -131,10 +131,12 @@ class RLBranch(NetworkComponent):
         """Close the breaker; current resumes from zero after an opening."""
         self.breaker_open = False
 
-    def retune(self, L: float, R: float) -> None:
-        """Change inductance and resistance without changing the current state."""
+    def retune(self, L: float, R: float) -> bool:
+        """Change impedance without changing current; report a network change."""
+        changed = self.L != L or self.R != R
         self.L, self.R = L, R
         self.storage = (replace(self.storage[0], value=L),)
+        return changed
 
     def use_external_conduction(self) -> None:
         """Take derivative and copper-loss factor from a connected constitutive subsystem."""
@@ -260,10 +262,12 @@ class RCNode(NetworkComponent):
             "u_C", C, self.power_scale, ((self.port, "current", 1.0),)
         ),)
 
-    def retune(self, C: float, R_d: float) -> None:
-        """Change capacitance and damping resistance without changing voltage."""
+    def retune(self, C: float, R_d: float) -> bool:
+        """Change impedance without changing voltage; report a network change."""
+        changed = self.C != C or self.R_d != R_d
         self.C, self.R_d = C, R_d
         self.storage = (replace(self.storage[0], value=C),)
+        return changed
 
     def network(self, nb):
         """Declare the damping resistance and shunt capacitor."""
@@ -375,9 +379,10 @@ class Element:
     source is another subsystem output or a configured physical-output path resolved by assembly.
     Each binding joins a configured bus name to a :class:`Port`; one- and multi-port
     elements use the same interface. Optional ``breakers`` or ``connect()`` enable switching;
-    optional ``retune()`` enables runtime parameter changes. Optional ``series_connections()`` maps
-    a bus to an inlet bus: assembly moves the original voltage driver to that inlet, inserting a
-    two-port element before the bus's followers without adding an artificial energy-storage state.
+    optional ``retune()`` enables runtime parameter changes and returns whether its network
+    declaration changed. Optional ``series_connections()`` maps a bus to an inlet bus: assembly
+    moves the original voltage driver to that inlet, inserting a two-port element before the bus's
+    followers without adding an artificial energy-storage state.
     Optional ``parameter_bindings()`` maps retunable scalar fields to ``(subsystem, attribute)``
     pairs so native export uses the same parameters as Python, including energy equations.
     """
@@ -656,8 +661,10 @@ class _ConfiguredComponent(Element):
             outputs[f"{prefix}.current"] = port.current
         return outputs
 
-    def retune(self, cfg: Any) -> None:
+    def retune(self, cfg: Any) -> bool:
+        changed = self.cfg != cfg
         self.cfg = cfg
+        return changed
 
 
 def register_component_type(cls: type) -> type:
@@ -715,10 +722,10 @@ class Load(Element):
     def signals(self) -> dict[str, complex]:
         return {f"{self.name}.i": self.branch.output.i}
 
-    def retune(self, cfg: Any) -> None:
+    def retune(self, cfg: Any) -> bool:
         """Take new load parameters while preserving branch current."""
         self.cfg = cfg
-        self.branch.retune(cfg.l, cfg.r)
+        return self.branch.retune(cfg.l, cfg.r)
 
 
 class _ResistorOutput(Bag):
@@ -819,10 +826,12 @@ class Resistor(Element):
         return {f"{self.name}.i": self.resistor.output.i,
                 f"{self.name}.power": self.resistor.output.power}
 
-    def retune(self, cfg: Any) -> None:
+    def retune(self, cfg: Any) -> bool:
+        changed = self.cfg.r != cfg.r
         self.cfg = cfg
         for name, (subsystem, attribute) in self.parameter_bindings().items():
             setattr(subsystem, attribute, getattr(cfg, name))
+        return changed
 
 
 class _VoltageSourceOutput(Bag):
@@ -901,6 +910,8 @@ class VoltageSource(Element):
     def signals(self) -> dict[str, float]:
         return {f"{self.name}.i": self.source.output.i}
 
-    def retune(self, cfg: Any) -> None:
+    def retune(self, cfg: Any) -> bool:
+        changed = self.cfg.r != cfg.r
         self.cfg = cfg
         self.source.voltage, self.source.resistance = cfg.v, cfg.r
+        return changed

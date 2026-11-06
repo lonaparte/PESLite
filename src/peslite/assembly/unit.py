@@ -308,18 +308,23 @@ class Unit(ABC):
         elif self.branch_f is None:
             self._set_gates(effective and self.bridge.on)
 
-    def retune(self, cfg: Any, paths: list[str], t: float) -> None:
+    def retune(self, cfg: Any, paths: list[str], t: float) -> bool:
+        """Apply unit parameters and report whether the electrical network changed."""
+        network_changed = False
         if any(path.startswith("protection.") for path in paths):
             self.protection.retune(cfg.protection)
         self.cfg = cfg
         if any(path.startswith("dclink.source.") for path in paths):
             source = cfg.dclink.source
-            self.dclink.retune_source(source.i, source.k, source.v, source.r)
+            network_changed = self.dclink.retune_source(
+                source.i, source.k, source.v, source.r
+            )
         rest = [path for path in paths if not path.startswith(("dclink.", "protection."))]
         if rest:
             if self.ctrl is None:
                 raise ValueError(f"{self.name}: no controller to retune")
             self.ctrl.retune(cfg, rest, t)
+        return network_changed
 
     def trip(self, t: float, cause: str, plant: Optional[Plant] = None,
              detail: str = "") -> None:
