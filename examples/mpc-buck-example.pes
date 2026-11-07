@@ -16,18 +16,19 @@ units:
     # The default bridge is synchronous and uses pwm_averaging.
     pwm: {f_sw: 20000.0}
     ctrl:
-      type: mpc_dc
+      type: current
       period: 50.0e-6
       computation: 1.0e-6
       references: {current: 4.0}
-      options:
-        # algorithm: ccs
-        prediction_horizon: 4
-        control_horizon: 3
-        # rate_weight: 0.01
-        current_min: -8.0
-        current_max: 8.0
-        # fallback: hold
+      loops:
+        PredictiveCurrentControl:
+          # algorithm: ccs
+          prediction_horizon: 4
+          control_horizon: 3
+          # rate_weight: 0.01
+          current_min: -8.0
+          current_max: 8.0
+          # fallback: hold
     protection:
       overcurrent: {enable: true, limit: 10.0}
 events:

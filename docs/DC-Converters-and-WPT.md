@@ -70,12 +70,15 @@ instantaneous energy balance.
 | `ctrl.type` | Use |
 |---|---|
 | `dc` | cascaded voltage and inductor-current control |
+| `current` | direct inductor-current control |
 | `open_loop` | direct duty reference |
 | `resonant` | amplitude, frequency and phase modulation graph |
 | `phase_shift` | square-wave full-bridge modulation |
 
 Built-in measurement channels are `current`, `voltage`, `vin` and requested port `power`.
 Available protection criteria are overcurrent, RMS current, terminal voltage and DC-link voltage.
+`PredictiveCurrentControl` can replace the PI current loop; see
+[Model Predictive Control](Model-Predictive-Control.md).
 
 ## Diode full-bridge rectifier
 

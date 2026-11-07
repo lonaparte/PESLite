@@ -33,7 +33,7 @@ __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "InductorCurrentControl", "PowerControl", "PhasePowerControl", "FrequencyPowerControl",
            "VoltageControl", "PhaseVoltageControl", "FrequencyVoltageControl", "CurrentControl",
            "PhaseCurrentControl", "FrequencyCurrentControl", "ResonantModulation",
-           "PhaseShiftModulation", "DutyModulation", "MODE"]
+           "PhaseShiftModulation", "DutyModulation", "MODE", "ENABLE"]
 
 
 # ------------------------------------------------------------------ signals
@@ -112,6 +112,8 @@ class Loop:
     state_names: tuple[str, ...] | Mapping[str, str] = ()
     carried: ClassVar[tuple[str, ...]] = ()
     log_outputs: ClassVar[tuple[str, ...]] = ()
+    observations: ClassVar[tuple[str, ...]] = ()
+    cpp_export: ClassVar[bool] = True
 
     def __init__(self, cfg: Any, unit: Any, startup: Any) -> None:
         self.cfg, self.unit, self.startup = cfg, unit, startup
@@ -262,6 +264,14 @@ class Loop:
         """Take non-state runtime attributes from the loop instance being replaced."""
         for name in self.carried:
             setattr(self, name, getattr(old, name))
+
+    def summary(self) -> dict[str, Any]:
+        """Return optional loop-level information for the owning controller summary."""
+        return {}
+
+    def observe(self) -> dict[str, float]:
+        """Return declared diagnostics which are not graph signals or simulation states."""
+        return {}
 
 
 LOOP_TYPES: dict[str, type] = {}
@@ -1150,6 +1160,7 @@ SI_POWER = SignalType("W", "scalar")
 DUTY_RATIO = SignalType("1", "duty_ratio")
 MODULATION = SignalType("1", "modulation")
 HERTZ = SignalType("Hz")
+ENABLE = SignalType("1", "enable")
 
 
 @dataclass(frozen=True, kw_only=True)

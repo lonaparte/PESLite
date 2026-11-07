@@ -1,9 +1,9 @@
 # Model Predictive Control
 
 PESLite provides continuous-control-set MPC (CCS-MPC) and finite-control-set MPC (FCS-MPC)
-through the existing sampled controller, ADC, PWM, protection and saved-state mechanisms.
-The built-in current controllers require no `ctrl.loops` graph. They support `switching` and
-`pwm_averaging`; continuous `averaging`, C++ export and Imperix export are unsupported.
+as ordinary sampled control loops. They use the same typed connections, ADC, PWM, protection,
+start-up and saved-state mechanisms as other loops. The converter adapters support `switching`
+and `pwm_averaging`; continuous `averaging`, C++ export and Imperix export are unsupported.
 
 ## Run the examples
 
@@ -29,31 +29,44 @@ For a DC converter with a synchronous half bridge and an external output bus:
 
 ```yaml
 ctrl:
-  type: mpc_dc
+  type: current
   period: 50.0e-6
   computation: 1.0e-6
   references: {current: 4.0}
-  options:
-    algorithm: ccs
-    prediction_horizon: 4
-    control_horizon: 3
-    tracking_weight: 1.0
-    input_weight: 0.0
-    rate_weight: 0.01
-    input_min: 0.0
-    input_max: 1.0
-    current_min: -8.0
-    current_max: 8.0
-    max_iterations: 100
-    max_evaluations: 10000
-    tolerance: 1.0e-9
-    feasibility_tolerance: 1.0e-7
-    fallback: hold
+  loops:
+    PredictiveCurrentControl:
+      algorithm: ccs
+      prediction_horizon: 4
+      control_horizon: 3
+      tracking_weight: 1.0
+      input_weight: 0.0
+      rate_weight: 0.01
+      input_min: 0.0
+      input_max: 1.0
+      current_min: -8.0
+      current_max: 8.0
+      max_iterations: 100
+      max_evaluations: 10000
+      tolerance: 1.0e-9
+      feasibility_tolerance: 1.0e-7
+      fallback: hold
 ```
 
-For a three-phase VSC, select `type: mpc_vsc` and, for example,
-`references: {id_ref_pu: 0.4, iq_ref_pu: 0.0}`. Either adapter accepts `algorithm: ccs` or
-`algorithm: fcs`.
+For a three-phase VSC, use the ordinary `gfl` profile with a synchronization loop and replace
+the current-loop/modulation chain with `ThreePhasePredictiveCurrentControl`:
+
+```yaml
+ctrl:
+  type: gfl
+  references: {id_ref_pu: 0.4, iq_ref_pu: 0.0}
+  loops:
+    SRFPLL: {kp_pu: 20.0, ki_pu: 1200.0}
+    ThreePhasePredictiveCurrentControl:
+      algorithm: fcs
+      prediction_horizon: 3
+```
+
+Either predictive loop accepts `algorithm: ccs` or `algorithm: fcs`.
 
 | Setting | Meaning |
 |---|---|
@@ -73,15 +86,13 @@ For a three-phase VSC, select `type: mpc_vsc` and, for example,
 
 The DC reference and current prediction use SI amperes. VSC `id_ref_pu`/`iq_ref_pu` use the
 unit's peak phase-current base, then convert to SI alpha-beta currents before optimization.
-The current limits of `mpc_vsc` bound alpha and beta independently; they are not phase-current
+The three-phase current limits bound alpha and beta independently; they are not phase-current
 peak or current-magnitude limits. Input and rate penalties use dimensionless duty ratios.
 Choose weights with these scales in mind; they do not normalize quantities automatically.
 
-The VSC adapter obtains phase from the measured terminal-voltage vector and extrapolates a
-sinusoidal reference at `references.omega` (rad/s, defaulting to the nominal frequency).
-It does not implement a PLL or a
-frequency estimator. Frequency/ROCOF protection cannot use this adapter as a frequency
-measurement. Existing physical overcurrent and voltage protection remains owned by the unit.
+The three-phase loop obtains frame and frequency through its typed graph inputs; the example
+connects them to `SRFPLL`. Existing frequency, ROCOF, overcurrent and voltage protection remains
+owned by the unit.
 
 ## Prediction and optimization
 
@@ -146,14 +157,14 @@ dimensions, finiteness and feasibility independently. Import these records from
 `peslite.control.mpc`. Additional optimization libraries are needed only by backends that
 choose to use them.
 
-The built-in adapters reuse the configured filter inductance, resistance and bridge on-resistance.
-They hold the measured DC-link voltage across the prediction. The DC adapter also holds its
-measured output voltage; the AC adapter extrapolates the measured terminal-voltage vector
-sinusoidally at `references.omega` and integrates the resulting RL forcing analytically. They
-do not construct a second plant or mutate the running electrical state. The DC adapter supports
+The built-in predictive loops reuse the configured filter inductance, resistance and bridge
+on-resistance. They hold the measured DC-link voltage across the prediction. The scalar loop
+also holds its measured output voltage; the three-phase loop extrapolates the measured terminal
+voltage at its connected `omega` input and integrates the resulting RL forcing analytically. They
+do not construct a second plant or mutate the running electrical state. The scalar loop supports
 the synchronous half bridge with its ordinary midpoint output. Reverse-port, lower-rail,
 unilateral diode and other scalar bridge configurations require an appropriate custom model
-and are rejected by this adapter.
+and are rejected by this loop.
 
 CCS prediction describes bridge-average voltage, including when the plant runs in switching
 mode. FCS prediction uses the chosen held binary level. Both ideal predictors omit physical
@@ -168,7 +179,7 @@ time, PWM register loads, physical switching and multirate integration retain th
 [timing semantics](Bridge-and-PWM.md). Solver wall-clock execution does not advance simulation
 time; `ctrl.computation` is the configured simulated computation delay.
 
-The built-in adapters compensate a known, constant control-interrupt-to-register-load delay. Their
+The built-in loops compensate a known, constant control-interrupt-to-register-load delay. Their
 supported timing requires:
 
 - `ctrl.period` is an integer multiple of `pwm.load_period`.
@@ -192,7 +203,7 @@ predictor uses those supplied values without reconstructing their acquisition or
 delay; it does not add an observer. Account for that approximation when selecting measurement
 settings and evaluating tracking or constraint accuracy.
 
-Duty-ratio dead-time compensation is unsupported by these adapters. In particular, it would
+Duty-ratio dead-time compensation is unsupported by these loops. In particular, it would
 turn an FCS binary action into a fractional duty and change the finite action set.
 
 ## Failure handling, diagnostics and continuation
@@ -220,12 +231,12 @@ A fallback supplies an admissible actuator command or blocks actuation. It canno
 state/output feasibility when the prediction problem itself is infeasible. Unit protection
 continues to override optimized and fallback commands through its normal trip mechanism.
 
-The controller CSV fields `mpc.success`, `mpc.objective`, `mpc.iterations`, `mpc.evaluations`,
-`mpc.seconds`, `mpc.solves`, `mpc.fallbacks` and `mpc.delay` report each sampled observation.
-The summary includes the last textual solve status. Computation cost is an observation;
-wall-clock timing is not a reproducible
-electrical state. Previous decisions and necessary startup/controller state use the normal
-named-state mechanism, so continuation restores them together with the PWM registers and ADC.
+The predictive loop's `success`, `objective`, `iterations`, `evaluations`, `seconds`, `solves`,
+`fallbacks` and `delay` diagnostics are recorded under its configured loop name.
+The controller summary includes the last textual solve status. Computation cost is an observation;
+wall-clock timing is not a reproducible electrical state. Previous decisions and necessary
+startup/controller state use the normal named-state mechanism, so continuation restores them
+together with the PWM registers and ADC.
 The existing restrictions on continuation during unrecorded ADC/computation windows still apply.
 
 Reference changes and supported option changes use ordinary `set` events. Structural changes
@@ -234,19 +245,12 @@ configuration. See [Events Timeline](Events-Timeline.md).
 
 ## Custom algorithms
 
-Use `MPCCurrentController` when a custom optimizer can use the same current-model and converter
-boundary. Its `prediction(t, measurement)` method returns the augmented state, reference
-forecast and affine model sequence. Its `solve(t, measurement)` method returns an `MPCResult`;
-overriding that method retains the shared command, startup, fallback and state interface.
-`previous_input` supplies the preceding duty vector for rate penalties. Keep any additional
-state that affects later decisions in the controller's named-state methods. A custom CCS QP
-backend can instead be supplied as `MPCCurrentController(cfg, topology, backend=backend)`.
-
-Register a custom control profile through `register_control_type`, using a controller factory,
-its typed options/reference schema, validation and supported modes. Place the implementation
-under `peslite.addons.control`, or in `PESaddons/control` beside a simulation file. The existing
-add-on discovery imports it before parsing the file; no simulation-runner changes are needed.
-See [Extending PESLite](Extending-PESLite.md).
+Subclass `PredictiveCurrentControl` or `ThreePhasePredictiveCurrentControl` when a custom
+optimizer uses the same current model and converter boundary. `prediction(t, inputs)` returns
+the augmented state, reference forecast and affine model sequence; overriding `solve(t, inputs)`
+retains the ordinary graph, fallback and named-state behavior. Register the subclass with
+`register_loop_type` and place it under `peslite.addons.control`, or in `PESaddons/control`
+beside a simulation file. See [Extending PESLite](Extending-PESLite.md).
 
 The generic numerical classes can also be used independently of a converter adapter. Custom
 prediction models, objectives, constraints and algorithms belong behind this control boundary;

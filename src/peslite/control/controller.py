@@ -25,13 +25,13 @@ from ..solver.model import (Bag, ConfigError, _complex, _component_plan, _depend
 from ..solver.energy import Port
 from ..solver.timing import control_clock_offset
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
-from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,
+from .loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,
                     SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ,
                     Loop, SignalType, SyncLaw)
 from .modulation import CONFIGURED, OutputStage
 from .profiles import (DutyReferenceParams, PhaseShiftReferenceParams, ReferenceParams,
                        ResonantReferenceParams,
-                       ScalarVoltageReferenceParams, control_type,
+                       ScalarCurrentReferenceParams, ScalarVoltageReferenceParams, control_type,
                        register_control_type, validate_duty_references,
                        validate_phase_shift_references,
                        validate_resonant_references,
@@ -320,9 +320,11 @@ SAMPLED_VSC_INTERFACE = replace(
         "d_a": DUTY_RATIO,
         "d_b": DUTY_RATIO,
         "d_c": DUTY_RATIO,
+        "enable": ENABLE,
         "theta": ANGLE,
         "omega": FREQUENCY,
     }),
+    optional_outputs=frozenset(("enable",)),
 )
 
 
@@ -423,6 +425,16 @@ class ControlGraph:
             if source not in types or not types[source].compatible(spec):
                 raise ConfigError(f"ctrl.outputs.{port}: missing or incompatible source {source!r}")
             pending_sources.append(source)
+        if interface.optional_outputs:
+            retained = frozenset(port for port in interface.optional_outputs
+                                 if port in self.outputs)
+            self.interface = interface = replace(
+                interface,
+                outputs=MappingProxyType({name: spec for name, spec in interface.outputs.items()
+                                          if name not in interface.optional_outputs
+                                          or name in retained}),
+                optional_outputs=retained,
+            )
         while pending_sources:
             owner = pending_sources.pop().partition(".")[0]
             if owner not in classes or owner in active:
@@ -458,6 +470,18 @@ class ControlGraph:
                                           for port, spec in node.outputs.items())
             self.periods[name] = loop.period
             self._store(name, node.initial_outputs(), real=_real, complex=_complex)
+        self.observation_names = tuple(
+            f"{name}.{field}"
+            for name, node in self.nodes.items()
+            for field in node.observations
+        )
+        for name, node in self.nodes.items():
+            declared, actual = set(node.observations), set(node.observe())
+            if actual != declared:
+                raise RuntimeError(
+                    f"control loop {name}: declared observations {sorted(declared)} "
+                    f"differ from returned observations {sorted(actual)}"
+                )
         self._sample_inputs = {
             name: {port: 0.0 for port in node.inputs}
             for name, node in self.nodes.items()
@@ -950,6 +974,22 @@ class ControlGraph:
         """Return the graph output ``port`` (``u_dq``, ``theta`` or ``omega``)."""
         return self._read(*self._output_source[port], meas)
 
+    def observations(self):
+        """Return loop diagnostics without turning them into held graph signals."""
+        return {
+            f"{name}.{field}": value
+            for name, node in self.nodes.items()
+            for field, value in node.observe().items()
+        }
+
+    def summary(self):
+        """Return the nonempty summaries supplied by active loops."""
+        result = {}
+        for name, node in self.nodes.items():
+            if summary := node.summary():
+                result[name] = summary
+        return result
+
     def describe(self):
         return {"loops": {n: {"period": self.periods[n]}
                           for n in self.order}, "connections": dict(self.connections), "outputs": dict(self.outputs)}
@@ -989,6 +1029,41 @@ class ControlGraph:
         state = gather(self.nodes)
         state.update({f"held.{self._state_port(k)}": v for k, v in self.values.items()})
         return state
+
+    @property
+    def discrete_state_names(self):
+        return tuple(
+            f"{name}.{local}"
+            for name, node in self.nodes.items()
+            for local in getattr(node, "discrete_state_names", ())
+        )
+
+    @property
+    def linearization_state_names(self):
+        selected = []
+        for name, node in self.nodes.items():
+            declared = getattr(node, "linearization_state_names", None)
+            selected.extend(
+                f"{name}.{local}"
+                for local in (node.get_state() if declared is None else declared)
+            )
+        selected.extend(f"held.{self._state_port(key)}" for key in self.values)
+        return tuple(selected)
+
+    def periodic_state(self, values):
+        result = dict(values)
+        for name, node in self.nodes.items():
+            project = getattr(node, "periodic_state", None)
+            if project is None:
+                continue
+            prefix = name + "."
+            local = {key[len(prefix):]: value for key, value in result.items()
+                     if key.startswith(prefix)}
+            for key in tuple(result):
+                if key.startswith(prefix):
+                    result.pop(key)
+            result.update({prefix + key: value for key, value in project(local).items()})
+        return result
 
     def set_state(self, values):
         unknown = set(values) - set(self.get_state())
@@ -1093,13 +1168,16 @@ def default_wiring(cfg, family):
         return wires, {"u_dq": f"{command}.u_dq", "theta": theta, "omega": omega}
     if modulation is None:
         raise ConfigError(f"ctrl.loops: sampled {family} control needs a modulation loop")
-    return wires, {
+    outputs = {
         "d_a": f"{modulation}.d_a",
         "d_b": f"{modulation}.d_b",
         "d_c": f"{modulation}.d_c",
         "theta": theta,
         "omega": omega,
     }
+    if "enable" in LOOP_TYPES[loops[modulation].type].outputs:
+        outputs["enable"] = f"{modulation}.enable"
+    return wires, outputs
 
 
 # ------------------------------------------------------------------ the controller
@@ -1125,7 +1203,26 @@ class _GraphRuntime:
     @property
     def discrete_state_names(self) -> tuple[str, ...]:
         """Run/ramp bookkeeping is restored, not differentiated as controller memory."""
-        return tuple(f"startup.{name}" for name in self.startup.get_state())
+        startup = tuple(f"startup.{name}" for name in self.startup.get_state())
+        return startup if self.continuous else (*self.graph.discrete_state_names, *startup)
+
+    @property
+    def linearization_state_names(self) -> tuple[str, ...]:
+        if self.continuous:
+            return tuple(self.get_state())
+        startup = tuple(f"startup.{name}" for name in self.startup.get_state())
+        return (*self.graph.linearization_state_names, *startup)
+
+    def periodic_state(self, values):
+        if self.continuous:
+            return dict(values)
+        startup = {name: value for name, value in values.items()
+                   if name.startswith("startup.")}
+        graph = self.graph.periodic_state({
+            name: value for name, value in values.items()
+            if not name.startswith("startup.")
+        })
+        return {**graph, **startup}
 
     @property
     def angle_state_names(self) -> tuple[str, ...]:
@@ -1287,7 +1384,9 @@ class VSCController(_GraphRuntime):
         self.graph = graph = ControlGraph(
             cfg, self.startup, wires, outputs, interface=interface,
         )
-        self._carried_outputs = interface.auxiliary_outputs(graph.outputs)
+        self._carried_outputs = tuple(
+            port for port in interface.auxiliary_outputs(graph.outputs) if port != "enable"
+        )
         self.periods = graph.periods
         self.v_base, self.i_base, self.w0 = cfg.base.v_phase_peak, cfg.base.i_phase_peak, cfg.base.w0
         self.v_dc_base = cfg.dc_base.v
@@ -1336,10 +1435,10 @@ class VSCController(_GraphRuntime):
                             else graph.outputs["theta"])
         self._is_gfl = profile.grid_following
         if self._is_gfl:
-            mode_log_sources = (
-                {"id_ref_pu": graph.connections[f"{self._log_cc}.id_ref"]}
-                if self._log_cc is not None else {}
-            )
+            mode_log_sources = {"id_ref_pu": (
+                graph.connections[f"{self._log_cc}.id_ref"]
+                if self._log_cc is not None else "references.id_ref_pu"
+            )}
         else:
             mode_log_sources = (
                 {"p_pu": f"{self._sync}.p", "q_pu": f"{self._sync}.q",
@@ -1476,6 +1575,7 @@ class VSCController(_GraphRuntime):
             names.append("vdc_raw_pu")
         names += (["id_ref_pu", "freq_dev", "angle_rel"] if self._is_gfl else
                   ["p_pu", "q_pu", "p_ref_pu", "v_ref_pu", "freq_dev", "angle_rel"])
+        names += self.graph.observation_names
         return tuple(names)
 
     def mode_log_sources(self) -> Mapping[str, str]:
@@ -1524,7 +1624,9 @@ class VSCController(_GraphRuntime):
         frame = graph._read(*graph._resolve(self._frame_path), control_meas)
         rot = cmath.exp(-1j * frame)
         self.v_dq, self.i_dq = control_meas.u_g * rot, control_meas.i_c * rot
-        gates = startup.active
+        gates = startup.active and (
+            "enable" not in graph.outputs or bool(graph.output("enable", control_meas))
+        )
         duty = np.asarray([graph.values[source] for source in self._duty_sources], dtype=float)
         terminal = self._terminal_node
         m_max = (float(terminal.m_peak) if hasattr(terminal, "m_peak")
@@ -1549,6 +1651,7 @@ class VSCController(_GraphRuntime):
                    "in_service": 1.0 if gates else 0.0,
                    **self._raw_log(meas, frame)}
             log.update(self._mode_log(t, control_meas))
+            log.update(graph.observations())
             self.last_log = log
         commands = ({port: self.graph.output(port, control_meas) for port in self._carried_outputs}
                     if self._carried_outputs else None)
@@ -1620,6 +1723,7 @@ class VSCController(_GraphRuntime):
                "vac_pu": abs(self.v_dq), "vdc_pu": meas.u_dc,
                "in_service": 1.0 if self.startup.active else 0.0}
         log.update(self._mode_log(t, meas))
+        log.update(self.graph.observations())
         self.last_log = log
         return log
 
@@ -1629,6 +1733,8 @@ class VSCController(_GraphRuntime):
         # The frame and terminal commands are consumed after each sampled graph pass.
         reads = [(self._frame_path, 1)]
         reads.extend((graph.outputs[port], 1) for port in ("d_a", "d_b", "d_c"))
+        if "enable" in graph.outputs:
+            reads.append((graph.outputs["enable"], 1))
         # initial_sync() also supplies the bridge before the first graph update.
         reads.extend((graph.outputs[port], None) for port in ("theta", "omega"))
         return graph.overwritten_state_names(period, reads=reads)
@@ -1656,6 +1762,7 @@ class VSCController(_GraphRuntime):
             )
         if self._sync is not None:
             summary["law"] = self.p.ctrl.loops[self._sync].type
+        summary.update(self.graph.summary())
         summary["alarms"] = list(self.alarms)
         return summary
 
@@ -1674,8 +1781,20 @@ DC_CONVERTER_INTERFACE = ControlInterface(
         "meas.duty_feedforward": DUTY_RATIO,
         "references.voltage": SI_VOLTAGE,
     }),
-    outputs=MappingProxyType({"duty": DUTY_RATIO}),
-    optional_inputs=frozenset(("meas.power",)),
+    outputs=MappingProxyType({"duty": DUTY_RATIO, "enable": ENABLE}),
+    optional_inputs=frozenset(("meas.power", "meas.duty_feedforward")),
+    optional_outputs=frozenset(("enable",)),
+)
+
+CURRENT_CONVERTER_INTERFACE = ControlInterface(
+    inputs=MappingProxyType({
+        **_CONVERTER_MEASUREMENT_INPUTS,
+        "meas.duty_feedforward": DUTY_RATIO,
+        "references.current": SI_CURRENT,
+    }),
+    outputs=MappingProxyType({"duty": DUTY_RATIO, "enable": ENABLE}),
+    optional_inputs=frozenset(("meas.power", "meas.duty_feedforward")),
+    optional_outputs=frozenset(("enable",)),
 )
 
 RESONANT_CONVERTER_INTERFACE = ControlInterface(
@@ -1778,14 +1897,25 @@ def _dc_converter_wiring(cfg):
             f"{voltage}.voltage": "meas.voltage",
         })
     if current is not None:
-        wires.update({
-            f"{current}.reference": (
-                f"{voltage}.current_reference" if voltage is not None else None
-            ),
-            f"{current}.current": "meas.current",
-            f"{current}.feedforward": "meas.duty_feedforward",
-        })
-    return wires, ({"duty": f"{current}.duty"} if current is not None else {})
+        interface = control_type(cfg.ctrl.type).interface
+        reference = (f"{voltage}.current_reference" if voltage is not None
+                     else "references.current" if "references.current" in interface.inputs
+                     else None)
+        sources = {
+            "reference": reference,
+            "current": "meas.current",
+            "voltage": "meas.voltage",
+            "vin": "meas.vin",
+            "feedforward": "meas.duty_feedforward",
+        }
+        loop = LOOP_TYPES[cfg.ctrl.loops[current].type]
+        wires.update({f"{current}.{port}": sources[port] for port in loop.inputs
+                      if port in sources and sources[port] is not None})
+        outputs = {port: f"{current}.{port}" for port in interface.outputs
+                   if port in loop.outputs}
+    else:
+        outputs = {}
+    return wires, outputs
 
 
 @dataclass
@@ -1853,13 +1983,14 @@ class GraphController(_GraphRuntime):
                and (not source.startswith("references.") or source in observed or source in used)},
             **{f"{name}.{port}": f"{name}.{port}"
                for name, node in self.graph.nodes.items() for port in node.log_outputs},
+            **{name: name for name in self.graph.observation_names},
         })
         self._logs_loop_outputs = any(
             source in self.graph.values for source in self._log_sources.values()
         )
         self._last_measurement = ConverterMeasurement(vin=cfg.dclink.vdc_ref)
         self._command_ports = tuple(port for port in self.graph.interface.outputs
-                                    if port in self.graph.outputs)
+                                    if port != "enable" and port in self.graph.outputs)
         self._last_outputs = {port: (topology.neutral_duty if port == "duty" else 0.0)
                               for port in self._command_ports}
         if self.continuous:
@@ -1914,7 +2045,10 @@ class GraphController(_GraphRuntime):
         outputs = {port: float(self.graph.output(port, measurement))
                    for port in self._command_ports}
         self._last_measurement, self._last_outputs = measurement, outputs
-        gates = self.startup.active
+        gates = self.startup.active and (
+            "enable" not in self.graph.outputs
+            or bool(self.graph.output("enable", measurement))
+        )
         log = self._log(outputs, gates) if self.logging else None
         return BridgeControlOutput(
             log=log,
@@ -1951,6 +2085,7 @@ class GraphController(_GraphRuntime):
                        for name, value in self.graph.references.items()})
         if self._logs_loop_outputs:
             values.update(self.graph.values)
+        values.update(self.graph.observations())
         self.last_log = {name: values[source] for name, source in self._log_sources.items()}
         return self.last_log
 
@@ -1975,7 +2110,10 @@ class GraphController(_GraphRuntime):
         )
 
     def summary(self) -> dict[str, Any]:
-        return {"alarms": []}
+        return {
+            **self.graph.summary(),
+            "alarms": [],
+        }
 
 
 def make_controller(cfg, **kwargs):
@@ -2007,6 +2145,19 @@ register_control_type(
     default_bridge="half_bridge",
     controller_factory=GraphController,
     reference_validator=validate_scalar_voltage_references,
+)
+register_control_type(
+    "current",
+    references=ScalarCurrentReferenceParams,
+    unit_types=frozenset(("dc_converter",)),
+    interface=CURRENT_CONVERTER_INTERFACE,
+    wiring=_dc_converter_wiring,
+    log_sources=_converter_log_sources(
+        input_voltage="meas.vin",
+        current_reference="references.current",
+    ),
+    default_bridge="half_bridge",
+    controller_factory=GraphController,
 )
 register_control_type(
     "open_loop",

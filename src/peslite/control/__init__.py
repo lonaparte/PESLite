@@ -12,7 +12,7 @@ solver's kernel: the hardware adapts to its interface (:class:`Measurement`, :cl
 from ..solver import ConfigError
 from .blocks import Filter, Integrator, OutputLimit, PI, complex_power, unit_delay
 from .loops import (ANGLE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES, MODE, POWER, V, V_AB, V_DQ,
-                    DUTY_RATIO, HERTZ, MODULATION, SI_CURRENT, SI_VOLTAGE, SI_POWER,
+                    DUTY_RATIO, ENABLE, HERTZ, MODULATION, SI_CURRENT, SI_VOLTAGE, SI_POWER,
                     DCVoltageControl, ThreePhaseModulation,
                     InductorCurrentControl, PowerControl, PhasePowerControl, FrequencyPowerControl,
                     VoltageControl, PhaseVoltageControl, FrequencyVoltageControl, CurrentControl,
@@ -26,17 +26,18 @@ from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, Cont
                          Startup, VSCController, default_wiring,
                          make_controller)
 from .mpc import CCSMPC, FCSMPC, LinearModel, MPCResult, QuadraticProblem, SolverResult, solve_slsqp
-from .mpc_controller import MPCCurrentController, MPCCurrentReferences, MPCOptions
+from .predictive import PredictiveCurrentControl, ThreePhasePredictiveCurrentControl
 from .profiles import register_control_type
 
 __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter",
            "complex_power", "unit_delay", "SignalType", "ConfigError",
-           "SI_CURRENT", "SI_VOLTAGE", "SI_POWER", "DUTY_RATIO", "MODULATION", "HERTZ", "MODE",
+           "SI_CURRENT", "SI_VOLTAGE", "SI_POWER", "DUTY_RATIO", "MODULATION", "HERTZ", "MODE", "ENABLE",
            "DCVoltageControl", "InductorCurrentControl", "PowerControl", "PhasePowerControl",
            "FrequencyPowerControl", "VoltageControl", "PhaseVoltageControl",
            "FrequencyVoltageControl", "CurrentControl", "PhaseCurrentControl",
            "FrequencyCurrentControl", "ResonantModulation", "PhaseShiftModulation",
-           "DutyModulation", "ThreePhaseModulation",
+           "DutyModulation", "ThreePhaseModulation", "PredictiveCurrentControl",
+           "ThreePhasePredictiveCurrentControl",
            "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER",
            "LOOP_TYPES", "register_loop_type", "ControlInterface", "CONTROL_INTERFACE",
@@ -44,5 +45,4 @@ __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter",
            "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
            "BridgeControlOutput", "ConverterMeasurement", "Controller", "Startup", "VSCController", "GraphController",
            "make_controller", "register_control_type", "LinearModel", "CCSMPC", "FCSMPC",
-           "MPCResult", "QuadraticProblem", "SolverResult", "solve_slsqp",
-           "MPCCurrentController", "MPCCurrentReferences", "MPCOptions"]
+           "MPCResult", "QuadraticProblem", "SolverResult", "solve_slsqp"]

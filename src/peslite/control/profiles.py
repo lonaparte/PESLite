@@ -40,6 +40,13 @@ class ScalarVoltageReferenceParams:
 
 
 @dataclass(frozen=True)
+class ScalarCurrentReferenceParams:
+    """Inductor-current reference in amperes for scalar converter control."""
+
+    current: float
+
+
+@dataclass(frozen=True)
 class ResonantReferenceParams:
     """Fundamental commands and an optional signed port-power reference (W)."""
 

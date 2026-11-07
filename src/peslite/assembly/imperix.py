@@ -17,7 +17,7 @@ from . import imperix_build
 from .cpp import (_CONTROL_MATH, _CPP_TYPES, _MOVING_WINDOW, _ControlGenerator, _Expression,
                   _ModelGenerator, _ProtectionGenerator,
                   _controller_implementation, _identifier, _literal, _number,
-                  _parameter_generator, _prepare_export)
+                  _parameter_generator, _prepare_export, _validate_native_control_graph)
 from .exporter import ExportResult, _exporter, _signal_names
 from .validate import _whole
 
@@ -61,6 +61,7 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
     """An allocation-free hardware boundary for the existing control-loop tracer."""
 
     continuous = False
+    export_target = "Imperix export"
 
     def __init__(self, name, unit, model, binding):
         super().__init__(name, unit, model, "u")
@@ -267,6 +268,8 @@ def _bindings(simulation, config, model, *, events=None):
     for name, unit in units.items():
         if unit.continuous:
             raise TypeError(f"{name}: Imperix requires a supported sampled control graph")
+        # Reject unsupported control equations before hardware-specific bindings obscure them.
+        _validate_native_control_graph(unit.ctrl, "Imperix export")
         if unit.cfg.pwm.pattern_sync == "pulse":
             raise TypeError(f"{name}: the Imperix hardware PWM adapter does not implement "
                             "complete-pulse updates")

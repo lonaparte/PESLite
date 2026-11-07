@@ -5699,14 +5699,29 @@ _NATIVE_MODULATORS = {
 }
 
 
+def _validate_native_control_graph(ctrl: Any, target: str = "C++ export") -> None:
+    """Reject graph loops which deliberately have no native equation generator."""
+    graph = getattr(ctrl, "graph", None)
+    unsupported = (() if graph is None else tuple(
+        name for name, node in graph.nodes.items() if not node.cpp_export
+    ))
+    if unsupported:
+        raise TypeError(
+            f"{target}: control loop(s) have no native generator: " + ", ".join(unsupported)
+        )
+
+
 class _ControlGenerator:
     """Shared names and configuration expressions for generated unit controllers."""
+
+    export_target = "C++ export"
 
     def __init__(self, name: str, unit: Any, model: _ModelGenerator, prefix: str) -> None:
         self.name, self.unit, self.model = name, unit, model
         self.tag = _identifier(name)
         self.cfg, self.ctrl = model.runtime.copy(unit.cfg), model.runtime.object(unit.ctrl)
         self.graph = getattr(self.ctrl, "graph", None)
+        _validate_native_control_graph(self.ctrl, self.export_target)
         modulator = getattr(unit.bridge, "modulator", None)
         self.modulation = next((adapter() for cls, adapter in _NATIVE_MODULATORS.items()
                                 if modulator is not None and _uses_implementation(modulator, cls)), None)

@@ -2,7 +2,7 @@
 
 import copy
 import math
-from dataclasses import replace
+from dataclasses import dataclass
 
 import numpy as np
 import pytest
@@ -10,19 +10,29 @@ from scipy.integrate import quad
 
 import peslite
 from peslite.assembly.params import from_dict, read_initial
-from peslite.control import ConverterMeasurement, Measurement
+from peslite.control import (ConverterMeasurement, Measurement, PredictiveCurrentControl,
+                             register_loop_type)
 from peslite.control.mpc import MPCResult
-from peslite.control.mpc_controller import MPCCurrentController
-from peslite.control.profiles import CONTROL_TYPES, register_control_type
 from test_dc_converters import _case as dc_case
+
+
+_DC_MPC = "PredictiveCurrentControl"
+_AC_MPC = "ThreePhasePredictiveCurrentControl"
+
+
+def _controller(simulation, unit=None):
+    host = simulation.unit(unit).ctrl
+    return host, host.graph.nodes[_DC_MPC if unit in (None, "converter") else _AC_MPC]
 
 
 def _dc(mode="pwm_averaging", **overrides):
     params = dc_case(model=mode, lower_controlled=True, t_end=0.003, ac_base=False)
     return params.replace(**{
         "units.converter.ctrl": {
-            "type": "mpc_dc", "references": {"current": 4.0},
-            "options": {"algorithm": "ccs", "prediction_horizon": 4, "control_horizon": 3},
+            "type": "current", "references": {"current": 4.0},
+            "loops": {_DC_MPC: {
+                "algorithm": "ccs", "prediction_horizon": 4, "control_horizon": 3,
+            }},
         },
         "units.converter.connected": True,
         "simulation.progress.enable": False,
@@ -36,15 +46,31 @@ def _ac(case, mode="pwm_averaging", **overrides):
     tree = case()
     unit = tree["units"]["vsc"]
     unit["ctrl"] = {
-        "type": "mpc_vsc", "references": {"id_ref_pu": 0.3},
-        "options": {"algorithm": "fcs", "prediction_horizon": 2, "control_horizon": 2},
+        "type": "gfl", "references": {"id_ref_pu": 0.3},
+        "loops": {
+            "SRFPLL": {"kp_pu": 20.0, "ki_pu": 1200.0},
+            _AC_MPC: {"algorithm": "fcs", "prediction_horizon": 2, "control_horizon": 2},
+        },
     }
     unit["bridge"]["model"] = mode
     unit["dclink"] = {"vdc_ref": 1500.0, "source": {"type": "voltage"}}
     unit["connected"] = True
-    tree["simulation"].update(t_end=0.002, progress={"enable": False},
+    tree["simulation"].update(t_end=0.008, progress={"enable": False},
                               output={"period": 50e-6, "precision": 17})
     return from_dict(tree).replace(**overrides)
+
+
+def test_current_profile_is_not_specific_to_mpc():
+    params = _dc(**{
+        "units.converter.ctrl.loops": {
+            "InductorCurrentControl": {
+                "kp": 0.02, "ki": 20.0, "minimum": 0.0, "maximum": 1.0,
+            },
+        },
+    })
+    graph = peslite.Simulation(params).unit().ctrl.graph
+    assert graph.connections["InductorCurrentControl.reference"] == "references.current"
+    assert graph.outputs == {"duty": "InductorCurrentControl.duty"}
 
 
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging"])
@@ -66,42 +92,42 @@ def test_buck_mpc_tracks_current_and_load_change_with_bounded_duty(mode, tmp_pat
     assert np.mean(current[before]) == pytest.approx(4.0, abs=0.2)
     assert np.mean(current[after]) == pytest.approx(5.0, abs=0.2)
     assert result.states["output.u_C"][-1] == pytest.approx(20.0, abs=1.0)
-    duties = result.states["converter.ctrl.previous_input.0"]
+    duties = result.states[f"converter.ctrl.{_DC_MPC}.previous_input.0"]
     assert np.all((duties >= 0) & (duties <= 1))
-    assert simulation.unit().ctrl.fallback_count == 0
+    assert _controller(simulation)[1].fallback_count == 0
 
 
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging"])
 @pytest.mark.parametrize("algorithm", ["ccs", "fcs"])
 def test_three_phase_mpc_tracks_dq_current_at_rated_physical_scale(case, mode, algorithm, tmp_path):
-    params = _ac(case, mode, **{"units.vsc.ctrl.options.algorithm": algorithm})
+    params = _ac(case, mode, **{f"units.vsc.ctrl.loops.{_AC_MPC}.algorithm": algorithm})
     simulation = peslite.Simulation(params)
     result = simulation.run(out_dir=tmp_path)
     current = result.states["vsc.branch_f.i.re"] + 1j * result.states["vsc.branch_f.i.im"]
     # Compare against the measured PCC frame, as specified by the current reference contract.
     voltage = result.states["pcc.u_C.re"] + 1j * result.states["pcc.u_C.im"]
     dq = current * np.exp(-1j * np.angle(voltage)) / params.base.i_phase_peak
-    settled = result.t >= 0.001
+    settled = result.t >= 0.006
     assert np.mean(dq[settled].real) == pytest.approx(0.3, abs=0.06)
     assert np.mean(dq[settled].imag) == pytest.approx(0.0, abs=0.06)
     for leg in range(3):
-        duty = result.states[f"vsc.ctrl.previous_input.{leg}"]
+        duty = result.states[f"vsc.ctrl.{_AC_MPC}.previous_input.{leg}"]
         assert np.all((duty >= 0.0) & (duty <= 1.0))
         if algorithm == "fcs":
             assert set(duty) <= {0.0, 1.0}
-    assert simulation.unit().ctrl.fallback_count == 0
+    assert _controller(simulation, "vsc")[1].fallback_count == 0
 
 
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging"])
 def test_finite_set_buck_tracks_current_using_binary_commands(mode, tmp_path):
-    params = _dc(mode, **{"units.converter.ctrl.options.algorithm": "fcs"})
+    params = _dc(mode, **{f"units.converter.ctrl.loops.{_DC_MPC}.algorithm": "fcs"})
     simulation = peslite.Simulation(params)
     result = simulation.run(out_dir=tmp_path)
     settled = result.t >= 0.002
     # The finite voltage set creates a bounded current ripple around the mean reference.
     assert np.mean(result.states["converter.branch_f.i"][settled]) == pytest.approx(4.0, abs=0.4)
-    assert set(result.states["converter.ctrl.previous_input.0"]) <= {0.0, 1.0}
-    assert simulation.unit().ctrl.fallback_count == 0
+    assert set(result.states[f"converter.ctrl.{_DC_MPC}.previous_input.0"]) <= {0.0, 1.0}
+    assert _controller(simulation)[1].fallback_count == 0
 
 
 @pytest.mark.parametrize("resistance", [0.0, 0.05])
@@ -118,13 +144,14 @@ def test_dc_predictor_matches_independent_split_interval_rl_solution(
         "units.converter.ctrl.offset": offset,
         "units.converter.ctrl.computation": computation,
     })
-    controller = peslite.Simulation(params).unit().ctrl
-    controller.command(True)
-    controller.startup.advance()
+    simulation = peslite.Simulation(params)
+    host, controller = _controller(simulation)
+    host.command(True)
+    host.startup.advance()
     controller.previous_enabled = True
     controller.previous_input[:] = 0.25
-    measurement = ConverterMeasurement(current=2.0, voltage=18.0, vin=48.0)
-    state, _, models = controller.prediction(offset, measurement)
+    inputs = {"reference": 4.0, "current": 2.0, "voltage": 18.0, "vin": 48.0}
+    state, _, models = controller.prediction(offset, inputs)
     action = np.array([0.7])
     predicted = models[0].A @ state + models[0].B @ action + models[0].offset
 
@@ -143,13 +170,23 @@ def test_dc_predictor_matches_independent_split_interval_rl_solution(
 
 def test_ac_predictor_matches_independent_sinusoidal_forcing_integral(case):
     params = _ac(case, **{"units.vsc.ctrl.offset": 10e-6, "units.vsc.ctrl.computation": 2e-6})
-    controller = peslite.Simulation(params).unit().ctrl
-    controller.command(True)
-    controller.startup.advance()
+    simulation = peslite.Simulation(params)
+    host, controller = _controller(simulation, "vsc")
+    host.command(True)
+    host.startup.advance()
     controller.previous_enabled = True
     controller.previous_input[:] = [1, 0, 0]
     measurement = Measurement(10e-6, 420 + 150j, 20 - 5j, 1500.0, np.zeros(3))
-    state, _, models = controller.prediction(measurement.t, measurement)
+    inputs = {
+        "v": measurement.u_g / params.base.v_phase_peak,
+        "i": measurement.i_c / params.base.i_phase_peak,
+        "u_dc": measurement.u_dc / params.unit("vsc").dc_base.v,
+        "frame": np.angle(measurement.u_g),
+        "omega": params.base.w0,
+        "id_ref": 0.3,
+        "iq_ref": 0.0,
+    }
+    state, _, models = controller.prediction(measurement.t, inputs)
     action = np.array([0, 1, 0])
     predicted = models[0].A @ state + models[0].B @ action + models[0].offset
     T, L, R, delay = controller.T, controller.L, controller.R, controller.delay
@@ -184,12 +221,13 @@ def test_mpc_uses_existing_adc_interrupt_and_pwm_load_clocks(
     })
     simulation = peslite.Simulation(params)
     unit = simulation.unit()
+    controller = unit.ctrl.graph.nodes[_DC_MPC]
     calls, conversions, writes, loads = [], [], [], []
-    solve, convert, write, load = unit.ctrl.solve, unit.adc.convert, unit.bridge.write, unit.bridge.load
+    solve, convert, write, load = controller.solve, unit.adc.convert, unit.bridge.write, unit.bridge.load
 
-    def solve_recorded(t, measurement):
-        calls.append((t, measurement.current))
-        return solve(t, measurement)
+    def solve_recorded(t, inputs):
+        calls.append((t, inputs["current"]))
+        return solve(t, inputs)
 
     def convert_recorded(t):
         value = convert(t)
@@ -205,7 +243,7 @@ def test_mpc_uses_existing_adc_interrupt_and_pwm_load_clocks(
         loads.append((t, unit.bridge.get_state()))
         return result
 
-    monkeypatch.setattr(unit.ctrl, "solve", solve_recorded)
+    monkeypatch.setattr(controller, "solve", solve_recorded)
     monkeypatch.setattr(unit.adc, "convert", convert_recorded)
     monkeypatch.setattr(unit.bridge, "write", write_recorded)
     monkeypatch.setattr(unit.bridge, "load", load_recorded)
@@ -217,8 +255,8 @@ def test_mpc_uses_existing_adc_interrupt_and_pwm_load_clocks(
         # Before the first independent ADC tick the sample is seeded from the zero-current plant.
         latest = [0.0, *(sample for t, sample in conversions if t <= interrupt)][-1]
         assert value == latest
-    assert unit.ctrl.solve_count == len(calls)
-    assert unit.ctrl.delay == pytest.approx(delay)
+    assert controller.solve_count == len(calls)
+    assert controller.delay == pytest.approx(delay)
     for at, state in loads:
         # Positive computation always writes after a coincident load, even below TIME_EPS.
         eligible = [value for when, value in writes
@@ -230,13 +268,21 @@ def test_mpc_uses_existing_adc_interrupt_and_pwm_load_clocks(
 
 def test_prediction_does_not_mutate_plant_or_adc_measurement(case):
     simulation = peslite.Simulation(_ac(case))
-    controller = simulation.unit().ctrl
-    controller.command(True)
-    controller.startup.advance()
+    host, controller = _controller(simulation, "vsc")
+    host.command(True)
+    host.startup.advance()
     before = simulation.system.get_state()
     measurement = Measurement(0.0, 500 + 20j, 10 + 2j, 1500.0, np.array([10.0, -3.0, -7.0]))
     original = copy.deepcopy(measurement)
-    controller.solve(0.0, measurement)
+    controller.solve(0.0, {
+        "v": measurement.u_g / simulation.p.base.v_phase_peak,
+        "i": measurement.i_c / simulation.p.base.i_phase_peak,
+        "u_dc": measurement.u_dc / simulation.p.unit("vsc").dc_base.v,
+        "frame": np.angle(measurement.u_g),
+        "omega": simulation.p.base.w0,
+        "id_ref": 0.3,
+        "iq_ref": 0.0,
+    })
     assert simulation.system.get_state() == before
     assert measurement.u_g == original.u_g
     assert measurement.i_c == original.i_c
@@ -247,16 +293,16 @@ def test_current_limit_is_enforced_in_predictions_and_representative_averaged_tr
     params = _dc(**{
         "simulation.t_end": 0.003,
         "units.converter.ctrl.references.current": 8.0,
-        "units.converter.ctrl.options.current_max": 5.0,
-        "units.converter.ctrl.options.input_max": 0.8,
+        f"units.converter.ctrl.loops.{_DC_MPC}.current_max": 5.0,
+        f"units.converter.ctrl.loops.{_DC_MPC}.input_max": 0.8,
     })
     simulation = peslite.Simulation(params)
-    controller = simulation.unit().ctrl
+    controller = _controller(simulation)[1]
     solve = controller.solve
     predictions = []
 
-    def recorded(t, measurement):
-        result = solve(t, measurement)
+    def recorded(t, inputs):
+        result = solve(t, inputs)
         if result.success:
             predictions.append(result.states[1:, 0])
         return result
@@ -264,8 +310,8 @@ def test_current_limit_is_enforced_in_predictions_and_representative_averaged_tr
     monkeypatch.setattr(controller, "solve", recorded)
     result = simulation.run(out_dir=tmp_path)
     assert predictions
-    assert max(np.max(values) for values in predictions) <= 5.0 + controller.options.feasibility_tolerance
-    assert np.max(result.states["converter.ctrl.previous_input.0"]) <= 0.8
+    assert max(np.max(values) for values in predictions) <= 5.0 + controller.cfg.feasibility_tolerance
+    assert np.max(result.states[f"converter.ctrl.{_DC_MPC}.previous_input.0"]) <= 0.8
     assert np.max(result.states["converter.branch_f.i"]) <= 5.05
     assert result.states["converter.branch_f.i"][-1] == pytest.approx(5.0, abs=0.05)
 
@@ -278,11 +324,12 @@ def test_mpc_results_are_consistent_under_step_refinement_and_multirate_integrat
         ("multirate", {"simulation.solver.subsystems": {"output": 0.5}}),
     ):
         actual = peslite.Simulation(params.replace(**changes)).run(out_dir=tmp_path / label)
-        for key in ("converter.branch_f.i", "output.u_C", "converter.ctrl.previous_input.0"):
+        for key in ("converter.branch_f.i", "output.u_C",
+                    f"converter.ctrl.{_DC_MPC}.previous_input.0"):
             np.testing.assert_allclose(actual.states[key], baseline.states[key],
                                        rtol=2e-5, atol=2e-5, err_msg=f"{label}: {key}")
-        np.testing.assert_array_equal(actual.states["converter.ctrl.solve_count"],
-                                      baseline.states["converter.ctrl.solve_count"])
+        np.testing.assert_array_equal(actual.states[f"converter.ctrl.{_DC_MPC}.solve_count"],
+                                      baseline.states[f"converter.ctrl.{_DC_MPC}.solve_count"])
 
 
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging"])
@@ -305,34 +352,35 @@ def test_repeated_and_resumed_mpc_run_preserves_decisions_and_plant_state(mode, 
 def test_runtime_options_and_reference_events_apply_without_changing_state_schema(tmp_path):
     params = _dc(**{"simulation.t_end": 0.0004, "events": {
         "retune": {"type": "set", "t": 0.0002, "set": {
-            "units.converter.ctrl.options.rate_weight": 0.2,
+            f"units.converter.ctrl.loops.{_DC_MPC}.rate_weight": 0.2,
             "units.converter.ctrl.references.current": 2.0,
         }},
     }})
     simulation = peslite.Simulation(params)
     names = set(simulation.unit().ctrl.get_state())
     simulation.run(out_dir=tmp_path)
-    controller = simulation.unit().ctrl
-    assert controller.options.rate_weight == 0.2
-    assert controller.p.ctrl.references.current == 2.0
-    assert set(controller.get_state()) == names
+    host, controller = _controller(simulation)
+    assert controller.cfg.rate_weight == 0.2
+    assert host.p.ctrl.references.current == 2.0
+    assert set(host.get_state()) == names
     assert controller.solve_count == 9
 
 
 @pytest.mark.parametrize("fallback", ["hold", "fixed", "block"])
 def test_infeasible_current_constraint_uses_admissible_fallback(fallback):
     params = _dc(**{
-        "units.converter.ctrl.options.current_max": 1.0,
-        "units.converter.ctrl.options.fallback": fallback,
-        "units.converter.ctrl.options.fallback_input": [0.4],
-        "units.converter.ctrl.options.input_min": 0.1,
-        "units.converter.ctrl.options.input_max": 0.9,
+        f"units.converter.ctrl.loops.{_DC_MPC}.current_max": 1.0,
+        f"units.converter.ctrl.loops.{_DC_MPC}.fallback": fallback,
+        f"units.converter.ctrl.loops.{_DC_MPC}.fallback_input": [0.4],
+        f"units.converter.ctrl.loops.{_DC_MPC}.input_min": 0.1,
+        f"units.converter.ctrl.loops.{_DC_MPC}.input_max": 0.9,
     })
-    controller = peslite.Simulation(params).unit().ctrl
-    controller.command(True)
+    simulation = peslite.Simulation(params)
+    host, controller = _controller(simulation)
+    host.command(True)
     controller.previous_input[:] = 0.3
     controller.previous_enabled = True
-    output = controller(0.0, ConverterMeasurement(current=100.0, voltage=24.0, vin=48.0))
+    output = host(0.0, ConverterMeasurement(current=100.0, voltage=24.0, vin=48.0))
     assert not controller.last_result.success
     assert controller.fallback_count == 1
     assert output.duty == pytest.approx(0.3 if fallback == "hold" else 0.4)
@@ -347,8 +395,8 @@ def test_start_stop_and_reconnect_suspend_optimization_and_resume_current_contro
     simulation = peslite.Simulation(params)
     result = simulation.run(out_dir=tmp_path)
     stopped = (result.t >= 0.00025) & (result.t < 0.0005)
-    assert np.ptp(result.states["converter.ctrl.solve_count"][stopped]) == 0
-    assert np.all(result.states["converter.ctrl.previous_enabled"][stopped] == 0)
+    assert np.ptp(result.states[f"converter.ctrl.{_DC_MPC}.solve_count"][stopped]) == 0
+    assert np.all(result.states[f"converter.ctrl.{_DC_MPC}.previous_enabled"][stopped] == 0)
     assert simulation.unit().ctrl.startup.complete
     assert simulation.unit().gates
 
@@ -360,15 +408,16 @@ def test_reconnect_between_interrupts_preserves_last_submitted_enable_in_predict
     }})
     simulation = peslite.Simulation(params)
     unit = simulation.unit()
-    solve = unit.ctrl.solve
+    controller = unit.ctrl.graph.nodes[_DC_MPC]
+    solve = controller.solve
     restarted = []
 
-    def recorded(t, measurement):
+    def recorded(t, inputs):
         if math.isclose(t, 0.00025, abs_tol=1e-15):
-            restarted.append((unit.ctrl.previous_enabled, unit.bridge.on, unit.breaker))
-        return solve(t, measurement)
+            restarted.append((controller.previous_enabled, unit.bridge.on, unit.breaker))
+        return solve(t, inputs)
 
-    monkeypatch.setattr(unit.ctrl, "solve", recorded)
+    monkeypatch.setattr(controller, "solve", recorded)
     simulation.run(out_dir=tmp_path)
     # No interrupt submitted a disabled PWM word while the terminal was disconnected.
     assert restarted == [(True, True, True)]
@@ -380,11 +429,11 @@ def test_converter_protection_remains_effective_during_optimizer_fallback(monkey
         "simulation.stop_on_trip": False,
         "units.converter.protection.overcurrent.enable": True,
         "units.converter.protection.overcurrent.limit_pu": 0.05,
-        "units.converter.ctrl.options.fallback": "fixed",
-        "units.converter.ctrl.options.fallback_input": [1.0],
+        f"units.converter.ctrl.loops.{_DC_MPC}.fallback": "fixed",
+        f"units.converter.ctrl.loops.{_DC_MPC}.fallback_input": [1.0],
     })
     simulation = peslite.Simulation(params)
-    controller = simulation.unit().ctrl
+    controller = _controller(simulation)[1]
     invalid = MPCResult(True, np.array([np.nan]), None, None, None, "invalid")
     monkeypatch.setattr(controller, "solve", lambda t, measurement: invalid)
     result = simulation.run(out_dir=tmp_path)
@@ -393,30 +442,37 @@ def test_converter_protection_remains_effective_during_optimizer_fallback(monkey
     assert not simulation.unit().gates
 
 
-class _DeadbeatMPC(MPCCurrentController):
-    def solve(self, t, measurement):
+@register_loop_type
+class _DeadbeatMPC(PredictiveCurrentControl):
+    @dataclass(frozen=True, kw_only=True)
+    class Params(PredictiveCurrentControl.Params):
+        type: str = "test_deadbeat_mpc"
+
+    type = "test_deadbeat_mpc"
+
+    def solve(self, t, inputs):
         decay = math.exp(-self.R * self.T / self.L)
         gain = self.T / self.L if self.R == 0 else (1 - decay) / self.R
-        duty = ((self.p.ctrl.references.current - decay * measurement.current) / gain
-                + measurement.voltage) / measurement.vin
-        action = np.array([np.clip(duty, self.options.input_min, self.options.input_max)])
+        duty = ((inputs["reference"] - decay * inputs["current"]) / gain
+                + inputs["voltage"]) / inputs["vin"]
+        action = np.array([np.clip(duty, self.cfg.input_min, self.cfg.input_max)])
         return MPCResult(True, action, None, None, None, "deadbeat")
 
 
-_custom = replace(CONTROL_TYPES["mpc_dc"], name="test_custom_mpc", controller_factory=_DeadbeatMPC)
-register_control_type(_custom.name, **{key: value for key, value in vars(_custom).items() if key != "name"})
-
-
-def test_custom_mpc_algorithm_is_registered_without_runner_changes(tmp_path):
+def test_custom_mpc_loop_is_registered_without_runner_changes(tmp_path):
     params = _dc(**{
-        "units.converter.ctrl.type": "test_custom_mpc",
+        "units.converter.ctrl.loops": {
+            "deadbeat": {"type": "test_deadbeat_mpc", "prediction_horizon": 4,
+                         "control_horizon": 3},
+        },
         "units.converter.ctrl.computation": 0.0,
         "simulation.t_end": 0.001,
     })
     simulation = peslite.Simulation(params)
     result = simulation.run(out_dir=tmp_path)
-    assert isinstance(simulation.unit().ctrl, _DeadbeatMPC)
-    assert simulation.unit().ctrl.last_result.status == "deadbeat"
+    controller = simulation.unit().ctrl.graph.nodes["deadbeat"]
+    assert isinstance(controller, _DeadbeatMPC)
+    assert controller.last_result.status == "deadbeat"
     assert result.states["converter.branch_f.i"][-1] == pytest.approx(4.0, abs=0.1)
 
 
@@ -431,6 +487,6 @@ def test_mpc_export_is_explicitly_rejected_without_generating_files(format, tmp_
             "startup_ramp": 0.0, "hardware_overcurrent_configured": True,
         }}}}
     out = tmp_path / "exported"
-    with pytest.raises(TypeError, match="controller.*no generator"):
+    with pytest.raises(TypeError, match="loop|generator"):
         simulation.export(format, out, **options)
     assert not out.exists()

@@ -15,19 +15,21 @@ units:
     # bridge: {model: pwm_averaging}
     pwm: {f_sw: 20000.0}
     ctrl:
-      type: mpc_vsc
+      type: gfl
       period: 50.0e-6
       computation: 1.0e-6
       references: {id_ref_pu: 0.4}
-      options:
-        algorithm: fcs
-        # prediction_horizon: 3
-        control_horizon: 2
-        rate_weight: 0.02
-        current_min: -25.0
-        current_max: 25.0
-        max_evaluations: 64
-        # fallback: hold
+      loops:
+        SRFPLL: {kp_pu: 20.0, ki_pu: 1200.0}
+        ThreePhasePredictiveCurrentControl:
+          algorithm: fcs
+          # prediction_horizon: 3
+          control_horizon: 2
+          rate_weight: 0.02
+          current_min: -25.0
+          current_max: 25.0
+          max_evaluations: 64
+          # fallback: hold
     protection:
       overcurrent: {enable: true, limit_pu: 1.4}
 events:
