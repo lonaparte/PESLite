@@ -17,7 +17,7 @@ from . import imperix_build
 from .cpp import (_CONTROL_MATH, _CPP_TYPES, _MOVING_WINDOW, _ControlGenerator, _Expression,
                   _ModelGenerator, _ProtectionGenerator,
                   _controller_implementation, _identifier, _literal, _number,
-                  _parameter_generator, _prepare_export)
+                  _parameter_generator, _prepare_export, _validate_native_control_graph)
 from .exporter import ExportResult, _exporter, _signal_names
 from .validate import _whole
 
@@ -61,6 +61,7 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
     """An allocation-free hardware boundary for the existing control-loop tracer."""
 
     continuous = False
+    export_target = "Imperix export"
 
     def __init__(self, name, unit, model, binding):
         super().__init__(name, unit, model, "u")
@@ -118,14 +119,10 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
         lines = self._sampled_measurement_lines()
         lines += self._sampled_loop_lines()
         if isinstance(self.ctrl, VSCController):
-            members += [f"Complex {self.m('u_cmd')} = {_literal(self.ctrl.u_cmd)};",
-                        f"double {self.m('theta')} = {_number(self.ctrl.theta)};",
-                        f"double {self.m('omega')} = {_number(self.ctrl.omega)};",
-                        f"double {self.m('command_theta')} = {_number(self.ctrl.command_theta)};"]
-            lines += self._sampled_vsc_command_lines()
-            modulation, _ = self._modulation_values(
-                self.m("u_cmd"), self.m("command_theta"), self._adc_value("u_dc"))
-            output = SimpleNamespace(d_abc=tuple(0.5 * (1.0 + value) for value in modulation))
+            output = SimpleNamespace(d_abc=tuple(
+                _Expression(self.source(self.graph.outputs[port]), "real")
+                for port in ("d_a", "d_b", "d_c")
+            ))
             voltage = "std::abs(meas_u_g)"
             frequency = f"({self.source(self.graph.outputs['omega'])} - {_number(self.cfg.base.w0)}) / (2.0 * pi)"
             vdc_error = f"meas_u_dc - {self._reference('vdc_ref_pu')}"
@@ -267,6 +264,8 @@ def _bindings(simulation, config, model, *, events=None):
     for name, unit in units.items():
         if unit.continuous:
             raise TypeError(f"{name}: Imperix requires a supported sampled control graph")
+        # Reject unsupported control equations before hardware-specific bindings obscure them.
+        _validate_native_control_graph(unit.ctrl, "Imperix export")
         if unit.cfg.pwm.pattern_sync == "pulse":
             raise TypeError(f"{name}: the Imperix hardware PWM adapter does not implement "
                             "complete-pulse updates")

@@ -32,6 +32,7 @@ nav:
       - Black-box Models: Black-Box-Models.md
   - Advanced:
       - Architecture: Architecture.md
+      - Model Predictive Control: Model-Predictive-Control.md
       - Plotting: Plotting.md
       - Online Stability Analysis: Online-Stability-Analysis.md
       - Extending PESLite: Extending-PESLite.md

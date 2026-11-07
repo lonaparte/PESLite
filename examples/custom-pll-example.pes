@@ -20,6 +20,7 @@ units:
       loops:
         VoltageAdaptivePLL: {bandwidth: 20.0}
         CurrentLoop: {bandwidth: 200.0}
+        ThreePhaseModulation: {}
         DCVoltageControl: {kp: 0.8, ki: 90.0, minimum: 0.0, maximum: 1.15,
                            feedforward: 0.9, output_polarity: -1.0}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}

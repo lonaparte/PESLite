@@ -40,6 +40,13 @@ class ScalarVoltageReferenceParams:
 
 
 @dataclass(frozen=True)
+class ScalarCurrentReferenceParams:
+    """Inductor-current reference in amperes for scalar converter control."""
+
+    current: float
+
+
+@dataclass(frozen=True)
 class ResonantReferenceParams:
     """Fundamental commands and an optional signed port-power reference (W)."""
 
@@ -71,7 +78,14 @@ class PhaseShiftReferenceParams:
 
 @dataclass(frozen=True)
 class ControlTypeSpec:
-    """Behavior selected by one ``ctrl.type`` value."""
+    """Behavior selected by one ``ctrl.type`` value.
+
+    ``options`` is the optional dataclass schema for ``ctrl.options``. A standalone controller
+    sets ``requires_loops=False`` and may validate cross-field relationships with ``validator``.
+    ``supported_models`` restricts bridge simulation forms before constructing runtime parts.
+    ``wiring(cfg, continuous=...)`` returns the default connections and boundary outputs for the
+    selected graph execution form.
+    """
 
     name: str
     references: type | None = None
@@ -83,6 +97,10 @@ class ControlTypeSpec:
     default_bridge: str | None = None
     controller_factory: Callable[..., Any] | None = None
     reference_validator: Callable[[Any, str], None] | None = None
+    options: type | None = None
+    requires_loops: bool = True
+    supported_models: frozenset[str] | None = None
+    validator: Callable[[Any, str], None] | None = None
     # Registered modulator (components.pwm.MODULATOR_TYPES) of a sampled bridge commanded by
     # this type's outputs; None: the carrier modulation of duty ratios.
     modulator: str | None = None

@@ -22,6 +22,7 @@ units:
       loops:
         DVOC: {eta_pu: 6.2832, alpha_pu: 62.832, kappa: 1.5708}
         VirtualImpedance: {x_v_pu: 0.05}
+        ThreePhaseModulation: {}
       references: {p_ref_pu: 0.5}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 events:

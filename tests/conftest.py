@@ -65,6 +65,7 @@ CASE = {
         "ctrl": {"type": "gfl", "loops": {
             "SRFPLL": {"period": 5e-5, "kp_pu": 20.0, "ki_pu": 1200.0},
             "CurrentLoop": {"period": 5e-5, "bandwidth": 200.0},
+            "ThreePhaseModulation": {"period": 5e-5},
             "DCVoltageControl": {"period": 5e-5, "kp": 0.8, "ki": 90.0,
                                  "minimum": 0.0, "maximum": 1.15,
                                  "feedforward": 0.9, "output_polarity": -1.0},

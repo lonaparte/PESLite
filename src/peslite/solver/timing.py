@@ -40,7 +40,27 @@ def resolve_clock_offset(period: float, offset: float | None, default: float = 0
     return default % period if offset is None else offset
 
 
-def control_clock_offset(control, pwm) -> float:
+def control_period(control, pwm) -> float:
+    """Return the configured control period or its carrier-period default."""
+    return pwm.switching_period if control.period is None else control.period
+
+
+def control_computation(control) -> float:
+    """Return the configured computation delay or its sampled-control default."""
+    return 1.0e-6 if control.computation is None else control.computation
+
+
+def control_clock_offset(control, pwm, *, pwm_timed: bool = True) -> float:
     """Resolve a controller's clock position from the ordinary control and PWM fields."""
-    period = pwm.switching_period if control.period is None else control.period
-    return resolve_clock_offset(period, control.offset, pwm.grid_offset)
+    period = control_period(control, pwm)
+    return resolve_clock_offset(period, control.offset, pwm.grid_offset if pwm_timed else 0.0)
+
+
+def control_actuation_clock(control, pwm, *, pwm_timed: bool = True) -> PeriodicClock:
+    """Return the grid on which a sampled command becomes electrically active."""
+    if pwm_timed:
+        return PeriodicClock(pwm.load_period, pwm.grid_offset)
+    period = control_period(control, pwm)
+    offset = (control_clock_offset(control, pwm, pwm_timed=False)
+              + control_computation(control))
+    return PeriodicClock(period, offset % period)

@@ -98,6 +98,7 @@ units:                     # converters, one entry each
           # decoupling: 1
           # feedforward: 1
           # antiwindup: 1     # tracking anti-windup after controller output limiting
+        ThreePhaseModulation: {} # dq voltage command to the three bridge duty cycles
         DCVoltageControl:
           kp: 0.8
           ki: 90.0
@@ -107,7 +108,8 @@ units:                     # converters, one entry each
           output_polarity: -1.0 # positive d-axis export current lowers the DC-link voltage
           # antiwindup: 1
       # connections: {CurrentLoop.id_ref: DCVoltageControl.current_reference}
-      # outputs: {u_dq: CurrentLoop.u_dq, theta: SRFPLL.theta, omega: SRFPLL.omega}
+      # outputs: {d_a: ThreePhaseModulation.d_a, d_b: ThreePhaseModulation.d_b,
+      #           d_c: ThreePhaseModulation.d_c, theta: SRFPLL.theta, omega: SRFPLL.omega}
       # references:        # constant inputs, pu on this unit's base
       #   id_ref_pu: 0.0
       #   iq_ref_pu: 0.0

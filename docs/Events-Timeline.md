@@ -43,8 +43,8 @@ first connection event, or connected when it has no connection events. Events at
 simulation start take precedence; later events continue to write the same command normally.
 
 Its C++ export selection is described in [C++ Export](Cpp-Export.md#exported-variables).
-The command does not reset a protection latch or force a PWM register load. In sampled models,
-startup, control computation and the existing PWM load timing determine when the gates activate.
+The command does not reset a protection latch or force an actuation boundary. In sampled models,
+startup, control computation and the bridge's actuation timing determine when the gates activate.
 
 ### `connect`
 
@@ -142,7 +142,7 @@ Depending on the selected model, named state includes:
 
 - physical network, filter and DC-link state;
 - controller integrators, filters, startup progress and protection timers;
-- PWM active and shadow registers and enable bits;
+- sampled bridge active and pending command registers and enable bits;
 - ADC averaging-window accumulators;
 - multirate window anchors, slopes and input integrals, so a row inside a window retains the
   required solver state;
@@ -155,12 +155,12 @@ rejected:
 
 - between two control interrupts of a unit whose ADC oversamples (`meas.period` shorter than
   `ctrl.period`);
-- inside a controller computation window when the next PWM register load would take a word that
-  no load has applied yet (see
+- inside a controller computation window when the next actuation boundary would take a command
+  that no boundary has applied yet (see
   [Computation time](Bridge-and-PWM.md#computation-time)).
 
-Ideal averaging has no PWM register state or ADC samples; its continuous controller state, and the
-history of any `meas.rms` window, are restored with the plant state instead.
+Continuous ideal averaging restores its controller state and `meas.rms` history with the plant
+state. A sampled-only graph also restores its held commands and ADC state.
 
 ## Restart consistency
 

@@ -16,12 +16,15 @@ from typing import TYPE_CHECKING, Optional
 from ..components.converter import make_topology
 from ..components.pwm import validate_modulator
 from ..components.network import element_buses
+from ..control.controller import continuous_control
 from ..control.profiles import control_type
 from ..solver.integrators import (ADAPTIVE_METHODS, EXPLICIT_FIXED_METHODS, FIXED_METHODS,
                                   IMPLICIT_ADAPTIVE_METHODS, IMPLICIT_FIXED_METHODS)
 from ..solver.model import ConfigError
 from ..solver.multirate import own_schedule, parse_step
-from ..solver.timing import TIME_EPS, PeriodicClock, control_clock_offset
+from ..solver.timing import (TIME_EPS, PeriodicClock, control_actuation_clock,
+                             control_clock_offset, control_computation as _computation,
+                             control_period as _period)
 from .events import NAMED, SWITCHABLE, SWITCHING
 from .types import unit_type
 
@@ -83,7 +86,8 @@ def _dclink(cfg, where):
         raise ConfigError(f"{where}: a voltage source with a capacitor requires positive source resistance or ESR")
 
 
-def _pwm(w, base, where: str, continuous: bool = False, *, dead_time_active: bool = True) -> None:
+def _pwm(w, base, where: str, carrier_unused: bool = False, *,
+         dead_time_active: bool = True) -> None:
     """Check switching frequency, phase and synchronous pulse ratio."""
     if not math.isfinite(w.f_sw) or w.f_sw <= 0.0:
         raise ConfigError(f"{where}.f_sw must be finite and positive, got {w.f_sw}")
@@ -92,7 +96,7 @@ def _pwm(w, base, where: str, continuous: bool = False, *, dead_time_active: boo
     if not math.isfinite(w.dead_time) or w.dead_time < 0.0:
         raise ConfigError(f"{where}.dead_time must be finite and nonnegative, got {w.dead_time}")
     if not dead_time_active and (w.dead_time > 0.0 or w.dead_time_compensation):
-        reason = ("ideal averaging" if continuous
+        reason = ("ideal averaging" if carrier_unused
                   else "a bridge without a complementary controlled pair")
         warnings.warn(
             f"{where}.dead_time and {where}.dead_time_compensation are ignored by {reason}",
@@ -100,7 +104,7 @@ def _pwm(w, base, where: str, continuous: bool = False, *, dead_time_active: boo
         )
     if dead_time_active and w.dead_time >= 0.5 * w.switching_period:
         raise ConfigError(f"{where}.dead_time must be shorter than half a switching period")
-    if not continuous and w.sync == "synchronous":
+    if not carrier_unused and w.sync == "synchronous":
         base.require("f0", where=f"{where}.sync = 'synchronous'")
         ratio = w.f_sw / base.f0
         if abs(ratio - round(ratio)) > 1e-9 * np.maximum(1.0, ratio):
@@ -108,17 +112,8 @@ def _pwm(w, base, where: str, continuous: bool = False, *, dead_time_active: boo
                               f"pwm.f_sw / base.f0, got {w.f_sw} / {base.f0} = {ratio}")
 
 
-def _period(c, pwm) -> float:
-    """The control period (s), defaulting to one carrier period."""
-    return c.period if c.period is not None else pwm.switching_period
-
-
-def _computation(c) -> float:
-    """The controller computation time (s), defaulting to 1 us."""
-    return 1.0e-6 if c.computation is None else c.computation
-
-
-def _timing(c, pwm, where: str, continuous: bool = False) -> None:
+def _timing(c, pwm, where: str, continuous: bool = False, *,
+            pwm_timed: bool = True) -> None:
     """Check the carrier-triggered control interrupt and computation time."""
     if continuous:
         if c.period is not None and (not math.isfinite(c.period) or c.period <= 0.0):
@@ -133,11 +128,11 @@ def _timing(c, pwm, where: str, continuous: bool = False) -> None:
     T_c = _period(c, pwm)
     if not math.isfinite(T_c) or T_c <= 0.0:
         raise ConfigError(f"{where}.period must be finite and positive, got {T_c}")
-    offset = control_clock_offset(c, pwm)
+    offset = control_clock_offset(c, pwm, pwm_timed=pwm_timed)
     if not math.isfinite(offset) or not 0.0 <= offset < T_c:
         raise ConfigError(f"{where}.offset must be in [0, ctrl.period), got {offset}")
     half = pwm.switching_period / 2.0
-    if not _whole(T_c / half):
+    if pwm_timed and not _whole(T_c / half):
         raise ConfigError(f"{where}.period = {T_c:.6g} s is not a multiple of half the carrier period "
                           f"({half:.6g} s at pwm.f_sw = {pwm.f_sw:g} Hz): the carrier triggers the "
                           f"interrupt at its valleys and peaks")
@@ -148,8 +143,9 @@ def _timing(c, pwm, where: str, continuous: bool = False) -> None:
 
 
 def _control(c, pwm, where: str, continuous: bool = False) -> None:
-    """Check typed control loops."""
-    if not c.loops:
+    """Check shared controller fields and the registered controller configuration."""
+    profile = control_type(c.type, f"{where}.type")
+    if profile.requires_loops and not c.loops:
         raise ConfigError(f"{where}.loops must contain at least one loop")
     T_c = None if continuous else _period(c, pwm)
     for name, cfg in c.loops.items():
@@ -176,9 +172,11 @@ def _control(c, pwm, where: str, continuous: bool = False) -> None:
             continue
         if not isinstance(name, str) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ConfigError(f"{where}.references: expected finite scalar references")
-    reference_validator = control_type(c.type, f"{where}.type").reference_validator
+    reference_validator = profile.reference_validator
     if reference_validator is not None:
         reference_validator(c.references, f"{where}.references")
+    if profile.validator is not None:
+        profile.validator(c, where)
 
 
 def _measurement(m, T_c: Optional[float], where: str,
@@ -256,13 +254,20 @@ def _converter(u, base, where: str):
     if u.bridge.parallel_capacitance > 0.0 and u.bridge.on_resistance == 0.0:
         raise ConfigError(f"{where}.bridge.parallel_capacitance requires positive on_resistance")
     _dclink(u.dclink, f"{where}.dclink")
-    continuous = u.ctrl is None or u.bridge.model == "averaging"
+    continuous = u.ctrl is None or continuous_control(u)
     if u.ctrl is not None:
-        dead_time_active = not continuous and not topology.unilateral
-        _pwm(u.pwm, base, f"{where}.pwm", continuous,
+        profile = control_type(u.ctrl.type, f"{where}.ctrl.type")
+        if profile.supported_models is not None and u.bridge.model not in profile.supported_models:
+            raise ConfigError(
+                f"{where}.bridge.model: control type {u.ctrl.type!r} supports only "
+                f"{sorted(profile.supported_models)}, got {u.bridge.model!r}"
+            )
+        pwm_timed = u.bridge.pwm_timed
+        dead_time_active = pwm_timed and not topology.unilateral
+        _pwm(u.pwm, base, f"{where}.pwm", carrier_unused=not pwm_timed,
              dead_time_active=dead_time_active)
         validate_modulator(u, topology, where, dead_time_active=dead_time_active)
-        _timing(u.ctrl, u.pwm, f"{where}.ctrl", continuous)
+        _timing(u.ctrl, u.pwm, f"{where}.ctrl", continuous, pwm_timed=pwm_timed)
         _control(u.ctrl, u.pwm, f"{where}.ctrl", continuous)
     protection = u.protection
     for item in fields(protection):
@@ -315,7 +320,8 @@ def _dc_converter(u, base, where: str, *, nested: bool = False) -> None:
         raise ConfigError(f"{where}: a composite child uses its parent's scoped power bus")
     if u.filter is not None and u.filter.l_f <= 0.0:
         raise ConfigError(f"{where}.filter.l_f must be > 0")
-    if u.pwm is not None and u.pwm.sync != "asynchronous":
+    if (u.pwm is not None and u.bridge.pwm_timed
+            and u.pwm.sync != "asynchronous"):
         raise ConfigError(f"{where}.pwm.sync: scalar converters require asynchronous PWM")
 
 
@@ -370,7 +376,7 @@ def _switch_controlled_capacitors(u, where: str) -> None:
     for side in unit_type(u.type).children:
         child = getattr(u, side)
         ctrl = child.ctrl
-        clocked = ctrl is not None and child.bridge.model != "averaging" and child.pwm is not None
+        clocked = ctrl is not None and child.bridge.pwm_timed and child.pwm is not None
         commanded = ctrl is not None and "scc_angle" in ctrl.outputs
         scc = getattr(u.link, f"{side}_scc", None)
         at = f"{where}.link.{side}_scc"
@@ -567,23 +573,25 @@ def _initial(p: Params) -> None:
         raise ConfigError("simulation.initial.t must be >= 0")
     for name, u in _unit_items(p.units):
         m = u.meas
-        if u.bridge.model == "averaging" or not u.bridge.controlled:
+        if continuous_control(u) or not u.bridge.controlled:
             continue
         T_c = _period(u.ctrl, u.pwm)
         given = p.simulation.initial.states
-        continued = any(key.startswith((f"{name}.ctrl.", f"{name}.pwm.")) for key in given)
+        bridge_prefix = f"{name}.{'pwm' if u.bridge.model != 'averaging' else 'command'}."
+        continued = any(key.startswith((f"{name}.ctrl.", bridge_prefix)) for key in given)
         if not continued and not any(key.startswith(f"{name}.meas.") for key in given):
             continue
-        offset = control_clock_offset(u.ctrl, u.pwm)
-        interrupts, loads = PeriodicClock(T_c, offset), PeriodicClock(u.pwm.load_period, u.pwm.grid_offset)
+        pwm_timed = u.bridge.pwm_timed
+        offset = control_clock_offset(u.ctrl, u.pwm, pwm_timed=pwm_timed)
+        interrupts = PeriodicClock(T_c, offset)
+        loads = control_actuation_clock(u.ctrl, u.pwm, pwm_timed=pwm_timed)
         k, j, tau = interrupts.index_after(t0), loads.index_after(t0), _computation(u.ctrl)
-        # The next load takes the word the latest interrupt replaced; the active word restores it
-        # only if a load followed that word's completion.
+        # A pending command overwritten during computation is not part of the saved state.
         if continued and (interrupts.at(k - 1) + tau > loads.at(j) + TIME_EPS
                           and interrupts.at(k - 2) + tau > loads.at(j - 1) + TIME_EPS):
             raise ConfigError(f"simulation.initial.t = {t0} is inside the computation of a control interrupt "
-                              f"of {name!r}, before a PWM register load that takes the shadow word the "
-                              f"interrupt replaced, which is not a state: continue from outside a controller "
+                              f"of {name!r}, before an actuation boundary that would apply the pending "
+                              f"command replaced by that interrupt: continue from outside a controller "
                               f"computation window")
         if m.period is None or m.period >= T_c * (1.0 - 1e-9):
             continue
@@ -620,7 +628,7 @@ def validate(p: Params) -> Params:
         unit_type(unit.type, f"units.{name}.type").validator(unit, p.base, f"units.{name}")
     from .params import _unit_items
     for name, unit in _unit_items(p.units):
-        continuous = unit.bridge.model == "averaging" or unit.ctrl is None
+        continuous = unit.ctrl is None or continuous_control(unit)
         period = ((unit.meas.period or p.simulation.output.period) if unit.ctrl is None
                   else None if continuous else _period(unit.ctrl, unit.pwm))
         if period is not None and (not math.isfinite(period) or period <= 0):

@@ -20,19 +20,20 @@ import numpy as np
 
 from ..solver.model import ConfigError, _complex, _real, assign, gather, join, scatter
 from .blocks import Filter, OutputLimit, PI, complex_power
+from .modulation import OutputStage
 
 __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER",
            "ROLES", "Loop", "LOOP_TYPES", "register_loop_type", "PowerFilterParams",
            "CurrentLimitParams",
-           "SRFPLL", "CurrentLoop", "DCVoltageControl", "SyncLawParams", "SyncLaw",
+           "SRFPLL", "CurrentLoop", "ThreePhaseModulation", "DCVoltageControl", "SyncLawParams", "SyncLaw",
            "PSC", "Droop", "VSG", "DVOC",
            "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping",
            "SI_CURRENT", "SI_VOLTAGE", "SI_POWER", "DUTY_RATIO", "MODULATION", "HERTZ",
            "InductorCurrentControl", "PowerControl", "PhasePowerControl", "FrequencyPowerControl",
            "VoltageControl", "PhaseVoltageControl", "FrequencyVoltageControl", "CurrentControl",
            "PhaseCurrentControl", "FrequencyCurrentControl", "ResonantModulation",
-           "PhaseShiftModulation", "DutyModulation", "MODE"]
+           "PhaseShiftModulation", "DutyModulation", "MODE", "ENABLE"]
 
 
 # ------------------------------------------------------------------ signals
@@ -111,10 +112,22 @@ class Loop:
     state_names: tuple[str, ...] | Mapping[str, str] = ()
     carried: ClassVar[tuple[str, ...]] = ()
     log_outputs: ClassVar[tuple[str, ...]] = ()
+    observations: ClassVar[tuple[str, ...]] = ()
+    cpp_export: ClassVar[bool] = True
+
+    @classmethod
+    def supports_continuous(cls) -> bool:
+        """Return whether this loop type implements the continuous graph protocol."""
+        if cls.flow is not Loop.flow:
+            return True
+        return cls.flow_inputs is not None and (
+            cls.flow_path is not Loop.flow_path or cls.equation is not Loop.equation
+        )
 
     def __init__(self, cfg: Any, unit: Any, startup: Any) -> None:
         self.cfg, self.unit, self.startup = cfg, unit, startup
-        self.block_period = None if unit.bridge.model == "averaging" else cfg.period
+        continuous = getattr(startup, "continuous", unit.bridge.model == "averaging")
+        self.block_period = None if continuous else cfg.period
         self._state_blocks: dict[str, Any] = {}
 
     def state_block(self, name: str, block):
@@ -157,6 +170,15 @@ class Loop:
             raise NotImplementedError
         result = self.equation(*(inputs[port] for port in self.flow_inputs))
         return dict(zip(self.outputs, result))
+
+    def sample_into(self, t: float, inputs: Mapping[str, Any], outputs: dict[str, Any]) -> None:
+        """Evaluate one sample into a reusable output mapping."""
+        if type(self).sample is Loop.sample:
+            result = self.equation(*(inputs[port] for port in self.flow_inputs))
+            for name, value in zip(self.outputs, result):
+                outputs[name] = value
+            return
+        outputs.update(self.sample(t, inputs))
 
     def flow(self, t: float, inputs: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         """Return continuous outputs and named state derivatives for ideal averaging."""
@@ -244,10 +266,22 @@ class Loop:
     def reset_integrator(self) -> None:
         """Clear this loop's error integrator, if it has one, before PWM start-up."""
 
+    def output_limit(self, port: str, limit: float, *, active=None) -> OutputLimit:
+        """Build the constraint applied to one output by a downstream actuator stage."""
+        return OutputLimit(limit, active=active)
+
     def retuned(self, old: "Loop") -> None:
         """Take non-state runtime attributes from the loop instance being replaced."""
         for name in self.carried:
             setattr(self, name, getattr(old, name))
+
+    def summary(self) -> dict[str, Any]:
+        """Return optional loop-level information for the owning controller summary."""
+        return {}
+
+    def observe(self) -> dict[str, float]:
+        """Return declared diagnostics which are not graph signals or simulation states."""
+        return {}
 
 
 LOOP_TYPES: dict[str, type] = {}
@@ -425,7 +459,6 @@ class SRFPLL(Loop):
     def reset_integrator(self):
         self.pi.reset()
 
-
 @register_loop_type
 class CurrentLoop(Loop):
     """dq PI current loop: ``u = u_ff + (r_pu + j*omega/w0*x_pu)*i + kp*e + ki*integral`` (+ ``extra``).
@@ -483,11 +516,16 @@ class CurrentLoop(Loop):
         return {"u_dq": 0j, "extra": 0j}
 
     def sample(self, t, inputs):
+        outputs = {}
+        self.sample_into(t, inputs, outputs)
+        return outputs
+
+    def sample_into(self, t, inputs, outputs):
         output, extra, _derivative = self._evaluate(
             inputs["id_ref"], inputs["iq_ref"], inputs["v"], inputs["i"],
             inputs["frame"], inputs["omega"], inputs["extra"],
         )
-        return {"u_dq": output, "extra": extra}
+        outputs["u_dq"], outputs["extra"] = output, extra
 
     def _evaluate(self, id_ref, iq_ref, voltage, current, frame, omega, extra):
         """One law for both PI realizations; the flow path binds directly to this call."""
@@ -526,6 +564,11 @@ class CurrentLoop(Loop):
 
     def reset_integrator(self):
         self.pi.reset()
+
+    def output_limit(self, port: str, limit: float, *, active=None) -> OutputLimit:
+        if port != "u_dq":
+            return super().output_limit(port, limit, active=active)
+        return OutputLimit(limit, pi=self.pi, active=active)
 
 
 @register_loop_type
@@ -652,6 +695,10 @@ class SyncLaw(Loop):
                "p": POWER, "q": POWER}
     state_names = ("theta",)
     flow_inputs = ("v", "i", "u_dc", "p_ref", "q_ref", "v_ref")
+
+    @classmethod
+    def supports_continuous(cls) -> bool:
+        return cls._flow is not SyncLaw._flow
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -1127,6 +1174,7 @@ SI_POWER = SignalType("W", "scalar")
 DUTY_RATIO = SignalType("1", "duty_ratio")
 MODULATION = SignalType("1", "modulation")
 HERTZ = SignalType("Hz")
+ENABLE = SignalType("1", "enable")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1297,6 +1345,59 @@ PhaseCurrentControl = _feedback_loop(
 FrequencyCurrentControl = _feedback_loop(
     "FrequencyCurrentControl", "current", "frequency",
     "Port-current feedback onto the switching frequency.")
+
+
+@register_loop_type
+class ThreePhaseModulation(Loop):
+    """Convert a dq voltage command into the three bridge duty-cycle commands.
+
+    This is the ordinary sampled VSC actuator stage. A different terminal loop may replace it
+    and drive the same ``d_a``, ``d_b`` and ``d_c`` controller outputs directly.
+    """
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: Optional[float] = None
+        type: str = "three_phase_modulation"
+
+    type = "three_phase_modulation"
+    role = "modulation"
+    carried = ("m_peak", "saturated")
+    inputs = {"u_dq": V_DQ, "theta": ANGLE, "u_dc": V}
+    outputs = {
+        "d_a": DUTY_RATIO,
+        "d_b": DUTY_RATIO,
+        "d_c": DUTY_RATIO,
+    }
+
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
+        self.stage = OutputStage(unit)
+        self.m_peak = 0.0
+        self.saturated = False
+
+    def initial_outputs(self):
+        return {"d_a": 0.5, "d_b": 0.5, "d_c": 0.5}
+
+    def sample_into(self, t, inputs, outputs):
+        values, saturated = self.stage.equation(
+            inputs["u_dq"], np.exp(1j * inputs["theta"]),
+            inputs["u_dc"] * self.stage.v_dc_base,
+        )
+        m_peak = np.maximum(abs(values[0]), np.maximum(abs(values[1]), abs(values[2])))
+        outputs["d_a"] = 0.5 * (1.0 + values[0])
+        outputs["d_b"] = 0.5 * (1.0 + values[1])
+        outputs["d_c"] = 0.5 * (1.0 + values[2])
+        self.m_peak, self.saturated = m_peak, saturated
+
+    def sample(self, t, inputs):
+        outputs = self.initial_outputs()
+        self.sample_into(t, inputs, outputs)
+        return outputs
+
+    def command_limit(self, u_dc_pu):
+        """Return the upstream dq-command limit imposed by this modulation stage."""
+        return self.stage.command_limit(u_dc_pu)
 
 
 @register_loop_type

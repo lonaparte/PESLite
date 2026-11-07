@@ -20,12 +20,12 @@ They are complete run presets that select the bridge model of every unit and the
 Yes. Set `units.<name>.bridge.model` independently for each unit and run without a preset, or
 override a unit with `--set` ([CLI Reference](CLI-Reference.md#override-parameters)).
 
-## Does ideal averaging preserve PWM and computation delay?
+## Does ideal averaging preserve control timing?
 
-No. Ideal `averaging` uses a controlled voltage-source bridge and continuous controller states.
-ADC windows, controller interrupts, computation completion, carrier comparison and PWM
-shadow/active registers belong to the sampled `switching` and `pwm_averaging` models. See
-[Ideal averaging](Bridge-and-PWM.md#ideal-averaging) for which sampled settings it ignores.
+It depends on the active control graph. Loops with continuous equations join the plant ODE and do
+not use sampled timing. A sampled-only graph retains ADC, interrupt and computation timing, then
+holds each command without carrier comparison or PWM loads. See
+[Ideal averaging](Bridge-and-PWM.md#ideal-averaging).
 
 ## How should solver accuracy be checked?
 

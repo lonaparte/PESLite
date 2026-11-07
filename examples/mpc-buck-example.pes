@@ -1,0 +1,43 @@
+# PESLite 0.5.1
+# Synchronous Buck current control. All electrical values are SI.
+# The output voltage follows load resistance times controlled current;
+# this example intentionally has no outer voltage loop.
+base: {s_base: 500.0, v_ll_rms: 230.0, f0: 50.0}
+buses:
+  output: {phases: 1, c: 470.0e-6}
+elements:
+  load: {type: resistor, bus: output, r: 6.0}
+units:
+  converter:
+    type: dc_converter
+    bus: output
+    filter: {l_f: 1.0e-3, r_f: 0.05}
+    dclink: {vdc_ref: 48.0, source: {type: voltage}}
+    # The default bridge is synchronous and uses pwm_averaging.
+    pwm: {f_sw: 20000.0}
+    ctrl:
+      type: current
+      period: 50.0e-6
+      computation: 1.0e-6
+      references: {current: 4.0}
+      loops:
+        PredictiveCurrentControl:
+          # algorithm: ccs
+          prediction_horizon: 4
+          control_horizon: 3
+          # rate_weight: 0.01
+          current_min: -8.0
+          current_max: 8.0
+          # fallback: hold
+    protection:
+      overcurrent: {enable: true, limit: 10.0}
+events:
+  current_step: {type: set, t: 0.01, set: {units.converter.ctrl.references.current: 5.0}}
+  load_step: {type: set, t: 0.02, set: {elements.load.r: 4.0}}
+simulation:
+  t_end: 0.03
+  solver: {dt: 2.5e-6, linearisations: 0}
+  output: {period: 50.0e-6, signals: 1}
+meta:
+  title: Predictive Buck current control
+  description: Linear constrained CCS-MPC with reference and load changes and PWM-load delay compensation.

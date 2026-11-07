@@ -28,7 +28,7 @@ bridge:
 |---|---|---|---|
 | `switching` | exact carrier-comparison switch states | sampled ADC, computation and PWM loads | ripple, harmonics and commutation |
 | `pwm_averaging` | held active duty between register loads | same sampled periods and updates as switching | sampled control without carrier ripple |
-| `averaging` | continuous controlled voltage | continuous controller equations | control-envelope and long-duration studies |
+| `averaging` | ideal controlled voltage | continuous equations or sampled held commands | control-envelope and long-duration studies |
 
 Each converter Unit selects its model independently.
 
@@ -89,6 +89,7 @@ ctrl:
   period: 50e-6
   loops:
     CurrentLoop: {period: 50e-6}
+    ThreePhaseModulation: {period: 50e-6}
     DCVoltageControl: {period: 500e-6}
 ```
 
@@ -191,16 +192,21 @@ criteria. A trip blocks the bridge and disconnects the DC source.
 
 ## Ideal averaging
 
-With `bridge.model: averaging`, controller and plant states are integrated continuously.
+With `bridge.model: averaging`, a graph whose active loops provide continuous equations joins the
+plant ODE. Otherwise the same graph runs at `ctrl.period` and its command is zero-order held; this
+is how sampled controllers such as MPC drive the ideal averaged bridge.
 
 | Setting or feature | Behavior |
 |---|---|
-| ADC interrupt and `meas.offset` | not used |
-| `ctrl.period`, `ctrl.offset`, `ctrl.computation` | not used for controller execution |
+| ADC interrupt and `meas.offset` | used by a sampled graph; not used by a continuous graph |
+| `ctrl.period`, `ctrl.offset`, `ctrl.computation` | define sampled graph timing; ignored by a continuous graph |
 | carrier and PWM register loads | not used |
 | `pwm.dead_time`, `pwm.dead_time_compensation` | ignored |
 | `meas.period` | protection and RMS period |
-| loop implementation | must provide a continuous-time equation |
+| loop implementation | active sampled-only loops select held-command execution |
+
+Fixed- and variable-step solvers stop at every sampled control and actuation boundary before
+continuing the electrical integration.
 
 ## Command presets
 
