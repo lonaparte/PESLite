@@ -237,7 +237,9 @@ def test_class_named_control_loops_round_trip_without_a_type_field():
     p = peslite.load(EXAMPLES / "gfl-example.pes")
     loops = to_dict(p)["units"]["vsc"]["ctrl"]["loops"]
 
-    assert tuple(loops) == ("SRFPLL", "CurrentLoop", "DCVoltageControl")
+    assert tuple(loops) == (
+        "SRFPLL", "CurrentLoop", "DutyCycleModulation", "DCVoltageControl",
+    )
     assert all("type" not in parameters for parameters in loops.values())
     assert from_dict(to_dict(p)) == p
 

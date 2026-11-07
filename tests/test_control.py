@@ -108,6 +108,50 @@ class _SampledDuty(Loop):
         return {"duty": inputs["duty"]}
 
 
+@register_loop_type
+class _DirectThreePhaseDuty(Loop):
+    """A terminal actuator loop which replaces voltage control and modulation together."""
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: float | None = None
+        type: str = "test_direct_three_phase_duty"
+
+    type = "test_direct_three_phase_duty"
+    role = "modulation"
+    inputs = {"i": I_AB}
+    outputs = {"d_a": DUTY_RATIO, "d_b": DUTY_RATIO, "d_c": DUTY_RATIO}
+
+    def initial_outputs(self):
+        return {"d_a": 0.5, "d_b": 0.5, "d_c": 0.5}
+
+    def sample(self, t, inputs):
+        return {"d_a": 0.2, "d_b": 0.5, "d_c": 0.8}
+
+
+def test_terminal_actuator_loop_replaces_current_control_and_modulation(gfl):
+    params = gfl()
+    loops = dict(params.unit("vsc").ctrl.loops)
+    loops.pop("CurrentLoop")
+    loops.pop("DutyCycleModulation")
+    loops["_DirectThreePhaseDuty"] = _DirectThreePhaseDuty.Params(
+        period=params.unit("vsc").ctrl.period,
+    )
+    params = params.replace(**{"units.vsc.ctrl.loops": loops})
+    controller = peslite.Simulation(params).unit().ctrl
+
+    controller.command(True, 0.0)
+    output = controller(0.0, Measurement(
+        0.0, controller.p.base.v_phase_peak + 0j, 0j,
+        controller.p.dclink.vdc_ref, np.zeros(3),
+    ))
+
+    assert "CurrentLoop" not in controller.graph.nodes
+    assert "DutyCycleModulation" not in controller.graph.nodes
+    assert controller.graph.order[-1] == "_DirectThreePhaseDuty"
+    assert output.d_abc == pytest.approx([0.2, 0.5, 0.8])
+
+
 def test_registered_loop_owns_its_schema_and_uses_default_role_wiring(tmp_path):
     period = 5e-5
     p = peslite.load(
@@ -304,7 +348,7 @@ def test_adc_sample_and_controller_measurement_have_distinct_scopes():
 def test_control_graph_has_one_typed_boundary_for_inputs_and_outputs(gfl):
     graph = peslite.Simulation(gfl()).unit().ctrl.graph
 
-    assert graph.interface is CONTROL_INTERFACE
+    assert set(graph.interface.outputs) == {"d_a", "d_b", "d_c", "theta", "omega"}
     assert set(CONTROL_INTERFACE.inputs) == {
         "meas.u_g", "meas.i_c", "meas.u_dc",
         "references.id_ref_pu", "references.iq_ref_pu", "references.theta",
@@ -314,9 +358,9 @@ def test_control_graph_has_one_typed_boundary_for_inputs_and_outputs(gfl):
     assert set(CONTROL_INTERFACE.outputs) == {"u_dq", "theta", "omega"}
     assert set(graph._boundary_sources) == set(CONTROL_INTERFACE.inputs)
     for port, source in graph.outputs.items():
-        assert port in CONTROL_INTERFACE.outputs
+        assert port in graph.interface.outputs
         owner, _, source_port = source.partition(".")
-        assert graph.nodes[owner].outputs[source_port] == CONTROL_INTERFACE.outputs[port]
+        assert graph.nodes[owner].outputs[source_port] == graph.interface.outputs[port]
 
     # Without a PLL, theta, omega and the logged dq frame are references; a set event moves the
     # controller's outputs and frame through the same boundary as the loop inputs.
@@ -336,7 +380,9 @@ def test_control_graph_has_one_typed_boundary_for_inputs_and_outputs(gfl):
         else:
             controller(0.0, Measurement(0.0, cfg.base.v_phase_peak + 0j, 0j,
                                         cfg.dclink.vdc_ref, np.zeros(3)))
-        assert (controller.theta, controller.command_theta, controller.omega) == (0.5, 0.5, 300.0)
+        assert (controller.theta, controller.omega) == (0.5, 300.0)
+        if controller.continuous:
+            assert controller.command_theta == 0.5
         assert controller.v_dq == pytest.approx(np.exp(-0.5j))
 
 
@@ -369,7 +415,9 @@ def test_reference_changes_rewire_graph_outputs_and_frame(gfl, model):
             0.0, cfg.base.v_phase_peak + 0j, 0j, cfg.dclink.vdc_ref, np.zeros(3),
         ))
 
-    assert (controller.theta, controller.command_theta, controller.omega) == (0.5, 0.5, 300.0)
+    assert (controller.theta, controller.omega) == (0.5, 300.0)
+    if controller.continuous:
+        assert controller.command_theta == 0.5
     assert controller.v_dq == pytest.approx(np.exp(-0.5j))
 
 
@@ -453,7 +501,7 @@ def test_dc_voltage_control_owns_its_limit_in_both_execution_modes(gfl):
     limit = sampled.graph._limits["CurrentLoop"][1]
     assert limit is sampled._terminal_limit and limit.pi is sampled.graph.nodes["CurrentLoop"].pi
     assert limit.limit == pytest.approx(0.6 * sampled._terminal_limit_scale)
-    assert abs(sampled.u_cmd) == pytest.approx(limit.limit)
+    assert abs(sampled.graph.values["CurrentLoop.u_dq"]) == pytest.approx(limit.limit)
 
     # A registered loop in the dc_voltage role without the limit observer is wired by its role
     # but neither observed nor counted in the summary.

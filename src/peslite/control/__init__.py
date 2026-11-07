@@ -12,7 +12,8 @@ solver's kernel: the hardware adapts to its interface (:class:`Measurement`, :cl
 from ..solver import ConfigError
 from .blocks import Filter, Integrator, OutputLimit, PI, complex_power, unit_delay
 from .loops import (ANGLE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES, MODE, POWER, V, V_AB, V_DQ,
-                    DUTY_RATIO, HERTZ, MODULATION, SI_CURRENT, SI_VOLTAGE, SI_POWER, DCVoltageControl,
+                    DUTY_RATIO, HERTZ, MODULATION, SI_CURRENT, SI_VOLTAGE, SI_POWER,
+                    DCVoltageControl, DutyCycleModulation,
                     InductorCurrentControl, PowerControl, PhasePowerControl, FrequencyPowerControl,
                     VoltageControl, PhaseVoltageControl, FrequencyVoltageControl, CurrentControl,
                     PhaseCurrentControl, FrequencyCurrentControl, ResonantModulation,
@@ -35,7 +36,7 @@ __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter",
            "FrequencyPowerControl", "VoltageControl", "PhaseVoltageControl",
            "FrequencyVoltageControl", "CurrentControl", "PhaseCurrentControl",
            "FrequencyCurrentControl", "ResonantModulation", "PhaseShiftModulation",
-           "DutyModulation",
+           "DutyModulation", "DutyCycleModulation",
            "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER",
            "LOOP_TYPES", "register_loop_type", "ControlInterface", "CONTROL_INTERFACE",

@@ -233,7 +233,10 @@ def test_custom_pll_assembles_with_builtin_loops_and_runs(examples, tmp_path, mo
     simulation = peslite.Simulation(params)
     nodes = simulation.unit().ctrl.graph.nodes
 
-    assert set(nodes) == {"VoltageAdaptivePLL", "CurrentLoop", "DCVoltageControl"}
+    expected = {"VoltageAdaptivePLL", "CurrentLoop", "DCVoltageControl"}
+    if model != "averaging":
+        expected.add("DutyCycleModulation")
+    assert set(nodes) == expected
     assert isinstance(nodes["VoltageAdaptivePLL"], VoltageAdaptivePLL)
     assert type(nodes["VoltageAdaptivePLL"]).sample is Loop.sample
     assert type(nodes["VoltageAdaptivePLL"]).flow_path is Loop.flow_path

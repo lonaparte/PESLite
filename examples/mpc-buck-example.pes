@@ -1,4 +1,4 @@
-# PESLite 0.5.0
+# PESLite 0.5.1
 # Synchronous Buck current control. All electrical values are SI.
 # The output voltage follows load resistance times controlled current;
 # this example intentionally has no outer voltage loop.

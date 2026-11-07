@@ -67,17 +67,19 @@ cycle; continuous graphs identify strongly connected loop groups and solve only 
 groups iteratively.
 
 The graph has one typed, directed boundary. Its input ports are measured feedback signals
-(`meas.*`) and controller references (`references.*`). Its output schema belongs to that boundary:
-AC control exposes `u_dq`, `theta` and `omega`, while DC bridge control exposes its modulator
-registers, such as `duty` (see [Bridge and PWM](Bridge-and-PWM.md)). A
-connection always binds a loop input to a boundary or loop output. Default wiring and explicit
-custom wiring are both lowered to this same graph before the run.
+(`meas.*`) and controller references (`references.*`). Its output schema belongs to the attached
+bridge: sampled VSC control exposes `d_a`, `d_b`, `d_c`, `theta` and `omega`; ideal averaging
+exposes `u_dq`, `theta` and `omega`; scalar bridge control exposes registers such as `duty` (see
+[Bridge and PWM](Bridge-and-PWM.md)). A connection always binds a loop input to a boundary or loop
+output. Default wiring and explicit custom wiring are both lowered to this same graph before the
+run.
 
 Control ports use one canonical set of signal representations: complex vectors `I_AB`, `V_AB`,
 `I_DQ` and `V_DQ`; scalar `I`, `V` and `POWER`; and scalar `ANGLE` and `FREQUENCY`.
 
-`Startup` owns run/stop and reference-ramp progress. The modulation output stage converts controller
-voltage commands into duty ratios. Protection does not belong to the controller.
+`Startup` owns run/stop and reference-ramp progress. `DutyCycleModulation` is an ordinary terminal
+loop from a dq voltage command to three duty cycles; another terminal loop may drive the same bridge
+ports directly. Protection does not belong to the controller.
 
 ## Assembly
 

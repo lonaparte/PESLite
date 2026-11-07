@@ -26,7 +26,7 @@ from ..solver.energy import Port
 from ..solver.timing import control_clock_offset
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,
-                    SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ, CurrentLoop,
+                    SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ,
                     Loop, SignalType, SyncLaw)
 from .modulation import CONFIGURED, OutputStage
 from .profiles import (DutyReferenceParams, PhaseShiftReferenceParams, ReferenceParams,
@@ -38,7 +38,8 @@ from .profiles import (DutyReferenceParams, PhaseShiftReferenceParams, Reference
                        validate_scalar_voltage_references)
 
 __all__ = ["Measurement", "ConverterMeasurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
-           "ControlInterface", "CONTROL_INTERFACE", "ControlGraph", "default_wiring",
+           "ControlInterface", "CONTROL_INTERFACE", "SAMPLED_VSC_INTERFACE",
+           "ControlGraph", "default_wiring",
            "VSCController", "BridgeControlOutput", "GraphController",
            "make_controller"]
 
@@ -313,6 +314,17 @@ CONTROL_INTERFACE = ControlInterface(
     outputs=MappingProxyType({"u_dq": V_DQ, "theta": ANGLE, "omega": FREQUENCY}),
 )
 
+SAMPLED_VSC_INTERFACE = replace(
+    CONTROL_INTERFACE,
+    outputs=MappingProxyType({
+        "d_a": DUTY_RATIO,
+        "d_b": DUTY_RATIO,
+        "d_c": DUTY_RATIO,
+        "theta": ANGLE,
+        "omega": FREQUENCY,
+    }),
+)
+
 
 class ControlGraph:
     """The active loops of ``cfg.ctrl.loops`` wired by typed ports and run by the control interrupt.
@@ -446,7 +458,15 @@ class ControlGraph:
                                           for port, spec in node.outputs.items())
             self.periods[name] = loop.period
             self._store(name, node.initial_outputs(), real=_real, complex=_complex)
-        self._samples = {name: node.sample for name, node in self.nodes.items()}
+        self._sample_inputs = {
+            name: {port: 0.0 for port in node.inputs}
+            for name, node in self.nodes.items()
+        }
+        self._sample_outputs = {
+            name: {port: self.values[key] for port, key, _complex in self._out_specs[name]}
+            for name in self.nodes
+        }
+        self._samples = {name: node.sample_into for name, node in self.nodes.items()}
         dependencies = {name: set() for name in self.nodes}
         for name, node in self.nodes.items():
             for port, spec in node.inputs.items():
@@ -506,6 +526,9 @@ class ControlGraph:
         self._every_interrupt = (None if self.continuous else
                                  frozenset(name for name, every in self._every)
                                  if all(every == 1 for _name, every in self._every) else None)
+        self._sample_runner = (
+            self._compile_sample_runner() if self._every_interrupt is not None else None
+        )
         angles = []
         for name, node in self.nodes.items():
             node_states = node.get_state()
@@ -530,18 +553,17 @@ class ControlGraph:
         if node is None or port not in node.outputs:
             raise ConfigError(f"controller limit: unknown output {name}.{port}")
         self._limits[name] = (port, limit)
-        sample = node.sample
+        sample = node.sample_into
 
-        def limited_sample(t, inputs):
-            outputs = sample(t, inputs)
+        def limited_sample(t, inputs, outputs):
+            sample(t, inputs, outputs)
             outputs[port] = limit.sample(t, outputs[port])
-            return outputs
 
         self._samples[name] = limited_sample
 
     def clear_limit(self, name):
         if self._limits.pop(name, None) is not None:
-            self._samples[name] = self.nodes[name].sample
+            self._samples[name] = self.nodes[name].sample_into
 
     def _rewire(self):
         """Resolve loop inputs and graph outputs against the current references."""
@@ -682,6 +704,37 @@ class ControlGraph:
         exec(compile(source, "<peslite continuous control>", "exec"), environment)
         return environment["run"]
 
+    def _compile_sample_runner(self):
+        """Compile an all-rates-aligned sampled graph into one allocation-free call."""
+        environment = {
+            "_values": self.values,
+            "_samples": self._samples,
+            "_inputs": self._sample_inputs,
+            "_outputs": self._sample_outputs,
+            "_store": self._store,
+        }
+        body = []
+        for index, name in enumerate(self.order):
+            inputs = f"_inputs[{name!r}]"
+            for port, kind, key in self._wiring[name]:
+                if kind == _HELD:
+                    value = f"_values[{key!r}]"
+                elif kind == _MEASURED:
+                    value = f"meas.{key}"
+                else:
+                    constant = f"_constant{index}_{len(environment)}"
+                    environment[constant] = key
+                    value = constant
+                body.append(f"{inputs}[{port!r}] = {value}")
+            outputs = f"_outputs[{name!r}]"
+            body.append(f"_samples[{name!r}](t, {inputs}, {outputs})")
+            body.append(f"_store({name!r}, {outputs})")
+        source = "def run(t, meas):\n" + "\n".join(
+            "    " + line for line in (body or ["pass"])
+        ) + "\n"
+        exec(compile(source, "<peslite sampled control>", "exec"), environment)
+        return environment["run"]
+
     def schedule(self, cfg):
         """Queue unit parameters to take effect at the next control update."""
         self._pending.append(cfg)
@@ -697,6 +750,8 @@ class ControlGraph:
                 self._rewire()
                 if self.continuous:
                     self._prepare_flow()
+                elif self._every_interrupt is not None:
+                    self._sample_runner = self._compile_sample_runner()
             changed = [name for name in self.nodes
                        if ctrl.loops[name] != self.cfg.ctrl.loops[name]]
             self.cfg = cfg
@@ -724,7 +779,7 @@ class ControlGraph:
                 f"states than before ({exc}), so it cannot continue from them") from None
         fresh.retuned(old)
         self.nodes[name] = fresh
-        self._samples[name] = fresh.sample
+        self._samples[name] = fresh.sample_into
         if self.continuous:
             self._prepare_flow()
         if self.on_retune is not None:
@@ -803,15 +858,32 @@ class ControlGraph:
         """
         if self._pending:
             self._apply_pending()
+        if self._sample_runner is not None:
+            self._sample_runner(t, meas)
+            self.updated = updated = self._every_interrupt
+            if finalize is not None:
+                finalize(t, meas, updated)
+            return updated
         self.updated = updated = set()
         due = self.due(t)
         if not due:
             return updated
-        samples, gather_, wiring = self._samples, self._gather, self._wiring
+        samples, wiring = self._samples, self._wiring
+        values = self.values
         for name in self.order:
             if name not in due:
                 continue
-            self._store(name, samples[name](t, gather_(wiring[name], meas)))
+            inputs = self._sample_inputs[name]
+            for port, kind, key in wiring[name]:
+                if kind == _HELD:
+                    inputs[port] = values[key]
+                elif kind == _MEASURED:
+                    inputs[port] = getattr(meas, key)
+                else:
+                    inputs[port] = key
+            outputs = self._sample_outputs[name]
+            samples[name](t, inputs, outputs)
+            self._store(name, outputs)
             updated.add(name)
         if finalize is not None:
             finalize(t, meas, updated)
@@ -979,8 +1051,10 @@ def default_wiring(cfg, family):
     theta = f"{angle}.theta" if angle else "references.theta"
     omega = f"{angle}.omega" if angle else "references.omega"
     dc, cc = find("dc_voltage"), find("current")
+    modulation = find("modulation")
     va, vi, damping = find("admittance"), find("impedance"), find("damping")
     extra = f"{damping}.extra" if damping else "references.zero_v_pu"
+    command = vi if family == "gfm" and vi else cc
     ports_of = {
         "pll": {"v": "meas.u_g"},
         "dc_voltage": {"voltage": "meas.u_dc", "reference": "references.vdc_ref_pu"},
@@ -996,12 +1070,36 @@ def default_wiring(cfg, family):
                       "extra": extra},
         "admittance": {"v_ref": f"{sync}.v_ref", "frame": frame, "omega": omega, "v": "meas.u_g"},
         "damping": {"i": "meas.i_c", "frame": frame},
+        "modulation": {
+            "u_dq": f"{command}.u_dq",
+            "theta": theta,
+            "u_dc": "meas.u_dc",
+            "v": "meas.u_g",
+            "i": "meas.i_c",
+            "frame": frame,
+            "omega": omega,
+            "id_ref": (f"{va}.id_ref" if va else f"{dc}.current_reference"
+                       if dc else "references.id_ref_pu"),
+            "iq_ref": f"{va}.iq_ref" if va else "references.iq_ref_pu",
+            "extra": extra,
+        },
     }
     wires = {f"{name}.{port}": source for name, role in roles.items()
              for port, source in ports_of.get(role, {}).items()
              if port in LOOP_TYPES[loops[name].type].inputs}
-    terminal = vi if family == "gfm" and vi else cc
-    return wires, {"u_dq": f"{terminal}.u_dq", "theta": theta, "omega": omega}
+    if cfg.bridge.model == "averaging":
+        if command is None:
+            raise ConfigError(f"ctrl.loops: {family} averaging needs a voltage-command loop")
+        return wires, {"u_dq": f"{command}.u_dq", "theta": theta, "omega": omega}
+    if modulation is None:
+        raise ConfigError(f"ctrl.loops: sampled {family} control needs a modulation loop")
+    return wires, {
+        "d_a": f"{modulation}.d_a",
+        "d_b": f"{modulation}.d_b",
+        "d_c": f"{modulation}.d_c",
+        "theta": theta,
+        "omega": omega,
+    }
 
 
 # ------------------------------------------------------------------ the controller
@@ -1185,20 +1283,31 @@ class VSCController(_GraphRuntime):
         self.startup = ContinuousStartup(run=False) if self.continuous else Startup(cfg.ctrl.period)
         profile = control_type(cfg.ctrl.type)
         wires, outputs = profile.wiring(cfg)
+        interface = profile.interface if self.continuous else SAMPLED_VSC_INTERFACE
         self.graph = graph = ControlGraph(
-            cfg, self.startup, wires, outputs, interface=profile.interface,
+            cfg, self.startup, wires, outputs, interface=interface,
         )
-        self._carried_outputs = profile.interface.auxiliary_outputs(graph.outputs)
+        self._carried_outputs = interface.auxiliary_outputs(graph.outputs)
         self.periods = graph.periods
         self.v_base, self.i_base, self.w0 = cfg.base.v_phase_peak, cfg.base.i_phase_peak, cfg.base.w0
         self.v_dc_base = cfg.dc_base.v
-        # Ideal averaging has no PWM/output stage. Its continuous controller drives the bridge
-        # voltage ratio directly; sampled bridge models retain modulation and anti-windup here.
-        self.stage = (None if self.continuous else
-                      OutputStage(cfg, pwm_method=pwm_method, limiter=limiter))
+        # Sampled VSC modulation is an ordinary terminal graph node. Ideal averaging instead
+        # terminates at the continuous dq-voltage command.
+        terminal_port = "u_dq" if self.continuous else "d_a"
+        self._terminal = graph.outputs[terminal_port].partition(".")[0]
+        terminal = graph.nodes.get(self._terminal)
+        self._terminal_node = terminal
+        self.stage = None if terminal is None else getattr(terminal, "stage", None)
+        if not self.continuous and (pwm_method is not None or limiter is not CONFIGURED):
+            if self.stage is None:
+                raise TypeError("a custom PWM method or limiter requires a modulation loop with an output stage")
+            terminal.stage = self.stage = OutputStage(
+                cfg, pwm_method=pwm_method, limiter=limiter,
+            )
         self.theta, self.omega = self.initial_sync()
-        self.u_cmd = 1.0 + 0j
-        self.command_theta = self.theta
+        if self.continuous:
+            self.u_cmd = 1.0 + 0j
+            self.command_theta = self.theta
         self.v_dq = self.i_dq = 0j
         self.last_log = {}
         self.logging = True
@@ -1210,8 +1319,8 @@ class VSCController(_GraphRuntime):
             return next((name for name, value in role.items()
                          if value == r and (port is None or port in graph.nodes[name].inputs)), None)
 
-        self._terminal = graph.outputs["u_dq"].partition(".")[0]
-        self._terminal_in_graph = self._terminal in graph.nodes
+        self._duty_sources = (() if self.continuous else
+                              tuple(graph.outputs[name] for name in ("d_a", "d_b", "d_c")))
         graph.on_retune = self._loop_retuned
         self._frame_key = f"{graph.outputs['theta'].partition('.')[0]}.frame"
         # The DC-voltage loop is observed (ID_REF_LIMIT, summary) only through its limit observer.
@@ -1243,10 +1352,18 @@ class VSCController(_GraphRuntime):
         self._mode_log_sources = MappingProxyType(mode_log_sources)
         self._terminal_limit = None
         self._terminal_limit_scale = None
+        self._command_output = None
+        if self.stage is not None:
+            source = graph.connections.get(f"{self._terminal}.u_dq")
+            if source is not None:
+                owner, _, port = source.partition(".")
+                if owner in graph.nodes:
+                    self._command_output = owner, port
         self._flow_limits = {}
         self.alarms: list[str] = []
         self._configure_limit(self._dc)
-        self._configure_limit(self._terminal)
+        if self._command_output is not None:
+            self._configure_limit(self._command_output[0])
         if self.continuous:
             self._build_flow_state()
 
@@ -1258,22 +1375,20 @@ class VSCController(_GraphRuntime):
         graph.clear_limit(name)
         self._flow_limits.pop(name, None)
         node = graph.nodes.get(name)
-        if name == self._terminal and self.stage is not None:
-            self.stage._command_saturated = False
         if self.continuous and name == self._dc:
             self._flow_limits[name] = (f"{name}.current_reference", "ID_REF_LIMIT", node)
-        if (not self.continuous and name == self._terminal
-                and isinstance(node, CurrentLoop) and self.stage is not None):
+        if (not self.continuous and self._command_output is not None
+                and name == self._command_output[0] and self.stage is not None):
             limit = self.stage.command_limit(1.0)
             if limit is not None:
-                output_limit = OutputLimit(
-                    limit, pi=node.pi,
-                    active=lambda: self.startup.active,
+                port = self._command_output[1]
+                output_limit = node.output_limit(
+                    port, limit, active=lambda: self.startup.active,
                 )
                 if self._terminal_limit is not None:
                     # A loop rebuilt by a set event keeps the limit __call__ scaled to u_dc.
                     output_limit.limit = self._terminal_limit.limit
-                graph.limit_output(name, "u_dq", output_limit)
+                graph.limit_output(name, port, output_limit)
                 self._terminal_limit = output_limit
                 self._terminal_limit_scale = limit
 
@@ -1300,6 +1415,11 @@ class VSCController(_GraphRuntime):
     def _loop_retuned(self, name=None):
         """Rebuild the loop's limit and continuous state bindings after a set event."""
         self._configure_limit(name)
+        if name == self._terminal and self._command_output is not None:
+            terminal = self.graph.nodes[name]
+            self._terminal_node = terminal
+            self.stage = getattr(terminal, "stage", None)
+            self._configure_limit(self._command_output[0])
         super()._loop_retuned(name)
 
     def describe(self):
@@ -1383,15 +1503,10 @@ class VSCController(_GraphRuntime):
         return values
 
     def _accept_command(self, t, meas, updated):
-        """Update the held angle, frequency and sampled voltage command."""
+        """Update the held synchronization outputs after a sampled graph pass."""
         graph = self.graph
         self.theta = float(graph.output("theta", meas))
         self.omega = float(graph.output("omega", meas))
-        if self._terminal in updated or (updated and not self._terminal_in_graph):
-            self.u_cmd = complex(graph.output("u_dq", meas))
-            self.command_theta = self.theta
-            if self._terminal_limit is not None:
-                self.stage._command_saturated = self._terminal_limit.saturated
 
     def __call__(self, t, meas):
         if self.continuous:
@@ -1410,14 +1525,27 @@ class VSCController(_GraphRuntime):
         rot = cmath.exp(-1j * frame)
         self.v_dq, self.i_dq = control_meas.u_g * rot, control_meas.i_c * rot
         gates = startup.active
-        duty = self.stage.modulate(t, self.u_cmd, self.command_theta, control_meas.u_dc,
-                                   count=gates)
+        duty = np.asarray([graph.values[source] for source in self._duty_sources], dtype=float)
+        terminal = self._terminal_node
+        m_max = (float(terminal.m_peak) if hasattr(terminal, "m_peak")
+                 else peak_abs(2.0 * duty - 1.0))
+        if self.stage is not None:
+            if self._terminal in graph.updated and gates:
+                self.stage.n_updates += 1
+                saturated = bool(getattr(terminal, "saturated", False))
+                saturated = saturated or (
+                    self._terminal_limit is not None and self._terminal_limit.saturated
+                )
+                if saturated:
+                    self.stage.n_saturated += 1
+                    if self.stage.first_saturation_t is None:
+                        self.stage.first_saturation_t = t
         log = None
         if self.logging:
             log = {"id_pu": self.i_dq.real, "iq_pu": self.i_dq.imag,
                    "vd_pu": self.v_dq.real, "vq_pu": self.v_dq.imag,
                    "vac_pu": abs(self.v_dq), "vdc_pu": control_meas.u_dc,
-                   "m_max": peak_abs(self.stage.m_abc),
+                   "m_max": m_max,
                    "in_service": 1.0 if gates else 0.0,
                    **self._raw_log(meas, frame)}
             log.update(self._mode_log(t, control_meas))
@@ -1498,36 +1626,14 @@ class VSCController(_GraphRuntime):
     # ------------------------------------------------------------ states and summary
     def overwritten_state_names(self, period):
         graph = self.graph
-        # The frame is read after each sample; the voltage command only after its producer runs.
-        reads = [(self._frame_path, 1),
-                 (graph.outputs["u_dq"], dict(graph._every).get(self._terminal, 1))]
+        # The frame and terminal commands are consumed after each sampled graph pass.
+        reads = [(self._frame_path, 1)]
+        reads.extend((graph.outputs[port], 1) for port in ("d_a", "d_b", "d_c"))
         # initial_sync() also supplies the bridge before the first graph update.
         reads.extend((graph.outputs[port], None) for port in ("theta", "omega"))
         return graph.overwritten_state_names(period, reads=reads)
 
-    def get_state(self):
-        state = super().get_state()
-        if not self.continuous:
-            # The held command precedes the start-up entries in the restart schema.
-            startup = {name: state.pop(name) for name in self.discrete_state_names}
-            state.update({"command.u_dq_pu": self.u_cmd, "command.theta": self.command_theta,
-                          "command.omega": self.omega})
-            state.update(startup)
-        return state
-
     def set_state(self, values):
-        if not self.continuous:
-            rest = {}
-            for name, value in values.items():
-                if name == "command.u_dq_pu":
-                    self.u_cmd = complex(value)
-                elif name == "command.theta":
-                    self.command_theta = float(value)
-                elif name == "command.omega":
-                    self.omega = float(value)
-                else:
-                    rest[name] = value
-            values = rest
         super().set_state(values)
         if not self.continuous:
             self.theta, self.omega = self.initial_sync()

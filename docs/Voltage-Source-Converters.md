@@ -16,8 +16,9 @@ units:
     ctrl:
       type: gfl
       loops:
-        SRFPLL: {k_p_pu: 20.0, k_i_pu: 1200.0}
+        SRFPLL: {kp_pu: 20.0, ki_pu: 1200.0}
         CurrentLoop: {bandwidth: 200.0}
+        DutyCycleModulation: {}
         DCVoltageControl:
           kp: 0.8
           ki: 90.0
@@ -55,7 +56,9 @@ are `l_f` or `l_f_pu` and optional `r_f` or `r_f_pu`.
 | `custom` | explicit loop graph and wiring |
 
 `ctrl.loops` keys are registered loop classes. `ctrl.connections` and `ctrl.outputs` override
-profile wiring. Periods, ADC configuration and bridge models are documented under
+profile wiring. Sampled GFL and GFM graphs normally end in `DutyCycleModulation`; a terminal loop
+that produces `d_a`, `d_b` and `d_c` replaces both it and any upstream loop it does not consume.
+Periods, ADC configuration and bridge models are documented under
 [Bridge and PWM](Bridge-and-PWM.md). DC-link source fields are documented under
 [Electrical Sources](Electrical-Sources.md#converter-dc-source).
 

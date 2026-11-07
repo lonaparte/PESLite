@@ -89,6 +89,7 @@ ctrl:
   period: 50e-6
   loops:
     CurrentLoop: {period: 50e-6}
+    DutyCycleModulation: {period: 50e-6}
     DCVoltageControl: {period: 500e-6}
 ```
 

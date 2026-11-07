@@ -234,6 +234,7 @@ def _custom_case(case):
             "vi": {"type": "virtual_impedance"},
             "damp": {"type": "active_damping", "period": 5e-5,
                      "r_a_pu": 0.2, "alpha_d": 40.0},
+            "DutyCycleModulation": {"period": 5e-5},
         },
         "references": {"p_ref_pu": 0.5},
     }

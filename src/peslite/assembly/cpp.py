@@ -5893,16 +5893,6 @@ class _ControlGenerator:
                 f"meas_{_identifier(path[5:])} = {value.code};"
                 for path, value in self._sampled_control_inputs().items()]
 
-    def _modulation_values(self, command: str, theta: str, udc: str):
-        stage = self.ctrl.stage
-        if not stage._trusted_pwm or not stage._standard_limiter:
-            raise TypeError("C++ export: a custom VSC output stage has no equation tracer contract")
-        return self.model._trace(lambda: stage.equation(
-            _Expression(command, "complex"),
-            _Expression(f"Complex{{std::cos({theta}), std::sin({theta})}}", "complex"),
-            _Expression(udc, "real"),
-        ))
-
     def _sampled_due(self, name: str) -> str:
         every = self.graph.period_stride(self.graph.periods[name], self.cfg.ctrl.period)
         if isinstance(every, _InitializationExpression):
@@ -5910,16 +5900,9 @@ class _ControlGenerator:
         return "true" if int(every) == 1 else f"{self.m('pwm_k')} % {int(every)} == 0"
 
     def _sampled_vsc_command_lines(self) -> list[str]:
-        """Match VSCController._accept_command, including the held command's coordinate frame."""
-        lines = [f"{self.m('theta')} = {self.source(self.graph.outputs['theta'])};",
-                 f"{self.m('omega')} = {self.source(self.graph.outputs['omega'])};"]
-        due = ([self._sampled_due(self.ctrl._terminal)] if self.ctrl._terminal_in_graph else
-               list(dict.fromkeys(self._sampled_due(name) for name in self.graph.order)))
-        condition = "true" if "true" in due else " || ".join(f"({item})" for item in due) or "false"
-        commit = [f"{self.m('u_cmd')} = {self.source(self.graph.outputs['u_dq'])};",
-                  f"{self.m('command_theta')} = {self.m('theta')};"]
-        return lines + (commit if condition == "true" else
-                        [f"if ({condition}) {{", *["    " + line for line in commit], "}"])
+        """Match the synchronization outputs accepted after each sampled graph pass."""
+        return [f"{self.m('theta')} = {self.source(self.graph.outputs['theta'])};",
+                f"{self.m('omega')} = {self.source(self.graph.outputs['omega'])};"]
 
     def derivatives(self) -> list[str]:
         return [self.d(*name.split(".", 1)) for name in self.ctrl.state_names]
@@ -7321,24 +7304,19 @@ class _UnitGenerator(_ACControlGenerator):
 
     def members(self) -> list[str]:
         ctrl, stage = self.ctrl, self.ctrl.stage
-        first = math.nan if stage.first_saturation_t is None else stage.first_saturation_t
+        first = math.nan if stage is None or stage.first_saturation_t is None else stage.first_saturation_t
         return [
             f"double {self.m('theta')} = {_number(ctrl.theta)};",
             f"double {self.m('omega')} = {_number(ctrl.omega)};",
-            f"Complex {self.m('u_cmd')} = {_complex(ctrl.u_cmd)};",
-            f"double {self.m('command_theta')} = {_number(ctrl.command_theta)};",
             f"double {self.m('last_m_max')} = 0.0;",
             f"bool {self.m('command_saturated')} = false;",
-            f"std::size_t {self.m('mod_updates')} = {stage.n_updates};",
-            f"std::size_t {self.m('mod_saturated')} = {stage.n_saturated};",
+            f"std::size_t {self.m('mod_updates')} = {0 if stage is None else stage.n_updates};",
+            f"std::size_t {self.m('mod_saturated')} = {0 if stage is None else stage.n_saturated};",
             f"double {self.m('mod_first_t')} = {_number(first)};",
             *super().members(),
         ]
 
     def state_expression(self, part: Any, local: str) -> str:
-        held = {"command.u_dq_pu": "u_cmd", "command.theta": "command_theta", "command.omega": "omega"}
-        if local in held and (part is self.ctrl or part is self.unit.ctrl):
-            return self.m(held[local])
         return super().state_expression(part, local)
 
     def controller_method(self) -> str:
@@ -7393,22 +7371,23 @@ class _UnitGenerator(_ACControlGenerator):
         return lines
 
     def _modulation_lines(self, indent: str) -> list[str]:
-        command = self.m("u_cmd")
-        theta = self.m("command_theta")
-        udc = self._adc_value("u_dc")
-        modulation, output_saturated = self._modulation_values(command, theta, udc)
+        terminal = self.ctrl._terminal
+        node = self.graph.nodes[terminal]
+        duties = [self.source(self.graph.outputs[name]) for name in ("d_a", "d_b", "d_c")]
+        modulation = [f"(2.0 * {duty} - 1.0)" for duty in duties]
+        diagnostics = {"m_peak", "saturated"} <= set(node.carried)
+        peak = (self.node(terminal, "m_peak") if diagnostics else
+                f"std::max({{{', '.join(f'std::abs({value})' for value in modulation)}}})")
+        saturated = self.node(terminal, "saturated") if diagnostics else "false"
+        due = self._sampled_due(terminal)
         lines = [
-                  f"{indent}std::array<double, 3> modulation{{"
-                  f"{', '.join(value.code for value in modulation)}}};",
-                  f"{indent}const double peak_m = std::max({{std::abs(modulation[0]), std::abs(modulation[1]), std::abs(modulation[2])}});",
-                  f"{indent}const bool output_saturated = {output_saturated.code};",
-                  f"{indent}const bool saturated = {self.m('command_saturated')} || output_saturated;",
-                  f"{indent}{self.m('last_m_max')} = peak_m;",
-                  f"{indent}if ({self.m('startup_run')}) {{",
+                  f"{indent}{self.m('last_m_max')} = {peak};",
+                  f"{indent}if ({self.m('startup_run')} && ({due})) {{",
                   f"{indent}    ++{self.m('mod_updates')};",
-                  f"{indent}    if (saturated) {{ ++{self.m('mod_saturated')}; if (!std::isfinite({self.m('mod_first_t')})) {self.m('mod_first_t')} = t; }}",
+                  f"{indent}    if ({self.m('command_saturated')} || ({saturated})) {{ ++{self.m('mod_saturated')}; if (!std::isfinite({self.m('mod_first_t')})) {self.m('mod_first_t')} = t; }}",
                   f"{indent}}}",
-                  f"{indent}for (int k = 0; k < 3; ++k) {self.m('pending_d')}[k] = 0.5 * (1.0 + modulation[k]);"]
+                  *[f"{indent}{self.m('pending_d')}[{index}] = {duty};"
+                    for index, duty in enumerate(duties)]]
         lines += [f"{indent}{self.m('pending_d')}[{index}] = {self.source(self.graph.outputs[name])};"
                   for index, name in enumerate(self.bridge.register_names[3:], 3)]
         return lines
