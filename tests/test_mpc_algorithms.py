@@ -143,6 +143,27 @@ def test_backend_receives_condensed_problem_and_its_solution_is_independently_ch
     np.testing.assert_allclose(calls[0].linear, [4.0, 2.0])
 
 
+def test_backend_cannot_change_the_constraints_used_for_independent_validation():
+    def mutating_backend(problem):
+        assert not problem.lower.flags.writeable
+        assert not problem.upper.flags.writeable
+        problem.lower.setflags(write=True)
+        problem.upper.setflags(write=True)
+        problem.lower[:] = -np.inf
+        problem.upper[:] = np.inf
+        return SolverResult(np.array([10.0, 10.0]), True, "optimal")
+
+    controller = CCSMPC(
+        LinearModel([[1.0]], [[1.0]]), 2,
+        input_bounds=(0.0, 1.0), backend=mutating_backend,
+    )
+    result = controller.solve([0.0], [0.0])
+
+    assert not result.success
+    assert result.status == "invalid_solution"
+    assert result.action is None
+
+
 @pytest.mark.parametrize("solution", [[np.nan, 0.0], [0.0], [2.0, 0.0], [0.0 + 1j, 0.0], ["bad", "data"]])
 def test_invalid_backend_solution_never_becomes_an_action(solution):
     controller = CCSMPC(LinearModel([[1.0]], [[1.0]]), 2, input_bounds=(-1.0, 1.0),

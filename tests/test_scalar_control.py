@@ -7,6 +7,7 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 
 import peslite.control
+from peslite.assembly.params import BridgeParams
 from peslite.control import (
     DUTY_RATIO,
     LOOP_TYPES,
@@ -49,6 +50,7 @@ def _graph(*, continuous=False):
         ),
     }
     ctrl = SimpleNamespace(
+        type="dc",
         loops=loops,
         references=_References(),
         period=period,
@@ -59,7 +61,10 @@ def _graph(*, continuous=False):
     unit = SimpleNamespace(
         ctrl=ctrl,
         pwm=SimpleNamespace(grid_offset=0.0),
-        bridge=SimpleNamespace(model="averaging" if continuous else "pwm_averaging"),
+        bridge=BridgeParams(
+            model="averaging" if continuous else "pwm_averaging",
+            type="half_bridge",
+        ),
     )
     interface = ControlInterface(
         MappingProxyType({

@@ -15,7 +15,8 @@ from numpy.typing import NDArray
 from ..control.blocks import A120, phases, smoothstep
 from ..solver.energy import Port, StoragePort
 from ..solver.model import Bag, ConfigError, Empty, LocatedZero, OutputMethod, _real
-from ..solver.timing import TIME_EPS, control_clock_offset
+from ..solver.timing import (TIME_EPS, control_actuation_clock,
+                             control_clock_offset)
 from .network import NetworkComponent, RCNode, _extend_record
 from .pwm import CarrierComparison, Modulator, PWM, ZOH, make_unit_modulator
 
@@ -540,6 +541,19 @@ class PWMAveragingModel(_SampledModel):
     """A bridge topology driven by duty ratios held for one PWM interval."""
 
 
+class _SampledAveragingModel(_SampledModel):
+    """An ideal averaged bridge driven by sampled, zero-order-held commands."""
+
+    state_prefix = "command"
+
+    @property
+    def event_periods(self) -> list[float]:
+        return [self.period]
+
+    def describe(self) -> str:
+        return "ideal averaging, sampled control"
+
+
 class AveragingModel(_BridgeModel):
     """Ideal averaged bridge driven directly by the continuous controller output.
 
@@ -565,7 +579,8 @@ def topology_type(name: str, where: str = "bridge.type") -> type:
         ) from None
 
 
-def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None) -> _BridgeModel:
+def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None, *,
+                continuous: bool | None = None) -> _BridgeModel:
     """Compose a bridge topology with switching, PWM or averaging behavior."""
     topology = topology if topology is not None else make_topology(cfg.bridge)
     pwm = cfg.pwm
@@ -578,9 +593,21 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None) -> 
             raise ValueError("PWM dead time requires a controlled bridge")
         return _BridgeModel(topology, switching=True, **impedance)
     if cfg.bridge.model == "averaging":
-        if modulator is not None:
-            raise ValueError("an averaging bridge does not use a PWM modulator")
-        return AveragingModel(topology, **impedance)
+        if continuous is not False:
+            if modulator is not None:
+                raise ValueError("a continuously controlled averaging bridge does not use a modulator")
+            return AveragingModel(topology, **impedance)
+        control_offset = control_clock_offset(cfg.ctrl, pwm, pwm_timed=False)
+        actuation = control_actuation_clock(cfg.ctrl, pwm, pwm_timed=False)
+        return _SampledAveragingModel(
+            cfg.ctrl.period, actuation.period, control_offset, actuation.offset,
+            cfg.ctrl.computation, cfg.ctrl.period,
+            modulator if modulator is not None else make_unit_modulator(cfg),
+            topology,
+            pattern_sync="interval",
+            parallel_capacitance=cfg.bridge.parallel_capacitance,
+            on_resistance=cfg.bridge.on_resistance,
+        )
     model_type = SwitchingModel if cfg.bridge.model == "switching" else PWMAveragingModel
     control_offset = control_clock_offset(cfg.ctrl, pwm)
     return model_type(

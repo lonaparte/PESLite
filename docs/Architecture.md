@@ -68,11 +68,11 @@ groups iteratively.
 
 The graph has one typed, directed boundary. Its input ports are measured feedback signals
 (`meas.*`) and controller references (`references.*`). Its output schema belongs to the attached
-bridge: sampled VSC control exposes `d_a`, `d_b`, `d_c`, `theta` and `omega`; ideal averaging
-exposes `u_dq`, `theta` and `omega`; scalar bridge control exposes registers such as `duty` (see
-[Bridge and PWM](Bridge-and-PWM.md)). A connection always binds a loop input to a boundary or loop
-output. Default wiring and explicit custom wiring are both lowered to this same graph before the
-run.
+bridge: sampled VSC control exposes `d_a`, `d_b`, `d_c`, `theta` and `omega`; continuous VSC
+control exposes `u_dq`, `theta` and `omega`; scalar bridge control exposes registers such as `duty`
+(see [Bridge and PWM](Bridge-and-PWM.md)). A connection always binds a loop input to a boundary or
+loop output. Default wiring and explicit custom wiring are both lowered to this same graph before
+the run.
 
 Control ports use one canonical set of signal representations: complex vectors `I_AB`, `V_AB`,
 `I_DQ` and `V_DQ`; scalar `I`, `V` and `POWER`; and scalar `ANGLE` and `FREQUENCY`.

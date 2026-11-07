@@ -95,6 +95,23 @@ def _weight(value, width, name):
     return weight
 
 
+class _QuadraticStageCost:
+    """Validated quadratic tracking, input and input-increment cost."""
+
+    __slots__ = ("Q", "R", "S")
+
+    def __init__(self, output_width, input_width, tracking_weight, input_weight, rate_weight):
+        self.Q = _weight(tracking_weight, output_width, "tracking_weight")
+        self.R = _weight(input_weight, input_width, "input_weight")
+        self.S = _weight(rate_weight, input_width, "rate_weight")
+
+    def evaluate(self, output, action, reference, previous) -> float:
+        error = output - reference
+        delta = action - previous
+        return float(error @ self.Q @ error + action @ self.R @ action
+                     + delta @ self.S @ delta)
+
+
 @dataclass(frozen=True, init=False)
 class LinearModel:
     """Discrete affine model ``x_next = A x + B u + offset``, ``y_next = C x_next``.
@@ -148,6 +165,15 @@ class QuadraticProblem:
     max_iterations: int
     tolerance: float
     feasibility_tolerance: float
+
+    def __post_init__(self) -> None:
+        # Backends receive their own immutable copy. The controller retains separate
+        # coefficients for independent post-solve validation.
+        for name in ("hessian", "linear", "lower", "upper", "constraint_matrix",
+                     "constraint_lower", "constraint_upper", "initial"):
+            value = np.array(getattr(self, name), dtype=float, copy=True)
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
 
 
 @dataclass(frozen=True)
@@ -239,9 +265,9 @@ class CCSMPC:
         if self.control_horizon > self.prediction_horizon:
             raise ValueError("control_horizon must not exceed prediction_horizon")
         self.nx, self.nu, self.ny = model.A.shape[0], model.B.shape[1], model.C.shape[0]
-        self.Q = _weight(tracking_weight, self.ny, "tracking_weight")
-        self.R = _weight(input_weight, self.nu, "input_weight")
-        self.S = _weight(rate_weight, self.nu, "rate_weight")
+        self._cost = _QuadraticStageCost(
+            self.ny, self.nu, tracking_weight, input_weight, rate_weight,
+        )
         self.input_bounds = _bounds(input_bounds, self.prediction_horizon, self.nu, "input_bounds")
         self.state_bounds = _bounds(state_bounds, self.prediction_horizon, self.nx, "state_bounds")
         self.output_bounds = _bounds(output_bounds, self.prediction_horizon, self.ny, "output_bounds")
@@ -295,9 +321,9 @@ class CCSMPC:
             free = model.A @ free + model.offset
             output_response, output_free = model.C @ response, model.C @ free
             for mapping, offset, weight in (
-                (output_response, output_free - refs[k], self.Q),
-                (selection, np.zeros(self.nu), self.R),
-                (selection - prior_response, -prior_free, self.S),
+                (output_response, output_free - refs[k], self._cost.Q),
+                (selection, np.zeros(self.nu), self._cost.R),
+                (selection - prior_response, -prior_free, self._cost.S),
             ):
                 hessian += 2.0 * mapping.T @ weight @ mapping
                 linear += 2.0 * mapping.T @ weight @ offset
@@ -317,8 +343,9 @@ class CCSMPC:
                 and np.isfinite(constant) and np.all(np.isfinite(constraint_matrix))):
             return MPCResult(False, None, None, None, None, "numerical_failure",
                              message="Prediction produced non-finite condensed coefficients")
+        lower_flat, upper_flat = lower.ravel(), upper.ravel()
         problem = QuadraticProblem(
-            hessian, linear, constant, lower.ravel(), upper.ravel(),
+            hessian, linear, constant, lower_flat, upper_flat,
             constraint_matrix, constraint_lower, constraint_upper, guess,
             self.max_iterations, self.tolerance, self.feasibility_tolerance,
         )
@@ -336,7 +363,7 @@ class CCSMPC:
         if valid:
             tolerance = self.feasibility_tolerance
             constraint = constraint_matrix @ z
-            valid = (np.all(z >= problem.lower - tolerance) and np.all(z <= problem.upper + tolerance)
+            valid = (np.all(z >= lower_flat - tolerance) and np.all(z <= upper_flat + tolerance)
                      and np.all(constraint >= constraint_lower - tolerance)
                      and np.all(constraint <= constraint_upper + tolerance))
         if not valid:

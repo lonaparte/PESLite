@@ -115,9 +115,19 @@ class Loop:
     observations: ClassVar[tuple[str, ...]] = ()
     cpp_export: ClassVar[bool] = True
 
+    @classmethod
+    def supports_continuous(cls) -> bool:
+        """Return whether this loop type implements the continuous graph protocol."""
+        if cls.flow is not Loop.flow:
+            return True
+        return cls.flow_inputs is not None and (
+            cls.flow_path is not Loop.flow_path or cls.equation is not Loop.equation
+        )
+
     def __init__(self, cfg: Any, unit: Any, startup: Any) -> None:
         self.cfg, self.unit, self.startup = cfg, unit, startup
-        self.block_period = None if unit.bridge.model == "averaging" else cfg.period
+        continuous = getattr(startup, "continuous", unit.bridge.model == "averaging")
+        self.block_period = None if continuous else cfg.period
         self._state_blocks: dict[str, Any] = {}
 
     def state_block(self, name: str, block):
@@ -685,6 +695,10 @@ class SyncLaw(Loop):
                "p": POWER, "q": POWER}
     state_names = ("theta",)
     flow_inputs = ("v", "i", "u_dc", "p_ref", "q_ref", "v_ref")
+
+    @classmethod
+    def supports_continuous(cls) -> bool:
+        return cls._flow is not SyncLaw._flow
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)

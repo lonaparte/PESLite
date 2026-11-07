@@ -1,16 +1,18 @@
 # Model Predictive Control
 
 PESLite provides continuous-control-set MPC (CCS-MPC) and finite-control-set MPC (FCS-MPC)
-as ordinary sampled control loops. They use the same typed connections, ADC, PWM, protection,
-start-up and saved-state mechanisms as other loops. The converter adapters support `switching`
-and `pwm_averaging`; continuous `averaging`, C++ export and Imperix export are unsupported.
+as ordinary sampled control loops. They use the same typed connections, ADC, actuation,
+protection, start-up and saved-state mechanisms as other loops. The converter adapters support
+`switching`, `pwm_averaging` and `averaging`; C++ and Imperix export are unsupported.
 
 ## Run the examples
 
 ```bash
 peslite mpc-buck-example --pwm-averaging
+peslite mpc-buck-example --averaging
 peslite mpc-buck-example --switching
 peslite mpc-vsc-example --pwm-averaging
+peslite mpc-vsc-example --averaging
 peslite mpc-vsc-example --switching
 ```
 
@@ -20,8 +22,8 @@ this example does not add an outer voltage regulator.
 
 `mpc-vsc-example` uses FCS-MPC to track a three-phase converter's current reference. The
 controller chooses one of the eight binary three-leg commands, including both zero vectors.
-Each chosen command follows the ordinary PWM register timing. Binary duties produce held
-switching states, so the ideal FCS command has the same bridge voltage in both supported modes.
+Each chosen command follows the bridge model's ordinary actuation timing. Binary duties produce
+held bridge states, so the ideal FCS command has the same bridge voltage in every model.
 
 ## Configuration and units
 
@@ -72,9 +74,9 @@ Either predictive loop accepts `algorithm: ccs` or `algorithm: fcs`.
 |---|---|
 | `prediction_horizon` | Number of predicted controller intervals; positive integer. |
 | `control_horizon` | Number of independent input decisions, no larger than the prediction horizon; omitted means the prediction horizon. The last decision is held thereafter. |
-| `tracking_weight` | Nonnegative squared current-error weight; current is in amperes. |
-| `input_weight` | Nonnegative squared duty-ratio weight. |
-| `rate_weight` | Nonnegative squared duty-increment weight relative to the preceding command. |
+| `tracking_weight` (Q) | Nonnegative squared current-error weight; current is in amperes. |
+| `input_weight` (R) | Nonnegative squared duty-ratio weight. |
+| `rate_weight` (S) | Nonnegative squared duty-increment weight relative to the preceding command. |
 | `input_min`, `input_max` | Duty bounds, within `[0, 1]`, applied to every controlled leg. |
 | `current_min`, `current_max` | Optional lower/upper predicted current bounds in amperes, applied separately to each controlled coordinate. |
 | `max_iterations` | CCS solver iteration limit. |
@@ -93,6 +95,46 @@ Choose weights with these scales in mind; they do not normalize quantities autom
 The three-phase loop obtains frame and frequency through its typed graph inputs; the example
 connects them to `SRFPLL`. Existing frequency, ROCOF, overcurrent and voltage protection remains
 owned by the unit.
+
+### Weight matrices
+
+The three configuration fields directly define the stage-cost matrices Q, R and S:
+
+`(current_error).T @ Q @ current_error + duty.T @ R @ duty + duty_change.T @ S @ duty_change`.
+
+Each field accepts a scalar for a uniform diagonal, a vector for an explicit diagonal or a full
+symmetric positive-semidefinite matrix:
+
+```yaml
+# Uniform diagonals: Q = 1.0 I, R = 0 and S = 0.02 I.
+tracking_weight: 1.0
+input_weight: 0.0
+rate_weight: 0.02
+
+# Equivalent coordinate-specific diagonals for a three-phase loop.
+tracking_weight: [1.0, 0.8]
+input_weight: [0.001, 0.001, 0.001]
+rate_weight: [0.02, 0.02, 0.02]
+```
+
+A full three-phase tracking matrix can include coupling between the alpha and beta errors:
+
+```yaml
+tracking_weight:
+  - [1.0, 0.1]
+  - [0.1, 0.8]
+```
+
+For `PredictiveCurrentControl`, Q, R and S are all 1-by-1. For
+`ThreePhasePredictiveCurrentControl`, Q is 2-by-2 for the alpha-beta current error, while R and S
+are 3-by-3 for the three bridge-leg commands. PESLite validates the dimensions and matrix
+properties when the loop is constructed.
+
+Start with `tracking_weight: 1.0`, `input_weight: 0.0` and `rate_weight: 0.01`. Increase Q to
+prioritize current tracking, R to penalize command magnitude, or S to penalize command changes.
+Because current errors are in amperes and duties are dimensionless, these tradeoffs remain an
+engineering design choice. The built-in loops derive A, B, C and the affine offset from the
+converter, filter and timing configuration; users do not enter those plant matrices.
 
 ## Prediction and optimization
 
@@ -117,8 +159,7 @@ if result.success:
     command = result.action
 ```
 
-Weights accept a scalar, diagonal vector or symmetric positive-semidefinite matrix. Each
-`input_bounds`, `state_bounds` or `output_bounds` is a `(lower, upper)` pair; each side can
+Each `input_bounds`, `state_bounds` or `output_bounds` is a `(lower, upper)` pair; each side can
 be scalar, one coordinate vector or a horizon-by-coordinate array. References similarly
 accept a coordinate vector or one row per prediction stage. `solve(..., models=...)` accepts
 one dimension-compatible affine model per stage for known disturbances or varying coefficients.
@@ -152,8 +193,9 @@ incumbent. Equal-cost choices follow the configured action ordering, making ties
 Both algorithms return `MPCResult(success, action, inputs, states, objective, status, ...)`.
 Successful `inputs` cover the full prediction horizon and `states` include the initial state
 followed by every predicted endpoint. Failure results have no applicable `action`. CCS also
-accepts a callable `backend(QuadraticProblem) -> SolverResult`; the MPC checks its returned
-dimensions, finiteness and feasibility independently. Import these records from
+accepts a callable `backend(QuadraticProblem) -> SolverResult`; the backend receives read-only
+coefficient copies, and the MPC checks its returned dimensions, finiteness and feasibility
+against private originals. Import these records from
 `peslite.control.mpc`. Additional optimization libraries are needed only by backends that
 choose to use them.
 
@@ -164,7 +206,8 @@ voltage at its connected `omega` input and integrates the resulting RL forcing a
 do not construct a second plant or mutate the running electrical state. The scalar loop supports
 the synchronous half bridge with its ordinary midpoint output. Reverse-port, lower-rail,
 unilateral diode and other scalar bridge configurations require an appropriate custom model
-and are rejected by this loop.
+and are rejected by this loop. The built-in RL predictors also require a bridge without internal
+energy storage; configure a custom predictive loop when bridge capacitance belongs in the model.
 
 CCS prediction describes bridge-average voltage, including when the plant runs in switching
 mode. FCS prediction uses the chosen held binary level. Both ideal predictors omit physical
@@ -175,27 +218,36 @@ bound is not proof that switching ripple or a transient phase-current peak stays
 ## Sampling and known delay
 
 Optimization occurs at existing controller interrupts. ADC averaging and offsets, computation
-time, PWM register loads, physical switching and multirate integration retain their normal
+time, command loads, physical switching and multirate integration retain their normal
 [timing semantics](Bridge-and-PWM.md). Solver wall-clock execution does not advance simulation
-time; `ctrl.computation` is the configured simulated computation delay.
+time; `ctrl.computation` is the configured simulated computation delay. With `averaging`, the
+command is zero-order held at its actuation boundary and the electrical plant remains continuous;
+fixed- or variable-step integration never crosses a controller or actuation boundary.
 
-The built-in loops compensate a known, constant control-interrupt-to-register-load delay. Their
-supported timing requires:
+The built-in loops compensate a known, constant control-interrupt-to-actuation delay. With
+`switching` or `pwm_averaging`, their timing requires:
 
 - `ctrl.period` is an integer multiple of `pwm.load_period`.
-- The first eligible load after a computation is no later than the following control interrupt.
+- The first eligible PWM load after a computation is no later than the following control interrupt.
 - PWM is asynchronous and uses the `interval` update pattern.
+
+With `averaging`, `ctrl.period` is the command-hold period and `ctrl.computation` places the
+actuation boundary; carrier synchronization and PWM load periods do not constrain the control
+clock.
 
 The delay is derived from the shared control/load clocks, including their offsets. Zero
 computation allows a coincident load to take the new command. Positive computation takes the
 first eligible later load. Unsupported timing combinations raise configuration errors rather
 than treating an overwritten or variably delayed command as applied.
 
-Within a controller interval, the predictor applies the previous command until its known load
-delay and the new command afterward. The previous duty is an augmented prediction state. If
-the delay equals one full control period, a new decision first affects the second predicted
-sample; use a horizon greater than one. This is compensation for the configured register
-delay, not a general delay estimator or prediction of individual carrier pulses.
+Within a controller interval, the predictor applies an enabled previous command until its known
+load delay and the new command afterward. A blocked previous command contributes no commanded
+bridge voltage, but the measured current remains the initial state and follows the ordinary RL
+dynamics; the scalar Buck predictor applies its diode-imposed zero-current boundary only if that
+trajectory reaches it. The previous duty is an augmented prediction state. If the delay equals one
+full control period, a new decision first affects the second predicted sample; use a horizon greater
+than one. This is compensation for the configured register delay, not a general delay estimator or
+prediction of individual carrier pulses.
 
 ADC timing is independent of this execution-delay model. A held ADC conversion may precede
 the control interrupt, and a window-averaged current is not an instantaneous state. The
@@ -203,8 +255,9 @@ predictor uses those supplied values without reconstructing their acquisition or
 delay; it does not add an observer. Account for that approximation when selecting measurement
 settings and evaluating tracking or constraint accuracy.
 
-Duty-ratio dead-time compensation is unsupported by these loops. In particular, it would
-turn an FCS binary action into a fractional duty and change the finite action set.
+Duty-ratio dead-time compensation is unsupported by these loops in PWM-timed models. In
+particular, it would turn an FCS binary action into a fractional duty and change the finite
+action set. An ideal averaged bridge has no physical dead time.
 
 ## Failure handling, diagnostics and continuation
 
@@ -224,8 +277,8 @@ result and a configured deterministic fallback:
 - `block` requests blocked gates through the usual command interface.
 
 Without an explicit `fallback_input`, CCS uses the configured lower duty bounds and FCS uses
-the first admissible binary action. After an input-bound update makes the old held command
-inadmissible, `hold` uses that validated fallback command.
+the first admissible binary action. If a solve fails after an input-bound update makes the old
+held command inadmissible, `hold` uses that validated fallback command.
 
 A fallback supplies an admissible actuator command or blocks actuation. It cannot promise
 state/output feasibility when the prediction problem itself is infeasible. Unit protection
@@ -236,7 +289,7 @@ The predictive loop's `success`, `objective`, `iterations`, `evaluations`, `seco
 The controller summary includes the last textual solve status. Computation cost is an observation;
 wall-clock timing is not a reproducible electrical state. Previous decisions and necessary
 startup/controller state use the normal named-state mechanism, so continuation restores them
-together with the PWM registers and ADC.
+together with the sampled bridge commands and ADC.
 The existing restrictions on continuation during unrecorded ADC/computation windows still apply.
 
 Reference changes and supported option changes use ordinary `set` events. Structural changes

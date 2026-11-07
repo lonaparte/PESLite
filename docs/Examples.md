@@ -31,7 +31,7 @@ peslite case.pes
 | `gfm-dvoc-example` | Grid-forming dispatchable virtual oscillator control. |
 | `gfm-matching-example` | Matching control coupled to a dynamic dc link and current source. |
 | `mpc-buck-example` | CCS-MPC inductor-current control of a synchronous Buck, with current-reference and load changes. |
-| `mpc-vsc-example` | FCS-MPC three-phase current control with a reference change and the existing PWM register timing. |
+| `mpc-vsc-example` | FCS-MPC three-phase current control with a reference change and the existing bridge actuation timing. |
 | `two-converters-example` | A GFM and a GFL unit on separate buses, with different ratings and switching frequencies. |
 | `wpt-example` | A composite series-series compensated WPT unit whose independently clocked full-bridge primary and secondary are assembled from its single nested unit tree. |
 | `wpt-ss-example` | SS WPT with local primary-side power feedback controlling modulation amplitude, including a 1200 to 1800 W reference step. |
@@ -59,9 +59,9 @@ They represent different model fidelity and timing semantics; compare quantities
 bandwidth rather than expecting identical switching-scale waveforms. See
 [Bridge and PWM](Bridge-and-PWM.md).
 
-The MPC examples support `--switching` and `--pwm-averaging`. Their controller models,
-constraints, delay compensation and extension API are described in
-[Model Predictive Control](Model-Predictive-Control.md); continuous `--averaging` is unsupported.
+The MPC examples support `--switching`, `--pwm-averaging` and `--averaging`. Their controller
+models, constraints, delay compensation and extension API are described in
+[Model Predictive Control](Model-Predictive-Control.md).
 
 ## WPT power feedback
 

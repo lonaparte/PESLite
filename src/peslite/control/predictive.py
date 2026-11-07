@@ -17,11 +17,56 @@ from typing import Any, ClassVar, Mapping, Optional
 import numpy as np
 
 from ..solver.model import ConfigError
-from ..solver.timing import TIME_EPS, PeriodicClock, control_clock_offset
+from ..solver.timing import TIME_EPS, control_actuation_clock, control_clock_offset
 from .blocks import abc2complex
 from .loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, I, I_AB, SI_CURRENT,
                     SI_VOLTAGE, V, V_AB, Loop, register_loop_type)
-from .mpc import CCSMPC, FCSMPC, LinearModel, MPCResult
+from .mpc import CCSMPC, FCSMPC, LinearModel, MPCResult, _QuadraticStageCost
+
+
+class _RLCurrentPrediction:
+    """Exact discrete affine prediction for one RL current path per coordinate."""
+
+    def __init__(self, inductance, resistance, period, delay, voltage_map, *, blocked_min=None):
+        self.L, self.R = inductance, resistance
+        self.period, self.delay = period, delay
+        self.voltage_map = np.asarray(voltage_map, dtype=float)
+        self.voltage_map.setflags(write=False)
+        self.n_current, self.n_input = self.voltage_map.shape
+        self.decay = math.exp(-self.R * self.period / self.L)
+        self.blocked_min = (None if blocked_min is None else
+                            np.broadcast_to(blocked_min, (self.n_current,)).copy())
+        if self.blocked_min is not None:
+            self.blocked_min.setflags(write=False)
+
+    def integral(self, duration):
+        """Exact RL input integral, including the physical R = 0 limit."""
+        return (duration / self.L if self.R == 0
+                else -math.expm1(-self.R * duration / self.L) / self.R)
+
+    def model(self, vdc, current, disturbance_before, disturbance_after, previous_applied):
+        n, m = self.n_current, self.n_input
+        A = np.zeros((n + m, n + m))
+        B = np.zeros((n + m, m))
+        before_decay = math.exp(-self.R * self.delay / self.L)
+        after = self.period - self.delay
+        after_decay = math.exp(-self.R * after / self.L)
+        prior_state = np.eye(n) * before_decay
+        prior_offset = -np.asarray(disturbance_before)
+        if (not previous_applied and self.delay > 0.0
+                and self.blocked_min is not None):
+            blocked = prior_state @ current + prior_offset <= self.blocked_min
+            prior_state[blocked] = 0.0
+            prior_offset[blocked] = self.blocked_min[blocked]
+        A[:n, :n] = after_decay * prior_state
+        if previous_applied:
+            A[:n, n:] = after_decay * self.integral(self.delay) * vdc * self.voltage_map
+        B[:n] = self.integral(after) * vdc * self.voltage_map
+        B[n:] = np.eye(m)
+        C = np.zeros((n, n + m))
+        C[:, :n] = np.eye(n)
+        offset = after_decay * prior_offset - np.asarray(disturbance_after)
+        return LinearModel(A, B, C, np.r_[offset, np.zeros(m)])
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -76,39 +121,42 @@ class _PredictiveCurrentControl(Loop):
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
-        if unit.bridge.model not in ("switching", "pwm_averaging"):
-            raise ConfigError(f"{type(self).__name__} requires switching or pwm_averaging")
-        if unit.pwm.sync != "asynchronous" or unit.pwm.pattern_sync != "interval":
+        pwm_timed = unit.bridge.pwm_timed
+        if pwm_timed and (
+                unit.pwm.sync != "asynchronous" or unit.pwm.pattern_sync != "interval"):
             raise ConfigError(
                 f"{type(self).__name__} requires asynchronous interval PWM"
             )
-        if unit.pwm.dead_time_compensation:
+        if pwm_timed and unit.pwm.dead_time_compensation:
             raise ConfigError(
                 f"{type(self).__name__} commands cannot use duty-ratio dead-time compensation"
             )
         self.T = cfg.period
-        ratio = self.T / unit.pwm.load_period
+        actuation = control_actuation_clock(unit.ctrl, unit.pwm, pwm_timed=pwm_timed)
+        ratio = self.T / actuation.period
         if not math.isclose(ratio, round(ratio), rel_tol=1e-9) or ratio < 1:
             raise ConfigError(
-                f"{type(self).__name__}.period must be a whole multiple of the PWM load period"
+                f"{type(self).__name__}.period must be a whole multiple of the actuation period"
             )
-        clock = PeriodicClock(unit.pwm.load_period, unit.pwm.grid_offset)
-        t0 = control_clock_offset(unit.ctrl, unit.pwm)
-        index = clock.index_at_or_after(t0 + unit.ctrl.computation)
+        t0 = control_clock_offset(unit.ctrl, unit.pwm, pwm_timed=pwm_timed)
+        index = actuation.index_at_or_after(t0 + unit.ctrl.computation)
         if unit.ctrl.computation > 0:
-            index = max(index, clock.index_after(t0))
-        delay = clock.at(index) - t0
+            index = max(index, actuation.index_after(t0))
+        delay = actuation.at(index) - t0
         if delay < -TIME_EPS or delay > self.T + TIME_EPS:
             raise ConfigError("predictive-control execution delay must be within one loop period")
         self.delay = min(self.T, max(0.0, delay))
-        self._configure_plant(unit)
-        self.actions = np.array(list(itertools.product((0.0, 1.0), repeat=self.n_input)))
-        self.actions = self.actions[np.all(
-            (self.actions >= cfg.input_min) & (self.actions <= cfg.input_max), axis=1,
-        )]
-        if cfg.algorithm == "fcs" and len(self.actions) == 0:
-            raise ConfigError("input bounds exclude every finite control action")
-        default = self.actions[0] if cfg.algorithm == "fcs" else [cfg.input_min] * self.n_input
+        self.plant = self._configure_plant(unit)
+        if cfg.algorithm == "fcs":
+            actions = np.array(list(itertools.product((0.0, 1.0), repeat=self.n_input)))
+            self.actions = actions[np.all(
+                (actions >= cfg.input_min) & (actions <= cfg.input_max), axis=1,
+            )]
+            if len(self.actions) == 0:
+                raise ConfigError("input bounds exclude every finite control action")
+            default = self.actions[0]
+        else:
+            default = [cfg.input_min] * self.n_input
         self.fixed_input = np.asarray(
             default if cfg.fallback_input is None else cfg.fallback_input, dtype=float,
         ).copy()
@@ -122,66 +170,71 @@ class _PredictiveCurrentControl(Loop):
         self.fallback_count = 0
         self.last_result: MPCResult | None = None
         self._last_diagnostics = self._diagnostics(None, False, 0.0)
-        template = self._model(unit.dclink.vdc_ref, np.zeros(self.n_current), enabled=True)
-        self.ccs = CCSMPC(
-            template, cfg.prediction_horizon, cfg.control_horizon,
-            tracking_weight=cfg.tracking_weight, input_weight=cfg.input_weight,
-            rate_weight=cfg.rate_weight, input_bounds=(cfg.input_min, cfg.input_max),
-            output_bounds=(
-                -np.inf if cfg.current_min is None else cfg.current_min,
-                np.inf if cfg.current_max is None else cfg.current_max,
-            ), max_iterations=cfg.max_iterations, tolerance=cfg.tolerance,
-            feasibility_tolerance=cfg.feasibility_tolerance,
-        )
-        if cfg.algorithm == "fcs":
-            self.fcs = FCSMPC(
+        if cfg.algorithm == "ccs":
+            template = self.plant.model(
+                unit.dclink.vdc_ref, np.zeros(self.n_current),
+                np.zeros(self.n_current), np.zeros(self.n_current),
+                previous_applied=True,
+            )
+            self.optimizer = CCSMPC(
+                template, cfg.prediction_horizon, cfg.control_horizon,
+                tracking_weight=cfg.tracking_weight, input_weight=cfg.input_weight,
+                rate_weight=cfg.rate_weight, input_bounds=(cfg.input_min, cfg.input_max),
+                output_bounds=(
+                    -np.inf if cfg.current_min is None else cfg.current_min,
+                    np.inf if cfg.current_max is None else cfg.current_max,
+                ), max_iterations=cfg.max_iterations, tolerance=cfg.tolerance,
+                feasibility_tolerance=cfg.feasibility_tolerance,
+            )
+        else:
+            self._cost = _QuadraticStageCost(
+                self.n_current, self.n_input,
+                cfg.tracking_weight, cfg.input_weight, cfg.rate_weight,
+            )
+            self.optimizer = FCSMPC(
                 self.actions, cfg.prediction_horizon, self._predict, self._stage_cost,
                 control_horizon=cfg.control_horizon, constraint=self._constraint,
                 max_evaluations=cfg.max_evaluations,
                 feasibility_tolerance=cfg.feasibility_tolerance,
             )
 
-    def _configure_plant(self, unit) -> None:
+    def _configure_plant(self, unit) -> _RLCurrentPrediction:
         raise NotImplementedError
+
+    def _rl_plant(self, unit, inductance, resistance, voltage_map, *, blocked_min=None):
+        """Build the shared RL predictor after checking its physical model boundary."""
+        if unit.bridge.parallel_capacitance > 0.0:
+            raise ConfigError(
+                f"{type(self).__name__} requires a bridge without internal energy storage"
+            )
+        return _RLCurrentPrediction(
+            inductance, resistance, self.T, self.delay, voltage_map,
+            blocked_min=blocked_min,
+        )
 
     def _forecast(self, inputs: Mapping[str, Any]):
         raise NotImplementedError
 
-    def _disturbance(self, inputs: Mapping[str, Any], k: int, enabled: bool) -> np.ndarray:
+    def _disturbance(self, inputs: Mapping[str, Any], start: float,
+                     duration: float) -> np.ndarray:
         raise NotImplementedError
 
     def _write_action(self, outputs: dict[str, Any], action: np.ndarray) -> None:
         raise NotImplementedError
 
-    def _integral(self, duration):
-        """Exact RL input integral, including the physical R = 0 limit."""
-        return duration / self.L if self.R == 0 else -math.expm1(-self.R * duration / self.L) / self.R
-
-    def _model(self, vdc, voltage_integral, *, enabled):
-        n, m = self.n_current, self.n_input
-        A = np.zeros((n + m, n + m))
-        B = np.zeros((n + m, m))
-        if enabled or self.delay == 0:
-            A[:n, :n] = np.eye(n) * math.exp(-self.R * self.T / self.L)
-        if enabled:
-            A[:n, n:] = (math.exp(-self.R * (self.T - self.delay) / self.L)
-                          * self._integral(self.delay) * vdc * self.voltage_map)
-        B[:n] = self._integral(self.T - self.delay) * vdc * self.voltage_map
-        B[n:] = np.eye(m)
-        C = np.zeros((n, n + m))
-        C[:, :n] = np.eye(n)
-        return LinearModel(A, B, C, np.r_[-voltage_integral, np.zeros(m)])
-
     def prediction(self, t: float, inputs: Mapping[str, Any]):
         """Build affine prediction data without reading or mutating the running plant."""
         current, vdc, references = self._forecast(inputs)
-        models = [
-            self._model(
-                vdc, self._disturbance(inputs, k, k > 0 or self.previous_enabled),
-                enabled=k > 0 or self.previous_enabled,
-            )
-            for k in range(self.cfg.prediction_horizon)
-        ]
+        models = []
+        for k in range(self.cfg.prediction_horizon):
+            start = k * self.T
+            models.append(self.plant.model(
+                vdc,
+                current,
+                self._disturbance(inputs, start, self.delay),
+                self._disturbance(inputs, start + self.delay, self.T - self.delay),
+                previous_applied=k > 0 or self.previous_enabled,
+            ))
         return np.r_[current, self.previous_input], references, models
 
     def _predict(self, state, action, k):
@@ -189,10 +242,7 @@ class _PredictiveCurrentControl(Loop):
         return model.A @ state + model.B @ action + model.offset
 
     def _stage_cost(self, state, action, reference, previous, k):
-        error = state[:self.n_current] - reference
-        delta = action - previous
-        return float(error @ self.ccs.Q @ error + action @ self.ccs.R @ action
-                     + delta @ self.ccs.S @ delta)
+        return self._cost.evaluate(state[:self.n_current], action, reference, previous)
 
     def _constraint(self, state, action, k):
         current = state[:self.n_current]
@@ -207,17 +257,28 @@ class _PredictiveCurrentControl(Loop):
         """Optimize once; a custom registered loop may override this method."""
         state, reference, self._models = self.prediction(t, inputs)
         if self.cfg.algorithm == "ccs":
-            return self.ccs.solve(state, reference, self.previous_input, models=self._models)
-        return self.fcs.solve(state, reference, self.previous_input)
+            return self.optimizer.solve(
+                state, reference, self.previous_input, models=self._models,
+            )
+        return self.optimizer.solve(state, reference, self.previous_input)
 
     def _admissible(self, action) -> bool:
+        if not self._valid_history(action):
+            return False
         action = np.asarray(action)
-        if (action.shape != (self.n_input,) or action.dtype.kind not in "fiu"
-                or not np.all(np.isfinite(action))
-                or np.any(action < self.cfg.input_min) or np.any(action > self.cfg.input_max)):
+        if np.any(action < self.cfg.input_min) or np.any(action > self.cfg.input_max):
             return False
         return (self.cfg.algorithm != "fcs"
                 or bool(np.any(np.all(self.actions == action, axis=1))))
+
+    def _valid_history(self, action) -> bool:
+        """Whether an action can represent a previously applied bridge command."""
+        action = np.asarray(action)
+        if (action.shape != (self.n_input,) or action.dtype.kind not in "fiu"
+                or not np.all(np.isfinite(action))
+                or np.any(action < 0.0) or np.any(action > 1.0)):
+            return False
+        return self.cfg.algorithm != "fcs" or bool(np.all((action == 0.0) | (action == 1.0)))
 
     def _diagnostics(self, result, valid, elapsed):
         return {
@@ -302,20 +363,30 @@ class _PredictiveCurrentControl(Loop):
         unknown = set(values) - set(self.get_state())
         if unknown:
             raise KeyError(f"{type(self).__name__} has no states {sorted(unknown)}")
+        action = self.previous_input.tolist()
+        enabled = self.previous_enabled
+        counters = {
+            "solve_count": self.solve_count,
+            "fallback_count": self.fallback_count,
+        }
         for key, value in values.items():
             if key.startswith("previous_input."):
-                if (not math.isfinite(value) or value < self.cfg.input_min
-                        or value > self.cfg.input_max):
-                    raise ValueError("previous input must be a finite admissible duty ratio")
-                self.previous_input[int(key.rsplit(".", 1)[1])] = value
+                action[int(key.rsplit(".", 1)[1])] = value
             elif key == "previous_enabled":
                 if value not in (0, 1):
                     raise ValueError("previous_enabled must be 0 or 1")
-                self.previous_enabled = bool(value)
+                enabled = bool(value)
             else:
                 if not math.isfinite(value) or value < 0 or value != int(value):
                     raise ValueError(f"{key} must be a nonnegative integer")
-                setattr(self, key, int(value))
+                counters[key] = int(value)
+        action = np.asarray(action)
+        if not self._valid_history(action):
+            raise ValueError("previous input must be a valid finite bridge command")
+        self.previous_input = np.asarray(action, dtype=float)
+        self.previous_enabled = enabled
+        self.solve_count = counters["solve_count"]
+        self.fallback_count = counters["fallback_count"]
 
     def summary(self):
         return {
@@ -362,9 +433,13 @@ class PredictiveCurrentControl(_PredictiveCurrentControl):
             )
         if unit.filter is None:
             raise ConfigError("PredictiveCurrentControl requires an inductive filter")
-        self.L = unit.filter.l_f
-        self.R = unit.filter.r_f + bridge.on_resistance
-        self.voltage_map = np.ones((1, 1))
+        return self._rl_plant(
+            unit,
+            unit.filter.l_f,
+            unit.filter.r_f + bridge.on_resistance,
+            np.ones((1, 1)),
+            blocked_min=0.0,
+        )
 
     def _forecast(self, inputs):
         references = np.full(
@@ -373,9 +448,8 @@ class PredictiveCurrentControl(_PredictiveCurrentControl):
         )
         return np.array([inputs["current"]]), inputs["vin"], references
 
-    def _disturbance(self, inputs, k, enabled):
-        duration = self.T if enabled else self.T - self.delay
-        return np.array([inputs["voltage"] * self._integral(duration)])
+    def _disturbance(self, inputs, start, duration):
+        return np.array([inputs["voltage"] * self.plant.integral(duration)])
 
     def _write_action(self, outputs, action):
         outputs["duty"] = float(action[0])
@@ -413,16 +487,20 @@ class ThreePhasePredictiveCurrentControl(_PredictiveCurrentControl):
             raise ConfigError(
                 "ThreePhasePredictiveCurrentControl requires a two-level three-phase bridge"
             )
-        self.L = unit.ac_filter.l_f
-        self.R = unit.ac_filter.r_f + unit.bridge.on_resistance
         vectors = [abc2complex(row) for row in np.eye(3)]
-        self.voltage_map = np.array([
-            [value.real for value in vectors],
-            [value.imag for value in vectors],
-        ])
+        plant = self._rl_plant(
+            unit,
+            unit.ac_filter.l_f,
+            unit.ac_filter.r_f + unit.bridge.on_resistance,
+            np.array([
+                [value.real for value in vectors],
+                [value.imag for value in vectors],
+            ]),
+        )
         self.i_base = unit.base.i_phase_peak
         self.v_base = unit.base.v_phase_peak
         self.vdc_base = unit.dc_base.v
+        return plant
 
     def _forecast(self, inputs):
         current = inputs["i"] * self.i_base
@@ -437,14 +515,12 @@ class ThreePhasePredictiveCurrentControl(_PredictiveCurrentControl):
         ])
         return np.array([current.real, current.imag]), inputs["u_dc"] * self.vdc_base, references
 
-    def _disturbance(self, inputs, k, enabled):
-        duration = self.T if enabled else self.T - self.delay
-        start = k * self.T + (0.0 if enabled else self.delay)
+    def _disturbance(self, inputs, start, duration):
         omega = inputs["omega"]
-        denominator = self.R + 1j * omega * self.L
-        factor = (duration / self.L if denominator == 0 else
+        denominator = self.plant.R + 1j * omega * self.plant.L
+        factor = (duration / self.plant.L if denominator == 0 else
                   (cmath.exp(1j * omega * duration)
-                   - math.exp(-self.R * duration / self.L)) / denominator)
+                   - math.exp(-self.plant.R * duration / self.plant.L)) / denominator)
         integral = inputs["v"] * self.v_base * cmath.exp(1j * omega * start) * factor
         return np.array([integral.real, integral.imag])
 

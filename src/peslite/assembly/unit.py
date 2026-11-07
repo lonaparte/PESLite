@@ -1,8 +1,9 @@
 """A converter unit: power stage, sensing, controller and protection.
 
 Switching and PWM-period averaging use an ADC and a closed sampled controller. Ideal averaging
-wires instantaneous measurements and a continuous controller into the plant ODE. All protection
-decisions, their single trip latch, breakers and gates belong to the unit.
+runs loops with continuous equations in the plant ODE and sampled-only loops through the same ADC,
+interrupt and held-command path. All protection decisions, their single trip latch, breakers and
+gates belong to the unit.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from ..components.network import RLBranch, Port
 from ..components.pwm import Modulator
 from ..control.blocks import phases
 from ..control.controller import (Controller, ConverterMeasurement,
-                                  Measurement, make_controller)
+                                  Measurement, continuous_control, make_controller)
 from ..solver.timing import TIME_EPS, PeriodicClock, control_clock_offset, resolve_clock_offset
 from .events import Scenario
 from .params import SimulationParams, UnitParams, _parameterized
@@ -125,7 +126,13 @@ class Unit(ABC):
             """Control interrupts, or a continuous unit's own protection/measurement clock."""
             cfg, simulation = values
             if not self.continuous:
-                return PeriodicClock(cfg.ctrl.period, control_clock_offset(cfg.ctrl, cfg.pwm))
+                return PeriodicClock(
+                    cfg.ctrl.period,
+                    control_clock_offset(
+                        cfg.ctrl, cfg.pwm,
+                        pwm_timed=cfg.bridge.pwm_timed,
+                    ),
+                )
             meas = cfg.meas
             return PeriodicClock(
                 simulation.output.period if meas.period is None else meas.period,
@@ -693,7 +700,12 @@ class VSC(Unit):
 
         # ------------------------------------------------------------ power
         try:
-            self.bridge = _parameterized(lambda c: make_bridge(c, modulator), cfg)
+            self.bridge = _parameterized(
+                lambda c: make_bridge(
+                    c, modulator, continuous=continuous_control(c),
+                ),
+                cfg,
+            )
         except ValueError as exc:
             raise ValueError(f"{name}: {exc}") from None
         self.continuous = self.bridge.continuous
@@ -838,7 +850,13 @@ class DCConverter(Unit):
                  ctrl: Optional[Any] = None, modulator: Optional[Modulator] = None) -> None:
         super().__init__(name, cfg, bus)
         topology = make_topology(cfg.bridge)
-        self.bridge = _parameterized(lambda c: make_bridge(c, modulator, topology=topology), cfg)
+        self.bridge = _parameterized(
+            lambda c: make_bridge(
+                c, modulator, topology=topology,
+                continuous=continuous_control(c),
+            ),
+            cfg,
+        )
         self.continuous = self.bridge.continuous
         self.branch_f = None if cfg.filter is None else _parameterized(lambda c: RLBranch(
             c.l_f,

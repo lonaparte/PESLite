@@ -29,10 +29,12 @@ from types import UnionType
 from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
 
 from ..components.network import ELEMENT_TYPES, element_buses
+from ..control.controller import continuous_control
 from ..control.loops import LOOP_TYPES, loop_key_type, loop_type
 from ..control.profiles import ReferenceParams, control_type
 from ..solver.integrators import CIRCUIT_MODELS, canonical_method
 from ..solver.model import ConfigError
+from ..solver.timing import control_computation, control_period
 from .events import EVENT_TYPES, NAMED, SWITCHABLE, events_for
 from .types import unit_type
 
@@ -409,7 +411,7 @@ class MeasurementParams:
     (s, at most the control period). Channels not listed are instantaneous.
     ``period`` is the ADC oversampling period; it defaults to the control period.
     ``sources`` selects physical outputs for existing channels. ``rms`` selects sliding
-    mean-square windows, in whole control periods (protection/output periods in ideal averaging).
+    mean-square windows, in whole sampling periods (protection/output periods for continuous control).
     """
 
     average: list[str] = field(default_factory=list)
@@ -424,10 +426,9 @@ class MeasurementParams:
 class ControlParams:
     """Digital controller fields shared by every controller architecture.
 
-    For switching and PWM-period averaging, ``period`` defaults to one carrier period and
-    ``computation`` defaults to 1 us: the time from the ADC sample until the new shadow duty
-    ratios may be loaded. With the ideal averaging bridge the controller is continuous; these
-    discrete timing settings are retained in the file but ignored.
+    For sampled control, ``period`` defaults to one carrier period and ``computation`` defaults
+    to 1 us: the time from the ADC sample until the new command may be loaded. An ideal averaging
+    bridge uses these fields only when its active graph contains sampled-only loops.
 
     ``type`` selects the reference-field schema and default wiring. ``connections`` and ``outputs``
     override that wiring. A ``loops`` key names a registered loop class. The optional
@@ -438,7 +439,7 @@ class ControlParams:
     type: str
     period: Optional[float] = None  # s; default: one carrier period
     offset: Optional[float] = None  # s; default: the PWM load-clock offset
-    computation: Optional[float] = None  # s; sampled default 1 us; ignored by continuous averaging
+    computation: Optional[float] = None  # s; sampled default 1 us
     loops: dict[str, Any] = field(default_factory=dict, metadata={"entries": "loop"})
     connections: dict = field(default_factory=dict)
     outputs: dict = field(default_factory=dict)
@@ -503,10 +504,10 @@ class BridgeParams:
 
     ``"switching"`` follows exact carrier-comparison edges. ``"pwm_averaging"`` keeps the
     PWM timer, duty registers and load timing but applies each active duty ratio continuously until
-    the next compare-register load. ``"averaging"`` is an ideal controlled voltage source driven
-    by continuous measurement and control equations, with no ADC, interrupt, computation or PWM
-    events. For a unilateral half bridge, ``pwm.f_sw`` still defines the physical cycle used by
-    the averaged DCM conduction law; it does not schedule carrier events.
+    the next compare-register load. ``"averaging"`` is an ideal controlled voltage source. A
+    continuous-capable control graph joins the plant ODE; a sampled-only graph drives it through
+    held commands without carrier events. For a unilateral half bridge, ``pwm.f_sw`` still defines
+    the physical cycle used by the averaged DCM conduction law; it does not schedule carrier events.
     A controllerless diode full bridge has no PWM waveform to average, so all three selections
     retain its exactly located natural commutations while selecting the surrounding run preset.
     Optional device resistance and port capacitance use the same topology and execution form;
@@ -531,6 +532,11 @@ class BridgeParams:
     def controlled(self) -> bool:
         """Whether any device is gated; otherwise the full bridge is a diode rectifier."""
         return self.upper_controlled or self.lower_controlled
+
+    @property
+    def pwm_timed(self) -> bool:
+        """Whether command actuation follows the PWM load clock."""
+        return self.model != "averaging"
 
     @property
     def neutral_duty(self) -> float:
@@ -618,12 +624,12 @@ class UnitParams:
         ctrl = self.ctrl
         if ctrl is not None:
             assert self.pwm is not None and self.bridge is not None
-            continuous = self.bridge.model == "averaging"
+            continuous = continuous_control(self)
             if not continuous and ctrl.period is None:
-                ctrl = replace(ctrl, period=self.pwm.switching_period)
+                ctrl = replace(ctrl, period=control_period(ctrl, self.pwm))
                 derived.add("ctrl.period")
             if not continuous and ctrl.computation is None:
-                ctrl = replace(ctrl, computation=1.0e-6)
+                ctrl = replace(ctrl, computation=control_computation(ctrl))
                 derived.add("ctrl.computation")
             if (unit_type(self.type).defaults_grid_frequency
                     and hasattr(ctrl.references, "omega") and ctrl.references.omega is None):

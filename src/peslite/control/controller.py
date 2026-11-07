@@ -4,8 +4,8 @@ At each control interrupt the controller takes an ADC sample (:class:`Measuremen
 the unit's pu bases, runs its loop network (:class:`ControlGraph`: the loops of :mod:`.loops`
 connected by typed ports) and its start-up state, and turns the voltage command into duty
 ratios. It sees only its samples, host commands and its own state. Protection and physical trip
-actions belong to the unit.  The ideal averaging bridge uses the same graph as a continuous ODE;
-the other bridge models run it as one closed sampled block.
+actions belong to the unit. The graph runs as a continuous ODE when every active loop supports
+that protocol and otherwise as one closed sampled block.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from ..solver.timing import control_clock_offset
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,
                     SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ,
-                    Loop, SignalType, SyncLaw)
+                    Loop, SignalType, SyncLaw, loop_type)
 from .modulation import CONFIGURED, OutputStage
 from .profiles import (DutyReferenceParams, PhaseShiftReferenceParams, ReferenceParams,
                        ResonantReferenceParams,
@@ -186,6 +186,8 @@ class Startup:
     which owns that reference.
     """
 
+    continuous = False
+
     def __init__(self, T: float, run: bool = True, ramp: float = 0.0) -> None:
         self.T = _real(T)
         self.run = bool(run)
@@ -247,6 +249,8 @@ class Startup:
 
 class ContinuousStartup:
     """Run/ramp command for a continuous controller, evaluated from absolute time."""
+
+    continuous = True
 
     def __init__(self, run: bool = True, ramp: float = 0.0) -> None:
         self.run = bool(run)
@@ -328,6 +332,51 @@ SAMPLED_VSC_INTERFACE = replace(
 )
 
 
+def _active_loop_names(classes: Mapping[str, type[Loop]], connections: Mapping[str, str],
+                       sources: Any) -> set[str]:
+    """Trace the loop instances that contribute to boundary sources."""
+    active = set()
+    pending = list(sources)
+    while pending:
+        owner = pending.pop().partition(".")[0]
+        if owner not in classes or owner in active:
+            continue
+        active.add(owner)
+        for port in classes[owner].inputs:
+            target = f"{owner}.{port}"
+            source = connections.get(target)
+            if source is None:
+                raise ConfigError(
+                    f"ctrl.connections.{target}: missing or unknown source {source!r}"
+                )
+            pending.append(source)
+    return active
+
+
+def continuous_control(unit: Any) -> bool:
+    """Whether an averaged unit's active control graph can run as one continuous ODE."""
+    if unit.bridge.pwm_timed:
+        return False
+    ctrl = getattr(unit, "ctrl", None)
+    if ctrl is None:
+        return True
+    profile = control_type(ctrl.type)
+    if profile.wiring is None:
+        return False
+    connections, outputs = profile.wiring(unit, continuous=True)
+    connections = {**connections, **ctrl.connections}
+    outputs = {**outputs, **ctrl.outputs}
+    required = {
+        name for name in profile.interface.outputs
+        if name not in profile.interface.optional_outputs or name in outputs
+    }
+    if not required <= outputs.keys():
+        return False
+    classes = {name: loop_type(params.type) for name, params in ctrl.loops.items()}
+    active = _active_loop_names(classes, connections, outputs.values())
+    return all(classes[name].supports_continuous() for name in active)
+
+
 class ControlGraph:
     """The active loops of ``cfg.ctrl.loops`` wired by typed ports and run by the control interrupt.
 
@@ -346,7 +395,8 @@ class ControlGraph:
     _cycle_atol = 1e-10
     _cycle_rtol = 1e-8
 
-    def __init__(self, cfg, startup, connections, outputs, *, interface=CONTROL_INTERFACE):
+    def __init__(self, cfg, startup, connections, outputs, *, interface=CONTROL_INTERFACE,
+                 continuous: bool | None = None):
         self.cfg, self.startup = cfg, startup
         self.interface = interface
         self._pending: list[Any] = []
@@ -355,9 +405,12 @@ class ControlGraph:
         self.outputs = {**outputs, **cfg.ctrl.outputs}
         self.nodes = {}
         self.periods = {}
-        self.continuous = cfg.bridge.model == "averaging"
+        self.continuous = (cfg.bridge.model == "averaging"
+                           if continuous is None else bool(continuous))
         self._T = None if self.continuous else _real(cfg.ctrl.period)
-        self._t0 = control_clock_offset(cfg.ctrl, cfg.pwm)
+        self._t0 = control_clock_offset(
+            cfg.ctrl, cfg.pwm, pwm_timed=cfg.bridge.pwm_timed,
+        )
         self.values: dict[str, Any] = {}
         self._out_specs: dict[str, tuple] = {}
         self._limits: dict[str, tuple[str, OutputLimit]] = {}
@@ -416,7 +469,6 @@ class ControlGraph:
                                           **{port: types[self.outputs[port]] for port in additional}}),
                 optional_outputs=interface.optional_outputs | additional,
             )
-        active = set()
         pending_sources = []
         for port, spec in self.interface.outputs.items():
             source = self.outputs.get(port)
@@ -435,19 +487,7 @@ class ControlGraph:
                                           or name in retained}),
                 optional_outputs=retained,
             )
-        while pending_sources:
-            owner = pending_sources.pop().partition(".")[0]
-            if owner not in classes or owner in active:
-                continue
-            active.add(owner)
-            for port in classes[owner].inputs:
-                target = f"{owner}.{port}"
-                source = self.connections.get(target)
-                if source not in types:
-                    raise ConfigError(
-                        f"ctrl.connections.{target}: missing or unknown source {source!r}"
-                    )
-                pending_sources.append(source)
+        active = _active_loop_names(classes, self.connections, pending_sources)
         self.connections = {
             target: source for target, source in self.connections.items()
             if target.partition(".")[0] in active
@@ -1109,7 +1149,7 @@ def _role_finder(cfg, label: str):
 
     return find
 
-def default_wiring(cfg, family):
+def default_wiring(cfg, family, *, continuous=False):
     """Return the default ``(connections, outputs)`` for family ``"gfl"``, ``"gfm"`` or ``"custom"``.
 
     Each loop is wired by its role (:attr:`peslite.control.loops.Loop.role`), so a registered loop
@@ -1162,9 +1202,9 @@ def default_wiring(cfg, family):
     wires = {f"{name}.{port}": source for name, role in roles.items()
              for port, source in ports_of.get(role, {}).items()
              if port in LOOP_TYPES[loops[name].type].inputs}
-    if cfg.bridge.model == "averaging":
+    if continuous:
         if command is None:
-            raise ConfigError(f"ctrl.loops: {family} averaging needs a voltage-command loop")
+            return wires, {}
         return wires, {"u_dq": f"{command}.u_dq", "theta": theta, "omega": omega}
     if modulation is None:
         raise ConfigError(f"ctrl.loops: sampled {family} control needs a modulation loop")
@@ -1248,15 +1288,9 @@ class _GraphRuntime:
         names = []
         for name in self.graph.order:
             node = self.graph.nodes[name]
-            if (type(node).flow is Loop.flow
-                    and (node.flow_inputs is None
-                         or (type(node).flow_path is Loop.flow_path
-                             and type(node).equation is Loop.equation))):
+            if not type(node).supports_continuous():
                 raise ConfigError(f"ctrl.loops.{name}: loop type {node.type!r} "
                                   "has no continuous-time implementation")
-            if isinstance(node, SyncLaw) and type(node)._flow is SyncLaw._flow:
-                raise ConfigError(f"ctrl.loops.{name}: loop type {node.type!r} "
-                                  "has no continuous-time flow implementation")
             for local, value in node.flow_state().items():
                 if isinstance(value, bool):
                     raise ConfigError(
@@ -1367,22 +1401,23 @@ class _GraphRuntime:
 class VSCController(_GraphRuntime):
     """Configurable closed controller block with loops, start-up and output stage.
 
-    The host gives it only run/stop commands and parameter updates.  With switching or PWM-period
-    averaging it is called at each interrupt.  With ideal averaging it is a continuous subsystem:
-    its loop states join the plant ODE and its output is the bridge's modulation space vector.
+    The host gives it only run/stop commands and parameter updates. A sampled graph is called at
+    each interrupt; a continuous graph joins its loop states to the plant ODE and supplies the
+    bridge's modulation space vector directly.
     """
 
     def __init__(self, cfg, pwm_method=None, *, limiter=CONFIGURED):
         self.p = cfg
-        self.continuous = cfg.bridge.model == "averaging"
+        self.continuous = continuous_control(cfg)
         # A continuous controller already participates in construction-time energy probes, before
         # VSC.start() applies its scenario. Keep its ideal source off until that command arrives.
         self.startup = ContinuousStartup(run=False) if self.continuous else Startup(cfg.ctrl.period)
         profile = control_type(cfg.ctrl.type)
-        wires, outputs = profile.wiring(cfg)
+        wires, outputs = profile.wiring(cfg, continuous=self.continuous)
         interface = profile.interface if self.continuous else SAMPLED_VSC_INTERFACE
         self.graph = graph = ControlGraph(
             cfg, self.startup, wires, outputs, interface=interface,
+            continuous=self.continuous,
         )
         self._carried_outputs = tuple(
             port for port in interface.auxiliary_outputs(graph.outputs) if port != "enable"
@@ -1872,7 +1907,7 @@ _PHASE_SHIFT_LOG_SOURCES = _converter_log_sources(
 )
 
 
-def _modulation_wiring(cfg):
+def _modulation_wiring(cfg, *, continuous=False):
     """Wire the modulation-role loop: each of its inputs named like a reference of the control
     type reads that reference, and each controller output reads the loop output of its name."""
     find = _role_finder(cfg, cfg.ctrl.type)
@@ -1887,7 +1922,7 @@ def _modulation_wiring(cfg):
     return connections, outputs
 
 
-def _dc_converter_wiring(cfg):
+def _dc_converter_wiring(cfg, *, continuous=False):
     find = _role_finder(cfg, cfg.ctrl.type)
     voltage, current = find("dc_voltage"), find("current")
     wires = {}
@@ -1945,19 +1980,20 @@ class GraphController(_GraphRuntime):
     def __init__(self, cfg, topology) -> None:
         self.p = cfg
         self.topology = topology
-        self.continuous = cfg.bridge.model == "averaging"
+        self.continuous = continuous_control(cfg)
         self.startup = (
             ContinuousStartup(run=False) if self.continuous
             else Startup(cfg.ctrl.period, run=False)
         )
         profile = control_type(cfg.ctrl.type)
-        connections, outputs = profile.wiring(cfg)
+        connections, outputs = profile.wiring(cfg, continuous=self.continuous)
         self.graph = ControlGraph(
             cfg,
             self.startup,
             connections,
             outputs,
             interface=profile.interface,
+            continuous=self.continuous,
         )
         self.outputs_need_inputs = any(
             isinstance(source, str) and source.startswith("meas.")
@@ -2130,7 +2166,9 @@ for _control_name in ("gfl", "gfm", "custom"):
         references=ReferenceParams,
         unit_types=frozenset(("vsc",)),
         interface=CONTROL_INTERFACE,
-        wiring=lambda cfg, family=_control_name: default_wiring(cfg, family),
+        wiring=lambda cfg, continuous=False, family=_control_name: default_wiring(
+            cfg, family, continuous=continuous,
+        ),
         grid_following=_control_name == "gfl",
         default_bridge="three_phase_bridge",
         controller_factory=VSCController,

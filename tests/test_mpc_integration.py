@@ -73,7 +73,7 @@ def test_current_profile_is_not_specific_to_mpc():
     assert graph.outputs == {"duty": "InductorCurrentControl.duty"}
 
 
-@pytest.mark.parametrize("mode", ["switching", "pwm_averaging"])
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
 def test_buck_mpc_tracks_current_and_load_change_with_bounded_duty(mode, tmp_path):
     params = _dc(mode, **{
         "simulation.t_end": 0.008,
@@ -97,7 +97,7 @@ def test_buck_mpc_tracks_current_and_load_change_with_bounded_duty(mode, tmp_pat
     assert _controller(simulation)[1].fallback_count == 0
 
 
-@pytest.mark.parametrize("mode", ["switching", "pwm_averaging"])
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
 @pytest.mark.parametrize("algorithm", ["ccs", "fcs"])
 def test_three_phase_mpc_tracks_dq_current_at_rated_physical_scale(case, mode, algorithm, tmp_path):
     params = _ac(case, mode, **{f"units.vsc.ctrl.loops.{_AC_MPC}.algorithm": algorithm})
@@ -118,7 +118,7 @@ def test_three_phase_mpc_tracks_dq_current_at_rated_physical_scale(case, mode, a
     assert _controller(simulation, "vsc")[1].fallback_count == 0
 
 
-@pytest.mark.parametrize("mode", ["switching", "pwm_averaging"])
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
 def test_finite_set_buck_tracks_current_using_binary_commands(mode, tmp_path):
     params = _dc(mode, **{f"units.converter.ctrl.loops.{_DC_MPC}.algorithm": "fcs"})
     simulation = peslite.Simulation(params)
@@ -189,7 +189,8 @@ def test_ac_predictor_matches_independent_sinusoidal_forcing_integral(case):
     state, _, models = controller.prediction(measurement.t, inputs)
     action = np.array([0, 1, 0])
     predicted = models[0].A @ state + models[0].B @ action + models[0].offset
-    T, L, R, delay = controller.T, controller.L, controller.R, controller.delay
+    T, L, R, delay = (controller.T, controller.plant.L,
+                      controller.plant.R, controller.delay)
     old_voltage = 1000 + 0j
     new_voltage = -500 + 500j * math.sqrt(3)
 
@@ -266,6 +267,44 @@ def test_mpc_uses_existing_adc_interrupt_and_pwm_load_clocks(
             assert state[unit.bridge.register_names[0]] == pytest.approx(eligible[-1][0])
 
 
+@pytest.mark.parametrize("method", ["DP45", "radau"])
+def test_sampled_averaging_mpc_respects_control_boundaries_with_adaptive_steps(
+    method, monkeypatch, tmp_path,
+):
+    period = 50e-6
+    common = {
+        "simulation.t_end": 0.001,
+        "simulation.output.period": 10e-6,
+    }
+    reference = peslite.Simulation(_dc("averaging", **{
+        **common,
+        "simulation.solver.type": "fixed",
+        "simulation.solver.method": "RK4",
+        "simulation.solver.dt": 1e-6,
+    })).run(out_dir=tmp_path / "reference")
+    params = _dc("averaging", **{
+        **common,
+        "simulation.solver.type": "adaptive",
+        "simulation.solver.method": method,
+    })
+    simulation = peslite.Simulation(params)
+    host, controller = _controller(simulation)
+    solve = controller.solve
+    calls = []
+
+    def recorded(t, inputs):
+        calls.append(t)
+        return solve(t, inputs)
+
+    monkeypatch.setattr(controller, "solve", recorded)
+    result = simulation.run(out_dir=tmp_path)
+
+    np.testing.assert_allclose(calls, np.arange(0.0, 0.001 + period, period), atol=1e-14)
+    for state in ("converter.branch_f.i", "output.u_C"):
+        np.testing.assert_allclose(result.states[state], reference.states[state], atol=2e-10)
+    assert host.graph.nodes[_DC_MPC].fallback_count == 0
+
+
 def test_prediction_does_not_mutate_plant_or_adc_measurement(case):
     simulation = peslite.Simulation(_ac(case))
     host, controller = _controller(simulation, "vsc")
@@ -332,7 +371,7 @@ def test_mpc_results_are_consistent_under_step_refinement_and_multirate_integrat
                                       baseline.states[f"converter.ctrl.{_DC_MPC}.solve_count"])
 
 
-@pytest.mark.parametrize("mode", ["switching", "pwm_averaging"])
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
 def test_repeated_and_resumed_mpc_run_preserves_decisions_and_plant_state(mode, tmp_path):
     params = _dc(mode, **{"simulation.t_end": 0.0008, "simulation.output.period": 5e-6})
     whole = peslite.Simulation(params).run(out_dir=tmp_path / "whole")
@@ -364,6 +403,40 @@ def test_runtime_options_and_reference_events_apply_without_changing_state_schem
     assert host.p.ctrl.references.current == 2.0
     assert set(host.get_state()) == names
     assert controller.solve_count == 9
+
+
+def test_retune_preserves_applied_input_history_but_fallback_uses_new_bounds(
+    monkeypatch,
+):
+    params = _dc()
+    simulation = peslite.Simulation(params)
+    host, controller = _controller(simulation)
+    controller.previous_input[:] = 0.8
+    controller.previous_enabled = True
+    changed = params.replace(**{
+        f"units.converter.ctrl.loops.{_DC_MPC}.input_max": 0.5,
+    })
+
+    host.retune(
+        changed.unit("converter"),
+        [f"ctrl.loops.{_DC_MPC}.input_max"],
+        0.0,
+    )
+    host.initialize()
+    controller = host.graph.nodes[_DC_MPC]
+    np.testing.assert_array_equal(controller.previous_input, [0.8])
+    assert not controller._admissible(controller.previous_input)
+
+    monkeypatch.setattr(
+        controller,
+        "solve",
+        lambda _t, _inputs: MPCResult(False, None, None, None, None, "solver_failure"),
+    )
+    host.command(True)
+    output = host(0.0, ConverterMeasurement(current=1.0, voltage=24.0, vin=48.0))
+
+    assert output.duty == 0.0
+    assert output.gates
 
 
 @pytest.mark.parametrize("fallback", ["hold", "fixed", "block"])
@@ -451,8 +524,8 @@ class _DeadbeatMPC(PredictiveCurrentControl):
     type = "test_deadbeat_mpc"
 
     def solve(self, t, inputs):
-        decay = math.exp(-self.R * self.T / self.L)
-        gain = self.T / self.L if self.R == 0 else (1 - decay) / self.R
+        decay = math.exp(-self.plant.R * self.T / self.plant.L)
+        gain = self.plant.integral(self.T)
         duty = ((inputs["reference"] - decay * inputs["current"]) / gain
                 + inputs["voltage"]) / inputs["vin"]
         action = np.array([np.clip(duty, self.cfg.input_min, self.cfg.input_max)])

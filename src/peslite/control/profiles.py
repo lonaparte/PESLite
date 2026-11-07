@@ -83,6 +83,8 @@ class ControlTypeSpec:
     ``options`` is the optional dataclass schema for ``ctrl.options``. A standalone controller
     sets ``requires_loops=False`` and may validate cross-field relationships with ``validator``.
     ``supported_models`` restricts bridge simulation forms before constructing runtime parts.
+    ``wiring(cfg, continuous=...)`` returns the default connections and boundary outputs for the
+    selected graph execution form.
     """
 
     name: str

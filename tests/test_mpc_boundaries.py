@@ -6,7 +6,7 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.control import ConverterMeasurement, MPCResult, PredictiveCurrentControl
-from peslite.solver.model import StateRegistry
+from peslite.solver.model import ConfigError, StateRegistry
 
 
 _MPC = "PredictiveCurrentControl"
@@ -114,38 +114,56 @@ def test_fcs_default_fallback_is_selected_from_admissible_actions(
     np.testing.assert_array_equal(controller.previous_input, [expected])
 
 
-def test_recovery_prediction_discards_current_reset_by_coincident_block_load(
-    mpc_params, tmp_path, monkeypatch,
-):
-    params = mpc_params.replace(**{
-        "events": {},
-        "simulation.t_end": 250.0e-6,
-        "simulation.output.period": 50.0e-6,
-        f"units.converter.ctrl.loops.{_MPC}.fallback": "block",
+def test_blocked_prediction_keeps_the_measured_current_as_the_initial_state(mpc_params):
+    _simulation, _host, controller = _parts(mpc_params)
+    controller.previous_enabled = False
+    controller.previous_input[:] = 0.75
+    current = 5.0
+
+    state, _references, models = controller.prediction(0.0, {
+        "reference": 0.0,
+        "current": current,
+        "voltage": 0.0,
+        "vin": 48.0,
     })
-    simulation, _host, controller = _parts(params)
-    period = controller.T
-    samples = {}
+    predicted = models[0].A @ state + models[0].B @ np.zeros(1) + models[0].offset
 
-    def solve(t, inputs):
-        state, references, models = controller.prediction(t, inputs)
-        action = np.array([0.5])
-        predicted = models[0].A @ state + models[0].B @ action + models[0].offset
-        samples[round(t / period)] = (
-            inputs["current"], controller.previous_enabled, predicted[0],
-        )
-        if round(t / period) == 2:
-            return MPCResult(False, None, None, None, None, "solver_failure")
-        return MPCResult(True, action, None, None, 0.0, "optimal")
+    assert models[0].A[0, 0] == pytest.approx(controller.plant.decay)
+    assert models[0].A[0, 1] == 0.0
+    assert predicted[0] == pytest.approx(current * controller.plant.decay)
 
-    monkeypatch.setattr(controller, "solve", solve)
-    result = simulation.run(out_dir=tmp_path)
+    state, _references, models = controller.prediction(0.0, {
+        "reference": 0.0,
+        "current": 0.01,
+        "voltage": 24.0,
+        "vin": 48.0,
+    })
+    predicted = models[0].A @ state + models[0].B @ np.zeros(1) + models[0].offset
+    assert predicted[0] == 0.0
 
-    current_before_block, prior_enabled, predicted_after_block = samples[3]
-    assert current_before_block > 0.0
-    assert not prior_enabled
-    assert predicted_after_block == pytest.approx(0.0, abs=1e-14)
-    assert samples[4][0] == pytest.approx(predicted_after_block, abs=1e-14)
-    blocked_row = np.argmin(abs(result.t - 3 * period))
-    assert result.states["converter.pwm.on"][blocked_row] == 0.0
-    assert controller.fallback_count == 1
+
+def test_fcs_state_restore_validates_the_complete_physical_action(mpc_params):
+    params = mpc_params.replace(**{
+        f"units.converter.ctrl.loops.{_MPC}.algorithm": "fcs",
+        f"units.converter.ctrl.loops.{_MPC}.input_max": 0.8,
+    })
+    _simulation, _host, controller = _parts(params)
+    initial = controller.previous_input.copy()
+
+    with pytest.raises(ValueError, match="valid finite bridge command"):
+        controller.set_state({"previous_input.0": 0.5})
+    np.testing.assert_array_equal(controller.previous_input, initial)
+
+    controller.set_state({"previous_input.0": 1.0})
+    np.testing.assert_array_equal(controller.previous_input, [1.0])
+    assert not controller._admissible(controller.previous_input)
+
+
+def test_bridge_energy_storage_is_not_silently_omitted_from_the_predictor(mpc_params):
+    params = mpc_params.replace(**{
+        "units.converter.bridge.on_resistance": 0.01,
+        "units.converter.bridge.parallel_capacitance": 1e-6,
+    })
+
+    with pytest.raises(ConfigError, match="without internal energy storage"):
+        peslite.Simulation(params)

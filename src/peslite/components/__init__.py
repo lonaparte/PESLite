@@ -3,7 +3,8 @@
 The power circuit (:mod:`.network`, including registered ``elements``, and :mod:`.converter`) is
 continuous-time, in SI, connected through :class:`peslite.solver.model.Model`. Sampled bridge
 models use the ADC (:mod:`.adc`) and own their PWM timing/register implementation from
-:mod:`.pwm`; the ideal averaging bridge connects directly to continuous controller equations.
+:mod:`.pwm`; the ideal averaging bridge accepts either continuous equations or sampled held
+commands from the same control graph.
 """
 
 from ..solver import Bag, ConfigError, Empty, Port, StoragePort

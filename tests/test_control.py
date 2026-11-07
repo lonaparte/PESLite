@@ -180,7 +180,7 @@ def test_registered_loop_owns_its_schema_and_uses_default_role_wiring(tmp_path):
     )
 
 
-def test_sampled_custom_loop_must_supply_its_own_continuous_equations_for_averaging():
+def test_sampled_only_active_loops_use_held_commands_with_averaging():
     p = peslite.load(
         EXAMPLES / "gfm-psc-example.pes", **QUIET,
         **{"units.vsc.bridge.model": "averaging"},
@@ -189,16 +189,18 @@ def test_sampled_custom_loop_must_supply_its_own_continuous_equations_for_averag
     loops.pop("PSC")
     loops["_FixedFrequency"] = _FixedFrequency.Params(period=5e-5)
     p = p.replace(**{"units.vsc.ctrl.loops": loops})
-    with pytest.raises(ConfigError, match="no continuous-time flow implementation"):
-        peslite.Simulation(p)
+    simulation = peslite.Simulation(p)
+    assert not simulation.unit().ctrl.continuous
+    assert "_FixedFrequency" in simulation.unit().ctrl.graph.nodes
 
-    # A DC converter's graph is checked by the same construction-time rule.
+    # The same graph capability selection applies to scalar converters.
     tree = read_tree(EXAMPLES / "buck-open-loop-example.pes")
     tree["units"]["converter"]["bridge"] = {"model": "averaging"}
     tree["units"]["converter"]["ctrl"]["loops"] = {"_SampledDuty": {}}
     tree["events"] = {}
-    with pytest.raises(ConfigError, match="_SampledDuty: .* no continuous-time implementation"):
-        peslite.Simulation(from_dict(tree))
+    simulation = peslite.Simulation(from_dict(tree))
+    assert not simulation.unit().ctrl.continuous
+    assert "_SampledDuty" in simulation.unit().ctrl.graph.nodes
 
 
 def test_continuous_control_graph_automatically_solves_feedback_between_loops():
