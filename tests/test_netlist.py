@@ -632,7 +632,7 @@ def test_export_planning_covers_default_device_circuits_and_diode_modes():
     assert set(solve.inputs) == set(circuit.inputs)
 
 
-def test_device_ratio_changes_do_not_factorize_an_unused_numeric_network(
+def test_device_ratio_changes_factorize_each_exact_stability_mode_at_most_once(
         monkeypatch, tmp_path):
     count = 0
     original = nl._DenseSolve.__init__
@@ -650,9 +650,18 @@ def test_device_ratio_changes_do_not_factorize_an_unused_numeric_network(
         "simulation.solver.circuit_model": "device",
     })
     simulation = peslite.Simulation(params)
+    initial = count
+    initial_structures = sum(
+        len(circuit.netlist._structures) for circuit in simulation.system.circuits
+    )
     simulation.run(out_dir=tmp_path)
-    steps = params.simulation.t_end / params.simulation.solver.dt
-    assert count < 0.05 * steps
+    modes = simulation.solver._mode_eigenvalues
+    new_structures = sum(
+        len(circuit.netlist._structures) for circuit in simulation.system.circuits
+    ) - initial_structures
+    assert modes
+    assert count - initial <= len(modes) + new_structures
+    assert len(simulation.solver._stability_results) == len(modes)
 
 
 @pytest.mark.parametrize("example", [

@@ -119,14 +119,10 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
         lines = self._sampled_measurement_lines()
         lines += self._sampled_loop_lines()
         if isinstance(self.ctrl, VSCController):
-            members += [f"Complex {self.m('u_cmd')} = {_literal(self.ctrl.u_cmd)};",
-                        f"double {self.m('theta')} = {_number(self.ctrl.theta)};",
-                        f"double {self.m('omega')} = {_number(self.ctrl.omega)};",
-                        f"double {self.m('command_theta')} = {_number(self.ctrl.command_theta)};"]
-            lines += self._sampled_vsc_command_lines()
-            modulation, _ = self._modulation_values(
-                self.m("u_cmd"), self.m("command_theta"), self._adc_value("u_dc"))
-            output = SimpleNamespace(d_abc=tuple(0.5 * (1.0 + value) for value in modulation))
+            output = SimpleNamespace(d_abc=tuple(
+                _Expression(self.source(self.graph.outputs[port]), "real")
+                for port in ("d_a", "d_b", "d_c")
+            ))
             voltage = "std::abs(meas_u_g)"
             frequency = f"({self.source(self.graph.outputs['omega'])} - {_number(self.cfg.base.w0)}) / (2.0 * pi)"
             vdc_error = f"meas_u_dc - {self._reference('vdc_ref_pu')}"

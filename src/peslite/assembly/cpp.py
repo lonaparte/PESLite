@@ -6048,8 +6048,14 @@ class _ControlGenerator:
                 if external_limit:
                     port, original = self.graph._limits[loop_name]
                     limit = copy.copy(original)
-                    if limit.pi is node.pi:
-                        limit.pi = clone.pi
+                    if limit.pi is not None:
+                        original_bindings = node.flow_state_bindings()
+                        cloned_bindings = clone.flow_state_bindings()
+                        owner_map = {
+                            id(owner): cloned_bindings[name][0]
+                            for name, (owner, _attribute) in original_bindings.items()
+                        }
+                        limit.pi = owner_map[id(limit.pi)]
                     if original is self.ctrl._terminal_limit:
                         limit.limit = self.ctrl.stage.command_limit(
                             _Expression(self.source("meas.u_dc"), "real")
@@ -7125,9 +7131,7 @@ class _ACControlGenerator(_ProtectionGenerator, _ControlGenerator):
 
     def _tracked_outputs(self):
         return [(self.m('theta'), self.graph.outputs['theta']),
-                (self.m('omega'), self.graph.outputs['omega']),
-                *([] if self.continuous else
-                  [(self.m('command_theta'), self.graph.outputs['theta'])])]
+                (self.m('omega'), self.graph.outputs['omega'])]
 
     def _frequency_deviation(self) -> str:
         return f"({self.m('omega')} - {_number(self.cfg.base.w0)}) / (2.0 * pi)"

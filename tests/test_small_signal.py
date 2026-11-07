@@ -452,7 +452,8 @@ def test_loop_reads_controller_angle_coordinates_from_state_owner_metadata(gfl, 
     angles = sim._states.angle_names
     assert "vsc.ctrl.SRFPLL.theta" in angles
     if model == "switching":
-        assert {"vsc.ctrl.held.SRFPLL.theta", "vsc.ctrl.command.theta"} <= angles
+        assert {"vsc.ctrl.held.SRFPLL.theta", "vsc.ctrl.held.SRFPLL.frame"} <= angles
+        assert "vsc.ctrl.command.theta" not in sim.state_names()
     loop = SystemLoop(sim, period=0.02, frame_frequency=0.0)
     assert loop._angles == set(angles)
 

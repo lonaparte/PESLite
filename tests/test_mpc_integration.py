@@ -9,6 +9,9 @@ import pytest
 from scipy.integrate import quad
 
 import peslite
+from peslite.addons.control.voltage_adaptive_pll import VoltageAdaptivePLL
+from peslite.addons.functions import energy_closure, plot_result
+from peslite.addons.functions.small_signal import small_signal
 from peslite.assembly.params import from_dict, read_initial
 from peslite.control import (ConverterMeasurement, Measurement, PredictiveCurrentControl,
                              register_loop_type)
@@ -547,6 +550,58 @@ def test_custom_mpc_loop_is_registered_without_runner_changes(tmp_path):
     assert isinstance(controller, _DeadbeatMPC)
     assert controller.last_result.status == "deadbeat"
     assert result.states["converter.branch_f.i"][-1] == pytest.approx(4.0, abs=0.1)
+
+
+def test_mpc_composes_with_control_and_component_addons(examples, tmp_path):
+    params = peslite.load(examples / "cable-gfl-example.pes", **{
+        "simulation.t_end": 0.001,
+        "simulation.progress.enable": 0,
+        "simulation.solver.linearisations": 0,
+        "units.vsc.connected": True,
+        "units.vsc.dclink": {
+            "vdc_ref": 20000.0,
+            "source": {"type": "voltage"},
+        },
+        "units.vsc.ctrl": {
+            "type": "gfl",
+            "references": {"id_ref_pu": 0.2},
+            "loops": {
+                "VoltageAdaptivePLL": {"bandwidth": 20.0},
+                _AC_MPC: {
+                    "algorithm": "fcs",
+                    "prediction_horizon": 2,
+                    "control_horizon": 2,
+                },
+            },
+        },
+    })
+    simulation = peslite.Simulation(params)
+    result = simulation.run(out_dir=tmp_path)
+    nodes = simulation.unit("vsc").ctrl.graph.nodes
+
+    assert isinstance(nodes["VoltageAdaptivePLL"], VoltageAdaptivePLL)
+    assert nodes[_AC_MPC].fallback_count == 0
+    assert np.isfinite(result.states["cable1.iL1.re"]).all()
+    assert not result.tripped
+
+
+@pytest.mark.full
+def test_mpc_results_work_with_function_addons(tmp_path):
+    params = _dc("averaging", **{
+        "simulation.t_end": 0.02,
+        "simulation.output.energy": True,
+    })
+    simulation = peslite.Simulation(params)
+    result = simulation.run(out_dir=tmp_path)
+
+    closure = energy_closure(result)
+    figure = plot_result(result, "converter.branch_f.i", latex=False)
+    analysis = small_signal(simulation, period=50e-6)
+
+    assert np.isfinite(tuple(closure.values())).all()
+    assert figure.is_file()
+    assert analysis.phi.shape[0] == analysis.phi.shape[1] > 0
+    assert analysis.periodic
 
 
 @pytest.mark.static
