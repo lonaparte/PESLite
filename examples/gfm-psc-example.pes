@@ -22,7 +22,7 @@ units:
       loops:
         PSC: {k_p_pu: 6.2832, k_vi: 20.0}
         VirtualImpedance: {}
-        DutyCycleModulation: {}
+        ThreePhaseModulation: {}
         ActiveDamping: {r_a_pu: 0.2, alpha_d: 40.0}
       references: {p_ref_pu: 0.5}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}

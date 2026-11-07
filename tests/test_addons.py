@@ -235,7 +235,7 @@ def test_custom_pll_assembles_with_builtin_loops_and_runs(examples, tmp_path, mo
 
     expected = {"VoltageAdaptivePLL", "CurrentLoop", "DCVoltageControl"}
     if model != "averaging":
-        expected.add("DutyCycleModulation")
+        expected.add("ThreePhaseModulation")
     assert set(nodes) == expected
     assert isinstance(nodes["VoltageAdaptivePLL"], VoltageAdaptivePLL)
     assert type(nodes["VoltageAdaptivePLL"]).sample is Loop.sample

@@ -26,7 +26,7 @@ __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER",
            "ROLES", "Loop", "LOOP_TYPES", "register_loop_type", "PowerFilterParams",
            "CurrentLimitParams",
-           "SRFPLL", "CurrentLoop", "DutyCycleModulation", "DCVoltageControl", "SyncLawParams", "SyncLaw",
+           "SRFPLL", "CurrentLoop", "ThreePhaseModulation", "DCVoltageControl", "SyncLawParams", "SyncLaw",
            "PSC", "Droop", "VSG", "DVOC",
            "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping",
            "SI_CURRENT", "SI_VOLTAGE", "SI_POWER", "DUTY_RATIO", "MODULATION", "HERTZ",
@@ -1323,7 +1323,7 @@ FrequencyCurrentControl = _feedback_loop(
 
 
 @register_loop_type
-class DutyCycleModulation(Loop):
+class ThreePhaseModulation(Loop):
     """Convert a dq voltage command into the three bridge duty-cycle commands.
 
     This is the ordinary sampled VSC actuator stage. A different terminal loop may replace it
@@ -1333,9 +1333,9 @@ class DutyCycleModulation(Loop):
     @dataclass(frozen=True, kw_only=True)
     class Params:
         period: Optional[float] = None
-        type: str = "duty_cycle_modulation"
+        type: str = "three_phase_modulation"
 
-    type = "duty_cycle_modulation"
+    type = "three_phase_modulation"
     role = "modulation"
     carried = ("m_peak", "saturated")
     inputs = {"u_dq": V_DQ, "theta": ANGLE, "u_dc": V}

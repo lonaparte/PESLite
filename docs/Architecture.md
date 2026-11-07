@@ -77,7 +77,7 @@ run.
 Control ports use one canonical set of signal representations: complex vectors `I_AB`, `V_AB`,
 `I_DQ` and `V_DQ`; scalar `I`, `V` and `POWER`; and scalar `ANGLE` and `FREQUENCY`.
 
-`Startup` owns run/stop and reference-ramp progress. `DutyCycleModulation` is an ordinary terminal
+`Startup` owns run/stop and reference-ramp progress. `ThreePhaseModulation` is an ordinary terminal
 loop from a dq voltage command to three duty cycles; another terminal loop may drive the same bridge
 ports directly. Protection does not belong to the controller.
 

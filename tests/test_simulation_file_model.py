@@ -238,7 +238,7 @@ def test_class_named_control_loops_round_trip_without_a_type_field():
     loops = to_dict(p)["units"]["vsc"]["ctrl"]["loops"]
 
     assert tuple(loops) == (
-        "SRFPLL", "CurrentLoop", "DutyCycleModulation", "DCVoltageControl",
+        "SRFPLL", "CurrentLoop", "ThreePhaseModulation", "DCVoltageControl",
     )
     assert all("type" not in parameters for parameters in loops.values())
     assert from_dict(to_dict(p)) == p

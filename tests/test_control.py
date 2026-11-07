@@ -133,7 +133,7 @@ def test_terminal_actuator_loop_replaces_current_control_and_modulation(gfl):
     params = gfl()
     loops = dict(params.unit("vsc").ctrl.loops)
     loops.pop("CurrentLoop")
-    loops.pop("DutyCycleModulation")
+    loops.pop("ThreePhaseModulation")
     loops["_DirectThreePhaseDuty"] = _DirectThreePhaseDuty.Params(
         period=params.unit("vsc").ctrl.period,
     )
@@ -147,7 +147,7 @@ def test_terminal_actuator_loop_replaces_current_control_and_modulation(gfl):
     ))
 
     assert "CurrentLoop" not in controller.graph.nodes
-    assert "DutyCycleModulation" not in controller.graph.nodes
+    assert "ThreePhaseModulation" not in controller.graph.nodes
     assert controller.graph.order[-1] == "_DirectThreePhaseDuty"
     assert output.d_abc == pytest.approx([0.2, 0.5, 0.8])
 

@@ -22,7 +22,7 @@ units:
       loops:
         VSG: {h: 2.0, d_p_pu: 20.0, k_q_pu: 0.05, t_q: 0.02}
         VirtualImpedance: {x_v_pu: 0.1}
-        DutyCycleModulation: {}
+        ThreePhaseModulation: {}
       references: {p_ref_pu: 0.5}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 events:
