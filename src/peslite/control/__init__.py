@@ -28,6 +28,7 @@ from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, Cont
 from .mpc import CCSMPC, FCSMPC, LinearModel, MPCResult, QuadraticProblem, SolverResult, solve_slsqp
 from .predictive import PredictiveCurrentControl, ThreePhasePredictiveCurrentControl
 from .profiles import register_control_type
+from .signals import TableSignal
 
 __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter",
            "complex_power", "unit_delay", "SignalType", "ConfigError",
@@ -45,4 +46,4 @@ __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter",
            "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
            "BridgeControlOutput", "ConverterMeasurement", "Controller", "Startup", "VSCController", "GraphController",
            "make_controller", "register_control_type", "LinearModel", "CCSMPC", "FCSMPC",
-           "MPCResult", "QuadraticProblem", "SolverResult", "solve_slsqp"]
+           "MPCResult", "QuadraticProblem", "SolverResult", "solve_slsqp", "TableSignal"]

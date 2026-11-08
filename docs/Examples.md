@@ -1,6 +1,6 @@
 # Examples
 
-PESLite ships twenty simulation files with the Python wheel. They can be run by name from any
+PESLite ships twenty-one simulation files with the Python wheel. They can be run by name from any
 directory, so cloning the repository is not required.
 
 ```bash
@@ -32,6 +32,7 @@ peslite case.pes
 | `gfm-matching-example` | Matching control coupled to a dynamic dc link and current source. |
 | `mpc-buck-example` | CCS-MPC inductor-current control of a synchronous Buck, with current-reference and load changes. |
 | `mpc-vsc-example` | FCS-MPC three-phase current control with a reference change and the existing bridge actuation timing. |
+| `reference-signal-example` | Open-loop Buck driven by a repeating inline duty-ratio table on the existing controller schedule. |
 | `two-converters-example` | A GFM and a GFL unit on separate buses, with different ratings and switching frequencies. |
 | `wpt-example` | A composite series-series compensated WPT unit whose independently clocked full-bridge primary and secondary are assembled from its single nested unit tree. |
 | `wpt-ss-example` | SS WPT with local primary-side power feedback controlling modulation amplitude, including a 1200 to 1800 W reference step. |

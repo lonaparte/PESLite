@@ -6,6 +6,9 @@ _EXPORTS = {
     "energy_closure": ("energy_audit", "energy_closure"),
     "plot_csv": ("plotting", "plot_csv"),
     "plot_result": ("plotting", "plot_result"),
+    "reference_csv": ("reference_signals", "reference_csv"),
+    "reference_expression": ("reference_signals", "reference_expression"),
+    "reference_table": ("reference_signals", "reference_table"),
 }
 __all__ = list(_EXPORTS)
 

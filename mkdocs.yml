@@ -20,6 +20,7 @@ nav:
   - Simulation Files: Simulation-Files.md
   - Simulation:
       - Events Timeline: Events-Timeline.md
+      - Reference Signals: Reference-Signals.md
       - Solvers: Solvers.md
       - Multirate Simulation: Multirate-Simulation.md
       - Output and Results: Output-and-Results.md
