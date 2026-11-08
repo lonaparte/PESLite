@@ -1,12 +1,12 @@
-"""Backend for the CodeSim VS Code extension (``codesim-frontend``).
+"""PESLite frontend service.
 
-The extension's topology view, parameter editor, waveform plots and small-signal panel drive a
-resident process over line-delimited JSON on stdin/stdout. This package serves that protocol for
-PESLite simulation files: each file is one selectable "system". Start it with::
+The topology view, parameter editor, waveform plots and small-signal panel communicate with a
+resident process over line-delimited JSON on stdin/stdout. Each PESLite simulation file is one
+selectable system. Start the service with::
 
     python -m peslite.frontend
 
-The extension recognizes a PESLite checkout by ``src/peslite/frontend`` and runs this module.
+PESLite initially incorporated the [CodeSim](https://github.com/NoClassDefError/codesim) frontend implementation and has since developed it further.
 """
 
 from .descriptor import SignalRecorder, Topology, small_signal_descriptor
