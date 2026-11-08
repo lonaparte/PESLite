@@ -2,6 +2,9 @@
 
 ## 0.5.1
 
+- Added continuous- and finite-control-set MPC current loops through the ordinary control graph,
+  with explicit modulation nodes, constrained prediction, full weight matrices, deterministic work
+  limits, fallback and runnable DC and three-phase examples.
 - Unified exact circuit-mode stability checks across Python, C++ and all circuit models, corrected
   native dense-LU pivoting and identifier substitution, and added accepted-step commutation checks.
 - Reused sparse network factors, low-rank transformer-ratio updates, output rows, structural stage

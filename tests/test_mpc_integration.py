@@ -111,6 +111,60 @@ def test_buck_mpc_tracks_current_and_load_change_with_bounded_duty(mode, tmp_pat
     assert _controller(simulation)[1].fallback_count == 0
 
 
+@pytest.mark.parametrize("mode", ["pwm_averaging", "averaging"])
+def test_vsc_mpc_example_tracks_its_mean_current_with_each_actuation_timing(
+        examples, mode, tmp_path):
+    params = peslite.load(examples / "mpc-vsc-example.pes", **{
+        "simulation.progress.enable": False,
+        "simulation.t_end": 0.01,
+        "units.vsc.bridge.model": mode,
+    })
+    result = peslite.Simulation(params).run(out_dir=tmp_path)
+    settled = np.asarray(result.t) >= 0.005
+    assert np.mean(np.asarray(result.plant["vsc.id_pu"])[settled]) == pytest.approx(
+        0.4, abs=0.01,
+    )
+
+
+@pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
+def test_vsc_mpc_full_matrix_example_runs_through_each_bridge_model(examples, mode, tmp_path):
+    params = peslite.load(examples / "mpc-vsc-matrices-example.pes", **{
+        "simulation.progress.enable": False,
+        "simulation.t_end": 0.006,
+        "units.vsc.bridge.model": mode,
+    })
+    simulation = peslite.Simulation(params)
+    result = simulation.run(out_dir=tmp_path)
+    controller = _controller(simulation, "vsc")[1]
+    weights = tuple(np.asarray(value) for value in (
+        controller.cfg.tracking_weight,
+        controller.cfg.input_weight,
+        controller.cfg.rate_weight,
+    ))
+    assert tuple(weight.shape for weight in weights) == ((2, 2), (3, 3), (3, 3))
+    assert all(np.count_nonzero(weight - np.diag(np.diag(weight))) for weight in weights)
+    settled = np.asarray(result.t) >= 0.003
+    assert np.mean(np.asarray(result.plant["vsc.id_pu"])[settled]) == pytest.approx(
+        0.4, abs=0.02,
+    )
+    assert controller.fallback_count == 0
+
+
+def test_vsc_mpc_full_matrix_example_tracks_its_reference_event(examples, tmp_path):
+    params = peslite.load(examples / "mpc-vsc-matrices-example.pes", **{
+        "simulation.progress.enable": False,
+        "simulation.t_end": 0.016,
+    })
+    result = peslite.Simulation(params).run(out_dir=tmp_path)
+    settled = np.asarray(result.t) >= 0.014
+    assert np.mean(np.asarray(result.plant["vsc.id_pu"])[settled]) == pytest.approx(
+        0.65, abs=0.02,
+    )
+    assert np.mean(np.asarray(result.plant["vsc.iq_pu"])[settled]) == pytest.approx(
+        -0.10, abs=0.02,
+    )
+
+
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
 @pytest.mark.parametrize("algorithm", ["ccs", "fcs"])
 def test_three_phase_mpc_tracks_dq_current_at_rated_physical_scale(case, mode, algorithm, tmp_path):

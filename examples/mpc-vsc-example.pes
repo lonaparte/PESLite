@@ -23,7 +23,7 @@ units:
         SRFPLL: {kp_pu: 20.0, ki_pu: 1200.0}
         ThreePhasePredictiveCurrentControl:
           algorithm: fcs
-          # prediction_horizon: 3
+          prediction_horizon: 2
           control_horizon: 2
           rate_weight: 0.02
           current_min: -25.0
@@ -40,4 +40,4 @@ simulation:
   output: {period: 50.0e-6, signals: 1}
 meta:
   title: Finite-set three-phase current control
-  description: Binary bridge commands through the normal PWM registers with a two-move search and three-step prediction.
+  description: Binary bridge commands through the normal PWM registers with a two-move, two-step prediction.

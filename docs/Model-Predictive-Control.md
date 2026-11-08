@@ -14,6 +14,7 @@ peslite mpc-buck-example --switching
 peslite mpc-vsc-example --pwm-averaging
 peslite mpc-vsc-example --averaging
 peslite mpc-vsc-example --switching
+peslite mpc-vsc-matrices-example --pwm-averaging
 ```
 
 `mpc-buck-example` regulates the inductor current of a synchronous Buck using CCS-MPC. It
@@ -24,6 +25,9 @@ this example does not add an outer voltage regulator.
 controller chooses one of the eight binary three-leg commands, including both zero vectors.
 Each chosen command follows the bridge model's ordinary actuation timing. Binary duties produce
 held bridge states, so the ideal FCS command has the same bridge voltage in every model.
+
+`mpc-vsc-matrices-example` uses CCS-MPC with full, unequal Q, R and S matrices, current and duty
+constraints, a reference event and the same converter timing path.
 
 ## Configuration and units
 
@@ -128,7 +132,8 @@ tracking_weight:
 For `PredictiveCurrentControl`, Q, R and S are all 1-by-1. For
 `ThreePhasePredictiveCurrentControl`, Q is 2-by-2 for the alpha-beta current error, while R and S
 are 3-by-3 for the three bridge-leg commands. PESLite validates the dimensions and matrix
-properties when the loop is constructed.
+properties when the loop is constructed. The bundled `mpc-vsc-matrices-example` shows complete
+Q, R and S matrices in a runnable controller.
 
 Start with `tracking_weight: 1.0`, `input_weight: 0.0` and `rate_weight: 0.01`. Increase Q to
 prioritize current tracking, R to penalize command magnitude, or S to penalize command changes.
@@ -247,7 +252,8 @@ dynamics; the scalar Buck predictor applies its diode-imposed zero-current bound
 trajectory reaches it. The previous duty is an augmented prediction state. If the delay equals one
 full control period, a new decision first affects the second predicted sample; use a horizon greater
 than one. This is compensation for the configured register delay, not a general delay estimator or
-prediction of individual carrier pulses.
+prediction of individual carrier pulses. Account for this delay when choosing horizons: a shorter
+control horizon holds its final decision over the remaining predicted samples.
 
 ADC timing is independent of this execution-delay model. A held ADC conversion may precede
 the control interrupt, and a window-averaged current is not an instantaneous state. The
