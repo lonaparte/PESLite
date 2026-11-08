@@ -6,11 +6,8 @@ style, and run the relevant tests before opening a pull request.
 ## Engineering principles
 
 - Prefer general solutions over case-specific patches.
-- Reuse existing shared structures whenever possible; do not introduce duplicate or redundant
-  implementations.
-- Keep logic simple and direct. If a solution becomes convoluted, reconsider the surrounding
-  design and solve the problem at the appropriate architectural level instead of accumulating
-  local conditions.
+- Reuse existing shared structures whenever possible; do not introduce duplicate or redundant implementations.
+- Keep logic simple and direct. If a solution becomes convoluted, reconsider the surrounding design and solve the problem at the appropriate architectural level instead of accumulating local conditions.
 
 Every feature must be reviewed against these principles before it is considered complete.
 
