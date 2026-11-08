@@ -78,6 +78,8 @@ def test_functions_hold_the_plotting_addon():
     assert peslite.addons.functions.energy_closure is peslite.addons.energy_closure
     assert peslite.addons.functions.plot_csv is peslite.addons.plot_csv
     assert peslite.addons.functions.plot_result is peslite.addons.plot_result
+    assert set(peslite.addons.functions._ROOT_EXPORTS) <= set(peslite.addons.__all__)
+    assert "reference_csv" not in peslite.addons.__all__
 
 
 def test_addon_entry_points_match_builtin_public_apis():

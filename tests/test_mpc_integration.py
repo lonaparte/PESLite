@@ -76,6 +76,17 @@ def test_current_profile_is_not_specific_to_mpc():
     assert graph.outputs == {"duty": "InductorCurrentControl.duty"}
 
 
+def test_optimizer_wall_time_is_summary_only(tmp_path):
+    simulation = peslite.Simulation(_dc(**{"simulation.t_end": 0.0001}))
+    host, controller = _controller(simulation)
+
+    assert "seconds" not in host.graph.observation_names
+    result = simulation.run(out_dir=tmp_path)
+    summary = result.summary[f"converter.PredictiveCurrentControl"]
+    assert summary["solve_seconds"] >= 0.0
+    assert "converter.PredictiveCurrentControl.seconds" not in result.ctrl
+
+
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
 def test_buck_mpc_tracks_current_and_load_change_with_bounded_duty(mode, tmp_path):
     params = _dc(mode, **{

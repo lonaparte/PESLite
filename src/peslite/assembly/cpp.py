@@ -3013,11 +3013,6 @@ class _ModelGenerator:
         owner = method.__self__
         out = owner.output
         function = getattr(method, "__func__", method)
-        passthrough = getattr(function, "_peslite_netlist_passthrough", None)
-        if passthrough is not None:
-            circuit = owner._circuit
-            return [f"{self.value(out, field)} = {self.value(circuit.output, source)};"
-                    for field, source in passthrough]
         generated = getattr(function, "_peslite_netlist_outputs", None)
         if generated is not None:
             circuit, fields = generated
@@ -4239,7 +4234,11 @@ class _ModelGenerator:
             with self._netlist_symbols(circuit):
                 self._trace_circuit_solve(circuit, _Expression("t", "real"))
                 for field in fields:
-                    setattr(owner.output, field, getattr(circuit.output, circuit.published[id(owner), field]))
+                    setattr(
+                        owner.output,
+                        field,
+                        getattr(circuit.output, circuit.published[id(owner.component), field]),
+                    )
                 return tuple(getattr(owner.output, field) for field in fields)
 
         with self._shared_terms() as (prefix, terms):

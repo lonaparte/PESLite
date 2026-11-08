@@ -284,8 +284,9 @@ A fallback supplies an admissible actuator command or blocks actuation. It canno
 state/output feasibility when the prediction problem itself is infeasible. Unit protection
 continues to override optimized and fallback commands through its normal trip mechanism.
 
-The predictive loop's `success`, `objective`, `iterations`, `evaluations`, `seconds`, `solves`,
-`fallbacks` and `delay` diagnostics are recorded under its configured loop name.
+The predictive loop's `success`, `objective`, `iterations`, `evaluations`, `solves`, `fallbacks`
+and `delay` diagnostics are recorded under its configured loop name. Cumulative optimizer time is
+reported as `solve_seconds` in the simulation summary.
 The controller summary includes the last textual solve status. Computation cost is an observation;
 wall-clock timing is not a reproducible electrical state. Previous decisions and necessary
 startup/controller state use the normal named-state mechanism, so continuation restores them

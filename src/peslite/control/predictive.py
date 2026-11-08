@@ -115,9 +115,9 @@ class _PredictiveCurrentControl(Loop):
     n_input: ClassVar[int]
     outputs_from_state = True
     cpp_export = False
-    carried = ("last_result",)
-    observations = ("success", "objective", "iterations", "evaluations", "seconds",
-                    "solves", "fallbacks", "delay")
+    carried = ("last_result", "solve_seconds")
+    observations = ("success", "objective", "iterations", "evaluations", "solves",
+                    "fallbacks", "delay")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -168,8 +168,9 @@ class _PredictiveCurrentControl(Loop):
         self.previous_enabled = False
         self.solve_count = 0
         self.fallback_count = 0
+        self.solve_seconds = 0.0
         self.last_result: MPCResult | None = None
-        self._last_diagnostics = self._diagnostics(None, False, 0.0)
+        self._last_diagnostics = self._diagnostics(None, False)
         if cfg.algorithm == "ccs":
             template = self.plant.model(
                 unit.dclink.vdc_ref, np.zeros(self.n_current),
@@ -280,14 +281,13 @@ class _PredictiveCurrentControl(Loop):
             return False
         return self.cfg.algorithm != "fcs" or bool(np.all((action == 0.0) | (action == 1.0)))
 
-    def _diagnostics(self, result, valid, elapsed):
+    def _diagnostics(self, result, valid):
         return {
             "success": float(valid),
             "objective": (float(result.objective)
                           if result is not None and result.objective is not None else 0.0),
             "iterations": float(result.iterations) if result is not None else 0.0,
             "evaluations": float(result.evaluations) if result is not None else 0.0,
-            "seconds": elapsed,
             "solves": float(self.solve_count),
             "fallbacks": float(self.fallback_count),
             "delay": self.delay,
@@ -299,13 +299,13 @@ class _PredictiveCurrentControl(Loop):
         return outputs
 
     def sample_into(self, t, inputs, outputs):
-        elapsed = 0.0
         result = None
         enable = self.startup.active
         if enable:
             start = perf_counter()
             result = self.solve(t, inputs)
             elapsed = perf_counter() - start
+            self.solve_seconds += elapsed
             self.solve_count += 1
             valid = result.success and result.action is not None and self._admissible(result.action)
             if result.success and not valid:
@@ -326,7 +326,7 @@ class _PredictiveCurrentControl(Loop):
         self.previous_input = action
         self.previous_enabled = enable
         self.last_result = result
-        self._last_diagnostics = self._diagnostics(result, valid, elapsed)
+        self._last_diagnostics = self._diagnostics(result, valid)
         self._write_action(outputs, action)
         outputs["enable"] = float(enable)
 
@@ -393,6 +393,7 @@ class _PredictiveCurrentControl(Loop):
             "algorithm": self.cfg.algorithm,
             "solves": self.solve_count,
             "fallbacks": self.fallback_count,
+            "solve_seconds": self.solve_seconds,
             "delay": self.delay,
             "status": None if self.last_result is None else self.last_result.status,
         }

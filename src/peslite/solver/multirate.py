@@ -183,6 +183,13 @@ class MultirateSolver:
         self._assignment = assignment
         self._plan_revision = model.plan_revision
         self._refresh_group_plans()
+        empty = [label for label, group in (("inner", self.inner), ("outer", self.outer))
+                 if group is not None and not np.any(group.mask)]
+        if empty:
+            selected = sorted(name for name, label in assignment.items() if label in empty)
+            raise ValueError(
+                f"subsystems {selected} select no continuous states for their own schedule"
+            )
         self.window = self.window_steps * self.dt
         self.outer_method = outer_method or method
         self._outer_solver = (integrator(self.outer_method, self.window, rtol, atol)

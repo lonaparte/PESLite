@@ -124,6 +124,7 @@ class ControlCase:
             loop = dict(self.parameters)
             loops = {loop_name: loop, "VirtualImpedance": {}}
             control_type = "gfm"
+        loops["ThreePhaseModulation"] = {}
         return {
             "type": control_type,
             "period": T_CONTROL,

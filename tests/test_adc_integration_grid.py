@@ -48,7 +48,7 @@ def test_adc_sampling_grid_works_with_multirate_subsystems(tmp_path):
     result = _power(
         2.0e-6,
         tmp_path,
-        **{"simulation.solver.subsystems": {"charger.primary.dclink": 4}},
+        **{"simulation.solver.subsystems": {"charger.link": 4}},
     )
     values = np.asarray(list(result.values()))
 

@@ -1875,6 +1875,7 @@ class NetworkView:
             )
             exec(compile(f"def netlist_outputs(self, t):\n{body}",
                          "<peslite netlist outputs>", "exec"), env)
+            env["netlist_outputs"]._peslite_netlist_outputs = (circuit, self.declared)
             self.netlist_outputs = MethodType(env["netlist_outputs"], self)
             self.output_stages = (OutputMethod(
                 "netlist_outputs", (), self.declared, rhs=False

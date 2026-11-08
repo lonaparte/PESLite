@@ -97,6 +97,14 @@ def _tree():
     return read_tree(EXAMPLES / "gfl-example.pes")
 
 
+def test_unregistered_class_qualified_loop_reports_the_missing_registration():
+    tree = _tree()
+    tree["units"]["vsc"]["ctrl"]["loops"]["MissingAddonLoop"] = {}
+
+    with pytest.raises(ConfigError, match=r"MissingAddonLoop.*not registered.*add-on"):
+        from_dict(tree)
+
+
 def test_initial_and_output_belong_to_simulation():
     p = from_dict(_tree())
     assert p.simulation.initial.t == 0.0

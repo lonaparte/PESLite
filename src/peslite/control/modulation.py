@@ -114,8 +114,6 @@ class OutputStage:
         self.n_updates = 0
         self.n_saturated = 0
         self.first_saturation_t: float | None = None
-        self.m_abc = np.zeros(3)
-        self._command_saturated = False
 
     def command_limit(self, u_dc_pu: float) -> float | None:
         """Circular dq-command limit for the configured standard PWM, otherwise ``None``."""
@@ -149,24 +147,3 @@ class OutputStage:
             saturated = limited.tolist() != original.tolist() or (u_dc <= 0.0 and u_ab != 0j)
             m = tuple(limited)
         return m, saturated
-
-    def modulate(self, t: float, u_cmd_dq: complex, theta: float, u_dc: float, *,
-                 count: bool = True) -> np.ndarray:
-        """Convert a dq voltage command to duty ratios.
-
-        ``u_cmd_dq`` is in pu on the AC base; ``theta`` is in rad and ``u_dc`` is in pu on the
-        DC base. ``count=False`` leaves the controller-update and saturation counters unchanged.
-        """
-        rot = np.exp(1j * theta)
-        u_dc = u_dc * self.v_dc_base  # PWM receives DC volts; loop feedback stays pu
-        values, saturated = self.equation(u_cmd_dq, rot, u_dc)
-        saturated = saturated or self._command_saturated
-        self.m_abc = np.asarray(values, dtype=float)
-        duty = 0.5 * (1.0 + self.m_abc)
-        if count:
-            self.n_updates += 1
-            if saturated:
-                self.n_saturated += 1
-                if self.first_saturation_t is None:
-                    self.first_saturation_t = t
-        return duty

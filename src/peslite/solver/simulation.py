@@ -1904,6 +1904,12 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
         p = p.replace(**{"simulation.progress.enable": True})
     if args.watch and not p.simulation.progress.enable:
         ap.error("--watch prints on the progress bar: add --progress")
+    if args.plot:
+        try:
+            from ..addons.functions import _resolve
+            _resolve("plot_result")
+        except (ImportError, RuntimeError) as exc:
+            ap.error(f"--plot: {exc}")
     try:
         sim = Simulation(p)
     except ConfigError as exc:

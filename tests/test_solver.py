@@ -280,6 +280,18 @@ def test_make_solver_builds_the_configured_integrator():
             make_solver(configured, model)
 
 
+def test_multirate_rejects_a_schedule_without_continuous_states():
+    params = peslite.load(EXAMPLES / "gfl-example.pes")
+    model = peslite.System(params).model
+    settings = params.simulation.solver
+    configured = settings.__class__(**{
+        **vars(settings), "subsystems": {"circuit": 0.5},
+    })
+
+    with pytest.raises(ValueError, match="circuit.*no continuous states"):
+        make_solver(configured, model)
+
+
 @pytest.mark.full
 @pytest.mark.parametrize("method", ["radau", "trapezoidal"])
 def test_a_stiff_inner_group_can_use_an_implicit_method(method, tmp_path):

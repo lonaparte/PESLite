@@ -1367,8 +1367,12 @@ def _loop_entry(name: str, item: Any, path: str) -> Any:
     direct = loop_key_type(name, path)
     selected = values.get("type")
     if direct is None:
-        if selected is not None:
-            values["type"] = loop_type(selected, f"{path}.type").type
+        if selected is None:
+            raise ConfigError(
+                f"{path}: loop {name!r} is not registered; install or register its add-on, "
+                "or specify a registered type"
+            )
+        values["type"] = loop_type(selected, f"{path}.type").type
         return values
     if selected is not None and loop_type(selected, f"{path}.type") is not direct:
         raise ConfigError(

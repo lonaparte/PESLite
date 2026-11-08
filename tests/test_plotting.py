@@ -7,8 +7,10 @@ import numpy as np
 import pytest
 
 from peslite.addons import plot_csv, plot_result
+from peslite.addons import functions
 from peslite.addons.functions import plotting
 from peslite.addons.functions.plotting import _time_scale
+from peslite.solver import simulation
 from peslite.solver.simulation import main
 
 
@@ -90,3 +92,19 @@ def test_cli_runs_then_plots_named_waveforms(examples, tmp_path, monkeypatch):
 
     assert status == 0
     assert (out / "fig_states.pdf").read_bytes().startswith(b"%PDF")
+
+
+def test_cli_resolves_the_plot_addon_before_simulation(monkeypatch, capsys):
+    def unavailable(_name):
+        raise ModuleNotFoundError("plot addon unavailable", name="peslite.addons.functions.plotting")
+
+    monkeypatch.setattr(functions, "_resolve", unavailable)
+    monkeypatch.setattr(
+        simulation,
+        "Simulation",
+        lambda _params: pytest.fail("simulation started before the requested add-on was resolved"),
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        main(["gfl-example", "--plot", "vsc.dclink.u_C"])
+    assert "--plot: plot addon unavailable" in capsys.readouterr().err
