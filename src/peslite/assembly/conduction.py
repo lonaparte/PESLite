@@ -9,6 +9,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .params import ConfigError
+from ..solver.integrators import (_accepted_checkpoint, _accepted_checkpoint_at,
+                                  _accepted_restore)
 from ..solver.model import commutation_tolerance
 
 __all__ = ["DiodeConduction", "CommutationError"]
@@ -158,17 +160,20 @@ class DiodeConduction:
                 scheduled = min(float(sub.next_commutation_time()) for sub in self._scheduled)
                 target = min(target, scheduled)
             origin_t, origin_state = t, state
+            origin_checkpoint = _accepted_checkpoint()
             lower_margin = None
             if observe_steps:
                 step = self._guarded(t, target, state.copy(), guarded, located)
                 trial, upper_margin = step.y, step.margin
                 if step.crossed:
                     origin_t, origin_state = step.previous_t, step.previous_y
+                    origin_checkpoint = _accepted_checkpoint_at(origin_t)
                     lower_margin = step.previous_margin
                     target = step.t
             else:
                 trial, upper_margin = self._trial(t, target, state.copy(), guarded, located)
             if upper_margin < 0.0:
+                upper_checkpoint = _accepted_checkpoint()
                 lower, upper = origin_t, target
                 if lower_margin is None:
                     lower_margin = self._margin(lower, origin_state, guarded, located)
@@ -188,12 +193,15 @@ class DiodeConduction:
                             interpolated = True
                     # Alternation guarantees bracket contraction even if a secant hugs an end.
                     bisect_next = interpolated
+                    _accepted_restore(origin_checkpoint)
                     value, margin = self._trial(
                         origin_t, middle, origin_state.copy(), guarded, located
                     )
+                    candidate_checkpoint = _accepted_checkpoint()
                     invalid = margin < 0.0
                     if invalid:
                         upper, upper_margin, trial = middle, margin, value
+                        upper_checkpoint = candidate_checkpoint
                     else:
                         lower, lower_margin = middle, margin
                     if interpolated:
@@ -201,13 +209,17 @@ class DiodeConduction:
                         # accepting a small residual (a valid guard may have a zero plateau).
                         adjacent = middle - tolerance if invalid else middle + tolerance
                         if lower < adjacent < upper:
+                            _accepted_restore(origin_checkpoint)
                             value, margin = self._trial(
                                 origin_t, adjacent, origin_state.copy(), guarded, located
                             )
+                            candidate_checkpoint = _accepted_checkpoint()
                             if margin < 0.0:
                                 upper, upper_margin, trial = adjacent, margin, value
+                                upper_checkpoint = candidate_checkpoint
                             else:
                                 lower, lower_margin = adjacent, margin
+                _accepted_restore(upper_checkpoint)
                 target = upper
                 for index, direction, commutates in guarded:
                     if not commutates and direction * trial[index] < 0.0:

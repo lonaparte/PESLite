@@ -581,7 +581,8 @@ class Circuit:
 
     def build(self) -> None:
         """Compile the netlist from the components' present parameters (also after a ``set`` event)."""
-        rebuilding = self.netlist is not None
+        old = self.netlist
+        rebuilding = old is not None
         if self.netlist is not None:
             refreshed = {id(component): compile_network(component) for component in self.components}
             if any(declaration is None for declaration in refreshed.values()):
@@ -623,11 +624,14 @@ class Circuit:
                 net.add(CurrentSource(
                     None, nodes[id(port)], lambda _t, port=port: port.current
                 ))
+        net.bind_coefficients()
+        if old is not None:
+            net.reuse_dynamic_equations(old)
         declared = set(net.states.tolist())
         missing = sorted(f"{type(c).__name__}.{n}" for c, n, _z, i in self.layout if i not in declared)
         if missing:
             raise ConfigError(f"netlist components declare no primitive for their states {missing}")
-        old, self.netlist = self.netlist, net
+        self.netlist = net
         self._margin_evaluator_key = None
         self._margin_evaluator = None
         if old is not None and len(old.conducting) == len(net.conducting):  # a rebuild keeps diode memory
@@ -858,6 +862,8 @@ class Circuit:
         dependencies = set()
         for name, value in namespace.items():
             if re.search(rf"\b{re.escape(name)}\b", active) is None:
+                continue
+            if name in self.netlist._coefficient_values:
                 continue
             names = self._input_names(value, copied)
             if names is None:
@@ -1275,7 +1281,8 @@ class Circuit:
         self._bind_stage_owners()
         self._direct_dynamic = dynamic
         self._direct_mode_key = (
-            topology.mode.key[:2] if numeric or dynamic or net._switches else None
+            net._dynamic_structure_key(topology) if dynamic else
+            topology.mode.key[:2] if numeric or net._switches else None
         )
         self._numeric_stages = numeric
         self._stage_signature = signature
@@ -1399,10 +1406,11 @@ class Circuit:
             y[index] = T @ y[index]
         return y
 
-    def linear_mode(self) -> tuple[tuple, Callable[[], np.ndarray]]:
-        """Return the present linear-mode identity and a lazy state-matrix builder."""
+    def linear_mode(self) -> tuple[tuple, Callable[[], np.ndarray], Callable[[], Optional[float]]]:
+        """Return the present linear-mode identity, matrix builder and conservative norm bound."""
         topology = self._bound_device_topology() or self.netlist.topology()
-        return topology.state_matrix_key(), lambda: topology.state_space.A
+        return (topology.state_matrix_key(), lambda: topology.state_space.A,
+                topology.state_matrix_norm_bound)
 
     def _store(self, y: np.ndarray) -> None:
         """Write a netlist state vector back into the components."""
@@ -1579,9 +1587,13 @@ class Circuit:
 
     def _refresh_device_mode(self, topology: Optional[Topology] = None) -> None:
         """Bind or regenerate the equations selected by the current structural mode."""
+        def mode_key(selected: Topology):
+            return (self.netlist._dynamic_structure_key(selected)
+                    if self._direct_dynamic else selected.mode.key[:2])
+
         if self._numeric_stages:
             selected = self.netlist.topology() if topology is None else topology
-            if selected.mode.key[:2] != self._direct_mode_key:
+            if mode_key(selected) != self._direct_mode_key:
                 previous = self._stage_signature
                 self._compile_equation_stages()
                 if self._stage_signature != previous:
@@ -1592,7 +1604,7 @@ class Circuit:
         if self._direct_mode_key is not None:
             self.netlist._last = None
             selected = self.netlist.topology() if topology is None else topology
-            if selected.mode.key[:2] == self._direct_mode_key:
+            if mode_key(selected) == self._direct_mode_key:
                 return
             self._compile_equation_stages()
             for view in self._views:
@@ -2547,8 +2559,8 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
 class _CircuitPlan:
     """Static state mapping and exact-column metadata of one assembled circuit."""
 
-    __slots__ = ("circuit", "local_to_model", "transform", "inverse", "states", "exact",
-                 "skipped", "groups", "labels", "interface")
+    __slots__ = ("circuit", "local_to_model", "transform", "inverse", "norm_scale", "states",
+                 "exact", "skipped", "groups", "labels", "interface")
 
     def __init__(self, circuit: Circuit, local_to_model: np.ndarray, transform: np.ndarray,
                  inverse: np.ndarray, states: np.ndarray, exact: np.ndarray, skipped: np.ndarray,
@@ -2556,6 +2568,7 @@ class _CircuitPlan:
         self.circuit = circuit
         self.local_to_model = local_to_model
         self.transform, self.inverse = transform, inverse
+        self.norm_scale = float(np.linalg.norm(transform, 2) * np.linalg.norm(inverse, 2))
         self.states, self.exact, self.skipped = states, exact, skipped
         self.groups, self.labels, self.interface = tuple(groups), tuple(labels), frozenset(interface)
 
@@ -2663,7 +2676,6 @@ def circuit_structure(model: Any, circuits: Sequence[Circuit]):
             np.asarray(circuit.netlist.states, dtype=np.intp), exact, skipped,
             groups, labels, interface,
         )
-        circuit._mode_decompositions.clear()
         all_groups.extend(groups)
         all_labels.extend(labels)
         all_interface.update(interface)
@@ -2730,9 +2742,11 @@ def circuit_linear_modes(circuits: Sequence[Circuit]):
     matrix (a solver builds it only for a mode it has not seen)."""
     return tuple(
         ((id(circuit.netlist), key),
-         lambda circuit=circuit, matrix=matrix: _placed_linear_matrix(circuit, matrix()))
+         lambda circuit=circuit, matrix=matrix: _placed_linear_matrix(circuit, matrix()),
+         lambda circuit=circuit, bound=bound:
+             None if (value := bound()) is None else circuit._structure_plan.norm_scale * value)
         for circuit in circuits
-        for key, matrix in (circuit.linear_mode(),)
+        for key, matrix, bound in (circuit.linear_mode(),)
     )
 
 

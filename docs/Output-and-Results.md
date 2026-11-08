@@ -60,9 +60,10 @@ does not discard valid plant, state or energy output. Declared log columns use N
 unavailable sample. Each CSV retains its own sampling timestamps; different tables are not
 required to have equal row counts.
 
-After a run with `energy: 1`, `peslite.addons.energy_closure(result)` integrates supplied and
-dissipated power from `energy.csv` and compares them with stored-energy change and impulsive loss.
-It returns the component energies, the closure residual and a relative residual.
+After a run with `energy: 1`, `peslite.addons.energy_closure(result)` compares stored-energy change
+and impulsive loss with supplied and dissipated energy accumulated at accepted solver steps. It
+returns the component energies, the closure residual and a relative residual; CSV sampling and
+precision do not affect this calculation.
 
 ## State and signal names
 

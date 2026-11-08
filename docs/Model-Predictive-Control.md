@@ -174,7 +174,8 @@ each coordinate.
 
 CCS-MPC solves the constrained quadratic objective with SciPy SLSQP. SciPy is already a core
 dependency; no additional optimizer package is required. Solver success alone is insufficient:
-the returned action must also be finite and satisfy the configured feasibility tolerance.
+the returned action must be finite, feasible and satisfy a KKT optimality check. Failed solves
+use a separate linear-feasibility check instead of interpreting backend-specific status codes.
 The SLSQP adapter divides the quadratic and linear objective coefficients by one common
 positive scale and omits the constant during optimization. This leaves the minimizer and
 constraints unchanged and avoids false convergence at large physical-current scales.
@@ -189,11 +190,16 @@ input vectors and independent callbacks: `prediction(x, u, k)` returns the next 
 Callbacks receive copies and must not capture or modify the running plant. This supports
 custom finite-set models and objectives without changing the simulator.
 
+Set `vectorized=True` when each callback accepts a leading candidate dimension and returns one
+result per candidate. Scalar and vectorized callbacks use the same validation, ordering and work
+limit; the built-in predictive loops use the vectorized form.
+
 FCS-MPC enumerates admissible action sequences in deterministic order. Its computational cost
 grows exponentially with the control horizon and action count. Keep converter horizons short;
-the explicit evaluation limit counts attempted complete plans, including ones rejected by an
-infeasible prefix. Exhausting the budget returns a failure rather than applying a partial-search
-incumbent. Equal-cost choices follow the configured action ordering, making ties reproducible.
+the explicit evaluation limit must cover the exhaustive plan count. An insufficient budget returns
+a failure before evaluating callbacks rather than applying a partial-search incumbent. Numerically
+tied plans prefer the first command closest to the previously applied command; remaining ties
+follow the configured action ordering.
 
 Both algorithms return `MPCResult(success, action, inputs, states, objective, status, ...)`.
 Successful `inputs` cover the full prediction horizon and `states` include the initial state
@@ -267,8 +273,8 @@ action set. An ideal averaged bridge has no physical dead time.
 
 ## Failure handling, diagnostics and continuation
 
-The numerical status is `optimal`, `infeasible`, `solver_failure`, `iteration_limit`,
-`evaluation_limit`, `numerical_failure` or `invalid_solution`. A custom backend may supply a
+The numerical status is `optimal`, `infeasible`, `inaccurate`, `solver_failure`,
+`iteration_limit`, `evaluation_limit`, `numerical_failure` or `invalid_solution`. A custom backend may supply a
 more specific failure status. Iteration/evaluation limits are deterministic work limits;
 there is no wall-clock deadline.
 

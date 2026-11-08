@@ -253,6 +253,53 @@ class _Symbolic:
         return _Symbolic("imag", (self,))
 
 
+class _CoefficientValue(float):
+    """A numerical netlist coefficient retained as a leaf of generated equations."""
+
+    __array_priority__ = 1000
+
+    def __new__(cls, value: float, code: str):
+        item = float.__new__(cls, value)
+        item.code = code
+        return item
+
+    @property
+    def _peslite_numeric_value(self) -> float:
+        return float(self)
+
+    @property
+    def expression(self) -> _Symbolic:
+        return _Symbolic.value(self.code)
+
+    def _scaled(self, factor: float, code: str) -> "_CoefficientValue":
+        return _CoefficientValue(float(self) * factor, code)
+
+    def __hash__(self) -> int:
+        return hash((type(self), self.code))
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, _CoefficientValue) and self.code == other.code
+
+    def __add__(self, other):
+        return self if _constant(other) and other == 0.0 else _symbolic_binary("+", self.expression, other)
+    def __radd__(self, other):
+        return self if _constant(other) and other == 0.0 else _symbolic_binary("+", other, self.expression)
+    def __sub__(self, other):
+        return self if _constant(other) and other == 0.0 else _symbolic_binary("-", self.expression, other)
+    def __rsub__(self, other): return _symbolic_binary("-", other, self.expression)
+    def __mul__(self, other):
+        return (self._scaled(float(other), f"({self.code} * {float(other)!r})")
+                if _constant(other) else _symbolic_binary("*", self.expression, other))
+    def __rmul__(self, other):
+        return (self._scaled(float(other), f"({float(other)!r} * {self.code})")
+                if _constant(other) else _symbolic_binary("*", other, self.expression))
+    def __truediv__(self, other):
+        return (self._scaled(1.0 / float(other), f"({self.code} / {float(other)!r})")
+                if _constant(other) else _symbolic_binary("/", self.expression, other))
+    def __rtruediv__(self, other): return _symbolic_binary("/", other, self.expression)
+    def __neg__(self): return self._scaled(-1.0, f"(-{self.code})")
+
+
 def _constant(value: Any) -> bool:
     """Only literal numerical types can be folded; scalar subclasses may carry equations."""
     return type(value) in (bool, int, float, complex) or isinstance(value, np.number)
@@ -525,6 +572,8 @@ def _symbolic_source(expressions: Sequence[Any]) -> tuple[list[str], tuple[str, 
     lines: list[str] = []
 
     def render(value: Any, defining: Optional[_Symbolic] = None) -> str:
+        if isinstance(value, _CoefficientValue):
+            return value.code
         if not isinstance(value, _Symbolic):
             return _literal(value)
         if value in names and value is not defining:
@@ -1020,10 +1069,10 @@ class _Triplets:
         self.v.extend([s] * n)
 
     def block(self, r: int, c: int, m: NDArray[np.float64]) -> None:
-        i, j = np.nonzero(m)
+        i, j = np.nonzero(_numeric_values(m))
         self.r.extend((r + i).tolist())
         self.c.extend((c + j).tolist())
-        self.v.extend(m[i, j].tolist())
+        self.v.extend(m[int(row), int(column)] for row, column in zip(i, j))
 
     def incidence(self, r: int, br: _Branch, offsets: NDArray[np.intp], m: Optional[NDArray] = None,
                   s: float = 1.0) -> None:
@@ -1086,6 +1135,10 @@ class _Pattern:
         self.indptr = np.searchsorted(cs[first], np.arange(n + 1)).astype(np.int32)
         nb = len(base.v)
         self.base = np.bincount(pos[:nb], weights=_numeric_values(base.v), minlength=self.nnz)
+        expressions: list[Any] = [0.0] * self.nnz
+        for position, value in zip(pos[:nb], base.v):
+            expressions[int(position)] += value
+        self.expressions = tuple(expressions)
         self.slot_pos, self.slot_flat = pos[nb:], np.array(slots.flat, dtype=np.intp)
         self.slot_coef = np.array(slots.coef, dtype=float)
 
@@ -1484,7 +1537,7 @@ class _Projector:
             right = [*(weights @ x), *([0.0] * self.n_free),
                      *(self.G_u.toarray() @ np.asarray(u, dtype=object))]
             matrix = self._equations.tolist()
-            # The reference supplies pivot choices, while elimination retains each coefficient.
+            # The reference shares the lowering interface; elimination retains each coefficient.
             reference = self._equations.copy()
             reference[:self.n, :self.n] = self.W.toarray()
             solution = _symbolic_solve(matrix, right, np.asarray(reference, dtype=float))
@@ -1657,7 +1710,7 @@ class Topology:
                 row += d
             elif role == "cap":
                 M.eye(row, int(i_off[k]), d)
-                M.block(row, int(xd_off[k]), -br.element.C)
+                M.block(row, int(xd_off[k]), -net.coefficient(br.element, "C"))
                 row += d
                 if k not in dep_set:
                     M.incidence(row, br, e_off)
@@ -1667,10 +1720,12 @@ class Topology:
         for el in net._inductors:
             ks = net._ports[id(el)]
             d, start = brs[ks[0]].dim, row
+            inductance = net.coefficient(el, "L")
             for m, k in enumerate(ks):
                 M.incidence(row, brs[k], e_off)
                 for j, kj in enumerate(ks):
-                    M.block(row, int(xd_off[kj]), -el.L[m * d:(m + 1) * d, j * d:(j + 1) * d])
+                    M.block(row, int(xd_off[kj]),
+                            -inductance[m * d:(m + 1) * d, j * d:(j + 1) * d])
                 row += d
             for k in ks:
                 if k not in dep_set:
@@ -1803,6 +1858,7 @@ class Topology:
         top._evaluations = 0
         top._affine_equations = {}
         top._selected_outputs = {}
+        top.__dict__.pop("_dynamic_structure_key", None)
         return top
 
     @property
@@ -1843,9 +1899,10 @@ class Topology:
     def lu(self, value: object) -> None:
         self._lu = value
 
-    def _ratio_plan(self) -> Optional[_RatioPlan]:
+    def _ratio_plan(self, *, include_small_device: bool = False) -> Optional[_RatioPlan]:
         """Return the structure's shared low-rank ratio plan when it is ready and useful."""
-        cached = self._shared.get("ratio_plan", _PENDING)
+        cache_key = "ratio_plan_all" if include_small_device else "ratio_plan"
+        cached = self._shared.get(cache_key, _PENDING)
         if cached is not _PENDING:
             return cached
         base = self._shared["ratio_base"]
@@ -1856,15 +1913,44 @@ class Topology:
         eligible = (
             factor is not None
             and pattern.slot_pos.size
-            and (pattern.n > _DENSE_GROUP or self._store[0].form != "device")
+            and (include_small_device
+                 or pattern.n > _DENSE_GROUP or self._store[0].form != "device")
             and getattr(factor, "inverse", None) is None
         )
         plan = _RatioPlan(pattern, pattern.values(base.mode.ratios), factor) if eligible else None
         if plan is not None and max(plan.rows.size, plan.cols.size) > max(
                 4, _RATIO_RANK * pattern.n):
             plan = None
-        self._shared["ratio_plan"] = plan
+        self._shared[cache_key] = plan
         return plan
+
+    def state_matrix_norm_bound(self) -> Optional[float]:
+        """Return a cheap upper bound on the state matrix Frobenius norm.
+
+        A transformer-ratio copy uses the structure's Woodbury factors.  The bound therefore
+        avoids forming the dense state matrix while remaining conservative; an unavailable or
+        ill-conditioned low-rank update asks the caller to form the exact matrix instead.
+        """
+        base = self._shared["ratio_base"]
+        if self is base or not self._pattern.slot_pos.size:
+            return float(np.linalg.norm(base.state_space.A, "fro"))
+        _ = base.lu
+        plan = self._ratio_plan(include_small_device=True)
+        if plan is None:
+            return None
+        update = plan.update(self._pattern.values(self.mode.ratios))
+        if update is None:
+            return None
+        if "K" not in self._shared:
+            self._shared["K"] = sp.hstack([self.Ky, self.Ku, self.Kdu]).toarray()
+        n_x = self._net_shape[0]
+        base_solution = plan.shared("state_matrix_bound", self._shared["K"])
+        left = update.left[self.xd_index]
+        right = update.inverse @ base_solution[plan.cols, :n_x]
+        return float(
+            np.linalg.norm(base.state_space.A, "fro")
+            + np.linalg.norm(left, "fro") * np.linalg.norm(right, "fro")
+        )
 
     def _factorize(self, net: "Netlist", values: NDArray[np.float64]) -> object:
         """The factors of the sparse network matrix with entries ``values``: grouped onto the interface
@@ -2223,13 +2309,15 @@ def _roles(net: "Netlist", mode: Mode) -> tuple[list[Optional[str]], dict[int, N
         el = br.element
         if isinstance(el, Resistor):
             role = "res" if el.R.any() else "short"
-            resistance[k] = el.R
+            resistance[k] = net.coefficient(el, "R")
         elif isinstance(el, (Switch, Diode)):
             on = closed[id(el)] if isinstance(el, Switch) else conducting[id(el)]
             r = el.R_on if on else el.R_off
             role = "short" if r == 0.0 else None if r == math.inf else "res"
             if role == "res":
-                resistance[k] = np.diag(np.asarray([r] * br.dim, dtype=float if _constant(r) else object))
+                name = "R_on" if on else "R_off"
+                value = net.coefficient(el, name)
+                resistance[k] = np.diag(np.asarray([value] * br.dim, dtype=object))
         elif isinstance(el, Transformer):
             role = "p" if br.port == 0 else "s"
         else:
@@ -2463,6 +2551,8 @@ class Netlist:
         self._frozen_topology: Optional[Topology] = None
         self._frozen_scalar: Optional[Callable] = None
         self._recovery_excluded: set[tuple[bool, ...]] = set()
+        self._coefficient_expressions: dict[tuple[int, str], Any] = {}
+        self._coefficient_values: dict[str, float] = {}
 
     # ---------------------------------------------------------------- construction
     @staticmethod
@@ -2548,6 +2638,105 @@ class Netlist:
         self._diode_output_bases = None
         self.invalidate()
         return elements[0] if elements else None
+
+    def bind_coefficients(self) -> None:
+        """Retain primitive coefficients as generated-equation leaves with stable names."""
+        self._coefficient_expressions.clear()
+        self._coefficient_values.clear()
+        for element_index, element in enumerate(self.elements):
+            declared = dict(getattr(element, "_coefficients", {}))
+            if isinstance(element, Transformer) and element.constant is not None:
+                declared["N"] = element.constant
+            for name in sorted(declared):
+                numeric = element.constant if name == "N" else getattr(element, name)
+                values = np.asarray(declared[name], dtype=object)
+                shape = np.asarray(numeric).shape
+                if values.shape == () and shape:
+                    if len(shape) != 2 or shape[0] != shape[1]:
+                        raise ValueError(f"{element.name}: scalar {name} cannot form shape {shape}")
+                    values = values.item() * np.eye(shape[0], dtype=object)
+                elif values.shape != shape:
+                    values = values.reshape(shape)
+                converted = []
+                for position, value in enumerate(values.reshape(-1)):
+                    number = float(getattr(value, "_peslite_numeric_value", value))
+                    if number != 0.0 and math.isfinite(number):
+                        code = f"_coefficient_{element_index}_{name}_{position}"
+                        self._coefficient_values[code] = number
+                        converted.append(_CoefficientValue(number, code))
+                    else:
+                        converted.append(number)
+                expression = np.asarray(converted, dtype=object).reshape(shape)
+                self._coefficient_expressions[id(element), name] = (
+                    expression.item() if not shape else expression
+                )
+        # A declaration callback may have inspected a topology before every component was
+        # materialized.  Coefficient leaves belong to the completed netlist, so discard such
+        # provisional modes before compiling equations.
+        self.invalidate()
+
+    def coefficient(self, element: Element, name: str) -> Any:
+        """Return a primitive coefficient with its numerical value and equation identity."""
+        current = element.constant if name == "N" else getattr(element, name)
+        values = np.asarray(current, dtype=object)
+        if any(not _constant(value) and not isinstance(value, _CoefficientValue)
+               for value in values.flat):
+            return current
+        return self._coefficient_expressions.get(
+            (id(element), name),
+            current,
+        )
+
+    def _equation_structure_key(self) -> tuple:
+        """Structure that must match before generated scalar equations can be reused."""
+        primitives = []
+        for element in self.elements:
+            branches = tuple(
+                (self._branches[index].a, self._branches[index].b,
+                 self._branches[index].dim, self._branches[index].scale,
+                 self._branches[index].x)
+                for index in self._ports.get(id(element), ())
+            )
+            coefficients = []
+            names = sorted(name for owner, name in self._coefficient_expressions
+                           if owner == id(element))
+            for name in names:
+                values = np.asarray(
+                    element.constant if name == "N" else getattr(element, name), dtype=float
+                )
+                categories = np.where(values == 0.0, 0, np.where(np.isfinite(values), 1, 2))
+                coefficients.append((name, values.shape, categories.tobytes()))
+            primitives.append((
+                type(element), branches, tuple(getattr(element, "state", ())),
+                tuple(coefficients),
+                None if not isinstance(element, Transformer) else
+                (element.shape, element.constant is None),
+                None if not isinstance(element, (VoltageSource, CurrentSource)) else
+                (element.derivative is None),
+                None if not isinstance(element, Diode) else (element.gate is None),
+            ))
+        return (self.form, self.grouped, self.n_e, self.n_x, self.n_u,
+                tuple(self.states), tuple(primitives))
+
+    def reuse_dynamic_equations(self, previous: "Netlist") -> bool:
+        """Reuse coefficient-parametric equations when only numerical values changed."""
+        if self._equation_structure_key() != previous._equation_structure_key():
+            return False
+        rebound = OrderedDict()
+        for key, equations in previous._dynamic_scalar_equation_cache.items():
+            preamble, namespace, inputs, rates, derivatives, outputs = equations
+            namespace = dict(namespace)
+            namespace.update(self._coefficient_values)
+            for index, (source, _offset) in enumerate(self._sources):
+                namespace[f"_source_{index}"] = source.value
+                if source.derivative is not None:
+                    namespace[f"_source_rate_{index}"] = source.derivative
+            for index, transformer in enumerate(self._transformers):
+                if transformer.constant is None:
+                    namespace[f"_ratio_{index}"] = transformer.N
+            rebound[key] = (preamble, namespace, inputs, rates, derivatives, outputs)
+        self._dynamic_scalar_equation_cache = rebound
+        return bool(rebound)
 
     def invalidate(self) -> None:
         """Forget every compiled mode (after changing a parameter of an element)."""
@@ -3348,11 +3537,19 @@ class Netlist:
         return self._scalar_function(top, "outputs")(t, y)
 
     def _dynamic_structure_key(self, top: Topology) -> tuple:
-        """Return the discrete mode and numeric sparsity selecting symbolic pivots."""
+        """Return the discrete mode and symbolic sparsity selecting generated equations."""
         key = getattr(top, "_dynamic_structure_key", None)
         if key is None:
-            values = top._pattern.values(top.mode.ratios)
-            key = top.mode.key[:2], np.packbits(values != 0.0).tobytes()
+            pattern = top._pattern
+            symbolic = getattr(pattern, "_symbolic_sparsity", None)
+            if symbolic is None:
+                present = np.fromiter(
+                    (not _zero(value) for value in pattern.expressions),
+                    dtype=bool, count=pattern.nnz,
+                )
+                present[pattern.slot_pos] = True
+                pattern._symbolic_sparsity = symbolic = np.packbits(present).tobytes()
+            key = top.mode.key[:2], symbolic
             top._dynamic_structure_key = key
         return key
 
@@ -3371,12 +3568,12 @@ class Netlist:
 
     def _build_dynamic_scalar_equations(self, top: Topology) -> tuple:
         """Build symbolic equations for a mode whose transformer ratios remain run-time values."""
-        env: dict[str, Any] = {}
+        env: dict[str, Any] = dict(self._coefficient_values)
         preamble: list[str] = []
         flat_ratios: list[Any] = []
         for index, transformer in enumerate(self._transformers):
             if transformer.constant is not None:
-                flat_ratios.extend(transformer.constant.ravel())
+                flat_ratios.extend(np.asarray(self.coefficient(transformer, "N")).ravel())
                 continue
             callback, value = f"_ratio_{index}", f"_ratio_value_{index}"
             env[callback] = transformer.N
@@ -3396,7 +3593,7 @@ class Netlist:
 
         pattern = top._pattern
         columns = np.repeat(np.arange(pattern.n), np.diff(pattern.indptr))
-        entries: list[Any] = pattern.base.tolist()
+        entries: list[Any] = list(pattern.expressions)
         for position, flat, coefficient in zip(
                 pattern.slot_pos, pattern.slot_flat, pattern.slot_coef):
             entries[int(position)] += coefficient * flat_ratios[int(flat)]

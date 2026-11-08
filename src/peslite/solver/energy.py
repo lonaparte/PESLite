@@ -341,6 +341,24 @@ class _BalancePlan:
     transfers: tuple[_DefaultTransfer, ...]
     n_defaults: int
 
+    def powers(self, t: float, y: np.ndarray) -> tuple[float, float]:
+        """Return total continuous supplied and dissipated power without evaluating derivatives."""
+        self.model.sync(t, y)
+        into_default = [0.0] * self.n_defaults
+        for term in self.transfers:
+            other = getattr(term.other_record, term.other_field)
+            source = getattr(term.source_record, term.source_field)
+            into_default[term.default_index] -= term.coefficient * re_product(other, source)
+        supplied = dissipated = 0.0
+        for check in self.subsystems:
+            spec = check.spec
+            if spec.kind == "default":
+                supplied -= into_default[check.default_index]  # type: ignore[index]
+            elif spec.kind == "declared":
+                supplied += float(spec.supplied(check.subsystem))
+                dissipated += float(spec.dissipated(check.subsystem))
+        return supplied, dissipated
+
     def __call__(self, t: float, y: np.ndarray) -> EnergyReport:
         dy = self.model.rhs(t, y)
         # The derivative plan may omit observational output stages.  Energy ports and
@@ -485,6 +503,14 @@ def balance(model: Any, t: float, y: np.ndarray) -> EnergyReport:
     if plan is None or plan.specs is not model.energy_specs:  # declarations replaced by a set event
         plan = model._energy_balance_plan = compile_balance(model)
     return plan(t, y)
+
+
+def powers(model: Any, t: float, y: np.ndarray) -> tuple[float, float]:
+    """Continuous supplied and dissipated power at ``(t, y)`` from the balance plan."""
+    plan = getattr(model, "_energy_balance_plan", None)
+    if plan is None or plan.specs is not model.energy_specs:
+        plan = model._energy_balance_plan = compile_balance(model)
+    return plan.powers(t, y)
 
 
 # ------------------------------------------------------------------ the pH report

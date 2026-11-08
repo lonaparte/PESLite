@@ -15,8 +15,9 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .energy import re_product
-from .integrators import (EXPLICIT_FIXED_METHODS, RHS, TABLEAUS, SolverStep, combine,
-                          canonical_method, integrator, stage_state, subintervals)
+from .integrators import (EXPLICIT_FIXED_METHODS, RHS, TABLEAUS, SolverStep, _accepted,
+                          _accepted_steps, combine, canonical_method, integrator, stage_state,
+                          subintervals)
 from .model import ConfigError
 
 __all__ = ["MultirateSolver", "HeldStorage", "make_solver", "parse_step"]
@@ -519,6 +520,7 @@ class MultirateSolver:
         for _ in range(n):
             y = self._macro_step(t, H, y)
             t += H
+            _accepted(t, y)
         return y
 
     def _outer_at(self, t: float) -> Optional[NDArray[np.float64]]:
@@ -696,12 +698,13 @@ class MultirateSolver:
 
         trajectory = [y0]
         values, t = y0[indices], t0
-        for _ in range(count):
-            values = self._inner_solver(derivatives, t, t + h, values).y
-            t += h
-            state = np.array(y1, dtype=float)
-            state[indices] = values
-            trajectory.append(state)
+        with _accepted_steps(None):
+            for _ in range(count):
+                values = self._inner_solver(derivatives, t, t + h, values).y
+                t += h
+                state = np.array(y1, dtype=float)
+                state[indices] = values
+                trajectory.append(state)
         return trajectory
 
     def _track_flow(self, t: float) -> None:

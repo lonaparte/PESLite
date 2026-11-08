@@ -274,6 +274,7 @@ class ONNXModel(Element):
                 lambda _t, inputs: runtime.run(inputs)[0],
                 inputs=input_initial,
                 outputs=output_initial,
+                cpp_export=False,
                 observer=True,
             )
             return
@@ -302,6 +303,7 @@ class ONNXModel(Element):
             period=cfg.period,
             offset=cfg.offset,
             feedthrough=(),
+            cpp_export=False,
             observer=True,
         )
 

@@ -11,6 +11,7 @@ from peslite.assembly.params import ConfigError, from_dict, read_tree, to_dict
 from peslite.components import RLBranch, register_component_type
 from peslite.components.network import Element, _register_assembled_type
 from peslite.control import Measurement
+from peslite.solver import netlist as nl
 
 
 def _tree():
@@ -316,6 +317,41 @@ def test_parameter_events_rebuild_only_changed_network_declarations(monkeypatch)
     system.apply(changes["impedance"])
     assert calls == [circuit]
     assert system.model.energy_specs is not specs
+
+
+def test_numeric_network_event_reuses_parameterized_device_equations(monkeypatch):
+    tree = _tree()
+    tree["units"]["vsc"]["bridge"] = {"model": "pwm_averaging"}
+    tree["events"] = {"impedance": {"type": "set", "t": 4e-4, "set": {
+        "sources.grid.x_pu": 0.8,
+    }}}
+    p = from_dict(tree)
+    system = peslite.System(p)
+    rebuilt = peslite.System(p)
+    circuit, = system.circuits
+    circuit.netlist._dynamic_scalar_function(circuit.netlist.topology())
+    calls = 0
+    original = nl._symbolic_solve
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(nl, "_symbolic_solve", counted)
+    system.apply(p.changes[0])
+
+    assert calls == 0
+    assert system.sources["grid"].branch.L == p.changes[0].params.sources["grid"].l
+    monkeypatch.setattr(nl, "_symbolic_solve", original)
+    rebuilt.circuits[0].netlist._dynamic_scalar_equation_cache.clear()
+    rebuilt.apply(p.changes[0])
+    y = system.model.get_initial_values()
+    np.testing.assert_allclose(
+        system.model.rhs(p.changes[0].t, y),
+        rebuilt.model.rhs(p.changes[0].t, y),
+        rtol=1e-12, atol=1e-12,
+    )
 
 
 def test_continuous_controller_retune_rebinds_its_ode_states(tmp_path):

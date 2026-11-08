@@ -1627,6 +1627,8 @@ class VSCController(_GraphRuntime):
         self._configure_limit(name)
         if name == self._terminal and self._command_output is not None:
             terminal = self.graph.nodes[name]
+            if self.stage is not None and getattr(terminal, "stage", None) is not None:
+                terminal.stage = self.stage
             self._terminal_node = terminal
             self.stage = getattr(terminal, "stage", None)
             self._configure_limit(self._command_output[0])

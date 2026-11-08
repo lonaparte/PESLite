@@ -44,7 +44,7 @@ from ..assembly.types import unit_type
 from ..assembly.unit import Plant, Unit
 from .timing import TIME_EPS
 from ..control.blocks import abc2complex, complex2abc
-from .integrators import Solver
+from .integrators import Solver, _accepted_steps
 from .linearization import coordinate_width
 from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
 from .multirate import make_solver, rated_effort
@@ -126,6 +126,102 @@ class _SnapshotRead:
 def _finite(y: np.ndarray) -> bool:
     """Return True when every entry of ``y`` is finite."""
     return all(map(math.isfinite, y.tolist()))
+
+
+class _AcceptedEnergy:
+    """Trapezoidal power quadrature on the solver's accepted physical states."""
+
+    def __init__(self, model) -> None:
+        self.model = model
+        self.started = False
+        self.supplied = self.dissipated = 0.0
+        self.last_t = self.last_supplied = self.last_dissipated = 0.0
+        self.initial_energy = self.initial_impulsive = self.initial_impulsive_supply = 0.0
+        self.history: list[tuple[float, tuple]] = []
+
+    @staticmethod
+    def _impulses(report) -> tuple[float, float]:
+        return (
+            sum(entry.impulsive or 0.0 for entry in report.subsystems),
+            sum(entry.impulsive_supply or 0.0 for entry in report.subsystems),
+        )
+
+    def _state(self, history_size: int | None = None) -> tuple:
+        return (
+            self.supplied, self.dissipated, self.last_t,
+            self.last_supplied, self.last_dissipated,
+            len(self.history) if history_size is None else history_size,
+        )
+
+    def _remember(self) -> None:
+        snapshot = self._state(len(self.history) + 1)
+        self.history.append((self.last_t, snapshot))
+
+    def begin_interval(self, t: float, y: np.ndarray) -> None:
+        """Seed the first interval or refresh power after a boundary changed the model."""
+        if not self.started:
+            report = self.model.energy_balance(t, y)
+            self.initial_energy = report.energy
+            self.initial_impulsive, self.initial_impulsive_supply = self._impulses(report)
+            self.last_supplied, self.last_dissipated = report.supplied, report.dissipated
+            self.last_t = t
+            self.started = True
+            self.history.clear()
+            self._remember()
+            return
+        if abs(t - self.last_t) > TIME_EPS:
+            raise RuntimeError("energy accounting did not reach the previous interval boundary")
+        self.last_supplied, self.last_dissipated = self.model.energy_powers(t, y)
+        self.history.clear()
+        self._remember()
+
+    def accept(self, t: float, y: np.ndarray) -> None:
+        supplied, dissipated = self.model.energy_powers(t, y)
+        step = t - self.last_t
+        if step < -TIME_EPS:
+            raise RuntimeError("accepted solver steps must be chronological")
+        if step > TIME_EPS:
+            self.supplied += 0.5 * step * (self.last_supplied + supplied)
+            self.dissipated += 0.5 * step * (self.last_dissipated + dissipated)
+        self.last_t, self.last_supplied, self.last_dissipated = t, supplied, dissipated
+        self._remember()
+
+    def checkpoint(self) -> tuple:
+        return self._state()
+
+    def checkpoint_at(self, t: float) -> tuple:
+        for when, checkpoint in reversed(self.history):
+            if abs(when - t) <= TIME_EPS:
+                return checkpoint
+        raise RuntimeError(f"accepted-step checkpoint missing at t = {t:.12g} s")
+
+    def restore(self, checkpoint: tuple) -> None:
+        (self.supplied, self.dissipated, self.last_t,
+         self.last_supplied, self.last_dissipated, size) = checkpoint
+        del self.history[size:]
+
+    def finish(self, t: float, y: np.ndarray) -> dict[str, float]:
+        if not self.started:
+            self.begin_interval(t, y)
+        elif t > self.last_t + TIME_EPS:
+            self.accept(t, y)
+        report = self.model.energy_balance(t, y)
+        impulsive_total, impulsive_supply_total = self._impulses(report)
+        impulsive = impulsive_total - self.initial_impulsive
+        impulsive_supply = impulsive_supply_total - self.initial_impulsive_supply
+        stored = report.energy - self.initial_energy
+        supplied = self.supplied + impulsive_supply
+        residual = supplied - self.dissipated - impulsive - stored
+        scale = max(abs(stored), abs(supplied), abs(self.dissipated), abs(impulsive), 1e-300)
+        return {
+            "stored": stored,
+            "supplied": supplied,
+            "dissipated": self.dissipated,
+            "impulsive": impulsive,
+            "impulsive_supply": impulsive_supply,
+            "residual": residual,
+            "relative": residual / scale,
+        }
 
 
 def _compile_interval_integrator(solver, rhs, conduction, settle, project):
@@ -1008,6 +1104,7 @@ class Simulation:
 
         mode = p.simulation.energy_check
         energy_on = mode != "off" and hasattr(mdl, "energy_balance")
+        accepted_energy = _AcceptedEnergy(mdl) if energy_on and output.energy else None
         phs_check_step = p.simulation.solver.phs_check_step
         snapshot_index = 0
         continuous_record_index = 0
@@ -1114,9 +1211,19 @@ class Simulation:
             """Integrate over ``[t_a, t_b]``; ``event`` means the model changes at ``t_b``."""
             nonlocal t_local, stop_reason, termination, coarse_reported
             plant.invalidate()
+            energy_checkpoint = None
+            if accepted_energy is not None:
+                accepted_energy.begin_interval(t_a, plant.state)
+                energy_checkpoint = accepted_energy.checkpoint()
             try:
-                plant.state = integrate(t_a, t_b, plant.state, event)
+                with _accepted_steps(accepted_energy):
+                    plant.state = integrate(t_a, t_b, plant.state, event)
+                if (accepted_energy is not None
+                        and accepted_energy.last_t < t_b - TIME_EPS):
+                    accepted_energy.accept(t_b, plant.state)
             except (OverflowError, FloatingPointError):
+                if accepted_energy is not None:
+                    accepted_energy.restore(energy_checkpoint)
                 termination = "diverged"
                 stop_reason = (f"diverged: the states overflowed between t = {t_a:.6g} s "
                                f"and {t_b:.6g} s")
@@ -1306,6 +1413,8 @@ class Simulation:
             summary["energy_tellegen_max_rel"] = worst["tellegen"]
             summary["energy_balance_max_rel"] = worst["balance"]
             summary["energy_problems"] = list(self.energy_problems)
+        if accepted_energy is not None:
+            summary["energy_closure"] = accepted_energy.finish(t_local, plant.state)
         interface = getattr(solver, "interface", None)
         if interface:  # split-interface indicators
             summary.update({f"interface_{k}": v for k, v in interface.items()})

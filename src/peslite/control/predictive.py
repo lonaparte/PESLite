@@ -197,6 +197,7 @@ class _PredictiveCurrentControl(Loop):
                 control_horizon=cfg.control_horizon, constraint=self._constraint,
                 max_evaluations=cfg.max_evaluations,
                 feasibility_tolerance=cfg.feasibility_tolerance,
+                vectorized=True,
             )
 
     def _configure_plant(self, unit) -> _RLCurrentPrediction:
@@ -240,19 +241,19 @@ class _PredictiveCurrentControl(Loop):
 
     def _predict(self, state, action, k):
         model = self._models[k]
-        return model.A @ state + model.B @ action + model.offset
+        return state @ model.A.T + action @ model.B.T + model.offset
 
     def _stage_cost(self, state, action, reference, previous, k):
-        return self._cost.evaluate(state[:self.n_current], action, reference, previous)
+        return self._cost.evaluate(state[..., :self.n_current], action, reference, previous)
 
     def _constraint(self, state, action, k):
-        current = state[:self.n_current]
+        current = state[..., :self.n_current]
         residuals = []
         if self.cfg.current_min is not None:
-            residuals.extend(current - self.cfg.current_min)
+            residuals.append(current - self.cfg.current_min)
         if self.cfg.current_max is not None:
-            residuals.extend(self.cfg.current_max - current)
-        return np.asarray(residuals)
+            residuals.append(self.cfg.current_max - current)
+        return np.concatenate(residuals, axis=-1) if residuals else np.empty((*state.shape[:-1], 0))
 
     def solve(self, t: float, inputs: Mapping[str, Any]) -> MPCResult:
         """Optimize once; a custom registered loop may override this method."""

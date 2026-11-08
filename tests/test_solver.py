@@ -90,6 +90,25 @@ def test_continuous_linear_modes_recheck_explicit_stability():
     assert model.builds == 2
 
 
+def test_rk4_stability_norm_certificate_avoids_forming_the_matrix():
+    builds = []
+    solver = FixedStepSolver(1e-3, "RK4")
+
+    assert solver._explicit_stable(1e-3, ((
+        "dynamic",
+        lambda: builds.append(True) or np.array([[-1.0]]),
+        lambda: 500.0,
+    ),))
+    assert not builds
+
+    assert solver._explicit_stable(1e-3, ((
+        "inconclusive",
+        lambda: builds.append(True) or np.array([[-1.0]]),
+        lambda: 2000.0,
+    ),))
+    assert builds == [True]
+
+
 def test_stability_reuses_unchanged_strongly_connected_blocks(monkeypatch):
     first = np.array([
         [-2.0, 1.0, 0.0, 0.0],
@@ -145,8 +164,9 @@ def test_explicit_stability_and_linearization_share_the_exact_circuit_matrix(exa
     blocks = simulation.system.model.linear_blocks()
 
     assert len(modes) == len(blocks)
-    for (_key, build), (_positions, matrix, _exact, _skipped) in zip(modes, blocks):
+    for (_key, build, bound), (_positions, matrix, _exact, _skipped) in zip(modes, blocks):
         np.testing.assert_array_equal(build(), matrix)
+        assert bound() >= np.linalg.norm(matrix, "fro") * (1.0 - 1e-12)
 
 
 @pytest.mark.parametrize("method", ["euler", "heun", "RK4"])

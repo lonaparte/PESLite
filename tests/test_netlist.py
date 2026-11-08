@@ -632,7 +632,7 @@ def test_export_planning_covers_default_device_circuits_and_diode_modes():
     assert set(solve.inputs) == set(circuit.inputs)
 
 
-def test_device_ratio_changes_factorize_each_exact_stability_mode_at_most_once(
+def test_device_ratio_stability_certificate_avoids_exact_mode_spectra(
         monkeypatch, tmp_path):
     count = 0
     original = nl._DenseSolve.__init__
@@ -659,9 +659,9 @@ def test_device_ratio_changes_factorize_each_exact_stability_mode_at_most_once(
     new_structures = sum(
         len(circuit.netlist._structures) for circuit in simulation.system.circuits
     ) - initial_structures
-    assert modes
-    assert count - initial <= len(modes) + new_structures
-    assert len(simulation.solver._stability_results) == len(modes)
+    assert not modes
+    assert simulation.solver._stability_results
+    assert count - initial <= new_structures
 
 
 @pytest.mark.parametrize("example", [
@@ -673,7 +673,7 @@ def test_device_stability_matrix_matches_the_current_netlist_mode(example):
     ))
     for circuit in simulation.system.circuits:
         circuit.receive()
-        _key, build = circuit.linear_mode()
+        _key, build, _bound = circuit.linear_mode()
         np.testing.assert_allclose(
             build(), circuit.netlist.topology().state_space.A,
             rtol=1e-10, atol=1e-9,

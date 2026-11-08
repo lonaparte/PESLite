@@ -547,6 +547,7 @@ def _explicit_stability(
 ) -> str:
     """Emit the same exact circuit-mode RK stability check used by Python."""
     coefficients = ", ".join(_number(value) for value in _stability_polynomial(method))
+    half_disk = 1.0 if method == "RK4" else 0.0
     members, checks = [], []
     for number, (size, lines, positions) in enumerate(plans):
         key = ", ".join(f"selected[{int(index)}]" for index in positions)
@@ -572,7 +573,11 @@ def _explicit_stability(
         using Key = std::array<double, Positions>;
         std::size_t epoch;
         Key key;
+        std::size_t size;
+        std::vector<Complex> matrix;
+        double norm_bound;
         std::vector<Complex> eigenvalues;
+        bool spectrum;
         bool converged;
     }};
     struct ExplicitStabilityBlock {{
@@ -725,7 +730,15 @@ def _explicit_stability(
         return active == 0;
     }}
 
-    template <class Held> static bool explicit_mode_stable(const Held& held, double h) {{
+    template <class Held> static bool explicit_mode_stable(Held& held, double h) {{
+        if (!held.spectrum) {{
+            if ({_number(half_disk)} > 0.0
+                    && h * held.norm_bound <= {_number(half_disk)}) return true;
+            held.converged = explicit_eigenvalues(
+                std::move(held.matrix), held.size, held.eigenvalues
+            );
+            held.spectrum = true;
+        }}
         if (!held.converged) return false;
         static constexpr double coefficients[] = {{{coefficients}}};
         for (const Complex eigenvalue : held.eigenvalues) {{
@@ -758,8 +771,19 @@ def _explicit_stability(
                     matrix[i * n + j] = column[i] - base[i];
             }}
             if (modes.size() >= 64) modes.erase(modes.begin());
-            modes.push_back({{implicit_epoch, key, {{}}, false}});
+            double norm_squared = 0.0;
+            for (const auto& value : matrix) norm_squared += std::norm(value);
+            const double norm_bound = std::sqrt(norm_squared);
+            modes.push_back({{
+                implicit_epoch, key, n, {{}}, norm_bound, {{}}, false, false
+            }});
             found = modes.end() - 1;
+            if ({_number(half_disk)} > 0.0
+                    && h * norm_bound <= {_number(half_disk)}) {{
+                found->matrix = std::move(matrix);
+                return true;
+            }}
+            found->spectrum = true;
             std::vector<unsigned char> pattern(matrix.size());
             std::transform(matrix.begin(), matrix.end(), pattern.begin(),
                            [](Complex value) {{ return value != Complex{{}}; }});
@@ -2081,6 +2105,15 @@ class _ModelGenerator:
         self.model = self.system.model
         self.subsystem_name = {id(sub): name for name, sub in zip(self.model.names, self.model.subsystems)}
         self.prefix = {id(sub): f"s{index}" for index, sub in enumerate(self.model.subsystems)}
+        unsupported = [
+            f"{name} ({type(sub).__name__})"
+            for name, sub in zip(self.model.names, self.model.subsystems)
+            if not getattr(sub, "cpp_export", True)
+        ]
+        if unsupported:
+            raise TypeError(
+                "C++ export: subsystem(s) have no native generator: " + ", ".join(unsupported)
+            )
         self.component_subsystem = {}
         for sub in self.model.subsystems:
             component = getattr(sub, "equation_owner", sub)
@@ -3183,18 +3216,21 @@ class _ModelGenerator:
         net = circuit.netlist
         transient = (circuit.derivatives, circuit.t, circuit._stored,
                      net._last, net._mode, net._frozen_mode, net._frozen_topology, net._frozen_scalar,
-                     net._scalar_functions, net._scalar_topology, net._ratio_override)
+                     net._scalar_functions, net._scalar_topology, net._ratio_override,
+                     net._coefficient_expressions, net._coefficient_values)
         circuit._stored = None
         net._scalar_functions = type(net._scalar_functions)()
         net._scalar_topology = None
         net._mode = net._frozen_mode = net._frozen_topology = net._frozen_scalar = None
         net._ratio_override = ratio_samples
+        net._coefficient_expressions, net._coefficient_values = {}, {}
         try:
             yield
         finally:
             (circuit.derivatives, circuit.t, circuit._stored,
              net._last, net._mode, net._frozen_mode, net._frozen_topology, net._frozen_scalar,
-             net._scalar_functions, net._scalar_topology, net._ratio_override) = transient
+             net._scalar_functions, net._scalar_topology, net._ratio_override,
+             net._coefficient_expressions, net._coefficient_values) = transient
             del circuit._cpp_coefficients
             del circuit._cpp_topologies
             for owner, name, value in reversed(restored):
