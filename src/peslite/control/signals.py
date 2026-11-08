@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..solver.model import ConfigError
+from ..solver.timing import TIME_EPS
 
 
 def _finite_sequence(values: Any, name: str) -> tuple[float, ...]:
@@ -104,6 +105,15 @@ class TableSignal:
         object.__setattr__(self, "_left_slope", left_slope)
         object.__setattr__(self, "_right_slope", right_slope)
 
+    def _aligned_position(self, t: float) -> tuple[float, int]:
+        """Return an interval position after applying the event-grid time tolerance."""
+        position = bisect_right(self.time, t)
+        if position < len(self.time) and self.time[position] - t < TIME_EPS:
+            return self.time[position], position + 1
+        if position and t - self.time[position - 1] < TIME_EPS:
+            return self.time[position - 1], position
+        return t, position
+
     def _outside(self, t: float, *, left: bool) -> float:
         if self.extrapolation == "hold":
             return self.value[0 if left else -1]
@@ -121,16 +131,19 @@ class TableSignal:
         t = float(t)
         if not math.isfinite(t):
             raise ValueError("signal time must be finite")
+        t, position = self._aligned_position(t)
         first, last = self.time[0], self.time[-1]
         if t < first:
             return self._outside(t, left=True)
         if t > last or (self.repeat and t == last):
             if not self.repeat:
                 return self._outside(t, left=False)
-            t = first + math.fmod(t - first, last - first)
+            t, position = self._aligned_position(
+                first + math.fmod(t - first, last - first)
+            )
         if len(self.time) == 1 or t == last:
             return self.value[-1]
-        index = bisect_right(self.time, t) - 1
+        index = position - 1
         if self.interpolation == "zero_order_hold":
             return self.value[index]
         x = t - self.time[index]

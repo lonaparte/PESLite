@@ -1,4 +1,5 @@
 import math
+from copy import deepcopy
 from dataclasses import replace
 
 import numpy as np
@@ -8,9 +9,10 @@ import peslite
 from peslite.addons.functions import reference_csv, reference_expression, reference_table
 from peslite.assembly.cpp import _validate_native_control_graph
 from peslite.assembly.params import from_dict, read_initial, read_tree, to_dict
-from peslite.control import TableSignal
+from peslite.control import ControlMeasurement, TableSignal
 from peslite.control.controller import ConverterMeasurement
 from peslite.solver import ConfigError
+from peslite.solver.timing import TIME_EPS
 
 
 def test_native_table_interpolation_repeat_and_extrapolation():
@@ -28,6 +30,7 @@ def test_native_table_interpolation_repeat_and_extrapolation():
     assert linear(3.0) == 0.0
     assert held(0.99) == 0.0
     assert held(1.01) == 2.0
+    assert held(1.0 - 0.5 * TIME_EPS) == 2.0
     assert held(2.5) == 0.0
     assert extrapolated(0.0) == pytest.approx(0.0)
     assert extrapolated(3.0) == pytest.approx(6.0)
@@ -85,6 +88,276 @@ def _signal_case(examples, *, reference="duty", signal="duty_profile"):
         reference: f"signals.{signal}",
     }
     return tree
+
+
+def _unit_section(tree, path):
+    unit = tree["units"]
+    for name in path.split("."):
+        unit = unit[name]
+    return unit
+
+
+def _bind_table_reference(
+        tree, unit, reference, values, *, stop=0.001, times=None,
+        interpolation="linear"):
+    tree["signals"] = {
+        "reference_profile": {
+            "type": "table",
+            "time": [0.0, stop] if times is None else list(times),
+            "value": list(values),
+            "interpolation": interpolation,
+        },
+    }
+    references = _unit_section(tree, unit)["ctrl"].setdefault("references", {})
+    references[reference] = "signals.reference_profile"
+    return tree
+
+
+def _evaluate_control_graph(ctrl, t, measurement):
+    if ctrl.continuous:
+        ctrl.startup.at(t)
+        ctrl.graph.flow(t, measurement)
+    else:
+        ctrl.startup.advance()
+        ctrl.graph.sample(t, measurement)
+    return {
+        name: ctrl.graph._gather(ctrl.graph._wiring[name], measurement)
+        for name in ctrl.graph.nodes
+    }
+
+
+@pytest.mark.parametrize("model", ("pwm_averaging", "averaging"))
+@pytest.mark.parametrize("values", ((24.0, 24.24), (12.0, 36.0)), ids=("small", "large"))
+def test_voltage_reference_signal_crosses_cascaded_dc_loops(examples, model, values):
+    tree = read_tree(examples / "buck-example.pes")
+    tree["events"] = {}
+    converter = tree["units"]["converter"]
+    converter.setdefault("bridge", {})["model"] = model
+    _bind_table_reference(tree, "converter", "voltage", values)
+    ctrl = peslite.Simulation(from_dict(tree)).unit("converter").ctrl
+    ctrl.command(True)
+    measurement = ConverterMeasurement(current=4.0, voltage=24.0, vin=48.0)
+
+    for t, expected in zip((0.0, 0.001), values):
+        inputs = _evaluate_control_graph(ctrl, t, measurement)
+        assert inputs["DCVoltageControl"]["reference"] == pytest.approx(expected)
+        assert inputs["InductorCurrentControl"]["reference"] == pytest.approx(
+            ctrl.graph.values["DCVoltageControl.current_reference"]
+        )
+
+
+@pytest.mark.parametrize("model", ("pwm_averaging", "averaging"))
+@pytest.mark.parametrize("size", ("small", "large"))
+@pytest.mark.parametrize("level", ("inner", "outer"))
+def test_vsc_reference_signal_reaches_inner_and_outer_control_levels(
+        examples, model, size, level):
+    tree = read_tree(examples / "gfl-example.pes")
+    tree["events"] = {}
+    vsc = tree["units"]["vsc"]
+    vsc.setdefault("bridge", {})["model"] = model
+    if level == "inner":
+        vsc["ctrl"]["loops"].pop("DCVoltageControl")
+        reference = "id_ref_pu"
+        values = (0.2, 0.202) if size == "small" else (-0.4, 0.8)
+    else:
+        reference = "vdc_ref_pu"
+        values = (1.0, 1.01) if size == "small" else (0.6, 1.4)
+    _bind_table_reference(tree, "vsc", reference, values)
+    ctrl = peslite.Simulation(from_dict(tree)).unit("vsc").ctrl
+    ctrl.command(True)
+    measurement = ControlMeasurement(0.0, 1.0 + 0j, 0j, 1.0, np.zeros(3))
+
+    for t, expected in zip((0.0, 0.001), values):
+        measurement.t = t
+        inputs = _evaluate_control_graph(ctrl, t, measurement)
+        if level == "inner":
+            assert inputs["CurrentLoop"]["id_ref"] == pytest.approx(expected)
+        else:
+            assert inputs["DCVoltageControl"]["reference"] == pytest.approx(expected)
+            assert inputs["CurrentLoop"]["id_ref"] == pytest.approx(
+                ctrl.graph.values["DCVoltageControl.current_reference"]
+            )
+
+
+@pytest.mark.parametrize("values", ((4.0, 4.04), (1.0, 7.0)), ids=("small", "large"))
+def test_reference_signal_reaches_a_predictive_current_loop(examples, values):
+    tree = read_tree(examples / "mpc-buck-example.pes")
+    tree["events"] = {}
+    _bind_table_reference(tree, "converter", "current", values)
+    ctrl = peslite.Simulation(from_dict(tree)).unit("converter").ctrl
+    ctrl.command(True)
+    measurement = ConverterMeasurement(current=4.0, voltage=24.0, vin=48.0)
+
+    for t, expected in zip((0.0, 0.001), values):
+        inputs = _evaluate_control_graph(ctrl, t, measurement)
+        assert inputs["PredictiveCurrentControl"]["reference"] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "example,unit,reference,outer,inner,inner_port,small,large",
+    (
+        ("wpt-ss-example.pes", "charger.primary", "power", "PowerControl",
+         "ResonantModulation", "modulation", (1200.0, 1212.0), (200.0, 2500.0)),
+        ("wpt-lcc-example.pes", "charger.secondary", "power", "PhasePowerControl",
+         "ResonantModulation", "phase", (-500.0, -505.0), (-100.0, -1000.0)),
+    ),
+    ids=("primary", "secondary"),
+)
+@pytest.mark.parametrize("size", ("small", "large"))
+def test_reference_signal_crosses_nested_wpt_control_levels(
+        examples, example, unit, reference, outer, inner, inner_port, small, large, size):
+    tree = read_tree(examples / example)
+    tree["events"] = {}
+    values = small if size == "small" else large
+    _bind_table_reference(tree, unit, reference, values)
+    ctrl = peslite.Simulation(from_dict(tree)).unit(unit).ctrl
+    ctrl.command(True)
+    measurement = ConverterMeasurement(current=0.0, voltage=0.0, vin=400.0, power=0.0)
+
+    for t, expected in zip((0.0, 0.001), values):
+        inputs = _evaluate_control_graph(ctrl, t, measurement)
+        assert inputs[outer]["reference"] == pytest.approx(expected)
+        assert inputs[inner][inner_port] == pytest.approx(
+            ctrl.graph.values[f"{outer}.{inner_port}"]
+        )
+
+
+def _reference_event_equivalence(
+        tree, unit, reference, values, step, end, log_name, output_dir):
+    tree["simulation"]["t_end"] = end
+    tree["simulation"]["solver"]["linearisations"] = 0
+    output = tree["simulation"].setdefault("output", {})
+    output.update({
+        "states": True, "signals": True, "energy": False,
+        "record_every": 1, "precision": 17,
+    })
+    tree["simulation"]["progress"] = {"enable": False}
+    tree["simulation"]["energy_check"] = "off"
+
+    signal_tree = deepcopy(tree)
+    _bind_table_reference(
+        signal_tree, unit, reference, values, stop=step,
+        interpolation="zero_order_hold",
+    )
+    event_tree = deepcopy(tree)
+    _unit_section(event_tree, unit)["ctrl"].setdefault("references", {})[reference] = values[0]
+    event_tree.setdefault("events", {})["reference_step"] = {
+        "type": "set",
+        "t": step,
+        "set": {f"units.{unit}.ctrl.references.{reference}": values[1]},
+    }
+
+    signal = peslite.Simulation(from_dict(signal_tree)).run(out_dir=output_dir / "signal")
+    event = peslite.Simulation(from_dict(event_tree)).run(out_dir=output_dir / "event")
+
+    np.testing.assert_array_equal(signal.t, event.t)
+    assert signal.states.keys() == event.states.keys()
+    for name in signal.states:
+        np.testing.assert_allclose(
+            signal.states[name], event.states[name], rtol=2e-10, atol=2e-11,
+            err_msg=name,
+        )
+    np.testing.assert_allclose(
+        signal.ctrl[log_name], event.ctrl[log_name], rtol=0.0, atol=1e-12,
+    )
+    selected = signal.ctrl[f"{unit}.t"] >= step - 1e-12
+    np.testing.assert_allclose(signal.ctrl[log_name][selected], values[1], atol=1e-12)
+
+
+@pytest.mark.parametrize("size", ("small", "large"))
+@pytest.mark.parametrize("case", ("dc_voltage", "predictive_current", "vsc_current"))
+def test_reference_signal_matches_set_event_across_converter_control_levels(
+        examples, case, size, tmp_path):
+    if case == "dc_voltage":
+        tree = read_tree(examples / "buck-example.pes")
+        tree["events"] = {}
+        values = (24.0, 24.24) if size == "small" else (12.0, 36.0)
+        arguments = ("converter", "voltage", values, "converter.voltage_reference")
+    elif case == "predictive_current":
+        tree = read_tree(examples / "mpc-buck-example.pes")
+        tree["events"] = {}
+        values = (4.0, 4.04) if size == "small" else (1.0, 7.0)
+        arguments = ("converter", "current", values, "converter.current_reference")
+    else:
+        tree = read_tree(examples / "gfl-example.pes")
+        tree["units"]["vsc"]["ctrl"]["loops"].pop("DCVoltageControl")
+        tree["events"] = {
+            "connect_vsc": {"type": "connect", "target": "vsc", "t": 0.0, "ramp": 0.0},
+        }
+        values = (0.2, 0.202) if size == "small" else (-0.4, 0.8)
+        arguments = ("vsc", "id_ref_pu", values, "vsc.id_ref_pu")
+    _reference_event_equivalence(
+        tree, *arguments[:3], 0.003, 0.006, arguments[3], tmp_path,
+    )
+
+
+@pytest.mark.parametrize(
+    "example,unit,values,log_name",
+    (
+        ("wpt-ss-example.pes", "charger.primary", (1200.0, 1212.0),
+         "charger.primary.power_reference"),
+        ("wpt-lcc-example.pes", "charger.secondary", (-500.0, -505.0),
+         "charger.secondary.power_reference"),
+        ("wpt-ss-example.pes", "charger.primary", (200.0, 2500.0),
+         "charger.primary.power_reference"),
+        ("wpt-lcc-example.pes", "charger.secondary", (-100.0, -1000.0),
+         "charger.secondary.power_reference"),
+    ),
+    ids=("primary-small", "secondary-small", "primary-large", "secondary-large"),
+)
+def test_reference_signal_matches_set_event_in_nested_wpt_control(
+        examples, example, unit, values, log_name, tmp_path):
+    tree = read_tree(examples / example)
+    tree["events"] = {}
+    tree["simulation"]["solver"]["dt"] = 100.0e-9
+    tree["simulation"].setdefault("output", {})["period"] = 1.0e-6
+    _reference_event_equivalence(
+        tree, unit, "power", values, 40.0e-6, 80.0e-6, log_name, tmp_path,
+    )
+
+
+@pytest.mark.full
+@pytest.mark.parametrize(
+    "example,unit,loop,targets",
+    (
+        ("wpt-ss-example.pes", "charger.primary", "PowerControl",
+         (1200.0, 1260.0, 1800.0)),
+        ("wpt-lcc-example.pes", "charger.secondary", "PhasePowerControl",
+         (-500.0, -525.0, -800.0)),
+    ),
+    ids=("primary", "secondary"),
+)
+def test_nested_wpt_tracks_small_and_large_arbitrary_reference_signals(
+        examples, example, unit, loop, targets, tmp_path):
+    tree = read_tree(examples / example)
+    tree["events"] = {}
+    for side in ("primary", "secondary"):
+        _unit_section(tree, f"charger.{side}").setdefault("bridge", {})["model"] = "averaging"
+    _bind_table_reference(
+        tree, unit, "power", targets, times=(0.0, 0.003, 0.006),
+        interpolation="zero_order_hold",
+    )
+    tree["simulation"]["t_end"] = 0.009
+    tree["simulation"]["solver"].update({"dt": 250.0e-9, "linearisations": 0})
+    tree["simulation"].update({"energy_check": "off", "progress": {"enable": False}})
+    tree["simulation"]["output"].update({
+        "states": False, "signals": True, "energy": False, "record_every": 1,
+    })
+    result = peslite.Simulation(from_dict(tree)).run(out_dir=tmp_path)
+
+    for begin, end, target in zip((0.0024, 0.0054, 0.0084),
+                                  (0.0028, 0.0058, 0.0088), targets):
+        control_time = result.ctrl[f"{unit}.t"]
+        control_selected = (control_time >= begin) & (control_time <= end)
+        np.testing.assert_allclose(
+            result.ctrl[f"{unit}.power_reference"][control_selected], target,
+            rtol=0.0, atol=1e-12,
+        )
+        selected = (result.t >= begin) & (result.t <= end)
+        time = result.t[selected]
+        power = result.plant[f"{unit}.{loop}.power"][selected]
+        mean = np.sum(0.5 * (power[1:] + power[:-1]) * np.diff(time)) / (end - begin)
+        assert mean == pytest.approx(target, rel=0.005)
 
 
 def test_inline_signal_uses_the_existing_sampled_reference_boundary(examples):
