@@ -119,6 +119,16 @@ def test_standalone_schema_rejects_unknown_options_and_invalid_combinations(case
 
 
 @pytest.mark.static
+def test_standalone_reference_without_an_input_port_rejects_dynamic_binding(case):
+    tree = _case(case)
+    tree["signals"] = {"duty": {"time": [0.0, 0.001], "value": [0.2, 0.4]}}
+    tree["units"]["vsc"]["ctrl"]["references"] = {"duty": "signals.duty"}
+
+    with pytest.raises(ConfigError, match="does not expose dynamic input"):
+        from_dict(tree)
+
+
+@pytest.mark.static
 def test_standalone_type_rejects_unsupported_bridge_model_before_assembly(case):
     tree = _case(case)
     tree["units"]["vsc"]["bridge"]["model"] = "averaging"

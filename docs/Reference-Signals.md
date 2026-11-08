@@ -55,7 +55,7 @@ functions. Sums of sine terms produce multiharmonic waveforms. Both helpers supp
 interpolation, extrapolation, time scaling and time/value offsets.
 
 Table references are deterministic and require no additional restart state because playback uses
-absolute simulation time. Native C++ and Imperix export currently reject a configuration containing
-one instead of replacing it with a constant.
+absolute simulation time. Native C++ and Imperix export reject dynamic reference tables; replace
+them with constant references before export.
 
 See `reference-signal-example` for a complete simulation file.

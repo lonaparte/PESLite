@@ -32,7 +32,7 @@ from ..components.network import ELEMENT_TYPES, element_buses
 from ..control.controller import continuous_control
 from ..control.loops import LOOP_TYPES, loop_key_type, loop_type
 from ..control.profiles import ReferenceParams, control_type
-from ..control.signals import ReferenceSignal, TableSignal
+from ..control.signals import ReferenceBinding, TableSignal
 from ..solver.integrators import CIRCUIT_MODELS, canonical_method
 from ..solver.model import ConfigError
 from ..solver.timing import control_computation, control_period
@@ -449,8 +449,8 @@ class ControlParams:
     outputs: dict = field(default_factory=dict)
     references: Any = None  # built from the schema selected by type
     options: Optional[Any] = None  # built from the optional schema selected by type
-    _reference_signals: dict[str, ReferenceSignal] = field(
-        init=False, default_factory=dict, compare=False, repr=False,
+    _reference_bindings: dict[str, ReferenceBinding] = field(
+        default_factory=dict, repr=False, metadata={"internal": True},
     )
 
 
@@ -649,7 +649,6 @@ class UnitParams:
                     loops[name] = replace(loop, period=ctrl.period)
                     derived.add(f"ctrl.loops.{name}.period")
             ctrl = replace(ctrl, loops=loops)
-            object.__setattr__(ctrl, "_reference_signals", self.ctrl._reference_signals)
         dclink = self.dclink
         if dclink is not None and dclink.source.v is None:
             voltage = dclink.vdc_ref if dclink.source.type == "voltage" else 0.0
@@ -1070,9 +1069,12 @@ def from_dict(data: dict) -> Params:
     from .validate import validate
 
     normalized = _normalize(data)
-    raw_signals = normalized.get("signals", {}) if isinstance(normalized, dict) else {}
+    if not isinstance(normalized, dict):
+        return _build(Params, normalized, "", None, None)
+    raw_signals = normalized.get("signals", {})
     signals = _build_named(TableSignal, raw_signals, "signals", None, None, normalized)
-    initial = normalized.get("simulation", {}).get("initial", {})
+    simulation = normalized.get("simulation")
+    initial = simulation.get("initial", {}) if isinstance(simulation, dict) else {}
     initial_t = initial.get("t", 0.0) if isinstance(initial, dict) else 0.0
     if isinstance(initial_t, bool) or not isinstance(initial_t, (int, float)):
         initial_t = 0.0  # the ordinary simulation parser reports the precise type error
@@ -1119,13 +1121,14 @@ def to_dict(p: Any, derived: bool = False) -> dict:
                if item.name in common or (item.name == "ctrl" and p.ctrl is not None)},
         }
     elif is_dataclass(p) and not isinstance(p, type):
-        d = {f.name: to_dict(getattr(p, f.name), derived) for f in fields(p) if f.init}
+        d = {f.name: to_dict(getattr(p, f.name), derived) for f in fields(p)
+             if f.init and not f.metadata.get("internal")}
         if isinstance(p, ControlParams):
             for name, loop in p.loops.items():
                 direct = loop_key_type(name)
                 if direct is not None and direct.type == loop.type:
                     d["loops"][name].pop("type", None)
-            for field_name, binding in p._reference_signals.items():
+            for field_name, binding in p._reference_bindings.items():
                 d["references"].pop(field_name, None)
                 d["references"][binding.input_name] = f"signals.{binding.name}"
     elif isinstance(p, dict):
@@ -1225,7 +1228,7 @@ def _build_control_params(data: Any, path: str, base: BaseValues,
     if not isinstance(references, dict):
         raise ConfigError(f"{path}.references: expected a mapping, got {type(references).__name__}")
     references = dict(references)
-    bindings: dict[str, ReferenceSignal] = {}
+    bindings: dict[str, ReferenceBinding] = {}
     context = _REFERENCE_SIGNAL_CONTEXT.get()
     if context is not None:
         signals, initial_t = context
@@ -1253,7 +1256,7 @@ def _build_control_params(data: Any, path: str, base: BaseValues,
                 raise ConfigError(
                     f"{path}.references.{input_name}: signals.{signal_name}: {exc}"
                 ) from None
-            bindings[target] = ReferenceSignal(
+            bindings[target] = ReferenceBinding(
                 signal_name, signal, input_name, factor,
             )
     values["references"] = _build(
@@ -1263,15 +1266,18 @@ def _build_control_params(data: Any, path: str, base: BaseValues,
         base,
         scales,
     )
+    for target, binding in tuple(bindings.items()):
+        current = getattr(values["references"], target)
+        integer = isinstance(current, int) and not isinstance(current, bool)
+        bindings[target] = replace(binding, integer=integer)
     if spec.options is not None:
         values["options"] = _build(
             spec.options, values.get("options", {}), f"{path}.options", base, scales,
         )
     elif values.get("options") is not None:
         raise ConfigError(f"{path}.options: control type {kind!r} does not accept options")
-    control = _build(ControlParams, values, path, base, scales)
-    object.__setattr__(control, "_reference_signals", bindings)
-    return control
+    return replace(_build(ControlParams, values, path, base, scales),
+                   _reference_bindings=bindings)
 
 
 def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
@@ -1492,7 +1498,10 @@ def _build_fields(cls, data: dict, path: str, base: Any, scales: Optional[dict],
                   *, names: Optional[frozenset[str]] = None) -> dict:
     """Parse selected dataclass fields through the same rules as an ordinary section."""
     hints = _type_hints(cls)
-    selected = tuple(f for f in fields(cls) if f.init and (names is None or f.name in names))
+    selected = tuple(
+        f for f in fields(cls)
+        if f.init and not f.metadata.get("internal") and (names is None or f.name in names)
+    )
     known = {f.name for f in selected}
     unknown = set(data) - known
     if unknown:

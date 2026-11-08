@@ -20,7 +20,6 @@ nav:
   - Simulation Files: Simulation-Files.md
   - Simulation:
       - Events Timeline: Events-Timeline.md
-      - Reference Signals: Reference-Signals.md
       - Solvers: Solvers.md
       - Multirate Simulation: Multirate-Simulation.md
       - Output and Results: Output-and-Results.md
@@ -28,6 +27,7 @@ nav:
       - Passive Network Components: Passive-Network-Components.md
       - Electrical Sources: Electrical-Sources.md
       - Bridge and PWM: Bridge-and-PWM.md
+      - Reference Signals: Reference-Signals.md
       - Voltage-Source Converters: Voltage-Source-Converters.md
       - DC converters and WPT: DC-Converters-and-WPT.md
       - Black-box Models: Black-Box-Models.md

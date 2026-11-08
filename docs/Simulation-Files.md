@@ -44,8 +44,9 @@ section simply omits it.
 
 ## Names and paths
 
-Names are unique within each of `buses`, `branches`, `sources`, `elements`, `units` and `signals`. They must
-be non-empty and cannot contain a dot. Dots separate public configuration, state and signal paths:
+Names are unique within each of `buses`, `branches`, `sources`, `elements`, `units` and `signals`.
+They must be non-empty and cannot contain a dot. Dots separate public configuration, state and
+signal paths:
 
 ```text
 units.vsc.ctrl.references.p_ref_pu

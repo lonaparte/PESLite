@@ -5702,7 +5702,7 @@ _NATIVE_MODULATORS = {
 def _validate_native_control_graph(ctrl: Any, target: str = "C++ export") -> None:
     """Reject graph loops which deliberately have no native equation generator."""
     graph = getattr(ctrl, "graph", None)
-    if graph is not None and graph.reference_signals:
+    if graph is not None and graph.reference_bindings:
         raise TypeError(
             f"{target}: time-varying controller reference signals have no native generator"
         )

@@ -124,7 +124,7 @@ class TableSignal:
         first, last = self.time[0], self.time[-1]
         if t < first:
             return self._outside(t, left=True)
-        if t > last:
+        if t > last or (self.repeat and t == last):
             if not self.repeat:
                 return self._outside(t, left=False)
             t = first + math.fmod(t - first, last - first)
@@ -141,16 +141,18 @@ class TableSignal:
 
 
 @dataclass(frozen=True)
-class ReferenceSignal:
-    """One table bound to a controller reference, including its ordinary SI/pu conversion."""
+class ReferenceBinding:
+    """One controller-reference binding with its ordinary SI/pu conversion."""
 
     name: str
     signal: TableSignal
     input_name: str
     scale: float = 1.0
+    integer: bool = False
 
-    def __call__(self, t: float) -> float:
-        return self.scale * self.signal(t)
+    def __call__(self, t: float) -> float | int:
+        value = self.scale * self.signal(t)
+        return int(round(value)) if self.integer else value
 
 
 __all__ = ["TableSignal"]

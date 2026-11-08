@@ -91,9 +91,17 @@ def reference_table(time: Iterable[float], value: Iterable[float], *, repeat: bo
     if (any(isinstance(item, bool) or not isinstance(item, (int, float))
             or not math.isfinite(item) for item in factors) or time_scale <= 0.0):
         raise ValueError("time_scale must be positive and all scales and offsets must be finite")
+    if isinstance(time, (str, bytes)) or isinstance(value, (str, bytes)):
+        raise ValueError("time and value must contain numbers")
     try:
-        times = [time_offset + time_scale * float(item) for item in time]
-        values = [value_offset + value_scale * float(item) for item in value]
+        raw_time, raw_value = tuple(time), tuple(value)
+    except (TypeError, ValueError):
+        raise ValueError("time and value must contain numbers") from None
+    if any(isinstance(item, bool) for item in (*raw_time, *raw_value)):
+        raise ValueError("time and value must contain numbers")
+    try:
+        times = [time_offset + time_scale * float(item) for item in raw_time]
+        values = [value_offset + value_scale * float(item) for item in raw_value]
     except (TypeError, ValueError):
         raise ValueError("time and value must contain numbers") from None
     table = {
