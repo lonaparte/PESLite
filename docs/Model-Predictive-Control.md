@@ -3,7 +3,7 @@
 PESLite provides continuous-control-set MPC (CCS-MPC) and finite-control-set MPC (FCS-MPC)
 as ordinary sampled control loops. They use the same typed connections, ADC, actuation,
 protection, start-up and saved-state mechanisms as other loops. The converter adapters support
-`switching`, `pwm_averaging` and `averaging`; C++ and Imperix export are unsupported.
+`switching`, `pwm_averaging` and `averaging`.
 
 ## Run the examples
 
@@ -200,6 +200,12 @@ the explicit evaluation limit must cover the exhaustive plan count. An insuffici
 a failure before evaluating callbacks rather than applying a partial-search incumbent. Numerically
 tied plans prefer the first command closest to the previously applied command; remaining ties
 follow the configured action ordering.
+
+For native export, CCS-MPC uses a fixed-size active-set quadratic-program solver and FCS-MPC uses
+the same exhaustive ordering as Python. Both are generated from the resolved loop dimensions,
+use no heap allocation or third-party C++ library, and share one implementation between standalone
+C++ and Imperix. Custom MPC subclasses and custom Python optimization backends are not exported
+and are rejected instead of being approximated.
 
 Both algorithms return `MPCResult(success, action, inputs, states, objective, status, ...)`.
 Successful `inputs` cover the full prediction horizon and `states` include the initial state

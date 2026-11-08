@@ -71,7 +71,8 @@ def _compile(source, binary, include=None):
 
 
 @pytest.mark.parametrize("name", ["buck", "boost", "buck-boost", "gfl", "gfl-slow-terminal", "gfm-psc", "gfm-vsg",
-                                  "gfm-dvoc", "gfm-matching", "wpt-ss", "wpt-lcc"])
+                                  "gfm-dvoc", "gfm-matching", "wpt-ss", "wpt-lcc",
+                                  "mpc-buck", "mpc-vsc"])
 @pytest.mark.parametrize("variables", [(), ("all",)])
 def test_generated_controller_matches_python_loops_states_and_duties(name, variables, tmp_path):
     sim = _simulation(name)
@@ -122,8 +123,9 @@ def test_generated_controller_matches_python_loops_states_and_duties(name, varia
     result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
     actual = [tuple(map(float, line.split())) for line in result.stdout.splitlines()]
     assert len(actual) == len(expected)
+    rtol, atol = ((1e-4, 1e-4) if name == "mpc-buck" else (5e-6, 3e-6))
     for a, b in zip(actual, expected):
-        np.testing.assert_allclose(a, b, rtol=5e-6, atol=3e-6)
+        np.testing.assert_allclose(a, b, rtol=rtol, atol=atol)
     header = (tmp_path / "peslite_control.hpp").read_text()
     assert not any(text in header for text in ("std::vector", "std::string ", "new ", "rhs("))
 

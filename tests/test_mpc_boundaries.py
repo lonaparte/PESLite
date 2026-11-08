@@ -114,6 +114,45 @@ def test_fcs_default_fallback_is_selected_from_admissible_actions(
     np.testing.assert_array_equal(controller.previous_input, [expected])
 
 
+@pytest.mark.parametrize(("field", "value", "message"), [
+    ("max_iterations", 0, "max_iterations"),
+    ("max_evaluations", 0, "max_evaluations"),
+    ("tolerance", 0.0, "tolerance"),
+    ("feasibility_tolerance", -1.0, "feasibility_tolerance"),
+    ("tracking_weight", -1.0, "tracking_weight"),
+    ("input_weight", -1.0, "input_weight"),
+    ("rate_weight", -1.0, "rate_weight"),
+    ("current_min", np.inf, "current_min"),
+    ("current_max", np.nan, "current_max"),
+])
+def test_predictive_loop_rejects_invalid_numerical_parameters(
+        mpc_params, field, value, message):
+    with pytest.raises(ConfigError, match=message):
+        params = mpc_params.replace(**{
+            f"units.converter.ctrl.loops.{_MPC}.{field}": value,
+        })
+        peslite.Simulation(params)
+
+
+def test_fcs_rejects_bounds_without_a_binary_action(mpc_params):
+    with pytest.raises(ConfigError, match="exclude every finite control action"):
+        params = mpc_params.replace(**{
+            f"units.converter.ctrl.loops.{_MPC}.algorithm": "fcs",
+            f"units.converter.ctrl.loops.{_MPC}.input_min": 0.2,
+            f"units.converter.ctrl.loops.{_MPC}.input_max": 0.8,
+        })
+        peslite.Simulation(params)
+
+
+def test_predictive_loop_rejects_fallback_outside_input_bounds(mpc_params):
+    with pytest.raises(ConfigError, match="finite admissible commands"):
+        params = mpc_params.replace(**{
+            f"units.converter.ctrl.loops.{_MPC}.input_min": 0.2,
+            f"units.converter.ctrl.loops.{_MPC}.fallback_input": [0.1],
+        })
+        peslite.Simulation(params)
+
+
 def test_blocked_prediction_keeps_the_measured_current_as_the_initial_state(mpc_params):
     _simulation, _host, controller = _parts(mpc_params)
     controller.previous_enabled = False

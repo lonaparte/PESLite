@@ -2,13 +2,16 @@
 
 import copy
 import math
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pytest
 from scipy.integrate import quad
 
 import peslite
+from conftest import EXAMPLES
 from peslite.addons.control.voltage_adaptive_pll import VoltageAdaptivePLL
 from peslite.addons.functions import energy_closure, plot_result
 from peslite.addons.functions.small_signal import small_signal
@@ -17,6 +20,7 @@ from peslite.control import (ConverterMeasurement, Measurement, PredictiveCurren
                              register_loop_type)
 from peslite.control.mpc import MPCResult
 from test_dc_converters import _case as dc_case
+from test_cpp_export import _compiler, _final_csv, _run_generated
 
 
 _DC_MPC = "PredictiveCurrentControl"
@@ -617,6 +621,17 @@ def test_custom_mpc_loop_is_registered_without_runner_changes(tmp_path):
     assert result.states["converter.branch_f.i"][-1] == pytest.approx(4.0, abs=0.1)
 
 
+@pytest.mark.static
+def test_custom_mpc_loop_requires_an_explicit_native_adapter(tmp_path):
+    params = _dc(**{
+        "units.converter.ctrl.loops": {
+            "deadbeat": {"type": "test_deadbeat_mpc"},
+        },
+    })
+    with pytest.raises(TypeError, match="deadbeat"):
+        peslite.export(params, "cpp", tmp_path)
+
+
 def test_mpc_composes_with_control_and_component_addons(examples, tmp_path):
     params = peslite.load(examples / "cable-gfl-example.pes", **{
         "simulation.t_end": 0.001,
@@ -670,16 +685,105 @@ def test_mpc_results_work_with_function_addons(tmp_path):
 
 
 @pytest.mark.static
-@pytest.mark.parametrize("format", ["cpp", "imperix"])
-def test_mpc_export_is_explicitly_rejected_without_generating_files(format, tmp_path):
-    simulation = peslite.Simulation(_dc())
+@pytest.mark.parametrize(("format", "filename"), [
+    ("cpp", "peslite.cpp"),
+    ("imperix", "peslite_control.hpp"),
+])
+def test_mpc_export_uses_the_shared_native_control_backend(format, filename, tmp_path):
+    params = _dc()
     options = {}
     if format == "imperix":
+        params = params.replace(**{"units.converter.pwm.dead_time": 1e-7})
         options = {"build": False, "target_config": {"units": {"converter": {
             "adc": {"current": 0, "voltage": 1, "vin": 2}, "pwm": [0],
             "startup_ramp": 0.0, "hardware_overcurrent_configured": True,
         }}}}
     out = tmp_path / "exported"
-    with pytest.raises(TypeError, match="loop|generator"):
-        simulation.export(format, out, **options)
-    assert not out.exists()
+    peslite.Simulation(params).export(format, out, **options)
+    assert (out / filename).is_file()
+
+
+def _assert_native_mpc_result(actual_dir, expected_dir):
+    for filename in ("states.csv", "plant.csv"):
+        actual = _final_csv(actual_dir / filename)
+        expected = _final_csv(expected_dir / filename)
+        assert actual.keys() == expected.keys()
+        physical = [key for key in actual
+                    if not any(field in key for field in (
+                        ".iterations", ".evaluations", ".objective",
+                    ))]
+        np.testing.assert_allclose(
+            [actual[key] for key in physical],
+            [expected[key] for key in physical],
+            rtol=2e-5, atol=1e-4, equal_nan=True,
+        )
+
+
+@pytest.mark.full
+@pytest.mark.parametrize("example", [
+    "mpc-buck-example.pes",
+    "mpc-vsc-example.pes",
+    "mpc-vsc-matrices-example.pes",
+])
+@pytest.mark.parametrize("variables", [(), ("all",)])
+def test_generated_cpp_mpc_matches_python_plant_and_controller(
+        example, variables, tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("a C++17 compiler is required")
+    params = peslite.load(EXAMPLES / example).replace(**{
+        "simulation.t_end": 1e-4,
+        "simulation.output.precision": 17,
+    })
+    if example == "mpc-buck-example.pes" and variables == ("all",):
+        params = params.replace(**{
+            "units.converter.ctrl.loops.PredictiveCurrentControl.fallback_input": [0.4],
+            "units.converter.ctrl.loops.PredictiveCurrentControl.current_min": -100.0,
+            "units.converter.ctrl.loops.PredictiveCurrentControl.current_max": 100.0,
+        })
+    project = tmp_path / Path(example).stem
+    _source, native, python = _run_generated(
+        params, project, compiler, variables=variables,
+    )
+    _assert_native_mpc_result(native, python)
+    if example == "mpc-buck-example.pes" and variables == ("all",):
+        changes = {
+            "units.converter.ctrl.loops.PredictiveCurrentControl.tracking_weight": 2.5,
+            "units.converter.ctrl.loops.PredictiveCurrentControl.rate_weight": 0.03,
+            "units.converter.filter.r_f": 0.05,
+        }
+        native_changed = project / "native-changed"
+        command = [str(project / "peslite")]
+        for path, value in changes.items():
+            command += ["--set", f"{path}={value}"]
+        subprocess.run([*command, "--out", native_changed], check=True)
+        python_changed = project / "python-changed"
+        peslite.Simulation(params.replace(**changes)).run(out_dir=python_changed)
+        _assert_native_mpc_result(native_changed, python_changed)
+        invalid = {
+            "max_iterations": 0,
+            "max_evaluations": 0,
+            "tolerance": 0.0,
+            "feasibility_tolerance": -1.0,
+            "tracking_weight": -1.0,
+            "input_max": 0.3,
+            "current_min": 200.0,
+        }
+        prefix = "units.converter.ctrl.loops.PredictiveCurrentControl."
+        for field, value in invalid.items():
+            rejected = subprocess.run(
+                [str(project / "peslite"), "--set", f"{prefix}{field}={value}"],
+                capture_output=True, text=True,
+            )
+            assert rejected.returncode == 1
+            assert "invalid parameter combination" in rejected.stderr
+        native_stopped = project / "native-stopped"
+        subprocess.run([
+            str(project / "peslite"), "--set", "units.converter.connected=0",
+            "--out", native_stopped,
+        ], check=True)
+        python_stopped = project / "python-stopped"
+        peslite.Simulation(params.replace(**{
+            "units.converter.connected": False,
+        })).run(out_dir=python_stopped)
+        _assert_native_mpc_result(native_stopped, python_stopped)
