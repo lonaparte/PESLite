@@ -57,9 +57,10 @@ outputs and event responses are insensitive to further reduction.
 Before a fixed explicit step, Python and generated C++ check each present circuit matrix against
 that method's stability region. The check uses the exact switch, diode and transformer-ratio mode;
 an unstable mode uses fixed Radau for that interval without changing the configured step grid.
-RK4 first applies a conservative matrix-norm certificate; an inconclusive certificate falls back
-to the exact spectrum. Repeated matrices are decomposed into strongly connected state blocks, and
-unchanged block spectra are reused without approximating the stability decision.
+RK4 first applies a conservative matrix-norm certificate. Python reuses one certificate over a
+declared physical transformer-ratio range; an unavailable or inconclusive range falls back to the
+current matrix and then its exact spectrum. Repeated exact matrices are decomposed into strongly
+connected state blocks, and unchanged block spectra are reused without approximating the decision.
 
 ## Adaptive solvers
 

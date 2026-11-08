@@ -72,7 +72,29 @@ class _LegGates:
         return self.gates[leg]
 
 
-class ThreePhaseBridge:
+class _BridgeTopology:
+    """Common physical conversion-ratio range of an affine bridge switching law."""
+
+    __slots__ = ()
+
+    def ratio_bounds(self):
+        """Return componentwise bounds reached by duty ratios in ``[0, 1]``."""
+        values = tuple(
+            self.switching_state(state)
+            for state in np.ndindex(*(2,) * len(self.duty_names))
+        )
+        if any(np.iscomplexobj(value) for value in values):
+            return (
+                complex(min(complex(value).real for value in values),
+                        min(complex(value).imag for value in values)),
+                complex(max(complex(value).real for value in values),
+                        max(complex(value).imag for value in values)),
+            )
+        array = np.asarray(values, dtype=float)
+        return np.min(array, axis=0), np.max(array, axis=0)
+
+
+class ThreePhaseBridge(_BridgeTopology):
     """Three-leg topology used by the existing AC converter model."""
 
     type = "three_phase_bridge"
@@ -180,6 +202,7 @@ class _BridgeModel(NetworkComponent):
         self.continuous = True
         self.enabled = False
         self._current_transfer = False
+        self.ratio_bounds = None
         initialize = getattr(self.topology, "initialize_model", None)
         if initialize is not None:
             initialize(self, parallel_capacitance)
@@ -221,6 +244,7 @@ class _BridgeModel(NetworkComponent):
             nb.add(nl.Transformer(
                 nb.node(self.power_port), lower, nb.node(self.dc_port), lower,
                 nb.value(self.input, "upper_current_ratio"),
+                bounds=(0.0, 1.0),
             ))
             resistance = getattr(self, "resistance", 0.0)
             if resistance:
@@ -254,7 +278,8 @@ class _BridgeModel(NetworkComponent):
             nb.add(nl.Resistor(pole, ac, resistance))
         lower = nb.node(self.lower_port) if self.lower_port is not None else None
         nb.add(nl.Transformer(
-            pole, lower, nb.node(self.dc_port), lower, nb.value(self.input, "q")
+            pole, lower, nb.node(self.dc_port), lower, nb.value(self.input, "q"),
+            bounds=self.ratio_bounds,
         ))
         nb.losses(self)
 
@@ -453,6 +478,8 @@ class _SampledModel(_BridgeModel, PWM):
         self.has_switching_events = not isinstance(modulator, ZOH)
         _BridgeModel.__init__(self, topology, parallel_capacitance=parallel_capacitance,
                               on_resistance=on_resistance, switching=self.has_switching_events)
+        ratio_bounds = getattr(topology, "ratio_bounds", None)
+        self.ratio_bounds = None if ratio_bounds is None else ratio_bounds()
         registers = getattr(modulator, "registers", None)
         carried = tuple(modulator.carried)
         PWM.__init__(
@@ -623,7 +650,7 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None, *,
 
 
 @_register_topology
-class HalfBridge:
+class HalfBridge(_BridgeTopology):
     """One scalar switching leg between upper and lower DC rails.
 
     Device placement is fixed once at construction.  Setting ``upper_controlled``
@@ -858,7 +885,7 @@ class HalfBridgeDiodeConduction:
 
 
 @_register_topology
-class FullBridge:
+class FullBridge(_BridgeTopology):
     """Two half bridges forming one scalar H-bridge.
 
     By default all four devices are controlled. With ``upper_controlled`` and ``lower_controlled``

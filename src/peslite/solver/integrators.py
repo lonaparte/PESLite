@@ -317,16 +317,24 @@ class FixedStepSolver:
             values.append(eigenvalues)
         return np.concatenate(values) if values else np.empty(0, dtype=complex)
 
-    def _explicit_stable(self, step: float, modes: Sequence[tuple]) -> bool:
+    def _explicit_stable(
+        self,
+        step: float,
+        modes: Sequence[tuple],
+        certificates: Sequence[tuple[object, float] | None] | None = None,
+    ) -> bool:
         """Check assembled linear modes against this Runge-Kutta stability region."""
         _c, rows, weights = TABLEAUS[self.method]
         radius = _STABILITY_HALF_DISK.get(self.method, 0.0)
-        for mode in modes:
+        if certificates is None:
+            certificates = tuple(
+                mode[2] if radius and len(mode) > 2 else None for mode in modes
+            )
+        for mode, certificate in zip(modes, certificates):
             key, build, *metadata = mode
             eigenvalues = self._mode_eigenvalues.get(key)
             if eigenvalues is None:
-                bound = metadata[0]() if radius and metadata else None
-                if bound is not None and step * bound <= radius:
+                if certificate is not None and step * certificate[1] <= radius:
                     continue
                 eigenvalues = self._eigenvalues(build())
                 self._mode_eigenvalues[key] = eigenvalues
@@ -354,10 +362,25 @@ class FixedStepSolver:
         if not callable(provider):
             return False
         modes = tuple(provider())
-        key = tuple(mode[0] for mode in modes), step
+        radius = _STABILITY_HALF_DISK.get(self.method, 0.0)
+        certificates = tuple(
+            mode[2] if radius and len(mode) > 2 else None for mode in modes
+        )
+        if all(
+            certificate is not None and step * certificate[1] <= radius
+            for certificate in certificates
+        ):
+            return False
+        identities = tuple(
+            ("certificate", certificate[0])
+            if certificate is not None and step * certificate[1] <= radius
+            else ("mode", mode[0])
+            for mode, certificate in zip(modes, certificates)
+        )
+        key = identities, step
         stable = self._stability_results.get(key)
         if stable is None:
-            stable = self._explicit_stable(step, modes)
+            stable = self._explicit_stable(step, modes, certificates)
             self._stability_results[key] = stable
             self._stability_results.move_to_end(key)
             while len(self._stability_results) > 64:

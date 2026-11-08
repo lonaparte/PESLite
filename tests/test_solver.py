@@ -97,16 +97,38 @@ def test_rk4_stability_norm_certificate_avoids_forming_the_matrix():
     assert solver._explicit_stable(1e-3, ((
         "dynamic",
         lambda: builds.append(True) or np.array([[-1.0]]),
-        lambda: 500.0,
+        ("range", 500.0),
     ),))
     assert not builds
 
     assert solver._explicit_stable(1e-3, ((
         "inconclusive",
         lambda: builds.append(True) or np.array([[-1.0]]),
-        lambda: 2000.0,
+        ("range", 2000.0),
     ),))
     assert builds == [True]
+
+
+def test_rk4_stability_reuses_a_certificate_across_exact_mode_keys():
+    class DynamicMode:
+        mode = 0
+        builds = 0
+
+        def linear_modes(self):
+            def build():
+                self.builds += 1
+                return np.array([[-1.0]])
+            return ((self.mode, build, ("whole-range", 500.0)),)
+
+    model = DynamicMode()
+    solver = FixedStepSolver(1e-3, "RK4", model=model)
+    state = np.array([1.0])
+    solver(lambda _t, y: -y, 0.0, 1e-3, state)
+    model.mode = 1
+    solver(lambda _t, y: -y, 1e-3, 2e-3, state)
+
+    assert model.builds == 0
+    assert not solver._stability_results
 
 
 def test_stability_reuses_unchanged_strongly_connected_blocks(monkeypatch):
@@ -164,9 +186,9 @@ def test_explicit_stability_and_linearization_share_the_exact_circuit_matrix(exa
     blocks = simulation.system.model.linear_blocks()
 
     assert len(modes) == len(blocks)
-    for (_key, build, bound), (_positions, matrix, _exact, _skipped) in zip(modes, blocks):
+    for (_key, build, certificate), (_positions, matrix, _exact, _skipped) in zip(modes, blocks):
         np.testing.assert_array_equal(build(), matrix)
-        assert bound() >= np.linalg.norm(matrix, "fro") * (1.0 - 1e-12)
+        assert certificate[1] >= np.linalg.norm(matrix, "fro") * (1.0 - 1e-12)
 
 
 @pytest.mark.parametrize("method", ["euler", "heun", "RK4"])

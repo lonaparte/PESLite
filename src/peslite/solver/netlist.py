@@ -900,11 +900,31 @@ class Transformer(Element):
     """
 
     def __init__(self, p_a: Port, p_b: Port, s_a: Port, s_b: Port,
-                 N: Callable[[], ArrayLike] | ArrayLike, name: str = "") -> None:
+                 N: Callable[[], ArrayLike] | ArrayLike, name: str = "", *,
+                 bounds: Optional[tuple[ArrayLike, ArrayLike]] = None) -> None:
         (dp, scale_p), (ds, scale_s) = _port(p_a, p_b), _port(s_a, s_b)
         self.ports, self.name, self.N = ((p_a, p_b), (s_a, s_b)), name, N
         self.shape, self.current_scale = (dp, ds), scale_p / scale_s
         self.constant = None if callable(N) else self._ratio(N)
+        if bounds is None:
+            self.bounds = ((self.constant, self.constant)
+                           if self.constant is not None else None)
+        else:
+            lower, upper = (self._ratio(value) for value in bounds)
+            if np.any(lower > upper):
+                raise ValueError(f"{self.name}: transformer ratio lower bounds exceed upper bounds")
+            self.bounds = lower, upper
+        if self.bounds is None:
+            self._range = None
+        else:
+            lower, upper = self.bounds
+            tolerance = _FLOAT_RTOL * np.maximum(
+                1.0, np.maximum(np.abs(lower), np.abs(upper))
+            )
+            self._range = tuple(zip(
+                (lower - tolerance).flat,
+                (upper + tolerance).flat,
+            ))
         self._cached_scalar: Optional[tuple[numbers.Number, NDArray[np.float64]]] = None
 
     def _ratio(self, value: ArrayLike) -> NDArray[np.float64]:
@@ -921,6 +941,15 @@ class Transformer(Element):
         if not np.isfinite(N).all():
             raise ValueError(f"{self.name}: the ratio is not finite")
         return N
+
+    def within_bounds(self, ratio: NDArray[np.float64]) -> bool:
+        """Whether a ratio is covered by the optional stability range declaration."""
+        if self._range is None:
+            return False
+        return all(
+            lower <= value <= upper
+            for value, (lower, upper) in zip(ratio.flat, self._range)
+        )
 
     def ratio(self) -> NDArray[np.float64]:
         """Return the current ratio, reusing the matrix form of an unchanged scalar callback."""
@@ -1149,6 +1178,26 @@ class _Pattern:
         return self.base + np.bincount(self.slot_pos, weights=self.slot_coef * flat[self.slot_flat],
                                        minlength=self.nnz)
 
+    def value_bounds(
+        self,
+        bounds: Sequence[tuple[NDArray[np.float64], NDArray[np.float64]]],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Componentwise network-matrix bounds for bounded transformer ratios."""
+        if not self.slot_pos.size:
+            return self.base, self.base
+        lower = np.concatenate([value[0].ravel() for value in bounds])
+        upper = np.concatenate([value[1].ravel() for value in bounds])
+        first = self.slot_coef * lower[self.slot_flat]
+        second = self.slot_coef * upper[self.slot_flat]
+        return (
+            self.base + np.bincount(
+                self.slot_pos, weights=np.minimum(first, second), minlength=self.nnz,
+            ),
+            self.base + np.bincount(
+                self.slot_pos, weights=np.maximum(first, second), minlength=self.nnz,
+            ),
+        )
+
     def matrix(self, ratios: Sequence[NDArray[np.float64]]) -> sp.csc_matrix:
         return sp.csc_matrix((self.values(ratios), self.indices, self.indptr), shape=(self.n, self.n))
 
@@ -1261,6 +1310,20 @@ class _RatioPlan:
         if solution is None:
             solution = self.solutions[key] = self.factor.solve(right)
         return solution
+
+    def change_bound(
+        self,
+        lower: NDArray[np.float64],
+        upper: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Entrywise absolute bound of the low-rank correction over an interval matrix."""
+        size = np.maximum(
+            np.abs(lower[self.positions] - self.base),
+            np.abs(upper[self.positions] - self.base),
+        )
+        change = np.zeros((self.rows.size, self.cols.size))
+        np.add.at(change, (self.row_index, self.col_index), size)
+        return change
 
 
 class _RatioUpdate:
@@ -1951,6 +2014,66 @@ class Topology:
             np.linalg.norm(base.state_space.A, "fro")
             + np.linalg.norm(left, "fro") * np.linalg.norm(right, "fro")
         )
+
+    def _state_matrix_range_certificate(self) -> Optional[tuple[object, float]]:
+        """Certify one state-matrix norm bound over every declared transformer ratio.
+
+        The interval matrix bounds the low-rank ratio correction entry by entry.  If its
+        interaction with the base inverse is below one, the Neumann bound proves that every
+        matrix in the range is nonsingular and bounds its state matrix without sampling ratios.
+        """
+        base = self._shared["ratio_base"]
+        cached = self._shared.get("state_matrix_range_certificate", _PENDING)
+        if cached is not _PENDING:
+            return cached
+        net = base._store[0]
+        bounds = tuple(transformer.bounds for transformer in net._transformers)
+        if any(bound is None for bound in bounds):
+            certificate = None
+        elif (not base._pattern.slot_pos.size
+              or all(np.array_equal(lower, upper) for lower, upper in bounds)):
+            certificate = (base, float(np.linalg.norm(base.state_space.A, "fro")))
+        else:
+            _ = base.lu
+            plan = base._ratio_plan(include_small_device=True)
+            certificate = None
+            if plan is not None:
+                lower, upper = base._pattern.value_bounds(bounds)
+                change = plan.change_bound(lower, upper)
+                change_norm = float(np.linalg.norm(change, "fro"))
+                interaction = float(np.linalg.norm(plan.ZC, 2)) * change_norm
+                if interaction < 1.0:
+                    if "K" not in self._shared:
+                        self._shared["K"] = sp.hstack([
+                            base.Ky, base.Ku, base.Kdu,
+                        ]).toarray()
+                    n_x = base._net_shape[0]
+                    solution = plan.shared(
+                        "state_matrix_bound", self._shared["K"]
+                    )
+                    correction = (
+                        float(np.linalg.norm(plan.Z[base.xd_index], 2))
+                        * change_norm / (1.0 - interaction)
+                        * float(np.linalg.norm(solution[plan.cols, :n_x], 2))
+                    )
+                    bound = float(np.linalg.norm(base.state_space.A, "fro")) + correction
+                    if math.isfinite(bound):
+                        certificate = (base, bound)
+        self._shared["state_matrix_range_certificate"] = certificate
+        return certificate
+
+    def state_matrix_stability_certificate(self) -> Optional[tuple[object, float]]:
+        """Return a reusable range certificate, or a bound for this exact ratio mode."""
+        net = self._store[0]
+        covered = all(
+            transformer.within_bounds(ratio)
+            for transformer, ratio in zip(net._transformers, self.mode.ratios)
+        )
+        certificate = self._state_matrix_range_certificate() if covered else None
+        if certificate is not None:
+            return certificate
+        bound = self.state_matrix_norm_bound()
+        return None if bound is None else (self.state_matrix_key(), bound)
 
     def _factorize(self, net: "Netlist", values: NDArray[np.float64]) -> object:
         """The factors of the sparse network matrix with entries ``values``: grouped onto the interface

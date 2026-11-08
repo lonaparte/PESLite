@@ -322,6 +322,15 @@ def test_causal_transformer_reduction_supports_a_shared_voltage_reference():
     np.testing.assert_allclose(evaluate(0.0, ()), [4.5, -1.25, -3.75], rtol=0.0, atol=1e-12)
 
 
+def test_dynamic_transformer_reports_coverage_by_its_declared_ratio_bounds():
+    ratio = [0.5]
+    transformer = Transformer(Node(), None, Node(), None, lambda: ratio[0], bounds=(0.0, 1.0))
+
+    assert transformer.within_bounds(transformer.ratio())
+    ratio[0] = 1.1
+    assert not transformer.within_bounds(transformer.ratio())
+
+
 def test_custom_ac_waveform_remains_the_source_of_its_declared_netlist():
     class CustomSource(ACVoltageSource):
         def set_outputs(self, t):
@@ -660,8 +669,51 @@ def test_device_ratio_stability_certificate_avoids_exact_mode_spectra(
         len(circuit.netlist._structures) for circuit in simulation.system.circuits
     ) - initial_structures
     assert not modes
-    assert simulation.solver._stability_results
+    assert not simulation.solver._stability_results
     assert count - initial <= new_structures
+
+
+def test_transformer_ratio_range_certificate_bounds_the_full_declared_box():
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "gfl-example.pes", **QUIET, **{
+            "simulation.solver.circuit_model": "device",
+        },
+    ))
+    circuit, = simulation.system.circuits
+    topology = circuit.netlist.topology()
+    certificate = topology._state_matrix_range_certificate()
+    assert certificate is not None
+    rng = np.random.default_rng(8317)
+    for _ in range(20):
+        ratios = tuple(
+            rng.uniform(lower, upper)
+            for transformer in circuit.netlist._transformers
+            for lower, upper in (transformer.bounds,)
+        )
+        mode = nl.Mode(topology.mode.closed, topology.mode.conducting, ratios)
+        matrix = circuit.netlist._compiled(mode).state_space.A
+        assert np.linalg.norm(matrix, "fro") <= certificate[1] * (1.0 + 1e-12)
+
+
+def test_transformer_ratio_outside_the_declared_box_uses_its_exact_mode():
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "gfl-example.pes", **QUIET, **{
+            "simulation.solver.circuit_model": "device",
+        },
+    ))
+    circuit, = simulation.system.circuits
+    topology = circuit.netlist.topology()
+    ratios = tuple(
+        upper + 1.0 if index == 0 else (lower + upper) / 2.0
+        for index, transformer in enumerate(circuit.netlist._transformers)
+        for lower, upper in (transformer.bounds,)
+    )
+    mode = nl.Mode(topology.mode.closed, topology.mode.conducting, ratios)
+    outside = circuit.netlist._compiled(mode)
+
+    certificate = outside.state_matrix_stability_certificate()
+    assert certificate is not None
+    assert certificate[0] == outside.state_matrix_key()
 
 
 @pytest.mark.parametrize("example", [

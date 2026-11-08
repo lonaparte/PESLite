@@ -1406,11 +1406,13 @@ class Circuit:
             y[index] = T @ y[index]
         return y
 
-    def linear_mode(self) -> tuple[tuple, Callable[[], np.ndarray], Callable[[], Optional[float]]]:
-        """Return the present linear-mode identity, matrix builder and conservative norm bound."""
+    def linear_mode(self) -> tuple[
+        tuple, Callable[[], np.ndarray], Optional[tuple[object, float]]
+    ]:
+        """Return the present linear-mode identity, matrix builder and stability certificate."""
         topology = self._bound_device_topology() or self.netlist.topology()
         return (topology.state_matrix_key(), lambda: topology.state_space.A,
-                topology.state_matrix_norm_bound)
+                topology.state_matrix_stability_certificate())
 
     def _store(self, y: np.ndarray) -> None:
         """Write a netlist state vector back into the components."""
@@ -2743,10 +2745,12 @@ def circuit_linear_modes(circuits: Sequence[Circuit]):
     return tuple(
         ((id(circuit.netlist), key),
          lambda circuit=circuit, matrix=matrix: _placed_linear_matrix(circuit, matrix()),
-         lambda circuit=circuit, bound=bound:
-             None if (value := bound()) is None else circuit._structure_plan.norm_scale * value)
+         None if certificate is None else (
+             (id(circuit.netlist), certificate[0]),
+             circuit._structure_plan.norm_scale * certificate[1],
+         ))
         for circuit in circuits
-        for key, matrix, bound in (circuit.linear_mode(),)
+        for key, matrix, certificate in (circuit.linear_mode(),)
     )
 
 
