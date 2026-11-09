@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import cmath
 import math
 from dataclasses import dataclass
 from typing import Optional
+
+import numpy as np
 
 from . import (ANGLE, FREQUENCY, V_AB, ConfigError, Filter, Integrator, Loop,
                register_loop_type)
@@ -78,7 +79,7 @@ class VoltageAdaptivePLL(Loop):
 
     def equation(self, voltage):
         frame = self.theta
-        measured = voltage * cmath.exp(-1j * frame)
+        measured = voltage * np.exp(-1j * frame)
         u_g = self.u_g
         error = measured.imag / u_g if u_g > 0.0 else 0.0
         omega_g = self.frequency(self.ki * error)

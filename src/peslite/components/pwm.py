@@ -563,7 +563,8 @@ class PWM:
         values = np.asarray(d[:self.modulation_width], dtype=float)
         if self.dead_time > 0.0:
             values = self._dead_time_average(values, self._pole_currents(self.input.i_c))
-        return self._held_state(values)
+        # Python floats keep the switching law on scalar arithmetic with equal results.
+        return self._held_state(np.asarray(values, dtype=float).tolist())
 
     def _dead_time_average(self, duties, currents):
         """Apply the cycle-averaged loss of physical dead time."""

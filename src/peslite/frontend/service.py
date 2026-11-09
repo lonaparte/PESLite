@@ -1,4 +1,4 @@
-"""Line-delimited JSON service speaking the CodeSim VS Code extension protocol.
+"""Line-delimited JSON service for the PESLite frontend.
 
 Every stdin line is one request ``{"id", "method", "params"}``; every stdout line is either a
 response ``{"id", "ok", "result" | "error"}`` or an event ``{"type", "requestId", ...}``.
@@ -99,7 +99,8 @@ class FrontendService:
 
     # ------------------------------------------------------------ transport
     def write(self, message: dict[str, Any]) -> None:
-        self.out.write(json.dumps(json_safe(message), allow_nan=False) + "\n")
+        json.dump(json_safe(message), self.out, allow_nan=False)
+        self.out.write("\n")
         self.out.flush()
 
     def respond(self, request_id: Any, result: Any) -> None:
@@ -152,8 +153,8 @@ class FrontendService:
             self.respond(request_id, {**self.save(),
                                       "unstablePoleCount": self.small_signal["unstablePoleCount"]})
         elif method in ("interaction.run", "transientVoltage.run"):
-            raise ValueError(f"{method} is a CodeSim symbolic-model analysis; PESLite simulation "
-                             "files support simulation and small-signal analysis")
+            raise ValueError(f"{method} is unavailable; the PESLite frontend supports simulation "
+                             "and small-signal analysis")
         elif method == "server.shutdown":
             self.respond(request_id, {"shutdown": True})
             self.running = False
@@ -193,45 +194,44 @@ class FrontendService:
 
     def restore(self) -> None:
         """Keep a saved layout, and saved results when they used the same parameter values."""
-        try:
-            saved = json.loads(self.snapshot_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return
-        if not isinstance(saved, dict) or saved.get("system", {}).get("id") != self.topology.system_id:
+        saved = self._snapshot()
+        if not saved:
             return
         if isinstance(saved.get("layout"), dict):
             self.layout = saved["layout"]
-        current = json_safe(self.topology.system()["parameters"])
+        current = self.topology.system()["parameters"]
         if saved["system"].get("parameters") == current:
             self.signals = saved.get("signals") or []
             small = saved.get("smallSignal") or {}
             self.small_signal = small if small.get("available") else {}
 
-    def descriptor(self) -> dict[str, Any]:
-        return self.topology.descriptor(self.signals, self.small_signal, self.layout)
+    def _snapshot(self) -> dict[str, Any]:
+        """Read a snapshot belonging to the loaded system."""
+        try:
+            saved = json.loads(self.snapshot_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        system = saved.get("system") if isinstance(saved, dict) else None
+        return (saved if isinstance(system, dict)
+                and system.get("id") == self.topology.system_id else {})
 
     def save(self) -> dict[str, Any]:
         """Write the descriptor atomically, keeping a layout the extension saved in place."""
-        try:
-            saved = json.loads(self.snapshot_file.read_text(encoding="utf-8"))
-            if (isinstance(saved, dict) and isinstance(saved.get("layout"), dict)
-                    and saved.get("system", {}).get("id") == self.topology.system_id):
-                self.layout = saved["layout"]
-        except (OSError, ValueError):
-            pass
-        descriptor = self.descriptor()
+        saved = self._snapshot()
+        if isinstance(saved.get("layout"), dict):
+            self.layout = saved["layout"]
+        descriptor = self.topology.descriptor(self.signals, self.small_signal, self.layout)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(json_safe(descriptor), allow_nan=False)
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.output_dir,
                                          suffix=".tmp", delete=False) as handle:
-            handle.write(payload)
+            json.dump(json_safe(descriptor), handle, allow_nan=False)
             temporary = Path(handle.name)
         os.replace(temporary, self.snapshot_file)
         return {"descriptor": descriptor, "snapshotFile": str(self.snapshot_file)}
 
     # ------------------------------------------------------------ analyses
     def run(self, request_id: Any, *, stream: bool) -> dict[str, Any]:
-        """Run the loaded case once, streaming its signals as CodeSim simulation chunks."""
+        """Run the loaded case once, streaming its signals as frontend simulation chunks."""
         p = self.topology.params
         self.simulation, self.signals, self.small_signal = None, [], {}
         sim = Simulation(p)
@@ -275,7 +275,7 @@ class FrontendService:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Serve the CodeSim frontend protocol on stdin/stdout until shutdown or end of input."""
+    """Serve the PESLite frontend protocol until shutdown or end of input."""
     import argparse
 
     parser = argparse.ArgumentParser(prog="python -m peslite.frontend", description=main.__doc__)

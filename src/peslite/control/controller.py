@@ -298,7 +298,28 @@ class ContinuousStartup:
 # ------------------------------------------------------------------ the loop network
 
 # kinds of input source
-_HELD, _MEASURED, _CONSTANT = 0, 1, 2
+_HELD, _MEASURED, _CONSTANT, _REFERENCE = 0, 1, 2, 3
+
+
+def _reference_bindings(ctrl) -> Mapping:
+    """Return optional time-varying bindings from a controller configuration."""
+    return getattr(ctrl, "_reference_bindings", {})
+
+
+class _ReferenceValues(dict):
+    """Runtime reference mapping with the attribute access expected by profile validators."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+def _reference_values(references, *, attributes: bool = False) -> dict:
+    values = ((item.name, getattr(references, item.name)) for item in fields(references))
+    return _ReferenceValues(values) if attributes else dict(values)
+
 
 CONTROL_INTERFACE = ControlInterface(
     inputs=MappingProxyType({
@@ -416,7 +437,12 @@ class ControlGraph:
         self._limits: dict[str, tuple[str, OutputLimit]] = {}
         self.updated = set()
         refs = cfg.ctrl.references
-        self.references = {f.name: getattr(refs, f.name) for f in fields(refs)}
+        self.reference_bindings = dict(_reference_bindings(cfg.ctrl))
+        self._reference_validator = control_type(cfg.ctrl.type).reference_validator
+        self.references = _reference_values(
+            refs, attributes=bool(self.reference_bindings and self._reference_validator),
+        )
+        self._reference_time = None
         declared_references = {
             path.partition(".")[2] for path in self.interface.inputs
             if path.startswith("references.")
@@ -639,7 +665,8 @@ class ControlGraph:
             elif owner == "references":
                 value = self.references[port]
                 self._boundary_sources[path] = (
-                        _CONSTANT, _complex(value) if spec.complex_value else value
+                    (_REFERENCE, port) if port in self.reference_bindings else
+                    (_CONSTANT, _complex(value) if spec.complex_value else value)
                 )
             else:  # ControlInterface is a package-owned declaration, not user input.
                 raise RuntimeError(f"unknown controller input owner {owner!r}")
@@ -700,7 +727,7 @@ class ControlGraph:
 
     def _compile_flow_runner(self, selected):
         """Compile an acyclic fixed-wiring graph into one allocation-free Python call."""
-        environment = {"_values": self.values}
+        environment = {"_values": self.values, "_references": self.references}
         body = []
         index = 0
         for group, _keys, steps in self._flow_plan:
@@ -723,6 +750,8 @@ class ControlGraph:
                     value = f"_values[{key!r}]"
                 elif kind == _MEASURED:
                     value = f"meas.{key}"
+                elif kind == _REFERENCE:
+                    value = f"_references[{key!r}]"
                 else:
                     constant = f"_constant{suffix}_{len(environment)}"
                     environment[constant] = key
@@ -776,6 +805,7 @@ class ControlGraph:
             "_inputs": self._sample_inputs,
             "_outputs": self._sample_outputs,
             "_store": self._store,
+            "_references": self.references,
         }
         body = []
         for index, name in enumerate(self.order):
@@ -785,6 +815,8 @@ class ControlGraph:
                     value = f"_values[{key!r}]"
                 elif kind == _MEASURED:
                     value = f"meas.{key}"
+                elif kind == _REFERENCE:
+                    value = f"_references[{key!r}]"
                 else:
                     constant = f"_constant{index}_{len(environment)}"
                     environment[constant] = key
@@ -808,9 +840,14 @@ class ControlGraph:
         while self._pending:
             cfg = self._pending.pop(0)
             ctrl = cfg.ctrl
-            if ctrl.references != self.cfg.ctrl.references:
-                self.references = {f.name: getattr(ctrl.references, f.name)
-                                   for f in fields(ctrl.references)}
+            bindings = _reference_bindings(ctrl)
+            if (ctrl.references != self.cfg.ctrl.references
+                    or bindings != _reference_bindings(self.cfg.ctrl)):
+                self.reference_bindings = dict(bindings)
+                self.references = _reference_values(
+                    ctrl.references, attributes=bool(bindings and self._reference_validator),
+                )
+                self._reference_time = None
                 self._rewire()
                 if self.continuous:
                     self._prepare_flow()
@@ -859,7 +896,34 @@ class ControlGraph:
             return self.values[key]
         if kind == _MEASURED:
             return getattr(meas, key)
+        if kind == _REFERENCE:
+            return self.references[key]
         return key
+
+    def _update_references(self, t: float) -> None:
+        """Evaluate every time-varying reference once at this graph boundary."""
+        if self._reference_time == t:
+            return
+        for name, signal in self.reference_bindings.items():
+            try:
+                value = signal(t)
+            except (ArithmeticError, ValueError) as exc:
+                raise FloatingPointError(
+                    f"controller reference {name!r} failed at t = {t}: {exc}"
+                ) from None
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    f"controller reference {name!r} returned a non-finite value at t = {t}"
+                )
+            self.references[name] = value
+        if self._reference_validator is not None:
+            try:
+                self._reference_validator(self.references, "controller references")
+            except ConfigError as exc:
+                raise FloatingPointError(
+                    f"controller reference validation failed at t = {t}: {exc}"
+                ) from None
+        self._reference_time = t
 
     def _gather(self, wiring, meas):
         values = self.values  # _read, inlined: this runs at every loop update
@@ -869,6 +933,8 @@ class ControlGraph:
                 out[port] = values[key]
             elif kind == _MEASURED:
                 out[port] = getattr(meas, key)
+            elif kind == _REFERENCE:
+                out[port] = self.references[key]
             else:
                 out[port] = key
         return out
@@ -901,6 +967,8 @@ class ControlGraph:
     # ------------------------------------------------------------ running
     def track(self, meas):
         """Pre-synchronise every loop that supports ``track(inputs)``."""
+        if self.reference_bindings:
+            self._update_references(meas.t)
         done = set()
         for name in self.order:
             track = getattr(self.nodes[name], "track", None)
@@ -922,6 +990,8 @@ class ControlGraph:
         """
         if self._pending:
             self._apply_pending()
+        if self.reference_bindings:
+            self._update_references(t)
         if self._sample_runner is not None:
             self._sample_runner(t, meas)
             self.updated = updated = self._every_interrupt
@@ -943,6 +1013,8 @@ class ControlGraph:
                     inputs[port] = values[key]
                 elif kind == _MEASURED:
                     inputs[port] = getattr(meas, key)
+                elif kind == _REFERENCE:
+                    inputs[port] = self.references[key]
                 else:
                     inputs[port] = key
             outputs = self._sample_outputs[name]
@@ -963,6 +1035,8 @@ class ControlGraph:
         """
         if self._pending:
             self._apply_pending()
+        if self.reference_bindings:
+            self._update_references(t)
         named = derivatives is None
         if derivatives is None:
             derivatives = [0.0] * len(self.flow_state_names)
@@ -990,6 +1064,8 @@ class ControlGraph:
                             inputs[port] = values[key]
                         elif kind == _MEASURED:
                             inputs[port] = getattr(meas, key)
+                        elif kind == _REFERENCE:
+                            inputs[port] = self.references[key]
                         else:
                             inputs[port] = key
                     evaluate(t, inputs, outputs, flow)
@@ -2172,6 +2248,9 @@ for _control_name in ("gfl", "gfm", "custom"):
         grid_following=_control_name == "gfl",
         default_bridge="three_phase_bridge",
         controller_factory=VSCController,
+        default_loops={} if _control_name == "custom" else {
+            "modulation": "ThreePhaseModulation"
+        },
     )
 register_control_type(
     "dc",

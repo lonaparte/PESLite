@@ -57,8 +57,11 @@ outputs and event responses are insensitive to further reduction.
 Before a fixed explicit step, Python and generated C++ check each present circuit matrix against
 that method's stability region. The check uses the exact switch, diode and transformer-ratio mode;
 an unstable mode uses fixed Radau for that interval without changing the configured step grid.
-Repeated matrix structures are decomposed into strongly connected state blocks, and unchanged
-block spectra are reused without approximating the stability decision.
+RK4 first compares a conservative spectral-radius bound with a left half-disk of radius 2.6 inside
+its stability region. The bound uses a diagonal similarity that balances coupled states, and Python
+reuses one certificate over a declared transformer-ratio range. An unavailable or inconclusive
+certificate falls back to the current matrix and then its exact spectrum. Repeated exact matrices
+are decomposed into strongly connected state blocks, and unchanged block spectra are reused.
 
 ## Adaptive solvers
 

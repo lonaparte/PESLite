@@ -32,6 +32,7 @@ from ..components.network import ELEMENT_TYPES, element_buses
 from ..control.controller import continuous_control
 from ..control.loops import LOOP_TYPES, loop_key_type, loop_type
 from ..control.profiles import ReferenceParams, control_type
+from ..control.signals import ReferenceBinding, TableSignal
 from ..solver.integrators import CIRCUIT_MODELS, canonical_method
 from ..solver.model import ConfigError
 from ..solver.timing import control_computation, control_period
@@ -57,6 +58,9 @@ __all__ = [
 _PARAMETER_RECORDER: ContextVar[Any] = ContextVar("peslite_parameter_recorder", default=None)
 _ASSET_DIRECTORY: ContextVar[Optional[Path]] = ContextVar(
     "peslite_asset_directory", default=None,
+)
+_REFERENCE_SIGNAL_CONTEXT: ContextVar[tuple[dict[str, TableSignal], float] | None] = ContextVar(
+    "peslite_reference_signal_context", default=None,
 )
 
 
@@ -445,6 +449,9 @@ class ControlParams:
     outputs: dict = field(default_factory=dict)
     references: Any = None  # built from the schema selected by type
     options: Optional[Any] = None  # built from the optional schema selected by type
+    _reference_bindings: dict[str, ReferenceBinding] = field(
+        default_factory=dict, repr=False, metadata={"internal": True},
+    )
 
 
 @dataclass(frozen=True)
@@ -637,6 +644,12 @@ class UnitParams:
                 ctrl = replace(ctrl, references=references)
                 derived.add("ctrl.references.omega")
             loops = dict(ctrl.loops)
+            if loops and not continuous:
+                roles = {LOOP_TYPES[loop.type].role for loop in loops.values()}
+                for role, name in control_type(ctrl.type).default_loops.items():
+                    if role not in roles:
+                        loops[name] = loop_key_type(name).Params(period=ctrl.period)
+                        derived.add(f"ctrl.loops.{name}")
             for name, loop in loops.items():
                 if not continuous and loop.period is None:
                     loops[name] = replace(loop, period=ctrl.period)
@@ -968,8 +981,8 @@ class MetaParams:
 class Params:
     """Complete configuration: system base, network elements, units and run settings.
 
-    ``buses``, ``branches``, ``sources``, ``units`` and ``elements`` map names to entries.
-    Names are scoped by section and prefix state names.
+    ``buses``, ``branches``, ``sources``, ``units``, ``elements`` and ``signals`` map names to
+    entries. Names are scoped by section and prefix state names.
     """
 
     base: BaseValues  # system base, used for network pu inputs
@@ -983,6 +996,7 @@ class Params:
     elements: dict[str, Any] = field(default_factory=dict, metadata={"entries": "element"})
     events: dict[str, Any] = field(default_factory=dict,
                                    metadata={"entries": "event", "structural": True})
+    signals: dict[str, TableSignal] = field(default_factory=dict)
     meta: MetaParams = field(default_factory=MetaParams)
 
     def unit(self, name: Optional[str] = None) -> UnitParams:
@@ -1046,8 +1060,10 @@ class Params:
             if identity in assigned:
                 raise ConfigError(f"{path}: both actual and pu values specify the same parameter")
             assigned.add(identity)
-            if canonical != keys[-1]:
-                node.pop(canonical, None)
+            if obj is not None:
+                for existing in tuple(node):
+                    if quantity_name(type(obj), existing) == canonical:
+                        node.pop(existing)
             node[keys[-1]] = value
         return from_dict(d)
 
@@ -1058,7 +1074,22 @@ def from_dict(data: dict) -> Params:
     """Build, validate and resolve parameters and every event's explicit variable bindings."""
     from .validate import validate
 
-    p = _build(Params, _normalize(data), "", None, None)
+    normalized = _normalize(data)
+    if not isinstance(normalized, dict):
+        return _build(Params, normalized, "", None, None)
+    raw_signals = normalized.get("signals", {})
+    signals = _build_named(TableSignal, raw_signals, "signals", None, None, normalized)
+    simulation = normalized.get("simulation")
+    initial = simulation.get("initial", {}) if isinstance(simulation, dict) else {}
+    initial_t = initial.get("t", 0.0) if isinstance(initial, dict) else 0.0
+    if isinstance(initial_t, bool) or not isinstance(initial_t, (int, float)):
+        initial_t = 0.0  # the ordinary simulation parser reports the precise type error
+    prepared = {**normalized, "signals": signals}
+    token = _REFERENCE_SIGNAL_CONTEXT.set((signals, float(initial_t)))
+    try:
+        p = _build(Params, prepared, "", None, None)
+    finally:
+        _REFERENCE_SIGNAL_CONTEXT.reset(token)
     validate(p)
     p = replace(p, sources={name: source.resolved(p.base) for name, source in p.sources.items()},
                 units={name: _resolve_unit(unit, p.base)
@@ -1096,12 +1127,16 @@ def to_dict(p: Any, derived: bool = False) -> dict:
                if item.name in common or (item.name == "ctrl" and p.ctrl is not None)},
         }
     elif is_dataclass(p) and not isinstance(p, type):
-        d = {f.name: to_dict(getattr(p, f.name), derived) for f in fields(p) if f.init}
+        d = {f.name: to_dict(getattr(p, f.name), derived) for f in fields(p)
+             if f.init and not f.metadata.get("internal")}
         if isinstance(p, ControlParams):
             for name, loop in p.loops.items():
                 direct = loop_key_type(name)
                 if direct is not None and direct.type == loop.type:
                     d["loops"][name].pop("type", None)
+            for field_name, binding in p._reference_bindings.items():
+                d["references"].pop(field_name, None)
+                d["references"][binding.input_name] = f"signals.{binding.name}"
     elif isinstance(p, dict):
         return {k: to_dict(v, derived) for k, v in p.items()}
     else:
@@ -1195,20 +1230,60 @@ def _build_control_params(data: Any, path: str, base: BaseValues,
             f"{path}.type: unit type {unit_type!r} cannot use control type {kind!r}"
         )
     values = dict(data)
+    references = values.get("references", {})
+    if not isinstance(references, dict):
+        raise ConfigError(f"{path}.references: expected a mapping, got {type(references).__name__}")
+    references = dict(references)
+    bindings: dict[str, ReferenceBinding] = {}
+    context = _REFERENCE_SIGNAL_CONTEXT.get()
+    if context is not None:
+        signals, initial_t = context
+        aliases = quantity_metadata(spec.references, "_input_aliases")
+        quantities = quantity_metadata(spec.references, "_quantities")
+        for input_name, value in tuple(references.items()):
+            if not isinstance(value, str) or not value.startswith("signals."):
+                continue
+            signal_name = value[8:]
+            if not signal_name or "." in signal_name or signal_name not in signals:
+                raise ConfigError(
+                    f"{path}.references.{input_name}: unknown signal {value!r}; "
+                    f"known: {sorted(signals)}"
+                )
+            spelling = aliases.get(input_name, input_name)
+            target = quantity_name(spec.references, input_name)
+            factor = 1.0
+            if target in quantities and spelling.endswith("_pu") != target.endswith("_pu"):
+                conversion = _scale(quantities[target], scales)
+                factor = conversion if spelling.endswith("_pu") else 1.0 / conversion
+            signal = signals[signal_name]
+            try:
+                references[input_name] = signal(initial_t)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"{path}.references.{input_name}: signals.{signal_name}: {exc}"
+                ) from None
+            bindings[target] = ReferenceBinding(
+                signal_name, signal, input_name, factor,
+            )
     values["references"] = _build(
         spec.references,
-        values.get("references", {}),
+        references,
         f"{path}.references",
         base,
         scales,
     )
+    for target, binding in tuple(bindings.items()):
+        current = getattr(values["references"], target)
+        integer = isinstance(current, int) and not isinstance(current, bool)
+        bindings[target] = replace(binding, integer=integer)
     if spec.options is not None:
         values["options"] = _build(
             spec.options, values.get("options", {}), f"{path}.options", base, scales,
         )
     elif values.get("options") is not None:
         raise ConfigError(f"{path}.options: control type {kind!r} does not accept options")
-    return _build(ControlParams, values, path, base, scales)
+    return replace(_build(ControlParams, values, path, base, scales),
+                   _reference_bindings=bindings)
 
 
 def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
@@ -1298,8 +1373,12 @@ def _loop_entry(name: str, item: Any, path: str) -> Any:
     direct = loop_key_type(name, path)
     selected = values.get("type")
     if direct is None:
-        if selected is not None:
-            values["type"] = loop_type(selected, f"{path}.type").type
+        if selected is None:
+            raise ConfigError(
+                f"{path}: loop {name!r} is not registered; install or register its add-on, "
+                "or specify a registered type"
+            )
+        values["type"] = loop_type(selected, f"{path}.type").type
         return values
     if selected is not None and loop_type(selected, f"{path}.type") is not direct:
         raise ConfigError(
@@ -1369,7 +1448,9 @@ def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dic
         if not literal_keys and (not name or "." in name):
             raise ConfigError(f"{path}: {name!r} is not a usable name (non-empty, no '.')")
         where = f"{path}.{name}"
-        if item_cls == "unit":
+        if isinstance(item_cls, type) and is_dataclass(item_cls) and isinstance(item, item_cls):
+            out[name] = item
+        elif item_cls == "unit":
             out[name] = _build_unit_params(item, where, base)
         elif item_cls in _TYPED:
             if item_cls == "loop":
@@ -1427,7 +1508,10 @@ def _build_fields(cls, data: dict, path: str, base: Any, scales: Optional[dict],
                   *, names: Optional[frozenset[str]] = None) -> dict:
     """Parse selected dataclass fields through the same rules as an ordinary section."""
     hints = _type_hints(cls)
-    selected = tuple(f for f in fields(cls) if f.init and (names is None or f.name in names))
+    selected = tuple(
+        f for f in fields(cls)
+        if f.init and not f.metadata.get("internal") and (names is None or f.name in names)
+    )
     known = {f.name for f in selected}
     unknown = set(data) - known
     if unknown:
@@ -1792,7 +1876,8 @@ def read_tree(path: str | Path) -> dict:
     return data
 
 
-_FILE_ORDER = ("base", "buses", "branches", "sources", "units", "elements", "events", "simulation", "meta")
+_FILE_ORDER = ("base", "buses", "branches", "sources", "units", "elements", "signals",
+               "events", "simulation", "meta")
 
 
 def _written_out(p: Params) -> dict:

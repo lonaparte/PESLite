@@ -3,7 +3,7 @@
 PESLite provides continuous-control-set MPC (CCS-MPC) and finite-control-set MPC (FCS-MPC)
 as ordinary sampled control loops. They use the same typed connections, ADC, actuation,
 protection, start-up and saved-state mechanisms as other loops. The converter adapters support
-`switching`, `pwm_averaging` and `averaging`; C++ and Imperix export are unsupported.
+`switching`, `pwm_averaging` and `averaging`.
 
 ## Run the examples
 
@@ -14,6 +14,7 @@ peslite mpc-buck-example --switching
 peslite mpc-vsc-example --pwm-averaging
 peslite mpc-vsc-example --averaging
 peslite mpc-vsc-example --switching
+peslite mpc-vsc-matrices-example --pwm-averaging
 ```
 
 `mpc-buck-example` regulates the inductor current of a synchronous Buck using CCS-MPC. It
@@ -24,6 +25,9 @@ this example does not add an outer voltage regulator.
 controller chooses one of the eight binary three-leg commands, including both zero vectors.
 Each chosen command follows the bridge model's ordinary actuation timing. Binary duties produce
 held bridge states, so the ideal FCS command has the same bridge voltage in every model.
+
+`mpc-vsc-matrices-example` uses CCS-MPC with full, unequal Q, R and S matrices, current and duty
+constraints, a reference event and the same converter timing path.
 
 ## Configuration and units
 
@@ -128,7 +132,8 @@ tracking_weight:
 For `PredictiveCurrentControl`, Q, R and S are all 1-by-1. For
 `ThreePhasePredictiveCurrentControl`, Q is 2-by-2 for the alpha-beta current error, while R and S
 are 3-by-3 for the three bridge-leg commands. PESLite validates the dimensions and matrix
-properties when the loop is constructed.
+properties when the loop is constructed. The bundled `mpc-vsc-matrices-example` shows complete
+Q, R and S matrices in a runnable controller.
 
 Start with `tracking_weight: 1.0`, `input_weight: 0.0` and `rate_weight: 0.01`. Increase Q to
 prioritize current tracking, R to penalize command magnitude, or S to penalize command changes.
@@ -169,7 +174,8 @@ each coordinate.
 
 CCS-MPC solves the constrained quadratic objective with SciPy SLSQP. SciPy is already a core
 dependency; no additional optimizer package is required. Solver success alone is insufficient:
-the returned action must also be finite and satisfy the configured feasibility tolerance.
+the returned action must be finite, feasible and satisfy a KKT optimality check. Failed solves
+use a separate linear-feasibility check instead of interpreting backend-specific status codes.
 The SLSQP adapter divides the quadratic and linear objective coefficients by one common
 positive scale and omits the constant during optimization. This leaves the minimizer and
 constraints unchanged and avoids false convergence at large physical-current scales.
@@ -184,11 +190,22 @@ input vectors and independent callbacks: `prediction(x, u, k)` returns the next 
 Callbacks receive copies and must not capture or modify the running plant. This supports
 custom finite-set models and objectives without changing the simulator.
 
+Set `vectorized=True` when each callback accepts a leading candidate dimension and returns one
+result per candidate. Scalar and vectorized callbacks use the same validation, ordering and work
+limit; the built-in predictive loops use the vectorized form.
+
 FCS-MPC enumerates admissible action sequences in deterministic order. Its computational cost
 grows exponentially with the control horizon and action count. Keep converter horizons short;
-the explicit evaluation limit counts attempted complete plans, including ones rejected by an
-infeasible prefix. Exhausting the budget returns a failure rather than applying a partial-search
-incumbent. Equal-cost choices follow the configured action ordering, making ties reproducible.
+the explicit evaluation limit must cover the exhaustive plan count. An insufficient budget returns
+a failure before evaluating callbacks rather than applying a partial-search incumbent. Numerically
+tied plans prefer the first command closest to the previously applied command; remaining ties
+follow the configured action ordering.
+
+For native export, CCS-MPC uses a fixed-size active-set quadratic-program solver and FCS-MPC uses
+the same exhaustive ordering as Python. Both are generated from the resolved loop dimensions,
+use no heap allocation or third-party C++ library, and share one implementation between standalone
+C++ and Imperix. Custom MPC subclasses and custom Python optimization backends are not exported
+and are rejected instead of being approximated.
 
 Both algorithms return `MPCResult(success, action, inputs, states, objective, status, ...)`.
 Successful `inputs` cover the full prediction horizon and `states` include the initial state
@@ -247,7 +264,8 @@ dynamics; the scalar Buck predictor applies its diode-imposed zero-current bound
 trajectory reaches it. The previous duty is an augmented prediction state. If the delay equals one
 full control period, a new decision first affects the second predicted sample; use a horizon greater
 than one. This is compensation for the configured register delay, not a general delay estimator or
-prediction of individual carrier pulses.
+prediction of individual carrier pulses. Account for this delay when choosing horizons: a shorter
+control horizon holds its final decision over the remaining predicted samples.
 
 ADC timing is independent of this execution-delay model. A held ADC conversion may precede
 the control interrupt, and a window-averaged current is not an instantaneous state. The
@@ -261,8 +279,8 @@ action set. An ideal averaged bridge has no physical dead time.
 
 ## Failure handling, diagnostics and continuation
 
-The numerical status is `optimal`, `infeasible`, `solver_failure`, `iteration_limit`,
-`evaluation_limit`, `numerical_failure` or `invalid_solution`. A custom backend may supply a
+The numerical status is `optimal`, `infeasible`, `inaccurate`, `solver_failure`,
+`iteration_limit`, `evaluation_limit`, `numerical_failure` or `invalid_solution`. A custom backend may supply a
 more specific failure status. Iteration/evaluation limits are deterministic work limits;
 there is no wall-clock deadline.
 
@@ -284,8 +302,9 @@ A fallback supplies an admissible actuator command or blocks actuation. It canno
 state/output feasibility when the prediction problem itself is infeasible. Unit protection
 continues to override optimized and fallback commands through its normal trip mechanism.
 
-The predictive loop's `success`, `objective`, `iterations`, `evaluations`, `seconds`, `solves`,
-`fallbacks` and `delay` diagnostics are recorded under its configured loop name.
+The predictive loop's `success`, `objective`, `iterations`, `evaluations`, `solves`, `fallbacks`
+and `delay` diagnostics are recorded under its configured loop name. Cumulative optimizer time is
+reported as `solve_seconds` in the simulation summary.
 The controller summary includes the last textual solve status. Computation cost is an observation;
 wall-clock timing is not a reproducible electrical state. Previous decisions and necessary
 startup/controller state use the normal named-state mechanism, so continuation restores them

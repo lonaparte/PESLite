@@ -132,8 +132,11 @@ class _DirectThreePhaseDuty(Loop):
 def test_terminal_actuator_loop_replaces_current_control_and_modulation(gfl):
     params = gfl()
     loops = dict(params.unit("vsc").ctrl.loops)
-    loops.pop("CurrentLoop")
     loops.pop("ThreePhaseModulation")
+    implicit = params.replace(**{"units.vsc.ctrl.loops": loops}).unit("vsc")
+    assert implicit.ctrl.loops["ThreePhaseModulation"].period == implicit.ctrl.period
+    assert "ctrl.loops.ThreePhaseModulation" in implicit.derived_defaults
+    loops.pop("CurrentLoop")
     loops["_DirectThreePhaseDuty"] = _DirectThreePhaseDuty.Params(
         period=params.unit("vsc").ctrl.period,
     )
@@ -250,6 +253,31 @@ def test_output_stage_reuses_an_inherited_standard_limiter(gfl):
 
     assert inherited.command_limit(1.0) is not None
     assert modified.command_limit(1.0) is None
+
+
+def test_terminal_loop_retune_preserves_the_configured_output_stage(gfl):
+    def pwm_method(_voltage, _dc_voltage):
+        return (0.1, 0.2, 0.3)
+
+    def limiter(values):
+        return values
+
+    params = gfl()
+    cfg = params.unit("vsc")
+    controller = peslite.VSCController(cfg, pwm_method=pwm_method, limiter=limiter)
+    stage = controller.stage
+    stage.n_updates, stage.n_saturated = 7, 2
+    terminal = controller._terminal
+    period = cfg.ctrl.loops[terminal].period
+    moved = params.replace(**{f"units.vsc.ctrl.loops.{terminal}.period": 2.0 * period})
+
+    controller.retune(moved.unit("vsc"), [f"ctrl.loops.{terminal}.period"], 0.0)
+    controller.initialize()
+
+    assert controller.stage is stage
+    assert controller.graph.nodes[terminal].stage is stage
+    assert (stage.pwm_method, stage.limiter) == (pwm_method, limiter)
+    assert (stage.n_updates, stage.n_saturated) == (7, 2)
 
 
 def test_repeated_loop_class_uses_qualified_names_without_type_fields():

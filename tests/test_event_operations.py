@@ -11,6 +11,7 @@ from peslite.assembly.params import ConfigError, from_dict, read_tree, to_dict
 from peslite.components import RLBranch, register_component_type
 from peslite.components.network import Element, _register_assembled_type
 from peslite.control import Measurement
+from peslite.solver import netlist as nl
 
 
 def _tree():
@@ -316,6 +317,33 @@ def test_parameter_events_rebuild_only_changed_network_declarations(monkeypatch)
     system.apply(changes["impedance"])
     assert calls == [circuit]
     assert system.model.energy_specs is not specs
+
+
+def test_numeric_network_event_recompiles_device_equations():
+    tree = _tree()
+    tree["units"]["vsc"]["bridge"] = {"model": "pwm_averaging"}
+    tree["events"] = {"impedance": {"type": "set", "t": 4e-4, "set": {
+        "sources.grid.x_pu": 0.8,
+    }}}
+    p = from_dict(tree)
+    system = peslite.System(p)
+    circuit, = system.circuits
+    old_netlist = circuit.netlist
+    old_equations = old_netlist._dynamic_scalar_function(old_netlist.topology())
+    system.apply(p.changes[0])
+
+    new_netlist = circuit.netlist
+    new_equations = new_netlist._dynamic_scalar_function(new_netlist.topology())
+    assert new_netlist is not old_netlist
+    assert new_equations is not old_equations
+    assert system.sources["grid"].branch.L == p.changes[0].params.sources["grid"].l
+    rebuilt = peslite.System(p.changes[0].params)
+    y = system.model.get_initial_values()
+    np.testing.assert_allclose(
+        system.model.rhs(p.changes[0].t, y),
+        rebuilt.model.rhs(p.changes[0].t, y),
+        rtol=1e-12, atol=1e-12,
+    )
 
 
 def test_continuous_controller_retune_rebinds_its_ode_states(tmp_path):

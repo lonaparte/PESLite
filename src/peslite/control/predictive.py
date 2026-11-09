@@ -11,6 +11,7 @@ import cmath
 import itertools
 import math
 from dataclasses import dataclass, field, replace
+from numbers import Integral, Real
 from time import perf_counter
 from typing import Any, ClassVar, Mapping, Optional
 
@@ -24,6 +25,43 @@ from .loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, I, I_AB, SI_CURRENT,
 from .mpc import CCSMPC, FCSMPC, LinearModel, MPCResult, _QuadraticStageCost
 
 
+def _numerical_configuration(value):
+    """Read the default number from a generated-parameter expression for numerical setup."""
+    if isinstance(value, np.ndarray):
+        items = [_numerical_configuration(item) for item in value.flat]
+        return np.asarray(items).reshape(value.shape)
+    if isinstance(value, (list, tuple)):
+        return type(value)(_numerical_configuration(item) for item in value)
+    return getattr(value, "_peslite_numeric_value", value)
+
+
+def _positive_configuration(value, name, *, integer=False):
+    """Validate one numerical parameter while retaining a generated range condition."""
+    kind = "a positive integer" if integer else "finite and positive"
+    generated = hasattr(value, "_peslite_numeric_value")
+    numerical = _numerical_configuration(value)
+    if (integer and not generated
+            and (isinstance(numerical, bool) or not isinstance(numerical, Integral))):
+        raise ConfigError(f"{name} must be {kind}")
+    if not isinstance(numerical, Real) or not math.isfinite(numerical) or numerical <= 0:
+        raise ConfigError(f"{name} must be {kind}")
+    if generated and (not np.isfinite(value) or not value > 0):
+        raise ConfigError(f"{name} must be {kind}")
+
+
+def _scalar_weight_configuration(value, name):
+    """Validate tunable scalar weights; vector and matrix forms remain numerical constants."""
+    numerical = _numerical_configuration(value)
+    if np.ndim(numerical) != 0:
+        return
+    if (not isinstance(numerical, Real) or not math.isfinite(numerical)
+            or numerical < 0):
+        raise ConfigError(f"{name} must be finite and nonnegative")
+    if (hasattr(value, "_peslite_numeric_value")
+            and (not np.isfinite(value) or not value >= 0)):
+        raise ConfigError(f"{name} must be finite and nonnegative")
+
+
 class _RLCurrentPrediction:
     """Exact discrete affine prediction for one RL current path per coordinate."""
 
@@ -33,7 +71,10 @@ class _RLCurrentPrediction:
         self.voltage_map = np.asarray(voltage_map, dtype=float)
         self.voltage_map.setflags(write=False)
         self.n_current, self.n_input = self.voltage_map.shape
-        self.decay = math.exp(-self.R * self.period / self.L)
+        numerical = _numerical_configuration
+        self.decay = math.exp(
+            -numerical(self.R) * numerical(self.period) / numerical(self.L)
+        )
         self.blocked_min = (None if blocked_min is None else
                             np.broadcast_to(blocked_min, (self.n_current,)).copy())
         if self.blocked_min is not None:
@@ -99,13 +140,39 @@ class _PredictiveCurrentParams:
         if not (math.isfinite(self.input_min) and math.isfinite(self.input_max)
                 and 0.0 <= self.input_min < self.input_max <= 1.0):
             raise ConfigError("input bounds must satisfy 0 <= input_min < input_max <= 1")
-        if (self.current_min is not None and not math.isfinite(self.current_min)):
-            raise ConfigError("current_min must be finite")
-        if (self.current_max is not None and not math.isfinite(self.current_max)):
-            raise ConfigError("current_max must be finite")
+        for name in ("current_min", "current_max"):
+            value = getattr(self, name)
+            if (value is not None
+                    and (not math.isfinite(value)
+                         or hasattr(value, "_peslite_numeric_value")
+                         and not np.isfinite(value))):
+                raise ConfigError(f"{name} must be finite")
         if (self.current_min is not None and self.current_max is not None
                 and self.current_min > self.current_max):
             raise ConfigError("current_min must not exceed current_max")
+        _positive_configuration(self.prediction_horizon, "prediction_horizon", integer=True)
+        if self.control_horizon is not None:
+            _positive_configuration(self.control_horizon, "control_horizon", integer=True)
+            if self.control_horizon > self.prediction_horizon:
+                raise ConfigError("control_horizon must not exceed prediction_horizon")
+        _positive_configuration(self.max_iterations, "max_iterations", integer=True)
+        _positive_configuration(self.max_evaluations, "max_evaluations", integer=True)
+        _positive_configuration(self.tolerance, "tolerance")
+        _positive_configuration(self.feasibility_tolerance, "feasibility_tolerance")
+        for name in ("tracking_weight", "input_weight", "rate_weight"):
+            _scalar_weight_configuration(getattr(self, name), name)
+        if (self.algorithm == "fcs"
+                and self.input_min * (1.0 - self.input_max) != 0.0):
+            raise ConfigError("input bounds exclude every finite control action")
+        if self.fallback_input is not None:
+            for value in self.fallback_input:
+                if (not isinstance(value, Real) or not math.isfinite(value)
+                        or not 0.0 <= value <= 1.0
+                        or not self.input_min <= value <= self.input_max
+                        or self.algorithm == "fcs" and value not in (0.0, 1.0)):
+                    raise ConfigError(
+                        "fallback_input must contain finite admissible commands"
+                    )
 
 
 class _PredictiveCurrentControl(Loop):
@@ -115,9 +182,9 @@ class _PredictiveCurrentControl(Loop):
     n_input: ClassVar[int]
     outputs_from_state = True
     cpp_export = False
-    carried = ("last_result",)
-    observations = ("success", "objective", "iterations", "evaluations", "seconds",
-                    "solves", "fallbacks", "delay")
+    carried = ("last_result", "solve_seconds")
+    observations = ("success", "objective", "iterations", "evaluations", "solves",
+                    "fallbacks", "delay")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -148,19 +215,21 @@ class _PredictiveCurrentControl(Loop):
         self.delay = min(self.T, max(0.0, delay))
         self.plant = self._configure_plant(unit)
         if cfg.algorithm == "fcs":
+            input_min = _numerical_configuration(cfg.input_min)
+            input_max = _numerical_configuration(cfg.input_max)
             actions = np.array(list(itertools.product((0.0, 1.0), repeat=self.n_input)))
-            self.actions = actions[np.all(
-                (actions >= cfg.input_min) & (actions <= cfg.input_max), axis=1,
-            )]
+            self.actions = np.array([
+                action for action in actions
+                if all(input_min <= float(value) <= input_max for value in action)
+            ])
             if len(self.actions) == 0:
                 raise ConfigError("input bounds exclude every finite control action")
             default = self.actions[0]
         else:
             default = [cfg.input_min] * self.n_input
-        self.fixed_input = np.asarray(
-            default if cfg.fallback_input is None else cfg.fallback_input, dtype=float,
-        ).copy()
-        if not self._admissible(self.fixed_input):
+        fixed = default if cfg.fallback_input is None else cfg.fallback_input
+        self.fixed_input = np.asarray(_numerical_configuration(fixed), dtype=float).copy()
+        if self.fixed_input.shape != (self.n_input,):
             raise ConfigError(
                 "fallback_input must contain one finite admissible command per controlled leg"
             )
@@ -168,34 +237,57 @@ class _PredictiveCurrentControl(Loop):
         self.previous_enabled = False
         self.solve_count = 0
         self.fallback_count = 0
+        self.solve_seconds = 0.0
         self.last_result: MPCResult | None = None
-        self._last_diagnostics = self._diagnostics(None, False, 0.0)
+        self._last_diagnostics = self._diagnostics(None, False)
         if cfg.algorithm == "ccs":
-            template = self.plant.model(
-                unit.dclink.vdc_ref, np.zeros(self.n_current),
+            numerical_plant = _RLCurrentPrediction(
+                _numerical_configuration(self.plant.L),
+                _numerical_configuration(self.plant.R),
+                _numerical_configuration(self.plant.period),
+                _numerical_configuration(self.plant.delay),
+                self.plant.voltage_map,
+                blocked_min=self.plant.blocked_min,
+            )
+            template = numerical_plant.model(
+                _numerical_configuration(unit.dclink.vdc_ref), np.zeros(self.n_current),
                 np.zeros(self.n_current), np.zeros(self.n_current),
                 previous_applied=True,
             )
             self.optimizer = CCSMPC(
-                template, cfg.prediction_horizon, cfg.control_horizon,
-                tracking_weight=cfg.tracking_weight, input_weight=cfg.input_weight,
-                rate_weight=cfg.rate_weight, input_bounds=(cfg.input_min, cfg.input_max),
+                template, _numerical_configuration(cfg.prediction_horizon),
+                (_numerical_configuration(cfg.control_horizon)
+                 if cfg.control_horizon is not None else None),
+                tracking_weight=_numerical_configuration(cfg.tracking_weight),
+                input_weight=_numerical_configuration(cfg.input_weight),
+                rate_weight=_numerical_configuration(cfg.rate_weight),
+                input_bounds=(_numerical_configuration(cfg.input_min),
+                              _numerical_configuration(cfg.input_max)),
                 output_bounds=(
-                    -np.inf if cfg.current_min is None else cfg.current_min,
-                    np.inf if cfg.current_max is None else cfg.current_max,
-                ), max_iterations=cfg.max_iterations, tolerance=cfg.tolerance,
-                feasibility_tolerance=cfg.feasibility_tolerance,
+                    -np.inf if cfg.current_min is None
+                    else _numerical_configuration(cfg.current_min),
+                    np.inf if cfg.current_max is None
+                    else _numerical_configuration(cfg.current_max),
+                ), max_iterations=_numerical_configuration(cfg.max_iterations),
+                tolerance=_numerical_configuration(cfg.tolerance),
+                feasibility_tolerance=_numerical_configuration(cfg.feasibility_tolerance),
             )
         else:
             self._cost = _QuadraticStageCost(
                 self.n_current, self.n_input,
-                cfg.tracking_weight, cfg.input_weight, cfg.rate_weight,
+                _numerical_configuration(cfg.tracking_weight),
+                _numerical_configuration(cfg.input_weight),
+                _numerical_configuration(cfg.rate_weight),
             )
             self.optimizer = FCSMPC(
-                self.actions, cfg.prediction_horizon, self._predict, self._stage_cost,
-                control_horizon=cfg.control_horizon, constraint=self._constraint,
-                max_evaluations=cfg.max_evaluations,
-                feasibility_tolerance=cfg.feasibility_tolerance,
+                self.actions, _numerical_configuration(cfg.prediction_horizon),
+                self._predict, self._stage_cost,
+                control_horizon=(_numerical_configuration(cfg.control_horizon)
+                                 if cfg.control_horizon is not None else None),
+                constraint=self._constraint,
+                max_evaluations=_numerical_configuration(cfg.max_evaluations),
+                feasibility_tolerance=_numerical_configuration(cfg.feasibility_tolerance),
+                vectorized=True,
             )
 
     def _configure_plant(self, unit) -> _RLCurrentPrediction:
@@ -239,19 +331,19 @@ class _PredictiveCurrentControl(Loop):
 
     def _predict(self, state, action, k):
         model = self._models[k]
-        return model.A @ state + model.B @ action + model.offset
+        return state @ model.A.T + action @ model.B.T + model.offset
 
     def _stage_cost(self, state, action, reference, previous, k):
-        return self._cost.evaluate(state[:self.n_current], action, reference, previous)
+        return self._cost.evaluate(state[..., :self.n_current], action, reference, previous)
 
     def _constraint(self, state, action, k):
-        current = state[:self.n_current]
+        current = state[..., :self.n_current]
         residuals = []
         if self.cfg.current_min is not None:
-            residuals.extend(current - self.cfg.current_min)
+            residuals.append(current - self.cfg.current_min)
         if self.cfg.current_max is not None:
-            residuals.extend(self.cfg.current_max - current)
-        return np.asarray(residuals)
+            residuals.append(self.cfg.current_max - current)
+        return np.concatenate(residuals, axis=-1) if residuals else np.empty((*state.shape[:-1], 0))
 
     def solve(self, t: float, inputs: Mapping[str, Any]) -> MPCResult:
         """Optimize once; a custom registered loop may override this method."""
@@ -266,7 +358,9 @@ class _PredictiveCurrentControl(Loop):
         if not self._valid_history(action):
             return False
         action = np.asarray(action)
-        if np.any(action < self.cfg.input_min) or np.any(action > self.cfg.input_max):
+        input_min = _numerical_configuration(self.cfg.input_min)
+        input_max = _numerical_configuration(self.cfg.input_max)
+        if any(not input_min <= float(value) <= input_max for value in action):
             return False
         return (self.cfg.algorithm != "fcs"
                 or bool(np.any(np.all(self.actions == action, axis=1))))
@@ -280,14 +374,13 @@ class _PredictiveCurrentControl(Loop):
             return False
         return self.cfg.algorithm != "fcs" or bool(np.all((action == 0.0) | (action == 1.0)))
 
-    def _diagnostics(self, result, valid, elapsed):
+    def _diagnostics(self, result, valid):
         return {
             "success": float(valid),
             "objective": (float(result.objective)
                           if result is not None and result.objective is not None else 0.0),
             "iterations": float(result.iterations) if result is not None else 0.0,
             "evaluations": float(result.evaluations) if result is not None else 0.0,
-            "seconds": elapsed,
             "solves": float(self.solve_count),
             "fallbacks": float(self.fallback_count),
             "delay": self.delay,
@@ -299,13 +392,13 @@ class _PredictiveCurrentControl(Loop):
         return outputs
 
     def sample_into(self, t, inputs, outputs):
-        elapsed = 0.0
         result = None
         enable = self.startup.active
         if enable:
             start = perf_counter()
             result = self.solve(t, inputs)
             elapsed = perf_counter() - start
+            self.solve_seconds += elapsed
             self.solve_count += 1
             valid = result.success and result.action is not None and self._admissible(result.action)
             if result.success and not valid:
@@ -326,7 +419,7 @@ class _PredictiveCurrentControl(Loop):
         self.previous_input = action
         self.previous_enabled = enable
         self.last_result = result
-        self._last_diagnostics = self._diagnostics(result, valid, elapsed)
+        self._last_diagnostics = self._diagnostics(result, valid)
         self._write_action(outputs, action)
         outputs["enable"] = float(enable)
 
@@ -393,6 +486,7 @@ class _PredictiveCurrentControl(Loop):
             "algorithm": self.cfg.algorithm,
             "solves": self.solve_count,
             "fallbacks": self.fallback_count,
+            "solve_seconds": self.solve_seconds,
             "delay": self.delay,
             "status": None if self.last_result is None else self.last_result.status,
         }

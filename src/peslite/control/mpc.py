@@ -11,7 +11,7 @@ they are deterministic and do not impose a wall-clock deadline.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
+from itertools import islice, product
 from numbers import Integral
 from typing import Callable
 
@@ -105,11 +105,15 @@ class _QuadraticStageCost:
         self.R = _weight(input_weight, input_width, "input_weight")
         self.S = _weight(rate_weight, input_width, "rate_weight")
 
-    def evaluate(self, output, action, reference, previous) -> float:
+    def evaluate(self, output, action, reference, previous):
         error = output - reference
         delta = action - previous
-        return float(error @ self.Q @ error + action @ self.R @ action
-                     + delta @ self.S @ delta)
+        value = (
+            np.einsum("...i,ij,...j->...", error, self.Q, error)
+            + np.einsum("...i,ij,...j->...", action, self.R, action)
+            + np.einsum("...i,ij,...j->...", delta, self.S, delta)
+        )
+        return float(value) if np.ndim(value) == 0 else value
 
 
 @dataclass(frozen=True, init=False)
@@ -233,11 +237,64 @@ def solve_slsqp(problem: QuadraticProblem) -> SolverResult:
         method="SLSQP", bounds=Bounds(problem.lower, problem.upper), constraints=constraints,
         options={"maxiter": problem.max_iterations, "ftol": problem.tolerance},
     )
-    status = "optimal" if result.success else {
-        4: "infeasible", 9: "iteration_limit",
-    }.get(result.get("status"), "solver_failure")
+    iterations = int(result.get("nit", 0))
+    status = ("optimal" if result.success else
+              "iteration_limit" if iterations >= problem.max_iterations else "solver_failure")
     return SolverResult(result.x, bool(result.success), status,
-                        int(result.get("nit", 0)), int(result.get("nfev", 0)), str(result.message))
+                        iterations, int(result.get("nfev", 0)), str(result.message))
+
+
+def _linear_feasibility(lower, upper, matrix, constraint_lower, constraint_upper):
+    """Return whether a bounded linear region is feasible, or ``None`` if undetermined."""
+    from scipy.optimize import linprog
+
+    rows, limits = [], []
+    for row, low, high in zip(matrix, constraint_lower, constraint_upper):
+        if np.isfinite(high):
+            rows.append(row)
+            limits.append(high)
+        if np.isfinite(low):
+            rows.append(-row)
+            limits.append(-low)
+    if not rows:
+        return True
+    bounds = [
+        (None if np.isneginf(low) else low, None if np.isposinf(high) else high)
+        for low, high in zip(lower, upper)
+    ]
+    result = linprog(np.zeros(len(lower)), A_ub=np.asarray(rows), b_ub=np.asarray(limits),
+                     bounds=bounds, method="highs")
+    if result.success:
+        return True
+    return False if result.status == 2 else None
+
+
+def _optimality_residual(hessian, linear, lower, upper, matrix,
+                         constraint_lower, constraint_upper, solution, active_tolerance):
+    """Return a scale-independent KKT stationarity residual for one feasible QP point."""
+    coefficient_scale = max(1.0, float(np.max(np.abs(hessian))),
+                            float(np.max(np.abs(linear))))
+    gradient = (hessian @ solution + linear) / coefficient_scale
+    normals = []
+    identity = np.eye(len(solution))
+    for index, value in enumerate(solution):
+        if np.isfinite(lower[index]) and value - lower[index] <= active_tolerance:
+            normals.append(-identity[index])
+        if np.isfinite(upper[index]) and upper[index] - value <= active_tolerance:
+            normals.append(identity[index])
+    values = matrix @ solution
+    for row, value, low, high in zip(matrix, values, constraint_lower, constraint_upper):
+        if np.isfinite(low) and value - low <= active_tolerance:
+            normals.append(-row)
+        if np.isfinite(high) and high - value <= active_tolerance:
+            normals.append(row)
+    if not normals:
+        return float(np.linalg.norm(gradient, ord=np.inf))
+    from scipy.optimize import nnls
+
+    multipliers, _residual = nnls(np.asarray(normals).T / coefficient_scale, -gradient)
+    stationarity = gradient + np.asarray(normals).T @ multipliers / coefficient_scale
+    return float(np.linalg.norm(stationarity, ord=np.inf))
 
 
 class CCSMPC:
@@ -356,7 +413,12 @@ class CCSMPC:
         if not isinstance(result, SolverResult):
             raise TypeError("MPC backend must return SolverResult")
         if not result.success:
-            return MPCResult(False, None, None, None, None, result.status,
+            feasibility = _linear_feasibility(
+                lower_flat, upper_flat, constraint_matrix,
+                constraint_lower, constraint_upper,
+            )
+            status = "infeasible" if feasibility is False else result.status
+            return MPCResult(False, None, None, None, None, status,
                              result.iterations, result.evaluations, result.message)
         z = np.asarray(result.solution)
         valid = (z.dtype.kind in "fiu" and z.shape == (size,) and np.all(np.isfinite(z)))
@@ -370,6 +432,21 @@ class CCSMPC:
             return MPCResult(False, None, None, None, None, "invalid_solution",
                              result.iterations, result.evaluations,
                              "Backend solution is non-finite, has the wrong shape or violates constraints")
+        residual = _optimality_residual(
+            hessian, linear, lower_flat, upper_flat, constraint_matrix,
+            constraint_lower, constraint_upper, z, self.feasibility_tolerance,
+        )
+        stationarity_tolerance = max(
+            10.0 * np.sqrt(self.tolerance),
+            10.0 * self.feasibility_tolerance,
+            100.0 * np.finfo(float).eps,
+        )
+        if residual > stationarity_tolerance:
+            return MPCResult(
+                False, None, None, None, None, "inaccurate",
+                result.iterations, result.evaluations,
+                f"Backend solution failed the optimality check (residual {residual:.3g})",
+            )
         plan = z.reshape(moves, self.nu)
         inputs = np.asarray([plan[min(k, moves - 1)] for k in range(horizon)])
         states = [x0]
@@ -384,26 +461,60 @@ class CCSMPC:
                          "optimal", result.iterations, result.evaluations, result.message)
 
 
+class _FCSCallbacks:
+    """Present scalar or vectorized user callbacks through one batched contract."""
+
+    def __init__(self, prediction, objective, constraint, vectorized):
+        self.prediction, self.objective, self.constraint = prediction, objective, constraint
+        self.vectorized = bool(vectorized)
+
+    def predict(self, states, actions, stage):
+        if self.vectorized:
+            return self.prediction(states.copy(), actions.copy(), stage)
+        return [self.prediction(x.copy(), u.copy(), stage) for x, u in zip(states, actions)]
+
+    def cost(self, states, actions, references, previous, stage):
+        if self.vectorized:
+            return self.objective(
+                states.copy(), actions.copy(), references.copy(), previous.copy(), stage,
+            )
+        return [
+            self.objective(x.copy(), u.copy(), r.copy(), last.copy(), stage)
+            for x, u, r, last in zip(states, actions, references, previous)
+        ]
+
+    def residuals(self, states, actions, stage):
+        if self.constraint is None:
+            return None
+        if self.vectorized:
+            return self.constraint(states.copy(), actions.copy(), stage)
+        return [self.constraint(x.copy(), u.copy(), stage) for x, u in zip(states, actions)]
+
+
 class FCSMPC:
-    """Exhaustive finite-control-set MPC with deterministic configured-order ties.
+    """Exhaustive finite-control-set MPC with deterministic minimum-switching ties.
 
     ``prediction(x, u, k)`` returns the next state. ``objective(x_next, u,
     reference[k], u_previous, k)`` returns a scalar stage cost. An optional
     ``constraint(x_next, u, k)`` returns residuals that must be nonnegative
-    within ``feasibility_tolerance``. Callbacks receive copies, so they cannot
-    mutate the input state, action set, reference, or another candidate plan.
-    Callbacks must be deterministic and must not capture mutable plant state.
+    within ``feasibility_tolerance``. With ``vectorized=True``, every array has a
+    leading candidate dimension and callbacks return one result per candidate.
+    Scalar callbacks are adapted to that same contract, so validation and search
+    have one implementation. Callbacks receive copies, must be deterministic and
+    must not capture mutable plant state.
     """
 
     def __init__(self, actions, prediction_horizon, prediction, objective, *,
                  control_horizon=None, constraint=None, max_evaluations=100_000,
-                 feasibility_tolerance=1e-7):
+                 feasibility_tolerance=1e-7, vectorized=False):
         self.actions = _array(actions, "actions")
         if self.actions.ndim == 1:
             self.actions = self.actions[:, None]
         if self.actions.ndim != 2 or not all(self.actions.shape):
             raise ValueError("actions must be a nonempty matrix of candidate input vectors")
         self.actions.setflags(write=False)
+        action_scale = np.ptp(self.actions, axis=0)
+        self._action_scale = np.where(action_scale > 0.0, action_scale, 1.0)
         self.prediction_horizon = _positive_integer(prediction_horizon, "prediction_horizon")
         self.control_horizon = (self.prediction_horizon if control_horizon is None
                                 else _positive_integer(control_horizon, "control_horizon"))
@@ -411,7 +522,10 @@ class FCSMPC:
             raise ValueError("control_horizon must not exceed prediction_horizon")
         if not callable(prediction) or not callable(objective) or (constraint is not None and not callable(constraint)):
             raise TypeError("prediction, objective and optional constraint must be callable")
+        if not isinstance(vectorized, (bool, np.bool_)):
+            raise TypeError("vectorized must be boolean")
         self.prediction, self.objective, self.constraint = prediction, objective, constraint
+        self._callbacks = _FCSCallbacks(prediction, objective, constraint, vectorized)
         self.max_evaluations = _positive_integer(max_evaluations, "max_evaluations")
         self.feasibility_tolerance = _positive(feasibility_tolerance, "feasibility_tolerance")
 
@@ -429,44 +543,93 @@ class FCSMPC:
             raise ValueError("reference must have at least one component")
         previous = (np.zeros(self.actions.shape[1]) if previous_input is None else
                     _vector(previous_input, self.actions.shape[1], "previous_input"))
-        best_cost, best_inputs, best_states, evaluations = np.inf, None, None, 0
-        for indices in product(range(len(self.actions)), repeat=self.control_horizon):
-            if evaluations == self.max_evaluations:
-                return MPCResult(False, None, None, None, None, "evaluation_limit",
-                                 evaluations=evaluations,
-                                 message="Finite-set search budget exhausted before all plans were checked")
-            evaluations += 1
-            states, inputs, cost, last, feasible = [x0.copy()], [], 0.0, previous.copy(), True
-            for k in range(self.prediction_horizon):
-                action = self.actions[indices[min(k, self.control_horizon - 1)]]
-                try:
-                    next_state = np.asarray(self.prediction(states[-1].copy(), action.copy(), k))
-                    if np.iscomplexobj(next_state) or next_state.shape != x0.shape:
-                        raise ValueError("prediction must return a real vector with the initial state's shape")
-                    if not np.all(np.isfinite(next_state)):
+        total = len(self.actions) ** self.control_horizon
+        if total > self.max_evaluations:
+            return MPCResult(
+                False, None, None, None, None, "evaluation_limit",
+                evaluations=self.max_evaluations,
+                message="Finite-set search budget is smaller than the exhaustive search",
+            )
+        best_cost, best_distance = np.inf, np.inf
+        best_inputs, best_states, evaluations = None, None, 0
+        plans = product(range(len(self.actions)), repeat=self.control_horizon)
+        while chunk := tuple(islice(plans, 256)):
+            choices = np.asarray(chunk, dtype=np.intp)
+            count = len(choices)
+            held = choices[:, np.minimum(
+                np.arange(self.prediction_horizon), self.control_horizon - 1,
+            )]
+            inputs = self.actions[held]
+            states = np.empty((count, self.prediction_horizon + 1, x0.size))
+            states[:, 0] = x0
+            costs = np.zeros(count)
+            feasible = np.ones(count, dtype=bool)
+            previous_actions = np.broadcast_to(previous, (count, previous.size)).copy()
+            try:
+                for stage in range(self.prediction_horizon):
+                    active = np.flatnonzero(feasible)
+                    if not active.size:
+                        break
+                    actions = inputs[active, stage]
+                    next_states = np.asarray(
+                        self._callbacks.predict(states[active, stage], actions, stage)
+                    )
+                    if (np.iscomplexobj(next_states)
+                            or next_states.shape != (active.size, x0.size)):
+                        raise ValueError(
+                            "prediction must return one real state vector per candidate"
+                        )
+                    if not np.all(np.isfinite(next_states)):
                         raise FloatingPointError("prediction returned a non-finite state")
-                    next_state = next_state.astype(float, copy=True)
-                    if self.constraint is not None:
-                        residuals = np.asarray(self.constraint(next_state.copy(), action.copy(), k))
-                        if np.iscomplexobj(residuals) or residuals.dtype.kind == "b" or residuals.ndim > 1:
-                            raise ValueError("constraint must return real nonnegative residuals, not booleans")
+                    states[active, stage + 1] = next_states
+                    residuals = self._callbacks.residuals(next_states, actions, stage)
+                    if residuals is not None:
+                        residuals = np.asarray(residuals)
+                        if (np.iscomplexobj(residuals) or residuals.dtype.kind == "b"
+                                or residuals.ndim == 0 or residuals.shape[0] != active.size):
+                            raise ValueError(
+                                "constraint must return real residuals with one row per candidate, not booleans"
+                            )
+                        residuals = residuals.reshape(active.size, -1)
                         if not np.all(np.isfinite(residuals)):
                             raise FloatingPointError("constraint returned non-finite residuals")
-                        if np.any(residuals < -self.feasibility_tolerance):
-                            feasible = False
-                            break
-                    stage_cost = float(self.objective(next_state.copy(), action.copy(), reference[k].copy(), last.copy(), k))
-                    cost += stage_cost
-                    if not np.isfinite(cost):
+                        accepted = np.all(
+                            residuals >= -self.feasibility_tolerance, axis=1,
+                        )
+                        feasible[active[~accepted]] = False
+                        active = active[accepted]
+                        if not active.size:
+                            continue
+                        next_states, actions = states[active, stage + 1], inputs[active, stage]
+                    stage_cost = np.asarray(self._callbacks.cost(
+                        next_states, actions,
+                        np.broadcast_to(reference[stage], (active.size, reference.shape[1])),
+                        previous_actions[active], stage,
+                    ), dtype=float)
+                    if stage_cost.shape != (active.size,):
+                        raise ValueError("objective must return one scalar cost per candidate")
+                    costs[active] += stage_cost
+                    if not np.all(np.isfinite(costs[active])):
                         raise FloatingPointError("objective returned a non-finite cost")
-                except (FloatingPointError, OverflowError, np.linalg.LinAlgError) as exc:
-                    return MPCResult(False, None, None, None, None, "numerical_failure",
-                                     evaluations=evaluations, message=str(exc))
-                states.append(next_state)
-                inputs.append(action.copy())
-                last = action
-            if feasible and cost < best_cost:
-                best_cost, best_inputs, best_states = cost, np.asarray(inputs), np.asarray(states)
+                    previous_actions[active] = actions
+            except (FloatingPointError, OverflowError, np.linalg.LinAlgError) as exc:
+                return MPCResult(
+                    False, None, None, None, None, "numerical_failure",
+                    evaluations=evaluations + count, message=str(exc),
+                )
+            evaluations += count
+            for index in np.flatnonzero(feasible):
+                cost = float(costs[index])
+                distance = float(np.sum(
+                    np.abs(inputs[index, 0] - previous) / self._action_scale
+                ))
+                tolerance = (32.0 * np.finfo(float).eps
+                             * max(1.0, abs(cost), abs(best_cost)))
+                better = best_inputs is None or cost < best_cost - tolerance
+                tied = best_inputs is not None and abs(cost - best_cost) <= tolerance
+                if better or (tied and distance < best_distance):
+                    best_cost, best_distance = cost, distance
+                    best_inputs, best_states = inputs[index].copy(), states[index].copy()
         if best_inputs is None:
             return MPCResult(False, None, None, None, None, "infeasible", evaluations=evaluations,
                              message="No admissible finite-action plan satisfies the constraints")

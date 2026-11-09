@@ -79,6 +79,8 @@ class LocatedZero:
 
 def _real(value):
     """Normalize scalar numbers while preserving their arithmetic semantics."""
+    if type(value) is float:
+        return value
     if hasattr(value, "item"):
         scalar = value.item()
         if scalar is value:
@@ -234,6 +236,7 @@ class BlackBoxSubsystem:
     A discrete model uses the same ``begin``, ``next_time``, ``sense`` and ``actuate`` event phases
     as a converter unit. The optional energy declaration uses the ordinary
     :class:`~peslite.solver.energy.Energetic` members, or ``observer=True`` for a non-loading model.
+    Set ``cpp_export=False`` when a callable depends on a runtime that native export cannot lower.
     """
 
     def __init__(
@@ -248,6 +251,7 @@ class BlackBoxSubsystem:
         period: float | None = None,
         offset: float = 0.0,
         feedthrough: Sequence[str] | None = None,
+        cpp_export: bool = True,
         observer: bool = False,
         ports: Sequence[_energy.Port] | None = None,
         storage: Sequence[_energy.StoragePort] | None = None,
@@ -256,6 +260,9 @@ class BlackBoxSubsystem:
     ) -> None:
         if not callable(output):
             raise TypeError("output must be callable")
+        if not isinstance(cpp_export, bool):
+            raise TypeError("cpp_export must be a boolean")
+        self.cpp_export = cpp_export
         self.input_names, self.input = _black_box_record(inputs, "inputs")
         self.output_names, self.output = _black_box_record(outputs, "outputs")
         if not self.output_names:
@@ -1211,12 +1218,15 @@ class _LinearModelView:
         modes = self.model.linear_modes()
         if len(modes) != len(self._mode_positions):
             raise RuntimeError("linear modes and blocks describe different circuits")
-        return tuple(
-            (key, lambda build=build, selected=selected:
-             np.asarray(build())[np.ix_(selected, selected)])
-            for (key, build), selected in zip(modes, self._mode_positions)
-            if selected.size
-        )
+        projected = []
+        for mode, selected in zip(modes, self._mode_positions):
+            if not selected.size:
+                continue
+            key, build, *metadata = mode
+            item = (key, lambda build=build, selected=selected:
+                    np.asarray(build())[np.ix_(selected, selected)])
+            projected.append((*item, *metadata))
+        return tuple(projected)
 
 
 class Model:
@@ -1238,11 +1248,14 @@ class Model:
         linear_mode_key: Callable[[], Any] | None = None,
         linear_blocks: Callable[[], Sequence[Any]] | None = None,
         linear_modes: Callable[[], Sequence[Any]] | None = None,
+        linear_certificates: Callable[[], Sequence[Any]] | None = None,
     ) -> None:
         self._linear_structure_builder = linear_structure
         self.linear_mode_key = linear_mode_key or _no_linear_mode
         self.linear_blocks = linear_blocks or _no_linear_data
         self.linear_modes = linear_modes or _no_linear_data
+        # Certificates alone let an explicit solver avoid materializing present mode identities.
+        self.linear_certificates = linear_certificates
         self.equation_revision = 0
         if isinstance(subsystems, Mapping):
             names = [str(n) for n in subsystems]
@@ -1907,6 +1920,8 @@ class Model:
     def set_zoh_input(self, label: str, value: Any) -> None:
         """Set a held external input (e.g. the switching state) by label."""
         targets = self._zoh_targets[label]
+        if isinstance(value, np.generic):  # generated equations run on Python scalars
+            value = value.item()
         changed = []
         for input, name in targets:
             previous = getattr(input, name)
@@ -1943,6 +1958,10 @@ class Model:
     def energy_balance(self, t: float, y: NDArray[np.float64]) -> "_energy.EnergyReport":
         """Energy accounting at ``(t, y)`` from the subsystems' declarations (see :mod:`peslite.solver.energy`)."""
         return _energy.balance(self, t, y)
+
+    def energy_powers(self, t: float, y: NDArray[np.float64]) -> tuple[float, float]:
+        """Return continuous supplied and dissipated power without evaluating derivatives."""
+        return _energy.powers(self, t, y)
 
     def ph_report(self, zoh: Mapping[str, Any] | None = None, groups: Mapping[str, Any] | None = None,
                   rtol: float = 1e-8, hold: Mapping[str, float] | None = None) -> "_energy.PHReport":

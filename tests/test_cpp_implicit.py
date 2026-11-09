@@ -10,16 +10,20 @@ from test_cpp_export import _compiler, _final_csv, _run_generated
 pytestmark = pytest.mark.full
 
 
-def _compare_native(params, tmp_path, *, variables=(), rtol=1e-8, atol=1e-9):
+def _compare_native(params, tmp_path, *, variables=(), rtol=1e-8, atol=1e-9,
+                    tables=("states.csv",)):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
     _source, native, python = _run_generated(params, tmp_path / "native", compiler, variables=variables)
-    actual, expected = _final_csv(native / "states.csv"), _final_csv(python / "states.csv")
-    assert actual.keys() == expected.keys()
-    np.testing.assert_allclose(
-        list(actual.values()), list(expected.values()), rtol=rtol, atol=atol
-    )
+    expected = None
+    for table in tables:
+        actual, expected = _final_csv(native / table), _final_csv(python / table)
+        assert actual.keys() == expected.keys()
+        np.testing.assert_allclose(
+            list(actual.values()), list(expected.values()), rtol=rtol, atol=atol,
+            err_msg=table,
+        )
     return expected
 
 
@@ -58,13 +62,28 @@ def test_native_implicit_switching_commutations(case, form, method, tmp_path):
         "simulation.solver.rtol": 1e-8, "simulation.solver.atol": 1e-9,
         "simulation.solver.linearisations": 0, "simulation.t_end": 6e-5,
         "simulation.progress.enable": 0, "simulation.energy_check": "off",
-        "simulation.output.states": True, "simulation.output.signals": False,
+        "simulation.output.states": True,
+        "simulation.output.signals": case == "wpt-scc-example",
         "simulation.output.energy": False,
     })
     # Hybrid trajectories can amplify cross-language factorization roundoff after a commutation.
-    final = _compare_native(params, tmp_path, rtol=2e-5, atol=1e-9)
-    assert max(abs(value) for name, value in final.items()
-               if name.startswith("charger.link.")) > 0.1
+    final = _compare_native(
+        params, tmp_path, rtol=2e-5, atol=1e-9,
+        tables=("states.csv", "plant.csv") if case == "wpt-scc-example" else ("states.csv",),
+    )
+    selected = (value for name, value in final.items()
+                if (name != "t" if case == "wpt-scc-example"
+                    else name.startswith("charger.link.")))
+    assert max(map(abs, selected)) > 0.1
+
+
+def test_native_export_traces_registered_addon_control_equations(tmp_path):
+    params = peslite.load(EXAMPLES / "custom-pll-example.pes", **{
+        "simulation.t_end": 2e-4,
+        "simulation.progress.enable": False,
+        "simulation.energy_check": "off",
+    })
+    _compare_native(params, tmp_path, rtol=1e-10, atol=1e-11)
 
 
 def test_native_export_keeps_python_adaptive_methods_explicit(tmp_path):

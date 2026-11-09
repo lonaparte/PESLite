@@ -20,7 +20,7 @@ from typing import Any, Callable, Optional, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
-from .integrators import IMPLICIT_FIXED_METHODS, RHS, SolverStep, subintervals
+from .integrators import IMPLICIT_FIXED_METHODS, RHS, SolverStep, _accepted, subintervals
 
 __all__ = ["ImplicitSolver", "LinearSystem", "Structure", "linear_system",
            "ModeJacobian"]
@@ -538,6 +538,7 @@ class ImplicitSolver:
         for _attempt in range(2):
             result = self._newton(f, t, y, h, f0)
             if result is not None:
+                _accepted(t + h, result[0])
                 return result
             self.linear.update(f, t, y, f0)
         if depth >= _MAX_SPLITS:

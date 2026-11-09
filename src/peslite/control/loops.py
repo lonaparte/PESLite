@@ -1399,6 +1399,11 @@ class ThreePhaseModulation(Loop):
         """Return the upstream dq-command limit imposed by this modulation stage."""
         return self.stage.command_limit(u_dc_pu)
 
+    def retuned(self, old):
+        """Keep the output stage and its runtime counters across a parameter rebuild."""
+        super().retuned(old)
+        self.stage = old.stage
+
 
 @register_loop_type
 class ResonantModulation(Loop):

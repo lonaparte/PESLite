@@ -568,6 +568,8 @@ def _symbolic_source(expressions: Sequence[Any]) -> tuple[list[str], tuple[str, 
 
 def _maximum(left: Any, right: Any) -> Any:
     """Scalar maximum which remains one arithmetic expression during equation lowering."""
+    if type(left) is float and type(right) is float:  # numeric hot path without ABC checks
+        return max(left, right)
     if isinstance(left, numbers.Real) and isinstance(right, numbers.Real):
         return max(left, right)
     if hasattr(left, "__array_ufunc__") or hasattr(right, "__array_ufunc__"):
@@ -577,6 +579,8 @@ def _maximum(left: Any, right: Any) -> Any:
 
 def _minimum(left: Any, right: Any) -> Any:
     """Scalar minimum paired with :func:`_maximum`."""
+    if type(left) is float and type(right) is float:  # numeric hot path without ABC checks
+        return min(left, right)
     if isinstance(left, numbers.Real) and isinstance(right, numbers.Real):
         return min(left, right)
     if hasattr(left, "__array_ufunc__") or hasattr(right, "__array_ufunc__"):
@@ -655,6 +659,42 @@ def _port(a: Port, b: Port) -> tuple[int, float]:
     if len(nodes) == 2 and (a.dim, a.scale) != (b.dim, b.scale):
         raise ValueError(f"branch ports {a!r} and {b!r} differ in dimension or power scale")
     return nodes[0].dim, nodes[0].scale
+
+
+def _symmetrizing_scale(matrix: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Return a positive diagonal similarity that balances mutually coupled entries.
+
+    The similarity preserves the spectrum, so its matrix 2-norm remains a rigorous spectral-radius
+    bound. Least-squares balancing keeps that bound useful when state scales differ greatly.
+    """
+    n = matrix.shape[0]
+    coupled = (matrix != 0.0) & (matrix.T != 0.0) & np.isfinite(matrix) & np.isfinite(matrix.T)
+    rows, cols = np.nonzero(np.triu(coupled, 1))
+    if not rows.size:
+        return np.ones(n)
+    target = 0.5 * (np.log(np.abs(matrix[cols, rows])) - np.log(np.abs(matrix[rows, cols])))
+    laplacian = 1e-9 * np.eye(n)
+    np.add.at(laplacian, (rows, rows), 1.0)
+    np.add.at(laplacian, (cols, cols), 1.0)
+    np.add.at(laplacian, (rows, cols), -1.0)
+    np.add.at(laplacian, (cols, rows), -1.0)
+    rhs = np.zeros(n)
+    np.add.at(rhs, rows, target)
+    np.add.at(rhs, cols, -target)
+    x = np.linalg.solve(laplacian, rhs)
+    x -= x.mean()
+    scale = np.exp(np.clip(x, -300.0, 300.0))
+    return scale if np.all(np.isfinite(scale)) else np.ones(n)
+
+
+def _scaled_norm(matrix: NDArray[np.float64], left: Optional[NDArray[np.float64]] = None,
+                 right: Optional[NDArray[np.float64]] = None) -> float:
+    """Return ``|diag(left) matrix diag(right)^-1|_2`` with either scale optional."""
+    if left is not None:
+        matrix = left[:, None] * matrix
+    if right is not None:
+        matrix = matrix / right[None, :]
+    return float(np.linalg.norm(matrix, 2)) if matrix.size else 0.0
 
 
 def _coefficient_array(value: Any) -> NDArray:
@@ -851,14 +891,43 @@ class Transformer(Element):
     """
 
     def __init__(self, p_a: Port, p_b: Port, s_a: Port, s_b: Port,
-                 N: Callable[[], ArrayLike] | ArrayLike, name: str = "") -> None:
+                 N: Callable[[], ArrayLike] | ArrayLike, name: str = "", *,
+                 bounds: Optional[tuple[ArrayLike, ArrayLike]] = None) -> None:
         (dp, scale_p), (ds, scale_s) = _port(p_a, p_b), _port(s_a, s_b)
         self.ports, self.name, self.N = ((p_a, p_b), (s_a, s_b)), name, N
         self.shape, self.current_scale = (dp, ds), scale_p / scale_s
         self.constant = None if callable(N) else self._ratio(N)
+        if bounds is None:
+            self.bounds = ((self.constant, self.constant)
+                           if self.constant is not None else None)
+        else:
+            lower, upper = (self._ratio(value) for value in bounds)
+            if np.any(lower > upper):
+                raise ValueError(f"{self.name}: transformer ratio lower bounds exceed upper bounds")
+            self.bounds = lower, upper
+        if self.bounds is None:
+            self._range = None
+        else:
+            lower, upper = self.bounds
+            tolerance = _FLOAT_RTOL * np.maximum(
+                1.0, np.maximum(np.abs(lower), np.abs(upper))
+            )
+            self._range = tuple(zip(
+                (lower - tolerance).ravel().tolist(),
+                (upper + tolerance).ravel().tolist(),
+            ))
         self._cached_scalar: Optional[tuple[numbers.Number, NDArray[np.float64]]] = None
 
     def _ratio(self, value: ArrayLike) -> NDArray[np.float64]:
+        # Common scalar bridge callbacks avoid NumPy's general shape conversion.
+        kind = type(value)
+        if kind is complex and self.shape == (2, 1):
+            real, imag = value.real, value.imag
+            if math.isfinite(real) and math.isfinite(imag):
+                return np.array(((real,), (imag,)))
+        elif (kind is float or kind is int) and self.shape == (1, 1):
+            if math.isfinite(value):
+                return np.array(((float(value),),))
         if np.ndim(value) == 0:
             if self.shape == (1, 1):
                 value = ((value,),)
@@ -873,12 +942,22 @@ class Transformer(Element):
             raise ValueError(f"{self.name}: the ratio is not finite")
         return N
 
+    def within_bounds(self, ratio: NDArray[np.float64]) -> bool:
+        """Whether a ratio is covered by the optional stability range declaration."""
+        if self._range is None:
+            return False
+        for value, (lower, upper) in zip(ratio.ravel().tolist(), self._range):
+            if not lower <= value <= upper:
+                return False
+        return True
+
     def ratio(self) -> NDArray[np.float64]:
         """Return the current ratio, reusing the matrix form of an unchanged scalar callback."""
         if self.constant is not None:
             return self.constant
         value = self.N()
-        if isinstance(value, numbers.Number):
+        kind = type(value)
+        if kind is complex or kind is float or isinstance(value, numbers.Number):
             cached = self._cached_scalar
             if cached is not None and cached[0] == value:
                 return cached[1]
@@ -1020,10 +1099,10 @@ class _Triplets:
         self.v.extend([s] * n)
 
     def block(self, r: int, c: int, m: NDArray[np.float64]) -> None:
-        i, j = np.nonzero(m)
+        i, j = np.nonzero(_numeric_values(m))
         self.r.extend((r + i).tolist())
         self.c.extend((c + j).tolist())
-        self.v.extend(m[i, j].tolist())
+        self.v.extend(m[int(row), int(column)] for row, column in zip(i, j))
 
     def incidence(self, r: int, br: _Branch, offsets: NDArray[np.intp], m: Optional[NDArray] = None,
                   s: float = 1.0) -> None:
@@ -1086,6 +1165,10 @@ class _Pattern:
         self.indptr = np.searchsorted(cs[first], np.arange(n + 1)).astype(np.int32)
         nb = len(base.v)
         self.base = np.bincount(pos[:nb], weights=_numeric_values(base.v), minlength=self.nnz)
+        expressions: list[Any] = [0.0] * self.nnz
+        for position, value in zip(pos[:nb], base.v):
+            expressions[int(position)] += value
+        self.expressions = tuple(expressions)
         self.slot_pos, self.slot_flat = pos[nb:], np.array(slots.flat, dtype=np.intp)
         self.slot_coef = np.array(slots.coef, dtype=float)
 
@@ -1095,6 +1178,26 @@ class _Pattern:
         flat = np.concatenate([N.ravel() for N in ratios])
         return self.base + np.bincount(self.slot_pos, weights=self.slot_coef * flat[self.slot_flat],
                                        minlength=self.nnz)
+
+    def value_bounds(
+        self,
+        bounds: Sequence[tuple[NDArray[np.float64], NDArray[np.float64]]],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Componentwise network-matrix bounds for bounded transformer ratios."""
+        if not self.slot_pos.size:
+            return self.base, self.base
+        lower = np.concatenate([value[0].ravel() for value in bounds])
+        upper = np.concatenate([value[1].ravel() for value in bounds])
+        first = self.slot_coef * lower[self.slot_flat]
+        second = self.slot_coef * upper[self.slot_flat]
+        return (
+            self.base + np.bincount(
+                self.slot_pos, weights=np.minimum(first, second), minlength=self.nnz,
+            ),
+            self.base + np.bincount(
+                self.slot_pos, weights=np.maximum(first, second), minlength=self.nnz,
+            ),
+        )
 
     def matrix(self, ratios: Sequence[NDArray[np.float64]]) -> sp.csc_matrix:
         return sp.csc_matrix((self.values(ratios), self.indices, self.indptr), shape=(self.n, self.n))
@@ -1208,6 +1311,20 @@ class _RatioPlan:
         if solution is None:
             solution = self.solutions[key] = self.factor.solve(right)
         return solution
+
+    def change_bound(
+        self,
+        lower: NDArray[np.float64],
+        upper: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Entrywise absolute bound of the low-rank correction over an interval matrix."""
+        size = np.maximum(
+            np.abs(lower[self.positions] - self.base),
+            np.abs(upper[self.positions] - self.base),
+        )
+        change = np.zeros((self.rows.size, self.cols.size))
+        np.add.at(change, (self.row_index, self.col_index), size)
+        return change
 
 
 class _RatioUpdate:
@@ -1484,7 +1601,7 @@ class _Projector:
             right = [*(weights @ x), *([0.0] * self.n_free),
                      *(self.G_u.toarray() @ np.asarray(u, dtype=object))]
             matrix = self._equations.tolist()
-            # The reference supplies pivot choices, while elimination retains each coefficient.
+            # The reference shares the lowering interface; elimination retains each coefficient.
             reference = self._equations.copy()
             reference[:self.n, :self.n] = self.W.toarray()
             solution = _symbolic_solve(matrix, right, np.asarray(reference, dtype=float))
@@ -1670,7 +1787,8 @@ class Topology:
             for m, k in enumerate(ks):
                 M.incidence(row, brs[k], e_off)
                 for j, kj in enumerate(ks):
-                    M.block(row, int(xd_off[kj]), -el.L[m * d:(m + 1) * d, j * d:(j + 1) * d])
+                    M.block(row, int(xd_off[kj]),
+                            -el.L[m * d:(m + 1) * d, j * d:(j + 1) * d])
                 row += d
             for k in ks:
                 if k not in dep_set:
@@ -1803,6 +1921,7 @@ class Topology:
         top._evaluations = 0
         top._affine_equations = {}
         top._selected_outputs = {}
+        top.__dict__.pop("_dynamic_structure_key", None)
         return top
 
     @property
@@ -1826,7 +1945,9 @@ class Topology:
         if self._lu is _PENDING:
             values = (self._values if self._values is not None else
                       self._pattern.values(self.mode.ratios))
-            plan = self._ratio_plan()
+            # A Woodbury solve pays off for large or numeric networks; small device modes refactor.
+            worth = self._pattern.n > _DENSE_GROUP or self._store[0].form != "device"
+            plan = self._ratio_plan() if worth else None
             update = plan.update(values) if plan is not None else None
             if update is not None:
                 self._values, self._M, self._lu = values, None, update
@@ -1844,7 +1965,7 @@ class Topology:
         self._lu = value
 
     def _ratio_plan(self) -> Optional[_RatioPlan]:
-        """Return the structure's shared low-rank ratio plan when it is ready and useful."""
+        """Return the structure's shared low-rank ratio plan when its factors are ready."""
         cached = self._shared.get("ratio_plan", _PENDING)
         if cached is not _PENDING:
             return cached
@@ -1856,7 +1977,6 @@ class Topology:
         eligible = (
             factor is not None
             and pattern.slot_pos.size
-            and (pattern.n > _DENSE_GROUP or self._store[0].form != "device")
             and getattr(factor, "inverse", None) is None
         )
         plan = _RatioPlan(pattern, pattern.values(base.mode.ratios), factor) if eligible else None
@@ -1865,6 +1985,117 @@ class Topology:
             plan = None
         self._shared["ratio_plan"] = plan
         return plan
+
+    def state_matrix_norm_bound(self) -> Optional[float]:
+        """Return a cheap upper bound on the state matrix's spectral radius.
+
+        The bound is the 2-norm of a diagonal similarity of the matrix. A transformer-ratio copy
+        uses the structure's Woodbury factors, avoiding the dense state matrix while remaining
+        conservative. An unavailable low-rank update asks the caller for the exact matrix.
+        """
+        base = self._shared["ratio_base"]
+        scale = self._stability_scale()
+        if self is base or not self._pattern.slot_pos.size:
+            return self._base_scaled_norm()
+        _ = base.lu
+        plan = self._ratio_plan()
+        if plan is None:
+            return None
+        update = plan.update(self._pattern.values(self.mode.ratios))
+        if update is None:
+            return None
+        if "K" not in self._shared:
+            self._shared["K"] = sp.hstack([self.Ky, self.Ku, self.Kdu]).toarray()
+        n_x = self._net_shape[0]
+        base_solution = plan.shared("state_matrix_bound", self._shared["K"])
+        left = update.left[self.xd_index]
+        right = update.inverse @ base_solution[plan.cols, :n_x]
+        return (self._base_scaled_norm()
+                + _scaled_norm(left, left=scale) * _scaled_norm(right, right=scale))
+
+    def _stability_scale(self) -> NDArray[np.float64]:
+        """Return the structure's cached diagonal similarity for stability bounds."""
+        scale = self._shared.get("stability_scale")
+        if scale is None:
+            scale = self._shared["stability_scale"] = _symmetrizing_scale(
+                self._shared["ratio_base"].state_space.A
+            )
+        return scale
+
+    def _base_scaled_norm(self) -> float:
+        """Return ``|diag(d) A diag(d)^-1|_2`` for the structure's base matrix."""
+        norm = self._shared.get("base_scaled_norm")
+        if norm is None:
+            scale = self._stability_scale()
+            norm = self._shared["base_scaled_norm"] = _scaled_norm(
+                self._shared["ratio_base"].state_space.A, scale, scale
+            )
+        return norm
+
+    def _state_matrix_range_certificate(self) -> Optional[tuple[object, float]]:
+        """Certify one spectral-radius bound over every declared transformer ratio.
+
+        The interval matrix bounds the low-rank ratio correction entry by entry.  If its
+        interaction with the base inverse is below one, the Neumann bound proves that every
+        matrix in the range is nonsingular and bounds its state matrix in one diagonal similarity.
+        """
+        base = self._shared["ratio_base"]
+        cached = self._shared.get("state_matrix_range_certificate", _PENDING)
+        if cached is not _PENDING:
+            return cached
+        net = base._store[0]
+        bounds = tuple(transformer.bounds for transformer in net._transformers)
+        if any(bound is None for bound in bounds):
+            certificate = None
+        elif (not base._pattern.slot_pos.size
+              or all(np.array_equal(lower, upper) for lower, upper in bounds)):
+            certificate = (base, self._base_scaled_norm())
+        else:
+            _ = base.lu
+            plan = base._ratio_plan()
+            certificate = None
+            if plan is not None:
+                lower, upper = base._pattern.value_bounds(bounds)
+                change = plan.change_bound(lower, upper)
+                change_norm = float(np.linalg.norm(change, "fro"))
+                interaction = float(np.linalg.norm(plan.ZC, 2)) * change_norm
+                if interaction < 1.0:
+                    if "K" not in self._shared:
+                        self._shared["K"] = sp.hstack([
+                            base.Ky, base.Ku, base.Kdu,
+                        ]).toarray()
+                    n_x = base._net_shape[0]
+                    solution = plan.shared(
+                        "state_matrix_bound", self._shared["K"]
+                    )
+                    scale = self._stability_scale()
+                    correction = (
+                        _scaled_norm(plan.Z[base.xd_index], left=scale)
+                        * change_norm / (1.0 - interaction)
+                        * _scaled_norm(solution[plan.cols, :n_x], right=scale)
+                    )
+                    bound = self._base_scaled_norm() + correction
+                    if math.isfinite(bound):
+                        certificate = (base, bound)
+        self._shared["state_matrix_range_certificate"] = certificate
+        return certificate
+
+    def range_stability_certificate(
+        self, ratios: Sequence[NDArray[np.float64]]
+    ) -> Optional[tuple[object, float]]:
+        """Return the structure's range certificate when it covers ``ratios``."""
+        for transformer, ratio in zip(self._store[0]._transformers, ratios):
+            if not transformer.within_bounds(ratio):
+                return None
+        return self._state_matrix_range_certificate()
+
+    def state_matrix_stability_certificate(self) -> Optional[tuple[object, float]]:
+        """Return a reusable range certificate, or a bound for this exact ratio mode."""
+        certificate = self.range_stability_certificate(self.mode.ratios)
+        if certificate is not None:
+            return certificate
+        bound = self.state_matrix_norm_bound()
+        return None if bound is None else (self.state_matrix_key(), bound)
 
     def _factorize(self, net: "Netlist", values: NDArray[np.float64]) -> object:
         """The factors of the sparse network matrix with entries ``values``: grouped onto the interface
@@ -2111,15 +2342,19 @@ class Topology:
         self._shared["input_reach"] = reach
         return reach
 
-    def state_matrix_key(self) -> tuple:
-        """Mode identity containing only transformer ratios that can change ``A``."""
+    def state_matrix_key(self, mode: Optional[Mode] = None) -> tuple:
+        """Mode identity containing only transformer ratios that can change ``A``.
+
+        ``mode`` may be another ratio mode of this structure; the reach is shared by them.
+        """
+        mode = self.mode if mode is None else mode
         reach = self.input_reach()
-        relevant = (np.ones(len(self.mode.ratios), dtype=bool)
+        relevant = (np.ones(len(mode.ratios), dtype=bool)
                     if reach is None else reach[2])
         ratios = b"".join(
-            ratio.tobytes() for ratio, used in zip(self.mode.ratios, relevant) if used
+            ratio.tobytes() for ratio, used in zip(mode.ratios, relevant) if used
         )
-        return self.mode.closed, self.mode.conducting, ratios
+        return mode.closed, mode.conducting, ratios
 
     def selected_outputs(self, selected: Sequence[int]) -> NDArray[np.float64]:
         """Cached ratio-independent rows of the network output map."""
@@ -2229,7 +2464,7 @@ def _roles(net: "Netlist", mode: Mode) -> tuple[list[Optional[str]], dict[int, N
             r = el.R_on if on else el.R_off
             role = "short" if r == 0.0 else None if r == math.inf else "res"
             if role == "res":
-                resistance[k] = np.diag(np.asarray([r] * br.dim, dtype=float if _constant(r) else object))
+                resistance[k] = np.diag(np.asarray([r] * br.dim, dtype=object))
         elif isinstance(el, Transformer):
             role = "p" if br.port == 0 else "s"
         else:
@@ -2868,6 +3103,9 @@ class Netlist:
         conduction margins confirm it."""
         if mode is None and self._frozen_topology is not None:
             return self._frozen_topology
+        if mode is None and self._frozen_mode is not None:
+            self._frozen_topology = self._compiled(self._frozen_mode)
+            return self._frozen_topology
         if mode is not None:
             return self._compiled(mode)
         requested = self.mode()
@@ -2921,15 +3159,49 @@ class Netlist:
         raise ConductionError("no nonsingular diode conduction pattern exists")
 
     def freeze_topology(self) -> None:
-        """Reuse the current compiled topology until the enclosing smooth interval ends."""
-        if self._frozen_topology is None:
-            topology = self.topology()
-            self._frozen_mode, self._frozen_topology = topology.mode, topology
+        """Reuse the current mode until the enclosing smooth interval ends.
+
+        A previously resolved switch and diode structure needs only its transformer-ratio copy;
+        that copy is created on first topology access, which a conclusive certificate avoids.
+        """
+        if self._frozen_mode is None:
+            requested = self.mode()
+            if (requested.closed, requested.conducting) in self._structures:
+                self._frozen_mode = requested
+            else:
+                topology = self.topology()
+                self._frozen_mode, self._frozen_topology = topology.mode, topology
             if (self.form == "device"
                     and all(transformer.constant is not None for transformer in self._transformers)):
-                key = topology.mode.key, "all", None
+                key = self._frozen_mode.key, "all", None
                 if key in self._scalar_functions:
-                    self._frozen_scalar = self._scalar_function(topology, "all")
+                    self._frozen_scalar = self._scalar_function(self.topology(), "all")
+
+    def _frozen_range_certificate(self) -> tuple[Optional[Topology], Optional[tuple[object, float]]]:
+        """Return the frozen mode's structure and covering range certificate, if available."""
+        mode = self._frozen_mode
+        if mode is None or self._frozen_topology is not None:
+            return None, None
+        base = self._structures.get((mode.closed, mode.conducting))
+        return base, None if base is None else base.range_stability_certificate(mode.ratios)
+
+    def stability_certificate(self) -> Optional[tuple[object, float]]:
+        """Return the present stability certificate without its identity or matrix."""
+        _base, certificate = self._frozen_range_certificate()
+        if certificate is not None:
+            return certificate
+        return self.topology().state_matrix_stability_certificate()
+
+    def linear_mode(self) -> tuple[tuple, Callable[[], NDArray[np.float64]],
+                                   Optional[tuple[object, float]]]:
+        """Return the present state-matrix identity, builder and stability certificate."""
+        base, certificate = self._frozen_range_certificate()
+        if certificate is not None:
+            return (base.state_matrix_key(self._frozen_mode),
+                    lambda: self.topology().state_space.A, certificate)
+        topology = self.topology()
+        return (topology.state_matrix_key(), lambda: topology.state_space.A,
+                topology.state_matrix_stability_certificate())
 
     def release_topology(self) -> None:
         """Allow topology callbacks to be read at the next model-changing boundary."""
@@ -3348,11 +3620,19 @@ class Netlist:
         return self._scalar_function(top, "outputs")(t, y)
 
     def _dynamic_structure_key(self, top: Topology) -> tuple:
-        """Return the discrete mode and numeric sparsity selecting symbolic pivots."""
+        """Return the discrete mode and symbolic sparsity selecting generated equations."""
         key = getattr(top, "_dynamic_structure_key", None)
         if key is None:
-            values = top._pattern.values(top.mode.ratios)
-            key = top.mode.key[:2], np.packbits(values != 0.0).tobytes()
+            pattern = top._pattern
+            symbolic = getattr(pattern, "_symbolic_sparsity", None)
+            if symbolic is None:
+                present = np.fromiter(
+                    (not _zero(value) for value in pattern.expressions),
+                    dtype=bool, count=pattern.nnz,
+                )
+                present[pattern.slot_pos] = True
+                pattern._symbolic_sparsity = symbolic = np.packbits(present).tobytes()
+            key = top.mode.key[:2], symbolic
             top._dynamic_structure_key = key
         return key
 
@@ -3396,7 +3676,7 @@ class Netlist:
 
         pattern = top._pattern
         columns = np.repeat(np.arange(pattern.n), np.diff(pattern.indptr))
-        entries: list[Any] = pattern.base.tolist()
+        entries: list[Any] = list(pattern.expressions)
         for position, flat, coefficient in zip(
                 pattern.slot_pos, pattern.slot_flat, pattern.slot_coef):
             entries[int(position)] += coefficient * flat_ratios[int(flat)]

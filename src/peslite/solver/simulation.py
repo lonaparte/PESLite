@@ -44,7 +44,7 @@ from ..assembly.types import unit_type
 from ..assembly.unit import Plant, Unit
 from .timing import TIME_EPS
 from ..control.blocks import abc2complex, complex2abc
-from .integrators import Solver
+from .integrators import Solver, _accepted_steps
 from .linearization import coordinate_width
 from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
 from .multirate import make_solver, rated_effort
@@ -123,9 +123,161 @@ class _SnapshotRead:
         return self._value
 
 
+class _VersionedStateRead:
+    """Read one physical state once per time and model version, including a failed read."""
+
+    __slots__ = ("_read", "_version", "_held", "_state", "_value", "_error")
+
+    def __init__(self, read: Callable, version: Callable[[], tuple]) -> None:
+        self._read, self._version = read, version
+        self._held, self._state, self._value, self._error = None, None, None, None
+
+    def __call__(self, t: float, state: np.ndarray):
+        held = (t, *self._version())
+        if held != self._held or state is not self._state:
+            self._held, self._state = held, state
+            self._value, self._error = None, None
+            try:
+                self._value = self._read(t, state)
+            except Exception as exc:
+                self._error = exc
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+
 def _finite(y: np.ndarray) -> bool:
     """Return True when every entry of ``y`` is finite."""
     return all(map(math.isfinite, y.tolist()))
+
+
+class _AcceptedEnergy:
+    """Trapezoidal power quadrature on accepted physical states.
+
+    Energy closure is an optional output. A numerical read failure disables this accounting
+    without stopping the physical simulation.
+    """
+
+    def __init__(self, model, balance: Callable) -> None:
+        self.model = model
+        self.balance = balance
+        self.started = False
+        self.unavailable = False
+        self.supplied = self.dissipated = 0.0
+        self.last_t = self.last_supplied = self.last_dissipated = 0.0
+        self.initial_energy = self.initial_impulsive = self.initial_impulsive_supply = 0.0
+        self.history: list[tuple[float, tuple]] = []
+
+    def _evaluate(self, t: float, name: str, read: Callable, *args):
+        if self.unavailable:
+            return None
+        value = _optional_output(t, f"energy closure: {name}", read, *args)
+        if value is _UNAVAILABLE:
+            self.unavailable = True
+            return None
+        return value
+
+    @staticmethod
+    def _impulses(report) -> tuple[float, float]:
+        return (
+            sum(entry.impulsive or 0.0 for entry in report.subsystems),
+            sum(entry.impulsive_supply or 0.0 for entry in report.subsystems),
+        )
+
+    def _state(self, history_size: int | None = None) -> tuple:
+        return (
+            self.supplied, self.dissipated, self.last_t,
+            self.last_supplied, self.last_dissipated,
+            len(self.history) if history_size is None else history_size,
+        )
+
+    def _remember(self) -> None:
+        snapshot = self._state(len(self.history) + 1)
+        self.history.append((self.last_t, snapshot))
+
+    def begin_interval(self, t: float, y: np.ndarray) -> None:
+        """Seed the first interval or refresh power after a boundary changed the model."""
+        if self.unavailable:
+            return
+        if not self.started:
+            report = self._evaluate(t, "energy balance", self.balance, t, y)
+            if report is None:
+                return
+            self.initial_energy = report.energy
+            self.initial_impulsive, self.initial_impulsive_supply = self._impulses(report)
+            self.last_supplied, self.last_dissipated = report.supplied, report.dissipated
+            self.last_t = t
+            self.started = True
+            self.history.clear()
+            self._remember()
+            return
+        if abs(t - self.last_t) > TIME_EPS:
+            raise RuntimeError("energy accounting did not reach the previous interval boundary")
+        powers = self._evaluate(t, "power", self.model.energy_powers, t, y)
+        if powers is None:
+            return
+        self.last_supplied, self.last_dissipated = powers
+        self.history.clear()
+        self._remember()
+
+    def accept(self, t: float, y: np.ndarray) -> None:
+        powers = self._evaluate(t, "power", self.model.energy_powers, t, y)
+        if powers is None:
+            return
+        supplied, dissipated = powers
+        step = t - self.last_t
+        if step < -TIME_EPS:
+            raise RuntimeError("accepted solver steps must be chronological")
+        if step > TIME_EPS:
+            self.supplied += 0.5 * step * (self.last_supplied + supplied)
+            self.dissipated += 0.5 * step * (self.last_dissipated + dissipated)
+        self.last_t, self.last_supplied, self.last_dissipated = t, supplied, dissipated
+        self._remember()
+
+    def checkpoint(self) -> tuple:
+        return self._state()
+
+    def checkpoint_at(self, t: float) -> tuple:
+        for when, checkpoint in reversed(self.history):
+            if abs(when - t) <= TIME_EPS:
+                return checkpoint
+        raise RuntimeError(f"accepted-step checkpoint missing at t = {t:.12g} s")
+
+    def restore(self, checkpoint: tuple) -> None:
+        (self.supplied, self.dissipated, self.last_t,
+         self.last_supplied, self.last_dissipated, size) = checkpoint
+        del self.history[size:]
+
+    def finish(self, t: float, y: np.ndarray) -> Optional[dict[str, float]]:
+        if self.unavailable:
+            return None
+        if not self.started:
+            self.begin_interval(t, y)
+            if self.unavailable:
+                return None
+        elif t > self.last_t + TIME_EPS:
+            self.accept(t, y)
+            if self.unavailable:
+                return None
+        report = self._evaluate(t, "energy balance", self.balance, t, y)
+        if report is None:
+            return None
+        impulsive_total, impulsive_supply_total = self._impulses(report)
+        impulsive = impulsive_total - self.initial_impulsive
+        impulsive_supply = impulsive_supply_total - self.initial_impulsive_supply
+        stored = report.energy - self.initial_energy
+        supplied = self.supplied + impulsive_supply
+        residual = supplied - self.dissipated - impulsive - stored
+        scale = max(abs(stored), abs(supplied), abs(self.dissipated), abs(impulsive), 1e-300)
+        return {
+            "stored": stored,
+            "supplied": supplied,
+            "dissipated": self.dissipated,
+            "impulsive": impulsive,
+            "impulsive_supply": impulsive_supply,
+            "residual": residual,
+            "relative": residual / scale,
+        }
 
 
 def _compile_interval_integrator(solver, rhs, conduction, settle, project):
@@ -1008,6 +1160,17 @@ class Simulation:
 
         mode = p.simulation.energy_check
         energy_on = mode != "off" and hasattr(mdl, "energy_balance")
+        energy_balance = (_VersionedStateRead(
+            mdl.energy_balance,
+            lambda: (
+                mdl.plan_revision,
+                mdl.equation_revision,
+                id(mdl.energy_specs),
+            ),
+        ) if energy_on else None)
+        accepted_energy = (
+            _AcceptedEnergy(mdl, energy_balance) if energy_on and output.energy else None
+        )
         phs_check_step = p.simulation.solver.phs_check_step
         snapshot_index = 0
         continuous_record_index = 0
@@ -1063,7 +1226,7 @@ class Simulation:
                                              ctrl_names=ctrl_names)
 
             def record_energy():
-                rep = mdl.energy_balance(t_now, plant.state)
+                rep = energy_balance(t_now, plant.state)
                 if rec.keep_energy:
                     rec.energy_row(t_now, rep.columns())
                 scale = rep.scale
@@ -1114,9 +1277,22 @@ class Simulation:
             """Integrate over ``[t_a, t_b]``; ``event`` means the model changes at ``t_b``."""
             nonlocal t_local, stop_reason, termination, coarse_reported
             plant.invalidate()
+            energy_checkpoint = None
+            if accepted_energy is not None:
+                accepted_energy.begin_interval(t_a, plant.state)
+                energy_checkpoint = accepted_energy.checkpoint()
             try:
-                plant.state = integrate(t_a, t_b, plant.state, event)
+                if accepted_energy is None:  # no observer to install
+                    plant.state = integrate(t_a, t_b, plant.state, event)
+                else:
+                    with _accepted_steps(accepted_energy):
+                        plant.state = integrate(t_a, t_b, plant.state, event)
+                if (accepted_energy is not None
+                        and accepted_energy.last_t < t_b - TIME_EPS):
+                    accepted_energy.accept(t_b, plant.state)
             except (OverflowError, FloatingPointError):
+                if accepted_energy is not None:
+                    accepted_energy.restore(energy_checkpoint)
                 termination = "diverged"
                 stop_reason = (f"diverged: the states overflowed between t = {t_a:.6g} s "
                                f"and {t_b:.6g} s")
@@ -1306,6 +1482,8 @@ class Simulation:
             summary["energy_tellegen_max_rel"] = worst["tellegen"]
             summary["energy_balance_max_rel"] = worst["balance"]
             summary["energy_problems"] = list(self.energy_problems)
+        if accepted_energy is not None:
+            summary["energy_closure"] = accepted_energy.finish(t_local, plant.state)
         interface = getattr(solver, "interface", None)
         if interface:  # split-interface indicators
             summary.update({f"interface_{k}": v for k, v in interface.items()})
@@ -1904,6 +2082,12 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
         p = p.replace(**{"simulation.progress.enable": True})
     if args.watch and not p.simulation.progress.enable:
         ap.error("--watch prints on the progress bar: add --progress")
+    if args.plot:
+        try:
+            from ..addons.functions import _resolve
+            _resolve("plot_result")
+        except (ImportError, RuntimeError) as exc:
+            ap.error(f"--plot: {exc}")
     try:
         sim = Simulation(p)
     except ConfigError as exc:
@@ -2242,7 +2426,13 @@ def main(argv=None) -> int:
         invoke = lambda: _create_main(values)
     else:
         invoke = lambda: _export_main(values)
-    return _json_command(command, invoke) if json_output else int(invoke())
+    if json_output:
+        return _json_command(command, invoke)
+    try:
+        return int(invoke())
+    except (ConfigError, OSError) as exc:
+        print(f"peslite {command}: error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

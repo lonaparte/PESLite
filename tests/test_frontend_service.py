@@ -1,4 +1,4 @@
-"""The CodeSim frontend protocol served for PESLite simulation files."""
+"""The PESLite frontend protocol for simulation files."""
 
 import io
 import json

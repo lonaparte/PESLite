@@ -1,9 +1,9 @@
-"""Translate a PESLite configuration and its run into the CodeSim frontend descriptor schema.
+"""Translate a PESLite configuration and its run into the frontend descriptor schema.
 
-The CodeSim VS Code extension draws a topology of buses, devices and connections, edits flat
-system parameters, plots named signals and shows small-signal modes. This module derives each of
-those views from an ordinary :class:`~peslite.assembly.params.Params` tree and from read-only run
-observations; it adds no simulation behaviour.
+The PESLite frontend draws a topology of buses, devices and connections, edits flat system
+parameters, plots named signals and shows small-signal modes. This module derives those views from
+an ordinary :class:`~peslite.assembly.params.Params` tree and read-only run observations; it adds
+no simulation behaviour.
 """
 
 from __future__ import annotations
@@ -117,14 +117,39 @@ class Topology:
     params: Params
     components: list[dict[str, Any]] = field(default_factory=list)
     connections: list[dict[str, Any]] = field(default_factory=list)
-    entities: list[Entity] = field(default_factory=list)
+    entities: dict[str, Entity] = field(default_factory=dict)
     # The connection carrying each device's terminal current (bus-attached devices only).
     terminals: dict[str, str] = field(default_factory=dict)
+    _tree: dict[str, Any] = field(init=False, repr=False)
+    _editable: dict[str, Any] = field(init=False, repr=False)
+    _system: dict[str, Any] = field(init=False, repr=False)
+    _lines: dict[tuple[str, str], int] = field(init=False, repr=False)
+    _unit_paths: tuple[str, ...] = field(init=False, repr=False)
 
     @classmethod
     def build(cls, case: str, path: Path, params: Params) -> "Topology":
         topology = cls(case, path.resolve(), params)
-        topology._build()
+        topology._tree = to_dict(params)
+        topology._lines = _source_lines(topology.path)
+        units = tuple(_unit_items(params.units, leaves_only=False))
+        topology._unit_paths = tuple(sorted((name for name, _unit in units),
+                                            key=len, reverse=True))
+        topology._build(units)
+        topology._editable = {
+            name: value for name, value in flat_paths(topology._tree).items()
+            if editable(name, value)
+        }
+        topology._system = {
+            "id": topology.system_id,
+            "name": params.meta.title or case,
+            "className": f"peslite:{topology.path.name}",
+            "parameterNames": list(topology._editable),
+            "parameters": [
+                _parameter(name, name, value, name.partition(".")[0], editable=True)
+                for name, value in topology._editable.items()
+            ],
+            "source": topology._source("", ""),
+        }
         return topology
 
     # ------------------------------------------------------------ system
@@ -132,25 +157,12 @@ class Topology:
     def system_id(self) -> str:
         return slug(self.case)
 
-    def tree(self) -> dict[str, Any]:
-        return to_dict(self.params)
-
     def editable_parameters(self) -> dict[str, Any]:
         """The current value of every parameter the system editor may override."""
-        return {path: value for path, value in flat_paths(self.tree()).items()
-                if editable(path, value)}
+        return self._editable
 
     def system(self) -> dict[str, Any]:
-        values = self.editable_parameters()
-        return {
-            "id": self.system_id,
-            "name": self.params.meta.title or self.case,
-            "className": f"peslite:{self.path.name}",
-            "parameterNames": list(values),
-            "parameters": [_parameter(path, path, value, path.partition(".")[0], editable=True)
-                           for path, value in values.items()],
-            "source": self._source("", ""),
-        }
+        return self._system
 
     # ------------------------------------------------------------ topology
     def _source(self, section: str, name: str) -> dict[str, Any]:
@@ -169,7 +181,7 @@ class Topology:
             "portType": port_type, "parameters": parameters,
             "classSource": source, "instanceSource": source,
         })
-        self.entities.append(entity)
+        self.entities.setdefault(entity.name, entity)
 
     def _connect(self, connection_id: str, name: str, source: str, target: str, section: str,
                  entity: str, parameters: Iterable[dict[str, Any]] = (),
@@ -186,8 +198,7 @@ class Topology:
             return None
         if bus in self.params.buses:
             return f"bus-{slug(bus)}"
-        units = [path for path, _unit in _unit_items(self.params.units, leaves_only=False)]
-        owner = max((path for path in units if bus.startswith(path + ".")), key=len, default=None)
+        owner = next((path for path in self._unit_paths if bus.startswith(path + ".")), None)
         return f"unit-{slug(owner)}" if owner else None
 
     def _attach(self, entity: Entity, bus: str | None, label: str) -> None:
@@ -198,9 +209,8 @@ class Topology:
         self._connect(connection_id, label, point, entity.id, entity.section, entity.name)
         self.terminals[entity.name] = connection_id
 
-    def _build(self) -> None:
-        p, tree = self.params, self.tree()
-        self._lines = _source_lines(self.path)
+    def _build(self, units: tuple[tuple[str, Any], ...]) -> None:
+        p, tree = self.params, self._tree
         for name in p.buses:
             entity = Entity(name, "buses", f"bus-{slug(name)}", "component")
             phases = p.buses[name].phases
@@ -211,18 +221,19 @@ class Topology:
             self._component(entity, name, "peslite.Source", "grid", "grid", tree["sources"][name])
             self._attach(entity, cfg.bus, "Terminal")
         unit_tree = tree["units"]
-        for path, cfg in _unit_items(p.units, leaves_only=False):
+        for path, cfg in units:
             entity = Entity(path, "units", f"unit-{slug(path)}", "component")
             node: Any = unit_tree
             for part in path.split("."):
                 node = node[part]
-            composite = unit_type(cfg.type).composite
+            unit_class = unit_type(cfg.type)
+            composite = unit_class.composite
             ctrl = cfg.ctrl.type if cfg.ctrl is not None else ""
             kind = {"gfm": "gfm", "gfl": "gfl"}.get(ctrl, "generic")
             icon = "device" if composite else "inverter"
             self._component(entity, path, f"peslite.{cfg.type}", kind, icon,
                             {key: value for key, value in node.items()
-                             if not (composite and key in unit_type(cfg.type).children)},
+                             if not (composite and key in unit_class.children)},
                             cfg.type)
             parent = path.rpartition(".")[0]
             if parent:
@@ -231,7 +242,7 @@ class Topology:
             self._attach(entity, cfg.bus, "Terminal")
         for name, cfg in p.branches.items():
             entity = Entity(name, "branches", f"branch-{slug(name)}", "connection")
-            self.entities.append(entity)
+            self.entities.setdefault(entity.name, entity)
             self._connect(entity.id, name, f"bus-{slug(cfg.bus1)}", f"bus-{slug(cfg.bus2)}",
                           "branches", name,
                           [_parameter(f"branches.{name}.r", "Resistance", cfg.r, "branches",
@@ -243,7 +254,7 @@ class Topology:
             points = [self._attach_point(cfg.get(key)) for key in ("bus1", "bus2")]
             if all(points):  # a two-terminal network element is drawn as a connection
                 entity = Entity(name, "elements", f"element-{slug(name)}", "connection")
-                self.entities.append(entity)
+                self.entities.setdefault(entity.name, entity)
                 self._connect(entity.id, name, points[0], points[1], "elements", name,
                               [_parameter(f"elements.{name}.{key}", key, value, "elements")
                                for key, value in flat_paths(cfg).items()],
@@ -259,17 +270,20 @@ class Topology:
 
     def owner(self, signal: str) -> Entity | None:
         """The entity whose name is the longest dotted prefix of a state or signal name."""
-        best = None
-        for entity in self.entities:
-            if signal == entity.name or signal.startswith(entity.name + "."):
-                if best is None or len(entity.name) > len(best.name):
-                    best = entity
-        return best
+        name = signal
+        while name:
+            entity = self.entities.get(name)
+            if entity is not None:
+                return entity
+            name, separator, _part = name.rpartition(".")
+            if not separator:
+                break
+        return None
 
     def descriptor(self, signals: list[dict[str, Any]] | None = None,
                    small_signal: Mapping[str, Any] | None = None,
                    layout: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        """The complete frontend descriptor; unsupported CodeSim analyses are marked unavailable."""
+        """The complete frontend descriptor, with unavailable analyses marked accordingly."""
         descriptor = {
             "schemaVersion": SCHEMA_VERSION,
             "system": self.system(),
@@ -295,14 +309,13 @@ class _Trace:
     category: str
     label: str
     unit: str
-    time: list[float] = field(default_factory=list)
     values: list[float] = field(default_factory=list)
 
-    def describe(self, start: int = 0) -> dict[str, Any]:
+    def describe(self, time: list[float], start: int = 0) -> dict[str, Any]:
         return {
             "id": self.id, "componentId": self.owner, "ownerId": self.owner,
             "ownerKind": self.owner_kind, "category": self.category, "label": self.label,
-            "unit": self.unit, "time": self.time[start:],
+            "unit": self.unit, "time": time[start:],
             "values": [value if math.isfinite(value) else None for value in self.values[start:]],
         }
 
@@ -319,11 +332,12 @@ class SignalRecorder:
                  emit: Callable[[list[dict[str, Any]]], None] | None = None) -> None:
         self.topology = topology
         self.system = sim.system
+        self.units = sim.units
         self.base = topology.params.base
         self.chunk_size = chunk_size
         self.emit = emit
         self.observe_values = tuple(
-            f"{name}.{column}" for name, unit in sim.units.items() if unit.ctrl is not None
+            f"{name}.{column}" for name, unit in self.units.items() if unit.ctrl is not None
             for column in getattr(unit.ctrl, "log_names", lambda: ())()
         )
         self.traces: dict[str, _Trace] = {}
@@ -369,7 +383,6 @@ class SignalRecorder:
                 self.traces[key] = _Trace(trace_id, owner[0], owner[1], key[0], label, unit)
         self.time.append(float(t))
         for key, trace in self.traces.items():
-            trace.time.append(float(t))
             item = row.get(key)
             trace.values.append(item[3] if item is not None else math.nan)
         if self.emit is not None and len(self.time) - self._emitted >= self.chunk_size:
@@ -378,15 +391,16 @@ class SignalRecorder:
     def flush(self) -> None:
         """Emit every sample not yet sent."""
         if self.emit is not None and len(self.time) > self._emitted:
-            self.emit([trace.describe(self._emitted) for trace in self.traces.values()])
+            self.emit([trace.describe(self.time, self._emitted)
+                       for trace in self.traces.values()])
             self._emitted = len(self.time)
 
     def signals(self) -> list[dict[str, Any]]:
-        return [trace.describe() for trace in self.traces.values()]
+        return [trace.describe(self.time) for trace in self.traces.values()]
 
     # ------------------------------------------------------------ signal views
     def _derived(self, row: dict, signals: Mapping[str, Any]) -> None:
-        """Bus voltage, connection current, device power and bus angle, as CodeSim plots them.
+        """Bus voltage, connection current, device power and bus angle for frontend plots.
 
         AC quantities are amplitude-invariant space vectors: magnitudes are in pu of the system
         base and ``p + jq = 1.5 u i*``. Scalar (DC) voltage and current stay in SI; power is in
@@ -396,11 +410,6 @@ class SignalRecorder:
         v_base, i_base, s_base = base.v_phase_peak or 1.0, base.i_phase_peak or 1.0, base.s_base
         reference = next((signals[f"{name}.angle"] for name in p.sources
                           if f"{name}.angle" in signals), None)
-
-        def magnitude(value) -> tuple[float, str, str]:
-            if isinstance(value, complex):
-                return abs(value), "pu", "ac"
-            return abs(float(value)), "", "dc"
 
         def bus_voltage(name: str | None):
             return signals.get(f"{name}.u") if name else None
@@ -445,12 +454,12 @@ class SignalRecorder:
             # A source current enters its bus from the grid emf.
             device(name, bus_voltage(cfg.bus), signals.get(f"{name}.i"), 1.0,
                    f"source-{slug(name)}")
-        for name, cfg in _unit_items(p.units):
+        for name in self.units:
             device(name, signals.get(f"{name}.u_g"), signals.get(f"{name}.i_c"), 1.0,
                    f"unit-{slug(name)}")
         for name, cfg in p.elements.items():
-            entity = topology.owner(name)
-            if entity is None or entity.name != name:
+            entity = topology.entities.get(name)
+            if entity is None:
                 continue
             i = signals.get(f"{name}.i", signals.get(f"{name}.i1"))
             if entity.owner_kind == "connection":

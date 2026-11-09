@@ -396,6 +396,9 @@ def test_discrete_update_samples_a_settled_multirate_state(tmp_path):
 
 
 def test_black_box_validates_declared_dimensions_and_dependencies():
+    with pytest.raises(TypeError, match="cpp_export must be a boolean"):
+        BlackBoxSubsystem(lambda _t, _inputs: 0.0, inputs=(), outputs=("y",), cpp_export=1)
+
     with pytest.raises(ValueError, match="unknown inputs"):
         BlackBoxSubsystem(
             lambda _t, inputs: inputs,

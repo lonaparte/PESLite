@@ -10,6 +10,8 @@ interval is recomputed on arrays.
 from __future__ import annotations
 
 import cmath
+import contextlib
+import contextvars
 import functools
 import linecache
 import math
@@ -28,6 +30,41 @@ __all__ = ["RHS", "SolverStep", "Solver", "FIXED_METHODS", "ADAPTIVE_METHODS", "
            "IMPLICIT_FIXED_METHODS", "IMPLICIT_ADAPTIVE_METHODS", "CIRCUIT_MODELS", "TABLEAUS", "combine",
            "canonical_method", "integrator", "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "AutoSolver",
            "subintervals"]
+
+
+_ACCEPTED_STEP = contextvars.ContextVar("peslite_accepted_step", default=None)
+
+
+@contextlib.contextmanager
+def _accepted_steps(observer):
+    """Install one optional accepted-step observer for the current integration call."""
+    token = _ACCEPTED_STEP.set(observer)
+    try:
+        yield
+    finally:
+        _ACCEPTED_STEP.reset(token)
+
+
+def _accepted(t: float, y) -> None:
+    observer = _ACCEPTED_STEP.get()
+    if observer is not None:
+        observer.accept(t, np.asarray(y, dtype=float))
+
+
+def _accepted_checkpoint():
+    observer = _ACCEPTED_STEP.get()
+    return None if observer is None else observer.checkpoint()
+
+
+def _accepted_checkpoint_at(t: float):
+    observer = _ACCEPTED_STEP.get()
+    return None if observer is None else observer.checkpoint_at(t)
+
+
+def _accepted_restore(checkpoint) -> None:
+    observer = _ACCEPTED_STEP.get()
+    if observer is not None and checkpoint is not None:
+        observer.restore(checkpoint)
 
 RHS = Callable[[float, NDArray[np.float64]], NDArray[np.float64]]
 
@@ -137,6 +174,12 @@ TABLEAUS: dict[str, tuple[tuple[float, ...], tuple[tuple[float, ...], ...], tupl
     "heun": ((0.0, 1.0), ((1.0,),), (0.5, 0.5)),
     "RK4": ((0.0, 0.5, 0.5, 1.0), ((0.5,), (0.0, 0.5), (0.0, 0.0, 1.0)), (1 / 6, 1 / 3, 1 / 3, 1 / 6)),
 }
+
+# The closed left half-disk of radius 2.6 is inside classical RK4's absolute-stability region: by the
+# maximum principle |R(z)| on it is largest on its boundary, at most 0.982 on the arc and at most
+# one on the imaginary segment (|R(iy)| <= 1 for |y| <= 2 sqrt(2)). Euler and Heun touch the
+# imaginary axis only at zero, so they have no positive half-disk certificate.
+_STABILITY_HALF_DISK = {"RK4": 2.6}
 
 
 def combine(method: str, y: NDArray[np.float64], h: float, ks: list) -> NDArray[np.float64]:
@@ -276,12 +319,25 @@ class FixedStepSolver:
             values.append(eigenvalues)
         return np.concatenate(values) if values else np.empty(0, dtype=complex)
 
-    def _explicit_stable(self, step: float, modes: Sequence[tuple]) -> bool:
+    def _explicit_stable(
+        self,
+        step: float,
+        modes: Sequence[tuple],
+        certificates: Sequence[tuple[object, float] | None] | None = None,
+    ) -> bool:
         """Check assembled linear modes against this Runge-Kutta stability region."""
         _c, rows, weights = TABLEAUS[self.method]
-        for key, build in modes:
+        radius = _STABILITY_HALF_DISK.get(self.method, 0.0)
+        if certificates is None:
+            certificates = tuple(
+                mode[2] if radius and len(mode) > 2 else None for mode in modes
+            )
+        for mode, certificate in zip(modes, certificates):
+            key, build, *metadata = mode
             eigenvalues = self._mode_eigenvalues.get(key)
             if eigenvalues is None:
+                if certificate is not None and step * certificate[1] <= radius:
+                    continue
                 eigenvalues = self._eigenvalues(build())
                 self._mode_eigenvalues[key] = eigenvalues
                 self._mode_eigenvalues.move_to_end(key)
@@ -307,11 +363,32 @@ class FixedStepSolver:
         provider = getattr(self.model, "linear_modes", None)
         if not callable(provider):
             return False
+        radius = _STABILITY_HALF_DISK.get(self.method, 0.0)
+        certify = getattr(self.model, "linear_certificates", None)
+        if radius and callable(certify) and all(
+            certificate is not None and step * certificate[1] <= radius
+            for certificate in certify()
+        ):
+            return False
         modes = tuple(provider())
-        key = tuple(mode for mode, _build in modes), step
+        certificates = tuple(
+            mode[2] if radius and len(mode) > 2 else None for mode in modes
+        )
+        if all(
+            certificate is not None and step * certificate[1] <= radius
+            for certificate in certificates
+        ):
+            return False
+        identities = tuple(
+            ("certificate", certificate[0])
+            if certificate is not None and step * certificate[1] <= radius
+            else ("mode", mode[0])
+            for mode, certificate in zip(modes, certificates)
+        )
+        key = identities, step
         stable = self._stability_results.get(key)
         if stable is None:
-            stable = self._explicit_stable(step, modes)
+            stable = self._explicit_stable(step, modes, certificates)
             self._stability_results[key] = stable
             self._stability_results.move_to_end(key)
             while len(self._stability_results) > 64:
@@ -352,7 +429,7 @@ class FixedStepSolver:
             return self._implicit_advance(f, t0, t1, y0, h)
         c, a, _b = TABLEAUS[self.method]
         self.n_rhs += len(c) * n
-        if self.method == "RK4":
+        if self.method == "RK4" and _ACCEPTED_STEP.get() is None:
             lists = getattr(getattr(f, "__self__", None), "rhs_list", None)
             if lists is not None:
                 v = _rk4_on_floats(len(y0))(lists, t0, y0.tolist(), n, h)
@@ -365,6 +442,7 @@ class FixedStepSolver:
                 ks.append(f(t + c[j] * h, y if j == 0 else stage_state(y, h, a[j - 1], ks)))
             y = combine(self.method, y, h, ks)
             t += h
+            _accepted(t, y)
         return SolverStep(t1, y, self.n_rhs)
 
     def advance_guarded(
@@ -407,7 +485,7 @@ class FixedStepSolver:
                     break
             return watch.result(t1, y, self.n_rhs)
         lists = getattr(getattr(f, "__self__", None), "rhs_list", None)
-        if self.method == "RK4" and lists is not None:
+        if self.method == "RK4" and lists is not None and _ACCEPTED_STEP.get() is None:
             result = _rk4_on_floats_guarded(len(y0), synchronized_guard is not None)(
                 lists, guard, synchronized_guard, t0, y0.tolist(), n, h
             )
@@ -437,6 +515,7 @@ class FixedStepSolver:
                 calls += 1
             y = combine(self.method, y, h, ks)
             t += h
+            _accepted(t, y)
             if synchronized_guard is None and watch.accept(t, y):
                 break
         else:
@@ -570,7 +649,8 @@ class AdaptiveSolver:
         if not callable(modes):
             return
         damping: list[float] = []
-        for _key, build in modes():
+        for mode in modes():
+            build = mode[1]
             values = np.linalg.eigvals(build())
             oscillatory = values[np.abs(values.imag) > 0.0]
             if oscillatory.size:
@@ -658,6 +738,7 @@ class AdaptiveSolver:
                 )
             sizes.append(float(stepper.t) - t)
             t, y = float(stepper.t), np.array(stepper.y, dtype=float)
+            _accepted(t, y)
             if watch is not None and watch.accept(t, y):
                 break
         self._finish_stepper(stepper, jac_rhs, sizes)
@@ -715,7 +796,7 @@ class DormandPrince45:
         if step <= 0.0:
             raise ValueError("max_step must be positive")
         lists = getattr(getattr(f, "__self__", None), "rhs_list", None)
-        if lists is not None:
+        if lists is not None and _ACCEPTED_STEP.get() is None:
             return self._call_lists(lists, t0, t1, y0, step, step_callback)
         a, b, c, e = self._a, self._b, self._c, self._e
         t, y = t0, np.asarray(y0, dtype=float)
@@ -741,6 +822,7 @@ class DormandPrince45:
             accepted, h_next = self._control(h, err, step)
             if accepted:
                 t, y, k1 = t + h, y1, k7
+                _accepted(t, y)
                 if step_callback is not None and step_callback(h, y6, y1, k6, k7):
                     self._h = h_next
                     return SolverStep(t, y, self.n_rhs)

@@ -21,6 +21,20 @@ def test_energy_closure_of_open_loop_buck(tmp_path):
     assert abs(closure["relative"]) < 1.0e-4
 
 
+def test_energy_closure_uses_accepted_steps_instead_of_rounded_csv_rows(tmp_path):
+    params = peslite.load(EXAMPLES / "buck-open-loop-example.pes", **{
+        "simulation.t_end": 5.0e-4,
+        "simulation.output.energy": True,
+        "simulation.output.period": 2.0e-4,
+        "simulation.output.precision": 2,
+        "simulation.solver.phs_check_step": 1,
+    })
+    result = peslite.Simulation(params).run(out_dir=tmp_path)
+
+    assert energy_closure(result) == result.summary["energy_closure"]
+    assert abs(energy_closure(result)["relative"]) < 1.0e-3
+
+
 def test_energy_closure_checks_its_input():
     with pytest.raises(ValueError, match="energy table"):
         energy_closure({"t": [0.0, 1.0]})

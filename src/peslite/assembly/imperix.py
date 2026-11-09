@@ -610,13 +610,16 @@ def _export_imperix(simulation, out_dir, name, variables, reusable, *,
     generators = [_ImperixControlGenerator(key, unit, model, bindings[key])
                   for key, unit in prepared.system.units.items()]
     controllers = "\n".join(gen.header() for gen in generators)
+    loop_code = "".join(dict.fromkeys(
+        code for generator in generators for code in generator.loop_shared_code()
+    ))
     source, probes = _source(generators, adc, clocks, period, phase, runtime,
                             sampling_period=timing["sampling_period"], postscaler=timing["postscaler"])
     header = ("#pragma once\n#include <algorithm>\n#include <array>\n#include <cmath>\n"
               "#include <complex>\n#include <limits>\n#include <string_view>\n"
               "namespace peslite_generated {\nusing Complex = std::complex<double>;\n"
               "constexpr double pi = 3.141592653589793238462643383279502884;\n"
-              + _MOVING_WINDOW + "\n" + _CONTROL_MATH + "\n"
+              + _MOVING_WINDOW + "\n" + _CONTROL_MATH + "\n" + loop_code + "\n"
               + _parameter_header(runtime) + controllers + "}\n")
     profile = config.get("build", {})
     if not isinstance(profile, dict):

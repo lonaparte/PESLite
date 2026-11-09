@@ -1,0 +1,62 @@
+# PESLite 0.5.1
+# Three-phase continuous-control-set MPC with full Q, R and S stage-cost matrices.
+# Q weights alpha-beta current error; R weights leg commands; S weights command increments.
+base: {s_base: 10000.0, v_ll_rms: 400.0, f0: 50.0}
+buses:
+  pcc: {c_pu: 0.02, r_d_pu: 0.5}
+sources:
+  grid: {bus: pcc, x_pu: 0.02, r_pu: 0.002}
+units:
+  vsc:
+    type: vsc
+    bus: pcc
+    ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
+    dclink: {vdc_ref: 750.0, source: {type: voltage}}
+    # bridge: {model: pwm_averaging}
+    pwm: {f_sw: 20000.0}
+    ctrl:
+      type: gfl
+      period: 50.0e-6
+      computation: 1.0e-6
+      references: {id_ref_pu: 0.4}
+      loops:
+        SRFPLL: {kp_pu: 20.0, ki_pu: 1200.0}
+        ThreePhasePredictiveCurrentControl:
+          # algorithm: ccs
+          # prediction_horizon: 3
+          control_horizon: 3
+          tracking_weight:              # Q: 2 x 2, symmetric positive definite
+            - [1.20, 0.15]
+            - [0.15, 0.70]
+          input_weight:                 # R: 3 x 3, symmetric positive definite
+            - [0.0030, 0.0004, 0.0002]
+            - [0.0004, 0.0020, 0.0003]
+            - [0.0002, 0.0003, 0.0015]
+          rate_weight:                  # S: 3 x 3, symmetric positive definite
+            - [0.040, -0.004, 0.002]
+            - [-0.004, 0.030, 0.003]
+            - [0.002, 0.003, 0.025]
+          # input_min: 0.0
+          # input_max: 1.0
+          current_min: -25.0
+          current_max: 25.0
+          # max_iterations: 100
+          # tolerance: 1.0e-9
+          # feasibility_tolerance: 1.0e-7
+          # fallback: hold
+    protection:
+      overcurrent: {enable: true, limit_pu: 1.4}
+events:
+  current_step:
+    type: set
+    t: 0.01
+    set:
+      units.vsc.ctrl.references.id_ref_pu: 0.65
+      units.vsc.ctrl.references.iq_ref_pu: -0.10
+simulation:
+  t_end: 0.02
+  solver: {dt: 2.5e-6, linearisations: 0}
+  output: {period: 50.0e-6, signals: 1}
+meta:
+  title: Full-matrix predictive VSC current control
+  description: Constrained CCS-MPC with unequal and coupled Q, R and S weights.

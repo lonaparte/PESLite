@@ -12,6 +12,7 @@ import peslite
 import pytest
 
 from conftest import EXAMPLES
+from peslite.addons.functions.energy_audit import energy_closure
 from peslite.addons.functions.small_signal import small_signal_report
 from peslite.solver.linearization import linearize_loop
 from peslite.solver.model import Empty, Model
@@ -604,6 +605,13 @@ def test_independent_snapshot_outputs_survive_a_different_provider_failure(tmp_p
         assert observed[-1]["output.u"] == expected.plant["output.u"][-1]
     if failed != "energy":
         np.testing.assert_array_equal(result.energy["t"], expected.energy["t"])
+        assert result.summary["energy_closure"] == expected.summary["energy_closure"]
+    elif failure_time in (0.0, params.simulation.t_end):
+        assert result.summary["energy_closure"] is None
+        with pytest.raises(ValueError, match="energy read failed"):
+            energy_closure(result)
+    else:
+        assert result.summary["energy_closure"] == expected.summary["energy_closure"]
     if failed == "logs":
         index = np.flatnonzero(np.isclose(result.ctrl["converter.t"], failure_time,
                                           atol=1e-12, rtol=0.0))[0]

@@ -13,6 +13,7 @@ branches: {}
 sources: {}
 elements: {}
 units: {}
+signals: {}
 events: {}
 
 simulation:
@@ -31,6 +32,7 @@ meta: {}
 | `units` with `type: vsc` | voltage-source converters | [Voltage-Source Converters](Voltage-Source-Converters.md) |
 | converter `bridge`, `pwm`, `ctrl`, `meas`, `protection` | bridge model and sampled control | [Bridge and PWM](Bridge-and-PWM.md) |
 | `units` with `type: dc_converter` or `wpt` | DC converters and coupled links | [DC converters and WPT](DC-Converters-and-WPT.md) |
+| `signals` | time-varying controller reference tables | [Reference Signals](Reference-Signals.md) |
 | `events` and `simulation.initial` | event timeline and continuation | [Events Timeline](Events-Timeline.md) |
 | `simulation.output` and `simulation.progress` | files, signals and progress | [Output and Results](Output-and-Results.md) |
 | `simulation.solver` | integration settings | [Solvers](Solvers.md) |
@@ -42,8 +44,9 @@ section simply omits it.
 
 ## Names and paths
 
-Names are unique within each of `buses`, `branches`, `sources`, `elements` and `units`. They must
-be non-empty and cannot contain a dot. Dots separate public configuration, state and signal paths:
+Names are unique within each of `buses`, `branches`, `sources`, `elements`, `units` and `signals`.
+They must be non-empty and cannot contain a dot. Dots separate public configuration, state and
+signal paths:
 
 ```text
 units.vsc.ctrl.references.p_ref_pu

@@ -104,6 +104,8 @@ class ControlTypeSpec:
     # Registered modulator (components.pwm.MODULATOR_TYPES) of a sampled bridge commanded by
     # this type's outputs; None: the carrier modulation of duty ratios.
     modulator: str | None = None
+    # Loop class per role supplied when a sampled graph declares other loops but omits that role.
+    default_loops: Mapping[str, str] = field(default_factory=dict)
 
 
 def validate_scalar_voltage_references(references: Any, where: str) -> None:

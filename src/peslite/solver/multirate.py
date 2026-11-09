@@ -15,8 +15,9 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .energy import re_product
-from .integrators import (EXPLICIT_FIXED_METHODS, RHS, TABLEAUS, SolverStep, combine,
-                          canonical_method, integrator, stage_state, subintervals)
+from .integrators import (EXPLICIT_FIXED_METHODS, RHS, TABLEAUS, SolverStep, _accepted,
+                          _accepted_steps, combine, canonical_method, integrator, stage_state,
+                          subintervals)
 from .model import ConfigError
 
 __all__ = ["MultirateSolver", "HeldStorage", "make_solver", "parse_step"]
@@ -183,6 +184,18 @@ class MultirateSolver:
         self._assignment = assignment
         self._plan_revision = model.plan_revision
         self._refresh_group_plans()
+        empty = [label for label, group in (("inner", self.inner), ("outer", self.outer))
+                 if group is not None and not np.any(group.mask)]
+        if empty:
+            selected = sorted(name for name, label in assignment.items() if label in empty)
+            owners = sorted(
+                name for name, subsystem in zip(model.names, model.subsystems)
+                if subsystem.state_names
+            )
+            raise ValueError(
+                f"subsystems {selected} select no continuous states for their own schedule; "
+                f"the continuous states belong to {owners}"
+            )
         self.window = self.window_steps * self.dt
         self.outer_method = outer_method or method
         self._outer_solver = (integrator(self.outer_method, self.window, rtol, atol)
@@ -512,6 +525,7 @@ class MultirateSolver:
         for _ in range(n):
             y = self._macro_step(t, H, y)
             t += H
+            _accepted(t, y)
         return y
 
     def _outer_at(self, t: float) -> Optional[NDArray[np.float64]]:
@@ -689,12 +703,13 @@ class MultirateSolver:
 
         trajectory = [y0]
         values, t = y0[indices], t0
-        for _ in range(count):
-            values = self._inner_solver(derivatives, t, t + h, values).y
-            t += h
-            state = np.array(y1, dtype=float)
-            state[indices] = values
-            trajectory.append(state)
+        with _accepted_steps(None):
+            for _ in range(count):
+                values = self._inner_solver(derivatives, t, t + h, values).y
+                t += h
+                state = np.array(y1, dtype=float)
+                state[indices] = values
+                trajectory.append(state)
         return trajectory
 
     def _track_flow(self, t: float) -> None:

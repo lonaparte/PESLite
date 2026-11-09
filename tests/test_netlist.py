@@ -322,6 +322,15 @@ def test_causal_transformer_reduction_supports_a_shared_voltage_reference():
     np.testing.assert_allclose(evaluate(0.0, ()), [4.5, -1.25, -3.75], rtol=0.0, atol=1e-12)
 
 
+def test_dynamic_transformer_reports_coverage_by_its_declared_ratio_bounds():
+    ratio = [0.5]
+    transformer = Transformer(Node(), None, Node(), None, lambda: ratio[0], bounds=(0.0, 1.0))
+
+    assert transformer.within_bounds(transformer.ratio())
+    ratio[0] = 1.1
+    assert not transformer.within_bounds(transformer.ratio())
+
+
 def test_custom_ac_waveform_remains_the_source_of_its_declared_netlist():
     class CustomSource(ACVoltageSource):
         def set_outputs(self, t):
@@ -434,7 +443,8 @@ def test_circuit_freezes_only_when_its_runtime_has_not_bound_the_topology(
     circuit, = simulation.system.circuits
 
     circuit.freeze_topology()
-    assert (circuit.netlist._frozen_topology is not None) is frozen
+    # A frozen mode makes its ratio copy on the first topology request.
+    assert (circuit.netlist._frozen_mode is not None) is frozen
     circuit.release_topology()
 
 
@@ -632,7 +642,7 @@ def test_export_planning_covers_default_device_circuits_and_diode_modes():
     assert set(solve.inputs) == set(circuit.inputs)
 
 
-def test_device_ratio_changes_factorize_each_exact_stability_mode_at_most_once(
+def test_device_ratio_stability_certificate_avoids_exact_mode_spectra(
         monkeypatch, tmp_path):
     count = 0
     original = nl._DenseSolve.__init__
@@ -659,9 +669,97 @@ def test_device_ratio_changes_factorize_each_exact_stability_mode_at_most_once(
     new_structures = sum(
         len(circuit.netlist._structures) for circuit in simulation.system.circuits
     ) - initial_structures
-    assert modes
-    assert count - initial <= len(modes) + new_structures
-    assert len(simulation.solver._stability_results) == len(modes)
+    assert not modes
+    assert not simulation.solver._stability_results
+    assert count - initial <= new_structures
+
+
+def test_transformer_ratio_range_certificate_bounds_the_full_declared_box():
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "gfl-example.pes", **QUIET, **{
+            "simulation.solver.circuit_model": "device",
+        },
+    ))
+    circuit, = simulation.system.circuits
+    topology = circuit.netlist.topology()
+    certificate = topology._state_matrix_range_certificate()
+    assert certificate is not None
+    rng = np.random.default_rng(8317)
+    for _ in range(20):
+        ratios = tuple(
+            rng.uniform(lower, upper)
+            for transformer in circuit.netlist._transformers
+            for lower, upper in (transformer.bounds,)
+        )
+        mode = nl.Mode(topology.mode.closed, topology.mode.conducting, ratios)
+        matrix = circuit.netlist._compiled(mode).state_space.A
+        scale = topology._stability_scale()
+        scaled = scale[:, None] * matrix / scale[None, :]
+        assert np.linalg.norm(scaled, 2) <= certificate[1] * (1.0 + 1e-12)
+        assert np.max(np.abs(np.linalg.eigvals(matrix))) <= certificate[1] * (1.0 + 1e-12)
+
+
+def test_symmetrizing_scale_bounds_a_stiff_cable_by_its_spectral_radius():
+    """Balancing keeps the cable's rigorous matrix-norm bound close to its spectral radius."""
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "cable-gfl-example.pes", **QUIET, **{
+            "simulation.solver.circuit_model": "device",
+        },
+    ))
+    circuit, = simulation.system.circuits
+    matrix = circuit.netlist.topology().state_space.A
+    scale = nl._symmetrizing_scale(matrix)
+    radius = np.max(np.abs(np.linalg.eigvals(matrix)))
+    bound = nl._scaled_norm(matrix, scale, scale)
+    assert np.all(scale > 0.0)
+    assert radius <= bound * (1.0 + 1e-12)
+    assert bound < 1.1 * radius < 0.05 * np.linalg.norm(matrix, "fro")
+
+
+@pytest.mark.parametrize("circuit_model", ["device", "statewise", "nodal"])
+def test_cable_ratio_modes_are_certified_without_spectra(circuit_model, monkeypatch, tmp_path):
+    """A declared ratio range avoids exact spectra for every covered control sample."""
+    count = 0
+    eigvals = np.linalg.eigvals
+
+    def counting(matrix):
+        nonlocal count
+        count += 1
+        return eigvals(matrix)
+
+    monkeypatch.setattr(np.linalg, "eigvals", counting)
+    params = peslite.load(EXAMPLES / "cable-gfl-example.pes", **QUIET, **{
+        "simulation.t_end": 0.005,
+        "simulation.solver.circuit_model": circuit_model,
+    })
+    simulation = peslite.Simulation(params)
+    simulation.run(out_dir=tmp_path)
+    (circuit,) = simulation.system.circuits
+    certificate = circuit.netlist.topology()._state_matrix_range_certificate()
+    assert certificate is not None
+    assert params.simulation.solver.dt * certificate[1] <= 2.6
+    assert count == 0
+
+
+def test_transformer_ratio_outside_the_declared_box_uses_its_exact_mode():
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "gfl-example.pes", **QUIET, **{
+            "simulation.solver.circuit_model": "device",
+        },
+    ))
+    circuit, = simulation.system.circuits
+    topology = circuit.netlist.topology()
+    ratios = tuple(
+        upper + 1.0 if index == 0 else (lower + upper) / 2.0
+        for index, transformer in enumerate(circuit.netlist._transformers)
+        for lower, upper in (transformer.bounds,)
+    )
+    mode = nl.Mode(topology.mode.closed, topology.mode.conducting, ratios)
+    outside = circuit.netlist._compiled(mode)
+
+    certificate = outside.state_matrix_stability_certificate()
+    assert certificate is not None
+    assert certificate[0] == outside.state_matrix_key()
 
 
 @pytest.mark.parametrize("example", [
@@ -673,7 +771,7 @@ def test_device_stability_matrix_matches_the_current_netlist_mode(example):
     ))
     for circuit in simulation.system.circuits:
         circuit.receive()
-        _key, build = circuit.linear_mode()
+        _key, build, _bound = circuit.linear_mode()
         np.testing.assert_allclose(
             build(), circuit.netlist.topology().state_space.A,
             rtol=1e-10, atol=1e-9,
@@ -790,3 +888,15 @@ def test_every_example_builds_with_an_electrical_netlist(example, circuit_model)
         **{"simulation.solver.circuit_model": circuit_model},
     ))
     assert simulation.system.circuits
+
+
+def test_device_outputs_evaluate_each_published_value_once():
+    """A node voltage published to the circuit and to every port at that node is one value."""
+    simulation = peslite.Simulation(peslite.load(EXAMPLES / "gfl-example.pes", **QUIET))
+    source = simulation.system.model.compiled_source
+    outputs = source[source.index("def _outputs("):source.index("def _zoh_outputs(")]
+    values = [line.split(" = ", 1)[1].split("  #")[0] for line in outputs.splitlines()
+              if " = " in line and line.split(" = ", 1)[0].strip().startswith("_")
+              and "(" in line.split(" = ", 1)[1]]
+    published = [value for value in values if "1j" in value or "*" in value]
+    assert published and len(published) == len(set(published))

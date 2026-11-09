@@ -164,6 +164,24 @@ def test_backend_cannot_change_the_constraints_used_for_independent_validation()
     assert result.action is None
 
 
+def test_backend_solution_must_be_feasible_and_optimal_and_failure_is_classified_independently():
+    model = LinearModel([[1.0]], [[1.0]])
+    suboptimal = CCSMPC(
+        model, 2, input_weight=1.0,
+        backend=lambda _problem: SolverResult(np.zeros(2), True, "optimal"),
+    ).solve([1.0], [0.0])
+    assert not suboptimal.success and suboptimal.status == "inaccurate"
+    assert suboptimal.action is None
+
+    infeasible = CCSMPC(
+        LinearModel([[1.0]], [[0.0]]), 2,
+        state_bounds=(-0.1, 0.1),
+        backend=lambda _problem: SolverResult(None, False, "solver_failure"),
+    ).solve([1.0], [0.0])
+    assert not infeasible.success and infeasible.status == "infeasible"
+    assert infeasible.action is None
+
+
 @pytest.mark.parametrize("solution", [[np.nan, 0.0], [0.0], [2.0, 0.0], [0.0 + 1j, 0.0], ["bad", "data"]])
 def test_invalid_backend_solution_never_becomes_an_action(solution):
     controller = CCSMPC(LinearModel([[1.0]], [[1.0]]), 2, input_bounds=(-1.0, 1.0),
@@ -197,7 +215,7 @@ def test_infeasible_state_constraints_fail_without_applying_invalid_control():
                         input_bounds=(-1.0, 1.0), state_bounds=(-0.1, 0.1))
     result = controller.solve([1.0], [0.0])
     assert not result.success and result.action is None
-    assert result.status in ("infeasible", "solver_failure")
+    assert result.status == "infeasible"
 
 
 def test_equal_input_bounds_produce_the_only_admissible_plan():
@@ -211,7 +229,7 @@ def test_fixed_inputs_and_infeasible_state_constraints_return_failure():
     result = CCSMPC(LinearModel([[1.0]], [[1.0]]), 2,
                     input_bounds=(0.0, 0.0), state_bounds=(-0.1, 0.1)).solve([1.0], [0.0])
     assert not result.success and result.action is None
-    assert result.status in ("infeasible", "solver_failure")
+    assert result.status == "infeasible"
 
 
 def test_model_and_solve_inputs_are_not_modified():
@@ -307,6 +325,54 @@ def test_fcs_short_horizon_holds_last_move_and_ties_keep_configured_order():
     assert result.success and result.evaluations == 2
     np.testing.assert_array_equal(result.inputs, [[1.0], [1.0], [1.0]])
     np.testing.assert_array_equal(result.states, [[0.0], [1.0], [2.0], [3.0]])
+
+
+def test_fcs_numerical_ties_prefer_the_smallest_normalized_switching_move():
+    controller = FCSMPC([[10.0, 0.0], [2.0, 1.0], [0.0, 4.0]], 1,
+                        lambda x, _u, _k: x,
+                        lambda _x, u, _ref, _previous, _k: 1.0 + 1e-16 * u[0])
+
+    result = controller.solve([0.0], [0.0], [2.0, 1.0])
+
+    assert result.success
+    np.testing.assert_array_equal(result.action, [2.0, 1.0])
+
+
+def test_vectorized_fcs_callbacks_share_the_scalar_search_semantics():
+    actions = np.array([[-0.5], [0.25], [0.75]])
+    reference = np.array([[0.2], [-0.1], [0.3]])
+    calls = []
+
+    def prediction(x, u, stage):
+        calls.append(("prediction", stage, len(x)))
+        return 0.8 * x + u + 0.02 * x * x
+
+    def objective(x, u, target, previous, stage):
+        calls.append(("objective", stage, len(x)))
+        return np.sum((x - target) ** 2 + 0.1 * u ** 2 + 0.2 * (u - previous) ** 2, axis=1)
+
+    def constraint(x, _u, stage):
+        calls.append(("constraint", stage, len(x)))
+        return np.concatenate((x + 1.0, 1.0 - x), axis=1)
+
+    vectorized = FCSMPC(
+        actions, 3, prediction, objective, constraint=constraint, vectorized=True,
+    ).solve([0.1], reference, [0.25])
+    scalar = FCSMPC(
+        actions, 3,
+        lambda x, u, _stage: 0.8 * x + u + 0.02 * x * x,
+        lambda x, u, target, previous, _stage: float(np.sum(
+            (x - target) ** 2 + 0.1 * u ** 2 + 0.2 * (u - previous) ** 2
+        )),
+        constraint=lambda x, _u, _stage: np.r_[x + 1.0, 1.0 - x],
+    ).solve([0.1], reference, [0.25])
+
+    assert vectorized.success and scalar.success
+    assert vectorized.evaluations == scalar.evaluations == len(actions) ** 3
+    np.testing.assert_array_equal(vectorized.inputs, scalar.inputs)
+    np.testing.assert_allclose(vectorized.states, scalar.states)
+    assert vectorized.objective == pytest.approx(scalar.objective)
+    assert sum(name == "prediction" for name, _stage, _size in calls) <= 3
 
 
 def test_fcs_infeasibility_budget_exhaustion_and_nonfinite_cost_have_distinct_statuses():

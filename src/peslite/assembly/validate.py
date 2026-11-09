@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import warnings
 import numpy as np
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 
 from typing import TYPE_CHECKING, Optional
 
@@ -175,6 +175,43 @@ def _control(c, pwm, where: str, continuous: bool = False) -> None:
     reference_validator = profile.reference_validator
     if reference_validator is not None:
         reference_validator(c.references, f"{where}.references")
+    bindings = c._reference_bindings
+    if bindings:
+        reference_inputs = {
+            path.partition(".")[2]
+            for path in (profile.interface.inputs if profile.interface else ())
+            if path.startswith("references.")
+        }
+        unsupported = set(bindings) - reference_inputs
+        if unsupported:
+            raise ConfigError(
+                f"{where}.references: control type {c.type!r} does not expose dynamic input(s) "
+                f"{sorted(unsupported)}"
+            )
+    for target, binding in bindings.items():
+        values = tuple(binding.scale * value for value in binding.signal.value)
+        varying = any(value != values[0] for value in values[1:])
+        if binding.integer and varying and binding.signal.interpolation != "zero_order_hold":
+            raise ConfigError(
+                f"{where}.references.{binding.input_name}: an integer reference requires "
+                "zero_order_hold interpolation"
+            )
+        if binding.integer and varying and binding.signal.extrapolation == "linear":
+            raise ConfigError(
+                f"{where}.references.{binding.input_name}: an integer reference cannot use "
+                "linear extrapolation"
+            )
+        if binding.integer and any(int(value) != value for value in values):
+            raise ConfigError(
+                f"{where}.references.{binding.input_name}: an integer reference requires "
+                "integer table values"
+            )
+        if reference_validator is not None:
+            for index, value in enumerate(values):
+                candidate = replace(
+                    c.references, **{target: int(value) if binding.integer else value},
+                )
+                reference_validator(candidate, f"signals.{binding.name}.value[{index}]")
     if profile.validator is not None:
         profile.validator(c, where)
 

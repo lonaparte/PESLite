@@ -103,6 +103,7 @@ class _BlackBoxElement(Element):
     class Params:
         decay: float
         initial: float
+        native: bool = True
         type: str = "test_black_box"
 
     def __init__(self, name, cfg, buses, p):
@@ -114,6 +115,7 @@ class _BlackBoxElement(Element):
             state={"x": cfg.initial},
             rhs=lambda _t, state, _inputs: -cfg.decay * state,
             feedthrough=(),
+            cpp_export=cfg.native,
             observer=True,
         )
 
@@ -1151,6 +1153,25 @@ def test_generated_cpp_runs_black_box_outputs_and_peslite_state_equations(tmp_pa
     assert cpp_plant["model.y"] == pytest.approx(python_plant["model.y"], rel=2e-10)
     text = source.read_text(encoding="utf-8")
     assert "dy[0]" in text and "model.y" in text
+
+
+def test_cpp_export_reports_a_subsystem_without_a_native_generator(tmp_path):
+    params = from_dict({
+        "base": {"s_base": 1.0},
+        "elements": {
+            "model": {
+                "type": "test_black_box", "decay": 4.0, "initial": 3.0, "native": False,
+            },
+        },
+        "simulation": {
+            "t_end": 0.01,
+            "solver": {"type": "fixed", "method": "rk4", "dt": 1.0e-4},
+            "energy_check": "off",
+        },
+    })
+
+    with pytest.raises(TypeError, match=r"subsystem.*no native generator.*model"):
+        peslite.export(params, "cpp", tmp_path / "unsupported")
 
 
 @pytest.mark.parametrize(("initial", "t_end", "expected"), [
