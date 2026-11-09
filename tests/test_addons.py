@@ -277,3 +277,30 @@ def test_custom_cable_gfl_case_runs_in_every_bridge_mode(examples, tmp_path, mod
     assert np.isfinite(result.states["cable1.iL1.re"]).all()
     assert np.isfinite(result.states["cable1.uC2.im"]).all()
     assert {"cable1.i1_a", "cable1.i2_a"} <= result.plant.keys()
+
+
+def test_custom_cable_parameters_can_change_at_an_event(examples, tmp_path):
+    params = peslite.load(
+        examples / "cable-gfl-example.pes",
+        **{
+            "simulation.t_end": 0.001,
+            "simulation.solver.type": "adaptive",
+            "simulation.solver.method": "DP45",
+            "simulation.solver.linearisations": 0,
+            "simulation.output.signals": 0,
+            "units.vsc.bridge.model": "averaging",
+        },
+    )
+    initial = params.replace(**{"elements.cable1.r_per_km": 0.2})
+    event = params.replace(**{
+        "events.cable_r": {
+            "type": "set",
+            "t": 0.0,
+            "set": {"elements.cable1.r_per_km": 0.2},
+        }
+    })
+    finals = [
+        peslite.Simulation(case).run(out_dir=tmp_path / str(index)).final_states()
+        for index, case in enumerate((initial, event))
+    ]
+    assert finals[1] == pytest.approx(finals[0], rel=1e-9)

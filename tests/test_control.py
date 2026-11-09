@@ -132,8 +132,11 @@ class _DirectThreePhaseDuty(Loop):
 def test_terminal_actuator_loop_replaces_current_control_and_modulation(gfl):
     params = gfl()
     loops = dict(params.unit("vsc").ctrl.loops)
-    loops.pop("CurrentLoop")
     loops.pop("ThreePhaseModulation")
+    implicit = params.replace(**{"units.vsc.ctrl.loops": loops}).unit("vsc")
+    assert implicit.ctrl.loops["ThreePhaseModulation"].period == implicit.ctrl.period
+    assert "ctrl.loops.ThreePhaseModulation" in implicit.derived_defaults
+    loops.pop("CurrentLoop")
     loops["_DirectThreePhaseDuty"] = _DirectThreePhaseDuty.Params(
         period=params.unit("vsc").ctrl.period,
     )

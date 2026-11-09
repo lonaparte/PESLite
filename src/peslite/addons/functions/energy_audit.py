@@ -12,6 +12,8 @@ __all__ = ["energy_closure"]
 def energy_closure(result: Any) -> dict[str, float]:
     """Return stored, supplied, dissipated, impulsive and residual energy in joules."""
     summary = getattr(result, "summary", {})
+    if isinstance(summary, Mapping) and summary.get("energy_closure", ...) is None:
+        raise ValueError("accepted-step energy closure is unavailable because an energy read failed")
     accumulated = summary.get("energy_closure") if isinstance(summary, Mapping) else None
     if isinstance(accumulated, Mapping):
         return {name: float(value) for name, value in accumulated.items()}

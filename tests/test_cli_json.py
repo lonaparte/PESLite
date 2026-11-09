@@ -119,6 +119,13 @@ def test_json_configuration_error_has_a_stable_envelope(capsys):
     assert payload["error"]["code"] == "configuration_error"
     assert payload["config"].endswith("gfl-example.pes")
     assert payload["output"] is None and payload["simulation"] is None
+    assert peslite.main([
+        "validate", "gfl-example", "--set", "simulation.t_end=invalid"
+    ]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.startswith("peslite validate: error: ")
+    assert "Traceback" not in captured.err
+    assert payload["error"]["message"] in captured.err
 
 
 def test_json_malformed_configuration_is_an_input_error(capsys, tmp_path):

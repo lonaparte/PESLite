@@ -644,6 +644,12 @@ class UnitParams:
                 ctrl = replace(ctrl, references=references)
                 derived.add("ctrl.references.omega")
             loops = dict(ctrl.loops)
+            if loops and not continuous:
+                roles = {LOOP_TYPES[loop.type].role for loop in loops.values()}
+                for role, name in control_type(ctrl.type).default_loops.items():
+                    if role not in roles:
+                        loops[name] = loop_key_type(name).Params(period=ctrl.period)
+                        derived.add(f"ctrl.loops.{name}")
             for name, loop in loops.items():
                 if not continuous and loop.period is None:
                     loops[name] = replace(loop, period=ctrl.period)

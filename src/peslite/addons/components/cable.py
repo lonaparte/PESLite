@@ -39,14 +39,7 @@ class CableModel(NetworkComponent):
     def __init__(self, *, length_km: float, r_per_km: float, l_per_km: float,
                  g_per_km: float, c_per_km: float, sections: int,
                  voltage0: complex) -> None:
-        cell = length_km / sections
-        end = 0.5 * cell
-        lengths = (end, *(cell for _ in range(sections - 1)), end)
         self.sections = sections
-        self.series_r = tuple(r_per_km * span for span in lengths)
-        self.series_l = tuple(l_per_km * span for span in lengths)
-        self.shunt_g = g_per_km * cell
-        self.shunt_c = c_per_km * cell
         self.state_names = _state_record(sections).__slots__
         self.state_dimensions = dict.fromkeys(self.state_names, 2)
         initial = {name: 0j for name in self.state_names}
@@ -63,17 +56,35 @@ class CableModel(NetworkComponent):
             electrical_domain="ac", standalone="voltage"
         )
         self.ports = (self.port1, self.port2)
+        self.set_parameters(
+            length_km=length_km,
+            r_per_km=r_per_km,
+            l_per_km=l_per_km,
+            g_per_km=g_per_km,
+            c_per_km=c_per_km,
+        )
+
+    def set_parameters(self, *, length_km: float, r_per_km: float, l_per_km: float,
+                       g_per_km: float, c_per_km: float) -> None:
+        """Set the ladder values and their stored-energy declarations."""
+        cell = length_km / self.sections
+        end = 0.5 * cell
+        lengths = (end, *(cell for _ in range(self.sections - 1)), end)
+        self.series_r = tuple(r_per_km * span for span in lengths)
+        self.series_l = tuple(l_per_km * span for span in lengths)
+        self.shunt_g = g_per_km * cell
+        self.shunt_c = c_per_km * cell
         self.storage = tuple(
             StoragePort(
                 f"iL{k + 1}", inductance, 1.5,
                 ((self.port1, "voltage", 1.0),) if k == 0 else
-                ((self.port2, "voltage", -1.0),) if k == sections else (),
+                ((self.port2, "voltage", -1.0),) if k == self.sections else (),
                 "inductor",
             )
             for k, inductance in enumerate(self.series_l)
         ) + tuple(
             StoragePort(f"uC{k + 1}", self.shunt_c, 1.5, kind="capacitor")
-            for k in range(sections)
+            for k in range(self.sections)
         )
 
     def network(self, nb):
@@ -172,3 +183,17 @@ class Cable(Element):
     def signals(self) -> dict[str, complex]:
         return {f"{self.name}.i1": self.model.output.i1,
                 f"{self.name}.i2": self.model.output.i2}
+
+    def retune(self, cfg: Any) -> bool:
+        """Take new cable values while preserving the ladder states."""
+        if self.cfg == cfg:
+            return False
+        self.cfg = cfg
+        self.model.set_parameters(
+            length_km=cfg.length_km,
+            r_per_km=cfg.r_per_km,
+            l_per_km=cfg.l_per_km,
+            g_per_km=cfg.g_per_km,
+            c_per_km=cfg.c_per_km,
+        )
+        return True

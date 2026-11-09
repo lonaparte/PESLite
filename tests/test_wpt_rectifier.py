@@ -365,11 +365,14 @@ def test_capacitive_diode_bridge_is_exported_without_a_controller(tmp_path):
 
 def test_windowed_solver_groups_are_rejected():
     tree = _tree(SS, 200.0, 1e-5)
-    tree["simulation"]["solver"]["subsystems"] = {"charger.primary.dclink": 4}
+    tree["simulation"]["solver"]["subsystems"] = {"charger.link": 4}
     tree["simulation"]["output"]["signals"] = False
     simulation = peslite.Simulation(from_dict(tree))
     with pytest.raises(ConfigError, match="single-rate solver"):
         simulation.run(out_dir=None)
+    tree["simulation"]["solver"]["subsystems"] = {"charger.primary.dclink": 4}
+    with pytest.raises(ConfigError, match=r"no continuous states.*belong to \['charger.link'\]"):
+        peslite.Simulation(from_dict(tree))
 
 
 def test_parameter_files_round_trip_a_diode_full_bridge(tmp_path):

@@ -1627,8 +1627,6 @@ class VSCController(_GraphRuntime):
         self._configure_limit(name)
         if name == self._terminal and self._command_output is not None:
             terminal = self.graph.nodes[name]
-            if self.stage is not None and getattr(terminal, "stage", None) is not None:
-                terminal.stage = self.stage
             self._terminal_node = terminal
             self.stage = getattr(terminal, "stage", None)
             self._configure_limit(self._command_output[0])
@@ -2250,6 +2248,9 @@ for _control_name in ("gfl", "gfm", "custom"):
         grid_following=_control_name == "gfl",
         default_bridge="three_phase_bridge",
         controller_factory=VSCController,
+        default_loops={} if _control_name == "custom" else {
+            "modulation": "ThreePhaseModulation"
+        },
     )
 register_control_type(
     "dc",

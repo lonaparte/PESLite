@@ -624,9 +624,6 @@ class Circuit:
                 net.add(CurrentSource(
                     None, nodes[id(port)], lambda _t, port=port: port.current
                 ))
-        net.bind_coefficients()
-        if old is not None:
-            net.reuse_dynamic_equations(old)
         declared = set(net.states.tolist())
         missing = sorted(f"{type(c).__name__}.{n}" for c, n, _z, i in self.layout if i not in declared)
         if missing:
@@ -862,8 +859,6 @@ class Circuit:
         dependencies = set()
         for name, value in namespace.items():
             if re.search(rf"\b{re.escape(name)}\b", active) is None:
-                continue
-            if name in self.netlist._coefficient_values:
                 continue
             names = self._input_names(value, copied)
             if names is None:
@@ -2561,8 +2556,8 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
 class _CircuitPlan:
     """Static state mapping and exact-column metadata of one assembled circuit."""
 
-    __slots__ = ("circuit", "local_to_model", "transform", "inverse", "norm_scale", "states",
-                 "exact", "skipped", "groups", "labels", "interface")
+    __slots__ = ("circuit", "local_to_model", "transform", "inverse", "states", "exact",
+                 "skipped", "groups", "labels", "interface")
 
     def __init__(self, circuit: Circuit, local_to_model: np.ndarray, transform: np.ndarray,
                  inverse: np.ndarray, states: np.ndarray, exact: np.ndarray, skipped: np.ndarray,
@@ -2570,7 +2565,6 @@ class _CircuitPlan:
         self.circuit = circuit
         self.local_to_model = local_to_model
         self.transform, self.inverse = transform, inverse
-        self.norm_scale = float(np.linalg.norm(transform, 2) * np.linalg.norm(inverse, 2))
         self.states, self.exact, self.skipped = states, exact, skipped
         self.groups, self.labels, self.interface = tuple(groups), tuple(labels), frozenset(interface)
 
@@ -2745,10 +2739,8 @@ def circuit_linear_modes(circuits: Sequence[Circuit]):
     return tuple(
         ((id(circuit.netlist), key),
          lambda circuit=circuit, matrix=matrix: _placed_linear_matrix(circuit, matrix()),
-         None if certificate is None else (
-             (id(circuit.netlist), certificate[0]),
-             circuit._structure_plan.norm_scale * certificate[1],
-         ))
+         # Similarity preserves the spectrum, so the netlist bound also certifies the placed matrix.
+         None if certificate is None else ((id(circuit.netlist), certificate[0]), certificate[1]))
         for circuit in circuits
         for key, matrix, certificate in (circuit.linear_mode(),)
     )

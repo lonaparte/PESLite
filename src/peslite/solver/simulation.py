@@ -123,21 +123,59 @@ class _SnapshotRead:
         return self._value
 
 
+class _VersionedStateRead:
+    """Read one physical state once per time and model version, including a failed read."""
+
+    __slots__ = ("_read", "_version", "_held", "_state", "_value", "_error")
+
+    def __init__(self, read: Callable, version: Callable[[], tuple]) -> None:
+        self._read, self._version = read, version
+        self._held, self._state, self._value, self._error = None, None, None, None
+
+    def __call__(self, t: float, state: np.ndarray):
+        held = (t, *self._version())
+        if held != self._held or state is not self._state:
+            self._held, self._state = held, state
+            self._value, self._error = None, None
+            try:
+                self._value = self._read(t, state)
+            except Exception as exc:
+                self._error = exc
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+
 def _finite(y: np.ndarray) -> bool:
     """Return True when every entry of ``y`` is finite."""
     return all(map(math.isfinite, y.tolist()))
 
 
 class _AcceptedEnergy:
-    """Trapezoidal power quadrature on the solver's accepted physical states."""
+    """Trapezoidal power quadrature on accepted physical states.
 
-    def __init__(self, model) -> None:
+    Energy closure is an optional output. A numerical read failure disables this accounting
+    without stopping the physical simulation.
+    """
+
+    def __init__(self, model, balance: Callable) -> None:
         self.model = model
+        self.balance = balance
         self.started = False
+        self.unavailable = False
         self.supplied = self.dissipated = 0.0
         self.last_t = self.last_supplied = self.last_dissipated = 0.0
         self.initial_energy = self.initial_impulsive = self.initial_impulsive_supply = 0.0
         self.history: list[tuple[float, tuple]] = []
+
+    def _evaluate(self, t: float, name: str, read: Callable, *args):
+        if self.unavailable:
+            return None
+        value = _optional_output(t, f"energy closure: {name}", read, *args)
+        if value is _UNAVAILABLE:
+            self.unavailable = True
+            return None
+        return value
 
     @staticmethod
     def _impulses(report) -> tuple[float, float]:
@@ -159,8 +197,12 @@ class _AcceptedEnergy:
 
     def begin_interval(self, t: float, y: np.ndarray) -> None:
         """Seed the first interval or refresh power after a boundary changed the model."""
+        if self.unavailable:
+            return
         if not self.started:
-            report = self.model.energy_balance(t, y)
+            report = self._evaluate(t, "energy balance", self.balance, t, y)
+            if report is None:
+                return
             self.initial_energy = report.energy
             self.initial_impulsive, self.initial_impulsive_supply = self._impulses(report)
             self.last_supplied, self.last_dissipated = report.supplied, report.dissipated
@@ -171,12 +213,18 @@ class _AcceptedEnergy:
             return
         if abs(t - self.last_t) > TIME_EPS:
             raise RuntimeError("energy accounting did not reach the previous interval boundary")
-        self.last_supplied, self.last_dissipated = self.model.energy_powers(t, y)
+        powers = self._evaluate(t, "power", self.model.energy_powers, t, y)
+        if powers is None:
+            return
+        self.last_supplied, self.last_dissipated = powers
         self.history.clear()
         self._remember()
 
     def accept(self, t: float, y: np.ndarray) -> None:
-        supplied, dissipated = self.model.energy_powers(t, y)
+        powers = self._evaluate(t, "power", self.model.energy_powers, t, y)
+        if powers is None:
+            return
+        supplied, dissipated = powers
         step = t - self.last_t
         if step < -TIME_EPS:
             raise RuntimeError("accepted solver steps must be chronological")
@@ -200,12 +248,20 @@ class _AcceptedEnergy:
          self.last_supplied, self.last_dissipated, size) = checkpoint
         del self.history[size:]
 
-    def finish(self, t: float, y: np.ndarray) -> dict[str, float]:
+    def finish(self, t: float, y: np.ndarray) -> Optional[dict[str, float]]:
+        if self.unavailable:
+            return None
         if not self.started:
             self.begin_interval(t, y)
+            if self.unavailable:
+                return None
         elif t > self.last_t + TIME_EPS:
             self.accept(t, y)
-        report = self.model.energy_balance(t, y)
+            if self.unavailable:
+                return None
+        report = self._evaluate(t, "energy balance", self.balance, t, y)
+        if report is None:
+            return None
         impulsive_total, impulsive_supply_total = self._impulses(report)
         impulsive = impulsive_total - self.initial_impulsive
         impulsive_supply = impulsive_supply_total - self.initial_impulsive_supply
@@ -1104,7 +1160,17 @@ class Simulation:
 
         mode = p.simulation.energy_check
         energy_on = mode != "off" and hasattr(mdl, "energy_balance")
-        accepted_energy = _AcceptedEnergy(mdl) if energy_on and output.energy else None
+        energy_balance = (_VersionedStateRead(
+            mdl.energy_balance,
+            lambda: (
+                mdl.plan_revision,
+                mdl.equation_revision,
+                id(mdl.energy_specs),
+            ),
+        ) if energy_on else None)
+        accepted_energy = (
+            _AcceptedEnergy(mdl, energy_balance) if energy_on and output.energy else None
+        )
         phs_check_step = p.simulation.solver.phs_check_step
         snapshot_index = 0
         continuous_record_index = 0
@@ -1160,7 +1226,7 @@ class Simulation:
                                              ctrl_names=ctrl_names)
 
             def record_energy():
-                rep = mdl.energy_balance(t_now, plant.state)
+                rep = energy_balance(t_now, plant.state)
                 if rec.keep_energy:
                     rec.energy_row(t_now, rep.columns())
                 scale = rep.scale
@@ -2357,7 +2423,13 @@ def main(argv=None) -> int:
         invoke = lambda: _create_main(values)
     else:
         invoke = lambda: _export_main(values)
-    return _json_command(command, invoke) if json_output else int(invoke())
+    if json_output:
+        return _json_command(command, invoke)
+    try:
+        return int(invoke())
+    except (ConfigError, OSError) as exc:
+        print(f"peslite {command}: error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

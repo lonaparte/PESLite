@@ -188,8 +188,13 @@ class MultirateSolver:
                  if group is not None and not np.any(group.mask)]
         if empty:
             selected = sorted(name for name, label in assignment.items() if label in empty)
+            owners = sorted(
+                name for name, subsystem in zip(model.names, model.subsystems)
+                if subsystem.state_names
+            )
             raise ValueError(
-                f"subsystems {selected} select no continuous states for their own schedule"
+                f"subsystems {selected} select no continuous states for their own schedule; "
+                f"the continuous states belong to {owners}"
             )
         self.window = self.window_steps * self.dt
         self.outer_method = outer_method or method

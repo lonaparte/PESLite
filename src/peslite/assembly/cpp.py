@@ -3218,21 +3218,18 @@ class _ModelGenerator:
         net = circuit.netlist
         transient = (circuit.derivatives, circuit.t, circuit._stored,
                      net._last, net._mode, net._frozen_mode, net._frozen_topology, net._frozen_scalar,
-                     net._scalar_functions, net._scalar_topology, net._ratio_override,
-                     net._coefficient_expressions, net._coefficient_values)
+                     net._scalar_functions, net._scalar_topology, net._ratio_override)
         circuit._stored = None
         net._scalar_functions = type(net._scalar_functions)()
         net._scalar_topology = None
         net._mode = net._frozen_mode = net._frozen_topology = net._frozen_scalar = None
         net._ratio_override = ratio_samples
-        net._coefficient_expressions, net._coefficient_values = {}, {}
         try:
             yield
         finally:
             (circuit.derivatives, circuit.t, circuit._stored,
              net._last, net._mode, net._frozen_mode, net._frozen_topology, net._frozen_scalar,
-             net._scalar_functions, net._scalar_topology, net._ratio_override,
-             net._coefficient_expressions, net._coefficient_values) = transient
+             net._scalar_functions, net._scalar_topology, net._ratio_override) = transient
             del circuit._cpp_coefficients
             del circuit._cpp_topologies
             for owner, name, value in reversed(restored):
