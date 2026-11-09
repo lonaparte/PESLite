@@ -24,7 +24,7 @@ BELOW = {
     "addons": {"solver", "control", "components", "addons"},
 }
 TOP = {"solver/simulation.py"}
-INTEGRATIONS = {"frontend"}
+INTEGRATIONS = {"gui"}
 
 
 def _imports(path):
@@ -43,7 +43,7 @@ def _imports(path):
 
 def test_the_package_has_five_code_parts():
     entries = {p.name for p in PACKAGE.iterdir() if p.name != "__pycache__"}
-    assert entries == {"__init__.py", "frontend", *PARTS}
+    assert entries == {"__init__.py", "gui", *PARTS}
 
 
 def test_the_root_examples_directory_contains_only_pes_case_files():

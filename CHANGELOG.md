@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Standardized the graphical interface naming as `peslite.gui`, `GUIService` and `peslite-gui`
+  across source, packaging and release automation.
 - Moved MPC algorithms, converter loops and native export support into the control addon,
   leaving only the reusable native-loop adapter interface in the core runtime.
 - Held inputs enter the generated equations as Python scalars. A NumPy scalar from a bridge
@@ -57,9 +59,9 @@
   project workspace and add-on discovery rules.
 - Allowed bus objects without implicit shunt capacitance while retaining the same named connection,
   measurement and optional passive-device interfaces.
-- Split the Python distribution into composable `peslite-core`, `peslite`, `peslite-frontend` and
+- Split the Python distribution into composable `peslite-core`, `peslite`, `peslite-gui` and
   `peslite-full` packages under the same `peslite` import namespace. The default package adds the
-  built-in add-ons and examples; the full package adds the frontend and ONNX support.
+  built-in add-ons and examples; the full package adds the GUI and ONNX support.
 - Updated release automation to build, verify and publish all four distributions behind one approval,
   and set the minimum supported Python version to 3.10.1.
 

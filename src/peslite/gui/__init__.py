@@ -4,9 +4,10 @@ The topology view, parameter editor, waveform plots and small-signal panel commu
 resident process over line-delimited JSON on stdin/stdout. Each PESLite simulation file is one
 selectable system. Start the service with::
 
-    python -m peslite.frontend
+    python -m peslite.gui
 
-PESLite initially incorporated the [CodeSim](https://github.com/NoClassDefError/codesim) frontend implementation and has since developed it further.
+PESLite initially incorporated the frontend implementation from
+[CodeSim](https://github.com/NoClassDefError/codesim) and has since developed it further.
 """
 
 from .descriptor import SignalRecorder, Topology, small_signal_descriptor

@@ -1,4 +1,4 @@
-"""The PESLite frontend protocol for simulation files."""
+"""The PESLite GUI protocol for simulation files."""
 
 import io
 import json
@@ -9,7 +9,7 @@ import sys
 import pytest
 
 from conftest import EXAMPLES, ROOT
-from peslite.frontend import FrontendService, Topology
+from peslite.gui import FrontendService, Topology
 import peslite
 
 
@@ -70,7 +70,7 @@ def test_protocol_loads_simulates_and_streams(tmp_path):
                    for signal in message["signals"] if signal["id"] == voltage["id"])
     assert streamed == len(voltage["values"])
     assert not _response(messages, 4)["ok"]
-    assert (tmp_path / "output" / "buck-example" / "frontend-snapshot.json").is_file()
+    assert (tmp_path / "output" / "buck-example" / "gui-snapshot.json").is_file()
 
 
 @pytest.mark.full
@@ -90,7 +90,7 @@ def test_small_signal_modes_follow_the_frontend_schema(tmp_path):
 def test_module_serves_stdio_like_the_extension_starts_it():
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
     process = subprocess.run(
-        [sys.executable, "-u", "-m", "peslite.frontend"], cwd=ROOT, capture_output=True,
+        [sys.executable, "-u", "-m", "peslite.gui"], cwd=ROOT, capture_output=True,
         text=True, timeout=120, env=env,
         input='{"id":1,"method":"getSystems","params":{}}\n'
               '{"id":2,"method":"server.shutdown","params":{}}\n')

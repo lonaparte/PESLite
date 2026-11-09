@@ -37,9 +37,9 @@ def _manifest() -> tuple[dict[str, set[Path]], dict]:
             destination = excluded if pattern.startswith("!") else included
             destination.update(_matching_files(pattern.lstrip("!")))
         groups[name] = included - excluded
-    if not groups["addons"].isdisjoint(groups["frontend"]):
-        raise RuntimeError("addon and frontend file groups overlap")
-    if not (groups["addons"] | groups["frontend"]) <= groups["all"]:
+    if not groups["addons"].isdisjoint(groups["gui"]):
+        raise RuntimeError("addon and GUI file groups overlap")
+    if not (groups["addons"] | groups["gui"]) <= groups["all"]:
         raise RuntimeError("every optional file must belong to the complete source group")
     return groups, data["distributions"]
 
@@ -52,7 +52,7 @@ def selections() -> dict[str, set[Path]]:
         files = set().union(*(groups[group] for group in config.get("include", ())))
         files.difference_update(*(groups[group] for group in config.get("exclude", ())))
         selected[name] = files
-    code = ("peslite-core", "peslite", "peslite-frontend")
+    code = ("peslite-core", "peslite", "peslite-gui")
     for index, left in enumerate(code):
         for right in code[index + 1:]:
             overlap = selected[left] & selected[right]

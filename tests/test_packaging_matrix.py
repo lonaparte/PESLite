@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROJECTS = {
     "peslite-core": ROOT / "pyproject.toml",
     "peslite": ROOT / "packages/peslite/pyproject.toml",
-    "peslite-frontend": ROOT / "packages/frontend/pyproject.toml",
+    "peslite-gui": ROOT / "packages/gui/pyproject.toml",
     "peslite-full": ROOT / "packages/full/pyproject.toml",
 }
 
@@ -43,19 +43,19 @@ def test_distribution_names_versions_and_dependencies_form_the_install_matrix():
     version, = versions
     assert _requirements(projects["peslite-core"]) == {"numpy", "scipy", "PyYAML"}
     assert _requirements(projects["peslite"]) == {"peslite-core", "matplotlib"}
-    assert _requirements(projects["peslite-frontend"]) == {"peslite"}
+    assert _requirements(projects["peslite-gui"]) == {"peslite"}
     assert _requirements(projects["peslite-full"]) == {
-        "peslite-frontend", "onnx", "onnxruntime"}
+        "peslite-gui", "onnx", "onnxruntime"}
     assert f"peslite-core=={version}" in projects["peslite"]["dependencies"]
-    assert f"peslite=={version}" in projects["peslite-frontend"]["dependencies"]
-    assert f"peslite-frontend=={version}" in projects["peslite-full"]["dependencies"]
+    assert f"peslite=={version}" in projects["peslite-gui"]["dependencies"]
+    assert f"peslite-gui=={version}" in projects["peslite-full"]["dependencies"]
 
 
 def test_code_distributions_own_disjoint_python_files():
     owned = selections()
     for left, right in (("peslite-core", "peslite"),
-                        ("peslite-core", "peslite-frontend"),
-                        ("peslite", "peslite-frontend")):
+                        ("peslite-core", "peslite-gui"),
+                        ("peslite", "peslite-gui")):
         assert owned[left].isdisjoint(owned[right])
     assert Path("src/peslite/addons/__init__.py") in owned["peslite-core"]
     assert Path("src/peslite/addons/functions/__init__.py") in owned["peslite-core"]
@@ -64,7 +64,7 @@ def test_code_distributions_own_disjoint_python_files():
     assert Path("src/peslite/addons/control/mpc.py") in owned["peslite"]
     assert Path("src/peslite/addons/control/predictive.py") in owned["peslite"]
     assert Path("src/peslite/addons/control/_native_mpc.py") in owned["peslite"]
-    assert Path("src/peslite/frontend/service.py") in owned["peslite-frontend"]
+    assert Path("src/peslite/gui/service.py") in owned["peslite-gui"]
 
 
 def test_templates_and_cases_have_distinct_owners():
@@ -74,9 +74,9 @@ def test_templates_and_cases_have_distinct_owners():
     assert distributions["peslite"]["files"] == ["examples/*.pes"]
 
 
-def test_frontend_is_not_advertised_in_public_documentation():
+def test_gui_is_not_advertised_in_public_documentation():
     documents = [ROOT / "README.md", ROOT / "mkdocs.yml", *sorted((ROOT / "docs").glob("*.md"))]
-    assert all("peslite-frontend" not in path.read_text(encoding="utf-8") for path in documents)
+    assert all("peslite-gui" not in path.read_text(encoding="utf-8") for path in documents)
 
 
 def test_release_uses_one_approval_gate_for_the_distribution_matrix():
@@ -91,7 +91,7 @@ def test_release_uses_one_approval_gate_for_the_distribution_matrix():
     expected = {
         "peslite": "pypi",
         "peslite-core": "pypi",
-        "peslite-frontend": "pypi-frontend",
+        "peslite-gui": "pypi-gui",
         "peslite-full": "pypi-full",
     }
     matrix = publish["strategy"]["matrix"]["include"]

@@ -8,7 +8,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 
-EXPECTED = {"peslite-core", "peslite", "peslite-frontend", "peslite-full"}
+EXPECTED = {"peslite-core", "peslite", "peslite-gui", "peslite-full"}
 
 
 def _installed_path(name: str) -> str:
@@ -43,7 +43,7 @@ def main(directory: str = "dist") -> int:
         if len(artifacts) != 2:
             raise RuntimeError(f"{distribution} must have one wheel and one source archive")
 
-    code = ("peslite-core", "peslite", "peslite-frontend")
+    code = ("peslite-core", "peslite", "peslite-gui")
     for index, left in enumerate(code):
         for right in code[index + 1:]:
             overlap = wheels[left] & wheels[right]
@@ -59,7 +59,7 @@ def main(directory: str = "dist") -> int:
             "peslite/addons/functions/small_signal.py",
             "share/peslite/examples/gfl-example.pes",
         ),
-        "peslite-frontend": ("peslite/frontend/service.py",),
+        "peslite-gui": ("peslite/gui/service.py",),
     }
     for distribution, paths in required.items():
         for path in paths:

@@ -26,7 +26,7 @@ from .descriptor import SignalRecorder, Topology, json_safe, small_signal_descri
 
 CASE_SUFFIXES = (".pes", ".yaml", ".yml")
 CASES_ENVIRONMENT = "PESLITE_CASES"
-SNAPSHOT_NAME = "frontend-snapshot.json"
+SNAPSHOT_NAME = "gui-snapshot.json"
 # Frontend run options and the parameter path each one sets.
 OPTION_PATHS = {"EndTime_s": "simulation.t_end", "OutputStep_s": "simulation.output.period"}
 RESULT_OPTIONS = ("RunTimeDomain", "RunSmallSignal", "RunInteractionAnalysis")
@@ -278,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
     """Serve the PESLite frontend protocol until shutdown or end of input."""
     import argparse
 
-    parser = argparse.ArgumentParser(prog="python -m peslite.frontend", description=main.__doc__)
+    parser = argparse.ArgumentParser(prog="python -m peslite.gui", description=main.__doc__)
     parser.add_argument("--root", help="directory searched for simulation files (default: cwd)")
     parser.add_argument("--output", help="run and snapshot directory (default: <root>/output)")
     args = parser.parse_args(argv)

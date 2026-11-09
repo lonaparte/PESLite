@@ -9,13 +9,13 @@
       "!src/peslite/addons/control/__init__.py",
       "!src/peslite/addons/functions/__init__.py"
     ],
-    "frontend": ["src/peslite/frontend/**/*.py"]
+    "gui": ["src/peslite/gui/**/*.py"]
   },
   "distributions": {
     "peslite-core": {
       "project": "pyproject.toml",
       "include": ["all"],
-      "exclude": ["addons", "frontend"],
+      "exclude": ["addons", "gui"],
       "files": ["examples/templates/*"]
     },
     "peslite": {
@@ -23,9 +23,9 @@
       "include": ["addons"],
       "files": ["examples/*.pes"]
     },
-    "peslite-frontend": {
-      "project": "packages/frontend/pyproject.toml",
-      "include": ["frontend"]
+    "peslite-gui": {
+      "project": "packages/gui/pyproject.toml",
+      "include": ["gui"]
     },
     "peslite-full": {
       "project": "packages/full/pyproject.toml",

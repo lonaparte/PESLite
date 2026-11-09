@@ -154,7 +154,7 @@ jobs:
           projects = [
               "pyproject.toml",
               "packages/peslite/pyproject.toml",
-              "packages/frontend/pyproject.toml",
+              "packages/gui/pyproject.toml",
               "packages/full/pyproject.toml",
           ]
           versions = set()
@@ -232,7 +232,7 @@ jobs:
           from importlib.metadata import version
 
           import peslite
-          import peslite.frontend
+          import peslite.gui
           import onnx
           import onnxruntime
 
@@ -241,7 +241,7 @@ jobs:
           print("peslite module:", peslite.__file__)
           print("peslite version:", peslite.__version__)
           print("Simulation:", peslite.Simulation)
-          print("Frontend:", peslite.frontend)
+          print("GUI:", peslite.gui)
           print("ONNX:", onnx.__version__)
           print("ONNX Runtime:", onnxruntime.__version__)
           PY
@@ -301,8 +301,8 @@ jobs:
             environment: pypi
           - distribution: peslite-core
             environment: pypi
-          - distribution: peslite-frontend
-            environment: pypi-frontend
+          - distribution: peslite-gui
+            environment: pypi-gui
           - distribution: peslite-full
             environment: pypi-full
 
@@ -369,7 +369,7 @@ jobs:
           import onnx
           import onnxruntime
           from peslite.addons.components.cable import CableModel
-          import peslite.frontend
+          import peslite.gui
 
           print("Installed from:", peslite.__file__)
           print("Version:", peslite.__version__)
@@ -377,7 +377,7 @@ jobs:
           print("Built-in addon:", CableModel)
           print("ONNX:", onnx.__version__)
           print("ONNX Runtime:", onnxruntime.__version__)
-          assert find_spec("peslite.frontend") is not None
+          assert find_spec("peslite.gui") is not None
           PY
 
       - name: Verify PyPI CLI
