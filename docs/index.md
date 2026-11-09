@@ -1,9 +1,10 @@
 # PESLite
 
 PESLite is an open-source, lightweight, multirate, and extensible power electronics simulator in
-Python. It is designed for time-domain studies of power-electronic converters and converter-based
-systems, combining switching and averaged models, sampled control, event-driven operation
-and flexible numerical integration across multiple time scales.
+Python. It provides time-domain simulation for power-electronic converters and converter-based
+systems—combining switching and averaged models, sampled control, event-driven operation,
+and flexible multi-time-scale numerical integration via readable YAML files and a Python
+API—designed as a deterministic simulation backend for LLM reasoning and verification.
 
 > This documentation describes the current development version on the `main` branch. For released
 > versions and changes, see [GitHub Releases](https://github.com/lonaparte/PESLite/releases) and
@@ -11,13 +12,15 @@ and flexible numerical integration across multiple time scales.
 
 PESLite supports:
 
-- converter networks described by readable YAML simulation files;
-- switching, PWM-period-averaged and ideal averaged bridge models;
-- grid-following and grid-forming control;
-- fixed-step, adaptive and multirate integration;
-- ADC and PWM periods, sampled control, protection and energy accounting;
-- events and continuation from saved states;
-- export as a standalone C++17 simulator.
+- AC and DC converter networks, including grid-connected and wireless-power-transfer systems.
+- Configurable grid-following, grid-forming and DC converter control.
+- Switching, PWM-period-averaged and continuously averaged models.
+- Sampled control, sensing and converter protection.
+- Fixed-step, adaptive and multirate integration with exact event boundaries.
+- Simulation events and continuation from saved states.
+- Streamed waveform output, optional plotting and energy accounting.
+- Custom control loops, circuit elements, events and solvers through the Python extension API.
+- Standalone C++17 export with no third-party C++ runtime dependencies.
 
 The power circuit uses SI units. Controller quantities ending in `_pu` use each converter's own
 per-unit base.
