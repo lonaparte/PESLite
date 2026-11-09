@@ -1,4 +1,4 @@
-# PESLite 0.5.1
+# PESLite 0.5.2
 # Closed-loop Buck application assembled from an open DCConverter, a scalar output bus and a
 # resistive load. The half bridge owns only its power stage; the filter inductance, bus capacitor
 # and load remain independently connected network components. Electrical values are SI.

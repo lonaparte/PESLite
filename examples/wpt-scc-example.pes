@@ -1,4 +1,4 @@
-# PESLite 0.5.1
+# PESLite 0.5.2
 # SS WPT with a switch-controlled primary compensation capacitor. Power feedback commands the SCC
 # conduction angle through a normal auxiliary controller output.
 

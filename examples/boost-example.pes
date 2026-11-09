@@ -1,4 +1,4 @@
-# PESLite 0.5.1
+# PESLite 0.5.2
 # Closed-loop Boost application assembled from an open DCConverter. The external scalar bus is
 # the input port, while the converter's standard DC link is the regulated output capacitor.
 # Electrical values are SI.

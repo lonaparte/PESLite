@@ -1,4 +1,4 @@
-# PESLite 0.5.1
+# PESLite 0.5.2
 # Independent series load, explicitly selected load-power feedback and local RMS protection.
 # Measurement routing is explicit; no communication transport or phase-zero override is implied.
 

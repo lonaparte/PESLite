@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "peslite-full"
-version = "0.5.1"
+version = "0.5.2"
 description = "Complete PESLite installation with GUI and ONNX support."
 readme = "README.md"
 requires-python = ">=3.10.1"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 dependencies = [
-    "peslite-gui==0.5.1",
+    "peslite-gui==0.5.2",
     "onnx>=1.17.0",
     "onnxruntime>=1.18.0",
 ]
