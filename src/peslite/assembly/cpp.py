@@ -2011,9 +2011,13 @@ class _RuntimeParameters:
     def declarations(self) -> str:
         members = "\n    ".join(
             f"{'long long' if isinstance(item.default, int) else 'double'} "
-            f"{item.member} = {_number(self.at(self.initial_p, item.path)
-                                      if isinstance(item.default, bool)
-                                      and item.path in self.internal else item.default)};"
+            f"{item.member} = "
+            + _number(
+                self.at(self.initial_p, item.path)
+                if isinstance(item.default, bool) and item.path in self.internal
+                else item.default
+            )
+            + ";"
             + (f"\n    bool given_{item.member} = false;"
                if item.derived or isinstance(item.default, bool) else "")
             for item in self.tracked
