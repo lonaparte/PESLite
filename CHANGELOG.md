@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Moved MPC algorithms, converter loops and native export support into the control addon,
+  leaving only the reusable native-loop adapter interface in the core runtime.
 - Held inputs enter the generated equations as Python scalars. A NumPy scalar from a bridge
   command made every derivative and output evaluation of an averaged converter run NumPy scalar
   arithmetic, with the same results.

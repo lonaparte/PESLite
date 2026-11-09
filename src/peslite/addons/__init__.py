@@ -1,4 +1,4 @@
-"""Optional functions and automatically discovered custom PESLite types."""
+"""PESLite extensions."""
 
 from __future__ import annotations
 

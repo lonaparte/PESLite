@@ -2,9 +2,8 @@
 
 The package has five parts: :mod:`.components` (power circuit and converter hardware),
 :mod:`.control` (the converter's controller), :mod:`.assembly` (a system built from a simulation
-file), :mod:`.solver` (the model kernel, integrators and run), and :mod:`.addons` (custom extension
-entry points and optional functions). Plant quantities are in SI; controllers work in each unit's
-pu bases.
+file), :mod:`.solver` (the model kernel, integrators and run), and :mod:`.addons` (extensions).
+Plant quantities are in SI; controllers work in each unit's pu bases.
 """
 
 from . import solver, control, components, assembly

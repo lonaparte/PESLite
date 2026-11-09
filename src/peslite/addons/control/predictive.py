@@ -17,11 +17,11 @@ from typing import Any, ClassVar, Mapping, Optional
 
 import numpy as np
 
-from ..solver.model import ConfigError
-from ..solver.timing import TIME_EPS, control_actuation_clock, control_clock_offset
-from .blocks import abc2complex
-from .loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, I, I_AB, SI_CURRENT,
-                    SI_VOLTAGE, V, V_AB, Loop, register_loop_type)
+from ...solver.model import ConfigError
+from ...solver.timing import TIME_EPS, control_actuation_clock, control_clock_offset
+from ...control.blocks import abc2complex
+from ...control.loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, I, I_AB, SI_CURRENT,
+                              SI_VOLTAGE, V, V_AB, Loop, register_loop_type)
 from .mpc import CCSMPC, FCSMPC, LinearModel, MPCResult, _QuadraticStageCost
 
 
@@ -505,6 +505,7 @@ class PredictiveCurrentControl(_PredictiveCurrentControl):
 
     type = "predictive_current_control"
     role = "current"
+    native_generator = "peslite.addons.control._native_mpc:PredictiveLoopGenerator"
     n_current, n_input = 1, 1
     inputs = {
         "reference": SI_CURRENT,
@@ -559,6 +560,7 @@ class ThreePhasePredictiveCurrentControl(_PredictiveCurrentControl):
 
     type = "three_phase_predictive_current_control"
     role = "modulation"
+    native_generator = "peslite.addons.control._native_mpc:PredictiveLoopGenerator"
     n_current, n_input = 2, 3
     inputs = {
         "v": V_AB,

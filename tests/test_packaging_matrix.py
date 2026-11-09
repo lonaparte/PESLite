@@ -61,6 +61,9 @@ def test_code_distributions_own_disjoint_python_files():
     assert Path("src/peslite/addons/functions/__init__.py") in owned["peslite-core"]
     assert Path("src/peslite/addons/components/cable.py") in owned["peslite"]
     assert Path("src/peslite/addons/functions/small_signal.py") in owned["peslite"]
+    assert Path("src/peslite/addons/control/mpc.py") in owned["peslite"]
+    assert Path("src/peslite/addons/control/predictive.py") in owned["peslite"]
+    assert Path("src/peslite/addons/control/_native_mpc.py") in owned["peslite"]
     assert Path("src/peslite/frontend/service.py") in owned["peslite-frontend"]
 
 

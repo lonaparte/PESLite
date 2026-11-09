@@ -114,6 +114,7 @@ class Loop:
     log_outputs: ClassVar[tuple[str, ...]] = ()
     observations: ClassVar[tuple[str, ...]] = ()
     cpp_export: ClassVar[bool] = True
+    native_generator: ClassVar[object | None] = None
 
     @classmethod
     def supports_continuous(cls) -> bool:

@@ -1,7 +1,8 @@
 # Model Predictive Control
 
-PESLite provides continuous-control-set MPC (CCS-MPC) and finite-control-set MPC (FCS-MPC)
-as ordinary sampled control loops. They use the same typed connections, ADC, actuation,
+Model predictive control is an addon providing continuous-control-set MPC (CCS-MPC) and
+finite-control-set MPC (FCS-MPC) as ordinary sampled control loops. They use the same typed
+connections, ADC, actuation,
 protection, start-up and saved-state mechanisms as other loops. The converter adapters support
 `switching`, `pwm_averaging` and `averaging`.
 
@@ -151,7 +152,7 @@ they do not constrain the supplied initial state. `C` defaults to the identity a
 to zero. Model matrices are copied and read-only.
 
 ```python
-from peslite.control.mpc import CCSMPC, LinearModel
+from peslite.addons.control.mpc import CCSMPC, LinearModel
 
 model = LinearModel(A=[[1.0]], B=[[1.0]])
 controller = CCSMPC(
@@ -213,7 +214,7 @@ followed by every predicted endpoint. Failure results have no applicable `action
 accepts a callable `backend(QuadraticProblem) -> SolverResult`; the backend receives read-only
 coefficient copies, and the MPC checks its returned dimensions, finiteness and feasibility
 against private originals. Import these records from
-`peslite.control.mpc`. Additional optimization libraries are needed only by backends that
+`peslite.addons.control.mpc`. Additional optimization libraries are needed only by backends that
 choose to use them.
 
 The built-in predictive loops reuse the configured filter inductance, resistance and bridge

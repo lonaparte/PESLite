@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-__all__ = ["MPC_KERNEL"]
+import itertools
+import math
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
+
+import numpy as np
+
+__all__ = ["MPC_KERNEL", "PredictiveLoopGenerator"]
 
 
 MPC_KERNEL = r'''
@@ -519,3 +526,284 @@ PredictiveResult<NU> solve_fcs_mpc(
     return result;
 }
 '''
+
+
+def _native_weight(value: Any, width: int) -> tuple[Any, ...]:
+    """Normalize one validated scalar, diagonal or full MPC weight without losing parameters."""
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return tuple(value if row == column else 0.0
+                     for row in range(width) for column in range(width))
+    values = tuple(value)
+    nested = any(isinstance(item, Sequence) and not isinstance(item, (str, bytes))
+                 for item in values)
+    if not nested:
+        return tuple(values[row] if row == column else 0.0
+                     for row in range(width) for column in range(width))
+    return tuple(item for row in values for item in row)
+
+
+def _native_array(generator: Any, values: Iterable[Any]) -> str:
+    return "{{" + ", ".join(
+        value if isinstance(value, str) else generator.number(value) for value in values
+    ) + "}}"
+
+
+class PredictiveLoopGenerator:
+    """Lower predictive loops to the target-independent fixed-size MPC kernel."""
+
+    shared_code = MPC_KERNEL
+
+    def members(self, generator: Any, loop_name: str, node: Any) -> list[str]:
+        lines = []
+        for local, value in node.get_state().items():
+            lines.append(
+                f"{generator.cpp_type(value)} "
+                f"{generator.node(loop_name, local)} = {generator.literal(value)};"
+            )
+        for field, value in node.observe().items():
+            lines.append(f"double {generator.g(loop_name + '.' + field)} = {generator.number(value)};")
+        return lines
+
+    @staticmethod
+    def reset(_generator: Any, _loop_name: str, _node: Any) -> list[str]:
+        return []
+
+    @staticmethod
+    def _bound(value: Any, lower: bool) -> Any:
+        if value is not None:
+            return value
+        return -math.inf if lower else math.inf
+
+    def _common(self, generator: Any, loop_name: str, node: Any) -> tuple[list[str], dict[str, str]]:
+        horizon = int(node.cfg.prediction_horizon)
+        moves = (int(node.cfg.control_horizon)
+                 if node.cfg.control_horizon is not None else horizon)
+        nc, nu, nx = node.n_current, node.n_input, node.n_current + node.n_input
+        prefix = generator.m("mpc_" + loop_name)
+        previous = [generator._state(loop_name, f"previous_input.{index}")
+                    for index in range(nu)]
+        names = {
+            "prefix": prefix,
+            "models": prefix + "_models",
+            "current": prefix + "_current",
+            "initial": prefix + "_initial",
+            "references": prefix + "_references",
+            "previous": prefix + "_previous",
+            "result": prefix + "_result",
+            "action": prefix + "_action",
+            "valid": prefix + "_valid",
+            "enabled": prefix + "_enabled",
+        }
+        q = _native_weight(node.cfg.tracking_weight, nc)
+        r = _native_weight(node.cfg.input_weight, nu)
+        s = _native_weight(node.cfg.rate_weight, nu)
+        lines = [
+            f"std::array<PredictiveModel<{nx}, {nu}, {nc}>, {horizon}> {names['models']}{{}};",
+            f"const std::array<double, {nu}> {names['previous']}{_native_array(generator, previous)};",
+            f"std::array<double, {nx}> {names['initial']}{{}};",
+            *[f"{names['initial']}[{index}] = {value};"
+              for index, value in enumerate((*(["0.0"] * nc), *previous))],
+            f"std::array<std::array<double, {nc}>, {horizon}> {names['references']}{{}};",
+            f"const std::array<double, {nc * nc}> {prefix}_q{_native_array(generator, q)};",
+            f"const std::array<double, {nu * nu}> {prefix}_r{_native_array(generator, r)};",
+            f"const std::array<double, {nu * nu}> {prefix}_s{_native_array(generator, s)};",
+        ]
+        return lines, names
+
+    def _dc_prediction(self, generator: Any, loop_name: str, node: Any,
+                       names: Mapping[str, str]) -> list[str]:
+        current = generator.input(loop_name, "current")
+        voltage = generator.input(loop_name, "voltage")
+        vdc = generator.input(loop_name, "vin")
+        reference = generator.input(loop_name, "reference")
+        prefix = names["prefix"]
+        plant = node.plant
+        horizon = int(node.cfg.prediction_horizon)
+        previous_enabled = generator._state(loop_name, "previous_enabled")
+        return [
+            f"const std::array<double, 1> {names['current']}{{{current}}};",
+            f"{names['initial']}[0] = {current};",
+            f"const double {prefix}_before = {voltage} * predictive_integral("
+            f"{generator.number(plant.L)}, {generator.number(plant.R)}, {generator.number(plant.delay)});",
+            f"const double {prefix}_after = {voltage} * predictive_integral("
+            f"{generator.number(plant.L)}, {generator.number(plant.R)}, {generator.number(plant.period - plant.delay)});",
+            *[line for stage in range(horizon) for line in (
+                f"{names['references']}[{stage}][0] = {reference} * {generator.m('startup_value')};",
+                f"{names['models']}[{stage}] = make_rl_prediction<1, 1>("
+                f"{generator.number(plant.L)}, {generator.number(plant.R)}, {generator.number(plant.period)}, "
+                f"{generator.number(plant.delay)}, {vdc}, {names['current']}, "
+                f"std::array<double, 1>{{{prefix}_before}}, "
+                f"std::array<double, 1>{{{prefix}_after}}, "
+                f"std::array<double, 1>{{1.0}}, "
+                f"{'true' if stage else previous_enabled}, true, std::array<double, 1>{{0.0}});",
+            )],
+        ]
+
+    def _ac_prediction(self, generator: Any, loop_name: str, node: Any,
+                       names: Mapping[str, str]) -> list[str]:
+        prefix = names["prefix"]
+        plant = node.plant
+        horizon = int(node.cfg.prediction_horizon)
+        current = generator.input(loop_name, "i")
+        voltage = generator.input(loop_name, "v")
+        frame = generator.input(loop_name, "frame")
+        omega = generator.input(loop_name, "omega")
+        id_ref = generator.input(loop_name, "id_ref")
+        iq_ref = generator.input(loop_name, "iq_ref")
+        vdc = generator.input(loop_name, "u_dc")
+        previous_enabled = generator._state(loop_name, "previous_enabled")
+        voltage_map = tuple(float(value) for value in plant.voltage_map.ravel())
+        lines = [
+            f"const Complex {prefix}_i = {current} * {generator.number(node.i_base)};",
+            f"const std::array<double, 2> {names['current']}{{std::real({prefix}_i), std::imag({prefix}_i)}};",
+            f"{names['initial']}[0] = std::real({prefix}_i);",
+            f"{names['initial']}[1] = std::imag({prefix}_i);",
+            f"const Complex {prefix}_target = Complex{{{id_ref}, {iq_ref}}} "
+            f"* {generator.number(node.i_base)} * {generator.m('startup_value')};",
+            f"const double {prefix}_vdc = {vdc} * {generator.number(node.vdc_base)};",
+            f"const Complex {prefix}_denominator{{{generator.number(plant.R)}, {omega} * {generator.number(plant.L)}}};",
+            f"auto {prefix}_disturbance = [&](double start, double duration) {{",
+            f"    const Complex factor = std::abs({prefix}_denominator) == 0.0",
+            f"        ? Complex{{duration / {generator.number(plant.L)}, 0.0}}",
+            f"        : (std::exp(Complex{{0.0, {omega} * duration}}) "
+            f"- std::exp(-{generator.number(plant.R)} * duration / {generator.number(plant.L)})) / {prefix}_denominator;",
+            f"    const Complex value = {voltage} * {generator.number(node.v_base)} "
+            f"* std::exp(Complex{{0.0, {omega} * start}}) * factor;",
+            "    return std::array<double, 2>{std::real(value), std::imag(value)};",
+            "};",
+        ]
+        for stage in range(horizon):
+            before = f"{prefix}_before_{stage}"
+            after = f"{prefix}_after_{stage}"
+            lines += [
+                f"const Complex {prefix}_reference_{stage} = {prefix}_target * std::exp("
+                f"Complex{{0.0, {frame} + {omega} * {generator.number((stage + 1) * plant.period)}}});",
+                f"{names['references']}[{stage}] = {{std::real({prefix}_reference_{stage}), "
+                f"std::imag({prefix}_reference_{stage})}};",
+                f"const auto {before} = {prefix}_disturbance("
+                f"{generator.number(stage * plant.period)}, {generator.number(plant.delay)});",
+                f"const auto {after} = {prefix}_disturbance("
+                f"{generator.number(stage * plant.period + plant.delay)}, "
+                f"{generator.number(plant.period - plant.delay)});",
+                f"{names['models']}[{stage}] = make_rl_prediction<2, 3>("
+                f"{generator.number(plant.L)}, {generator.number(plant.R)}, {generator.number(plant.period)}, "
+                f"{generator.number(plant.delay)}, {prefix}_vdc, {names['current']}, {before}, {after}, "
+                f"std::array<double, 6>{_native_array(generator, voltage_map)}, "
+                f"{'true' if stage else previous_enabled}, false, std::array<double, 2>{{}});",
+            ]
+        return lines
+
+    def _solver(self, generator: Any, node: Any, names: Mapping[str, str]) -> list[str]:
+        horizon = int(node.cfg.prediction_horizon)
+        moves = (int(node.cfg.control_horizon)
+                 if node.cfg.control_horizon is not None else horizon)
+        nc, nu, nx = node.n_current, node.n_input, node.n_current + node.n_input
+        prefix = names["prefix"]
+        output_min = self._bound(node.cfg.current_min, True)
+        output_max = self._bound(node.cfg.current_max, False)
+        common = (
+            f"{names['models']}, {names['initial']}, {names['references']}, "
+            f"{names['previous']}, {prefix}_q, {prefix}_r, {prefix}_s, "
+            f"{generator.number(node.cfg.input_min)}, {generator.number(node.cfg.input_max)}, "
+            f"{generator.number(output_min)}, {generator.number(output_max)}, "
+        )
+        if node.cfg.algorithm == "ccs":
+            call = (
+                f"solve_ccs_mpc<{nx}, {nu}, {nc}, {horizon}, {moves}>("
+                f"{common}static_cast<std::size_t>({generator.number(node.cfg.max_iterations)}), "
+                f"{generator.number(node.cfg.tolerance)}, {generator.number(node.cfg.feasibility_tolerance)})"
+            )
+            return [f"{names['result']} = {call};"]
+        actions = tuple(itertools.product((0.0, 1.0), repeat=nu))
+        action_values = ", ".join(_native_array(generator, action) for action in actions)
+        call = (
+            f"solve_fcs_mpc<{nx}, {nu}, {nc}, {horizon}, {moves}, {len(actions)}>("
+            f"{names['models']}, {names['initial']}, {names['references']}, "
+            f"{names['previous']}, {prefix}_actions, {prefix}_q, {prefix}_r, {prefix}_s, "
+            f"{generator.number(node.cfg.input_min)}, {generator.number(node.cfg.input_max)}, "
+            f"{generator.number(output_min)}, {generator.number(output_max)}, "
+            f"static_cast<std::size_t>({generator.number(node.cfg.max_evaluations)}), "
+            f"{generator.number(node.cfg.feasibility_tolerance)})"
+        )
+        return [
+            f"const std::array<std::array<double, {nu}>, {len(actions)}> "
+            f"{prefix}_actions{{{{{action_values}}}}};",
+            f"{names['result']} = {call};",
+        ]
+
+    def _fixed_action(self, generator: Any, node: Any, prefix: str) -> tuple[list[str], str]:
+        name = prefix + "_fixed"
+        if node.cfg.fallback_input is not None:
+            return ([f"const std::array<double, {node.n_input}> {name}"
+                     f"{_native_array(generator, node.cfg.fallback_input)};"], name)
+        if node.cfg.algorithm == "ccs":
+            return ([f"std::array<double, {node.n_input}> {name}{{}};",
+                     f"{name}.fill({generator.number(node.cfg.input_min)});"], name)
+        default = (f"({generator.number(node.cfg.input_min)} <= 0.0 && "
+                   f"{generator.number(node.cfg.input_max)} >= 0.0 ? 0.0 : 1.0)")
+        return ([f"std::array<double, {node.n_input}> {name}{{}};",
+                 f"{name}.fill({default});"], name)
+
+    def lines(self, generator: Any, loop_name: str, node: Any) -> list[str]:
+        lines, names = self._common(generator, loop_name, node)
+        fixed_lines, fixed = self._fixed_action(generator, node, names["prefix"])
+        lines += [*fixed_lines, f"PredictiveResult<{node.n_input}> {names['result']}{{}};"]
+        prediction = (
+            self._dc_prediction(generator, loop_name, node, names)
+            if node.n_current == 1
+            else self._ac_prediction(generator, loop_name, node, names)
+        )
+        solve = [*prediction, *self._solver(generator, node, names)]
+        lines += [f"if ({generator.m('startup_run')}) {{",
+                  *("    " + line for line in solve), "}"]
+        previous_enabled = generator._state(loop_name, "previous_enabled")
+        solves = generator._state(loop_name, "solve_count")
+        fallbacks = generator._state(loop_name, "fallback_count")
+        lines += [
+            f"std::array<double, {node.n_input}> {names['action']} = {fixed};",
+            f"bool {names['enabled']} = {generator.m('startup_run')};",
+            f"bool {names['valid']} = false;",
+            f"if ({generator.m('startup_run')}) {{",
+            f"    ++{solves};",
+            f"    {names['valid']} = {names['result']}.success;",
+            f"    for (double value : {names['result']}.action)",
+            f"        {names['valid']} = {names['valid']} && std::isfinite(value) "
+            f"&& value >= {generator.number(node.cfg.input_min)} && value <= {generator.number(node.cfg.input_max)};",
+            f"    if ({names['valid']}) {names['action']} = {names['result']}.action;",
+            "    else {",
+            f"        ++{fallbacks};",
+        ]
+        if node.cfg.fallback == "hold":
+            hold_valid = (f"std::all_of({names['previous']}.begin(), {names['previous']}.end(), "
+                          f"[&](double value) {{ return std::isfinite(value) "
+                          f"&& value >= {generator.number(node.cfg.input_min)} "
+                          f"&& value <= {generator.number(node.cfg.input_max)}; }})")
+            lines += [f"        if ({hold_valid}) {names['action']} = {names['previous']};"]
+        if node.cfg.fallback == "block":
+            lines.append(f"        {names['enabled']} = false;")
+        lines += [
+            "    }",
+            "}",
+            *[f"{generator._state(loop_name, f'previous_input.{index}')} = "
+              f"{names['action']}[{index}];" for index in range(node.n_input)],
+            f"{previous_enabled} = {names['enabled']};",
+        ]
+        output_ports = tuple(port for port in node.outputs if port != "enable")
+        lines += [f"{generator.g(loop_name + '.' + port)} = {names['action']}[{index}];"
+                  for index, port in enumerate(output_ports)]
+        lines += [
+            f"{generator.g(loop_name + '.enable')} = {names['enabled']} ? 1.0 : 0.0;",
+            f"{generator.g(loop_name + '.success')} = {names['valid']} ? 1.0 : 0.0;",
+            f"{generator.g(loop_name + '.objective')} = "
+            f"{names['result']}.success ? {names['result']}.objective : 0.0;",
+            f"{generator.g(loop_name + '.iterations')} = "
+            f"static_cast<double>({names['result']}.iterations);",
+            f"{generator.g(loop_name + '.evaluations')} = "
+            f"static_cast<double>({names['result']}.evaluations);",
+            f"{generator.g(loop_name + '.solves')} = {solves};",
+            f"{generator.g(loop_name + '.fallbacks')} = {fallbacks};",
+            f"{generator.g(loop_name + '.delay')} = {generator.number(node.delay)};",
+        ]
+        return lines

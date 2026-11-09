@@ -1,4 +1,4 @@
-"""Entry point for optional and custom PESLite control-loop modules.
+"""Entry point for PESLite control-loop addon modules.
 
 Place modules in this package and register their loop classes with
 ``register_loop_type``. PESLite imports each module during package initialisation, so its types

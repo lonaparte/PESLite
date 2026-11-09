@@ -15,5 +15,8 @@ def discover_modules(package: str, paths: Iterable[str]) -> tuple[ModuleType, ..
     decorators.  Python's module cache makes repeated discovery safe and inexpensive.
     """
     prefix = f"{package}."
-    names = sorted(info.name for info in iter_modules(paths, prefix))
+    names = sorted(
+        info.name for info in iter_modules(paths, prefix)
+        if not info.name.rsplit(".", 1)[-1].startswith("_")
+    )
     return tuple(import_module(name) for name in names)

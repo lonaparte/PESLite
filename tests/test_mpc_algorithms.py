@@ -5,7 +5,7 @@ from itertools import product
 import numpy as np
 import pytest
 
-from peslite.control.mpc import CCSMPC, FCSMPC, LinearModel, SolverResult
+from peslite.addons.control.mpc import CCSMPC, FCSMPC, LinearModel, SolverResult
 
 
 def test_two_step_integrator_matches_analytic_unconstrained_and_active_bound_solutions():

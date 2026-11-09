@@ -10,6 +10,8 @@ from peslite.addons import control as addon_control
 from peslite.addons.components.cable import CableModel
 from peslite.assembly.params import runtime_changeable
 from peslite.addons.control.voltage_adaptive_pll import VoltageAdaptivePLL
+from peslite.addons.control.predictive import (PredictiveCurrentControl,
+                                               ThreePhasePredictiveCurrentControl)
 from peslite.components.network import ELEMENT_TYPES
 from peslite.control import LOOP_TYPES, Loop
 
@@ -17,6 +19,10 @@ from peslite.control import LOOP_TYPES, Loop
 def test_control_addon_path_registers_loops(tmp_path, monkeypatch):
     path = tmp_path / "control"
     path.mkdir()
+    (path / "_private.py").write_text(
+        "raise RuntimeError('private add-on helpers must not be discovered')\n",
+        encoding="utf-8",
+    )
     (path / "test_controller_addon.py").write_text(
         """from dataclasses import dataclass
 from peslite.addons.control import Loop, register_loop_type
@@ -80,6 +86,16 @@ def test_functions_hold_the_plotting_addon():
     assert peslite.addons.functions.plot_result is peslite.addons.plot_result
     assert set(peslite.addons.functions._ROOT_EXPORTS) <= set(peslite.addons.__all__)
     assert "reference_csv" not in peslite.addons.__all__
+
+
+def test_mpc_is_a_control_addon():
+    assert LOOP_TYPES[PredictiveCurrentControl.type] is PredictiveCurrentControl
+    assert (
+        LOOP_TYPES[ThreePhasePredictiveCurrentControl.type]
+        is ThreePhasePredictiveCurrentControl
+    )
+    assert "CCSMPC" not in peslite.control.__all__
+    assert "PredictiveCurrentControl" not in peslite.control.__all__
 
 
 def test_addon_entry_points_match_builtin_public_apis():

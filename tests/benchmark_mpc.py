@@ -24,7 +24,7 @@ import scipy
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from peslite.control.mpc import CCSMPC, FCSMPC, LinearModel  # noqa: E402
+from peslite.addons.control.mpc import CCSMPC, FCSMPC, LinearModel  # noqa: E402
 
 
 def main() -> int:

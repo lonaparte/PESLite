@@ -5,7 +5,9 @@ import pytest
 
 import peslite
 from conftest import EXAMPLES
-from peslite.control import ConverterMeasurement, MPCResult, PredictiveCurrentControl
+from peslite.control import ConverterMeasurement
+from peslite.addons.control.mpc import MPCResult
+from peslite.addons.control.predictive import PredictiveCurrentControl
 from peslite.solver.model import ConfigError, StateRegistry
 
 

@@ -16,9 +16,9 @@ from peslite.addons.control.voltage_adaptive_pll import VoltageAdaptivePLL
 from peslite.addons.functions import energy_closure, plot_result
 from peslite.addons.functions.small_signal import small_signal
 from peslite.assembly.params import from_dict, read_initial
-from peslite.control import (ConverterMeasurement, Measurement, PredictiveCurrentControl,
-                             register_loop_type)
-from peslite.control.mpc import MPCResult
+from peslite.control import ConverterMeasurement, Measurement, register_loop_type
+from peslite.addons.control.mpc import MPCResult
+from peslite.addons.control.predictive import PredictiveCurrentControl
 from test_dc_converters import _case as dc_case
 from test_cpp_export import _compiler, _final_csv, _run_generated
 

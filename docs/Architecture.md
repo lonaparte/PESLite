@@ -19,10 +19,10 @@ src/peslite/
 ├── control/      control loops, graphs, startup and modulation
 ├── assembly/     parameters, events, protection, units, systems and exporters
 ├── solver/       connected model kernel, energy model, integrators and simulation run
-└── addons/       custom extension entry points
-    ├── control/      automatically discovered custom control-loop modules
-    ├── components/   automatically discovered custom circuit-element modules
-    └── functions/    optional user-facing functions such as IEEE PDF plotting
+└── addons/       control, component and function addons
+    ├── control/      automatically discovered control-loop modules
+    ├── components/   automatically discovered circuit-element modules
+    └── functions/    optional functions such as IEEE-style plotting
 ```
 
 Dependencies point inward through small interfaces: components use the model kernel, controller
@@ -30,7 +30,7 @@ logic uses typed signals, assembly wires both into a system, and `solver.simulat
 assembled system.
 
 Controller and component modules in their respective add-on packages are imported once at package
-initialisation. Their decorators populate the same registries used by built-in types, so there is
+initialisation. Their decorators populate the same registries used by core types, so there is
 no add-on lookup or dispatch in the simulation hot path. Built-in function addons such as
 [plotting](Plotting.md) do not run unless explicitly invoked.
 The optional online stability analysis functions also live in `addons/functions`. They consume

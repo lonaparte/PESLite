@@ -25,8 +25,6 @@ from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, Cont
                          GraphController, Measurement,
                          Startup, VSCController, default_wiring,
                          make_controller)
-from .mpc import CCSMPC, FCSMPC, LinearModel, MPCResult, QuadraticProblem, SolverResult, solve_slsqp
-from .predictive import PredictiveCurrentControl, ThreePhasePredictiveCurrentControl
 from .profiles import register_control_type
 from .signals import TableSignal
 
@@ -37,13 +35,11 @@ __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter",
            "FrequencyPowerControl", "VoltageControl", "PhaseVoltageControl",
            "FrequencyVoltageControl", "CurrentControl", "PhaseCurrentControl",
            "FrequencyCurrentControl", "ResonantModulation", "PhaseShiftModulation",
-           "DutyModulation", "ThreePhaseModulation", "PredictiveCurrentControl",
-           "ThreePhasePredictiveCurrentControl",
+           "DutyModulation", "ThreePhaseModulation",
            "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER",
            "LOOP_TYPES", "register_loop_type", "ControlInterface", "CONTROL_INTERFACE",
            "ControlGraph", "default_wiring",
            "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
            "BridgeControlOutput", "ConverterMeasurement", "Controller", "Startup", "VSCController", "GraphController",
-           "make_controller", "register_control_type", "LinearModel", "CCSMPC", "FCSMPC",
-           "MPCResult", "QuadraticProblem", "SolverResult", "solve_slsqp", "TableSignal"]
+           "make_controller", "register_control_type", "TableSignal"]
