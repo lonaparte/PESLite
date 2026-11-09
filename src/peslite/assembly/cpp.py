@@ -32,7 +32,7 @@ from ..control.blocks import OutputLimit
 from ..control.controller import GraphController, VSCController
 from ..control.predictive import PredictiveCurrentControl, ThreePhasePredictiveCurrentControl
 from ..solver.energy import Port, re_product
-from ..solver.integrators import DormandPrince45, FixedStepSolver, TABLEAUS
+from ..solver.integrators import DormandPrince45, FixedStepSolver, TABLEAUS, _STABILITY_HALF_DISK
 from ..solver.implicit import (ImplicitSolver, _JACOBIAN_STEP, _MAX_SPLITS, _TABLEAUX,
                                _NEWTON_ITERATIONS, _NEWTON_SCALE, _THETA_MAX)
 from ..solver.model import _dependency_plan, commutation_tolerance
@@ -549,7 +549,7 @@ def _explicit_stability(
 ) -> str:
     """Emit the same exact circuit-mode RK stability check used by Python."""
     coefficients = ", ".join(_number(value) for value in _stability_polynomial(method))
-    half_disk = 1.0 if method == "RK4" else 0.0
+    half_disk = _STABILITY_HALF_DISK.get(method, 0.0)
     members, checks = [], []
     for number, (size, lines, positions) in enumerate(plans):
         key = ", ".join(f"selected[{int(index)}]" for index in positions)
@@ -2141,6 +2141,8 @@ class _ModelGenerator:
         self._coefficient_plans = {}
         self._coefficient_topologies = {}
         self._dynamic_netlist_traces = {}
+        # symbolic eliminations by their inputs' codes, shared by every term pool
+        self._dynamic_netlist_solutions = {}
         self.event_parameter_bindings: dict[str, tuple[bool, str | None]] = {}
         self._runtime_networks = {}
         self.equation_bindings = {}
@@ -3737,18 +3739,35 @@ class _ModelGenerator:
         inputs = net.source_values(t)
         rates = net.source_rates(t, topology.needs_rate)
         state_values = tuple(states[int(index)] for index in net.states)
-        right = [0.0] * pattern.n
-        for name, vector in (("y", state_values), ("u", inputs), ("du", rates)):
-            stamps = matrices[name]
-            for row, column, coefficient in zip(stamps.r, stamps.c, stamps.v):
-                right[row] += _symbolic_node(coefficient) * _symbolic_node(vector[column])
-        solution = _symbolic_solve(
-            matrix, right, reference, varying, gauge=topology.gauge_singular
-        ) if pattern.n else []
-        derivative = tuple(solution[int(index)] for index in topology.xd_index)
-        output = tuple(sum(coefficient * value for coefficient, value in zip(row, solution)
-                           if coefficient != 0.0)
-                       for row in topology.S_out.toarray())
+
+        def codes(values) -> tuple:
+            return tuple(_Expression.of(value).code for value in values)
+
+        # The elimination depends on the mode, the ratio and input expressions alone. A term
+        # pool names its own temporaries, so equal codes are equal expressions in every pool.
+        solve_key = (
+            id(circuit), topology.mode.key,
+            codes(entry for ratio in resolved for entry in np.asarray(ratio, dtype=object).flat),
+            codes(state_values), codes(inputs), codes(rates),
+            None if control is None else tuple(sorted(control.decisions.items())),
+        )
+        solved = self._dynamic_netlist_solutions.get(solve_key)
+        if solved is None:
+            right = [0.0] * pattern.n
+            for name, vector in (("y", state_values), ("u", inputs), ("du", rates)):
+                stamps = matrices[name]
+                for row, column, coefficient in zip(stamps.r, stamps.c, stamps.v):
+                    right[row] += _symbolic_node(coefficient) * _symbolic_node(vector[column])
+            solution = _symbolic_solve(
+                matrix, right, reference, varying, gauge=topology.gauge_singular
+            ) if pattern.n else []
+            solved = self._dynamic_netlist_solutions[solve_key] = (
+                tuple(solution[int(index)] for index in topology.xd_index),
+                tuple(sum(coefficient * value for coefficient, value in zip(row, solution)
+                          if coefficient != 0.0)
+                      for row in topology.S_out.toarray()),
+            )
+        derivative, output = solved
         if raw:
             result = tuple(derivative), tuple(output)
         else:

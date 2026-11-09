@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Held inputs enter the generated equations as Python scalars. A NumPy scalar from a bridge
+  command made every derivative and output evaluation of an averaged converter run NumPy scalar
+  arithmetic, with the same results.
+- A circuit value published to several records is evaluated once per output stage, and equal
+  published expressions share one evaluation.
+- C++ export shares each symbolic network elimination between the output stages that trace it.
+- RK4 stability checks use a balanced spectral-radius bound over declared transformer-ratio ranges,
+  allowing covered modes to skip repeated matrix construction and eigendecomposition without
+  changing the exact fallback decision.
+- Frozen transformer-ratio modes create their compiled topology only when it is actually required.
+- Reduced per-interval overhead by bypassing inactive conduction planning and accepted-step
+  observers and by keeping common scalar ratio and limiting operations on their scalar paths.
+
 ## 0.5.1
 
 - Added continuous- and finite-control-set MPC current loops through the ordinary control graph,

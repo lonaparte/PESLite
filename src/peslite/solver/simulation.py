@@ -1282,8 +1282,11 @@ class Simulation:
                 accepted_energy.begin_interval(t_a, plant.state)
                 energy_checkpoint = accepted_energy.checkpoint()
             try:
-                with _accepted_steps(accepted_energy):
+                if accepted_energy is None:  # no observer to install
                     plant.state = integrate(t_a, t_b, plant.state, event)
+                else:
+                    with _accepted_steps(accepted_energy):
+                        plant.state = integrate(t_a, t_b, plant.state, event)
                 if (accepted_energy is not None
                         and accepted_energy.last_t < t_b - TIME_EPS):
                     accepted_energy.accept(t_b, plant.state)

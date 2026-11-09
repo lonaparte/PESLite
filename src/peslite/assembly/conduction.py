@@ -124,6 +124,8 @@ class DiodeConduction:
         """Advance all conduction guards through one locator and one boundary dispatcher."""
         if self.solver is None:
             raise RuntimeError("diode conduction cannot advance without a solver")
+        if not (self.commutating or self.current_states or self.located or self._scheduled):
+            return self._smooth(t0, t1, state)  # no guard to plan or observe
         initial_guarded, initial_located = self._guard_plan(state)
         scheduled_due = any(
             float(subsystem.next_commutation_time()) <= t0 + commutation_tolerance(t0)

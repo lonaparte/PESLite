@@ -175,9 +175,11 @@ TABLEAUS: dict[str, tuple[tuple[float, ...], tuple[tuple[float, ...], ...], tupl
     "RK4": ((0.0, 0.5, 0.5, 1.0), ((0.5,), (0.0, 0.5), (0.0, 0.0, 1.0)), (1 / 6, 1 / 3, 1 / 3, 1 / 6)),
 }
 
-# The closed left-half unit disk is inside classical RK4's absolute-stability region.  Euler and
-# Heun touch the imaginary axis only at zero, so they have no positive half-disk certificate.
-_STABILITY_HALF_DISK = {"RK4": 1.0}
+# The closed left half-disk of radius 2.6 is inside classical RK4's absolute-stability region: by the
+# maximum principle |R(z)| on it is largest on its boundary, at most 0.982 on the arc and at most
+# one on the imaginary segment (|R(iy)| <= 1 for |y| <= 2 sqrt(2)). Euler and Heun touch the
+# imaginary axis only at zero, so they have no positive half-disk certificate.
+_STABILITY_HALF_DISK = {"RK4": 2.6}
 
 
 def combine(method: str, y: NDArray[np.float64], h: float, ks: list) -> NDArray[np.float64]:
@@ -361,8 +363,14 @@ class FixedStepSolver:
         provider = getattr(self.model, "linear_modes", None)
         if not callable(provider):
             return False
-        modes = tuple(provider())
         radius = _STABILITY_HALF_DISK.get(self.method, 0.0)
+        certify = getattr(self.model, "linear_certificates", None)
+        if radius and callable(certify) and all(
+            certificate is not None and step * certificate[1] <= radius
+            for certificate in certify()
+        ):
+            return False
+        modes = tuple(provider())
         certificates = tuple(
             mode[2] if radius and len(mode) > 2 else None for mode in modes
         )

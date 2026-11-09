@@ -79,6 +79,8 @@ class LocatedZero:
 
 def _real(value):
     """Normalize scalar numbers while preserving their arithmetic semantics."""
+    if type(value) is float:
+        return value
     if hasattr(value, "item"):
         scalar = value.item()
         if scalar is value:
@@ -1246,11 +1248,14 @@ class Model:
         linear_mode_key: Callable[[], Any] | None = None,
         linear_blocks: Callable[[], Sequence[Any]] | None = None,
         linear_modes: Callable[[], Sequence[Any]] | None = None,
+        linear_certificates: Callable[[], Sequence[Any]] | None = None,
     ) -> None:
         self._linear_structure_builder = linear_structure
         self.linear_mode_key = linear_mode_key or _no_linear_mode
         self.linear_blocks = linear_blocks or _no_linear_data
         self.linear_modes = linear_modes or _no_linear_data
+        # Certificates alone let an explicit solver avoid materializing present mode identities.
+        self.linear_certificates = linear_certificates
         self.equation_revision = 0
         if isinstance(subsystems, Mapping):
             names = [str(n) for n in subsystems]
@@ -1915,6 +1920,8 @@ class Model:
     def set_zoh_input(self, label: str, value: Any) -> None:
         """Set a held external input (e.g. the switching state) by label."""
         targets = self._zoh_targets[label]
+        if isinstance(value, np.generic):  # generated equations run on Python scalars
+            value = value.item()
         changed = []
         for input, name in targets:
             previous = getattr(input, name)

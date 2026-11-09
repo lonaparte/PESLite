@@ -51,6 +51,7 @@ from ..solver.netlist import (QUANTITIES, CoupledInductors, CurrentSource, Diode
 
 __all__ = ["NetlistBuilder", "NetworkPlan", "Circuit", "NetworkView", "circuit_structure",
            "circuit_mode_key", "circuit_linear_blocks", "circuit_linear_modes",
+           "circuit_linear_certificates",
            "lower", "bind_device", "compile_network"]
 
 
@@ -790,6 +791,7 @@ class Circuit:
         position = {index: k for k, index in enumerate(selected)}
         lines: list[str] = []
         env: dict[str, Any] = {}
+        computed: dict[str, str] = {}
         for key, dimension, terms in publications:
             parts = [
                 " + ".join(
@@ -799,7 +801,7 @@ class Circuit:
                 for k in range(dimension)
             ]
             expression = (f"({parts[0]}) + 1j * ({parts[1]})" if dimension == 2 else parts[0])
-            self._append_publication_writes(key, expression, lines, env, "runtime")
+            self._append_publication_writes(key, expression, lines, env, "runtime", computed)
         lines.extend(f"output.{output} = input.{input_}" for input_, output in self.passthrough)
         env.update(input=self.input, output=self.output)
         exec(compile("def publish(o):\n" + "\n".join("    " + line for line in lines or ["pass"]) + "\n",
@@ -1031,6 +1033,7 @@ class Circuit:
         def scaled(factor: float, expression: str) -> str:
             return f"({expression})" if factor == 1.0 else f"{factor!r} * ({expression})"
 
+        computed: dict[str, str] = {}
         for key in keys:
             dimension, terms = publications[key]
             parts = [
@@ -1042,13 +1045,19 @@ class Circuit:
             ]
             expression = (f"({parts[0]}) + 1j * ({parts[1]})"
                           if dimension == 2 else parts[0])
-            self._append_publication_writes(key, expression, body, namespace, label)
+            self._append_publication_writes(key, expression, body, namespace, label, computed)
 
     def _append_publication_writes(
         self, key: str, expression: str, body: list[str], namespace: dict[str, Any],
-        label: str,
+        label: str, computed: dict[str, str],
     ) -> None:
-        """Write one public circuit value to every record that declares it."""
+        """Write one public circuit value to every record that declares it.
+
+        The value is evaluated once into a local. ``computed`` maps the expressions already
+        evaluated in the same straight-line body to their locals: publications read only states
+        and the body's own locals and write only output records, so an equal expression has the
+        same value and reuses the local.
+        """
         targets: list[tuple[Any, str]] = [(self.output, key)]
         for port, _group, voltage_key, current_key in self.port_values:
             if key == voltage_key:
@@ -1060,6 +1069,14 @@ class Circuit:
             component = components.get(owner)
             if component is not None and published == key:
                 targets.append((component.output, field))
+        known = computed.get(expression)
+        if known is not None:
+            expression = known
+        else:
+            value = f"_published_{label}_{len(namespace)}"
+            body.append(f"{value} = {expression}")
+            computed[expression] = value
+            expression = value
         for target, field in targets:
             token = f"_circuit_output_{label}_{len(namespace)}"
             namespace[token] = target
@@ -1405,9 +1422,18 @@ class Circuit:
         tuple, Callable[[], np.ndarray], Optional[tuple[object, float]]
     ]:
         """Return the present linear-mode identity, matrix builder and stability certificate."""
-        topology = self._bound_device_topology() or self.netlist.topology()
+        topology = self._bound_device_topology()
+        if topology is None:
+            return self.netlist.linear_mode()
         return (topology.state_matrix_key(), lambda: topology.state_space.A,
                 topology.state_matrix_stability_certificate())
+
+    def stability_certificate(self) -> Optional[tuple[object, float]]:
+        """Return the present mode's stability certificate without its identity or matrix."""
+        topology = self._bound_device_topology()
+        if topology is None:
+            return self.netlist.stability_certificate()
+        return topology.state_matrix_stability_certificate()
 
     def _store(self, y: np.ndarray) -> None:
         """Write a netlist state vector back into the components."""
@@ -2733,17 +2759,27 @@ def _placed_linear_matrix(circuit: Circuit, matrix: np.ndarray) -> np.ndarray:
     return plan.inverse @ placed @ plan.transform
 
 
+def _placed_certificate(circuit: Circuit, certificate: Optional[tuple[object, float]]):
+    # Similarity preserves the spectrum, so the netlist bound also certifies the placed matrix.
+    return None if certificate is None else ((id(circuit.netlist), certificate[0]), certificate[1])
+
+
 def circuit_linear_modes(circuits: Sequence[Circuit]):
     """Return each assembled circuit's present-mode identity and the builder of its exact state
     matrix (a solver builds it only for a mode it has not seen)."""
     return tuple(
         ((id(circuit.netlist), key),
          lambda circuit=circuit, matrix=matrix: _placed_linear_matrix(circuit, matrix()),
-         # Similarity preserves the spectrum, so the netlist bound also certifies the placed matrix.
-         None if certificate is None else ((id(circuit.netlist), certificate[0]), certificate[1]))
+         _placed_certificate(circuit, certificate))
         for circuit in circuits
         for key, matrix, certificate in (circuit.linear_mode(),)
     )
+
+
+def circuit_linear_certificates(circuits: Sequence[Circuit]):
+    """Return present-mode certificates without materializing identities or matrices."""
+    return tuple(_placed_certificate(circuit, circuit.stability_certificate())
+                 for circuit in circuits)
 
 
 _VOLTAGE_ROLES = ("vsrc", "short", "cap")

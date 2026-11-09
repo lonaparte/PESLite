@@ -277,3 +277,15 @@ def test_held_input_refresh_uses_the_same_dependency_plan(cyclic):
     assert driven.output.x == pytest.approx(expected)
     assert consumer.output.x == pytest.approx(1.0 + 0.5 * expected)
     assert independent.calls == calls
+
+
+def test_held_numpy_scalars_enter_the_generated_equations_as_python_scalars():
+    """NumPy scalar arithmetic is several times slower than Python's, with equal results."""
+    import numpy as np
+
+    driven, consumer = _Feedthrough(), _Feedthrough()
+    model = Model([consumer, driven], {(consumer, "x"): (driven, "x")}, {(driven, "x"): "held"})
+    model.set_zoh_input("held", np.float64(4.0))
+    assert type(driven.input.x) is float and driven.input.x == 4.0
+    model.set_zoh_input("held", np.complex128(1.0 + 2.0j))
+    assert type(driven.input.x) is complex and driven.input.x == 1.0 + 2.0j

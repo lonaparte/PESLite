@@ -568,6 +568,8 @@ def _symbolic_source(expressions: Sequence[Any]) -> tuple[list[str], tuple[str, 
 
 def _maximum(left: Any, right: Any) -> Any:
     """Scalar maximum which remains one arithmetic expression during equation lowering."""
+    if type(left) is float and type(right) is float:  # numeric hot path without ABC checks
+        return max(left, right)
     if isinstance(left, numbers.Real) and isinstance(right, numbers.Real):
         return max(left, right)
     if hasattr(left, "__array_ufunc__") or hasattr(right, "__array_ufunc__"):
@@ -577,6 +579,8 @@ def _maximum(left: Any, right: Any) -> Any:
 
 def _minimum(left: Any, right: Any) -> Any:
     """Scalar minimum paired with :func:`_maximum`."""
+    if type(left) is float and type(right) is float:  # numeric hot path without ABC checks
+        return min(left, right)
     if isinstance(left, numbers.Real) and isinstance(right, numbers.Real):
         return min(left, right)
     if hasattr(left, "__array_ufunc__") or hasattr(right, "__array_ufunc__"):
@@ -655,6 +659,42 @@ def _port(a: Port, b: Port) -> tuple[int, float]:
     if len(nodes) == 2 and (a.dim, a.scale) != (b.dim, b.scale):
         raise ValueError(f"branch ports {a!r} and {b!r} differ in dimension or power scale")
     return nodes[0].dim, nodes[0].scale
+
+
+def _symmetrizing_scale(matrix: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Return a positive diagonal similarity that balances mutually coupled entries.
+
+    The similarity preserves the spectrum, so its matrix 2-norm remains a rigorous spectral-radius
+    bound. Least-squares balancing keeps that bound useful when state scales differ greatly.
+    """
+    n = matrix.shape[0]
+    coupled = (matrix != 0.0) & (matrix.T != 0.0) & np.isfinite(matrix) & np.isfinite(matrix.T)
+    rows, cols = np.nonzero(np.triu(coupled, 1))
+    if not rows.size:
+        return np.ones(n)
+    target = 0.5 * (np.log(np.abs(matrix[cols, rows])) - np.log(np.abs(matrix[rows, cols])))
+    laplacian = 1e-9 * np.eye(n)
+    np.add.at(laplacian, (rows, rows), 1.0)
+    np.add.at(laplacian, (cols, cols), 1.0)
+    np.add.at(laplacian, (rows, cols), -1.0)
+    np.add.at(laplacian, (cols, rows), -1.0)
+    rhs = np.zeros(n)
+    np.add.at(rhs, rows, target)
+    np.add.at(rhs, cols, -target)
+    x = np.linalg.solve(laplacian, rhs)
+    x -= x.mean()
+    scale = np.exp(np.clip(x, -300.0, 300.0))
+    return scale if np.all(np.isfinite(scale)) else np.ones(n)
+
+
+def _scaled_norm(matrix: NDArray[np.float64], left: Optional[NDArray[np.float64]] = None,
+                 right: Optional[NDArray[np.float64]] = None) -> float:
+    """Return ``|diag(left) matrix diag(right)^-1|_2`` with either scale optional."""
+    if left is not None:
+        matrix = left[:, None] * matrix
+    if right is not None:
+        matrix = matrix / right[None, :]
+    return float(np.linalg.norm(matrix, 2)) if matrix.size else 0.0
 
 
 def _coefficient_array(value: Any) -> NDArray:
@@ -873,12 +913,21 @@ class Transformer(Element):
                 1.0, np.maximum(np.abs(lower), np.abs(upper))
             )
             self._range = tuple(zip(
-                (lower - tolerance).flat,
-                (upper + tolerance).flat,
+                (lower - tolerance).ravel().tolist(),
+                (upper + tolerance).ravel().tolist(),
             ))
         self._cached_scalar: Optional[tuple[numbers.Number, NDArray[np.float64]]] = None
 
     def _ratio(self, value: ArrayLike) -> NDArray[np.float64]:
+        # Common scalar bridge callbacks avoid NumPy's general shape conversion.
+        kind = type(value)
+        if kind is complex and self.shape == (2, 1):
+            real, imag = value.real, value.imag
+            if math.isfinite(real) and math.isfinite(imag):
+                return np.array(((real,), (imag,)))
+        elif (kind is float or kind is int) and self.shape == (1, 1):
+            if math.isfinite(value):
+                return np.array(((float(value),),))
         if np.ndim(value) == 0:
             if self.shape == (1, 1):
                 value = ((value,),)
@@ -897,17 +946,18 @@ class Transformer(Element):
         """Whether a ratio is covered by the optional stability range declaration."""
         if self._range is None:
             return False
-        return all(
-            lower <= value <= upper
-            for value, (lower, upper) in zip(ratio.flat, self._range)
-        )
+        for value, (lower, upper) in zip(ratio.ravel().tolist(), self._range):
+            if not lower <= value <= upper:
+                return False
+        return True
 
     def ratio(self) -> NDArray[np.float64]:
         """Return the current ratio, reusing the matrix form of an unchanged scalar callback."""
         if self.constant is not None:
             return self.constant
         value = self.N()
-        if isinstance(value, numbers.Number):
+        kind = type(value)
+        if kind is complex or kind is float or isinstance(value, numbers.Number):
             cached = self._cached_scalar
             if cached is not None and cached[0] == value:
                 return cached[1]
@@ -1937,15 +1987,16 @@ class Topology:
         return plan
 
     def state_matrix_norm_bound(self) -> Optional[float]:
-        """Return a cheap upper bound on the state matrix Frobenius norm.
+        """Return a cheap upper bound on the state matrix's spectral radius.
 
-        A transformer-ratio copy uses the structure's Woodbury factors.  The bound therefore
-        avoids forming the dense state matrix while remaining conservative; an unavailable or
-        ill-conditioned low-rank update asks the caller to form the exact matrix instead.
+        The bound is the 2-norm of a diagonal similarity of the matrix. A transformer-ratio copy
+        uses the structure's Woodbury factors, avoiding the dense state matrix while remaining
+        conservative. An unavailable low-rank update asks the caller for the exact matrix.
         """
         base = self._shared["ratio_base"]
+        scale = self._stability_scale()
         if self is base or not self._pattern.slot_pos.size:
-            return float(np.linalg.norm(base.state_space.A, "fro"))
+            return self._base_scaled_norm()
         _ = base.lu
         plan = self._ratio_plan()
         if plan is None:
@@ -1959,17 +2010,34 @@ class Topology:
         base_solution = plan.shared("state_matrix_bound", self._shared["K"])
         left = update.left[self.xd_index]
         right = update.inverse @ base_solution[plan.cols, :n_x]
-        return float(
-            np.linalg.norm(base.state_space.A, "fro")
-            + np.linalg.norm(left, "fro") * np.linalg.norm(right, "fro")
-        )
+        return (self._base_scaled_norm()
+                + _scaled_norm(left, left=scale) * _scaled_norm(right, right=scale))
+
+    def _stability_scale(self) -> NDArray[np.float64]:
+        """Return the structure's cached diagonal similarity for stability bounds."""
+        scale = self._shared.get("stability_scale")
+        if scale is None:
+            scale = self._shared["stability_scale"] = _symmetrizing_scale(
+                self._shared["ratio_base"].state_space.A
+            )
+        return scale
+
+    def _base_scaled_norm(self) -> float:
+        """Return ``|diag(d) A diag(d)^-1|_2`` for the structure's base matrix."""
+        norm = self._shared.get("base_scaled_norm")
+        if norm is None:
+            scale = self._stability_scale()
+            norm = self._shared["base_scaled_norm"] = _scaled_norm(
+                self._shared["ratio_base"].state_space.A, scale, scale
+            )
+        return norm
 
     def _state_matrix_range_certificate(self) -> Optional[tuple[object, float]]:
-        """Certify one state-matrix norm bound over every declared transformer ratio.
+        """Certify one spectral-radius bound over every declared transformer ratio.
 
         The interval matrix bounds the low-rank ratio correction entry by entry.  If its
         interaction with the base inverse is below one, the Neumann bound proves that every
-        matrix in the range is nonsingular and bounds its state matrix without sampling ratios.
+        matrix in the range is nonsingular and bounds its state matrix in one diagonal similarity.
         """
         base = self._shared["ratio_base"]
         cached = self._shared.get("state_matrix_range_certificate", _PENDING)
@@ -1981,7 +2049,7 @@ class Topology:
             certificate = None
         elif (not base._pattern.slot_pos.size
               or all(np.array_equal(lower, upper) for lower, upper in bounds)):
-            certificate = (base, float(np.linalg.norm(base.state_space.A, "fro")))
+            certificate = (base, self._base_scaled_norm())
         else:
             _ = base.lu
             plan = base._ratio_plan()
@@ -2000,25 +2068,30 @@ class Topology:
                     solution = plan.shared(
                         "state_matrix_bound", self._shared["K"]
                     )
+                    scale = self._stability_scale()
                     correction = (
-                        float(np.linalg.norm(plan.Z[base.xd_index], 2))
+                        _scaled_norm(plan.Z[base.xd_index], left=scale)
                         * change_norm / (1.0 - interaction)
-                        * float(np.linalg.norm(solution[plan.cols, :n_x], 2))
+                        * _scaled_norm(solution[plan.cols, :n_x], right=scale)
                     )
-                    bound = float(np.linalg.norm(base.state_space.A, "fro")) + correction
+                    bound = self._base_scaled_norm() + correction
                     if math.isfinite(bound):
                         certificate = (base, bound)
         self._shared["state_matrix_range_certificate"] = certificate
         return certificate
 
+    def range_stability_certificate(
+        self, ratios: Sequence[NDArray[np.float64]]
+    ) -> Optional[tuple[object, float]]:
+        """Return the structure's range certificate when it covers ``ratios``."""
+        for transformer, ratio in zip(self._store[0]._transformers, ratios):
+            if not transformer.within_bounds(ratio):
+                return None
+        return self._state_matrix_range_certificate()
+
     def state_matrix_stability_certificate(self) -> Optional[tuple[object, float]]:
         """Return a reusable range certificate, or a bound for this exact ratio mode."""
-        net = self._store[0]
-        covered = all(
-            transformer.within_bounds(ratio)
-            for transformer, ratio in zip(net._transformers, self.mode.ratios)
-        )
-        certificate = self._state_matrix_range_certificate() if covered else None
+        certificate = self.range_stability_certificate(self.mode.ratios)
         if certificate is not None:
             return certificate
         bound = self.state_matrix_norm_bound()
@@ -2269,15 +2342,19 @@ class Topology:
         self._shared["input_reach"] = reach
         return reach
 
-    def state_matrix_key(self) -> tuple:
-        """Mode identity containing only transformer ratios that can change ``A``."""
+    def state_matrix_key(self, mode: Optional[Mode] = None) -> tuple:
+        """Mode identity containing only transformer ratios that can change ``A``.
+
+        ``mode`` may be another ratio mode of this structure; the reach is shared by them.
+        """
+        mode = self.mode if mode is None else mode
         reach = self.input_reach()
-        relevant = (np.ones(len(self.mode.ratios), dtype=bool)
+        relevant = (np.ones(len(mode.ratios), dtype=bool)
                     if reach is None else reach[2])
         ratios = b"".join(
-            ratio.tobytes() for ratio, used in zip(self.mode.ratios, relevant) if used
+            ratio.tobytes() for ratio, used in zip(mode.ratios, relevant) if used
         )
-        return self.mode.closed, self.mode.conducting, ratios
+        return mode.closed, mode.conducting, ratios
 
     def selected_outputs(self, selected: Sequence[int]) -> NDArray[np.float64]:
         """Cached ratio-independent rows of the network output map."""
@@ -3026,6 +3103,9 @@ class Netlist:
         conduction margins confirm it."""
         if mode is None and self._frozen_topology is not None:
             return self._frozen_topology
+        if mode is None and self._frozen_mode is not None:
+            self._frozen_topology = self._compiled(self._frozen_mode)
+            return self._frozen_topology
         if mode is not None:
             return self._compiled(mode)
         requested = self.mode()
@@ -3079,15 +3159,49 @@ class Netlist:
         raise ConductionError("no nonsingular diode conduction pattern exists")
 
     def freeze_topology(self) -> None:
-        """Reuse the current compiled topology until the enclosing smooth interval ends."""
-        if self._frozen_topology is None:
-            topology = self.topology()
-            self._frozen_mode, self._frozen_topology = topology.mode, topology
+        """Reuse the current mode until the enclosing smooth interval ends.
+
+        A previously resolved switch and diode structure needs only its transformer-ratio copy;
+        that copy is created on first topology access, which a conclusive certificate avoids.
+        """
+        if self._frozen_mode is None:
+            requested = self.mode()
+            if (requested.closed, requested.conducting) in self._structures:
+                self._frozen_mode = requested
+            else:
+                topology = self.topology()
+                self._frozen_mode, self._frozen_topology = topology.mode, topology
             if (self.form == "device"
                     and all(transformer.constant is not None for transformer in self._transformers)):
-                key = topology.mode.key, "all", None
+                key = self._frozen_mode.key, "all", None
                 if key in self._scalar_functions:
-                    self._frozen_scalar = self._scalar_function(topology, "all")
+                    self._frozen_scalar = self._scalar_function(self.topology(), "all")
+
+    def _frozen_range_certificate(self) -> tuple[Optional[Topology], Optional[tuple[object, float]]]:
+        """Return the frozen mode's structure and covering range certificate, if available."""
+        mode = self._frozen_mode
+        if mode is None or self._frozen_topology is not None:
+            return None, None
+        base = self._structures.get((mode.closed, mode.conducting))
+        return base, None if base is None else base.range_stability_certificate(mode.ratios)
+
+    def stability_certificate(self) -> Optional[tuple[object, float]]:
+        """Return the present stability certificate without its identity or matrix."""
+        _base, certificate = self._frozen_range_certificate()
+        if certificate is not None:
+            return certificate
+        return self.topology().state_matrix_stability_certificate()
+
+    def linear_mode(self) -> tuple[tuple, Callable[[], NDArray[np.float64]],
+                                   Optional[tuple[object, float]]]:
+        """Return the present state-matrix identity, builder and stability certificate."""
+        base, certificate = self._frozen_range_certificate()
+        if certificate is not None:
+            return (base.state_matrix_key(self._frozen_mode),
+                    lambda: self.topology().state_space.A, certificate)
+        topology = self.topology()
+        return (topology.state_matrix_key(), lambda: topology.state_space.A,
+                topology.state_matrix_stability_certificate())
 
     def release_topology(self) -> None:
         """Allow topology callbacks to be read at the next model-changing boundary."""

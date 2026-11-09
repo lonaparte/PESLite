@@ -104,7 +104,7 @@ def test_rk4_stability_norm_certificate_avoids_forming_the_matrix():
     assert solver._explicit_stable(1e-3, ((
         "inconclusive",
         lambda: builds.append(True) or np.array([[-1.0]]),
-        ("range", 2000.0),
+        ("range", 3000.0),
     ),))
     assert builds == [True]
 
@@ -188,7 +188,8 @@ def test_explicit_stability_and_linearization_share_the_exact_circuit_matrix(exa
     assert len(modes) == len(blocks)
     for (_key, build, certificate), (_positions, matrix, _exact, _skipped) in zip(modes, blocks):
         np.testing.assert_array_equal(build(), matrix)
-        assert certificate[1] >= np.linalg.norm(matrix, "fro") * (1.0 - 1e-12)
+        radius = np.max(np.abs(np.linalg.eigvals(matrix)), initial=0.0)
+        assert certificate[1] >= radius * (1.0 - 1e-12)
 
 
 @pytest.mark.parametrize("method", ["euler", "heun", "RK4"])
