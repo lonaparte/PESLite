@@ -1,0 +1,40 @@
+{
+  "name": "peslite-workspace",
+  "displayName": "PESLite Workspace",
+  "description": "Offline .pes schematic and result preview using a locally selected PESLite Python environment.",
+  "version": "0.5.1",
+  "private": true,
+  "publisher": "peslite",
+  "license": "AGPL-3.0-only",
+  "engines": { "vscode": "^1.96.0" },
+  "main": "./out/extension.js",
+  "activationEvents": ["onCommand:peslite.preview", "onCommand:peslite.run", "onCommand:peslite.stop"],
+  "contributes": {
+    "commands": [
+      { "command": "peslite.preview", "title": "PESLite: Preview File" },
+      { "command": "peslite.run", "title": "PESLite: Run Simulation" },
+      { "command": "peslite.stop", "title": "PESLite: Stop Simulation" }
+    ],
+    "menus": { "explorer/context": [
+      { "command": "peslite.preview", "when": "resourceExtname == .pes || resourceExtname == .csv || resourceFilename == summary.json" }
+    ] },
+    "configuration": {
+      "title": "PESLite",
+      "properties": {
+        "peslite.pythonPath": {
+          "type": "string", "default": "python",
+          "description": "Python executable in the environment containing PESLite; used only by the extension host."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "tsc && node scripts/copy-assets.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.96.0",
+    "typescript": "~5.6.3"
+  }
+}

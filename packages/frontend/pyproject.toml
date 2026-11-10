@@ -12,6 +12,9 @@ license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 dependencies = ["peslite==0.5.1"]
 
+[project.scripts]
+peslite-frontend = "peslite.frontend.web_service:main"
+
 [project.urls]
 Homepage = "https://github.com/lonaparte/PESLite"
 Repository = "https://github.com/lonaparte/PESLite"
@@ -21,3 +24,6 @@ Issues = "https://github.com/lonaparte/PESLite/issues"
 where = ["src"]
 include = ["peslite.frontend*"]
 namespaces = true
+
+[tool.setuptools.package-data]
+"peslite.frontend" = ["web_dist/**/*"]

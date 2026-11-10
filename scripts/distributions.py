@@ -83,6 +83,13 @@ def stage(name: str, destination: str | Path) -> Path:
             raise FileExistsError(f"staging directory is not empty: {target}")
     else:
         target.mkdir(parents=True)
+    if name == "peslite-frontend" and not (
+            ROOT / "src/peslite/frontend/web_dist/index.html").is_file():
+        raise RuntimeError(
+            "build the offline frontend UI before staging peslite-frontend: "
+            "npm --prefix src/peslite/frontend/ui install && "
+            "npm --prefix src/peslite/frontend/ui run build"
+        )
     config = distributions[name]
     shutil.copy2(ROOT / config["project"], target / "pyproject.toml")
     for support in SUPPORT_FILES:

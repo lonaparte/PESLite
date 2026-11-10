@@ -1,7 +1,7 @@
 import { parsePES } from './parser.js';
 import { layoutView } from './layout.js';
 import type {
-  Diagnostic, GraphGroup, GraphLayout, GraphView,
+  Diagnostic, GraphEdge, GraphGroup, GraphLayout, GraphNode, GraphView,
   LayoutNode, PESModel, SourceLocation,
 } from './types.js';
 
@@ -11,10 +11,15 @@ let instance = 0;
 export interface PESPreviewOptions {
   /** Called when the user selects a declaration or diagnostic. */
   onSourceSelect?: (location: SourceLocation) => void;
+  /** The host may inspect an entity without coupling the renderer to an editor. */
+  onNodeSelect?: (node: GraphNode, viewName: string) => void;
+  /** A host may offer safe connection edits without coupling the renderer to files. */
+  onEdgeSelect?: (edge: GraphEdge, viewName: string) => void;
   onDiagnostics?: (diagnostics: readonly Diagnostic[]) => void;
 }
 export interface PESPreviewInstance {
   update(text: string): PESModel;
+  updateModel(model: PESModel): PESModel;
   navigate(viewName: string): boolean;
   getModel(): PESModel;
   destroy(): void;
@@ -64,7 +69,8 @@ const STYLES = `
   background-size: 16px 16px; }
 .pes-preview .pp-svg { display: block; width: 100%; min-height: 320px; max-height: 640px;
   touch-action: none; user-select: none; }
-.pes-preview .pp-edge { fill: none; stroke: #617e94; stroke-width: 2; }
+.pes-preview .pp-edge { fill: none; stroke: #617e94; stroke-width: 2; cursor: pointer; }
+.pes-preview .pp-edge:hover { stroke: #1177a8; stroke-width: 3.5; }
 .pes-preview .pp-edge-inactive { stroke: #afb8be; stroke-dasharray: 6 5; opacity: .25; }
 .pes-preview .pp-node { cursor: pointer; }
 .pes-preview .pp-node rect { fill: #fff; stroke: #7b9aaf; stroke-width: 1.7; }
@@ -129,16 +135,26 @@ class Renderer implements PESPreviewInstance {
   update(text: string): PESModel {
     this.ensureLive();
     if (typeof text !== 'string') throw new TypeError('update(text) requires a string');
-    this.model = parsePES(text);
-    this.layouts = new Map(this.model.views.map(view => [view.name, layoutView(view)]));
-    if (!this.model.views.some(view => view.name === this.viewName)) {
-      this.viewName = this.model.defaultView;
+    return this.updateModel(parsePES(text));
+  }
+
+  /** Accept a normalized model from an optional host-side format adapter. */
+  updateModel(model: PESModel): PESModel {
+    this.ensureLive();
+    if (!model || !Array.isArray(model.views) || !Array.isArray(model.timeline) ||
+        !Array.isArray(model.diagnostics)) {
+      throw new TypeError('updateModel(model) requires a PESModel');
+    }
+    this.model = model;
+    this.layouts = new Map(model.views.map(view => [view.name, layoutView(view)]));
+    if (!model.views.some(view => view.name === this.viewName)) {
+      this.viewName = model.defaultView;
       this.history = [];
     }
-    this.segment = Math.min(this.segment, Math.max(0, this.model.timeline.length - 1));
-    this.options.onDiagnostics?.(this.model.diagnostics);
+    this.segment = Math.min(this.segment, Math.max(0, model.timeline.length - 1));
+    this.options.onDiagnostics?.(model.diagnostics);
     this.render();
-    return this.model;
+    return model;
   }
 
   navigate(viewName: string): boolean {
@@ -310,6 +326,19 @@ class Renderer implements PESPreviewInstance {
       const line = svg('path', { class: `pp-edge${inactive ? ' pp-edge-inactive' : ''}`,
         d: `M ${a.x} ${a.y} L ${b.x} ${b.y}` });
       if (edge.directed && !inactive) line.setAttribute('marker-end', `url(#${this.markerId})`);
+      if (this.options.onEdgeSelect) {
+        line.setAttribute('tabindex', '0');
+        line.setAttribute('role', 'button');
+        line.setAttribute('aria-label', `Select connection ${edge.id}`);
+        const select = () => this.options.onEdgeSelect?.(edge, view.name);
+        line.addEventListener('click', select);
+        line.addEventListener('keydown', event => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            select();
+          }
+        });
+      }
       const title = svg('title');
       title.textContent = `${edge.from}${edge.fromPort ? '.' + edge.fromPort : ''} ${edge.directed ? '→' : '—'} ${edge.to}${edge.toPort ? '.' + edge.toPort : ''}${inactive ? ' (disconnected)' : ''}`;
       line.appendChild(title);
@@ -336,6 +365,7 @@ class Renderer implements PESPreviewInstance {
         group.appendChild(type);
       }
       const action = () => {
+        this.options.onNodeSelect?.(node, view.name);
         if (this.model.views.some(view => view.name === node.name) && node.name !== this.viewName) {
           this.navigate(node.name);
         } else this.options.onSourceSelect?.(node.source.start);

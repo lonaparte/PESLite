@@ -25,7 +25,8 @@
     },
     "peslite-frontend": {
       "project": "packages/frontend/pyproject.toml",
-      "include": ["frontend"]
+      "include": ["frontend"],
+      "files": ["src/peslite/frontend/web_dist/**/*"]
     },
     "peslite-full": {
       "project": "packages/full/pyproject.toml",

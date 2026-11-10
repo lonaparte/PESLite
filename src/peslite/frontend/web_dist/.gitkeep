@@ -1,0 +1,1 @@
+Built offline UI assets are generated here with: npm --prefix src/peslite/frontend/ui run build

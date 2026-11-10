@@ -168,3 +168,48 @@ test('renders host-neutral SVG and updates timeline/folding/navigation without s
     assert.throws(() => preview.update(SAMPLE), /destroyed/);
   } finally { globalThis.document = old; }
 });
+
+
+test('accepts a host-normalized legacy YAML graph without requiring a Python parser in the bundle', () => {
+  const old = globalThis.document;
+  globalThis.document = {
+    createElement: tag => new FakeElement(tag),
+    createElementNS: (_namespace, tag) => new FakeElement(tag),
+  };
+  try {
+    const host = new FakeElement('div');
+    const preview = createPESPreview(host);
+    const graph = parsePES('@circuit\nGrid -- VSC\n');
+    graph.views[0].nodes.find(node => node.id === 'VSC').name = 'controller';
+    graph.views[0].nodes.find(node => node.id === 'VSC').type = 'vsc';
+    preview.updateModel(graph);
+    assert.equal(preview.getModel(), graph);
+    assert.ok(findAll(host, node => node.getAttribute('aria-label') === 'controller (vsc)').length);
+    assert.throws(() => preview.updateModel({}), /requires a PESModel/);
+    preview.destroy();
+  } finally { globalThis.document = old; }
+});
+
+test('exposes optional host-neutral edge selections without modifying source', () => {
+  const old = globalThis.document;
+  globalThis.document = {
+    createElement: tag => new FakeElement(tag),
+    createElementNS: (_namespace, tag) => new FakeElement(tag),
+  };
+  try {
+    const host = new FakeElement('div');
+    const selected = [];
+    const preview = createPESPreview(host, {
+      onEdgeSelect: (edge, view) => selected.push([edge.id, view]),
+    });
+    preview.update('@circuit\nA.out -> B.in\n');
+    const edge = findAll(host, node => node.tagName === 'path' &&
+      node.getAttribute('aria-label')?.startsWith('Select connection '))[0];
+    assert.ok(edge);
+    edge.click();
+    assert.equal(selected.length, 1);
+    assert.equal(selected[0][1], 'circuit');
+    assert.equal(selected[0][0], preview.getModel().views[0].edges[0].id);
+    preview.destroy();
+  } finally { globalThis.document = old; }
+});

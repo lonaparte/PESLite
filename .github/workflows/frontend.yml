@@ -1,0 +1,52 @@
+name: Frontend build and compatibility
+
+on:
+  pull_request:
+    paths:
+      - 'src/peslite/frontend/**'
+      - 'src/peslite/addons/functions/**'
+      - 'packages/frontend/**'
+      - 'packages/distributions.json'
+      - 'tests/test_frontend_workspace_files.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e '.[test]'
+      - run: python -m pytest -q tests/test_frontend_workspace_files.py tests/test_frontend_legacy_yaml.py tests/test_frontend_web_host.py tests/test_frontend_service.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund
+        working-directory: src/peslite/frontend/preview
+      - run: npm test && npm run build
+        working-directory: src/peslite/frontend/preview
+      - run: npm install --no-audit --no-fund
+        working-directory: src/peslite/frontend/ui
+      - run: npm run build
+        working-directory: src/peslite/frontend/ui
+      - run: npm install --no-audit --no-fund
+        working-directory: src/peslite/frontend/vscode
+      - run: npm run build
+        working-directory: src/peslite/frontend/vscode
+      - run: python scripts/distributions.py validate
+      - name: Verify frontend package stages offline assets
+        run: |
+          python scripts/distributions.py stage peslite-frontend /tmp/peslite-frontend-stage
+          test -f /tmp/peslite-frontend-stage/src/peslite/frontend/web_dist/index.html
+      - name: Verify VS Code ships only frontend assets
+        run: |
+          test -f src/peslite/frontend/vscode/media/index.html
+          ! find src/peslite/frontend/vscode/media -type f \( -name '*.py' -o -name '*.so' -o -name '*.pyd' \) | grep .
+      - run: python -m peslite.frontend.web_service --help
