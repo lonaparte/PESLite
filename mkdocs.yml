@@ -37,6 +37,7 @@ nav:
       - Plotting: Plotting.md
       - Online Stability Analysis: Online-Stability-Analysis.md
       - Analysis Functions: Analysis-Functions.md
+      - Physical Perturbation Analysis: Physical-Perturbation-Analysis.md
       - Extending PESLite: Extending-PESLite.md
       - C++ Export: Cpp-Export.md
       - Imperix Export: Imperix-Export.md

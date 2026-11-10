@@ -24,6 +24,8 @@ _EXPORTS = {
     "measure_port_matrix": ("port_measurement", "measure_port_matrix", False),
     "run_port_sweep": ("port_measurement", "run_port_sweep", False),
     "run_port_matrix": ("port_measurement", "run_port_matrix", False),
+    "measure_return_ratio": ("loop_gain", "measure_return_ratio", False),
+    "loop_gain_sweep": ("loop_gain", "loop_gain_sweep", False),
 }
 __all__ = list(_EXPORTS)
 _ROOT_EXPORTS = tuple(name for name, target in _EXPORTS.items() if target[2])
