@@ -46,6 +46,7 @@ testpaths = ["tests"]
 markers = [
     "static: configuration, interface and packaging checks run before numerical tests",
     "full: compiler, external-reference or long numerical integration tests",
+    "serial: resource-intensive tests that require a non-parallel pytest run",
     "motulator: cross-checks PESLite against the pinned motulator reference simulator",
     "pyspice: optional DC-converter and WPT cross-checks against PySpice and ngspice",
     "onnx: optional black-box compatibility tests against ONNX Runtime",

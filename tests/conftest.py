@@ -34,9 +34,14 @@ def pytest_collection_modifyitems(config, items):
         deselected = [item for item in items if item.get_closest_marker("full") is not None]
         items[:] = selected
         config.hook.pytest_deselected(items=deselected)
+    parallel_workers = getattr(config.option, "numprocesses", None)
+    serial = [item for item in items if item.get_closest_marker("serial") is not None]
+    if serial and parallel_workers not in (None, 0, "0", 1, "1"):
+        raise pytest.UsageError("tests marked serial require a non-parallel pytest run")
     items.sort(key=lambda item: (
         item.get_closest_marker("full") is not None,
         item.get_closest_marker("static") is None,
+        item.get_closest_marker("serial") is not None,
     ))
 
 
