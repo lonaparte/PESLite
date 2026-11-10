@@ -44,14 +44,14 @@ VSC: vsc, gfl
   DC: DCVoltageControl
     kp: 0.8
 
-@base:
+base:
   s_base: 2.0e6
 
-@simulation:
+simulation:
   t_end: 1.0
   solver: {dt: 25e-6}
 
-@events:
+events:
   connect_vsc: {type: connect, target: VSC, t: 0.2}
   disconnect_vsc: {type: disconnect, target: VSC, t: 0.7}
 </textarea>

@@ -27,14 +27,14 @@ VSC: vsc, gfl
   DC: DCVoltageControl
     kp: 0.8
 
-@base:
+base:
   s_base: 2.0e6
 
-@simulation:
+simulation:
   t_end: 1.0
   solver: {dt: 25e-6}
 
-@events:
+events:
   connect_vsc: {type: connect, target: VSC, t: 0.2}
   disconnect_vsc: {type: disconnect, target: VSC, t: 0.7}
 `;
@@ -79,12 +79,29 @@ test('creates separate timeline segments without recalculating layout', () => {
 });
 
 test('allows forward references and nested control views with independent names', () => {
-  const text = `@circuit\nA -- Unit\n@Unit\nX.out -> Y.in\nUnit: Converter, custom\n  X: PID\n    kp: 1.0\n  Y: Output\n@simulation:\n  t_end: 1\n`;
+  const text = `@circuit\nA -- Unit\n@Unit\nX.out -> Y.in\nUnit: Converter, custom\n  X: PID\n    kp: 1.0\n  Y: Output\nsimulation:\n  t_end: 1\n`;
   const parsed = parsePES(text);
   assert.deepEqual(parsed.diagnostics, []);
   assert.equal(parsed.views[0].nodes.find(node => node.name === 'Unit').controllerType, 'custom');
   assert.equal(parsed.views[1].nodes.find(node => node.name === 'X').type, 'PID');
   assert.deepEqual(parsed.views[1].nodes.find(node => node.name === 'X').ports, ['out']);
+});
+
+test('parses parameter domains without @ or a fixed domain-name list', () => {
+  const parsed = parsePES(`base:\n  s_base: 1e6\n@circuit\nGrid -- Unit\n@Unit\nLoop -> PWM\nUnit: Converter\n  Loop: CurrentControl\n  PWM: DutyModulation\ncustom_parameters:\n  enabled: true\nsimulation:\n  t_end: 2\n`);
+  assert.deepEqual(parsed.diagnostics, []);
+  assert.deepEqual(parsed.views.map(view => view.name), ['circuit', 'Unit']);
+  assert.deepEqual(parsed.globals.map(block => block.name),
+    ['base', 'custom_parameters', 'simulation']);
+  assert.ok(parsed.globals.find(block => block.name === 'custom_parameters')?.source
+    .includes('enabled: true'));
+  assert.deepEqual(parsed.timeline.map(segment => [segment.start, segment.end]), [[0, 2]]);
+});
+
+test('reserves @ headers for rendered views', () => {
+  const parsed = parsePES('@base:\n  s_base: 1e6\n@circuit\nA -- B\n');
+  assert.ok(parsed.diagnostics.some(diag => diag.message === 'invalid @view header'));
+  assert.ok(!parsed.globals.some(block => block.name === 'base'));
 });
 
 test('identifies nested control declarations from graph structure, not capitalization', () => {
@@ -97,16 +114,16 @@ test('identifies nested control declarations from graph structure, not capitaliz
 });
 
 test('reports syntax and YAML errors with precise line numbers and does not mutate source', () => {
-  const original = '@circuit\nA --\n&Loop: &Loop\n@simulation:\n  t_end: {bad\n';
+  const original = '@circuit\nA --\n&Loop: &Loop\nsimulation:\n  t_end: {bad\n';
   const model = parsePES(original);
   assert.ok(model.diagnostics.some(diag => diag.range.start.line === 2 && diag.severity === 'error'));
   assert.ok(model.diagnostics.some(diag => diag.range.start.line === 3 && diag.message.includes('cyclic')));
   assert.ok(model.diagnostics.some(diag => diag.range.start.line === 5 && diag.message.includes('unclosed')));
-  assert.equal(original, '@circuit\nA --\n&Loop: &Loop\n@simulation:\n  t_end: {bad\n');
+  assert.equal(original, '@circuit\nA --\n&Loop: &Loop\nsimulation:\n  t_end: {bad\n');
 });
 
 test('accepts event block mappings, same-topology intervals and separate ports', () => {
-  const model = parsePES(`@circuit\nS.a -> N.b\n@simulation:\n  t_end: 3\n@events:\n  a:\n    type: disconnect\n    target: S\n    t: 1\n  b:\n    type: disconnect\n    target: S\n    t: 2\n`);
+  const model = parsePES(`@circuit\nS.a -> N.b\nsimulation:\n  t_end: 3\nevents:\n  a:\n    type: disconnect\n    target: S\n    t: 1\n  b:\n    type: disconnect\n    target: S\n    t: 2\n`);
   assert.deepEqual(model.diagnostics, []);
   assert.deepEqual(model.timeline.map(segment => [segment.start, segment.end]), [[0, 1], [1, 2], [2, 3]]);
   assert.deepEqual(model.timeline[1].disconnected, model.timeline[2].disconnected);
@@ -115,7 +132,7 @@ test('accepts event block mappings, same-topology intervals and separate ports',
 });
 
 test('preserves event source lines independently of indentation width', () => {
-  const model = parsePES(`@circuit\nA -- B\n@events:\n    bad:\n      type: disconnect\n      target: A\n      t: invalid\n`);
+  const model = parsePES(`@circuit\nA -- B\nevents:\n    bad:\n      type: disconnect\n      target: A\n      t: invalid\n`);
   const error = model.diagnostics.find(diag => diag.message.includes('invalid connect/disconnect'));
   assert.equal(error?.range.start.line, 4);
 });
@@ -128,7 +145,7 @@ test('builds event timelines in one ordered state sweep', () => {
     time: (1999 - index) / 1000,
     line: index + 1,
   }));
-  const timeline = parsePES(`@circuit\nA -- B\n@simulation:\n  t_end: 2\n`).timeline;
+  const timeline = parsePES(`@circuit\nA -- B\nsimulation:\n  t_end: 2\n`).timeline;
   assert.deepEqual(timeline.map(segment => [segment.start, segment.end]), [[0, 2]]);
   const first = [...events].sort((a, b) => a.time - b.time || a.line - b.line)[0];
   assert.equal(first.time, 0);

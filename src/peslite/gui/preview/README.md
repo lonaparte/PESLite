@@ -1,6 +1,6 @@
 # PES text-to-SVG preview
 
-A small browser-only library for the **new `@circuit` / `@UnitName` rendering syntax**, not the legacy PESLite YAML simulation-file schema. All source, build files, examples and tests live under `src/peslite/gui/preview/`. No Python, React, CodeMirror, uPlot, external web assets or simulation runtime are used by the renderer.
+A small browser-only library for PESLite's `@circuit` / `@UnitName` views and YAML parameter domains. All source, build files, examples and tests live under `src/peslite/gui/preview/`. No Python, React, CodeMirror, uPlot, external web assets or simulation runtime are used by the renderer.
 
 ## Build and try it
 
@@ -36,7 +36,8 @@ The parser exposes `parsePES(text)`, `layoutView(view)` and `buildTimeline(event
 
 ### Supported notation
 
-- `@circuit` (default view), `@VSC` (unit/control view), `@base:`, `@simulation:`, `@events:` and other global YAML-style settings
+- `@circuit` (default view) and `@VSC` (unit/control view); only rendered views use `@`
+- `base:`, `simulation:`, `events:` and other parameter domains use YAML mappings and indentation
 - `A -- B`, `A -> B`, chained paths and named ports `A.port -> B.port`; repeated names identify the same node within a view
 - `Name: Type` and `Name: plant_type, control_type`, followed by indented parameter blocks; loop definitions live under their unit's parameter block
 - `&Group: A, B` and nested `&Outer: &Group, C` boundaries, with independent folding

@@ -4,8 +4,8 @@ import type {
 } from './types.js';
 
 const REFERENCE = /^([A-Za-z_][\w-]*)(?:\.([A-Za-z_][\w-]*))?$/;
-const HEADER = /^@([A-Za-z_][\w-]*)(:?)\s*$/;
-const GLOBALS = new Set(['base', 'simulation', 'events', 'meta', 'signals']);
+const VIEW_HEADER = /^@([A-Za-z_][\w-]*)\s*$/;
+const PARAMETER_HEADER = /^([A-Za-z_][\w-]*):\s*$/;
 
 type Value = null | string | number | boolean | Value[] | { [key: string]: Value };
 type Mapping = { [key: string]: Value };
@@ -13,7 +13,9 @@ interface ParsedMapping {
   value: Mapping;
   keyLines: Map<Mapping, Map<string, number>>;
 }
-interface Section { name: string; global: boolean; line: number; end: number }
+interface ViewSection { kind: 'view'; name: string; line: number; end: number }
+interface ParameterSection { kind: 'parameters'; line: number; end: number }
+type Section = ViewSection | ParameterSection;
 interface SourceLine { text: string; line: number }
 
 function loc(line: number, column = 1): SourceLocation { return { line, column }; }
@@ -182,7 +184,7 @@ function connectionPath(expression: string): { names: string[]; arrows: string[]
   return { names, arrows };
 }
 
-function parseView(section: Section, lines: string[], diagnostics: Diagnostic[]): GraphView {
+function parseView(section: ViewSection, lines: string[], diagnostics: Diagnostic[]): GraphView {
   const nodes = new Map<string, GraphNode>();
   const edges: GraphEdge[] = [];
   const groups: GraphGroup[] = [];
@@ -425,7 +427,7 @@ export function buildTimeline(events: readonly GraphEvent[], endTime: number, in
   return result;
 }
 
-/** Parse the standalone @-section PES preview syntax without running PESLite/Python. */
+/** Parse standalone schematic views and YAML parameter domains without running PESLite/Python. */
 export function parsePES(text: string): PESModel {
   const lines = text.replace(/^\uFEFF/, '').split(/\r\n|\n|\r/);
   const diagnostics: Diagnostic[] = [];
@@ -434,34 +436,55 @@ export function parsePES(text: string): PESModel {
   for (let index = 0; index < lines.length; index++) {
     const raw = stripComment(lines[index]);
     if (raw.startsWith('@')) {
-      const match = raw.match(HEADER);
-      if (!match) { diagnostic(diagnostics, index + 1, 1, 'invalid @section header'); continue; }
+      const match = raw.match(VIEW_HEADER);
+      if (!match) { diagnostic(diagnostics, index + 1, 1, 'invalid @view header'); continue; }
       if (current) current.end = index;
-      const global = match[2] === ':' || GLOBALS.has(match[1]);
-      if (sections.some(section => section.name === match[1])) {
-        diagnostic(diagnostics, index + 1, 1, `duplicate @${match[1]} section`);
+      if (sections.some(section => section.kind === 'view' && section.name === match[1])) {
+        diagnostic(diagnostics, index + 1, 1, `duplicate @${match[1]} view`);
       }
-      current = { name: match[1], global, line: index + 1, end: lines.length };
+      current = { kind: 'view', name: match[1], line: index + 1, end: lines.length };
+      sections.push(current);
+    } else if (PARAMETER_HEADER.test(raw) && current?.kind !== 'parameters') {
+      if (current) current.end = index;
+      current = { kind: 'parameters', line: index + 1, end: lines.length };
       sections.push(current);
     } else if (!current && raw.trim()) {
-      diagnostic(diagnostics, index + 1, 1, 'expected @circuit or @UnitName before content');
+      diagnostic(diagnostics, index + 1, 1,
+        'expected an @view or a top-level parameter domain before content');
     }
   }
   const views: GraphView[] = [];
   const globals: ParameterBlock[] = [];
   const settings = new Map<string, ParsedMapping>();
+  const settingLines = new Map<string, number>();
   for (const section of sections) {
-    if (!section.global) {
+    if (section.kind === 'view') {
       views.push(parseView(section, lines, diagnostics));
     } else {
-      const chunk = lines.slice(section.line, section.end);
-      const source = lines.slice(section.line - 1, section.end).join('\n');
-      globals.push({ id: '@' + section.name, name: section.name, type: 'global', source,
-        range: { start: loc(section.line), end: loc(section.end, (lines[section.end - 1] || '').length + 1) },
-        children: [], });
-      settings.set(section.name, parseYamlMapping(chunk.map((value, index) => ({
-        text: value, line: section.line + 1 + index,
-      })), diagnostics));
+      const parsed = parseYamlMapping(lines.slice(section.line - 1, section.end)
+        .map((value, index) => ({ text: value, line: section.line + index })), diagnostics);
+      const locations = parsed.keyLines.get(parsed.value) || new Map<string, number>();
+      const domains = [...locations].sort((a, b) => a[1] - b[1]);
+      for (let index = 0; index < domains.length; index++) {
+        const [name, start] = domains[index];
+        const end = index + 1 < domains.length ? domains[index + 1][1] - 1 : section.end;
+        const value = parsed.value[name];
+        if (settings.has(name)) {
+          diagnostic(diagnostics, start, 1, `duplicate parameter domain: ${name}`);
+          continue;
+        }
+        if (value !== null && (typeof value !== 'object' || Array.isArray(value))) {
+          diagnostic(diagnostics, start, 1, `parameter domain ${name} must be a mapping`);
+          continue;
+        }
+        const mapping = (value || {}) as Mapping;
+        settings.set(name, { value: mapping, keyLines: parsed.keyLines });
+        settingLines.set(name, start);
+        globals.push({ id: `global:${name}`, name, type: 'global',
+          source: lines.slice(start - 1, end).join('\n'),
+          range: { start: loc(start), end: loc(end, (lines[end - 1] || '').length + 1) },
+          children: [], });
+      }
     }
   }
   // A unit definition inside @UnitName describes the unit in the parent circuit.
@@ -482,8 +505,7 @@ export function parsePES(text: string): PESModel {
   const initialState = simulation.initial && typeof simulation.initial === 'object' &&
     !Array.isArray(simulation.initial) ? simulation.initial as Mapping : {};
   const initial = typeof initialState.t === 'number' ? initialState.t : 0;
-  const eventsSection = sections.find(section => section.name === 'events');
-  const events = readEvents(settings.get('events'), diagnostics, eventsSection?.line || 1);
+  const events = readEvents(settings.get('events'), diagnostics, settingLines.get('events') || 1);
   const defaultView = circuit ? 'circuit' : views[0]?.name || '';
   if (!views.length) diagnostic(diagnostics, 1, 1, 'no schematic view found (expected @circuit)');
   return { views, globals, events, timeline: buildTimeline(events, duration, initial),
