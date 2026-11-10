@@ -12,6 +12,8 @@ _EXPORTS = {
     "reference_prbs": ("identification", "reference_prbs", False),
     "reference_multitone": ("identification", "reference_multitone", False),
     "reference_chirp": ("identification", "reference_chirp", False),
+    "detect_operating_point": ("operating_point", "detect_operating_point", False),
+    "dynamic_performance": ("dynamic", "dynamic_performance", False),
 }
 __all__ = list(_EXPORTS)
 _ROOT_EXPORTS = tuple(name for name, target in _EXPORTS.items() if target[2])
