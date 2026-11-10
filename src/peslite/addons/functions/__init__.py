@@ -17,6 +17,13 @@ _EXPORTS = {
     "frequency_response": ("frequency", "frequency_response", False),
     "frequency_sweep": ("frequency", "frequency_sweep", False),
     "impedance_matrix": ("frequency", "impedance_matrix", False),
+    "recorded_signal": ("port_measurement", "recorded_signal", False),
+    "measure_recorded_transfer": ("port_measurement", "measure_recorded_transfer", False),
+    "measure_recorded_sweep": ("port_measurement", "measure_recorded_sweep", False),
+    "measure_multitone": ("port_measurement", "measure_multitone", False),
+    "measure_port_matrix": ("port_measurement", "measure_port_matrix", False),
+    "run_port_sweep": ("port_measurement", "run_port_sweep", False),
+    "run_port_matrix": ("port_measurement", "run_port_matrix", False),
 }
 __all__ = list(_EXPORTS)
 _ROOT_EXPORTS = tuple(name for name, target in _EXPORTS.items() if target[2])
