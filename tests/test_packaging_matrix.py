@@ -84,9 +84,12 @@ def test_templates_and_cases_have_distinct_owners():
     assert distributions["peslite"]["files"] == ["examples/*.pes"]
 
 
-def test_gui_is_not_advertised_in_public_documentation():
-    documents = [ROOT / "README.md", ROOT / "mkdocs.yml", *sorted((ROOT / "docs").glob("*.md"))]
-    assert all("peslite-gui" not in path.read_text(encoding="utf-8") for path in documents)
+def test_public_documentation_describes_the_distribution_matrix_and_gui():
+    installation = (ROOT / "docs/Getting-Started.md").read_text(encoding="utf-8")
+    for distribution in PROJECTS:
+        assert distribution in installation
+    navigation = (ROOT / "mkdocs.yml").read_text(encoding="utf-8")
+    assert "Graphical Interface: Graphical-Interface.md" in navigation
 
 
 def test_release_uses_one_approval_gate_for_the_distribution_matrix():
