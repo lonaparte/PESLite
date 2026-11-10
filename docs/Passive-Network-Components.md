@@ -70,3 +70,49 @@ domains is rejected before simulation.
 
 Project component types registered under `PESaddons/components` use the same `elements` mapping;
 see [Extending PESLite](Extending-PESLite.md#custom-circuit-elements).
+
+## Independent coupled coils and compensation
+
+The `coupled_coils` add-on component models a symmetric positive-definite inductance matrix
+without a built-in compensation network. Each winding has its own positive and negative
+terminal, which can connect to a named single-phase bus or a scalar Unit port. The literal
+`ground` denotes the reference node. Winding names must be valid identifiers; the row and
+column order of `inductance` follows the order in `windings`. Negative mutual inductance is
+supported and reverses the relative winding polarity.
+
+The optional `r` on each winding is a series resistance in ohms. The model publishes
+`<element>.i_<winding>` (A), `<element>.u_<winding>` (V, across both the inductor and
+its winding resistance), and `i_mode_1`, `i_mode_2`, ... as restartable modal-current states.
+The magnetic stored energy includes all mutual-inductance terms.
+
+```yaml
+buses:
+  tx_drive: {phases: 1}
+  tx_coil: {phases: 1}
+  rx_coil: {phases: 1}
+  rx_load: {phases: 1}
+
+elements:
+  drive: {type: voltage_source, bus: tx_drive, v: 24.0, r: 0.5}
+  tx_comp: {type: capacitor, bus1: tx_drive, bus2: tx_coil, c: 35.0e-9}
+  rx_comp: {type: capacitor, bus1: rx_coil, bus2: rx_load, c: 35.0e-9}
+  load: {type: resistor, bus: rx_load, r: 5.0}
+  coils:
+    type: coupled_coils
+    windings:
+      tx: {positive: tx_coil, negative: ground, r: 0.08}
+      rx: {positive: rx_coil, negative: ground, r: 0.10}
+    inductance:
+      - [100.0e-6, -20.0e-6]
+      - [-20.0e-6, 100.0e-6]
+```
+
+A separate `capacitor` add-on provides a two-terminal capacitance with optional series `r`
+(ESR). Combine it with existing branches, resistors and switches to construct SS, LCC or
+other compensation networks without changing the coupled magnetic component. Both elements
+reuse the ordinary circuit netlist and the same integration and energy accounting paths.
+
+This initial model is linear and stationary; the inductance matrix, winding count and
+terminal connections are assembly-time settings. All connected winding terminals must
+use scalar electrical nodes (one-phase buses). FEM, geometry, magnetic saturation and
+per-winding multirate partitioning are not part of this component.
