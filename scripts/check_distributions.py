@@ -63,6 +63,9 @@ def main(directory: str = "dist") -> int:
             "peslite/gui/service.py",
             "peslite/gui/preview/dist/pes-preview.es.js",
             "peslite/gui/preview/dist/pes-preview.iife.js",
+            "peslite/gui/preview/demo.html",
+            "peslite/gui/preview/workbench.css",
+            "peslite/gui/preview/workbench.js",
         ),
     }
     for distribution, paths in required.items():

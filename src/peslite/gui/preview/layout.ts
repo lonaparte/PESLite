@@ -1,4 +1,6 @@
-import type { GraphGroup, GraphLayout, GraphView, LayoutGroup, LayoutNode } from './types.js';
+import type {
+  GraphGroup, GraphLayout, GraphView, LayoutGroup, LayoutNode, NodeOffset, PreviewLayout,
+} from './types.js';
 
 const NODE_WIDTH = 142;
 const NODE_HEIGHT = 64;
@@ -6,9 +8,41 @@ const COLUMN_STEP = 222;
 const ROW_STEP = 122;
 const MARGIN_X = 130;
 const MARGIN_Y = 114;
+const MAX_OFFSET = 1e6;
+
+export const LAYOUT_FORMAT = 'peslite.preview-layout';
+
+export function emptyLayout(): PreviewLayout {
+  return { format: LAYOUT_FORMAT, version: 1, views: {} };
+}
+
+/** Drop malformed or stale entries before a host-provided layout reaches the renderer. */
+export function normalizeLayout(value: unknown): PreviewLayout {
+  const result = emptyLayout();
+  if (!value || typeof value !== 'object') return result;
+  const record = value as { format?: unknown; version?: unknown; views?: unknown };
+  if (record.format !== undefined && record.format !== LAYOUT_FORMAT) return result;
+  if (record.version !== undefined && record.version !== 1) return result;
+  if (!record.views || typeof record.views !== 'object') return result;
+  for (const [view, nodes] of Object.entries(record.views as Record<string, unknown>)) {
+    if (!view || !nodes || typeof nodes !== 'object') continue;
+    const offsets: Record<string, NodeOffset> = {};
+    for (const [node, raw] of Object.entries(nodes as Record<string, unknown>)) {
+      const offset = raw as { dx?: unknown; dy?: unknown } | null;
+      const dx = offset?.dx, dy = offset?.dy;
+      if (!node || typeof dx !== 'number' || typeof dy !== 'number' ||
+          !Number.isFinite(dx) || !Number.isFinite(dy) ||
+          Math.abs(dx) > MAX_OFFSET || Math.abs(dy) > MAX_OFFSET) continue;
+      if (dx || dy) offsets[node] = { dx, dy };
+    }
+    if (Object.keys(offsets).length) result.views[view] = offsets;
+  }
+  return result;
+}
 
 /** Text-order graph layout, calculated only from the view, never from an event interval. */
-export function layoutView(view: GraphView): GraphLayout {
+export function layoutView(view: GraphView,
+                           offsets: Readonly<Record<string, NodeOffset>> = {}): GraphLayout {
   const slots = new Map<string, { col: number; row: number }>();
   const occupied = new Set<string>();
   let lastRow = -1;
@@ -34,10 +68,14 @@ export function layoutView(view: GraphView): GraphLayout {
   }
   for (const node of view.nodes) if (!slots.has(node.id)) assign(node.id, 0, lastRow + 1);
   const nodes = new Map<string, LayoutNode>();
-  for (const [id, slot] of slots) nodes.set(id, {
-    id, x: MARGIN_X + slot.col * COLUMN_STEP, y: MARGIN_Y + slot.row * ROW_STEP,
-    width: NODE_WIDTH, height: NODE_HEIGHT,
-  });
+  for (const [id, slot] of slots) {
+    const offset = offsets[id];
+    nodes.set(id, {
+      id, x: MARGIN_X + slot.col * COLUMN_STEP + (offset?.dx || 0),
+      y: MARGIN_Y + slot.row * ROW_STEP + (offset?.dy || 0),
+      width: NODE_WIDTH, height: NODE_HEIGHT,
+    });
+  }
   const groups = new Map<string, LayoutGroup>();
   const groupMap = new Map(view.groups.map(group => [group.id, group]));
   function members(group: GraphGroup, seen: Set<string>): LayoutNode[] {
@@ -73,12 +111,17 @@ export function layoutView(view: GraphView): GraphLayout {
     groups.set(group.id, { id: group.id, x: left, y: top,
       width: right - left, height: bottom - top, depth: deep });
   }
-  const allRights = [...nodes.values()].map(item => item.x + item.width / 2);
-  const allBottoms = [...nodes.values()].map(item => item.y + item.height / 2);
-  const groupRights = [...groups.values()].map(item => item.x + item.width);
-  const groupBottoms = [...groups.values()].map(item => item.y + item.height);
-  return { nodes, groups,
-    width: Math.max(600, ...allRights, ...groupRights) + 90,
-    height: Math.max(340, ...allBottoms, ...groupBottoms) + 90,
+  const boxes = [
+    ...[...nodes.values()].map(item => ({ x: item.x - item.width / 2,
+      y: item.y - item.height / 2, width: item.width, height: item.height })),
+    ...groups.values(),
+  ];
+  const minX = Math.min(0, ...boxes.map(item => item.x));
+  const minY = Math.min(0, ...boxes.map(item => item.y));
+  const left = minX < 0 ? minX - 40 : 0;
+  const top = minY < 0 ? minY - 40 : 0;
+  return { nodes, groups, left, top,
+    width: Math.max(600, ...boxes.map(item => item.x + item.width)) + 90 - left,
+    height: Math.max(340, ...boxes.map(item => item.y + item.height)) + 90 - top,
   };
 }

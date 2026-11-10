@@ -92,8 +92,10 @@ def test_offline_preview_renders_in_headless_chromium(tmp_path):
 
         assert "PESLite standalone preview" in page.stdout
         assert page.stdout.count('class="pp-node"') == 5
-        assert 'aria-label="Event intervals"' in page.stdout
-        assert "0–0.2 s" in page.stdout
+        assert 'aria-label="Event timeline"' in page.stdout
+        assert 'role="slider"' in page.stdout
+        assert "connect VSC" in page.stdout
+        assert "workbench.css" in (workspace / "demo.html").read_text(encoding="utf-8")
         assert '<ul class="pp-diagnostics"' not in page.stdout
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)

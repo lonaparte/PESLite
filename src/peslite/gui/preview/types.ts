@@ -82,6 +82,14 @@ export interface LayoutGroup { id: string; x: number; y: number; width: number; 
 export interface GraphLayout {
   nodes: Map<string, LayoutNode>;
   groups: Map<string, LayoutGroup>;
+  left: number;
+  top: number;
   width: number;
   height: number;
+}
+export interface NodeOffset { dx: number; dy: number }
+export interface PreviewLayout {
+  format: 'peslite.preview-layout';
+  version: 1;
+  views: Record<string, Record<string, NodeOffset>>;
 }

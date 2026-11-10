@@ -5,7 +5,7 @@ response ``{"id", "ok", "result" | "error"}`` or an event ``{"type", "requestId"
 Diagnostics, warnings and any console output from a run go to stderr, so stdout stays valid JSON.
 
 Methods: ``getSystems``, ``model.load``, ``model.reset``, ``simulation.start``,
-``smallSignal.run``, ``interaction.run``, ``transientVoltage.run`` and ``server.shutdown``.
+``smallSignal.run``, ``preview.layout.load``, ``preview.layout.save`` and ``server.shutdown``.
 A "system" is a PESLite simulation file; its parameters are dotted-path overrides.
 """
 
@@ -23,6 +23,7 @@ from typing import Any, TextIO
 from ..assembly.params import load
 from ..solver.simulation import Simulation, _example_configs_dir
 from .descriptor import SignalRecorder, Topology, json_safe, small_signal_descriptor
+from .preview_cache import PreviewLayoutCache
 
 CASE_SUFFIXES = (".pes", ".yaml", ".yml")
 CASES_ENVIRONMENT = "PESLITE_CASES"
@@ -76,6 +77,7 @@ class FrontendService:
         self.output_root = Path(output_root) if output_root else self.root / "output"
         self.cases: dict[str, Path] = {}
         self.running = True
+        self.preview_cache = PreviewLayoutCache()
         self.reset()
 
     # ------------------------------------------------------------ state
@@ -155,11 +157,29 @@ class FrontendService:
         elif method in ("interaction.run", "transientVoltage.run"):
             raise ValueError(f"{method} is unavailable; the PESLite frontend supports simulation "
                              "and small-signal analysis")
+        elif method == "preview.layout.load":
+            key = self.preview_key(params)
+            self.respond(request_id, {"layout": self.preview_cache.load(key)})
+        elif method == "preview.layout.save":
+            key = self.preview_key(params)
+            self.respond(request_id, {"layout": self.preview_cache.save(key, params.get("layout"))})
         elif method == "server.shutdown":
             self.respond(request_id, {"shutdown": True})
+            self.preview_cache.close()
             self.running = False
         else:
             raise KeyError(f"unknown method: {method}")
+
+    def preview_key(self, params: dict[str, Any]) -> str:
+        case = params.get("systemName") or self.case
+        if not case:
+            raise ValueError("select a simulation file first")
+        if case not in self.cases:
+            self.cases = discover_cases(self.root)
+        path = self.cases.get(case)
+        if path is None:
+            raise KeyError(f"unknown simulation file {case!r}")
+        return str(path)
 
     # ------------------------------------------------------------ model
     def options(self) -> dict[str, Any]:
@@ -288,8 +308,10 @@ def main(argv: list[str] | None = None) -> int:
             reconfigure(encoding="utf-8")
     # Only protocol messages may reach stdout; route ordinary prints (progress lines) to stderr.
     protocol, sys.stdout = sys.stdout, sys.stderr
+    service = FrontendService(protocol, args.root, args.output)
     try:
-        FrontendService(protocol, args.root, args.output).serve(sys.stdin)
+        service.serve(sys.stdin)
     finally:
+        service.preview_cache.close()
         sys.stdout = protocol
     return 0

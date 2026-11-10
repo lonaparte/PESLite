@@ -4,45 +4,40 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PESLite standalone preview</title>
-  <style>
-    body { font-family: system-ui, sans-serif; margin: 0; background: #f1f5f9; color: #263c50; }
-    main { max-width: 1240px; margin: auto; padding: 22px; }
-    h1 { font-size: 20px; margin: 0 0 6px; }
-    p { margin: 0 0 16px; color: #64748b; }
-    section { display: grid; grid-template-columns: minmax(290px, 35%) 1fr; gap: 14px; }
-    textarea { width: 100%; min-height: 720px; padding: 16px; font: 12px/1.5 ui-monospace, monospace;
-      border: 1px solid #d5e0eb; border-radius: 9px; background: #fff; resize: vertical; }
-    #preview { min-width: 0; }
-    @media (max-width: 900px) { section { grid-template-columns: 1fr; } textarea { min-height: 300px; } }
-  </style>
+  <link rel="stylesheet" href="./workbench.css">
 </head>
 <body>
-<main>
-  <h1>PESLite · text-to-SVG preview</h1>
-  <p>Standalone offline demo. Edit the source on the left; the graph is redrawn from the unsaved text only.</p>
-  <section>
-    <textarea id="source" aria-label="PES source" spellcheck="false">@circuit
+<div class="workbench" id="workbench">
+  <header><strong>PESLite</strong><span id="workspace-name">Preview</span></header>
+  <div class="body">
+    <aside id="explorer"><div class="aside-title">EXPLORER</div><div id="files"></div></aside>
+    <div class="sash" id="explorer-sash" aria-label="Resize explorer"></div>
+    <section class="editor">
+      <div class="tab"><span id="file-name">sample.pes</span><button id="save" type="button">Save</button></div>
+      <textarea id="source" aria-label="PES source" spellcheck="false"></textarea>
+    </section>
+    <div class="sash" id="editor-sash" aria-label="Resize editor"></div>
+    <main id="preview"></main>
+  </div>
+  <footer><span id="status">Ready</span><span>Ctrl+B Explorer · Ctrl+S Save</span></footer>
+</div>
+<script id="sample" type="text/plain">@circuit
 Grid -- PCC -- VSC
 PCC -- Load1
 PCC -- Load2
-&amp;Loads: Load1, Load2
+&Loads: Load1, Load2
 
 @VSC
-PLL.theta -&gt; Current.theta
-DC.id_ref -&gt; Current.id_ref
-Current -&gt; PWM
+PLL.theta -> Current.theta
+DC.id_ref -> Current.id_ref
+Current -> PWM
 
 VSC: vsc, gfl
-  ac_filter:
-    l_f_pu: 0.2
   PLL: SRFPLL
     kp_pu: 20
-    ki_pu: 1200
   Current: CurrentLoop
-    bandwidth: 200
   PWM: ThreePhaseModulation
   DC: DCVoltageControl
-    kp: 0.8
 
 base:
   s_base: 2.0e6
@@ -54,22 +49,8 @@ simulation:
 events:
   connect_vsc: {type: connect, target: VSC, t: 0.2}
   disconnect_vsc: {type: disconnect, target: VSC, t: 0.7}
-</textarea>
-    <div id="preview"></div>
-  </section>
-</main>
-<script src="./dist/pes-preview.iife.js"></script>
-<script>
-  const source = document.getElementById('source');
-  const preview = PESLitePreview.createPESPreview(document.getElementById('preview'), {
-    onSourceSelect: ({line}) => {
-      const lines = source.value.split('\n');
-      const start = lines.slice(0, line - 1).reduce((sum, part) => sum + part.length + 1, 0);
-      source.focus(); source.setSelectionRange(start, start + (lines[line - 1] || '').length);
-    },
-  });
-  source.addEventListener('input', () => preview.update(source.value));
-  preview.update(source.value);
 </script>
+<script src="./dist/pes-preview.iife.js"></script>
+<script src="./workbench.js"></script>
 </body>
 </html>

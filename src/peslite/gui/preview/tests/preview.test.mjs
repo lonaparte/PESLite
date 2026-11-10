@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildTimeline, createPESPreview, parsePES, layoutView } from '../test-output/index.js';
+import {
+  buildTimeline, createPESPreview, parsePES, layoutView, normalizeLayout,
+  routeEdge, pathData, chooseSides, niceTicks, segmentAt,
+} from '../test-output/index.js';
 
 const SAMPLE = `# Standalone PES preview syntax
 @circuit
@@ -163,6 +166,8 @@ class FakeElement {
     this.className = '';
     this.textContent = '';
     this.open = false;
+    this.dataset = {};
+    this.style = {};
   }
   get lastElementChild() { return this.children.at(-1) || null; }
   get childElementCount() { return this.children.length; }
@@ -175,10 +180,20 @@ class FakeElement {
   addEventListener(name, handler) {
     this.listeners.set(name, [...(this.listeners.get(name) || []), handler]);
   }
-  getBoundingClientRect() { return { width: 900, height: 440 }; }
+  getBoundingClientRect() { return { left: 0, top: 0, width: 900, height: 440 }; }
   setPointerCapture() { }
+  scrollBy() { }
+  querySelector(selector) {
+    return findAll(this, node => selector.startsWith('.') &&
+      String(node.className).split(' ').includes(selector.slice(1)))[0];
+  }
   click() {
     for (const handler of this.listeners.get('click') || []) handler({ target: this, currentTarget: this });
+  }
+  fire(name, event = {}) {
+    for (const handler of this.listeners.get(name) || []) handler({ target: this, currentTarget: this,
+      button: 0, buttons: 1, pointerId: 1, clientX: 0, clientY: 0,
+      preventDefault() {}, stopPropagation() {}, ...event });
   }
 }
 function findAll(node, predicate) {
@@ -199,9 +214,9 @@ test('renders host-neutral SVG and updates timeline/folding/navigation without s
       node.getAttribute('aria-label') === 'VSC (vsc)')[0];
     assert.ok(firstX);
     assert.ok(findAll(host, node => (node.getAttribute('class') || '').includes('pp-edge-inactive')).length);
-    const tab = findAll(host, node => node.tagName === 'button' && node.textContent === '0.2–0.7 s')[0];
-    assert.ok(tab);
-    tab.click();
+    const slider = findAll(host, node => node.getAttribute('role') === 'slider')[0];
+    assert.ok(slider);
+    slider.fire('keydown', { key: 'PageDown' });
     assert.equal(findAll(host, node => (node.getAttribute('class') || '').includes('pp-edge-inactive')).length, 0);
     const toggle = findAll(host, node => node.getAttribute('aria-label') === 'Collapse subsystem Loads')[0];
     toggle.click();
@@ -209,11 +224,85 @@ test('renders host-neutral SVG and updates timeline/folding/navigation without s
     const vsc = findAll(host, node => node.getAttribute('aria-label') === 'VSC (vsc)')[0];
     vsc.click();
     assert.ok(findAll(host, node => node.getAttribute('aria-label') === 'PLL (SRFPLL)').length);
-    assert.ok(findAll(host, node => node.tagName === 'button' && node.textContent === '← Back').length);
+    assert.equal(findAll(host, node => node.tagName === 'button' && /Back/.test(node.textContent)).length, 0);
     preview.update('@circuit\nA ->');
     assert.ok(findAll(host, node => node.getAttribute('role') === 'alert').length);
     preview.destroy();
     assert.equal(host.children.length, 0);
     assert.throws(() => preview.update(SAMPLE), /destroyed/);
+  } finally { globalThis.document = old; }
+});
+
+test('assigns named declarations to their views and exposes unconnected views', () => {
+  const model = parsePES(`@circuit
+Grid -- VSC
+@VSC
+PLL -> PWM
+@Spare
+A -> B
+VSC: vsc, gfl
+  PLL: SRFPLL
+  PWM: ThreePhaseModulation
+`);
+  const circuit = model.views[0], vsc = model.views[1], spare = model.views[2];
+  assert.deepEqual(vsc.nodes.map(node => [node.name, node.type]),
+    [['PLL', 'SRFPLL'], ['PWM', 'ThreePhaseModulation']]);
+  assert.deepEqual(spare.nodes.map(node => node.name), ['A', 'B']);
+  assert.equal(circuit.nodes.find(node => node.name === 'VSC').type, 'vsc');
+  assert.ok(circuit.nodes.some(node => node.name === 'Spare'));
+  assert.ok(model.diagnostics.some(entry => entry.severity === 'warning' && /Spare/.test(entry.message)));
+});
+
+test('applies and validates manual layout offsets', () => {
+  const view = parsePES(SAMPLE).views[0];
+  const automatic = layoutView(view);
+  const moved = layoutView(view, { VSC: { dx: -600, dy: 32 } });
+  assert.equal(moved.nodes.get('VSC').x, automatic.nodes.get('VSC').x - 600);
+  assert.equal(moved.nodes.get('VSC').y, automatic.nodes.get('VSC').y + 32);
+  assert.ok(moved.left < 0);
+  assert.deepEqual(normalizeLayout({ views: { circuit: {
+    VSC: { dx: 8, dy: -4 }, bad: { dx: 'x', dy: 1 }, zero: { dx: 0, dy: 0 },
+  } } }).views, { circuit: { VSC: { dx: 8, dy: -4 } } });
+});
+
+test('routes edges orthogonally with square corners', () => {
+  const a = { x: 100, y: 100, width: 142, height: 64 };
+  const b = { x: 400, y: 220, width: 142, height: 64 };
+  assert.deepEqual(chooseSides(a, b, false), ['right', 'left']);
+  const points = routeEdge({ x: 171, y: 100, side: 'right', box: a },
+    { x: 329, y: 220, side: 'left', box: b });
+  assert.ok(points.slice(1).every((point, index) =>
+    point.x === points[index].x || point.y === points[index].y));
+  assert.ok(!pathData(points).includes('Q'));
+});
+
+test('selects event intervals and round time ticks', () => {
+  const timeline = parsePES(SAMPLE).timeline;
+  assert.equal(segmentAt(timeline, 0.2), 1);
+  assert.equal(segmentAt(timeline, 0.7), 2);
+  assert.deepEqual(niceTicks(0, 1, 5), [0, 0.2, 0.4, 0.6, 0.8, 1]);
+});
+
+test('drags blocks without changing source text and reports cacheable offsets', () => {
+  const old = globalThis.document;
+  globalThis.document = {
+    createElement: tag => new FakeElement(tag),
+    createElementNS: (_namespace, tag) => new FakeElement(tag),
+  };
+  try {
+    const host = new FakeElement('div'), layouts = [];
+    const preview = createPESPreview(host, { onLayoutChange: layout => layouts.push(layout) });
+    preview.update(SAMPLE);
+    const picture = findAll(host, node => node.tagName === 'svg')[0];
+    const vsc = findAll(host, node => node.getAttribute('aria-label') === 'VSC (vsc)')[0];
+    vsc.fire('pointerdown', { clientX: 100, clientY: 100 });
+    picture.fire('pointermove', { clientX: 180, clientY: 140 });
+    picture.fire('pointerup');
+    assert.equal(layouts.length, 1);
+    assert.ok(layouts[0].views.circuit.VSC.dx || layouts[0].views.circuit.VSC.dy);
+    assert.equal(preview.getModel().views[0].source.start.line, 2);
+    findAll(host, node => node.tagName === 'button' && node.textContent === 'Fit')[0].click();
+    assert.ok(preview.getLayout().views.circuit.VSC);
+    preview.destroy();
   } finally { globalThis.document = old; }
 });

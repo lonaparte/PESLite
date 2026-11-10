@@ -6,6 +6,7 @@ import type {
 const REFERENCE = /^([A-Za-z_][\w-]*)(?:\.([A-Za-z_][\w-]*))?$/;
 const VIEW_HEADER = /^@([A-Za-z_][\w-]*)\s*$/;
 const PARAMETER_HEADER = /^([A-Za-z_][\w-]*):\s*$/;
+const DEFINITION = /^([A-Za-z_][\w-]*)\s*:\s*([A-Za-z_][\w.-]*(?:\s*,\s*[A-Za-z_][\w.-]*)?)\s*$/;
 
 type Value = null | string | number | boolean | Value[] | { [key: string]: Value };
 type Mapping = { [key: string]: Value };
@@ -16,6 +17,7 @@ interface ParsedMapping {
 interface ViewSection { kind: 'view'; name: string; line: number; end: number }
 interface ParameterSection { kind: 'parameters'; line: number; end: number }
 type Section = ViewSection | ParameterSection;
+type LineSpan = [number, number];
 interface SourceLine { text: string; line: number }
 
 function loc(line: number, column = 1): SourceLocation { return { line, column }; }
@@ -184,7 +186,8 @@ function connectionPath(expression: string): { names: string[]; arrows: string[]
   return { names, arrows };
 }
 
-function parseView(section: ViewSection, lines: string[], diagnostics: Diagnostic[]): GraphView {
+function parseView(section: ViewSection, lines: string[], diagnostics: Diagnostic[],
+                   spans: readonly LineSpan[]): GraphView {
   const nodes = new Map<string, GraphNode>();
   const edges: GraphEdge[] = [];
   const groups: GraphGroup[] = [];
@@ -213,15 +216,18 @@ function parseView(section: ViewSection, lines: string[], diagnostics: Diagnosti
     previous.source = lines.slice(active.start - 1, endLine).join('\n');
     active = null;
   }
-  for (let lineNumber = section.line + 1; lineNumber <= section.end; lineNumber++) {
-    const raw = lines[lineNumber - 1] ?? '';
-    const expression = stripComment(raw).trim();
-    if (!expression) continue;
-    if (/\t/.test(raw.slice(0, raw.length - raw.trimStart().length))) {
-      diagnostic(diagnostics, lineNumber, 1, 'tab indentation is not supported');
-      continue;
-    }
-    const level = indent(raw);
+  let previous = 0;
+  for (const [first, last] of spans) for (let lineNumber = first; lineNumber <= last; lineNumber++) {
+      if (previous && lineNumber !== previous + 1) definitionEnd(previous);
+      previous = lineNumber;
+      const raw = lines[lineNumber - 1] ?? '';
+      const expression = stripComment(raw).trim();
+      if (!expression) continue;
+      if (/\t/.test(raw.slice(0, raw.length - raw.trimStart().length))) {
+        diagnostic(diagnostics, lineNumber, 1, 'tab indentation is not supported');
+        continue;
+      }
+      const level = indent(raw);
     if (level > 0) {
       if (!active) {
         diagnostic(diagnostics, lineNumber, level + 1, 'indented YAML without a parameter declaration');
@@ -312,7 +318,7 @@ function parseView(section: ViewSection, lines: string[], diagnostics: Diagnosti
       }
       continue;
     }
-    const definition = expression.match(/^([A-Za-z_][\w-]*)\s*:\s*([A-Za-z_][\w.-]*(?:\s*,\s*[A-Za-z_][\w.-]*)?)\s*$/);
+    const definition = expression.match(DEFINITION);
     if (definition) {
       const id = `${section.name}.${definition[1]}`;
       if (parameters.some(item => item.id === id)) {
@@ -336,7 +342,7 @@ function parseView(section: ViewSection, lines: string[], diagnostics: Diagnosti
     }
     diagnostic(diagnostics, lineNumber, 1, 'unrecognized schematic statement');
   }
-  definitionEnd(section.end);
+  definitionEnd(previous || section.end);
   const groupByName = new Map(groups.map(group => [group.id, group]));
   for (const group of groups) {
     for (const member of group.members) {
@@ -362,6 +368,38 @@ function parseView(section: ViewSection, lines: string[], diagnostics: Diagnosti
   for (const group of groups) checkCycles(group, new Set());
   view.nodes = [...nodes.values()].sort((a, b) => a.firstLine - b.firstLine);
   return view;
+}
+
+/** Assign each schematic statement to its named view before parsing its contents. */
+function viewSpans(sections: readonly Section[], lines: readonly string[]): Map<ViewSection, LineSpan[]> {
+  const views = sections.filter((section): section is ViewSection => section.kind === 'view');
+  const byName = new Map<string, ViewSection>();
+  for (const view of views) if (!byName.has(view.name)) byName.set(view.name, view);
+  const result = new Map(views.map(view => [view, [] as LineSpan[]]));
+  const moved = new Map<ViewSection, LineSpan[]>();
+  for (const view of views) {
+    let cursor = view.line + 1;
+    for (let line = cursor; line <= view.end; line++) {
+      const raw = lines[line - 1] || '';
+      const definition = indent(raw) === 0 ? stripComment(raw).trim().match(DEFINITION) : null;
+      const owner = definition ? byName.get(definition[1]) : undefined;
+      if (!owner || owner === view) continue;
+      let end = line;
+      while (end + 1 <= view.end) {
+        const next = lines[end] || '';
+        if (stripComment(next).trim() && indent(next) === 0) break;
+        end++;
+      }
+      if (cursor < line) result.get(view)!.push([cursor, line - 1]);
+      moved.set(owner, [...(moved.get(owner) || []), [line, end]]);
+      cursor = end + 1;
+      line = end;
+    }
+    if (cursor <= view.end) result.get(view)!.push([cursor, view.end]);
+  }
+  // Connections are parsed before relocated declarations so nested loop names already exist.
+  for (const [view, spans] of moved) result.get(view)!.push(...spans);
+  return result;
 }
 
 function readEvents(parsed: ParsedMapping | undefined, diagnostics: Diagnostic[],
@@ -457,9 +495,10 @@ export function parsePES(text: string): PESModel {
   const globals: ParameterBlock[] = [];
   const settings = new Map<string, ParsedMapping>();
   const settingLines = new Map<string, number>();
+  const assigned = viewSpans(sections, lines);
   for (const section of sections) {
     if (section.kind === 'view') {
-      views.push(parseView(section, lines, diagnostics));
+      views.push(parseView(section, lines, diagnostics, assigned.get(section) || []));
     } else {
       const parsed = parseYamlMapping(lines.slice(section.line - 1, section.end)
         .map((value, index) => ({ text: value, line: section.line + index })), diagnostics);
@@ -487,14 +526,27 @@ export function parsePES(text: string): PESModel {
       }
     }
   }
-  // A unit definition inside @UnitName describes the unit in the parent circuit.
   const circuit = views.find(view => view.name === 'circuit');
   if (circuit) for (const childView of views) {
-    if (childView.name === 'circuit') continue;
-    const unit = circuit.nodes.find(node => node.name === childView.name);
+    if (childView === circuit || views.some(parent => parent !== childView &&
+        parent.nodes.some(node => node.name === childView.name))) continue;
+    const section = sections.find((candidate): candidate is ViewSection =>
+      candidate.kind === 'view' && candidate.name === childView.name);
+    if (!section) continue;
+    circuit.nodes.push({ id: childView.name, name: childView.name, firstLine: section.line,
+      source: range(section.line, 1, childView.name.length + 2), ports: [] });
+    diagnostic(diagnostics, section.line, 1,
+      `unit ${childView.name} has a view but no connection in @circuit`, 'warning');
+  }
+  // A named view declaration describes that unit wherever another view places it.
+  for (const childView of views) {
     const definition = childView.parameters.find(block => block.name === childView.name);
-    if (unit && definition) {
-      const [type, controllerType] = definition.type.split(',').map(value => value.trim());
+    if (!definition) continue;
+    const [type, controllerType] = definition.type.split(',').map(value => value.trim());
+    for (const parent of views) {
+      if (parent === childView) continue;
+      const unit = parent.nodes.find(node => node.name === childView.name);
+      if (!unit) continue;
       unit.type = type;
       unit.controllerType = controllerType;
       unit.parameterBlock = definition.id;

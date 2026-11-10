@@ -10,5 +10,5 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true
   },
-  "include": ["index.ts", "renderer.ts", "parser.ts", "layout.ts", "types.ts"]
+  "include": ["index.ts", "renderer.ts", "parser.ts", "layout.ts", "routing.ts", "timeline.ts", "types.ts"]
 }
