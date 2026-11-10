@@ -36,6 +36,7 @@ nav:
       - Model Predictive Control: Model-Predictive-Control.md
       - Plotting: Plotting.md
       - Online Stability Analysis: Online-Stability-Analysis.md
+      - Analysis Functions: Analysis-Functions.md
       - Extending PESLite: Extending-PESLite.md
       - C++ Export: Cpp-Export.md
       - Imperix Export: Imperix-Export.md

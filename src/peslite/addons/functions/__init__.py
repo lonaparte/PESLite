@@ -14,6 +14,9 @@ _EXPORTS = {
     "reference_chirp": ("identification", "reference_chirp", False),
     "detect_operating_point": ("operating_point", "detect_operating_point", False),
     "dynamic_performance": ("dynamic", "dynamic_performance", False),
+    "frequency_response": ("frequency", "frequency_response", False),
+    "frequency_sweep": ("frequency", "frequency_sweep", False),
+    "impedance_matrix": ("frequency", "impedance_matrix", False),
 }
 __all__ = list(_EXPORTS)
 _ROOT_EXPORTS = tuple(name for name, target in _EXPORTS.items() if target[2])

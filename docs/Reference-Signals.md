@@ -93,7 +93,8 @@ apply the same transform as the existing reference helpers.
 
 Use the returned mapping under a simulation's `signals` entry and bind the target controller
 reference to `signals.<name>`. When measuring a frequency response, respect the sample clock
-and select a stationary single-tone window after the run has settled.
+and select a stationary single-tone window after the run has settled; see
+[Analysis Functions](Analysis-Functions.md).
 
 Table references are deterministic and require no additional restart state because playback uses
 absolute simulation time. Native C++ and Imperix export reject dynamic reference tables; replace
