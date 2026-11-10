@@ -428,11 +428,15 @@ def _register_assembled_type(cls: type) -> type:
 
 
 def element_buses(cfg: Any) -> dict[str, str]:
-    """Return fields named ``bus`` or ``busN`` from an element's parameters."""
-    return {f.name: getattr(cfg, f.name) for f in fields(cfg)
-            if f.init and (f.name == "bus"
-                           or (f.name.startswith("bus") and f.name[3:].isdigit()
-                               and int(f.name[3:]) > 0))}
+    """Return flat bus fields and additional declared element buses."""
+    buses = {f.name: getattr(cfg, f.name) for f in fields(cfg)
+             if f.init and (f.name == "bus"
+                            or (f.name.startswith("bus") and f.name[3:].isdigit()
+                                and int(f.name[3:]) > 0))}
+    additional = getattr(cfg, "connection_buses", None)
+    if additional is not None:
+        buses.update(additional())
+    return buses
 
 
 _DEFAULT_STATE = object()
