@@ -64,17 +64,24 @@ def test_code_distributions_own_disjoint_source_files():
     assert Path("src/peslite/addons/control/mpc.py") in owned["peslite"]
     assert Path("src/peslite/addons/control/predictive.py") in owned["peslite"]
     assert Path("src/peslite/addons/control/_native_mpc.py") in owned["peslite"]
+    assert Path("src/peslite/addons/functions/legacy_yaml.py") in owned["peslite-gui"]
     assert Path("src/peslite/gui/service.py") in owned["peslite-gui"]
     assert Path("src/peslite/gui/preview/parser.ts") in owned["peslite-gui"]
     assert Path("src/peslite/gui/preview/package-lock.json") in owned["peslite-gui"]
+    assert Path("src/peslite/gui/ui/src/App.tsx") in owned["peslite-gui"]
+    assert Path("src/peslite/gui/vscode/src/extension.ts") in owned["peslite-gui"]
 
 
 def test_gui_preview_uses_the_declarative_distribution_build():
     with (ROOT / "packages/distributions.json").open(encoding="utf-8") as handle:
         gui = json.load(handle)["distributions"]["peslite-gui"]
     steps = gui["build-steps"]
-    assert [step["command"][:2] for step in steps] == [["npm", "ci"], ["npm", "run"]]
-    assert {step["cwd"] for step in steps} == {"src/peslite/gui/preview"}
+    assert [(step["cwd"], step["command"][:2]) for step in steps] == [
+        ("src/peslite/gui/preview", ["npm", "ci"]),
+        ("src/peslite/gui/preview", ["npm", "run"]),
+        ("src/peslite/gui/ui", ["npm", "install"]),
+        ("src/peslite/gui/ui", ["npm", "run"]),
+    ]
 
 
 def test_templates_and_cases_have_distinct_owners():

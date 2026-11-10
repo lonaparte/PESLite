@@ -9,6 +9,11 @@ _EXPORTS = {
     "reference_csv": ("reference_signals", "reference_csv", False),
     "reference_expression": ("reference_signals", "reference_expression", False),
     "reference_table": ("reference_signals", "reference_table", False),
+    "legacy_yaml_preview": ("legacy_yaml", "preview", False),
+    "legacy_yaml_patch": ("legacy_yaml", "validated_patch", False),
+    "legacy_yaml_add_component": ("legacy_yaml", "validated_add_component", False),
+    "legacy_yaml_remove_component": ("legacy_yaml", "validated_remove_component", False),
+    "legacy_yaml_rewire": ("legacy_yaml", "validated_rewire", False),
 }
 __all__ = list(_EXPORTS)
 _ROOT_EXPORTS = tuple(name for name, target in _EXPORTS.items() if target[2])

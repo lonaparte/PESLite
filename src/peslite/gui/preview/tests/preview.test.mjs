@@ -306,3 +306,45 @@ test('drags blocks without changing source text and reports cacheable offsets', 
     preview.destroy();
   } finally { globalThis.document = old; }
 });
+
+test('accepts host-normalized models without replacing renderer features', () => {
+  const old = globalThis.document;
+  globalThis.document = {
+    createElement: tag => new FakeElement(tag),
+    createElementNS: (_namespace, tag) => new FakeElement(tag),
+  };
+  try {
+    const host = new FakeElement('div');
+    const preview = createPESPreview(host);
+    const model = parsePES('@circuit\nGrid -- VSC\n');
+    const vsc = model.views[0].nodes.find(node => node.id === 'VSC');
+    vsc.name = 'controller';
+    vsc.type = 'vsc';
+    assert.equal(preview.updateModel(model), model);
+    assert.equal(preview.getModel(), model);
+    assert.ok(findAll(host, node => node.getAttribute('aria-label') === 'controller (vsc)').length);
+    assert.throws(() => preview.updateModel({}), /requires a PESModel/);
+    preview.destroy();
+  } finally { globalThis.document = old; }
+});
+
+test('reports node and edge selections through the shared renderer API', () => {
+  const old = globalThis.document;
+  globalThis.document = {
+    createElement: tag => new FakeElement(tag),
+    createElementNS: (_namespace, tag) => new FakeElement(tag),
+  };
+  try {
+    const host = new FakeElement('div'), nodes = [], edges = [];
+    const preview = createPESPreview(host, {
+      onNodeSelect: (node, view) => nodes.push([node.id, view]),
+      onEdgeSelect: (edge, view) => edges.push([edge.id, view]),
+    });
+    preview.update('@circuit\nA.out -> B.in\n');
+    findAll(host, node => node.getAttribute('aria-label') === 'A')[0].click();
+    findAll(host, node => node.getAttribute('aria-label')?.startsWith('Select connection '))[0].click();
+    assert.deepEqual(nodes, [['A', 'circuit']]);
+    assert.deepEqual(edges, [[preview.getModel().views[0].edges[0].id, 'circuit']]);
+    preview.destroy();
+  } finally { globalThis.document = old; }
+});

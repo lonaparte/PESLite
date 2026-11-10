@@ -12,6 +12,9 @@ license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 dependencies = ["peslite==0.5.2"]
 
+[project.scripts]
+peslite-gui = "peslite.gui.web_service:main"
+
 [project.urls]
 Homepage = "https://github.com/lonaparte/PESLite"
 Repository = "https://github.com/lonaparte/PESLite"
@@ -19,8 +22,14 @@ Issues = "https://github.com/lonaparte/PESLite/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["peslite.gui*"]
+include = ["peslite.gui*", "peslite.addons.functions*"]
 namespaces = true
 
 [tool.setuptools.package-data]
-"peslite.gui" = ["preview/dist/*.js", "preview/demo.html", "preview/workbench.css", "preview/workbench.js"]
+"peslite.gui" = [
+    "preview/dist/*.js",
+    "preview/demo.html",
+    "preview/workbench.css",
+    "preview/workbench.js",
+    "web_dist/**/*",
+]

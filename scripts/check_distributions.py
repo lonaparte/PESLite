@@ -60,12 +60,17 @@ def main(directory: str = "dist") -> int:
             "share/peslite/examples/gfl-example.pes",
         ),
         "peslite-gui": (
+            "peslite/addons/functions/legacy_yaml.py",
+            "peslite/gui/host.py",
             "peslite/gui/service.py",
+            "peslite/gui/web_service.py",
+            "peslite/gui/workspace.py",
             "peslite/gui/preview/dist/pes-preview.es.js",
             "peslite/gui/preview/dist/pes-preview.iife.js",
             "peslite/gui/preview/demo.html",
             "peslite/gui/preview/workbench.css",
             "peslite/gui/preview/workbench.js",
+            "peslite/gui/web_dist/index.html",
         ),
     }
     for distribution, paths in required.items():

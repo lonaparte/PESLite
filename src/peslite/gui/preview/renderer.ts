@@ -4,8 +4,8 @@ import { chooseSides, pathData, routeEdge } from './routing.js';
 import { niceTicks, segmentAt } from './timeline.js';
 import type { Anchor, Box, Side } from './routing.js';
 import type {
-  Diagnostic, GraphGroup, GraphLayout, GraphView, LayoutNode, NodeOffset, PESModel,
-  PreviewLayout, SourceLocation,
+  Diagnostic, GraphEdge, GraphGroup, GraphLayout, GraphNode, GraphView, LayoutNode,
+  NodeOffset, PESModel, PreviewLayout, SourceLocation,
 } from './types.js';
 
 const NS = 'http://www.w3.org/2000/svg';
@@ -16,6 +16,8 @@ let instance = 0;
 
 export interface PESPreviewOptions {
   onSourceSelect?: (location: SourceLocation) => void;
+  onNodeSelect?: (node: GraphNode, viewName: string) => void;
+  onEdgeSelect?: (edge: GraphEdge, viewName: string) => void;
   onDiagnostics?: (diagnostics: readonly Diagnostic[]) => void;
   layout?: unknown;
   onLayoutChange?: (layout: PreviewLayout) => void;
@@ -24,6 +26,7 @@ export interface PESPreviewOptions {
 }
 export interface PESPreviewInstance {
   update(text: string): PESModel;
+  updateModel(model: PESModel): PESModel;
   navigate(viewName: string): boolean;
   getModel(): PESModel;
   getLayout(): PreviewLayout;
@@ -119,6 +122,8 @@ const STYLES = `
 .pes-preview .pp-svg { display:block; width:100%; min-height:320px; max-height:640px; touch-action:none;
   user-select:none; }
 .pes-preview .pp-edge { fill:none; stroke:#617e94; stroke-width:2; stroke-linejoin:miter; }
+.pes-preview .pp-edge[role="button"] { cursor:pointer; }
+.pes-preview .pp-edge[role="button"]:hover { stroke:#1478ac; stroke-width:3; }
 .pes-preview .pp-edge-inactive { stroke:#afb8be; stroke-dasharray:6 5; opacity:.25; }
 .pes-preview .pp-node,.pes-preview .pp-group-action { cursor:grab; }
 .pes-preview .pp-node rect { fill:#fff; stroke:#7b9aaf; stroke-width:1.7; }
@@ -191,7 +196,17 @@ class Renderer implements PESPreviewInstance {
   update(text: string): PESModel {
     this.ensureLive();
     if (typeof text !== 'string') throw new TypeError('update(text) requires a string');
-    this.model = parsePES(text);
+    return this.updateModel(parsePES(text));
+  }
+
+  updateModel(model: PESModel): PESModel {
+    this.ensureLive();
+    if (!model || !Array.isArray(model.views) || !Array.isArray(model.globals) ||
+        !Array.isArray(model.timeline) || !Array.isArray(model.events) ||
+        !Array.isArray(model.diagnostics) || typeof model.defaultView !== 'string') {
+      throw new TypeError('updateModel(model) requires a PESModel');
+    }
+    this.model = model;
     this.relayout();
     if (!this.model.views.some(view => view.name === this.viewName)) this.viewName = this.model.defaultView;
     this.time = this.clampTime(this.time);
@@ -505,6 +520,19 @@ class Renderer implements PESPreviewInstance {
       const line = svg('path', { class: `pp-edge${inactive ? ' pp-edge-inactive' : ''}`,
         d: pathData(routeEdge(a, b)) });
       if (edge.directed && !inactive) line.setAttribute('marker-end', `url(#${this.markerId})`);
+      if (this.options.onEdgeSelect) {
+        line.setAttribute('tabindex', '0');
+        line.setAttribute('role', 'button');
+        line.setAttribute('aria-label', `Select connection ${edge.id}`);
+        const select = () => this.options.onEdgeSelect?.(edge, view.name);
+        line.addEventListener('click', select);
+        line.addEventListener('keydown', event => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            select();
+          }
+        });
+      }
       scene.appendChild(line);
       if (!from.group && edge.fromPort) ports.set(`${edge.from}:${edge.fromPort}`, { anchor: a, label: edge.fromPort });
       if (!to.group && edge.toPort) ports.set(`${edge.to}:${edge.toPort}`, { anchor: b, label: edge.toPort });
@@ -526,9 +554,17 @@ class Renderer implements PESPreviewInstance {
         item.appendChild(type);
       }
       item.addEventListener('pointerdown', event => this.beginDrag(event, [node.id]));
-      item.addEventListener('click', () => {
+      const select = () => {
         if (Date.now() < this.suppressClickUntil) return;
+        this.options.onNodeSelect?.(node, view.name);
         if (!this.navigate(node.name)) this.options.onSourceSelect?.(node.source.start);
+      };
+      item.addEventListener('click', select);
+      item.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          select();
+        }
       });
       scene.appendChild(item);
     }
