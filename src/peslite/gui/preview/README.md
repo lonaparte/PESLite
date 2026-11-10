@@ -1,13 +1,13 @@
 # PES text-to-SVG preview
 
-A small browser-only library for the **new `@circuit` / `@UnitName` rendering syntax**, not the legacy PESLite YAML simulation-file schema. All source, build files, examples and tests live under `src/peslite/frontend/preview/`. No Python, React, CodeMirror, uPlot, external web assets or simulation runtime are used by the renderer.
+A small browser-only library for the **new `@circuit` / `@UnitName` rendering syntax**, not the legacy PESLite YAML simulation-file schema. All source, build files, examples and tests live under `src/peslite/gui/preview/`. No Python, React, CodeMirror, uPlot, external web assets or simulation runtime are used by the renderer.
 
 ## Build and try it
 
 From this folder:
 
 ```sh
-npm install
+npm ci
 npm test
 npm run build
 ```

@@ -51,7 +51,7 @@ def test_distribution_names_versions_and_dependencies_form_the_install_matrix():
     assert f"peslite-gui=={version}" in projects["peslite-full"]["dependencies"]
 
 
-def test_code_distributions_own_disjoint_python_files():
+def test_code_distributions_own_disjoint_source_files():
     owned = selections()
     for left, right in (("peslite-core", "peslite"),
                         ("peslite-core", "peslite-gui"),
@@ -65,6 +65,16 @@ def test_code_distributions_own_disjoint_python_files():
     assert Path("src/peslite/addons/control/predictive.py") in owned["peslite"]
     assert Path("src/peslite/addons/control/_native_mpc.py") in owned["peslite"]
     assert Path("src/peslite/gui/service.py") in owned["peslite-gui"]
+    assert Path("src/peslite/gui/preview/parser.ts") in owned["peslite-gui"]
+    assert Path("src/peslite/gui/preview/package-lock.json") in owned["peslite-gui"]
+
+
+def test_gui_preview_uses_the_declarative_distribution_build():
+    with (ROOT / "packages/distributions.json").open(encoding="utf-8") as handle:
+        gui = json.load(handle)["distributions"]["peslite-gui"]
+    steps = gui["build-steps"]
+    assert [step["command"][:2] for step in steps] == [["npm", "ci"], ["npm", "run"]]
+    assert {step["cwd"] for step in steps} == {"src/peslite/gui/preview"}
 
 
 def test_templates_and_cases_have_distinct_owners():

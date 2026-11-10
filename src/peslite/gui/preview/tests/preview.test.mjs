@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPESPreview, parsePES, layoutView } from '../test-output/index.js';
+import { buildTimeline, createPESPreview, parsePES, layoutView } from '../test-output/index.js';
 
 const SAMPLE = `# Standalone PES preview syntax
 @circuit
@@ -87,6 +87,15 @@ test('allows forward references and nested control views with independent names'
   assert.deepEqual(parsed.views[1].nodes.find(node => node.name === 'X').ports, ['out']);
 });
 
+test('identifies nested control declarations from graph structure, not capitalization', () => {
+  const parsed = parsePES(`@circuit\nGrid -- Unit\n@Unit\nLoop -> PWM\nUnit: Converter\n  mode: PWM\n  Loop: CurrentControl\n  PWM: DutyModulation\n`);
+  assert.deepEqual(parsed.diagnostics, []);
+  const view = parsed.views[1];
+  assert.deepEqual(view.nodes.map(node => node.name), ['Loop', 'PWM']);
+  assert.equal(view.nodes.find(node => node.name === 'Loop').type, 'CurrentControl');
+  assert.ok(!view.parameters.some(block => block.name === 'mode'));
+});
+
 test('reports syntax and YAML errors with precise line numbers and does not mutate source', () => {
   const original = '@circuit\nA --\n&Loop: &Loop\n@simulation:\n  t_end: {bad\n';
   const model = parsePES(original);
@@ -103,6 +112,29 @@ test('accepts event block mappings, same-topology intervals and separate ports',
   assert.deepEqual(model.timeline[1].disconnected, model.timeline[2].disconnected);
   assert.equal(model.views[0].edges[0].fromPort, 'a');
   assert.equal(model.views[0].edges[0].toPort, 'b');
+});
+
+test('preserves event source lines independently of indentation width', () => {
+  const model = parsePES(`@circuit\nA -- B\n@events:\n    bad:\n      type: disconnect\n      target: A\n      t: invalid\n`);
+  const error = model.diagnostics.find(diag => diag.message.includes('invalid connect/disconnect'));
+  assert.equal(error?.range.start.line, 4);
+});
+
+test('builds event timelines in one ordered state sweep', () => {
+  const events = Array.from({ length: 2000 }, (_, index) => ({
+    name: `event_${index}`,
+    type: index % 2 ? 'disconnect' : 'connect',
+    target: `node_${index % 20}`,
+    time: (1999 - index) / 1000,
+    line: index + 1,
+  }));
+  const timeline = parsePES(`@circuit\nA -- B\n@simulation:\n  t_end: 2\n`).timeline;
+  assert.deepEqual(timeline.map(segment => [segment.start, segment.end]), [[0, 2]]);
+  const first = [...events].sort((a, b) => a.time - b.time || a.line - b.line)[0];
+  assert.equal(first.time, 0);
+  const segments = buildTimeline(events, 2);
+  assert.equal(segments.length, 2000);
+  assert.equal(segments.at(-1).end, 2);
 });
 
 class FakeElement {

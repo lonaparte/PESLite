@@ -1,6 +1,10 @@
 {
   "file-groups": {
-    "all": ["src/peslite/**/*.py"],
+    "all": [
+      "src/peslite/**/*.py",
+      "src/peslite/gui/preview/*",
+      "src/peslite/gui/preview/tests/*"
+    ],
     "addons": [
       "src/peslite/addons/components/**/*.py",
       "src/peslite/addons/control/**/*.py",
@@ -9,7 +13,11 @@
       "!src/peslite/addons/control/__init__.py",
       "!src/peslite/addons/functions/__init__.py"
     ],
-    "gui": ["src/peslite/gui/**/*.py"]
+    "gui": [
+      "src/peslite/gui/**/*.py",
+      "src/peslite/gui/preview/*",
+      "src/peslite/gui/preview/tests/*"
+    ]
   },
   "distributions": {
     "peslite-core": {
@@ -25,7 +33,17 @@
     },
     "peslite-gui": {
       "project": "packages/gui/pyproject.toml",
-      "include": ["gui"]
+      "include": ["gui"],
+      "build-steps": [
+        {
+          "cwd": "src/peslite/gui/preview",
+          "command": ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+        },
+        {
+          "cwd": "src/peslite/gui/preview",
+          "command": ["npm", "run", "build"]
+        }
+      ]
     },
     "peslite-full": {
       "project": "packages/full/pyproject.toml",

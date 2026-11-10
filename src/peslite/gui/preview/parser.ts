@@ -9,6 +9,10 @@ const GLOBALS = new Set(['base', 'simulation', 'events', 'meta', 'signals']);
 
 type Value = null | string | number | boolean | Value[] | { [key: string]: Value };
 type Mapping = { [key: string]: Value };
+interface ParsedMapping {
+  value: Mapping;
+  keyLines: Map<Mapping, Map<string, number>>;
+}
 interface Section { name: string; global: boolean; line: number; end: number }
 interface SourceLine { text: string; line: number }
 
@@ -122,11 +126,14 @@ function yamlValue(raw: string): Value {
 }
 
 /** Lightweight YAML *mapping* reader for global settings and event metadata. */
-function parseYamlMapping(lines: SourceLine[], diagnostics: Diagnostic[]): Mapping {
+function parseYamlMapping(lines: SourceLine[], diagnostics: Diagnostic[]): ParsedMapping {
   const relevant = lines.filter(line => stripComment(line.text).trim() !== '');
+  const keyLines = new Map<Mapping, Map<string, number>>();
   let index = 0;
   function read(level: number): Mapping {
     const result: Mapping = {};
+    const locations = new Map<string, number>();
+    keyLines.set(result, locations);
     while (index < relevant.length) {
       const row = relevant[index];
       const column = indent(row.text);
@@ -146,6 +153,7 @@ function parseYamlMapping(lines: SourceLine[], diagnostics: Diagnostic[]): Mappi
         diagnostic(diagnostics, row.line, column + 1, `empty or duplicate YAML key: ${key}`);
         index++; continue;
       }
+      locations.set(key, row.line);
       const value = expression.slice(at + 1).trim();
       index++;
       if (value === '' && index < relevant.length && indent(relevant[index].text) > column) {
@@ -161,7 +169,7 @@ function parseYamlMapping(lines: SourceLine[], diagnostics: Diagnostic[]): Mappi
     }
     return result;
   }
-  return relevant.length ? read(indent(relevant[0].text)) : {};
+  return { value: relevant.length ? read(indent(relevant[0].text)) : {}, keyLines };
 }
 
 /** Split a schematic path into node references and -- / -> separators. */
@@ -231,8 +239,7 @@ function parseView(section: Section, lines: string[], diagnostics: Diagnostic[])
         catch (error) { diagnostic(diagnostics, lineNumber, level + 1, String(error)); }
       }
       const candidate = expression.match(/^([A-Za-z_][\w-]*)\s*:\s*([A-Za-z_][\w.-]*)\s*$/);
-      const nested = candidate && (nodes.has(candidate[1]) ||
-        /^[A-Z]/.test(candidate[1]) || /^[A-Z]/.test(candidate[2])) ? candidate : null;
+      const nested = candidate && nodes.has(candidate[1]) ? candidate : null;
       if (level === active.indent + 2) {
         if (active.nested) {
           active.nested.block.range.end = loc(lineNumber - 1, (lines[lineNumber - 2] || '').length + 1);
@@ -355,13 +362,14 @@ function parseView(section: Section, lines: string[], diagnostics: Diagnostic[])
   return view;
 }
 
-function readEvents(raw: Mapping | undefined, diagnostics: Diagnostic[], startLine: number,
-                    eventLines: Map<string, number>): GraphEvent[] {
+function readEvents(parsed: ParsedMapping | undefined, diagnostics: Diagnostic[],
+                    startLine: number): GraphEvent[] {
+  const raw = parsed?.value;
   if (!raw) return [];
   const result: GraphEvent[] = [];
   for (const [name, data] of Object.entries(raw)) {
     const event = data && typeof data === 'object' && !Array.isArray(data) ? data as Mapping : null;
-    const line = eventLines.get(name) || startLine;
+    const line = parsed.keyLines.get(raw)?.get(name) || startLine;
     if (!event) { diagnostic(diagnostics, line, 1, `event ${name} must be a mapping`); continue; }
     if (event.type !== 'connect' && event.type !== 'disconnect') continue;
     if (typeof event.target !== 'string' || typeof event.t !== 'number' ||
@@ -376,16 +384,8 @@ function readEvents(raw: Mapping | undefined, diagnostics: Diagnostic[], startLi
 
 /** Connection/node state at a fixed segment; no layout is recomputed. */
 export function disconnectedAt(events: readonly GraphEvent[], start: number): string[] {
-  const inactive = new Set<string>();
-  // A target first connected by an event is disconnected before that event.
-  for (const event of events) {
-    if (event.type === 'connect' && !events.some(prior =>
-      prior.target === event.target && (prior.time < event.time ||
-        (prior.time === event.time && prior !== event && events.indexOf(prior) < events.indexOf(event))))) {
-      inactive.add(event.target);
-    }
-  }
-  const ordered = [...events].sort((a, b) => a.time - b.time || a.line - b.line);
+  const ordered = orderEvents(events);
+  const inactive = initialDisconnected(ordered);
   for (const event of ordered) {
     if (event.time > start + 1e-12) break;
     if (event.type === 'connect') inactive.delete(event.target);
@@ -394,14 +394,35 @@ export function disconnectedAt(events: readonly GraphEvent[], start: number): st
   return [...inactive].sort();
 }
 
+function orderEvents(events: readonly GraphEvent[]): GraphEvent[] {
+  return [...events].sort((a, b) => a.time - b.time || a.line - b.line);
+}
+
+function initialDisconnected(events: readonly GraphEvent[]): Set<string> {
+  const first = new Map<string, GraphEvent['type']>();
+  for (const event of events) if (!first.has(event.target)) first.set(event.target, event.type);
+  return new Set([...first].filter(([, type]) => type === 'connect').map(([target]) => target));
+}
+
 export function buildTimeline(events: readonly GraphEvent[], endTime: number, initial = 0): EventSegment[] {
   const end = Number.isFinite(endTime) && endTime > initial ? endTime :
     Math.max(initial + 1, ...events.map(event => event.time + 1));
   const boundaries = [...new Set([initial, end, ...events.map(event => event.time)
     .filter(time => time > initial && time < end)])].sort((a, b) => a - b);
-  return boundaries.slice(0, -1).map((start, index) => ({
-    index, start, end: boundaries[index + 1], disconnected: disconnectedAt(events, start),
-  }));
+  const ordered = orderEvents(events);
+  const inactive = initialDisconnected(ordered);
+  const result: EventSegment[] = [];
+  let eventIndex = 0;
+  for (let index = 0; index < boundaries.length - 1; index++) {
+    const start = boundaries[index];
+    while (eventIndex < ordered.length && ordered[eventIndex].time <= start + 1e-12) {
+      const event = ordered[eventIndex++];
+      if (event.type === 'connect') inactive.delete(event.target);
+      else inactive.add(event.target);
+    }
+    result.push({ index, start, end: boundaries[index + 1], disconnected: [...inactive].sort() });
+  }
+  return result;
 }
 
 /** Parse the standalone @-section PES preview syntax without running PESLite/Python. */
@@ -428,7 +449,7 @@ export function parsePES(text: string): PESModel {
   }
   const views: GraphView[] = [];
   const globals: ParameterBlock[] = [];
-  const settings = new Map<string, Mapping>();
+  const settings = new Map<string, ParsedMapping>();
   for (const section of sections) {
     if (!section.global) {
       views.push(parseView(section, lines, diagnostics));
@@ -456,18 +477,13 @@ export function parsePES(text: string): PESModel {
       unit.parameterBlock = definition.id;
     }
   }
-  const simulation = settings.get('simulation') || {};
+  const simulation = settings.get('simulation')?.value || {};
   const duration = typeof simulation.t_end === 'number' ? simulation.t_end : NaN;
   const initialState = simulation.initial && typeof simulation.initial === 'object' &&
     !Array.isArray(simulation.initial) ? simulation.initial as Mapping : {};
   const initial = typeof initialState.t === 'number' ? initialState.t : 0;
   const eventsSection = sections.find(section => section.name === 'events');
-  const eventLines = new Map<string, number>();
-  if (eventsSection) for (let i = eventsSection.line; i < eventsSection.end; i++) {
-    const match = lines[i].match(/^ {2}([A-Za-z_][\w-]*)\s*:/);
-    if (match) eventLines.set(match[1], i + 1);
-  }
-  const events = readEvents(settings.get('events'), diagnostics, eventsSection?.line || 1, eventLines);
+  const events = readEvents(settings.get('events'), diagnostics, eventsSection?.line || 1);
   const defaultView = circuit ? 'circuit' : views[0]?.name || '';
   if (!views.length) diagnostic(diagnostics, 1, 1, 'no schematic view found (expected @circuit)');
   return { views, globals, events, timeline: buildTimeline(events, duration, initial),

@@ -1,0 +1,54 @@
+name: GUI
+
+on:
+  workflow_call:
+  pull_request:
+    paths:
+      - "src/peslite/gui/preview/**"
+      - "packages/distributions.json"
+      - "packages/gui/pyproject.toml"
+      - "scripts/distributions.py"
+      - ".github/workflows/gui.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "src/peslite/gui/preview/**"
+      - "packages/distributions.json"
+      - "packages/gui/pyproject.toml"
+      - "scripts/distributions.py"
+      - ".github/workflows/gui.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    name: Test and build preview
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: src/peslite/gui/preview/package-lock.json
+
+      - name: Install dependencies
+        working-directory: src/peslite/gui/preview
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run tests
+        working-directory: src/peslite/gui/preview
+        run: npm test
+
+      - name: Build browser bundles
+        working-directory: src/peslite/gui/preview
+        run: npm run build

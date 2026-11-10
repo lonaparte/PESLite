@@ -59,7 +59,11 @@ def main(directory: str = "dist") -> int:
             "peslite/addons/functions/small_signal.py",
             "share/peslite/examples/gfl-example.pes",
         ),
-        "peslite-gui": ("peslite/gui/service.py",),
+        "peslite-gui": (
+            "peslite/gui/service.py",
+            "peslite/gui/preview/dist/pes-preview.es.js",
+            "peslite/gui/preview/dist/pes-preview.iife.js",
+        ),
     }
     for distribution, paths in required.items():
         for path in paths:

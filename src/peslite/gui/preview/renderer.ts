@@ -37,10 +37,6 @@ function button(label: string, action: () => void, className?: string): HTMLButt
   return result;
 }
 function formatTime(value: number): string { return Number(value.toPrecision(5)).toString(); }
-function targetMatches(target: string, name: string): boolean {
-  return target === name || target === `units.${name}` || target === `sources.${name}` ||
-    target === `elements.${name}` || target === `buses.${name}`;
-}
 
 const STYLES = `
 .pes-preview { font: 13px/1.5 system-ui, sans-serif; color: #24384a; background: #fff;
@@ -303,10 +299,8 @@ class Renderer implements PESPreviewInstance {
       if (!from || !to || (from.key === to.key && from.group)) continue;
       const a = this.anchor(from, to.point, edge.fromPort, view);
       const b = this.anchor(to, from.point, edge.toPort, view);
-      const inactive = [...disconnected].some(target =>
-        targetMatches(target, edge.from) || targetMatches(target, edge.to) ||
-        target === edge.id || target === `${edge.from}--${edge.to}` ||
-        target === `${edge.from}->${edge.to}`);
+      const inactive = disconnected.has(edge.from) || disconnected.has(edge.to) ||
+        disconnected.has(edge.id);
       const line = svg('path', { class: `pp-edge${inactive ? ' pp-edge-inactive' : ''}`,
         d: `M ${a.x} ${a.y} L ${b.x} ${b.y}` });
       if (edge.directed && !inactive) line.setAttribute('marker-end', `url(#${this.markerId})`);
