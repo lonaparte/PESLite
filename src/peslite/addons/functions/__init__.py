@@ -9,6 +9,9 @@ _EXPORTS = {
     "reference_csv": ("reference_signals", "reference_csv", False),
     "reference_expression": ("reference_signals", "reference_expression", False),
     "reference_table": ("reference_signals", "reference_table", False),
+    "reference_prbs": ("identification", "reference_prbs", False),
+    "reference_multitone": ("identification", "reference_multitone", False),
+    "reference_chirp": ("identification", "reference_chirp", False),
 }
 __all__ = list(_EXPORTS)
 _ROOT_EXPORTS = tuple(name for name, target in _EXPORTS.items() if target[2])

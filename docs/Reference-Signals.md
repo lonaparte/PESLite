@@ -52,7 +52,48 @@ chirp = reference_expression(
 
 Expressions may combine `t`, numeric constants, `pi`, `e`, `tau` and the common mathematical
 functions. Sums of sine terms produce multiharmonic waveforms. Both helpers support repetition,
-interpolation, extrapolation, time scaling and time/value offsets.
+interpolation, extrapolation, time scaling and value/time offsets.
+
+### Identification excitations
+
+Use `reference_prbs` for a deterministic maximal-length pseudorandom binary sequence, or
+`reference_multitone` for multiple coherent sinusoidal tones. The linear-frequency
+`reference_chirp` is a convenient swept-frequency excitation. These generate ordinary native
+`TableSignal` data; no new simulation source type or random runtime state is introduced.
+
+```python
+from peslite.addons.functions import reference_prbs, reference_multitone, reference_chirp
+
+prbs = reference_prbs(
+    start=0.0, stop=0.127, period=0.001, order=7, seed=29,
+    low=-0.01, high=0.01,
+)
+multitone = reference_multitone(
+    start=0.0, stop=1.0, period=0.0005,
+    frequencies=(10.0, 20.0, 30.0), amplitudes=(0.01, 0.005, 0.005),
+    repeat=True,
+)
+sweep = reference_chirp(
+    start=0.0, stop=1.0, period=0.0005,
+    start_frequency=10.0, stop_frequency=200.0, amplitude=0.01,
+)
+```
+
+For PRBS, `period` is one held bit interval and `order` is between 2 and 16; the full
+sequence length is `2**order - 1` intervals. A nonzero seed fixes its phase and repeated
+invocations reproduce exactly the same samples. With `repeat=True`, playback repeats the
+provided table window; choose a complete LFSR period for a continuous sequence.
+
+Multitone frequencies are distinct positive Hz values below the sample-grid Nyquist limit;
+phases are in radians. Repeated multitone playback requires every tone to contain an integer
+number of cycles in the requested time window. Chirp start and stop frequencies are in Hz,
+limited by the same sampling constraint. Amplitude and offset are in the reference's own
+physical or per-unit coordinates; `time_scale`, `time_offset`, `value_scale` and `value_offset`
+apply the same transform as the existing reference helpers.
+
+Use the returned mapping under a simulation's `signals` entry and bind the target controller
+reference to `signals.<name>`. When measuring a frequency response, respect the sample clock
+and select a stationary single-tone window after the run has settled.
 
 Table references are deterministic and require no additional restart state because playback uses
 absolute simulation time. Native C++ and Imperix export reject dynamic reference tables; replace
