@@ -15,7 +15,7 @@ from packaging.version import Version
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, dumps, from_dict, read_tree, to_dict
-from peslite.assembly.simulation_file import parse_native_document
+from peslite.assembly.simulation_file import parse_native_text
 from peslite.control import LOOP_TYPES
 
 
@@ -145,7 +145,8 @@ def test_resolved_cli_prints_a_loadable_complete_file():
             "--set", "simulation.t_end=0.5",
             "--set", "units.vsc.pwm.f_sw=10000",
         ]) == 0
-    tree = parse_native_document(stream.getvalue()).parameters
+    tree, interface = parse_native_text(stream.getvalue())
+    assert "grid -- pcc -- vsc" in interface
     assert tree["simulation"]["t_end"] == 0.5
     assert tree["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)
     assert tree["units"]["vsc"]["ctrl"]["computation"] == pytest.approx(1e-6)

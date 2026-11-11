@@ -2,7 +2,7 @@
 
 import pytest
 from conftest import EXAMPLES
-from peslite.assembly.simulation_file import parse_native_document
+from peslite.assembly.simulation_file import parse_native_text
 from peslite.solver import simulation
 from peslite.solver.simulation import _config_path
 
@@ -14,9 +14,9 @@ def test_bundled_examples_are_native_pes_files():
     assert paths and all(name.endswith("-example.pes") for name in paths)
     for path in paths.values():
         assert path.is_file()
-        document = parse_native_document(path.read_text(encoding="utf-8"), path)
-        assert document.parameters
-        assert document.views[0].name == "circuit"
+        parameters, interface = parse_native_text(path.read_text(encoding="utf-8"), path)
+        assert parameters
+        assert interface.startswith("@circuit")
 
 
 def test_command_line_finds_bundled_pes_files():

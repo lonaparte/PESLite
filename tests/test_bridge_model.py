@@ -11,7 +11,7 @@ import yaml
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, _unit_items, read_tree
-from peslite.assembly.simulation_file import parse_native_document
+from peslite.assembly.simulation_file import parse_native_text
 from peslite.components.pwm import modulator_type
 from peslite.control.profiles import control_type
 
@@ -25,7 +25,7 @@ def _resolved(*args):
     output = io.StringIO()
     with redirect_stdout(output):
         assert peslite.main(["inspect", *args, "--resolved"]) == 0
-    return parse_native_document(output.getvalue()).parameters
+    return parse_native_text(output.getvalue())[0]
 
 
 def _models(*args):

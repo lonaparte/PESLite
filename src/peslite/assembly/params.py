@@ -36,6 +36,8 @@ from ..solver.integrators import CIRCUIT_MODELS, canonical_method
 from ..solver.model import ConfigError
 from ..solver.timing import control_computation, control_period
 from .events import EVENT_TYPES, NAMED, SWITCHABLE, events_for
+from .simulation_file import (PARAMETER_DOMAINS, SimulationFileError,
+                              parse_parameter_mapping, read_simulation_file)
 from .types import unit_type
 
 __all__ = [
@@ -1777,18 +1779,19 @@ def _register_load_preparer(function: Callable[[str | Path], Any]) -> None:
     if function not in _LOAD_PREPARERS:
         _LOAD_PREPARERS.append(function)
 
-def load(path: str | Path, initial: str | Path | None = None,
-         initial_time: Optional[float] = None, **overrides: Any) -> Params:
-    """Load a simulation file, optionally replace its initial state, and apply overrides.
-
-    ``initial``: states CSV (last row, or the row at ``initial_time`` in s) or YAML/JSON.
-    ``overrides``: dotted paths, e.g. ``load("case.pes", **{"simulation.t_end": 5.0})``.
-    """
+def _load_case(path: str | Path, initial: str | Path | None = None,
+               initial_time: Optional[float] = None,
+               **overrides: Any) -> tuple[Params, str]:
+    """Load parameters and return their untouched native interface source."""
     for prepare in _LOAD_PREPARERS:
         prepare(path)
     token = _ASSET_DIRECTORY.set(Path(path).resolve().parent)
     try:
-        p = from_dict(read_tree(path))
+        try:
+            tree, interface_text = read_simulation_file(path)
+        except SimulationFileError as exc:
+            raise ConfigError(str(exc)) from None
+        p = from_dict(tree)
         if initial is not None:
             init = read_initial(initial, initial_time)
             merged = to_dict(p)
@@ -1797,14 +1800,23 @@ def load(path: str | Path, initial: str | Path | None = None,
                 # keep the configured duration after the new start time
                 merged["simulation"]["t_end"] = init.get("t", 0.0) + p.simulation.t_end
             p = from_dict(merged)
-        return p.replace(**overrides) if overrides else p
+        return (p.replace(**overrides) if overrides else p), interface_text
     finally:
         _ASSET_DIRECTORY.reset(token)
 
 
+def load(path: str | Path, initial: str | Path | None = None,
+         initial_time: Optional[float] = None, **overrides: Any) -> Params:
+    """Load a simulation file, optionally replace its initial state, and apply overrides.
+
+    ``initial``: states CSV (last row, or the row at ``initial_time`` in s) or YAML/JSON.
+    ``overrides``: dotted paths, e.g. ``load("case.pes", **{"simulation.t_end": 5.0})``.
+    """
+    return _load_case(path, initial, initial_time, **overrides)[0]
+
+
 def _read(path: Path) -> Any:
     """Read a YAML or JSON data mapping."""
-    from .simulation_file import SimulationFileError, parse_parameter_mapping
     try:
         return parse_parameter_mapping(path.read_text(encoding="utf-8"), path)
     except SimulationFileError as exc:
@@ -1855,16 +1867,13 @@ def read_initial(path: str | Path, t: Optional[float] = None) -> dict:
 
 def read_tree(path: str | Path) -> dict:
     """Return the parameter mapping from a simulation file."""
-    source = Path(path)
-    from .simulation_file import SimulationFileError, parse_simulation_document
     try:
-        return parse_simulation_document(source.read_text(encoding="utf-8"), source).parameters
+        return read_simulation_file(path)[0]
     except SimulationFileError as exc:
         raise ConfigError(str(exc)) from None
 
 
-_FILE_ORDER = ("base", "buses", "branches", "sources", "units", "elements", "signals",
-               "events", "simulation", "meta")
+_FILE_ORDER = PARAMETER_DOMAINS
 
 
 def _written_out(p: Params) -> dict:
@@ -1897,17 +1906,22 @@ def _switches(value: Any) -> Any:
     return value
 
 
-def dumps(p: Params) -> str:
-    """Return a complete resolved native simulation file."""
-    d = _written_out(p)
-    import yaml  # type: ignore
+def _native_text(body: str, interface_text: str = "") -> str:
+    """Wrap a parameter body as a resolved native simulation file."""
     from .. import __version__
     header = (f"# PESLite {__version__} simulation file with every value written out (plant values in SI).\n"
               f"# null: not used, or derived when the case is built (for example loop gains from bandwidth).\n"
               f"# Run it with: peslite <this file>\n")
-    return header + "\n@circuit\n\n" + yaml.safe_dump(d, sort_keys=False)
+    interface = interface_text.strip() or "@circuit"
+    return f"{header}\n{interface}\n\n{body}"
 
 
-def dump(p: Params, path: str | Path) -> None:
+def dumps(p: Params, interface_text: str = "") -> str:
+    """Return a complete resolved native simulation file."""
+    import yaml  # type: ignore
+    return _native_text(yaml.safe_dump(_written_out(p), sort_keys=False), interface_text)
+
+
+def dump(p: Params, path: str | Path, interface_text: str = "") -> None:
     """Write a complete resolved simulation file (see :func:`dumps`)."""
-    Path(path).write_text(dumps(p), encoding="utf-8")
+    Path(path).write_text(dumps(p, interface_text), encoding="utf-8")

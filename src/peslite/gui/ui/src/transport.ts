@@ -17,6 +17,7 @@ export type PreviewResponse = {
   model: import('../../preview/types.js').PESModel | null;
   fields: Field[];
   diagnostics: import('../../preview/types.js').Diagnostic[];
+  source?: string;
 };
 export type CsvResponse = {
   columns: string[]; rows: (number | string | null)[][];

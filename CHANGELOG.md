@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Native simulation parsing now keeps interface source as plain text while parameter loading,
+  resolved output, C++ export and GUI diagnostics share one direct syntax boundary.
 - Added reusable GUI preview layout, orthogonal routing, drag-and-drop, event timeline and local
   workbench modules; dragged positions live only in a temporary cache that is deleted on close.
 - Plain YAML parameter domains no longer use `@`, and named or unconnected unit views are assembled

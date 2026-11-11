@@ -5,8 +5,10 @@ import type {
 
 const REFERENCE = /^([A-Za-z_][\w-]*)(?:\.([A-Za-z_][\w-]*))?$/;
 const VIEW_HEADER = /^@([A-Za-z_][\w-]*)\s*$/;
-const PARAMETER_HEADER = /^([A-Za-z_][\w-]*):\s*$/;
 const DEFINITION = /^([A-Za-z_][\w-]*)\s*:\s*([A-Za-z_][\w.-]*(?:\s*,\s*[A-Za-z_][\w.-]*)?)\s*$/;
+const QUOTED_KEY = /^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s*:/;
+const PARAMETER_DOMAINS = new Set(['base', 'buses', 'branches', 'sources', 'units', 'elements',
+  'signals', 'events', 'simulation', 'meta']);
 
 type Value = null | string | number | boolean | Value[] | { [key: string]: Value };
 type Mapping = { [key: string]: Value };
@@ -32,8 +34,10 @@ function indent(text: string): number { return text.match(/^ */)![0].length; }
 
 function startsParameters(text: string): boolean {
   const content = stripComment(text).trimEnd();
-  return PARAMETER_HEADER.test(content) ||
-    (/^[A-Za-z_][\w-]*\s*:/.test(content) && !DEFINITION.test(content));
+  if (QUOTED_KEY.test(content)) return true;
+  const matched = content.match(/^([A-Za-z_][\w-]*)\s*:\s*(.*)$/);
+  if (!matched) return false;
+  return PARAMETER_DOMAINS.has(matched[1]) || (!!matched[2].trim() && !DEFINITION.test(content));
 }
 
 /** Strip only comments outside quotes and YAML flow collections. */
@@ -147,7 +151,20 @@ function yamlValue(raw: string): Value {
 function parseYamlMapping(lines: SourceLine[], diagnostics: Diagnostic[]): ParsedMapping {
   const relevant = lines.filter(line => stripComment(line.text).trim() !== '');
   const keyLines = new Map<Mapping, Map<string, number>>();
+  const anchors = new Map<string, Value>();
   let index = 0;
+
+  function anchored(value: string): [string | null, string] {
+    const match = value.match(/^&([^\s{}\[\],]+)\s*(.*)$/);
+    return match ? [match[1], match[2]] : [null, value];
+  }
+  function scalar(value: string, line: number, column: number): Value {
+    const alias = value.match(/^\*([^\s{}\[\],]+)$/);
+    if (!alias) return yamlValue(value);
+    if (anchors.has(alias[1])) return anchors.get(alias[1])!;
+    diagnostic(diagnostics, line, column, `unknown YAML alias: *${alias[1]}`);
+    return null;
+  }
 
   function consumeFlow(value: string): string {
     if (value.startsWith('{') || value.startsWith('[')) {
@@ -170,17 +187,18 @@ function parseYamlMapping(lines: SourceLine[], diagnostics: Diagnostic[]): Parse
         diagnostic(diagnostics, row.line, column + 1, 'unexpected YAML sequence indentation');
         index++; continue;
       }
-      let value = expression.slice(1).trim();
+      let [anchor, value] = anchored(expression.slice(1).trim());
       index++;
       value = consumeFlow(value);
       if (value) {
-        try { result.push(yamlValue(value)); }
+        try { result.push(scalar(value, row.line, column + 2)); }
         catch (error) { diagnostic(diagnostics, row.line, column + 2, String(error)); }
       } else if (index < relevant.length && indent(relevant[index].text) > column) {
         const child = relevant[index];
         result.push(stripComment(child.text).trim().startsWith('-')
           ? readSequence(indent(child.text)) : read(indent(child.text)));
       } else result.push(null);
+      if (anchor) anchors.set(anchor, result[result.length - 1]);
     }
     return result;
   }
@@ -209,7 +227,7 @@ function parseYamlMapping(lines: SourceLine[], diagnostics: Diagnostic[]): Parse
         index++; continue;
       }
       locations.set(key, row.line);
-      let value = expression.slice(at + 1).trim();
+      let [anchor, value] = anchored(expression.slice(at + 1).trim());
       index++;
       value = consumeFlow(value);
       if (value === '' && index < relevant.length && indent(relevant[index].text) > column) {
@@ -221,9 +239,10 @@ function parseYamlMapping(lines: SourceLine[], diagnostics: Diagnostic[]): Parse
         while (index < relevant.length && indent(relevant[index].text) > column) index++;
         result[key] = value;
       } else {
-        try { result[key] = yamlValue(value); }
+        try { result[key] = scalar(value, row.line, column + at + 2); }
         catch (error) { diagnostic(diagnostics, row.line, column + at + 2, String(error)); }
       }
+      if (anchor && Object.prototype.hasOwnProperty.call(result, key)) anchors.set(anchor, result[key]);
     }
     return result;
   }
@@ -540,7 +559,7 @@ export function parsePES(text: string): PESModel {
       if (current) current.end = index;
       current = { kind: 'parameters', line: index + 1, end: lines.length };
       sections.push(current);
-    } else if (!current && raw.trim()) {
+    } else if (!current && raw.trim() && raw.trim() !== '---') {
       diagnostic(diagnostics, index + 1, 1,
         'expected an @view or a top-level parameter domain before content');
     }
@@ -564,6 +583,10 @@ export function parsePES(text: string): PESModel {
         const value = parsed.value[name];
         if (settings.has(name)) {
           diagnostic(diagnostics, start, 1, `duplicate parameter domain: ${name}`);
+          continue;
+        }
+        if (!PARAMETER_DOMAINS.has(name)) {
+          diagnostic(diagnostics, start, 1, `unknown parameter domain: ${name}`);
           continue;
         }
         if (value !== null && (typeof value !== 'object' || Array.isArray(value))) {
@@ -614,6 +637,7 @@ export function parsePES(text: string): PESModel {
   const events = readEvents(settings.get('events'), diagnostics, settingLines.get('events') || 1);
   const defaultView = circuit ? 'circuit' : views[0]?.name || '';
   if (!views.length) diagnostic(diagnostics, 1, 1, 'no schematic view found (expected @circuit)');
+  else if (!circuit) diagnostic(diagnostics, 1, 1, 'native simulation files require an @circuit view');
   return { views, globals, events, timeline: buildTimeline(events, duration, initial),
     diagnostics, defaultView };
 }

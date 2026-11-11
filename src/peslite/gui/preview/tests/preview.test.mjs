@@ -45,6 +45,16 @@ events:
   disconnect_vsc: {type: disconnect, target: VSC, t: 0.7}
 `;
 
+test('shares native syntax acceptance with the Python parser', () => {
+  const fixture = fileURLToPath(new URL('../../../../../tests/fixtures/pes_syntax_cases.json',
+    import.meta.url));
+  const cases = JSON.parse(readFileSync(fixture, 'utf8')).cases;
+  for (const { name, valid, text } of cases) {
+    const errors = parsePES(text).diagnostics.filter(item => item.severity === 'error');
+    assert.equal(errors.length === 0, valid, `${name}: ${errors.map(item => item.message).join('; ')}`);
+  }
+});
+
 test('parses every bundled native simulation file with matching event targets', () => {
   const examples = fileURLToPath(new URL('../../../../../examples/', import.meta.url));
   const files = readdirSync(examples).filter(name => name.endsWith('.pes'))
@@ -107,14 +117,14 @@ test('allows forward references and nested control views with independent names'
   assert.deepEqual(parsed.views[1].nodes.find(node => node.name === 'X').ports, ['out']);
 });
 
-test('parses parameter domains without @ or a fixed domain-name list', () => {
-  const parsed = parsePES(`base: {s_base: 1e6}\n@circuit\nGrid -- Unit\n@Unit\nLoop -> PWM\nUnit: Converter\n  Loop: CurrentControl\n  PWM: DutyModulation\ncustom_parameters:\n  enabled: true\n  matrix: [[1, 2],\n           [3, 4]]\nsimulation:\n  t_end: 2\n`);
+test('parses standard parameter domains without @ prefixes', () => {
+  const parsed = parsePES(`base: {s_base: 1e6}\n@circuit\nGrid -- Unit\n@Unit\nLoop -> PWM\nUnit: Converter\n  Loop: CurrentControl\n  PWM: DutyModulation\nmeta:\n  title: custom parameters\nsimulation:\n  t_end: 2\n`);
   assert.deepEqual(parsed.diagnostics, []);
   assert.deepEqual(parsed.views.map(view => view.name), ['circuit', 'Unit']);
   assert.deepEqual(parsed.globals.map(block => block.name),
-    ['base', 'custom_parameters', 'simulation']);
-  assert.ok(parsed.globals.find(block => block.name === 'custom_parameters')?.source
-    .includes('enabled: true'));
+    ['base', 'meta', 'simulation']);
+  assert.ok(parsed.globals.find(block => block.name === 'meta')?.source
+    .includes('title: custom parameters'));
   assert.deepEqual(parsed.timeline.map(segment => [segment.start, segment.end]), [[0, 2]]);
 });
 

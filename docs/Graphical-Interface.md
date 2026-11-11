@@ -69,6 +69,6 @@ path. Closing the page or host removes the cache. **Fit** changes only the viewp
 
 ## Validation boundary
 
-The preview parser provides immediate structural diagnostics without loading Python addons or
-running a simulation. Numerical validation and resolved parameter checks remain the responsibility
-of `peslite inspect` and `peslite run`.
+The browser and Python host apply the same native syntax boundaries and report source-located
+structural errors without running a simulation. Numerical validation and resolved parameter checks
+remain the responsibility of `peslite inspect` and `peslite run`.

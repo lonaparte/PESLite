@@ -9,7 +9,7 @@ import yaml
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, dumps, from_dict, read_tree, to_dict
-from peslite.assembly.simulation_file import parse_native_document
+from peslite.assembly.simulation_file import parse_native_text
 
 
 @pytest.mark.parametrize("filename", [
@@ -178,7 +178,7 @@ def test_nested_electrical_values_follow_si_and_pu_spelling():
 
 def test_switched_sections_require_settings_and_write_zero_or_one():
     p = peslite.load(EXAMPLES / "gfl-example.pes")
-    written = parse_native_document(dumps(p)).parameters
+    written = parse_native_text(dumps(p))[0]
     protection = written["units"]["vsc"]["protection"]
     assert protection["overcurrent"] == {"enable": 1, "limit_pu": 1.15}
     assert protection["frequency"] == {"enable": 0, "limit": None}
@@ -221,7 +221,7 @@ def test_dependent_defaults_follow_replace_and_stay_fixed_when_explicit():
     averaged = p.replace(**{"units.vsc.bridge.model": "pwm_averaging",
                             "units.vsc.meas.average": ["u_g", "i_c"],
                             "units.vsc.pwm.f_sw": 10_000.0})
-    written = parse_native_document(dumps(averaged)).parameters
+    written = parse_native_text(dumps(averaged))[0]
     assert written["units"]["vsc"]["meas"]["period"] == pytest.approx(1e-4)
     assert written["units"]["vsc"]["meas"]["window"] == pytest.approx(1e-4)
     assert written["units"]["vsc"]["meas"]["average"] == ["u_g", "i_c"]
@@ -231,7 +231,7 @@ def test_dependent_defaults_follow_replace_and_stay_fixed_when_explicit():
 def test_to_dict_preserves_following_defaults_but_dumps_resolves_them():
     p = peslite.load(EXAMPLES / "gfl-example.pes")
     compact = to_dict(p)
-    complete = parse_native_document(dumps(p)).parameters
+    complete = parse_native_text(dumps(p))[0]
     assert compact["units"]["vsc"]["ctrl"]["period"] is None
     assert compact["units"]["vsc"]["ctrl"]["references"]["omega"] is None
     assert complete["units"]["vsc"]["ctrl"]["period"] == pytest.approx(5e-5)
@@ -290,13 +290,13 @@ def test_a_loop_class_uses_a_class_qualified_name_without_type():
 def test_resolved_cli_and_meta_contract(capsys):
     assert peslite.main(["inspect", "gfl-example", "--resolved",
                          "--set", "units.vsc.pwm.f_sw=10000"]) == 0
-    resolved = parse_native_document(capsys.readouterr().out).parameters
+    resolved = parse_native_text(capsys.readouterr().out)[0]
     assert resolved["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)
     from_dict(resolved)
 
     assert peslite.main(["inspect", "gfl-example", "--switching", "--resolved",
                          "--set", "units.vsc.pwm.f_sw=10000"]) == 0
-    sampled = parse_native_document(capsys.readouterr().out).parameters
+    sampled = parse_native_text(capsys.readouterr().out)[0]
     assert sampled["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)
 
     tree = _tree()

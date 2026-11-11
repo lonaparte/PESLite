@@ -74,7 +74,7 @@ simulation:
 ```
 
 `@circuit` is the required system view; `@Name` defines a detailed view for a named Unit or
-subsystem. Within a view:
+subsystem. A view header may end with a `# comment`. Within a view:
 
 - `A -- B` is an undirected electrical connection and `A -> B` is a directed signal connection;
 - connections may be chained and may address named ports, such as `A.output -> B.input`;
@@ -82,9 +82,17 @@ subsystem. Within a view:
 - `Name: type` declares the displayed type, with optional indented block declarations;
 - repeated names identify the same displayed object within that view.
 
+A view ends at the next `@` header or parameter domain. A declaration always includes its displayed
+type (`VSC: vsc`, not `VSC:`); quoted parameter keys and the standard domains (`base`, `buses`,
+`branches`, `sources`, `units`, `elements`, `signals`, `events`, `simulation` and `meta`) are
+unambiguous boundaries.
+
 View blocks describe presentation. The parameter mappings remain the source of simulation values,
 and their schemas are documented in the component and simulation pages linked above. See
 [Graphical Interface](Graphical-Interface.md) for rendering and layout behavior.
+
+Resolved files written by `inspect --resolved`, a simulation run or exported C++ retain the source
+views. A simulation constructed directly from parameters writes an empty `@circuit` view.
 
 ## Names and paths
 

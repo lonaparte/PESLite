@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { createPESPreview } from '../../preview/index.js';
+import { createPESPreview, parsePES } from '../../preview/index.js';
 import type { GraphEdge, GraphNode, PESModel, SourceLocation } from '../../preview/types.js';
 import { request, subscribe, inVSCode } from './transport';
 import type { Operation } from './transport';
@@ -76,7 +76,13 @@ function GraphPane({ text, path, response, onSelect, onSource }: {
         diagnostics: response.diagnostics,
       });
     } else {
-      preview.current.update(text);
+      const model = parsePES(text);
+      const host = response.source === text ? response.diagnostics : [];
+      const lines = new Set(model.diagnostics.map(item => item.range.start.line));
+      preview.current.updateModel({
+        ...model,
+        diagnostics: [...model.diagnostics, ...host.filter(item => !lines.has(item.range.start.line))],
+      });
     }
   }, [text, path, response]);
   return <div className="graph-container" ref={container} />;

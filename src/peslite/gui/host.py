@@ -18,6 +18,23 @@ from typing import Any
 from .workspace import Workspace, WorkspaceError
 
 
+def _native_preview(text: str, path: Path) -> dict[str, Any]:
+    """Return diagnostics from the numerical parser; the browser renders the interface."""
+    from ..assembly.simulation_file import SimulationFileError, parse_native_text
+    diagnostics = []
+    try:
+        parse_native_text(text, path)
+    except SimulationFileError as exc:
+        line, column = exc.line or 1, exc.column or 1
+        diagnostics.append({
+            "severity": "error", "message": exc.message,
+            "range": {"start": {"line": line, "column": column},
+                      "end": {"line": line, "column": column + 1}},
+        })
+    return {"format": "native", "model": None, "fields": [],
+            "diagnostics": diagnostics, "source": text}
+
+
 class SimulationProcess:
     """Launch the existing PESLite CLI, with bounded output and cancellation."""
 
@@ -114,7 +131,7 @@ class Host:
             if is_native_source(text):
                 if method != "preview":
                     raise WorkspaceError("new-syntax schematics must be edited in source text")
-                return {"format": "native", "model": None, "fields": [], "diagnostics": []}
+                return _native_preview(text, target)
             if params.get("trustAddons") is True and self.files.has_project_addons(name):
                 from ..addons import _discover_for
                 # A workspace may place PESaddons next to a nested model or at

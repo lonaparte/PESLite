@@ -102,8 +102,10 @@ def test_native_host_preview_does_not_execute_addons(tmp_path):
     (tmp_path / 'PESaddons').mkdir()
     (tmp_path / 'model.pes').write_text('@circuit\nA -- B\n')
     api = Host(tmp_path)
-    response = api.dispatch('preview', { 'path': 'model.pes', 'text': '# comment\n\n@circuit\nA -- B\n' })
-    assert response == {'format': 'native', 'model': None, 'fields': [], 'diagnostics': []}
+    text = '# comment\n\n@circuit\nA -- B\n'
+    response = api.dispatch('preview', {'path': 'model.pes', 'text': text})
+    assert response['format'] == 'native' and response['source'] == text
+    assert response['diagnostics'][0]['message'] == 'top level must be a mapping'
     with pytest.raises(WorkspaceError, match='trust'):
         api.dispatch('run.start', {'path': 'model.pes'})
 
@@ -114,7 +116,9 @@ def test_native_preview_detection_does_not_depend_on_section_order(tmp_path):
     text = 'base: {s_base: 1}\n@circuit\nA -- B\nsimulation: {t_end: 1}\n'
     (tmp_path / 'model.pes').write_text(text)
     response = Host(tmp_path).dispatch('preview', {'path': 'model.pes', 'text': text})
-    assert response == {'format': 'native', 'model': None, 'fields': [], 'diagnostics': []}
+    assert response == {
+        'format': 'native', 'model': None, 'fields': [], 'diagnostics': [], 'source': text,
+    }
 
 
 def test_component_insertion_is_a_single_source_range_edit():

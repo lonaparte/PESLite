@@ -1,18 +1,33 @@
-"""Native simulation-document parsing and legacy-format delegation."""
+"""Direct native-text parsing and legacy-format delegation."""
 
+import json
 from pathlib import Path
 
 import pytest
 
 from peslite.assembly.simulation_file import (
-    SimulationFileError, parse_native_document, parse_simulation_document,
+    SimulationFileError, parse_native_text, parse_simulation_text,
 )
 from peslite.assembly.params import read_initial
 
 pytestmark = pytest.mark.static
 
 
-def test_native_document_separates_views_from_parameter_domains():
+SYNTAX_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "pes_syntax_cases.json").read_text(encoding="utf-8")
+)["cases"]
+
+
+@pytest.mark.parametrize("case", SYNTAX_CASES, ids=lambda case: case["name"])
+def test_shared_native_syntax_cases(case):
+    if case["valid"]:
+        parse_native_text(case["text"], "case.pes")
+    else:
+        with pytest.raises(SimulationFileError):
+            parse_native_text(case["text"], "case.pes")
+
+
+def test_native_text_separates_interface_source_from_parameter_domains():
     source = """# PESLite
 base: {s_base: 1.0e+6}
 
@@ -28,34 +43,48 @@ VSC: vsc, gfl
 simulation:
   t_end: 0.1
 """
-    document = parse_native_document(source, "case.pes")
-    assert document.parameters == {
+    parameters, interface = parse_native_text(source, "case.pes")
+    assert parameters == {
         "base": {"s_base": 1.0e6},
         "simulation": {"t_end": 0.1},
     }
-    assert [(view.name, view.line) for view in document.views] == [
-        ("circuit", 4), ("VSC", 7),
-    ]
-    assert "Grid -- PCC -- VSC" in document.views[0].source
-    assert "Current -> PWM" in document.views[1].source
+    assert interface == """@circuit
+Grid -- PCC -- VSC
+
+@VSC
+Current -> PWM
+VSC: vsc, gfl
+  Current: CurrentLoop
+  PWM: ThreePhaseModulation
+"""
 
 
-def test_native_document_requires_one_unambiguous_circuit_view():
+def test_native_text_requires_one_unambiguous_circuit_view():
     with pytest.raises(SimulationFileError, match="require an @circuit"):
-        parse_native_document("base: {s_base: 1}\n", "case.pes")
+        parse_native_text("base: {s_base: 1}\n", "case.pes")
     with pytest.raises(SimulationFileError, match="duplicate @circuit"):
-        parse_native_document("@circuit\n@circuit\nbase: {s_base: 1}\n", "case.pes")
+        parse_native_text("@circuit\n@circuit\nbase: {s_base: 1}\n", "case.pes")
     with pytest.raises(SimulationFileError, match="invalid interface view header"):
-        parse_native_document("@circuit wrong\nbase: {s_base: 1}\n", "case.pes")
+        parse_native_text("@circuit wrong\nbase: {s_base: 1}\n", "case.pes")
 
 
 def test_parameter_only_yaml_is_loaded_by_the_registered_format_addon():
-    document = parse_simulation_document(
+    parameters, interface = parse_simulation_text(
         "base: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n", Path("legacy.pes")
     )
-    assert document.parameters["simulation"]["t_end"] == 0.1
-    assert document.views == ()
-    assert document.source_format.endswith("addons.formats.legacy_yaml")
+    assert parameters["simulation"]["t_end"] == 0.1
+    assert interface == ""
+
+
+def test_native_text_reports_structural_and_parameter_errors():
+    with pytest.raises(SimulationFileError, match="requires a displayed type at line 2"):
+        parse_native_text("@circuit\nConverter:\nbase: {s_base: 1}\n")
+    with pytest.raises(SimulationFileError, match="duplicate key: t_end"):
+        parse_native_text(
+            "@circuit\nbase: {s_base: 1}\nsimulation:\n  t_end: 1\n  t_end: 2\n"
+        )
+    with pytest.raises(SimulationFileError, match="unknown parameter domain: extra"):
+        parse_native_text("@circuit\nbase: {s_base: 1}\nextra: {value: 2}\n")
 
 
 def test_native_simulation_file_can_supply_continuation_state(tmp_path):

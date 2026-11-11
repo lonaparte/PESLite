@@ -172,11 +172,6 @@ async function openPreview(context: vscode.ExtensionContext, uri?: vscode.Uri) {
           edit.replacement);
         if (!await vscode.workspace.applyEdit(change)) throw new Error('Could not apply the edit');
         result = { applied: true };
-      } else if (method === 'preview' &&
-                 String(params.text).split(/\r?\n/)
-                   .find(line => line.trim() && !line.trim().startsWith('#'))
-                   ?.trim().startsWith('@')) {
-        result = { format: 'native', model: null, fields: [], diagnostics: [] };
       } else if (method === 'preview' || method === 'parameter.patch' ||
                  method === 'component.add' || method === 'component.remove' ||
                  method === 'connection.rewire' || method === 'csv.read' ||

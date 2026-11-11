@@ -38,7 +38,7 @@ from ..assembly.events import Scenario, switching_schedule
 from ..assembly.conduction import DiodeConduction
 from ..assembly.exporter import _signal_names
 from ..assembly.params import (Params, _connection_variable, _parameterized, _unit_at, _unit_items,
-                               _unit_leaves, connection_defaults, dump, dumps, load, to_dict)
+                               _unit_leaves, _load_case, connection_defaults, dump, dumps, to_dict)
 from ..assembly.system import System, _start_connections
 from ..assembly.types import unit_type
 from ..assembly.unit import Plant, Unit
@@ -694,7 +694,8 @@ class Simulation:
 
     def __init__(self, p: Params, system: Any = None, solver: Solver | None = None,
                  parts: Mapping[str, Callable[..., Any]] | None = None,
-                 instances: Mapping[str, Any] | None = None) -> None:
+                 instances: Mapping[str, Any] | None = None,
+                 interface_text: str = "") -> None:
         """Build every part from ``p`` unless replaced through ``parts`` or ``instances``.
 
         parts: factories keyed ``"system"`` or ``"solver"`` (called with ``p``), or ``"<unit>"``,
@@ -703,6 +704,7 @@ class Simulation:
         instance the split error bound is not computed.
         """
         self.p = p
+        self.interface_text = interface_text
         self._parameters = p
         self._factories: dict[str, Callable[..., Any]] = dict(parts or {})
         given: dict[str, Any] = dict(instances or {})
@@ -1517,7 +1519,8 @@ class Simulation:
             summary_path = output_dir / "summary.json"
             params_path = output_dir / "simulation.pes"
             summary_path.write_text(json.dumps(payload, indent=2, default=float), encoding="utf-8")
-            dump(p if t_end == p.simulation.t_end else p.replace(**{"simulation.t_end": t_end}), params_path)
+            dump(p if t_end == p.simulation.t_end else p.replace(**{"simulation.t_end": t_end}),
+                 params_path, self.interface_text)
             files += [summary_path, params_path]
         self.result = SimulationResult(
             params=p, _records=records, out_dir=output_dir, files=files, summary=summary,
@@ -1952,7 +1955,7 @@ def _parse_command_args(ap: argparse.ArgumentParser, argv=None):
 
 
 def _load_command_params(args, extra_overrides: Mapping[str, Any] | None = None
-                         ) -> tuple[Path, Params, str | None]:
+                         ) -> tuple[Path, Params, str | None, str]:
     try:
         config = _config_path(args.config)
     except FileNotFoundError as exc:
@@ -1962,14 +1965,16 @@ def _load_command_params(args, extra_overrides: Mapping[str, Any] | None = None
     set_overrides = dict(args.set)
     overrides = {**set_overrides, **(extra_overrides or {})}
     try:
-        p = load(config, initial=args.initial, initial_time=args.initial_time, **overrides)
+        p, interface_text = _load_case(
+            config, initial=args.initial, initial_time=args.initial_time, **overrides,
+        )
     except ConfigError as exc:
         if args.json:
             raise _CommandFailure(2, "configuration_error", str(exc), config=config) from None
         raise
     model = next((flag for flag in _BRIDGE_PRESETS if getattr(args, flag)), None)
     if model is None:
-        return config, p, None
+        return config, p, None, interface_text
     effective_models = []
     for name, cfg in _unit_items(p.units):
         path = f"units.{name}.bridge.model"
@@ -2000,7 +2005,7 @@ def _load_command_params(args, extra_overrides: Mapping[str, Any] | None = None
                 or path.startswith("simulation.solver.subsystems.")
                 for path in set_overrides):
             changes["simulation.solver.subsystems"] = {}
-    return config, p.replace(**changes) if changes else p, model
+    return config, p.replace(**changes) if changes else p, model, interface_text
 
 
 def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
@@ -2074,7 +2079,7 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
         overrides["simulation.progress.watch"] = [name for value in args.watch
                                                    for name in value.split(",") if name]
     try:
-        config, p, model = _load_command_params(args, overrides)
+        config, p, model, interface_text = _load_command_params(args, overrides)
     except FileNotFoundError as exc:
         ap.error(str(exc))
     if (args.progress is None and not p.simulation.progress.enable
@@ -2089,7 +2094,7 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
         except (ImportError, RuntimeError) as exc:
             ap.error(f"--plot: {exc}")
     try:
-        sim = Simulation(p)
+        sim = Simulation(p, interface_text=interface_text)
     except ConfigError as exc:
         if args.json:
             raise _CommandFailure(3, "assembly_error", str(exc), config=config) from None
@@ -2143,9 +2148,10 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
     return _run_exit(s)[0]
 
 
-def _assemble_command(p: Params, config: Path, json_output: bool) -> Simulation:
+def _assemble_command(p: Params, config: Path, json_output: bool,
+                      interface_text: str = "") -> Simulation:
     try:
-        return Simulation(p)
+        return Simulation(p, interface_text=interface_text)
     except ConfigError as exc:
         if json_output:
             raise _CommandFailure(3, "assembly_error", str(exc), config=config) from None
@@ -2241,10 +2247,10 @@ def _validate_main(argv=None) -> int | _CommandOutcome:
     ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
     args = _parse_command_args(ap, argv)
     try:
-        config, p, _model = _load_command_params(args)
+        config, p, _model, interface_text = _load_command_params(args)
     except FileNotFoundError as exc:
         ap.error(str(exc))
-    simulation = _assemble_command(p, config, args.json)
+    simulation = _assemble_command(p, config, args.json, interface_text)
     validation = {
         "status": "valid",
         "units": list(simulation.units),
@@ -2272,7 +2278,7 @@ def _inspect_main(argv=None) -> int | _CommandOutcome:
     ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
     args = _parse_command_args(ap, argv)
     try:
-        config, p, _model = _load_command_params(args)
+        config, p, _model, interface_text = _load_command_params(args)
     except FileNotFoundError as exc:
         ap.error(str(exc))
     selected = {"resolved": args.resolved, "states": args.states,
@@ -2284,7 +2290,7 @@ def _inspect_main(argv=None) -> int | _CommandOutcome:
         assembly_p = p
         if selected["ph_report"] and p.simulation.energy_check == "off":
             assembly_p = p.replace(**{"simulation.energy_check": "warn"})
-        simulation = _assemble_command(assembly_p, config, args.json)
+        simulation = _assemble_command(assembly_p, config, args.json, interface_text)
     values = {}
     if selected["resolved"]:
         values["resolved"] = to_dict(p)
@@ -2298,7 +2304,7 @@ def _inspect_main(argv=None) -> int | _CommandOutcome:
     if args.json:
         return _CommandOutcome(0, _payload("inspect", config=config, **values))
     views = {
-        "resolved": ("Resolved configuration", lambda: dumps(p).rstrip()),
+        "resolved": ("Resolved configuration", lambda: dumps(p, interface_text).rstrip()),
         "states": ("States", lambda: "\n".join(values["states"])),
         "ph_report": ("Port-Hamiltonian report", lambda: str(simulation.ph_report)),
         "groups": ("Electrical groups", lambda: json.dumps(values["groups"], indent=2)),
@@ -2325,10 +2331,10 @@ def _export_main(argv=None) -> int | _CommandOutcome:
     if not args.imperix and (args.imperix_config or args.imperix_sdk or args.imperix_source_only):
         ap.error("Imperix options require --imperix")
     try:
-        config, p, model = _load_command_params(args)
+        config, p, model, interface_text = _load_command_params(args)
     except FileNotFoundError as exc:
         ap.error(str(exc))
-    simulation = _assemble_command(p, config, args.json)
+    simulation = _assemble_command(p, config, args.json, interface_text)
     suffix = "-" + model.replace("_", "-") if model is not None else ""
     out = Path(args.out) if args.out else Path("export") / f"{config.stem}{suffix}"
     export_format = "imperix" if args.imperix else "cpp"

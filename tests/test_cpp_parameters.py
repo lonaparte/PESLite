@@ -293,8 +293,8 @@ def test_initial_connection_does_not_replace_a_scheduled_command(at, tmp_path):
 
 def test_connection_config_template_keeps_json_values_typed_without_yaml(monkeypatch):
     import builtins
-    import json
     from peslite.assembly.cpp import _RuntimeParameters
+    from peslite.assembly.simulation_file import parse_native_text
 
     runtime = _RuntimeParameters(_case("buck", "pwm_averaging"), ("units.converter.connected",))
     original_import = builtins.__import__
@@ -308,8 +308,8 @@ def test_connection_config_template_keeps_json_values_typed_without_yaml(monkeyp
     body, replacements = runtime.resolved_template()
     assert len(replacements) == 1
     marker, _expression = replacements[0]
-    assert json.loads(body.replace(marker, "0"))["units"]["converter"]["connected"] == 0
-    assert json.loads(body.replace(marker, "null"))["units"]["converter"]["connected"] is None
+    assert parse_native_text(body.replace(marker, "0"))[0]["units"]["converter"]["connected"] == 0
+    assert parse_native_text(body.replace(marker, "null"))[0]["units"]["converter"]["connected"] is None
 
 
 def test_source_ramp_keeps_its_command_state_when_controller_startup_is_restored(tmp_path):
