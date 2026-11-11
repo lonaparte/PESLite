@@ -1,6 +1,9 @@
 # PESLite 0.5.2
 # Three-phase continuous-control-set MPC with full Q, R and S stage-cost matrices.
 # Q weights alpha-beta current error; R weights leg commands; S weights command increments.
+@circuit
+grid -- pcc -- vsc
+
 base: {s_base: 10000.0, v_ll_rms: 400.0, f0: 50.0}
 buses:
   pcc: {c_pu: 0.02, r_d_pu: 0.5}

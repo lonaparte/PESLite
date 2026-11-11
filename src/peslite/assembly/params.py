@@ -18,7 +18,6 @@ from __future__ import annotations
 import csv
 import dataclasses
 import functools
-import json
 import math
 from collections.abc import Mapping as _Mapping
 from copy import deepcopy
@@ -1780,7 +1779,7 @@ def _register_load_preparer(function: Callable[[str | Path], Any]) -> None:
 
 def load(path: str | Path, initial: str | Path | None = None,
          initial_time: Optional[float] = None, **overrides: Any) -> Params:
-    """Load a YAML/JSON configuration, optionally replace its initial state, and apply overrides.
+    """Load a simulation file, optionally replace its initial state, and apply overrides.
 
     ``initial``: states CSV (last row, or the row at ``initial_time`` in s) or YAML/JSON.
     ``overrides``: dotted paths, e.g. ``load("case.pes", **{"simulation.t_end": 5.0})``.
@@ -1804,26 +1803,12 @@ def load(path: str | Path, initial: str | Path | None = None,
 
 
 def _read(path: Path) -> Any:
-    """Read YAML or JSON configuration text."""
-    if path.suffix.lower() == ".json":
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ConfigError(f"{path}: {exc.msg} at line {exc.lineno}, column {exc.colno}") from None
+    """Read a YAML or JSON data mapping."""
+    from .simulation_file import SimulationFileError, parse_parameter_mapping
     try:
-        import yaml  # type: ignore
-    except ImportError as exc:  # pragma: no cover - exercised only without PyYAML
-        raise ConfigError(f"{path}: reading YAML needs PyYAML (pip install PyYAML), or write the "
-                          f"configuration as .json") from exc
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            return yaml.safe_load(fh)
-    except yaml.YAMLError as exc:
-        mark = getattr(exc, "problem_mark", None)
-        location = (f" at line {mark.line + 1}, column {mark.column + 1}"
-                    if mark is not None else "")
-        message = getattr(exc, "problem", None) or str(exc).splitlines()[0]
-        raise ConfigError(f"{path}: {message}{location}") from None
+        return parse_parameter_mapping(path.read_text(encoding="utf-8"), path)
+    except SimulationFileError as exc:
+        raise ConfigError(str(exc)) from None
 
 
 def read_initial(path: str | Path, t: Optional[float] = None) -> dict:
@@ -1856,7 +1841,7 @@ def read_initial(path: str | Path, t: Optional[float] = None) -> dict:
             if not math.isnan(value):
                 states[name] = value
         return {"t": float(row[0]), "states": states}
-    data = _read(path)
+    data = read_tree(path) if path.suffix.lower() == ".pes" else _read(path)
     if isinstance(data, dict) and isinstance(data.get("simulation"), dict):
         if "initial" not in data["simulation"]:
             raise ConfigError(f"{path}: a simulation file without a simulation.initial section")
@@ -1869,11 +1854,13 @@ def read_initial(path: str | Path, t: Optional[float] = None) -> dict:
 
 
 def read_tree(path: str | Path) -> dict:
-    """Return a top-level mapping from YAML or JSON configuration text."""
-    data = _read(Path(path))
-    if not isinstance(data, dict):
-        raise ConfigError(f"{path}: top level must be a mapping")
-    return data
+    """Return the parameter mapping from a simulation file."""
+    source = Path(path)
+    from .simulation_file import SimulationFileError, parse_simulation_document
+    try:
+        return parse_simulation_document(source.read_text(encoding="utf-8"), source).parameters
+    except SimulationFileError as exc:
+        raise ConfigError(str(exc)) from None
 
 
 _FILE_ORDER = ("base", "buses", "branches", "sources", "units", "elements", "signals",
@@ -1911,17 +1898,14 @@ def _switches(value: Any) -> Any:
 
 
 def dumps(p: Params) -> str:
-    """Return a complete resolved simulation file as YAML (or JSON without PyYAML)."""
+    """Return a complete resolved native simulation file."""
     d = _written_out(p)
-    try:
-        import yaml  # type: ignore
-    except ImportError:  # pragma: no cover
-        return json.dumps(d, indent=2) + "\n"
+    import yaml  # type: ignore
     from .. import __version__
     header = (f"# PESLite {__version__} simulation file with every value written out (plant values in SI).\n"
               f"# null: not used, or derived when the case is built (for example loop gains from bandwidth).\n"
               f"# Run it with: peslite <this file>\n")
-    return header + yaml.safe_dump(d, sort_keys=False)
+    return header + "\n@circuit\n\n" + yaml.safe_dump(d, sort_keys=False)
 
 
 def dump(p: Params, path: str | Path) -> None:

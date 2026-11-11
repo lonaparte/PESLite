@@ -30,6 +30,12 @@ function diagnostic(output: Diagnostic[], line: number, column: number, message:
 }
 function indent(text: string): number { return text.match(/^ */)![0].length; }
 
+function startsParameters(text: string): boolean {
+  const content = stripComment(text).trimEnd();
+  return PARAMETER_HEADER.test(content) ||
+    (/^[A-Za-z_][\w-]*\s*:/.test(content) && !DEFINITION.test(content));
+}
+
 /** Strip only comments outside quotes and YAML flow collections. */
 function stripComment(input: string): string {
   let quote = '', escaped = false;
@@ -71,6 +77,14 @@ function splitTopLevel(text: string, separator = ','): string[] {
   if (quote || depth !== 0) throw new Error('unclosed quote or flow collection');
   results.push(text.slice(start).trim());
   return results;
+}
+
+function flowComplete(text: string): boolean {
+  try { splitTopLevel(text); return true; }
+  catch (error) {
+    if (String(error).includes('unclosed quote or flow collection')) return false;
+    throw error;
+  }
 }
 
 function colonOutsideFlow(text: string): number {
@@ -134,6 +148,43 @@ function parseYamlMapping(lines: SourceLine[], diagnostics: Diagnostic[]): Parse
   const relevant = lines.filter(line => stripComment(line.text).trim() !== '');
   const keyLines = new Map<Mapping, Map<string, number>>();
   let index = 0;
+
+  function consumeFlow(value: string): string {
+    if (value.startsWith('{') || value.startsWith('[')) {
+      while (!flowComplete(value) && index < relevant.length) {
+        value += ` ${stripComment(relevant[index].text).trim()}`;
+        index++;
+      }
+    }
+    return value;
+  }
+
+  function readSequence(level: number): Value[] {
+    const result: Value[] = [];
+    while (index < relevant.length) {
+      const row = relevant[index];
+      const column = indent(row.text);
+      if (column < level) break;
+      const expression = stripComment(row.text.trimEnd()).trim();
+      if (column !== level || !expression.startsWith('-')) {
+        diagnostic(diagnostics, row.line, column + 1, 'unexpected YAML sequence indentation');
+        index++; continue;
+      }
+      let value = expression.slice(1).trim();
+      index++;
+      value = consumeFlow(value);
+      if (value) {
+        try { result.push(yamlValue(value)); }
+        catch (error) { diagnostic(diagnostics, row.line, column + 2, String(error)); }
+      } else if (index < relevant.length && indent(relevant[index].text) > column) {
+        const child = relevant[index];
+        result.push(stripComment(child.text).trim().startsWith('-')
+          ? readSequence(indent(child.text)) : read(indent(child.text)));
+      } else result.push(null);
+    }
+    return result;
+  }
+
   function read(level: number): Mapping {
     const result: Mapping = {};
     const locations = new Map<string, number>();
@@ -158,10 +209,13 @@ function parseYamlMapping(lines: SourceLine[], diagnostics: Diagnostic[]): Parse
         index++; continue;
       }
       locations.set(key, row.line);
-      const value = expression.slice(at + 1).trim();
+      let value = expression.slice(at + 1).trim();
       index++;
+      value = consumeFlow(value);
       if (value === '' && index < relevant.length && indent(relevant[index].text) > column) {
-        result[key] = read(indent(relevant[index].text));
+        const child = relevant[index];
+        result[key] = stripComment(child.text).trim().startsWith('-')
+          ? readSequence(indent(child.text)) : read(indent(child.text));
       } else if (/^[|>][-+]?\s*$/.test(value)) {
         // YAML block strings are display-only; skip their indented contents.
         while (index < relevant.length && indent(relevant[index].text) > column) index++;
@@ -482,7 +536,7 @@ export function parsePES(text: string): PESModel {
       }
       current = { kind: 'view', name: match[1], line: index + 1, end: lines.length };
       sections.push(current);
-    } else if (PARAMETER_HEADER.test(raw) && current?.kind !== 'parameters') {
+    } else if (startsParameters(raw) && current?.kind !== 'parameters') {
       if (current) current.end = index;
       current = { kind: 'parameters', line: index + 1, end: lines.length };
       sections.push(current);

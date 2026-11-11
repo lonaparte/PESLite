@@ -73,7 +73,7 @@ def _parameter(path: str, label: str, value: Any, group: str, **extra: Any) -> d
 
 
 def _source_lines(path: Path) -> dict[tuple[str, str], int]:
-    """Map ``(section, name)`` to the 1-based line declaring it in a YAML simulation file."""
+    """Map ``(section, name)`` to the 1-based line declaring it in a simulation file."""
     lines: dict[tuple[str, str], int] = {}
     try:
         text = path.read_text(encoding="utf-8").splitlines()

@@ -3,7 +3,7 @@
 PESLite is an open-source, lightweight, multirate, and extensible power electronics simulator in
 Python. It provides time-domain simulation for power-electronic converters and converter-based
 systems—combining switching and averaged models, sampled control, event-driven operation,
-and flexible multi-time-scale numerical integration via readable YAML files and a Python
+and flexible multi-time-scale numerical integration via readable simulation files and a Python
 API—designed as a deterministic simulation backend for LLM reasoning and verification.
 
 > This documentation describes the current development version on the `main` branch. For released

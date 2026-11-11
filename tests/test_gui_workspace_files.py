@@ -108,6 +108,15 @@ def test_native_host_preview_does_not_execute_addons(tmp_path):
         api.dispatch('run.start', {'path': 'model.pes'})
 
 
+def test_native_preview_detection_does_not_depend_on_section_order(tmp_path):
+    from peslite.gui.host import Host
+
+    text = 'base: {s_base: 1}\n@circuit\nA -- B\nsimulation: {t_end: 1}\n'
+    (tmp_path / 'model.pes').write_text(text)
+    response = Host(tmp_path).dispatch('preview', {'path': 'model.pes', 'text': text})
+    assert response == {'format': 'native', 'model': None, 'fields': [], 'diagnostics': []}
+
+
 def test_component_insertion_is_a_single_source_range_edit():
     text = ('# keep the model header\nbase: {s_base: 2e6}\n'
             'buses:\n  pcc:\n    c_pu: 0.02 # preserve\n'

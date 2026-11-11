@@ -1072,7 +1072,8 @@ def test_generated_cpp_matches_composite_wpt_switching_events(tmp_path):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
-    tree = yaml.safe_load((EXAMPLES / "wpt-example.pes").read_text(encoding="utf-8"))
+    from peslite.assembly.params import read_tree
+    tree = read_tree(EXAMPLES / "wpt-example.pes")
     for side in ("primary", "secondary"):
         tree["units"]["charger"][side]["bridge"] = {"model": "pwm_averaging"}
     tree["events"] = {
@@ -1232,7 +1233,8 @@ def test_generic_cpp_fallback_lowers_custom_equations_and_state_branches(tmp_pat
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
-    tree = yaml.safe_load((EXAMPLES / "gfl-example.pes").read_text(encoding="utf-8"))
+    from peslite.assembly.params import read_tree
+    tree = read_tree(EXAMPLES / "gfl-example.pes")
     tree["elements"] = {"conditional": {
         "type": "test_conditional_element",
         "bus": "pcc",

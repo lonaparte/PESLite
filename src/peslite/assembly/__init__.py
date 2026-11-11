@@ -10,6 +10,9 @@ from .params import (BaseValues, ConfigError, ControlParams, LCCLinkParams, LCCS
                      MultiSSLinkParams, Params, SCCParams, SSLinkParams, UnitParams,
                      dump, dumps, from_dict, load,
                      read_initial, to_dict)
+from .simulation_file import (InterfaceView, SimulationDocument, SimulationFileError,
+                              parse_simulation_document, read_simulation_document,
+                              register_simulation_reader)
 from .events import (EVENT_TYPES, Event, Scenario, SourceScenario,
                      register_event_type)
 from .protection import Protection, ProtectionSample
@@ -73,4 +76,6 @@ __all__ = ["Params", "BaseValues", "ConfigError", "load", "dump", "dumps", "from
            "SourceScenario", "Protection", "ProtectionSample", "Unit", "VSC", "DCConverter",
            "UnitParams", "ControlParams",
            "SSLinkParams", "LCCLinkParams", "LCCSLinkParams", "MultiSSLinkParams", "SCCParams",
+           "InterfaceView", "SimulationDocument", "SimulationFileError",
+           "parse_simulation_document", "read_simulation_document", "register_simulation_reader",
            "System"]

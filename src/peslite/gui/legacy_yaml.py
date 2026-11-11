@@ -18,7 +18,7 @@ from typing import Any
 import yaml
 from yaml.nodes import MappingNode, ScalarNode
 
-from ...gui.workspace import (
+from .workspace import (
     WorkspaceError, add_component, explicit_parameters, patch_scalar, patched_text,
     remove_component,
 )
@@ -125,8 +125,8 @@ def _event_data(config: Mapping, locations: Mapping[str, dict], params: Any,
                                "target": target, "time": float(time),
                                "line": locations.get(f"events.{name}", {}).get("start", {}).get("line", 1)})
 
-    from ...assembly.events import _initial_connection, switching_schedule
-    from ...assembly.params import connection_defaults
+    from ..assembly.events import _initial_connection, switching_schedule
+    from ..assembly.params import connection_defaults
 
     initially_inactive = set()
     for path, connected in connection_defaults(params):
@@ -176,13 +176,12 @@ def preview(text: str, path: str | Path) -> dict[str, Any]:
     """
     path = Path(path)
     try:
-        config = yaml.safe_load(text)
-        if not isinstance(config, dict):
-            raise WorkspaceError("PESLite YAML requires a top-level mapping")
         locations = _positions(text)
+        from ..assembly.simulation_file import parse_parameter_mapping
+        config = parse_parameter_mapping(text, path)
         # Do not call load(path): load preparers may execute project-local addons.
-        from ...assembly.params import _ASSET_DIRECTORY, from_dict
-        from ...gui.descriptor import Topology
+        from ..assembly.params import _ASSET_DIRECTORY, from_dict
+        from .descriptor import Topology
 
         token: Token = _ASSET_DIRECTORY.set(path.resolve().parent)
         try:
@@ -323,11 +322,9 @@ def validated_rewire(text: str, path: str | Path, key: str,
     """
     if not isinstance(target, str) or not target:
         raise WorkspaceError("a destination bus is required")
-    try:
-        config = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise WorkspaceError(f"invalid YAML: {exc}") from exc
-    if not isinstance(config, dict) or target not in (config.get("buses") or {}):
+    from ..assembly.simulation_file import parse_parameter_mapping
+    config = parse_parameter_mapping(text)
+    if target not in (config.get("buses") or {}):
         raise WorkspaceError(f"unknown destination bus: {target}")
     parts = key.split(".")
     if len(parts) < 3 or parts[0] not in {"sources", "units", "elements", "branches"}:

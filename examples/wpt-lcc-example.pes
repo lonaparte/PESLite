@@ -3,6 +3,9 @@
 # Negative secondary port power means that its DC source receives power.
 # Phase limits select one monotonic power-transfer branch; no remote measurements are needed.
 
+@circuit
+primary -- charger -- secondary
+
 base:
   s_base: 5000.0
   v_ll_rms: 400.0

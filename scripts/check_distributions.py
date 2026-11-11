@@ -53,14 +53,16 @@ def main(directory: str = "dist") -> int:
     required = {
         "peslite-core": (
             "peslite/addons/functions/__init__.py",
+            "peslite/addons/formats/__init__.py",
             "share/peslite/examples/templates/template.pes",
         ),
         "peslite": (
+            "peslite/addons/formats/legacy_yaml.py",
             "peslite/addons/functions/small_signal.py",
             "share/peslite/examples/gfl-example.pes",
         ),
         "peslite-gui": (
-            "peslite/addons/functions/legacy_yaml.py",
+            "peslite/gui/legacy_yaml.py",
             "peslite/gui/host.py",
             "peslite/gui/service.py",
             "peslite/gui/web_service.py",

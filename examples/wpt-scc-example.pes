@@ -2,6 +2,9 @@
 # SS WPT with a switch-controlled primary compensation capacitor. Power feedback commands the SCC
 # conduction angle through a normal auxiliary controller output.
 
+@circuit
+primary -- charger -- secondary
+
 base:
   s_base: 10000.0
   v_ll_rms: 400.0

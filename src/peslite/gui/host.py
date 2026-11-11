@@ -110,9 +110,8 @@ class Host:
             text = params.get("text")
             if not isinstance(text, str):
                 raise WorkspaceError("preview requires source text")
-            first_statement = next((line.strip() for line in text.splitlines()
-                                    if line.strip() and not line.lstrip().startswith("#")), "")
-            if first_statement.startswith("@"):
+            from ..assembly.simulation_file import is_native_source
+            if is_native_source(text):
                 if method != "preview":
                     raise WorkspaceError("new-syntax schematics must be edited in source text")
                 return {"format": "native", "model": None, "fields": [], "diagnostics": []}

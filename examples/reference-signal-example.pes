@@ -1,6 +1,9 @@
 # PESLite 0.5.2
 # Open-loop Buck with a repeating duty-ratio table evaluated at controller interrupts.
 
+@circuit
+converter -- output -- load
+
 base:
   s_base: 500.0
   v_ll_rms: 230.0

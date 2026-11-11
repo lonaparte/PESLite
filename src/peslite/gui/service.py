@@ -25,7 +25,7 @@ from ..solver.simulation import Simulation, _example_configs_dir
 from .descriptor import SignalRecorder, Topology, json_safe, small_signal_descriptor
 from .preview_cache import PreviewLayoutCache
 
-CASE_SUFFIXES = (".pes", ".yaml", ".yml")
+CASE_SUFFIXES = (".pes",)
 CASES_ENVIRONMENT = "PESLITE_CASES"
 SNAPSHOT_NAME = "gui-snapshot.json"
 # Frontend run options and the parameter path each one sets.
@@ -52,19 +52,10 @@ def discover_cases(root: Path) -> dict[str, Path]:
         else:
             continue
         for path in files:
-            if path.suffix.lower() in (".yaml", ".yml") and not _looks_like_case(path):
+            if path.suffix.lower() not in CASE_SUFFIXES:
                 continue
             cases.setdefault(path.stem, path.resolve())
     return cases
-
-
-def _looks_like_case(path: Path) -> bool:
-    """Accept generic YAML files only when they declare the required top-level sections."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    return "\nbase:" in f"\n{text}" and "\nsimulation:" in f"\n{text}"
 
 
 class FrontendService:

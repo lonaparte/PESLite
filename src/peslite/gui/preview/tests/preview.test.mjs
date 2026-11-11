@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   buildTimeline, createPESPreview, parsePES, layoutView, normalizeLayout,
   routeEdge, pathData, chooseSides, niceTicks, segmentAt,
@@ -42,6 +45,20 @@ events:
   disconnect_vsc: {type: disconnect, target: VSC, t: 0.7}
 `;
 
+test('parses every bundled native simulation file with matching event targets', () => {
+  const examples = fileURLToPath(new URL('../../../../../examples/', import.meta.url));
+  const files = readdirSync(examples).filter(name => name.endsWith('.pes'))
+    .map(name => join(examples, name));
+  files.push(join(examples, 'templates', 'template.pes'));
+  for (const file of files) {
+    const model = parsePES(readFileSync(file, 'utf8'));
+    assert.deepEqual(model.diagnostics.filter(item => item.severity === 'error'), [], file);
+    const circuit = model.views.find(view => view.name === 'circuit');
+    const nodes = new Set(circuit?.nodes.map(node => node.name));
+    for (const event of model.events) assert.ok(nodes.has(event.target), `${file}: ${event.target}`);
+  }
+});
+
 test('parses unit-scoped loops, nested group membership, named ports and YAML blocks', () => {
   const model = parsePES(SAMPLE);
   assert.deepEqual(model.diagnostics, []);
@@ -82,7 +99,7 @@ test('creates separate timeline segments without recalculating layout', () => {
 });
 
 test('allows forward references and nested control views with independent names', () => {
-  const text = `@circuit\nA -- Unit\n@Unit\nX.out -> Y.in\nUnit: Converter, custom\n  X: PID\n    kp: 1.0\n  Y: Output\nsimulation:\n  t_end: 1\n`;
+  const text = `@circuit\nA -- Unit\n@Unit\nX.out -> Y.in\nUnit: Converter, custom # displayed types\n  X: PID\n    kp: 1.0\n  Y: Output\nsimulation:\n  t_end: 1\n`;
   const parsed = parsePES(text);
   assert.deepEqual(parsed.diagnostics, []);
   assert.equal(parsed.views[0].nodes.find(node => node.name === 'Unit').controllerType, 'custom');
@@ -91,7 +108,7 @@ test('allows forward references and nested control views with independent names'
 });
 
 test('parses parameter domains without @ or a fixed domain-name list', () => {
-  const parsed = parsePES(`base:\n  s_base: 1e6\n@circuit\nGrid -- Unit\n@Unit\nLoop -> PWM\nUnit: Converter\n  Loop: CurrentControl\n  PWM: DutyModulation\ncustom_parameters:\n  enabled: true\nsimulation:\n  t_end: 2\n`);
+  const parsed = parsePES(`base: {s_base: 1e6}\n@circuit\nGrid -- Unit\n@Unit\nLoop -> PWM\nUnit: Converter\n  Loop: CurrentControl\n  PWM: DutyModulation\ncustom_parameters:\n  enabled: true\n  matrix: [[1, 2],\n           [3, 4]]\nsimulation:\n  t_end: 2\n`);
   assert.deepEqual(parsed.diagnostics, []);
   assert.deepEqual(parsed.views.map(view => view.name), ['circuit', 'Unit']);
   assert.deepEqual(parsed.globals.map(block => block.name),

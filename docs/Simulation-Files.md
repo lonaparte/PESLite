@@ -1,11 +1,15 @@
 # Simulation Files
 
-A `.pes` file describes one simulation. Its parameter domains use YAML mappings; PESLite validates
-them before assembly and reports unknown fields, invalid values and unresolved connections.
+A `.pes` file combines graphical interface views with YAML parameter domains. PESLite validates the
+parameter mapping before assembly and reports unknown fields, invalid values and unresolved
+connections.
 
 ## Structure
 
-```yaml
+```text
+@circuit
+Grid -- PCC -- Converter
+
 base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
 
 buses: {}
@@ -44,9 +48,8 @@ section simply omits it.
 
 ## Interface views
 
-The graphical interface renders optional view blocks from the simulation source. Only view headers
-use `@`; parameter domains such as `base:`, `simulation:` and `events:` remain ordinary YAML
-mappings.
+Every simulation file defines `@circuit`; additional named views are optional. Only view headers use
+`@`; parameter domains such as `base:`, `simulation:` and `events:` remain ordinary YAML mappings.
 
 ```text
 @circuit
@@ -70,7 +73,7 @@ simulation:
   t_end: 1.0
 ```
 
-`@circuit` is the default system view; `@Name` defines a detailed view for a named Unit or
+`@circuit` is the required system view; `@Name` defines a detailed view for a named Unit or
 subsystem. Within a view:
 
 - `A -- B` is an undirected electrical connection and `A -> B` is a directed signal connection;

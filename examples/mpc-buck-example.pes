@@ -2,6 +2,9 @@
 # Synchronous Buck current control. All electrical values are SI.
 # The output voltage follows load resistance times controlled current;
 # this example intentionally has no outer voltage loop.
+@circuit
+converter -- output -- load
+
 base: {s_base: 500.0, v_ll_rms: 230.0, f0: 50.0}
 buses:
   output: {phases: 1, c: 470.0e-6}

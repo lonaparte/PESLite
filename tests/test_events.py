@@ -12,6 +12,7 @@ from conftest import EXAMPLES
 from peslite.assembly import Event, Scenario, register_event_type
 from peslite.assembly.events import EVENT_TYPES, SourceScenario, events_for, switching_schedule
 from peslite.assembly.params import ConfigError, dumps, from_dict, read_tree
+from peslite.assembly.simulation_file import parse_native_document
 from peslite.control import Startup
 
 
@@ -217,7 +218,7 @@ def test_source_scenario_preserves_frequency_phase_and_voltage_changes():
     initial = _gfl().replace(**{"sources.grid.f": 50.5, "sources.grid.angle": 0.2})
     scenario = SourceScenario(initial.sources["grid"], initial.base.f0)
     assert scenario.angle(0.01) == pytest.approx(2 * math.pi * 0.5 * 0.01 + 0.2)
-    assert yaml.safe_load(dumps(_gfl()))["sources"]["grid"]["f"] == 50.0
+    assert parse_native_document(dumps(_gfl())).parameters["sources"]["grid"]["f"] == 50.0
 
 
 def test_events_round_trip_in_resolved_file_and_set_paths_are_replaceable():
@@ -226,7 +227,7 @@ def test_events_round_trip_in_resolved_file_and_set_paths_are_replaceable():
                      "events.power.t": 1.5})
     assert q.events["power"].set == {"units.vsc.ctrl.references.p_ref_pu": 0.7}
     assert q.events["power"].t == 1.5
-    rebuilt = from_dict(yaml.safe_load(dumps(q)))
+    rebuilt = from_dict(parse_native_document(dumps(q)).parameters)
     assert rebuilt.events["power"].set == q.events["power"].set
     assert rebuilt.changes[0].paths == q.changes[0].paths
 
@@ -255,7 +256,7 @@ def test_connection_variables_require_boolean_values(value):
 def test_connection_variables_follow_the_existing_switch_syntax_and_round_trip(value):
     p = _gfl().replace(**_set("stop", 0.3, **{"units.vsc.connected": value}))
     assert p.changes[-1].values == {"units.vsc.connected": False}
-    assert from_dict(yaml.safe_load(dumps(p))).changes[-1].values == p.changes[-1].values
+    assert from_dict(parse_native_document(dumps(p)).parameters).changes[-1].values == p.changes[-1].values
 
 
 def test_variable_binding_detects_mixed_syntax_connection_conflicts():

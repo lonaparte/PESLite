@@ -114,7 +114,10 @@ The simulation file, extension paths and local output layout are described toget
 
 A compact complete case looks like this:
 
-```yaml
+```text
+@circuit
+grid -- pcc -- vsc
+
 base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
 
 buses:

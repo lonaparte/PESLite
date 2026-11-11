@@ -146,7 +146,8 @@ def test_pwm_register_layout_rejects_state_collisions(registers, modulator, matc
 @pytest.mark.parametrize("example", ["gfl", "buck", "wpt"])
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
 def test_explicit_default_does_not_add_policy_or_state(example, mode):
-    tree = yaml.safe_load((EXAMPLES / f"{example}-example.pes").read_text())
+    from peslite.assembly.params import read_tree
+    tree = read_tree(EXAMPLES / f"{example}-example.pes")
     from peslite.assembly.params import _unit_items
     initial = from_dict(tree)
     changes = {f"units.{name}.bridge.model": mode for name, _ in _unit_items(initial.units)}

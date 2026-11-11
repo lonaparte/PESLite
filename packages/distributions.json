@@ -11,14 +11,14 @@
     "addons": [
       "src/peslite/addons/components/**/*.py",
       "src/peslite/addons/control/**/*.py",
+      "src/peslite/addons/formats/**/*.py",
       "src/peslite/addons/functions/**/*.py",
       "!src/peslite/addons/components/__init__.py",
       "!src/peslite/addons/control/__init__.py",
-      "!src/peslite/addons/functions/__init__.py",
-      "!src/peslite/addons/functions/legacy_yaml.py"
+      "!src/peslite/addons/formats/__init__.py",
+      "!src/peslite/addons/functions/__init__.py"
     ],
     "gui": [
-      "src/peslite/addons/functions/legacy_yaml.py",
       "src/peslite/gui/**/*.py",
       "src/peslite/gui/preview/*",
       "src/peslite/gui/preview/tests/*",

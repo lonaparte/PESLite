@@ -22,7 +22,7 @@ Issues = "https://github.com/lonaparte/PESLite/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["peslite.gui*", "peslite.addons.functions*"]
+include = ["peslite.gui*"]
 namespaces = true
 
 [tool.setuptools.package-data]
