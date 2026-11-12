@@ -14,6 +14,14 @@ _EXPORTS = {
     "legacy_yaml_add_component": ("peslite.gui.legacy_yaml", "validated_add_component", False),
     "legacy_yaml_remove_component": ("peslite.gui.legacy_yaml", "validated_remove_component", False),
     "legacy_yaml_rewire": ("peslite.gui.legacy_yaml", "validated_rewire", False),
+    "reference_prbs": ("identification", "reference_prbs", False),
+    "reference_multitone": ("identification", "reference_multitone", False),
+    "reference_chirp": ("identification", "reference_chirp", False),
+    "detect_operating_point": ("operating_point", "detect_operating_point", False),
+    "dynamic_performance": ("dynamic", "dynamic_performance", False),
+    "frequency_response": ("frequency", "frequency_response", False),
+    "frequency_sweep": ("frequency", "frequency_sweep", False),
+    "impedance_matrix": ("frequency", "impedance_matrix", False),
 }
 __all__ = list(_EXPORTS)
 _ROOT_EXPORTS = tuple(name for name, target in _EXPORTS.items() if target[2])

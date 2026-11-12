@@ -1,0 +1,33 @@
+name: Analysis add-on tests
+
+on:
+  push:
+    branches:
+      - feature/analysis-functions
+      - main
+  pull_request:
+    paths:
+      - "src/peslite/addons/functions/**"
+      - "tests/test_identification.py"
+      - "tests/test_dynamic_metrics.py"
+      - "tests/test_operating_point.py"
+      - "tests/test_frequency_measurements.py"
+      - ".github/workflows/analysis-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: python -m pip install -e ".[test]"
+      - name: Run the fast regression suite
+        run: python -m pytest -x
+      - name: Run complete-loop analysis regression cases
+        run: python -m pytest -x --run-full tests/test_small_signal.py tests/test_small_signal_ac.py tests/test_operating_point.py
