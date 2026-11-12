@@ -206,12 +206,6 @@ def _control(c, pwm, where: str, continuous: bool = False) -> None:
                 f"{where}.references.{binding.input_name}: an integer reference requires "
                 "integer table values"
             )
-        if reference_validator is not None:
-            for index, value in enumerate(values):
-                candidate = replace(
-                    c.references, **{target: int(value) if binding.integer else value},
-                )
-                reference_validator(candidate, f"signals.{binding.name}.value[{index}]")
     if profile.validator is not None:
         profile.validator(c, where)
 
@@ -658,6 +652,37 @@ def _progress(progress) -> None:
         raise ConfigError(f"simulation.progress.watch: expected a list of quantity names, got {watch!r}")
 
 
+def _reference_signals(p: Params) -> None:
+    """Validate each bound signal over the actual simulation window."""
+    from .params import _unit_items
+
+    window = p.simulation.initial.t, p.simulation.t_end
+    for name, unit in _unit_items(p.units):
+        control = unit.ctrl
+        if control is None or not control._reference_bindings:
+            continue
+        profile = control_type(control.type)
+        for target, binding in control._reference_bindings.items():
+            where = f"units.{name}.ctrl.references.{binding.input_name}"
+            try:
+                bounds = binding.bounds(*window)
+            except ValueError as exc:
+                raise ConfigError(f"{where}: signals.{binding.name}: {exc}") from None
+            # A general addon validator may couple several references. Its admissible joint
+            # trajectory cannot be inferred from independent scalar ranges, so such graphs keep
+            # the ordinary runtime validation. With one varying input the two extrema are exact.
+            if profile.reference_validator is None or len(control._reference_bindings) != 1:
+                continue
+            for value in bounds:
+                candidate = replace(control.references, **{target: value})
+                try:
+                    profile.reference_validator(candidate, f"units.{name}.ctrl.references")
+                except ConfigError as exc:
+                    raise ConfigError(
+                        f"signals.{binding.name} reaches {value:.6g} during the run: {exc}"
+                    ) from None
+
+
 def validate(p: Params) -> Params:
     """Check a :class:`Params` tree and return it unchanged; raise ConfigError if invalid."""
     _network(p)
@@ -685,6 +710,7 @@ def validate(p: Params) -> Params:
     _events(p)
     _progress(p.simulation.progress)
     _initial(p)
+    _reference_signals(p)
     return p
 
 

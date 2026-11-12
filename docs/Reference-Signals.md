@@ -28,6 +28,10 @@ interval from the first to the last time. The available interpolation methods ar
 `zero_order_hold`, `linear`, `cubic` and `pchip`; extrapolation outside a nonrepeating table can be
 `hold`, `zero`, `linear` or `error` and defaults to `hold`.
 
+PESLite checks the table over the configured simulation interval before running, including cubic
+and PCHIP extrema between table points. Joint constraints involving several varying references
+remain checked at their actual runtime values.
+
 The table uses the units implied by the reference spelling. For example, `p_ref_pu` reads per-unit
 values while `p_ref` reads watts and follows the ordinary SI-to-per-unit conversion. A `set` event
 on the same reference replaces its table binding with the event's constant value.
