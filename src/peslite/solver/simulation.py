@@ -50,7 +50,7 @@ from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
 from .multirate import make_solver, rated_effort
 from .splitbound import split_error_bound
 
-__all__ = ["Simulation", "SimulationResult", "Recorder", "main", "read_csv"]
+__all__ = ["Simulation", "SimulationResult", "Recorder", "main", "read_csv", "validate_model"]
 
 
 _UNAVAILABLE = object()
@@ -1528,6 +1528,11 @@ class Simulation:
         return self.result
 
 
+def validate_model(params: Params, *, interface_text: str = "") -> Simulation:
+    """Assemble and check a simulation without integrating or writing results."""
+    return Simulation(params, interface_text=interface_text)
+
+
 _LOOPMAP_EPS = 1e-9
 
 def macro_period(periods: list[float], limit: int = 64) -> float | None:
@@ -2093,12 +2098,7 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
             _resolve("plot_result")
         except (ImportError, RuntimeError) as exc:
             ap.error(f"--plot: {exc}")
-    try:
-        sim = Simulation(p, interface_text=interface_text)
-    except ConfigError as exc:
-        if args.json:
-            raise _CommandFailure(3, "assembly_error", str(exc), config=config) from None
-        raise
+    sim = _assemble_command(p, config, args.json, interface_text)
     suffix = "-" + model.replace("_", "-") if model is not None else ""
     out = Path(args.out) if args.out else _RESULTS / f"{config.stem}{suffix}"
     reporter = None
@@ -2151,7 +2151,7 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
 def _assemble_command(p: Params, config: Path, json_output: bool,
                       interface_text: str = "") -> Simulation:
     try:
-        return Simulation(p, interface_text=interface_text)
+        return validate_model(p, interface_text=interface_text)
     except ConfigError as exc:
         if json_output:
             raise _CommandFailure(3, "assembly_error", str(exc), config=config) from None

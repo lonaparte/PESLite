@@ -41,6 +41,13 @@ def test_distribution_names_versions_and_dependencies_form_the_install_matrix():
     versions = {project["version"] for project in projects.values()}
     assert len(versions) == 1
     version, = versions
+    npm_projects = [
+        ROOT / "src/peslite/gui/preview/package.json",
+        ROOT / "src/peslite/gui/ui/package.json",
+        ROOT / "src/peslite/gui/vscode/package.json",
+    ]
+    assert {json.loads(path.read_text(encoding="utf-8"))["version"]
+            for path in npm_projects} == {version}
     assert _requirements(projects["peslite-core"]) == {"numpy", "scipy", "PyYAML"}
     assert _requirements(projects["peslite"]) == {"peslite-core", "matplotlib"}
     assert _requirements(projects["peslite-gui"]) == {"peslite"}
@@ -71,7 +78,9 @@ def test_code_distributions_own_disjoint_source_files():
     assert Path("src/peslite/gui/preview/parser.ts") in owned["peslite-gui"]
     assert Path("src/peslite/gui/preview/package-lock.json") in owned["peslite-gui"]
     assert Path("src/peslite/gui/ui/src/App.tsx") in owned["peslite-gui"]
+    assert Path("src/peslite/gui/ui/package-lock.json") in owned["peslite-gui"]
     assert Path("src/peslite/gui/vscode/src/extension.ts") in owned["peslite-gui"]
+    assert Path("src/peslite/gui/vscode/package-lock.json") in owned["peslite-gui"]
 
 
 def test_gui_preview_uses_the_declarative_distribution_build():
@@ -81,7 +90,7 @@ def test_gui_preview_uses_the_declarative_distribution_build():
     assert [(step["cwd"], step["command"][:2]) for step in steps] == [
         ("src/peslite/gui/preview", ["npm", "ci"]),
         ("src/peslite/gui/preview", ["npm", "run"]),
-        ("src/peslite/gui/ui", ["npm", "install"]),
+        ("src/peslite/gui/ui", ["npm", "ci"]),
         ("src/peslite/gui/ui", ["npm", "run"]),
     ]
 

@@ -106,6 +106,7 @@ class Runs {
   stop() { this.process?.kill(); return { stopping: !!this.process }; }
 }
 const runs = new Runs();
+const layouts = new Map<string, unknown>();
 
 function webviewHtml(panel: vscode.WebviewPanel, context: vscode.ExtensionContext): string {
   const media = vscode.Uri.joinPath(context.extensionUri, 'media');
@@ -124,6 +125,7 @@ async function openPreview(context: vscode.ExtensionContext, uri?: vscode.Uri) {
   if (!target) throw new Error('Open a .pes, CSV or summary.json file first');
   const folder = folderFor(target);
   const filename = relative(folder, target);
+  const layoutKey = `${folder.uri.toString()}\0${filename}`;
   if (!safeSuffix.test(filename)) throw new Error('Unsupported file type');
   const panel = vscode.window.createWebviewPanel('peslite.preview', `PESLite: ${path.basename(filename)}`,
     vscode.ViewColumn.Beside, {
@@ -172,6 +174,14 @@ async function openPreview(context: vscode.ExtensionContext, uri?: vscode.Uri) {
           edit.replacement);
         if (!await vscode.workspace.applyEdit(change)) throw new Error('Could not apply the edit');
         result = { applied: true };
+      } else if (method === 'preview.layout.load') {
+        result = { layout: layouts.get(layoutKey) ?? { format: 'peslite.preview-layout', version: 1, views: {} } };
+      } else if (method === 'preview.layout.save') {
+        layouts.set(layoutKey, params.layout);
+        result = { layout: params.layout };
+      } else if (method === 'preview.layout.clear') {
+        layouts.delete(layoutKey);
+        result = { cleared: true };
       } else if (method === 'preview' || method === 'parameter.patch' ||
                  method === 'component.add' || method === 'component.remove' ||
                  method === 'connection.rewire' || method === 'csv.read' ||
@@ -193,7 +203,10 @@ async function openPreview(context: vscode.ExtensionContext, uri?: vscode.Uri) {
         error: problem instanceof Error ? problem.message : String(problem) });
     }
   }));
-  panel.onDidDispose(() => disposables.forEach(disposable => disposable.dispose()));
+  panel.onDidDispose(() => {
+    layouts.delete(layoutKey);
+    disposables.forEach(disposable => disposable.dispose());
+  });
 }
 
 export function activate(context: vscode.ExtensionContext) {

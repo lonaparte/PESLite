@@ -6,6 +6,7 @@ import json
 import math
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -49,34 +50,38 @@ class PreviewLayoutCache:
     def __init__(self) -> None:
         self.path: Path | None = None
         self.layouts: dict[str, dict[str, Any]] = {}
+        self._lock = threading.RLock()
 
     def load(self, key: str) -> dict[str, Any]:
-        return self.layouts.get(key, empty_layout())
+        with self._lock:
+            return self.layouts.get(key, empty_layout())
 
     def save(self, key: str, layout: Any) -> dict[str, Any]:
         clean = normalize_layout(layout)
-        self.layouts[key] = clean
-        if self.path is None:
-            descriptor, name = tempfile.mkstemp(prefix="peslite-preview-", suffix=".json")
-            os.close(descriptor)
-            self.path = Path(name)
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.path.parent,
-                                             prefix=self.path.stem, suffix=".tmp",
-                                             delete=False) as handle:
-                json.dump(self.layouts, handle, sort_keys=True)
-                temporary = Path(handle.name)
-            os.replace(temporary, self.path)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        with self._lock:
+            self.layouts[key] = clean
+            if self.path is None:
+                descriptor, name = tempfile.mkstemp(prefix="peslite-preview-", suffix=".json")
+                os.close(descriptor)
+                self.path = Path(name)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.path.parent,
+                                                 prefix=self.path.stem, suffix=".tmp",
+                                                 delete=False) as handle:
+                    json.dump(self.layouts, handle, sort_keys=True)
+                    temporary = Path(handle.name)
+                os.replace(temporary, self.path)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
         return clean
 
     def clear(self) -> None:
-        self.layouts.clear()
-        if self.path is not None:
-            self.path.unlink(missing_ok=True)
-            self.path = None
+        with self._lock:
+            self.layouts.clear()
+            if self.path is not None:
+                self.path.unlink(missing_ok=True)
+                self.path = None
 
     close = clear

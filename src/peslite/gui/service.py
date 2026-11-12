@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from ..assembly.params import load
-from ..solver.simulation import Simulation, _example_configs_dir
+from ..solver.simulation import Simulation, _example_configs_dir, validate_model
 from .descriptor import SignalRecorder, Topology, json_safe, small_signal_descriptor
 from .preview_cache import PreviewLayoutCache
 
@@ -245,7 +245,7 @@ class FrontendService:
         """Run the loaded case once, streaming its signals as frontend simulation chunks."""
         p = self.topology.params
         self.simulation, self.signals, self.small_signal = None, [], {}
-        sim = Simulation(p)
+        sim = validate_model(p)
         sequence = 0
 
         def emit(signals: list[dict[str, Any]]) -> None:

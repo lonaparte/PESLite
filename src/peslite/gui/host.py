@@ -15,6 +15,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from .preview_cache import PreviewLayoutCache
 from .workspace import Workspace, WorkspaceError
 
 
@@ -96,6 +97,10 @@ class Host:
     def __init__(self, root: str | Path, *, python: str = sys.executable):
         self.files = Workspace(root)
         self.runs = SimulationProcess(self.files, python)
+        self.preview_cache = PreviewLayoutCache()
+
+    def close(self) -> None:
+        self.preview_cache.close()
 
     def dispatch(self, method: str, params: dict[str, Any]) -> dict | list:
         if not isinstance(params, dict):
@@ -121,6 +126,16 @@ class Host:
                                                if params.get("byteOffset") is not None else None))
         if method == "summary.read":
             return self.files.summary(name)
+        if method in {"preview.layout.load", "preview.layout.save"}:
+            target = self.files.path(name, suffixes={".pes"})
+            if not target.is_file():
+                raise WorkspaceError("preview layout requires an existing .pes file")
+            if method == "preview.layout.load":
+                return {"layout": self.preview_cache.load(name)}
+            return {"layout": self.preview_cache.save(name, params.get("layout"))}
+        if method == "preview.layout.clear":
+            self.preview_cache.clear()
+            return {"cleared": True}
         if method in {"preview", "parameter.patch", "component.add", "component.remove",
                       "connection.rewire"}:
             target = self.files.path(name, suffixes={".pes"})
@@ -167,7 +182,11 @@ class Host:
 def invoke(root: str | Path, request: dict[str, Any]) -> dict:
     """One-shot JSON bridge used by the VS Code extension host process."""
     try:
-        result = Host(root).dispatch(request["method"], request.get("params") or {})
+        host = Host(root)
+        try:
+            result = host.dispatch(request["method"], request.get("params") or {})
+        finally:
+            host.close()
         return {"ok": True, "result": result}
     except (WorkspaceError, KeyError, ValueError, OSError, TypeError) as exc:
         return {"ok": False, "error": str(exc)}

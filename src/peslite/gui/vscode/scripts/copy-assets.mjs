@@ -1,4 +1,4 @@
-import { cpSync, existsSync, mkdirSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
@@ -9,3 +9,4 @@ if (!existsSync(resolve(source, 'index.html'))) {
 }
 mkdirSync(resolve(root, 'media'), { recursive: true });
 cpSync(source, resolve(root, 'media'), { recursive: true, force: true });
+copyFileSync(resolve(root, '../../../../LICENSE'), resolve(root, 'LICENSE'));

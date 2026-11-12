@@ -11,17 +11,26 @@ matrix is listed in [Getting Started](Getting-Started.md#install).
 
 ```bash
 python -m pip install peslite-gui
-python -m peslite.gui.preview_host case.pes
+peslite-gui --root path/to/workspace
 ```
 
-Open the local address printed by the command. Passing a directory instead of a file opens that
-directory as the workspace:
+The interface always runs in a browser. The command opens it automatically; `--no-browser` keeps
+the service running and prints its address for manual access, and `--port` selects the loopback
+port:
 
 ```bash
-python -m peslite.gui.preview_host cases/
+peslite-gui --root path/to/workspace --port 8765 --no-browser
 ```
 
 The host listens only on the local loopback interface.
+
+## VS Code
+
+The same workbench is packaged as `peslite-workspace.vsix`. Install it with
+`code --install-extension peslite-workspace.vsix`, select a Python environment containing PESLite
+through `peslite.pythonPath`, then use **PESLite: Preview File** from the Explorer. The extension
+uses VS Code's text editor and keeps unsaved changes, undo and redo under VS Code's control; it
+does not contain Python or a numerical runtime.
 
 ## Workbench
 

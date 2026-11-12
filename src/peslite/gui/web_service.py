@@ -34,6 +34,12 @@ class LocalServer(ThreadingHTTPServer):
         self.token = secrets.token_urlsafe(32)
         self.assets = (assets or Path(__file__).resolve().parent / "web_dist").resolve()
 
+    def server_close(self) -> None:
+        try:
+            super().server_close()
+        finally:
+            self.host_api.close()
+
 
 class Handler(BaseHTTPRequestHandler):
     server: LocalServer

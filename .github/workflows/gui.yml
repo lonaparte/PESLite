@@ -12,6 +12,7 @@ on:
       - "scripts/distributions.py"
       - "tests/test_gui_legacy_yaml.py"
       - "tests/test_gui_preview_cache.py"
+      - "tests/test_gui_preview.py"
       - "tests/test_gui_web_host.py"
       - "tests/test_gui_workspace_files.py"
       - ".github/workflows/gui.yml"
@@ -27,6 +28,7 @@ on:
       - "scripts/distributions.py"
       - "tests/test_gui_legacy_yaml.py"
       - "tests/test_gui_preview_cache.py"
+      - "tests/test_gui_preview.py"
       - "tests/test_gui_web_host.py"
       - "tests/test_gui_workspace_files.py"
       - ".github/workflows/gui.yml"
@@ -67,7 +69,10 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: src/peslite/gui/preview/package-lock.json
+          cache-dependency-path: |
+            src/peslite/gui/preview/package-lock.json
+            src/peslite/gui/ui/package-lock.json
+            src/peslite/gui/vscode/package-lock.json
 
       - name: Install dependencies
         working-directory: src/peslite/gui/preview
@@ -83,7 +88,7 @@ jobs:
 
       - name: Install workspace UI dependencies
         working-directory: src/peslite/gui/ui
-        run: npm install --ignore-scripts --no-audit --no-fund
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Build workspace UI
         working-directory: src/peslite/gui/ui
@@ -91,11 +96,11 @@ jobs:
 
       - name: Install VS Code extension dependencies
         working-directory: src/peslite/gui/vscode
-        run: npm install --ignore-scripts --no-audit --no-fund
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
-      - name: Build VS Code extension
+      - name: Package VS Code extension
         working-directory: src/peslite/gui/vscode
-        run: npm run build
+        run: npm run package
 
       - name: Validate distribution ownership
         run: python scripts/distributions.py validate
@@ -104,4 +109,14 @@ jobs:
         run: |
           test -f src/peslite/gui/web_dist/index.html
           test -f src/peslite/gui/vscode/media/index.html
+          test -f src/peslite/gui/vscode/peslite-workspace.vsix
+          test -f src/peslite/gui/vscode/LICENSE
+          ! unzip -Z1 src/peslite/gui/vscode/peslite-workspace.vsix | grep -E '\.py$'
           python -m peslite.gui.web_service --help
+
+      - name: Upload VS Code extension
+        uses: actions/upload-artifact@v7
+        with:
+          name: peslite-vscode-extension
+          path: src/peslite/gui/vscode/peslite-workspace.vsix
+          if-no-files-found: error

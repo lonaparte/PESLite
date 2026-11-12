@@ -53,7 +53,7 @@
         },
         {
           "cwd": "src/peslite/gui/ui",
-          "command": ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund"]
+          "command": ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
         },
         {
           "cwd": "src/peslite/gui/ui",

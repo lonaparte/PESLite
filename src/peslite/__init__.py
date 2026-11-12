@@ -17,7 +17,7 @@ from .components import (ADC, ADCSample, PWM, PWMAveragingModel, ZOH, AveragingM
 from .assembly import (DCConverter, Params, Protection, ProtectionSample,
                        SourceScenario, System, Unit, VSC,
                        dump, dumps, load, register_event_type)
-from .solver.simulation import Simulation, SimulationResult, main
+from .solver.simulation import Simulation, SimulationResult, main, validate_model
 from .assembly.exporter import ExportResult, export
 from . import addons
 from .assembly.params import _register_load_preparer
@@ -32,7 +32,7 @@ __all__ = [
     "DCConverter", "Protection", "ProtectionSample", "MeasurementPorts", "Model", "BlackBoxSubsystem",
     "SourceScenario",
     "Simulation", "SimulationResult", "ExportResult", "export", "VSCController", "main", "make_controller", "make_modulator", "make_solver",
-    "register_loop_type", "register_component_type", "register_event_type",
+    "register_loop_type", "register_component_type", "register_event_type", "validate_model",
     "OutputStage", "ADC", "ADCSample", "PWM", "SwitchingModel", "PWMAveragingModel", "AveragingModel",
     "ThreePhaseBridge", "make_bridge",
     "HalfBridge", "FullBridge",

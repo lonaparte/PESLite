@@ -157,7 +157,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: src/peslite/gui/preview/package-lock.json
+          cache-dependency-path: |
+            src/peslite/gui/preview/package-lock.json
+            src/peslite/gui/ui/package-lock.json
 
       - name: Check release version
         if: github.event_name == 'release'

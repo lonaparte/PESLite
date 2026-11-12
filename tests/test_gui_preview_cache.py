@@ -8,6 +8,7 @@ import urllib.request
 from peslite.gui.preview_cache import PreviewLayoutCache, empty_layout, normalize_layout
 from peslite.gui.preview_host import Workspace, make_server
 from peslite.gui.service import FrontendService
+from peslite.gui.host import Host
 
 LAYOUT = {"format": "peslite.preview-layout", "version": 1,
           "views": {"circuit": {"VSC": {"dx": 48, "dy": -24}}}}
@@ -75,3 +76,22 @@ def test_gui_service_uses_the_same_session_cache(tmp_path):
     assert responses[1]["result"]["layout"] == LAYOUT
     assert path is not None and not path.exists()
     assert service.preview_cache.load("missing") == empty_layout()
+
+
+def test_file_backed_host_uses_the_shared_session_cache(tmp_path):
+    (tmp_path / "case.pes").write_text("@circuit\nA -- B\n", encoding="utf-8")
+    host = Host(tmp_path)
+    try:
+        assert host.dispatch("preview.layout.load", {"path": "case.pes"}) == {
+            "layout": empty_layout(),
+        }
+        assert host.dispatch("preview.layout.save", {
+            "path": "case.pes", "layout": LAYOUT,
+        }) == {"layout": LAYOUT}
+        path = host.preview_cache.path
+        assert path is not None and path.is_file()
+        assert host.dispatch("preview.layout.load", {"path": "case.pes"})["layout"] == LAYOUT
+        assert host.dispatch("preview.layout.clear", {}) == {"cleared": True}
+        assert not path.exists()
+    finally:
+        host.close()

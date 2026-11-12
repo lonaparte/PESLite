@@ -65,7 +65,7 @@ def export(what: Params | "Simulation", format: str, out_dir: str | Path | None 
     to the selected exporter; ordinary simulation and other backends do not interpret them.
     """
     # The local imports avoid making the C++ backend part of ordinary simulation import time.
-    from ..solver.simulation import Simulation
+    from ..solver.simulation import Simulation, validate_model
 
     key = str(format).lower()
     if key in ("cpp", "imperix") and key not in EXPORTERS:
@@ -74,7 +74,7 @@ def export(what: Params | "Simulation", format: str, out_dir: str | Path | None 
         known = ", ".join(sorted(EXPORTERS)) or "none"
         raise ValueError(f"unknown export format {format!r}; known: {known}")
     caller_owned = isinstance(what, Simulation)
-    simulation = what if caller_owned else Simulation(what)
+    simulation = what if caller_owned else validate_model(what)
     if simulation.result is not None:
         raise RuntimeError("an already-run Simulation cannot be exported; build one from its Params")
     destination = Path(out_dir) if out_dir is not None else Path("export") / name

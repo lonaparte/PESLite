@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { createPESPreview, parsePES } from '../../preview/index.js';
-import type { GraphEdge, GraphNode, PESModel, SourceLocation } from '../../preview/types.js';
-import { request, subscribe, inVSCode } from './transport';
+import { createPESPreview, emptyLayout, parsePES } from '../../preview/index.js';
+import type {
+  GraphEdge, GraphNode, PESModel, PreviewLayout, SourceLocation,
+} from '../../preview/types.js';
+import { closePreviewSession, request, subscribe, inVSCode } from './transport';
 import type { Operation } from './transport';
 import type {
   CsvResponse, Field, PreviewResponse, RunStatus, SourceEdit, TextFile, TreeEntry,
@@ -49,24 +51,27 @@ function FileTree({ directory, current, onOpen, stamp }: {
   </div>;
 }
 
-function GraphPane({ text, path, response, onSelect, onSource }: {
+function GraphPane({ text, path, response, layout, onLayout, onSelect, onSource }: {
   text: string; path: string; response: PreviewResponse | null;
+  layout: PreviewLayout; onLayout: (layout: PreviewLayout) => void;
   onSelect: (node: GraphNode | GraphEdge, view: string, kind: 'node' | 'edge') => void;
   onSource: (location: SourceLocation) => void;
 }) {
   const container = useRef<HTMLDivElement>(null);
   const preview = useRef<ReturnType<typeof createPESPreview> | null>(null);
-  const callback = useRef({ onSelect, onSource });
-  callback.current = { onSelect, onSource };
+  const callback = useRef({ onLayout, onSelect, onSource });
+  callback.current = { onLayout, onSelect, onSource };
   useEffect(() => {
     if (!container.current) return;
     preview.current = createPESPreview(container.current, {
       onNodeSelect: (node, view) => callback.current?.onSelect(node, view, 'node'),
       onEdgeSelect: (edge, view) => callback.current?.onSelect(edge, view, 'edge'),
       onSourceSelect: loc => callback.current?.onSource(loc),
+      onLayoutChange: value => callback.current?.onLayout(value),
     });
     return () => { preview.current?.destroy(); preview.current = null; };
   }, []);
+  useEffect(() => { preview.current?.setLayout(layout); }, [layout]);
   useEffect(() => {
     if (!preview.current || !response) return;
     if (response.format === 'legacy') {
@@ -99,6 +104,7 @@ export function App() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [summary, setSummary] = useState<{ summary: unknown; simulationFile: string | null } | null>(null);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
+  const [layout, setLayout] = useState<PreviewLayout>(emptyLayout());
   const [selected, setSelected] = useState<Selection | null>(null);
   const [fields, setFields] = useState<Record<string, string>>({});
   const [jumpLine, setJumpLine] = useState<number | null>(null);
@@ -131,13 +137,21 @@ export function App() {
           path: selectedPath, offset: 0, stride: 1, limit: 1200,
         }));
         setStride(1); setSummary(null); setFile(null); setText(''); setDirty(false);
+        setLayout(emptyLayout());
       } else if (selectedPath.endsWith('summary.json')) {
         setSummary(await request<{ summary: unknown; simulationFile: string | null }>(
           'summary.read', { path: selectedPath }));
         setCsv(null); setFile(null); setText(''); setDirty(false);
+        setLayout(emptyLayout());
       } else {
-        const content = await request<TextFile>('file.read', { path: selectedPath });
+        const [content, saved] = await Promise.all([
+          request<TextFile>('file.read', { path: selectedPath }),
+          selectedPath.toLowerCase().endsWith('.pes')
+            ? request<{ layout: PreviewLayout }>('preview.layout.load', { path: selectedPath })
+            : Promise.resolve({ layout: emptyLayout() }),
+        ]);
         setFile(content); setText(content.text); setDirty(!!content.dirty);
+        setLayout(saved.layout);
         setCsv(null); setSummary(null);
       }
     } catch (problem) { setError(message(problem)); }
@@ -152,6 +166,11 @@ export function App() {
       }
     });
   }, [open]);
+
+  useEffect(() => {
+    window.addEventListener('pagehide', closePreviewSession);
+    return () => window.removeEventListener('pagehide', closePreviewSession);
+  }, []);
 
   useEffect(() => {
     if (!isPes || !file) { setPreview(null); return; }
@@ -453,7 +472,11 @@ export function App() {
           </div>}
           <div className={'editor-layout ' + (inVSCode ? 'only-diagram' : tab)}>
             {(inVSCode || tab !== 'source') && <GraphPane path={path} text={text}
-              response={preview} onSelect={(entity, view, selectedKind) => setSelected({
+              response={preview} layout={layout} onLayout={value => {
+                setLayout(value);
+                request('preview.layout.save', { path, layout: value })
+                  .catch(problem => setError(message(problem)));
+              }} onSelect={(entity, view, selectedKind) => setSelected({
                 name: selectedKind === 'node' ? (entity as GraphNode).name : entity.id,
                 id: entity.id, view, kind: selectedKind,
               })}

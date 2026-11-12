@@ -3,6 +3,7 @@ export type Operation =
   | 'tree' | 'file.read' | 'file.write' | 'file.create' | 'file.rename' | 'file.delete'
   | 'preview' | 'parameter.patch' | 'component.add' | 'component.remove'
   | 'connection.rewire' | 'csv.read' | 'summary.read'
+  | 'preview.layout.load' | 'preview.layout.save' | 'preview.layout.clear'
   | 'run.start' | 'run.stop' | 'run.status'
   | 'workspace.active' | 'editor.reveal' | 'editor.applyPatch';
 
@@ -71,5 +72,15 @@ export function request<T>(method: Operation, params: JsonObject = {}): Promise<
     const data: { ok: boolean; result?: T; error?: string } = await response.json();
     if (!response.ok || !data.ok) throw new Error(data.error || 'Request failed');
     return data.result as T;
+  });
+}
+
+export function closePreviewSession(): void {
+  if (vscode) return;
+  void fetch('/api', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-PESLite-Token': token },
+    body: JSON.stringify({ method: 'preview.layout.clear', params: {} }),
+    cache: 'no-store', keepalive: true,
   });
 }
