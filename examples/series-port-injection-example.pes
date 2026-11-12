@@ -1,0 +1,28 @@
+# PESLite 0.5.2
+# A two-terminal series voltage disturbance between input and output buses.
+
+base:
+  s_base: 1000.0
+  v_ll_rms: 230.0
+  f0: 50.0
+
+buses:
+  input: {phases: 1}
+  output: {phases: 1, c: 0.001}
+
+elements:
+  supply: {type: voltage_source, bus: input, v: 10.0, r: 1.0}
+  stimulus: {type: port_injection, kind: voltage,
+             inlet: input, bus: output, bias: 2.0}
+  load: {type: resistor, bus: output, r: 9.0}
+
+units: {}
+
+simulation:
+  t_end: 0.2
+  solver: {dt: 0.0001, linearisations: 0}
+  output: {period: 0.001, signals: 1}
+
+meta:
+  title: Physical series voltage injection
+  description: The series source enforces positive voltage from inlet to output.
