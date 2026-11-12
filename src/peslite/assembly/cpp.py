@@ -956,36 +956,33 @@ def _implicit_solver(method: str, name: str, arguments: str,
         for (const auto& factor : implicit_factors)
             if (factor.h == h) return factor;
         if (implicit_factors.size() > 16) implicit_factors.clear();
-        constexpr std::size_t n = implicit_size;
-        std::vector<double> matrix(n * n);
-        for (std::size_t p = 0; p < implicit_stages; ++p)
-            for (std::size_t q = 0; q < implicit_stages; ++q)
-                for (std::size_t i = 0; i < state_count; ++i)
-                    for (std::size_t j = 0; j < state_count; ++j)
-                        matrix[(p * state_count + i) * n + q * state_count + j] =
-                            (p == q && i == j ? 1.0 : 0.0)
-                            - h * implicit_a[p][q] * implicit_jacobian[i * state_count + j];
+        const auto stage_entry = [&](std::size_t row, std::size_t column) {{
+            constexpr std::size_t stride = state_count ? state_count : 1;
+            return (row == column ? 1.0 : 0.0)
+                - h * implicit_a[row / stride][column / stride]
+                    * implicit_jacobian[(row % stride) * stride + column % stride];
+        }};
         ImplicitFactor factor{{h, {{}}, {{{interface_values}}}, {{}}}};
         const std::vector<std::vector<std::size_t>> group_indices{{{group_values}}};
         const std::size_t ni = factor.interface.size();
         std::vector<double> schur(ni * ni);
         for (std::size_t row = 0; row < ni; ++row)
             for (std::size_t column = 0; column < ni; ++column)
-                schur[row * ni + column] = matrix[factor.interface[row] * n + factor.interface[column]];
+                schur[row * ni + column] = stage_entry(factor.interface[row], factor.interface[column]);
         for (const auto& index : group_indices) {{
             const std::size_t ng = index.size();
             std::vector<double> diagonal(ng * ng), coupling(ni * ng), response(ng * ni);
             for (std::size_t row = 0; row < ng; ++row)
                 for (std::size_t column = 0; column < ng; ++column)
-                    diagonal[row * ng + column] = matrix[index[row] * n + index[column]];
+                    diagonal[row * ng + column] = stage_entry(index[row], index[column]);
             for (std::size_t row = 0; row < ni; ++row)
                 for (std::size_t column = 0; column < ng; ++column)
-                    coupling[row * ng + column] = matrix[factor.interface[row] * n + index[column]];
+                    coupling[row * ng + column] = stage_entry(factor.interface[row], index[column]);
             auto local = dense_factor(std::move(diagonal), ng);
             for (std::size_t column = 0; column < ni; ++column) {{
                 std::vector<double> rhs(ng);
                 for (std::size_t row = 0; row < ng; ++row)
-                    rhs[row] = matrix[index[row] * n + factor.interface[column]];
+                    rhs[row] = stage_entry(index[row], factor.interface[column]);
                 dense_solve(local, rhs);
                 for (std::size_t row = 0; row < ng; ++row) response[row * ni + column] = rhs[row];
             }}

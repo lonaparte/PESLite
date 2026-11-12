@@ -74,7 +74,7 @@ simulation:
 ```
 
 `@circuit` is the required system view; `@Name` defines a detailed view for a named Unit or
-subsystem. A view header may end with a `# comment`. Within a view:
+subsystem. Within a view:
 
 - `A -- B` is an undirected electrical connection and `A -> B` is a directed signal connection;
 - connections may be chained and may address named ports, such as `A.output -> B.input`;

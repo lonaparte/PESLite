@@ -12,7 +12,7 @@ from conftest import EXAMPLES
 from peslite.solver import AdaptiveSolver, AutoSolver, ConfigError, DormandPrince45, FixedStepSolver, make_solver
 from peslite.solver.integrators import integrator
 from peslite.solver.implicit import (ImplicitSolver, LinearSystem, ModeJacobian, Structure,
-                                     _increment, linear_system)
+                                     _Factor, _ShiftFactor, _TABLEAUX, _increment, linear_system)
 
 
 A_OSCILLATOR = np.array([[-1.0, 10.0], [-10.0, -1.0]])
@@ -119,6 +119,41 @@ def test_radau_damps_a_stiff_mode_while_trapezoidal_keeps_it_bounded():
     assert radau == pytest.approx(math.cos(1.0), rel=1e-9)
     assert abs(trapezoidal - math.cos(1.0)) > 0.1
     assert abs(trapezoidal) < 3.0
+
+
+def test_radau_solves_each_complex_conjugate_pair_once(monkeypatch):
+    original_eig = np.linalg.eig
+
+    def reordered_eig(matrix):
+        values, vectors = original_eig(matrix)
+        order = np.roll(np.arange(values.size), 1)
+        values, vectors = values[order], vectors[:, order]
+        phases = (np.exp(0.37j), np.exp(-0.81j))
+        for index, phase in zip(np.flatnonzero(np.abs(values.imag) > 1e-12), phases):
+            vectors[:, index] *= phase
+        return values, vectors
+
+    monkeypatch.setattr(np.linalg, "eig", reordered_eig)
+    solves = []
+    original_solve = _ShiftFactor.solve
+
+    def counted_solve(self, residual):
+        solves.append(self)
+        return original_solve(self, residual)
+
+    monkeypatch.setattr(_ShiftFactor, "solve", counted_solve)
+    matrix = np.array([[-4.0, 2.0], [-3.0, -5.0]])
+    tableau = _TABLEAUX["radau"][0]
+    owner = LinearSystem(Structure.single(matrix.shape[0]))
+    factor = _Factor(matrix, owner.structure, tableau, 2e-3, owner, "radau")
+    residual = np.random.default_rng(7).normal(size=(tableau.shape[0], matrix.shape[0]))
+
+    actual = factor.solve(residual)
+    expanded = np.eye(residual.size) - 2e-3 * np.kron(tableau, matrix)
+    expected = np.linalg.solve(expanded, residual.ravel()).reshape(residual.shape)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    assert len(solves) == 2
 
 
 def test_linear_system_reuses_returning_jacobians():

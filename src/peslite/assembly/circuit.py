@@ -44,7 +44,9 @@ import numpy as np
 
 from ..components.network import Port
 from ..solver.energy import Energetic, spec_of
-from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _InlineProgram
+from ..solver.model import (
+    Bag, ConfigError, Empty, OutputMethod, _InlineProgram, _compile_straight_line,
+)
 from ..solver.netlist import (QUANTITIES, CoupledInductors, CurrentSource, Diode, Element, Mode,
                               Netlist, Node, Topology, VoltageSource, _DENSE_GROUP, _Degenerate,
                               _Evaluation, _linear_expression, _numeric_values, _roles, _UnionFind)
@@ -997,10 +999,9 @@ class Circuit:
         of rebuilding the scheduling graph.
         """
         env = dict(namespace)
-        source = f"def {name}(self, t):\n" + "\n".join(
-            "    " + line for line in body or ("pass",)
-        ) + "\n"
-        exec(compile(source, "<peslite direct circuit>", "exec"), env)
+        _compile_straight_line(env, "<peslite direct circuit>", (
+            (f"{name}(self, t)", body),
+        ))
         compiled = env[name]
         previous = self.__dict__.get(name)
         if isinstance(previous, MethodType):

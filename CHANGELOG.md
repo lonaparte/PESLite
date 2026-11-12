@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Radau reuses one shifted solve for each complex conjugate stage pair, and generated C++ implicit
+  solvers assemble their group and interface factors without a full stage-expanded matrix.
+- Full-model and multirate evaluation share one straight-line operation lowering, and grouped RHS
+  programs write derivatives directly without per-subsystem Python dispatch and scatter loops.
 - Native simulation parsing now keeps interface source as plain text while parameter loading,
   resolved output, C++ export and GUI diagnostics share one direct syntax boundary.
 - Added reusable GUI preview layout, orthogonal routing, drag-and-drop, event timeline and local

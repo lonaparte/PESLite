@@ -1913,7 +1913,7 @@ def _native_text(body: str, interface_text: str = "") -> str:
               f"# null: not used, or derived when the case is built (for example loop gains from bandwidth).\n"
               f"# Run it with: peslite <this file>\n")
     interface = interface_text.strip() or "@circuit"
-    return f"{header}\n{interface}\n\n{body}"
+    return f"{header}\n{interface}\n\n---\n{body}"
 
 
 def dumps(p: Params, interface_text: str = "") -> str:
