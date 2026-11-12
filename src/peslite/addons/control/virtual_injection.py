@@ -39,7 +39,9 @@ class _SineParams:
                 raise ConfigError(f"{name} must be finite")
         if self.frequency < 0:
             raise ConfigError("frequency must be nonnegative")
-        if self.period is not None and (not math.isfinite(self.period) or self.period <= 0):
+        if self.period is not None and (
+                isinstance(self.period, bool) or not isinstance(self.period, (int, float))
+                or not math.isfinite(self.period) or self.period <= 0):
             raise ConfigError("period must be finite and positive")
         if self.axis not in ("d", "q"):
             raise ConfigError("axis must be 'd' or 'q'")

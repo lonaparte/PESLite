@@ -37,6 +37,9 @@ def test_virtual_scalar_dq_and_continuous_laws_share_deterministic_clock():
     assert "virtual_dq_voltage_injection" in LOOP_TYPES
     with pytest.raises(peslite.solver.ConfigError, match="only the d axis"):
         _loop(VirtualVoltageInjection, axis="q")
+    for period in (True, "0.1"):
+        with pytest.raises(peslite.solver.ConfigError, match="period"):
+            _loop(VirtualVoltageInjection, period=period)
 
 
 def test_virtual_duty_injection_wires_into_normal_sampled_controller(examples, tmp_path):
@@ -106,3 +109,29 @@ def test_gain_and_phase_margins_respect_invalid_frequency_gaps(tmp_path):
     assert invalid.gain_margin_db is None
     assert invalid.phase_margin_deg is None
     assert not invalid.valid[2]
+
+
+def test_phase_crossings_are_independent_of_the_unwrapped_phase_branch():
+    frequencies = [10, 20, 40, 80]
+    phases = [150, 170, -170, -150]
+    points = {
+        f: FrequencyMeasurement(
+            f, 0.5 * np.exp(1j * np.deg2rad(phase)), 1 + 0j,
+            0.5 * np.exp(1j * np.deg2rad(phase)), 1.0, 0.0, 60.0, 60.0, {}, (),
+        )
+        for f, phase in zip(frequencies, phases)
+    }
+    result = loop_gain_sweep(points)
+    assert result.gain_margin_db == pytest.approx(20 * math.log10(2), rel=1e-12)
+    assert 20 < result.phase_crossover_hz < 40
+
+
+def test_zero_gain_rejects_only_its_own_sample():
+    points = {}
+    for f, gain in zip((10, 20, 40, 80), (2.0, 0.0, 0.5, 0.25)):
+        points[f] = FrequencyMeasurement(
+            f, complex(gain), 1 + 0j, complex(gain), 1.0,
+            0.0, 60.0, 60.0, {}, (),
+        )
+    result = loop_gain_sweep(points)
+    assert result.valid == (True, False, True, True)

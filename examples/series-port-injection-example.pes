@@ -1,6 +1,9 @@
 # PESLite 0.5.2
 # A two-terminal series voltage disturbance between input and output buses.
 
+@circuit
+supply -- input -- stimulus -- output -- load
+
 base:
   s_base: 1000.0
   v_ll_rms: 230.0

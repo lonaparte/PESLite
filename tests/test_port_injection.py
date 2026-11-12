@@ -19,22 +19,18 @@ def _injector(**kwargs):
 
 @pytest.mark.parametrize("kind,primitive", [
     ("current", nl.CurrentSource), ("voltage", nl.VoltageSource),
-    ("load", nl.CurrentSource),
 ])
 def test_injectors_use_the_correct_shunt_or_series_connection(kind, primitive):
-    options = {"nominal_voltage": 100.0} if kind == "load" else {}
-    element = _injector(kind=kind, amplitude=2.0, frequency=25.0, **options)
+    element = _injector(kind=kind, amplitude=2.0, frequency=25.0)
     assert element.model.state_names == ()
     assert (len(element.model.ports) == 2) == (kind == "voltage")
     if kind == "voltage":
         assert element.series_connections() == {"pcc": "stimulus.bus.in"}
         assert element.port_bindings()[0][0] == "stimulus.bus.in"
         assert element.model.injection_at(0.0) == pytest.approx(2.0)
-    elif kind == "current":
+    else:
         assert element.series_connections() == {}
         assert element.model.injection_at(0.0) == pytest.approx(2.0)
-    else:
-        assert element.model.injection_at(0.0) == pytest.approx(-200.0)
 
     class Builder:
         def __init__(self):
@@ -114,7 +110,7 @@ def test_explicit_voltage_inlet_handles_arbitrary_connection_nodes():
 @pytest.mark.parametrize("change", [
     {"kind": "short"}, {"amplitude": float("nan")}, {"frequency": -1.0},
     {"tone_amplitudes": [2.0]}, {"kind": "load"},
-    {"kind": "voltage", "inlet": "pcc"}, {"nominal_voltage": 1.0},
+    {"kind": "voltage", "inlet": "pcc"},
 ])
 def test_bad_physical_injections_fail_during_schema_validation(change):
     with pytest.raises(ConfigError):

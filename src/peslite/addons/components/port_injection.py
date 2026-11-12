@@ -68,10 +68,6 @@ class PortInjectionModel(NetworkComponent):
             envelope += sum(amplitude * math.cos(math.tau * f * t + phase)
                             for f, amplitude, phase in zip(cfg.tones, cfg.tone_amplitudes,
                                                            cfg.tone_phases))
-        if cfg.kind == "load":
-            # A small-signal conductance perturbation about a specified nominal voltage.
-            # True time-varying resistances are not part of the linear netlist contract.
-            envelope *= -cfg.nominal_voltage
         if self.phases == 1:
             return envelope
         frame = math.tau * cfg.frame_frequency * t
@@ -107,9 +103,6 @@ class PortInjectionModel(NetworkComponent):
             source = nl.CurrentSource(None, bus, value)
             builder.add(source)
             builder.output(self, "injection", ("branch_current", source))
-            if self.cfg.kind == "load" and self.cfg.nominal_conductance > 0.0:
-                builder.add(nl.Resistor(bus, None, 1.0 / self.cfg.nominal_conductance))
-                builder.losses(self)
         builder.port_output(self, "voltage", self.port, "voltage")
         builder.port_output(self, "current", self.port, "current")
         builder.supplies(self)
@@ -117,7 +110,7 @@ class PortInjectionModel(NetworkComponent):
 
 @_register_assembled_type
 class PortInjection(Element):
-    """An add-on component supporting series V and shunt I/load perturbations."""
+    """An add-on component supporting series-voltage and shunt-current injection."""
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
@@ -133,32 +126,23 @@ class PortInjection(Element):
         tones: tuple[float, ...] = ()
         tone_amplitudes: tuple[float, ...] = ()
         tone_phases: tuple[float, ...] = ()
-        nominal_voltage: float = field(default=0.0, metadata={"runtime": False})
-        nominal_conductance: float = field(default=0.0, metadata={"runtime": False})
         type: str = "port_injection"
 
         def __post_init__(self) -> None:
             if not isinstance(self.bus, str) or not self.bus:
                 raise ConfigError("bus must name an electrical port")
-            if self.kind not in ("voltage", "current", "load"):
-                raise ConfigError("kind must be 'voltage', 'current', or 'load'")
+            if self.kind not in ("voltage", "current"):
+                raise ConfigError("kind must be 'voltage' or 'current'")
             if self.inlet and (self.kind != "voltage" or self.inlet == self.bus):
                 raise ConfigError("inlet must name a distinct bus for voltage injection only")
             if self.axis not in ("alpha", "beta", "d", "q", "positive", "negative"):
                 raise ConfigError("axis must be alpha, beta, d, q, positive, or negative")
-            for key in ("amplitude", "frequency", "phase", "bias", "frame_frequency",
-                        "nominal_voltage", "nominal_conductance"):
+            for key in ("amplitude", "frequency", "phase", "bias", "frame_frequency"):
                 value = getattr(self, key)
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                     raise ConfigError(f"{key} must be a finite number")
             if self.frequency < 0 or self.frame_frequency < 0:
                 raise ConfigError("frequency and frame_frequency must be nonnegative")
-            if self.nominal_conductance < 0:
-                raise ConfigError("nominal_conductance must be nonnegative")
-            if self.kind == "load" and self.nominal_voltage <= 0:
-                raise ConfigError("load injection requires positive nominal_voltage")
-            if self.kind != "load" and (self.nominal_voltage or self.nominal_conductance):
-                raise ConfigError("nominal_voltage and nominal_conductance are for load injection only")
             for key in ("tones", "tone_amplitudes", "tone_phases"):
                 object.__setattr__(self, key, _numbers(getattr(self, key), key))
             if len(self.tones) != len(self.tone_amplitudes) or len(self.tones) != len(self.tone_phases):
@@ -221,7 +205,7 @@ class PortInjection(Element):
 
     def retune(self, cfg: Any) -> bool:
         """Retune only source values; topology fields are structural by construction."""
-        changed = (cfg.kind, cfg.bus, cfg.inlet, cfg.axis, cfg.nominal_conductance) != (
-            self.cfg.kind, self.cfg.bus, self.cfg.inlet, self.cfg.axis, self.cfg.nominal_conductance)
+        changed = (cfg.kind, cfg.bus, cfg.inlet, cfg.axis) != (
+            self.cfg.kind, self.cfg.bus, self.cfg.inlet, self.cfg.axis)
         self.cfg, self.model.cfg = cfg, cfg
         return changed

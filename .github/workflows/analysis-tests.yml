@@ -1,13 +1,17 @@
-name: Analysis add-on tests
+name: Analysis and injection add-on tests
 
 on:
   push:
     branches:
-      - feature/analysis-functions
       - main
   pull_request:
     paths:
+      - "src/peslite/addons/components/port_injection.py"
+      - "src/peslite/addons/control/virtual_injection.py"
       - "src/peslite/addons/functions/**"
+      - "tests/test_port_injection.py"
+      - "tests/test_port_measurement.py"
+      - "tests/test_virtual_injection.py"
       - "tests/test_identification.py"
       - "tests/test_dynamic_metrics.py"
       - "tests/test_operating_point.py"
@@ -30,4 +34,4 @@ jobs:
       - name: Run the fast regression suite
         run: python -m pytest -x
       - name: Run complete-loop analysis regression cases
-        run: python -m pytest -x --run-full tests/test_small_signal.py tests/test_small_signal_ac.py tests/test_operating_point.py
+        run: python -m pytest -x --run-full tests/test_small_signal.py tests/test_small_signal_ac.py

@@ -7,19 +7,18 @@ alternative frequency-response estimator.
 
 from __future__ import annotations
 
-import json
 import math
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 
-from .frequency import (_complex, _fit, frequency_response, frequency_sweep,
+from .frequency import (MatrixResponseResult, _fit, frequency_response, frequency_sweep,
                         impedance_matrix)
 
 __all__ = ["recorded_signal", "measure_recorded_transfer", "measure_recorded_sweep",
-           "measure_multitone", "measure_port_matrix", "PortMatrixResult"]
+           "measure_multitone", "measure_port_matrix"]
 
 
 def _table(result, name: str):
@@ -42,19 +41,8 @@ def _table(result, name: str):
                      "or simulation.output.states")
 
 
-def recorded_signal(result, name: str, *, component: str | None = None,
-                    frame_frequency: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
-    """Read one scalar or three-phase signal without inventing another sample history.
-
-    Three-phase sources use their standard ``_a/_b/_c`` columns. Set component
-    to ``alpha``, ``beta``, ``d`` or ``q``; d/q rotates the space vector by the
-    specified frame frequency. Scalar signals require ``component=None``.
-    """
-    if not isinstance(name, str) or not name:
-        raise ValueError("name must be a nonempty recorded signal path")
-    if isinstance(frame_frequency, bool) or not math.isfinite(frame_frequency):
-        raise ValueError("frame_frequency must be finite")
-    t, table = _table(result, name)
+def _recorded_values(t, table, name, component, frame_frequency):
+    """Project one located recording using its column structure."""
     if component is None:
         if name not in table:
             raise ValueError(f"{name!r} is a three-phase signal; select a component")
@@ -76,6 +64,23 @@ def recorded_signal(result, name: str, *, component: str | None = None,
             or np.any(np.diff(t) <= 0)):
         raise ValueError(f"{name!r} must have finite, strictly increasing recorded samples")
     return t, y
+
+
+def recorded_signal(result, name: str, *, component: str | None = None,
+                    frame_frequency: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+    """Read one scalar or three-phase signal without inventing another sample history.
+
+    Three-phase sources use their standard ``_a/_b/_c`` columns. Set component
+    to ``alpha``, ``beta``, ``d`` or ``q``; d/q rotates the space vector by the
+    specified frame frequency. Scalar signals require ``component=None``.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("name must be a nonempty recorded signal path")
+    if (isinstance(frame_frequency, bool) or not isinstance(frame_frequency, (int, float))
+            or not math.isfinite(frame_frequency)):
+        raise ValueError("frame_frequency must be finite")
+    t, table = _table(result, name)
+    return _recorded_values(t, table, name, component, frame_frequency)
 
 
 def _window(t, y, window):
@@ -201,56 +206,21 @@ def _phasor(t, y, frequency):
     return _fit(t, y, frequency, 1, float(t[0]))[0]
 
 
-@dataclass(frozen=True)
-class PortMatrixResult:
-    """SI complex multiport response with explicit axes, frame and validity."""
-
-    frequencies_hz: np.ndarray
-    values: np.ndarray  # [frequency, output component, input component]
-    kind: str
-    frame: str
-    input_names: tuple[str, ...]
-    output_names: tuple[str, ...]
-    valid: tuple[bool, ...]
-    flags: tuple[tuple[str, ...], ...]
-    conditions: tuple[dict, ...]
-
-    def to_dict(self):
-        return {
-            "frequency": {"value": self.frequencies_hz.tolist(), "unit": "Hz"},
-            self.kind: {"value": [[[_complex(z) for z in row] for row in matrix]
-                                  for matrix in self.values],
-                        "unit": "ohm" if self.kind == "impedance" else "S",
-                        "frame": self.frame, "inputs": list(self.input_names),
-                        "outputs": list(self.output_names)},
-            "validity": [{"valid": valid, "flags": list(flags), "conditions": dict(info)}
-                         for valid, flags, info in zip(self.valid, self.flags, self.conditions)],
-        }
-
-    def write_json(self, path: str | Path) -> Path:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), allow_nan=False, indent=2) + "\n", encoding="utf-8")
-        return path
-
-
 def _complex_signal(result, name, *, frame_frequency):
-    t, d = recorded_signal(result, name, component="d", frame_frequency=frame_frequency)
-    tq, q = recorded_signal(result, name, component="q", frame_frequency=frame_frequency)
-    if not np.array_equal(t, tq):
-        raise ValueError("the d and q components must share a sampling clock")
-    return t, (d, q)
+    t, table = _table(result, name)
+    channels = tuple(_recorded_values(t, table, name, component, frame_frequency)[1]
+                     for component in ("d", "q"))
+    return t, channels
 
 
 def _source_quality(result, name, frequency, window, frame_frequency, options):
     """Validate the imposed waveform, including an intentional zero cross-coupling."""
-    try:
-        t, channels = _complex_signal(result, name, frame_frequency=frame_frequency)
-    except ValueError as exc:
-        if "three-phase columns" not in str(exc):
-            raise
-        t, signal = recorded_signal(result, name)
-        channels = (signal,)
+    t, table = _table(result, name)
+    if name in table:
+        channels = (_recorded_values(t, table, name, None, frame_frequency)[1],)
+    else:
+        channels = tuple(_recorded_values(t, table, name, component, frame_frequency)[1]
+                         for component in ("d", "q"))
     selected = [_window(t, channel, window)[1] for channel in channels]
     t = _window(t, channels[0], window)[0]
     strongest = selected[int(np.argmax([abs(_phasor(t, s, frequency))
@@ -264,7 +234,7 @@ def measure_port_matrix(experiments: Mapping[float, Sequence[object]], *,
                         voltage: str, current: str, injection: str,
                         kind: str = "impedance", frame: str = "dq",
                         frame_frequency: float = 0.0, window=None,
-                        current_sign: float = 1.0, **quality_options) -> PortMatrixResult:
+                        current_sign: float = 1.0, **quality_options) -> MatrixResponseResult:
     """Identify scalar or complete dq/modified-sequence Z/Y from independent runs.
 
     Each frequency needs enough independent injected directions to span every
@@ -278,7 +248,8 @@ def measure_port_matrix(experiments: Mapping[float, Sequence[object]], *,
     if (isinstance(current_sign, bool) or not math.isfinite(current_sign)
             or current_sign not in (-1.0, 1.0)):
         raise ValueError("current_sign must be +1 or -1")
-    if not math.isfinite(frame_frequency):
+    if (isinstance(frame_frequency, bool) or not isinstance(frame_frequency, (int, float))
+            or not math.isfinite(frame_frequency)):
         raise ValueError("frame_frequency must be finite")
     if not experiments:
         raise ValueError("experiments must contain at least one frequency")
@@ -338,8 +309,10 @@ def measure_port_matrix(experiments: Mapping[float, Sequence[object]], *,
         matrices = np.asarray([T @ matrix @ inv for matrix in matrices])
     names = (("scalar",) if frame == "scalar" else
              ("positive", "negative") if frame == "sequence" else ("d", "q"))
-    return PortMatrixResult(frequencies, matrices, kind, frame, names, names,
-                            tuple(quality), tuple(flags), tuple(conditions))
+    return MatrixResponseResult(
+        frequencies, matrices, kind, "ohm" if kind == "impedance" else "S",
+        names, names, tuple(quality), tuple(flags), tuple(conditions), frame,
+    )
 
 
 def _run_cases(params, injection, cases, directory):
@@ -390,7 +363,7 @@ def run_port_sweep(params, *, injection: str, frequencies: Iterable[float],
 def run_port_matrix(params, *, injection: str, frequencies: Iterable[float],
                     voltage: str, current: str, directory: str | Path,
                     frame: str = "dq", frame_frequency: float = 0.0,
-                    **options) -> PortMatrixResult:
+                    **options) -> MatrixResponseResult:
     """Run independent scalar/d/q electrical injections and fit the response matrix."""
     frequencies = tuple(float(f) for f in frequencies)
     if (not frequencies or any(not math.isfinite(f) or f <= 0 for f in frequencies)

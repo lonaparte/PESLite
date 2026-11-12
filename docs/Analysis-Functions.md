@@ -22,9 +22,8 @@ print(point.to_dict())
 logical periodic-state projection, angular differences and state scaling as the existing
 [online stability analysis](Online-Stability-Analysis.md). It compares the final state with a
 reconstructed one-period endpoint and samples two interior positions to distinguish a static
-DC equilibrium from a recurring orbit. A periodic orbit with an active AC source is labeled
-`ac_periodic`; a periodic orbit without one is labeled `periodic`. A static equilibrium is
-labeled `dc`. Failed recurrence, changing discrete states, unfinished or tripped runs, active
+DC equilibrium from a recurring orbit. A recurring orbit is labeled `periodic`; a static
+equilibrium is labeled `dc`. Failed recurrence, changing discrete states, unfinished or tripped runs, active
 startup ramps, crossing one-off events, and reconstruction errors are `unconverged` with a reason.
 
 An explicit `period` can override the common schedule period if it repeats all declared

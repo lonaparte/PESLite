@@ -23,7 +23,7 @@ class OperatingPointResult:
     """A check of one completed state, with no eigenvalue calculation."""
 
     at: float
-    kind: str  # dc, ac_periodic, periodic, or unconverged
+    kind: str  # dc, periodic, or unconverged
     period: float | None
     periodic_error: float | None
     intra_period_error: float | None
@@ -152,9 +152,7 @@ def detect_operating_point(sim: Simulation, *, period: float | None = None,
         if midway <= tolerance:
             kind = "dc"
         else:
-            ac = any(abs(source.cfg.f) > 0.0 and source.emf.e_peak != 0.0
-                     for source in getattr(sim.system, "sources", {}).values())
-            kind = "ac_periodic" if ac else "periodic"
+            kind = "periodic"
         return OperatingPointResult(at, kind, span, error, midway, 3)
     except (ValueError, FloatingPointError, ArithmeticError, np.linalg.LinAlgError) as exc:
         return fail(str(exc))

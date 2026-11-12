@@ -69,21 +69,19 @@ source does not have a series inlet.
 
 ### Load perturbation
 
-`kind: load` represents an **equivalent small-signal conductance disturbance about a
-specified nominal voltage**, not a nonlinear time-varying physical resistor. It injects
-`-nominal_voltage * delta_G(t)` amps at a scalar node and can retain a fixed parallel
-`nominal_conductance` (siemens):
+A port injection is only a source. Represent the nominal load with the existing passive
+component and its small-signal conductance disturbance with the Norton current
+`-V0 * delta_G(t)`:
 
 ```yaml
 elements:
-  load_probe: {type: port_injection, kind: load, bus: output,
-               nominal_voltage: 24.0, nominal_conductance: 0.1,
-               amplitude: 0.002, frequency: 20.0}
+  load: {type: resistor, bus: output, r: 10.0}
+  load_probe: {type: port_injection, kind: current, bus: output,
+               amplitude: -0.048, frequency: 20.0}
 ```
 
-This approximation presumes the bus voltage stays near the nominal value. If the voltage
-excursion is not small, do not interpret the result as the response to a truly varying
-conductance. No new dynamic resistor law or hidden state is introduced.
+Here `V0 = 24 V` and the conductance amplitude is `0.002 S`. This approximation presumes
+the bus voltage stays near `V0`; model a large-signal load change with the passive component.
 
 ### Three-phase orientation and excitation
 

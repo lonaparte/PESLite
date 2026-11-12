@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
-from .reference_signals import reference_table
+from .reference_signals import _sample_grid, reference_table
 
 __all__ = ["reference_prbs", "reference_multitone", "reference_chirp"]
 
@@ -24,25 +24,6 @@ def _finite(name: str, value: float) -> float:
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite number")
     return number
-
-
-def _grid(start: float, stop: float, period: float) -> list[float]:
-    start, stop, period = (_finite("start", start), _finite("stop", stop),
-                           _finite("period", period))
-    if stop <= start or period <= 0:
-        raise ValueError("stop must exceed start and period must be positive")
-    count = int(math.floor((stop - start) / period))
-    if count > 1_000_000:
-        raise ValueError("the reference table would exceed one million samples")
-    times = [start + index * period for index in range(count + 1)]
-    tolerance = 1e-12 * max(1.0, abs(start), abs(stop))
-    if stop - times[-1] > tolerance:
-        times.append(stop)
-    else:
-        times[-1] = stop
-    if len(times) < 2 or any(b <= a for a, b in zip(times, times[1:])):
-        raise ValueError("the requested sample grid is not representable")
-    return times
 
 
 def reference_prbs(*, start: float, stop: float, period: float, order: int = 7,
@@ -64,7 +45,7 @@ def reference_prbs(*, start: float, stop: float, period: float, order: int = 7,
     low, high = _finite("low", low), _finite("high", high)
     if low == high:
         raise ValueError("low and high must differ")
-    times = _grid(start, stop, period)
+    times = _sample_grid(start, stop, period)
     state = seed
     values = []
     for _ in range(len(times) - 1):
@@ -89,7 +70,7 @@ def reference_multitone(*, start: float, stop: float, period: float,
     Frequencies are in Hz, phases in radians. Repeated tables require every
     tone to complete an integer number of cycles within the requested window.
     """
-    times = _grid(start, stop, period)
+    times = _sample_grid(start, stop, period)
     try:
         freq = tuple(_finite("frequency", f) for f in frequencies)
         amp = (1.0,) * len(freq) if amplitudes is None else tuple(
@@ -123,7 +104,7 @@ def reference_chirp(*, start: float, stop: float, period: float,
                     time_scale: float = 1.0, time_offset: float = 0.0,
                     value_scale: float = 1.0, value_offset: float = 0.0) -> dict:
     """Generate a linear-frequency sweep in Hz without introducing runtime state."""
-    times = _grid(start, stop, period)
+    times = _sample_grid(start, stop, period)
     f0 = _finite("start_frequency", start_frequency)
     f1 = _finite("stop_frequency", stop_frequency)
     amplitude, phase, offset = (_finite("amplitude", amplitude),

@@ -1,6 +1,9 @@
 # PESLite 0.5.2
 # One-ampere shunt current perturbation applied to a scalar RC network.
 
+@circuit
+stimulus -- pcc -- load
+
 base:
   s_base: 1000.0
   v_ll_rms: 230.0

@@ -7,7 +7,6 @@ of the return and forward signals at that cut, not by return/disturbance.
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -15,7 +14,7 @@ from typing import Mapping
 
 import numpy as np
 
-from .frequency import FrequencyMeasurement, _complex
+from .frequency import FrequencyMeasurement, _complex, _write
 from .port_measurement import measure_recorded_transfer
 
 __all__ = ["measure_return_ratio", "loop_gain_sweep", "LoopGainResult"]
@@ -94,10 +93,7 @@ class LoopGainResult:
         }
 
     def write_json(self, path: str | Path) -> Path:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), indent=2, allow_nan=False) + "\n", encoding="utf-8")
-        return path
+        return _write(self.to_dict(), path)
 
 
 def loop_gain_sweep(measurements: Mapping[float, FrequencyMeasurement]) -> LoopGainResult:
@@ -123,10 +119,11 @@ def loop_gain_sweep(measurements: Mapping[float, FrequencyMeasurement]) -> LoopG
     accepted = np.array([item.valid and item.gain is not None for item in records], dtype=bool)
     gains = np.asarray([item.gain if good else complex(math.nan, math.nan)
                         for item, good in zip(records, accepted)], dtype=complex)
-    # Unwrap only contiguous valid islands; there is no phase bridge over a
-    # missing or unreliable point.
+    # Unwrap only contiguous nonzero valid islands; there is no phase bridge
+    # over a missing, zero-gain or unreliable point.
     db = np.full(len(f), math.nan)
     phase = np.full(len(f), math.nan)
+    accepted &= np.abs(gains) > 0
     i = 0
     while i < len(f):
         if not accepted[i]:
@@ -137,22 +134,29 @@ def loop_gain_sweep(measurements: Mapping[float, FrequencyMeasurement]) -> LoopG
             j += 1
         island = gains[i:j]
         magnitude = np.abs(island)
-        if np.any(magnitude <= 0):
-            accepted[i:j] &= magnitude > 0
-        else:
-            db[i:j] = 20 * np.log10(magnitude)
-            phase[i:j] = np.rad2deg(np.unwrap(np.angle(island)))
+        db[i:j] = 20 * np.log10(magnitude)
+        phase[i:j] = np.rad2deg(np.unwrap(np.angle(island)))
         i = j
     accepted &= np.isfinite(db) & np.isfinite(phase)
     crossing_magnitude = _crossings(np.log10(f), db, 0.0, accepted)
-    crossing_phase = _crossings(np.log10(f), phase, -180.0, accepted)
-    phase_margins = [(180.0 + np.interp(log_at, np.log10(f)[good], phase[good]),
-                      10 ** log_at)
-                     for log_at, _i, _a in crossing_magnitude
-                     for good in [accepted]]
-    gain_margins = [(-float(np.interp(log_at, np.log10(f)[accepted], db[accepted])),
-                     10 ** log_at)
-                    for log_at, _i, _a in crossing_phase]
+    finite_phase = phase[accepted]
+    crossing_phase = []
+    if len(finite_phase):
+        first = math.ceil((float(np.min(finite_phase)) - 180.0) / 360.0)
+        last = math.floor((float(np.max(finite_phase)) - 180.0) / 360.0)
+        for branch in range(first, last + 1):
+            crossing_phase.extend(
+                _crossings(np.log10(f), phase, 180.0 + 360.0 * branch, accepted)
+            )
+    valid_logf = np.log10(f)[accepted]
+    phase_margins = []
+    for log_at, _index, _fraction in crossing_magnitude:
+        phase_at = float(np.interp(log_at, valid_logf, phase[accepted]))
+        phase_margins.append((math.remainder(phase_at + 180.0, 360.0), 10 ** log_at))
+    gain_margins = []
+    for log_at, _index, _fraction in crossing_phase:
+        gain_at = float(np.interp(log_at, valid_logf, db[accepted]))
+        gain_margins.append((-gain_at, 10 ** log_at))
     # A multi-crossover response has multiple classical margins: report the
     # smallest absolute margin and retain the ambiguity as a diagnostic.
     pm, fg = (min(phase_margins, key=lambda a: abs(a[0]))

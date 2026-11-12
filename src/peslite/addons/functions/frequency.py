@@ -10,7 +10,7 @@ from typing import Iterable
 
 import numpy as np
 
-__all__ = ["FrequencyMeasurement", "FrequencyResponseResult", "ImpedanceMatrixResult",
+__all__ = ["FrequencyMeasurement", "FrequencyResponseResult", "MatrixResponseResult",
            "frequency_response", "frequency_sweep", "impedance_matrix"]
 
 
@@ -244,27 +244,32 @@ def frequency_sweep(measurements: Iterable[FrequencyMeasurement]) -> FrequencyRe
 
 
 @dataclass(frozen=True)
-class ImpedanceMatrixResult:
-    """Complex voltage/current transfer matrices ordered by frequency and port."""
+class MatrixResponseResult:
+    """Complex transfer matrices ordered by frequency, output and input."""
 
     frequencies_hz: np.ndarray
-    values: np.ndarray  # [frequency, voltage output port, current input port]
+    values: np.ndarray  # [frequency, output, input]
+    quantity: str
+    unit: str
     input_names: tuple[str, ...]
     output_names: tuple[str, ...]
     valid: tuple[bool, ...]
     flags: tuple[tuple[str, ...], ...]
     conditions: tuple[dict, ...]
-    unit: str = "ohm"
+    frame: str | None = None
 
     def to_dict(self) -> dict:
+        response = {
+            "value": [[[_complex(z) for z in row] for row in matrix]
+                      for matrix in self.values],
+            "unit": self.unit, "outputs": list(self.output_names),
+            "inputs": list(self.input_names),
+        }
+        if self.frame is not None:
+            response["frame"] = self.frame
         return {
             "frequency": {"value": self.frequencies_hz.tolist(), "unit": "Hz"},
-            "impedance": {
-                "value": [[[_complex(z) for z in row] for row in matrix]
-                          for matrix in self.values],
-                "unit": self.unit, "outputs": list(self.output_names),
-                "inputs": list(self.input_names),
-            },
+            self.quantity: response,
             "validity": [{"valid": good, "flags": list(reasons), "conditions": dict(conditions)}
                          for good, reasons, conditions in zip(self.valid, self.flags,
                                                               self.conditions)],
@@ -279,7 +284,7 @@ def impedance_matrix(frequencies: Iterable[float], current_phasors: np.ndarray,
                      output_names: Iterable[str] | None = None,
                      measurement_valid: Iterable[Iterable[bool]] | None = None,
                      max_condition_number: float = 1e8,
-                     max_relative_residual: float = 0.05) -> ImpedanceMatrixResult:
+                     max_relative_residual: float = 0.05) -> MatrixResponseResult:
     """Fit ``V = Z I`` from independent complex-current injection experiments.
 
     Arrays have shape [frequency, experiment, input/output port]; a single
@@ -352,5 +357,5 @@ def impedance_matrix(frequencies: Iterable[float], current_phasors: np.ndarray,
                            "relative_residual": _finite(residual),
                            "max_condition_number": float(max_condition_number),
                            "max_relative_residual": float(max_relative_residual)})
-    return ImpedanceMatrixResult(f, matrices, names_in, names_out,
-                                 tuple(good), tuple(issues), tuple(conditions))
+    return MatrixResponseResult(f, matrices, "impedance", "ohm", names_in, names_out,
+                                tuple(good), tuple(issues), tuple(conditions))
