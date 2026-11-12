@@ -1,7 +1,7 @@
 # Architecture
 
 PESLite separates physical components, controller logic, system assembly, numerical execution and
-optional add-ons. The five core directories keep ownership explicit while allowing the same
+add-ons. These directories keep ownership explicit while allowing the same
 configuration to run with different bridge and solver implementations.
 
 ## Interface versioning
@@ -22,25 +22,25 @@ src/peslite/
 └── addons/       control, component and function addons
     ├── control/      automatically discovered control-loop modules
     ├── components/   automatically discovered circuit-element modules
-    └── functions/    optional functions such as IEEE-style plotting
+    └── functions/    optional functions
 ```
 
 Dependencies point inward through small interfaces: components use the model kernel, controller
 logic uses typed signals, assembly wires both into a system, and `solver.simulation` schedules the
 assembled system.
 
-Controller and component modules in their respective add-on packages are imported once at package
-initialisation. Their decorators populate the same registries used by core types, so there is
-no add-on lookup or dispatch in the simulation hot path. Built-in function addons such as
-[plotting](Plotting.md) do not run unless explicitly invoked.
-The optional online stability analysis functions also live in `addons/functions`. They consume
-selected observations during a run and share the solver-side loop-map linearization. The runner
-exposes an optional observation callback on its existing event grid; core time stepping never
-imports the analysis implementation, and the CLI loads it only with `--report`. Split-error
-diagnostics use the same finite-difference calculation without depending on the addon. See
-[Online Stability Analysis](Online-Stability-Analysis.md).
+Registration addon modules are imported once at package initialisation. Their declarations populate
+the same registries used by core types, so there is no add-on lookup or dispatch in the simulation
+hot path. Built-in function addons have one public
+facade, `peslite.addons.functions`; its catalog identifies each implementation provider and loads
+that provider only when the function is requested. Consumers never import a provider to locate a
+function. A function addon is an explicitly invoked capability outside the simulation core; merely
+installing it does not add work to a simulation. Analysis addons may consume selected observations
+through the runner's callback on its existing event grid while reusing solver-side calculations.
+Core time stepping does not import their implementations. See
+[Analysis Functions](Analysis-Functions.md).
 
-Loading a simulation file also merges a sibling `PESaddons/` tree into these three package paths
+Loading a simulation file also merges a sibling `PESaddons/` tree into the matching package paths
 without adding run-loop work; see [Project Workspace](Project-Workspace.md).
 
 ## Components

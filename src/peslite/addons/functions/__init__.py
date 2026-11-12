@@ -2,53 +2,58 @@
 
 from importlib import import_module
 
+
+class FunctionUnavailableError(ImportError):
+    """A cataloged function's implementation provider is not installed."""
+
+
 _EXPORTS = {
-    "energy_closure": ("energy_audit", "energy_closure", True),
-    "plot_csv": ("plotting", "plot_csv", True),
-    "plot_result": ("plotting", "plot_result", True),
-    "reference_csv": ("reference_signals", "reference_csv", False),
-    "reference_expression": ("reference_signals", "reference_expression", False),
-    "reference_table": ("reference_signals", "reference_table", False),
-    "legacy_yaml_preview": ("peslite.gui.legacy_yaml", "preview", False),
-    "legacy_yaml_patch": ("peslite.gui.legacy_yaml", "validated_patch", False),
-    "legacy_yaml_add_component": ("peslite.gui.legacy_yaml", "validated_add_component", False),
-    "legacy_yaml_remove_component": ("peslite.gui.legacy_yaml", "validated_remove_component", False),
-    "legacy_yaml_rewire": ("peslite.gui.legacy_yaml", "validated_rewire", False),
-    "reference_prbs": ("identification", "reference_prbs", False),
-    "reference_multitone": ("identification", "reference_multitone", False),
-    "reference_chirp": ("identification", "reference_chirp", False),
-    "detect_operating_point": ("operating_point", "detect_operating_point", False),
-    "dynamic_performance": ("dynamic", "dynamic_performance", False),
-    "frequency_response": ("frequency", "frequency_response", False),
-    "frequency_sweep": ("frequency", "frequency_sweep", False),
-    "impedance_matrix": ("frequency", "impedance_matrix", False),
-    "recorded_signal": ("port_measurement", "recorded_signal", False),
-    "measure_recorded_transfer": ("port_measurement", "measure_recorded_transfer", False),
-    "measure_recorded_sweep": ("port_measurement", "measure_recorded_sweep", False),
-    "measure_multitone": ("port_measurement", "measure_multitone", False),
-    "measure_port_matrix": ("port_measurement", "measure_port_matrix", False),
-    "run_port_sweep": ("port_measurement", "run_port_sweep", False),
-    "run_port_matrix": ("port_measurement", "run_port_matrix", False),
-    "measure_return_ratio": ("loop_gain", "measure_return_ratio", False),
-    "loop_gain_sweep": ("loop_gain", "loop_gain_sweep", False),
+    "energy_closure": ("energy_audit", "energy_closure"),
+    "plot_csv": ("plotting", "plot_csv"),
+    "plot_result": ("plotting", "plot_result"),
+    "reference_csv": ("reference_signals", "reference_csv"),
+    "reference_expression": ("reference_signals", "reference_expression"),
+    "reference_table": ("reference_signals", "reference_table"),
+    "legacy_yaml_preview": ("peslite.gui.legacy_yaml", "preview"),
+    "legacy_yaml_patch": ("peslite.gui.legacy_yaml", "validated_patch"),
+    "legacy_yaml_add_component": ("peslite.gui.legacy_yaml", "validated_add_component"),
+    "legacy_yaml_remove_component": ("peslite.gui.legacy_yaml", "validated_remove_component"),
+    "legacy_yaml_rewire": ("peslite.gui.legacy_yaml", "validated_rewire"),
+    "reference_prbs": ("identification", "reference_prbs"),
+    "reference_multitone": ("identification", "reference_multitone"),
+    "reference_chirp": ("identification", "reference_chirp"),
+    "detect_operating_point": ("operating_point", "detect_operating_point"),
+    "dynamic_performance": ("dynamic", "dynamic_performance"),
+    "frequency_response": ("frequency", "frequency_response"),
+    "frequency_sweep": ("frequency", "frequency_sweep"),
+    "impedance_matrix": ("frequency", "impedance_matrix"),
+    "recorded_signal": ("port_measurement", "recorded_signal"),
+    "measure_recorded_transfer": ("port_measurement", "measure_recorded_transfer"),
+    "measure_recorded_sweep": ("port_measurement", "measure_recorded_sweep"),
+    "measure_multitone": ("port_measurement", "measure_multitone"),
+    "measure_port_matrix": ("port_measurement", "measure_port_matrix"),
+    "run_port_sweep": ("port_measurement", "run_port_sweep"),
+    "run_port_matrix": ("port_measurement", "run_port_matrix"),
+    "measure_return_ratio": ("loop_gain", "measure_return_ratio"),
+    "loop_gain_sweep": ("loop_gain", "loop_gain_sweep"),
+    "small_signal": ("stability", "small_signal"),
+    "small_signal_report": ("stability", "small_signal_report"),
 }
 __all__ = list(_EXPORTS)
-_ROOT_EXPORTS = tuple(name for name, target in _EXPORTS.items() if target[2])
 
 
 def _resolve(name):
     """Resolve one public function through the authoritative lazy-export registry."""
     if name not in _EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module_name, attribute, _root = _EXPORTS[name]
+    module_name, attribute = _EXPORTS[name]
     qualified = module_name if "." in module_name else f"{__name__}.{module_name}"
     try:
         value = getattr(import_module(qualified), attribute)
     except ModuleNotFoundError as exc:
-        if exc.name == qualified:
-            raise ModuleNotFoundError(
-                f"add-on function {name!r} is unavailable in this installation",
-                name=qualified,
+        if exc.name and (exc.name == qualified or qualified.startswith(exc.name + ".")):
+            raise FunctionUnavailableError(
+                f"add-on function {name!r} is unavailable in this installation"
             ) from None
         raise
     globals()[name] = value

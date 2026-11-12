@@ -24,11 +24,14 @@ converter-study/
 |---|---|
 | `PESaddons/control/` | register project control loops |
 | `PESaddons/components/` | register project circuit elements |
-| `PESaddons/functions/` | provide optional user functions |
+| `PESaddons/functions/` | provide project function addons |
 
 `PESaddons` is case-sensitive. PESLite checks only the directory beside the simulation file; it
-does not search parent directories or add the project root to global `sys.path`. Add-on code is
-executed while the simulation file is loaded and must therefore be treated as trusted Python code.
+does not search parent directories or add the project root to global `sys.path`. Registration
+addons run while the simulation file is loaded; function addon modules run when imported. All
+addon code must be treated as trusted Python code. Project function modules share the
+`peslite.addons.functions` package path and remain explicit module imports; loading a project does
+not modify the built-in function catalog.
 
 See [Extending PESLite](Extending-PESLite.md) for extension interfaces and
 [Architecture](Architecture.md) for package ownership.

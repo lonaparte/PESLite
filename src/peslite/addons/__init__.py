@@ -8,7 +8,7 @@ from typing import Any
 
 from . import components, control, formats
 from ._discovery import discover_modules
-from . import functions as _functions
+from . import functions
 
 # These imports happen once when PESLite starts.  They populate the existing registries; no
 # directory search or add-on dispatch remains in the simulation hot path.
@@ -16,7 +16,7 @@ control.discover()
 components.discover()
 formats.discover()
 
-__all__ = ["control", "components", "formats", "functions", *_functions._ROOT_EXPORTS]
+__all__ = ["control", "components", "formats", "functions"]
 
 
 def _merge_path(package, directory: Path) -> bool:
@@ -61,15 +61,3 @@ def _discover_for(simulation_file: str | Path) -> tuple[Any, ...]:
     for package, directory in locations:
         imported.extend(discover_modules(package.__name__, (str(directory),)))
     return tuple(imported)
-
-
-def __getattr__(name: str) -> Any:
-    """Load optional function implementations only when their API is requested."""
-    if name == "functions":
-        globals()[name] = _functions
-        return _functions
-    if name in _functions._ROOT_EXPORTS:
-        value = _functions._resolve(name)
-        globals()[name] = value
-        return value
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

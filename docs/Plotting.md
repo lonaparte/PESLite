@@ -58,7 +58,7 @@ pdf = result.plot(
 Plot Python or standalone C++ CSV output directly:
 
 ```python
-from peslite.addons import plot_csv
+from peslite.addons.functions import plot_csv
 
 pdf = plot_csv(
     "output/run/states.csv",

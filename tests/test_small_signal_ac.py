@@ -17,7 +17,7 @@ import pytest
 from scipy.optimize import linear_sum_assignment
 
 from conftest import EXAMPLES
-from peslite.addons.functions.small_signal import small_signal, small_signal_report
+from peslite.addons.functions import small_signal, small_signal_report
 from peslite.assembly.params import from_dict, to_dict
 from peslite.solver.linearization import (active_coordinates, coordinate_difference, coordinate_width,
                                          linearize_loop)

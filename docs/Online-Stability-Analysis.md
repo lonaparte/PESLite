@@ -21,7 +21,7 @@ Inspection/export options cannot be combined with `--report`; plotting can.
 Use a fresh simulation to generate a timeline alongside its ordinary output:
 
 ```python
-from peslite.addons.functions.small_signal import small_signal_report
+from peslite.addons.functions import small_signal_report
 
 sim = peslite.Simulation(params)
 report = small_signal_report(
@@ -127,7 +127,7 @@ files are preserved.
 
 ```python
 import peslite
-from peslite.addons.functions.small_signal import small_signal
+from peslite.addons.functions import small_signal
 
 params = peslite.load("examples/buck-example.pes", **{"simulation.t_end": 0.05})
 sim = peslite.Simulation(params)

@@ -18,7 +18,7 @@ from .frequency import (MatrixResponseResult, _fit, frequency_response, frequenc
                         impedance_matrix)
 
 __all__ = ["recorded_signal", "measure_recorded_transfer", "measure_recorded_sweep",
-           "measure_multitone", "measure_port_matrix"]
+           "measure_multitone", "measure_port_matrix", "run_port_sweep", "run_port_matrix"]
 
 
 def _table(result, name: str):
@@ -380,6 +380,3 @@ def run_port_matrix(params, *, injection: str, frequencies: Iterable[float],
     return measure_port_matrix(groups, voltage=voltage, current=current,
                                injection=f"{injection}.injection", frame=frame,
                                frame_frequency=frame_frequency, **options)
-
-
-__all__ += ["run_port_sweep", "run_port_matrix"]

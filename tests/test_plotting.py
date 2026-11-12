@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from peslite.addons import plot_csv, plot_result
 from peslite.addons import functions
+from peslite.addons.functions import plot_csv, plot_result
 from peslite.addons.functions import plotting
 from peslite.addons.functions.plotting import _time_scale
 from peslite.solver import simulation
@@ -98,6 +98,7 @@ def test_cli_resolves_the_plot_addon_before_simulation(monkeypatch, capsys):
     def unavailable(_name):
         raise ModuleNotFoundError("plot addon unavailable", name="peslite.addons.functions.plotting")
 
+    monkeypatch.delattr(functions, "plot_result", raising=False)
     monkeypatch.setattr(functions, "_resolve", unavailable)
     monkeypatch.setattr(
         simulation,

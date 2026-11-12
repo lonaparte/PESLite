@@ -10,7 +10,7 @@ import pytest
 from peslite.addons.control.virtual_injection import (
     VirtualDqVoltageInjection, VirtualDutyInjection, VirtualVoltageInjection,
 )
-from peslite.addons.functions.loop_gain import measure_return_ratio, loop_gain_sweep
+from peslite.addons.functions import measure_return_ratio, loop_gain_sweep
 from peslite.addons.functions.frequency import FrequencyMeasurement
 from peslite.assembly.params import from_dict, read_tree
 from peslite.control import LOOP_TYPES

@@ -61,7 +61,7 @@ accounting without stopping the run. Declared log columns use NaN for an unavail
 CSV retains its own sampling timestamps; different tables are not required to have equal row
 counts.
 
-After a run with `energy: 1`, `peslite.addons.energy_closure(result)` compares stored-energy change
+After a run with `energy: 1`, `peslite.addons.functions.energy_closure(result)` compares stored-energy change
 and impulsive loss with supplied and dissipated energy accumulated at accepted solver steps. It
 returns the component energies, the closure residual and a relative residual; CSV sampling and
 precision do not affect this calculation.
