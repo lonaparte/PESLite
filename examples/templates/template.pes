@@ -1,5 +1,8 @@
 # PESLite 0.5.2
 # Grid-following converter; electrical values with a _pu suffix use per-unit values.
+@circuit
+grid -- pcc -- converter
+
 base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
 
 buses:

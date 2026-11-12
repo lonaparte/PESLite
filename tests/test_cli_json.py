@@ -29,6 +29,33 @@ def test_validate_assembles_without_running_or_writing(capsys, monkeypatch, tmp_
     assert not (tmp_path / "output").exists()
 
 
+def test_public_model_validation_returns_the_checked_unrun_assembly(monkeypatch):
+    def unexpected_run(*_args, **_kwargs):
+        raise AssertionError("model validation started a simulation")
+
+    monkeypatch.setattr(peslite.Simulation, "run", unexpected_run)
+    simulation = peslite.validate_model(peslite.load("examples/gfl-example.pes"))
+
+    assert simulation.result is None
+    assert "vsc.dclink.u_C" in simulation.state_names()
+
+
+def test_parameter_export_reuses_the_checked_model(monkeypatch, tmp_path):
+    from peslite.assembly.exporter import EXPORTERS, ExportResult
+
+    def export_checked(simulation, out_dir, name, variables, clone, **_options):
+        assert simulation.result is None and simulation.state_names()
+        assert name == "checked" and variables == () and clone is True
+        return ExportResult("test", out_dir, ())
+
+    monkeypatch.setitem(EXPORTERS, "test", export_checked)
+    result = peslite.export(
+        peslite.load("examples/gfl-example.pes"), "test", tmp_path, name="checked",
+    )
+
+    assert result.format == "test" and result.out_dir == tmp_path
+
+
 def test_inspect_states_returns_the_registered_names(capsys):
     code, payload = _command(capsys, "inspect", "gfl-example", "--states")
 

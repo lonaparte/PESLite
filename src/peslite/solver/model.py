@@ -867,9 +867,93 @@ def _source_writers(env: dict[str, Any]):
     return ref, put, value, step
 
 
+class _PlanCodeEmitter:
+    """Lower model operations and derivatives into straight-line Python statements."""
+
+    __slots__ = ("ref", "put", "_step", "_operation_cache")
+
+    def __init__(self, env: dict[str, Any]) -> None:
+        self.ref, self.put, _value, self._step = _source_writers(env)
+        self._operation_cache: dict[int, tuple[str, ...]] = {}
+
+    def inline(self, method: Callable) -> tuple[list[str], tuple[str, ...]] | None:
+        """Bind an explicitly generated method body to its owning subsystem."""
+        function = getattr(method, "__func__", method)
+        program = getattr(function, "_peslite_inline_program", None)
+        owner = getattr(method, "__self__", None)
+        if not isinstance(program, _InlineProgram) or owner is None:
+            return None
+        records = {
+            "self.state": getattr(owner, "state", None),
+            "self.input": getattr(owner, "input", None),
+            "self.output": getattr(owner, "output", None),
+        }
+        records = {
+            name: self.ref(value) for name, value in records.items() if value is not None
+        }
+        replacements = {"self": self.ref(owner)}
+        replacements.update(
+            {name: self.ref(value) for name, value in program.namespace.items()}
+        )
+        pattern = re.compile(
+            r"\b(" + "|".join(map(re.escape, sorted(replacements, key=len, reverse=True)))
+            + r")\b"
+        )
+
+        def substitute(source: str) -> str:
+            for name, replacement in records.items():
+                source = source.replace(name, replacement)
+            return pattern.sub(lambda match: replacements[match.group(1)], source)
+
+        return (
+            [substitute(line) for line in program.statements],
+            tuple(substitute(result) for result in program.results),
+        )
+
+    def operation(self, operation: tuple) -> tuple[str, ...]:
+        """Return the statements for one output, copy or algebraic operation."""
+        key = id(operation)
+        cached = self._operation_cache.get(key)
+        if cached is not None:
+            return cached
+        kind, method = operation
+        program = self.inline(method) if kind == "output" else None
+        lines = (tuple(program[0]) if program is not None and not program[1]
+                 else (self._step(operation),))
+        self._operation_cache[key] = lines
+        return lines
+
+    def derivative(
+        self, subsystem: Any, count: int, prefix: str,
+    ) -> tuple[list[str], tuple[str, ...]]:
+        """Return one RHS evaluation and names holding its derivative values."""
+        if not count:
+            return [], ()
+        values = tuple(f"{prefix}_{index}" for index in range(count))
+        program = self.inline(subsystem.rhs)
+        if program is None or len(program[1]) != count:
+            return [f"{', '.join(values)}, = {self.ref(subsystem)}.rhs(t)"], values
+        statements, expressions = program
+        return [*statements, *(f"{name} = {expression}"
+                                for name, expression in zip(values, expressions))], values
+
+
 def _function(signature: str, body: list[str]) -> list[str]:
     """Source lines for a generated function."""
     return [f"def {signature}:"] + ["    " + line for line in body or ["pass"]]
+
+
+def _compile_straight_line(
+    env: dict[str, Any], filename: str,
+    programs: Sequence[tuple[str, Sequence[str]]],
+) -> str:
+    """Compile ordered straight-line functions and return their generated source."""
+    source = "\n".join(
+        line for signature, body in programs
+        for line in _function(signature, list(body))
+    ) + "\n"
+    exec(compile(source, filename, "exec"), env)
+    return source
 
 
 def _signal_error(a: Any, b: Any) -> tuple[float, float]:
@@ -922,8 +1006,7 @@ class _AlgebraicLoop:
         _ref, put, value, step = _source_writers(env)
         tear = self.tears[0]
         body = [put(tear[0], tear[1], "x"), *map(step, self.operations), "return " + value(tear)]
-        source = "\n".join(_function("sweep(t, x)", body)) + "\n"
-        exec(compile(source, "<peslite algebraic scalar>", "exec"), env)
+        _compile_straight_line(env, "<peslite algebraic scalar>", (("sweep(t, x)", body),))
         return env["sweep"]
 
     def _scalar(self, t: float) -> None:
@@ -1016,7 +1099,7 @@ class GroupPlan:
 
     __slots__ = (
         "members", "mask", "plan", "own", "feed", "inputs", "rhs",
-        "run_plan", "run_own", "run_feed",
+        "run_feed", "run_rhs_plan", "run_rhs_own",
     )
 
     def __init__(self, members: tuple, mask: NDArray[np.bool_], plan: tuple, own: tuple, feed: tuple,
@@ -1024,15 +1107,34 @@ class GroupPlan:
         self.members, self.mask, self.plan, self.own, self.feed, self.inputs, self.rhs = (
             members, mask, plan, own, feed, inputs, rhs)
         env: dict[str, Any] = {}
-        step = _source_writers(env)[3]
-        runs = {"run_plan": plan, "run_own": own, "run_feed": feed}
-        source = "\n".join(
-            line
-            for name, operations in runs.items()
-            for line in _function(f"{name}(t)", [*map(step, operations)])
-        ) + "\n"
-        exec(compile(source, "<peslite group plan>", "exec"), env)
-        self.run_plan, self.run_own, self.run_feed = (env[name] for name in runs)
+        emitter = _PlanCodeEmitter(env)
+
+        def operations(items: tuple) -> list[str]:
+            return [line for operation in items for line in emitter.operation(operation)]
+
+        def rhs_program(items: tuple) -> list[str]:
+            lines = operations(items)
+            for index, (subsystem, entries) in enumerate(rhs):
+                derive, values = emitter.derivative(
+                    subsystem, len(entries), f"_group_d{index}"
+                )
+                lines.extend(derive)
+                for value, (position, is_complex) in zip(values, entries):
+                    lines.append(
+                        f"dy[{position}] = {value}.real" if is_complex
+                        else f"dy[{position}] = {value}"
+                    )
+                    if is_complex:
+                        lines.append(f"dy[{position + 1}] = {value}.imag")
+            return lines
+
+        names = ("run_feed", "run_rhs_plan", "run_rhs_own")
+        _compile_straight_line(env, "<peslite group plan>", (
+            ("run_feed(t)", operations(feed)),
+            ("run_rhs_plan(t, dy)", rhs_program(plan)),
+            ("run_rhs_own(t, dy)", rhs_program(own)),
+        ))
+        self.run_feed, self.run_rhs_plan, self.run_rhs_own = (env[name] for name in names)
 
 
 def _snake(name: str) -> str:
@@ -1657,47 +1759,16 @@ class Model:
         """Generate and compile ``_load``, ``_outputs``, ``rhs_list`` (source in ``compiled_source``)."""
         owners = {id(s): n for n, s in zip(self.names, self.subsystems)}
         env: dict[str, Any] = {}
-        ref, put, _value, step = _source_writers(env)
+        emitter = _PlanCodeEmitter(env)
+        ref, put = emitter.ref, emitter.put
         load = [put(st, name, f"complex(v[{idx}], v[{idx + 1}])" if is_c else f"v[{idx}]")
                 for st, name, idx, is_c in self._state_ops]
-
-        def inline(method: Callable) -> tuple[list[str], tuple[str, ...]] | None:
-            function = getattr(method, "__func__", method)
-            program = getattr(function, "_peslite_inline_program", None)
-            owner = getattr(method, "__self__", None)
-            if not isinstance(program, _InlineProgram) or owner is None:
-                return None
-            records = {
-                "self.state": getattr(owner, "state", None),
-                "self.input": getattr(owner, "input", None),
-                "self.output": getattr(owner, "output", None),
-            }
-            records = {name: ref(value) for name, value in records.items() if value is not None}
-            replacements = {"self": ref(owner)}
-            replacements.update({name: ref(value) for name, value in program.namespace.items()})
-            pattern = re.compile(
-                r"\b(" + "|".join(map(re.escape, sorted(replacements, key=len, reverse=True)))
-                + r")\b"
-            )
-
-            def substitute(source: str) -> str:
-                for name, replacement in records.items():
-                    source = source.replace(name, replacement)
-                return pattern.sub(lambda match: replacements[match.group(1)], source)
-
-            return ([substitute(line) for line in program.statements],
-                    tuple(substitute(result) for result in program.results))
-
-        def operation_lines(operation: tuple) -> list[str]:
-            kind, method = operation
-            program = inline(method) if kind == "output" else None
-            return program[0] if program is not None and not program[1] else [step(operation)]
 
         plan_by_operation, derivative_by_operation = [], []
         for operation, (op_owners, _srcs), rhs_required in zip(
                 self._plan, self._plan_owners, self._plan_rhs):
             comment = ", ".join(owners[id(owner)] for owner in op_owners)
-            lines = operation_lines(operation)
+            lines = list(emitter.operation(operation))
             if lines:
                 lines[-1] += f"  # {comment}"
             plan_by_operation.append(lines)
@@ -1709,24 +1780,21 @@ class Model:
 
         derive, packed = [], []
         for j, (sub, flags, _all_complex) in enumerate(self._rhs_plan):
-            got = [f"d{j}_{q}" for q in range(len(flags))]
-            program = inline(sub.rhs)
-            if program is None or len(program[1]) != len(got):
-                derive.append(f"{', '.join(got)}, = {ref(sub)}.rhs(t)  # {owners[id(sub)]}")
-            else:
-                statements, results = program
-                derive.extend(statements)
-                derive.extend(f"{name} = {result}" for name, result in zip(got, results))
-                derive[-1] += f"  # {owners[id(sub)]}"
+            lines, got = emitter.derivative(sub, len(flags), f"d{j}")
+            if lines:
+                lines[-1] += f"  # {owners[id(sub)]}"
+            derive.extend(lines)
             for d, is_c in zip(got, flags):
                 packed += [f"{d}.real", f"{d}.imag"] if is_c else [d]
 
-        source = "\n".join(_function("_load(v)", load) + _function("_outputs(t)", plan)
-                           + _function("_zoh_outputs(t)", zoh_plan)
-                           + _function("rhs_list(t, v)", load + derivative_plan + derive
-                                       + [f"return [{', '.join(packed)}]"])) + "\n"
         filename = f"<peslite model {id(self):#x}>"
-        exec(compile(source, filename, "exec"), env)
+        source = _compile_straight_line(env, filename, (
+            ("_load(v)", load),
+            ("_outputs(t)", plan),
+            ("_zoh_outputs(t)", zoh_plan),
+            ("rhs_list(t, v)", load + derivative_plan + derive
+             + [f"return [{', '.join(packed)}]"]),
+        ))
         linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
         # Rebuilt models own their debugging source; collecting one must release its cache entry.
         weakref.finalize(self, linecache.cache.pop, filename, None)
@@ -1812,15 +1880,8 @@ class Model:
         ``own=True`` keeps inputs from outside the group unchanged.
         """
         self.set_states(y)
-        (group.run_own if own else group.run_plan)(t)
         dy = np.zeros(self.n_states)
-        for sub, entries in group.rhs:
-            for d, (idx, is_c) in zip(sub.rhs(t), entries):
-                if is_c:
-                    dy[idx] = d.real
-                    dy[idx + 1] = d.imag
-                else:
-                    dy[idx] = d
+        (group.run_rhs_own if own else group.run_rhs_plan)(t, dy)
         return dy
 
     # ------------------------------------------------------------- packing

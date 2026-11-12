@@ -54,8 +54,8 @@ peslite case.pes
 peslite ./cases/my-converter.pes
 ```
 
-The suffix may be omitted. PESLite checks the supplied path and its `.pes`, `.yaml`, `.yml` and
-`.json` variants before checking bundled examples. The default result directory is
+The `.pes` suffix may be omitted. PESLite checks the supplied path before checking bundled examples.
+The default result directory is
 `output/<name>/`.
 
 ## Override parameters

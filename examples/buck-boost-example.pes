@@ -4,6 +4,9 @@
 # The upper controlled device charges the inductor from the input; the lower diode transfers its
 # energy to the output. Electrical states retain their physical polarity, so output.u_C is negative.
 
+@circuit
+converter -- output -- load
+
 base:
   s_base: 500.0
   v_ll_rms: 230.0

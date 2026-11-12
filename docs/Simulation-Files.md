@@ -1,11 +1,15 @@
 # Simulation Files
 
-A `.pes` file is a YAML description of one simulation. PESLite validates the complete file before
-assembly and reports unknown fields, invalid values and unresolved connections.
+A `.pes` file combines graphical interface views with YAML parameter domains. PESLite validates the
+parameter mapping before assembly and reports unknown fields, invalid values and unresolved
+connections.
 
 ## Structure
 
-```yaml
+```text
+@circuit
+Grid -- PCC -- Converter
+
 base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
 
 buses: {}
@@ -27,7 +31,7 @@ meta: {}
 | Section | Contents | Reference |
 |---|---|---|
 | `base` | system power, voltage and frequency bases | [SI and per-unit values](#si-and-per-unit-values) |
-| `buses`, `branches`, `elements` | passive electrical network | [Passive Network Components](Passive-Network-Components.md) |
+| `buses`, `branches`, `elements` | passive electrical network | [Passive Components](Passive-Components.md) |
 | `sources` | independent network sources | [Electrical Sources](Electrical-Sources.md) |
 | `units` with `type: vsc` | voltage-source converters | [Voltage-Source Converters](Voltage-Source-Converters.md) |
 | converter `bridge`, `pwm`, `ctrl`, `meas`, `protection` | bridge model and sampled control | [Bridge and PWM](Bridge-and-PWM.md) |
@@ -41,6 +45,54 @@ meta: {}
 
 All top-level sections except `base` and `simulation` are optional. A model without a component
 section simply omits it.
+
+## Interface views
+
+Every simulation file defines `@circuit`; additional named views are optional. Only view headers use
+`@`; parameter domains such as `base:`, `simulation:` and `events:` remain ordinary YAML mappings.
+
+```text
+@circuit
+Grid -- PCC -- VSC
+PCC -- Load
+&Loads: Load
+
+@VSC
+PLL.theta -> Current.theta
+Current -> PWM
+
+VSC: vsc, gfl
+  PLL: SRFPLL
+  Current: CurrentLoop
+  PWM: ThreePhaseModulation
+
+base:
+  s_base: 2.0e6
+
+simulation:
+  t_end: 1.0
+```
+
+`@circuit` is the required system view; `@Name` defines a detailed view for a named Unit or
+subsystem. Within a view:
+
+- `A -- B` is an undirected electrical connection and `A -> B` is a directed signal connection;
+- connections may be chained and may address named ports, such as `A.output -> B.input`;
+- `&Group: A, B` creates a collapsible group, and groups may contain other groups;
+- `Name: type` declares the displayed type, with optional indented block declarations;
+- repeated names identify the same displayed object within that view.
+
+A view ends at the next `@` header or parameter domain. A declaration always includes its displayed
+type (`VSC: vsc`, not `VSC:`); quoted parameter keys and the standard domains (`base`, `buses`,
+`branches`, `sources`, `units`, `elements`, `signals`, `events`, `simulation` and `meta`) are
+unambiguous boundaries.
+
+View blocks describe presentation. The parameter mappings remain the source of simulation values,
+and their schemas are documented in the component and simulation pages linked above. See
+[Graphical Interface](Graphical-Interface.md) for rendering and layout behavior.
+
+Resolved files written by `inspect --resolved`, a simulation run or exported C++ retain the source
+views. A simulation constructed directly from parameters writes an empty `@circuit` view.
 
 ## Names and paths
 

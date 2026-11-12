@@ -1,5 +1,8 @@
 # PESLite 0.5.2
 # Grid-forming converter: matching control (frequency from the dc-link voltage).
+@circuit
+grid -- pcc -- vsc
+
 base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
 buses:
   pcc: {c_pu: 0.02, r_d_pu: 0.5}

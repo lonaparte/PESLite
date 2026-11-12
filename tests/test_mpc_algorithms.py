@@ -5,7 +5,8 @@ from itertools import product
 import numpy as np
 import pytest
 
-from peslite.addons.control.mpc import CCSMPC, FCSMPC, LinearModel, SolverResult
+from peslite.addons.control.mpc import (CCSMPC, FCSMPC, LinearModel, QuadraticProblem,
+                                       SolverResult, solve_active_set)
 
 
 def test_two_step_integrator_matches_analytic_unconstrained_and_active_bound_solutions():
@@ -182,6 +183,105 @@ def test_backend_solution_must_be_feasible_and_optimal_and_failure_is_classified
     assert infeasible.action is None
 
 
+def test_active_set_solves_general_and_dependent_linear_constraints():
+    # The unconstrained minimizer is outside x + y <= 0.4. The duplicate row verifies that
+    # dependent active constraints do not make the reduced-space solve singular.
+    hessian = np.array([[4.0, 1.0], [1.0, 2.0]])
+    linear = np.array([-1.0, -1.0])
+    matrix = np.array([[1.0, 1.0], [2.0, 2.0]])
+    problem = QuadraticProblem(
+        hessian, linear, 0.0,
+        np.zeros(2), np.ones(2), matrix, np.full(2, -np.inf), np.array([0.4, 0.8]),
+        np.array([0.2, 0.2]), 30, 1e-11, 1e-9,
+    )
+
+    result = solve_active_set(problem)
+    expected = np.linalg.solve(
+        np.block([[hessian, np.ones((2, 1))], [np.ones((1, 2)), np.zeros((1, 1))]]),
+        np.r_[-linear, 0.4],
+    )[:2]
+
+    assert result.success and result.status == "optimal"
+    np.testing.assert_allclose(result.solution, expected, atol=1e-9)
+
+
+def test_active_set_preserves_exact_equalities_and_classifies_infeasibility():
+    fixed = QuadraticProblem(
+        np.eye(2), np.array([-1.0, 2.0]), 0.0,
+        np.array([0.25, -1.0]), np.array([0.25, 1.0]),
+        np.empty((0, 2)), np.empty(0), np.empty(0),
+        np.zeros(2), 20, 1e-10, 1e-9,
+    )
+    result = solve_active_set(fixed)
+    assert result.success
+    np.testing.assert_allclose(result.solution, [0.25, -1.0], atol=1e-10)
+
+    impossible = QuadraticProblem(
+        np.eye(1), np.zeros(1), 0.0,
+        np.array([1.0]), np.array([0.0]),
+        np.empty((0, 1)), np.empty(0), np.empty(0),
+        np.zeros(1), 20, 1e-10, 1e-9,
+    )
+    failed = solve_active_set(impossible)
+    assert not failed.success and failed.status == "infeasible"
+
+
+def test_active_set_follows_a_bounded_descent_direction_of_a_semidefinite_objective():
+    problem = QuadraticProblem(
+        np.diag([2.0, 0.0]), np.array([-2.0, -1.0]), 0.0,
+        np.array([-1.0, 0.0]), np.ones(2),
+        np.empty((0, 2)), np.empty(0), np.empty(0),
+        np.zeros(2), 20, 1e-10, 1e-9,
+    )
+
+    result = solve_active_set(problem)
+
+    assert result.success
+    np.testing.assert_allclose(result.solution, [1.0, 1.0], atol=1e-10)
+
+
+def test_active_set_matches_independent_two_dimensional_active_set_enumeration():
+    rng = np.random.default_rng(20261112)
+    for case_index in range(40):
+        factor = rng.normal(size=(2, 2))
+        hessian = (factor.T @ factor + 0.1 * np.eye(2) if case_index % 2 == 0
+                   else factor[:1].T @ factor[:1])
+        linear = rng.normal(size=2)
+        general = rng.normal(size=(3, 2))
+        general /= np.linalg.norm(general, axis=1, keepdims=True)
+        general_limit = rng.uniform(0.1, 1.0, size=3)  # the origin remains feasible
+        rows = np.vstack((general, np.eye(2), -np.eye(2)))
+        limits = np.r_[general_limit, np.ones(4)]
+        candidates = []
+        for active_count in range(3):
+            for active in product(range(len(rows)), repeat=active_count):
+                if len(set(active)) != active_count:
+                    continue
+                selected = rows[list(active)]
+                kkt = np.block([
+                    [hessian, selected.T],
+                    [selected, np.zeros((active_count, active_count))],
+                ])
+                try:
+                    solved = np.linalg.solve(kkt, np.r_[-linear, limits[list(active)]])
+                except np.linalg.LinAlgError:
+                    continue
+                value, multipliers = solved[:2], solved[2:]
+                if np.all(rows @ value <= limits + 1e-9) and np.all(multipliers >= -1e-9):
+                    candidates.append((0.5 * value @ hessian @ value + linear @ value, value))
+        expected = min(candidates, key=lambda item: item[0])
+        problem = QuadraticProblem(
+            hessian, linear, 0.0, -np.ones(2), np.ones(2),
+            general, np.full(3, -np.inf), general_limit,
+            np.zeros(2), 30, 1e-10, 1e-8,
+        )
+        result = solve_active_set(problem)
+
+        assert result.success
+        actual = 0.5 * result.solution @ hessian @ result.solution + linear @ result.solution
+        assert actual == pytest.approx(expected[0], abs=2e-8)
+
+
 @pytest.mark.parametrize("solution", [[np.nan, 0.0], [0.0], [2.0, 0.0], [0.0 + 1j, 0.0], ["bad", "data"]])
 def test_invalid_backend_solution_never_becomes_an_action(solution):
     controller = CCSMPC(LinearModel([[1.0]], [[1.0]]), 2, input_bounds=(-1.0, 1.0),
@@ -192,7 +292,10 @@ def test_invalid_backend_solution_never_becomes_an_action(solution):
 
 
 def test_solver_limits_and_numerical_failures_are_explicit_and_programming_errors_propagate():
-    controller = CCSMPC(LinearModel([[1.0]], [[1.0]]), 3, input_weight=1.0, max_iterations=1)
+    controller = CCSMPC(
+        LinearModel([[1.0]], [[1.0]]), 3, input_weight=1.0,
+        input_bounds=(-0.1, 0.1), max_iterations=1,
+    )
     result = controller.solve([3.0], [0.0])
     assert not result.success and result.status == "iteration_limit"
     assert result.action is None

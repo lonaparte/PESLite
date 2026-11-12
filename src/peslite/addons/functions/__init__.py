@@ -9,6 +9,11 @@ _EXPORTS = {
     "reference_csv": ("reference_signals", "reference_csv", False),
     "reference_expression": ("reference_signals", "reference_expression", False),
     "reference_table": ("reference_signals", "reference_table", False),
+    "legacy_yaml_preview": ("peslite.gui.legacy_yaml", "preview", False),
+    "legacy_yaml_patch": ("peslite.gui.legacy_yaml", "validated_patch", False),
+    "legacy_yaml_add_component": ("peslite.gui.legacy_yaml", "validated_add_component", False),
+    "legacy_yaml_remove_component": ("peslite.gui.legacy_yaml", "validated_remove_component", False),
+    "legacy_yaml_rewire": ("peslite.gui.legacy_yaml", "validated_rewire", False),
 }
 __all__ = list(_EXPORTS)
 _ROOT_EXPORTS = tuple(name for name, target in _EXPORTS.items() if target[2])
@@ -19,7 +24,7 @@ def _resolve(name):
     if name not in _EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     module_name, attribute, _root = _EXPORTS[name]
-    qualified = f"{__name__}.{module_name}"
+    qualified = module_name if "." in module_name else f"{__name__}.{module_name}"
     try:
         value = getattr(import_module(qualified), attribute)
     except ModuleNotFoundError as exc:

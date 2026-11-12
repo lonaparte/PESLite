@@ -1,6 +1,6 @@
-# Passive Network Components
+# Passive Components
 
-Passive network components are configured under `buses`, `branches` and `elements`.
+Passive components are configured under `buses`, `branches` and `elements`.
 
 ## Buses
 

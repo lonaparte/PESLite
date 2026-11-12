@@ -289,3 +289,84 @@ def test_held_numpy_scalars_enter_the_generated_equations_as_python_scalars():
     assert type(driven.input.x) is float and driven.input.x == 4.0
     model.set_zoh_input("held", np.complex128(1.0 + 2.0j))
     assert type(driven.input.x) is complex and driven.input.x == 1.0 + 2.0j
+
+
+def test_group_rhs_uses_the_same_inline_lowering_as_the_full_model():
+    import numpy as np
+
+    class State(Bag):
+        __slots__ = ("x",)
+
+    class Input(Bag):
+        __slots__ = ("a",)
+
+    class Output(Bag):
+        __slots__ = ("v",)
+
+    class Part:
+        state_names = ("x",)
+        outputs_need_inputs = False
+
+        def __init__(self, value):
+            self.state = State(x=value)
+            self.input = Input(a=0.0)
+            self.output = Output(v=0.0)
+
+        def set_outputs(self, t):
+            self.output.v = self.state.x + t
+
+        def rhs(self, _t):
+            return (self.input.a - self.state.x,)
+
+    Part.set_outputs._peslite_inline_program = kernel._InlineProgram(
+        ("self.output.v = self.state.x + t",), (), {}
+    )
+    Part.rhs._peslite_inline_program = kernel._InlineProgram(
+        (), ("self.input.a - self.state.x",), {}
+    )
+
+    source, driven = Part(1.0), Part(2.0)
+    model = Model(
+        {"source": source, "driven": driven},
+        {(driven, "a"): (source, "v")},
+    )
+    group = model.groups({"driven": "inner"})["inner"]
+    state = model.get_initial_values()
+
+    derivative = model.rhs_group(0.25, state, group)
+    np.testing.assert_allclose(derivative, [0.0, -0.75], rtol=0.0, atol=1e-15)
+    assert "rhs" not in group.run_rhs_plan.__code__.co_names
+    assert "set_outputs" not in group.run_rhs_plan.__code__.co_names
+
+    driven.input.a = 0.9
+    derivative = model.rhs_group(0.25, state, group, own=True)
+    np.testing.assert_allclose(derivative, [0.0, -1.1], rtol=0.0, atol=1e-15)
+
+
+def test_group_rhs_evaluates_each_complex_inline_result_once():
+    import numpy as np
+
+    class Part:
+        def __init__(self):
+            self.calls = 0
+
+        def value(self):
+            self.calls += 1
+            return 3.0 + 4.0j
+
+        def rhs(self, _t):
+            return (self.value(),)
+
+    Part.rhs._peslite_inline_program = kernel._InlineProgram(
+        (), ("self.value()",), {}
+    )
+    part = Part()
+    group = kernel.GroupPlan(
+        (), np.zeros(2, dtype=bool), (), (), (), (),
+        ((part, ((0, True),)),),
+    )
+    derivative = np.zeros(2)
+    group.run_rhs_plan(0.0, derivative)
+
+    np.testing.assert_array_equal(derivative, [3.0, 4.0])
+    assert part.calls == 1

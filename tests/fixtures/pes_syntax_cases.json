@@ -1,0 +1,94 @@
+{
+  "cases": [
+    {
+      "name": "trailing comment on a view header",
+      "valid": true,
+      "text": "@circuit  # system view\nGrid -- PCC\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "parameters before and between views",
+      "valid": true,
+      "text": "base: {s_base: 1.0e6}\n@circuit\nGrid -- PCC -- VSC\n@VSC\nCurrent -> PWM\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "byte-order mark and CRLF line ends",
+      "valid": true,
+      "text": "﻿@circuit\r\nGrid -- PCC\r\nbase: {s_base: 1.0e6}\r\nsimulation: {t_end: 0.1}\r\n"
+    },
+    {
+      "name": "leading YAML document start",
+      "valid": true,
+      "text": "---\n@circuit\nGrid -- PCC\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "YAML anchors and aliases",
+      "valid": true,
+      "text": "@circuit\nGrid -- PCC\nbase: &base {s_base: 1.0e6}\nsimulation:\n  t_end: &end 0.1\n  output: {period: *end}\n"
+    },
+    {
+      "name": "quoted parameter domain",
+      "valid": true,
+      "text": "@circuit\nGrid -- PCC\n\"base\": {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "detailed views and declarations",
+      "valid": true,
+      "text": "@circuit\nGrid -- PCC -- VSC\n&Loads: Load\n@VSC\nPLL.theta -> Current.theta\nVSC: vsc, gfl\n  PLL: SRFPLL\n    kp: 0.5\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "no circuit view",
+      "valid": false,
+      "text": "@VSC\nCurrent -> PWM\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "capitalized circuit view",
+      "valid": false,
+      "text": "@Circuit\nGrid -- PCC\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "malformed view header",
+      "valid": false,
+      "text": "@circuit wrong\nGrid -- PCC\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "duplicate view",
+      "valid": false,
+      "text": "@circuit\nA -- B\n@circuit\nB -- C\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "incomplete connection",
+      "valid": false,
+      "text": "@circuit\nGrid --\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "unrecognized view statement",
+      "valid": false,
+      "text": "@circuit\nGrid PCC\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "tab-indented declaration block",
+      "valid": false,
+      "text": "@circuit\nVSC: vsc\n\tPLL: SRFPLL\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "declaration without a type",
+      "valid": false,
+      "text": "@circuit\nGrid -- vsc\nvsc:\n  PLL: SRFPLL\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "duplicate parameter domain",
+      "valid": false,
+      "text": "@circuit\nA -- B\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\nsimulation: {t_end: 2}\n"
+    },
+    {
+      "name": "unknown parameter domain",
+      "valid": false,
+      "text": "@circuit\nA -- B\nbase: {s_base: 1.0e6}\nextra: {value: 1}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "indented line without a declaration",
+      "valid": false,
+      "text": "@circuit\nA -- B\n  kp: 1\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    }
+  ]
+}

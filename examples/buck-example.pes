@@ -3,6 +3,9 @@
 # resistive load. The half bridge owns only its power stage; the filter inductance, bus capacitor
 # and load remain independently connected network components. Electrical values are SI.
 
+@circuit
+converter -- output -- load
+
 base:
   s_base: 500.0
   v_ll_rms: 230.0

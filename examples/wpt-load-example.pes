@@ -2,6 +2,9 @@
 # Independent series load, explicitly selected load-power feedback and local RMS protection.
 # Measurement routing is explicit; no communication transport or phase-zero override is implied.
 
+@circuit
+primary -- charger -- secondary -- load
+
 base:
   s_base: 5000.0
   v_ll_rms: 400.0

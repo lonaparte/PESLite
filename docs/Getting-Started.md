@@ -8,11 +8,13 @@ new simulation file.
 | Installation | pip | Conda |
 | --- | --- | --- |
 | Core runtime | `python -m pip install peslite-core` | `conda install peslite-core` |
-| Default, including built-in addons | `python -m pip install peslite` | `conda install peslite` |
-| All runtime features | `python -m pip install peslite-full` | `conda install peslite-full` |
+| Default, including core addons | `python -m pip install peslite` | `conda install peslite` |
+| GUI and default features | `python -m pip install peslite-gui` | `conda install peslite-gui` |
+| All features | `python -m pip install peslite-full` | `conda install peslite-full` |
 
-The default installation keeps each built-in addon together with its runtime dependencies. The
-core installation retains the addon extension interface without installing built-in addons.
+All four distributions use the same `peslite` Python package and command. `peslite-core` provides
+the simulation runtime and extension interfaces, `peslite` adds the built-in core addons,
+`peslite-gui` adds the graphical workbench, and `peslite-full` installs all addon support.
 
 Check the command-line interface:
 
@@ -112,7 +114,10 @@ The simulation file, extension paths and local output layout are described toget
 
 A compact complete case looks like this:
 
-```yaml
+```text
+@circuit
+grid -- pcc -- vsc
+
 base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
 
 buses:

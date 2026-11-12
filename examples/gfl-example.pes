@@ -1,12 +1,16 @@
 # PESLite 0.5.2
 # Grid-following converter on a Thevenin grid: an annotated simulation file.
-# A simulation file is YAML (named .pes): the model (base, buses, branches, sources, units, elements),
-# what happens during the run (events), how it is simulated (simulation), then notes (meta). A key that
+# A simulation file combines interface views with YAML parameter domains: the model (base, buses,
+# branches, sources, units, elements), what happens during the run (events), how it is simulated
+# (simulation), then notes (meta). A key that
 # is left out takes its default; the commented keys show every option. Run
 # `peslite inspect gfl-example --resolved` to print this file with every value written out.
 # A name without a suffix is in SI units, a `_pu` name in pu:
 # network quantities on the system base, converter quantities on the unit's own base; a quantity can
 # also be given in SI by dropping `_pu` (e.g. `l_f: 1.5e-4` in H). A switch is 1 (on) or 0 (off).
+
+@circuit
+grid -- pcc -- vsc
 
 base:                      # system base
   s_base: 2.0e6            # VA

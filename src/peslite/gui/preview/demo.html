@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PESLite standalone preview</title>
+  <link rel="stylesheet" href="./workbench.css">
+</head>
+<body>
+<div class="workbench" id="workbench">
+  <header><strong>PESLite</strong><span id="workspace-name">Preview</span></header>
+  <div class="body">
+    <aside id="explorer"><div class="aside-title">EXPLORER</div><div id="files"></div></aside>
+    <div class="sash" id="explorer-sash" aria-label="Resize explorer"></div>
+    <section class="editor">
+      <div class="tab"><span id="file-name">sample.pes</span><button id="save" type="button">Save</button></div>
+      <textarea id="source" aria-label="PES source" spellcheck="false"></textarea>
+    </section>
+    <div class="sash" id="editor-sash" aria-label="Resize editor"></div>
+    <main id="preview"></main>
+  </div>
+  <footer><span id="status">Ready</span><span>Ctrl+B Explorer · Ctrl+S Save</span></footer>
+</div>
+<script id="sample" type="text/plain">@circuit
+Grid -- PCC -- VSC
+PCC -- Load1
+PCC -- Load2
+&Loads: Load1, Load2
+
+@VSC
+PLL.theta -> Current.theta
+DC.id_ref -> Current.id_ref
+Current -> PWM
+
+VSC: vsc, gfl
+  PLL: SRFPLL
+    kp_pu: 20
+  Current: CurrentLoop
+  PWM: ThreePhaseModulation
+  DC: DCVoltageControl
+
+base:
+  s_base: 2.0e6
+
+simulation:
+  t_end: 1.0
+  solver: {dt: 25e-6}
+
+events:
+  connect_vsc: {type: connect, target: VSC, t: 0.2}
+  disconnect_vsc: {type: disconnect, target: VSC, t: 0.7}
+</script>
+<script src="./dist/pes-preview.iife.js"></script>
+<script src="./workbench.js"></script>
+</body>
+</html>

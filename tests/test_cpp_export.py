@@ -15,7 +15,7 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import from_dict
+from peslite.assembly.params import from_dict, to_dict
 from peslite.components import Bag, Port
 from peslite.components.network import Element, _register_assembled_type
 from peslite.solver import BlackBoxSubsystem
@@ -1072,7 +1072,8 @@ def test_generated_cpp_matches_composite_wpt_switching_events(tmp_path):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
-    tree = yaml.safe_load((EXAMPLES / "wpt-example.pes").read_text(encoding="utf-8"))
+    from peslite.assembly.params import read_tree
+    tree = read_tree(EXAMPLES / "wpt-example.pes")
     for side in ("primary", "secondary"):
         tree["units"]["charger"][side]["bridge"] = {"model": "pwm_averaging"}
     tree["events"] = {
@@ -1232,7 +1233,8 @@ def test_generic_cpp_fallback_lowers_custom_equations_and_state_branches(tmp_pat
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
-    tree = yaml.safe_load((EXAMPLES / "gfl-example.pes").read_text(encoding="utf-8"))
+    from peslite.assembly.params import read_tree
+    tree = read_tree(EXAMPLES / "gfl-example.pes")
     tree["elements"] = {"conditional": {
         "type": "test_conditional_element",
         "bus": "pcc",
@@ -1320,6 +1322,21 @@ def test_generated_cpp_runtime_parameters(tmp_path):
     configured_params = peslite.load(configured_output / "simulation.pes")
     assert configured_params.simulation.t_end == pytest.approx(0.205)
     assert configured_params.unit("vsc").ctrl.references.p_ref_pu == pytest.approx(0.4)
+
+    viewed = project / "viewed.pes"
+    viewed.write_text(config.read_text(encoding="utf-8").replace(
+        "@circuit\n",
+        "@circuit  # system\ngrid -- pcc -- vsc\n"
+        "@vsc\nPLL.theta -> Current.theta\nCurrent -> PWM\n",
+        1,
+    ), encoding="utf-8")
+    viewed_output = project / "viewed-output"
+    viewed_run = subprocess.run([
+        executable, "--config", viewed,
+        "--set", "simulation.t_end=0.205", "--out", viewed_output,
+    ], capture_output=True, text=True)
+    assert viewed_run.returncode == 0
+    assert to_dict(peslite.load(viewed_output / "simulation.pes")) == to_dict(configured_params)
 
     rejected = subprocess.run(
         [executable, "--set", "units.vsc.ctrl.references.q_ref_pu=0.2"],

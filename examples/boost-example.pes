@@ -3,6 +3,9 @@
 # the input port, while the converter's standard DC link is the regulated output capacitor.
 # Electrical values are SI.
 
+@circuit
+supply -- input -- converter
+
 base:
   s_base: 500.0
   v_ll_rms: 230.0

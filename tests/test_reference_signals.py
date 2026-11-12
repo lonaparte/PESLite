@@ -53,6 +53,41 @@ def test_advanced_interpolation_is_constructed_once_and_evaluated_as_a_table(met
     assert math.isfinite(signal(0.25))
 
 
+def test_table_bounds_cover_internal_extrema_and_only_the_repeated_phase_window():
+    linear = TableSignal(time=[0.0, 1.0, 2.0], value=[0.0, 2.0, 0.0])
+    cubic = TableSignal(
+        time=[0.0, 1.0, 2.0, 3.0], value=[0.0, 1.0, 0.0, 1.0],
+        interpolation="cubic",
+    )
+    repeated = TableSignal(
+        time=[0.0, 1.0, 2.0], value=[0.0, 2.0, 0.0], repeat=True,
+    )
+    discontinuous = TableSignal(time=[0.0, 1.0], value=[2.0, 5.0], repeat=True)
+
+    assert linear.bounds(0.25, 1.75) == pytest.approx((0.5, 2.0))
+    low, high = cubic.bounds(0.0, 3.0)
+    assert low < 0.0 and high > 1.0
+    assert repeated.bounds(2.25, 2.75) == pytest.approx((0.5, 1.5))
+    assert repeated.bounds(3.75, 4.25) == pytest.approx((0.0, 0.5))
+    assert repeated.bounds(0.0, 2.0) == pytest.approx((0.0, 2.0))
+    assert discontinuous.bounds(0.0, 1.0) == pytest.approx((2.0, 5.0))
+
+
+def test_table_bounds_follow_extrapolation_and_reject_invalid_windows():
+    linear = TableSignal(
+        time=[1.0, 2.0], value=[2.0, 4.0], extrapolation="linear",
+    )
+    strict = TableSignal(
+        time=[1.0, 2.0], value=[2.0, 4.0], extrapolation="error",
+    )
+
+    assert linear.bounds(0.0, 3.0) == pytest.approx((0.0, 6.0))
+    with pytest.raises(ValueError, match="before the table interval"):
+        strict.bounds(0.0, 1.5)
+    with pytest.raises(ValueError, match="finite start <= stop"):
+        linear.bounds(2.0, 1.0)
+
+
 @pytest.mark.parametrize("change", [
     {"time": []},
     {"time": [0.0, 0.0], "value": [0.0, 1.0]},
@@ -408,7 +443,7 @@ def test_table_values_reuse_the_control_type_reference_validation(examples):
     tree = _signal_case(examples)
     tree["signals"]["duty_profile"]["value"] = [0.2, 1.1, 0.4]
 
-    with pytest.raises(ConfigError, match=r"signals\.duty_profile\.value\[1\]\.duty"):
+    with pytest.raises(ConfigError, match=r"signals\.duty_profile reaches 1\.1 during the run:.*duty"):
         from_dict(tree)
 
 
@@ -523,23 +558,39 @@ def test_continuous_graph_reads_the_table_at_its_existing_evaluation_time(exampl
 def test_runtime_playback_error_names_the_bound_reference(examples):
     tree = _signal_case(examples)
     tree["signals"]["duty_profile"]["extrapolation"] = "error"
+    with pytest.raises(ConfigError, match=r"references\.duty: signals\.duty_profile: time 0\.008"):
+        from_dict(tree)
+    tree["simulation"]["t_end"] = 0.004
     ctrl = peslite.Simulation(from_dict(tree)).unit("converter").ctrl
 
     with pytest.raises(FloatingPointError, match="controller reference 'duty' failed"):
         ctrl.graph.sample(0.005, ConverterMeasurement(vin=48.0))
 
 
-def test_runtime_validation_catches_interpolation_overshoot(examples):
+def test_parse_validation_catches_interpolation_overshoot(examples):
     tree = _signal_case(examples)
     tree["signals"]["duty_profile"] = {
         "time": [0.0, 0.001, 0.002, 0.003],
         "value": [0.0, 1.0, 0.0, 1.0],
         "interpolation": "cubic",
     }
-    ctrl = peslite.Simulation(from_dict(tree)).unit("converter").ctrl
+    with pytest.raises(ConfigError, match=r"signals\.duty_profile reaches -?\d.*duty must be in \[0, 1\]"):
+        from_dict(tree)
+    tree["signals"]["duty_profile"]["interpolation"] = "pchip"
+    assert from_dict(tree).unit("converter").ctrl._reference_bindings
 
-    with pytest.raises(FloatingPointError, match=r"duty must be in \[0, 1\]"):
-        ctrl.graph.sample(0.00075, ConverterMeasurement(vin=48.0))
+
+def test_repeated_signal_validation_uses_only_the_phases_reached_by_the_run(examples):
+    tree = _signal_case(examples)
+    tree["signals"]["duty_profile"] = {
+        "time": [0.0, 1.0, 2.0], "value": [0.2, 0.4, 1.2], "repeat": True,
+    }
+    tree["simulation"]["t_end"] = 0.5
+    assert from_dict(tree).unit("converter").ctrl._reference_bindings
+
+    tree["simulation"]["t_end"] = 2.1
+    with pytest.raises(ConfigError, match=r"signals\.duty_profile reaches 1\.2"):
+        from_dict(tree)
 
 
 def test_signal_configuration_survives_dump_and_load(examples, tmp_path):

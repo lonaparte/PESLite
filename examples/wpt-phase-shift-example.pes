@@ -2,6 +2,9 @@
 # SS WPT with a square-wave primary and a diode full-bridge rectifier. Power feedback commands
 # pulse width, while pulse synchronisation lets an active pulse finish before a pattern update.
 
+@circuit
+primary -- charger -- secondary
+
 base:
   s_base: 5000.0
   v_ll_rms: 400.0

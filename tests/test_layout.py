@@ -1,4 +1,4 @@
-"""The package has five code parts; the root examples directory contains YAML-format .pes files."""
+"""The package has five code parts; the root examples directory contains native .pes files."""
 
 import ast
 from pathlib import Path
@@ -21,7 +21,7 @@ BELOW = {
     "control": {"solver", "control"},
     "components": {"solver", "control", "components"},
     "assembly": {"solver", "control", "components", "assembly"},
-    "addons": {"solver", "control", "components", "addons"},
+    "addons": {"solver", "control", "components", "assembly", "addons"},
 }
 TOP = {"solver/simulation.py"}
 INTEGRATIONS = {"gui"}

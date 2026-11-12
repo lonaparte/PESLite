@@ -1,5 +1,8 @@
 # PESLite 0.5.2
 # A grid-following converter connected to a stiff grid through the custom distributed cable model.
+@circuit
+grid -- grid_bus -- pcc -- vsc
+
 base: {s_base: 10.0e6, v_ll_rms: 10.0e3, f0: 50.0}
 buses:
   grid_bus: {c_pu: 0.02, r_d_pu: 0.5}

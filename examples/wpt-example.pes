@@ -4,6 +4,9 @@
 # Each bridge and matching magnetic-link port share one scoped named bus. Electrical plant
 # values are SI.
 
+@circuit
+primary -- charger -- secondary
+
 base:
   s_base: 5000.0
   v_ll_rms: 400.0

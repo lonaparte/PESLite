@@ -29,6 +29,20 @@ def _finite_sequence(values: Any, name: str) -> tuple[float, ...]:
     return result
 
 
+def _quadratic_roots(a: float, b: float, c: float) -> tuple[float, ...]:
+    """Return the finite real roots of ``a*x**2 + b*x + c``."""
+    scale = max(abs(a), abs(b), abs(c), 1.0)
+    if abs(a) <= math.ulp(scale):
+        return () if abs(b) <= math.ulp(scale) else (-c / b,)
+    discriminant = b * b - 4.0 * a * c
+    tolerance = 8.0 * math.ulp(max(b * b, abs(4.0 * a * c), 1.0))
+    if discriminant < -tolerance:
+        return ()
+    root = math.sqrt(max(0.0, discriminant))
+    q = -0.5 * (b + math.copysign(root, b))
+    return (q / a, c / q) if q else (-b / (2.0 * a),)
+
+
 @dataclass(frozen=True)
 class TableSignal:
     """A scalar signal defined on absolute simulation time.
@@ -126,6 +140,74 @@ class TableSignal:
         side = "before" if left else "after"
         raise ValueError(f"time {t:.12g} is {side} the table interval")
 
+    def _piece_values(self, start: float, stop: float) -> list[float]:
+        """Extrema candidates from table pieces intersecting one in-table interval."""
+        if start > stop:
+            return []
+        values = [self(start), self(stop)]
+        for index, (left, right) in enumerate(zip(self.time, self.time[1:])):
+            low, high = max(start, left), min(stop, right)
+            if low > high:
+                continue
+            if self.interpolation == "zero_order_hold":
+                if low < high:
+                    values.append(self.value[index])
+                if high == right:
+                    values.append(self.value[index + 1])
+                continue
+            values.extend((self(low), self(high)))
+            if high == right:
+                values.append(self.value[index + 1])
+            if self.interpolation in ("cubic", "pchip"):
+                cubic, square, slope = self._coefficients[index][:3]
+                for position in _quadratic_roots(3.0 * cubic, 2.0 * square, slope):
+                    if low - left < position < high - left:
+                        result = 0.0
+                        for coefficient in self._coefficients[index]:
+                            result = result * position + coefficient
+                        values.append(result)
+        return values
+
+    def bounds(self, start: float, stop: float) -> tuple[float, float]:
+        """Return tight lower and upper bounds on the closed interval ``[start, stop]``."""
+        start, stop = float(start), float(stop)
+        if not math.isfinite(start) or not math.isfinite(stop) or start > stop:
+            raise ValueError("signal bounds require finite start <= stop")
+        first, last = self.time[0], self.time[-1]
+        if self.extrapolation == "error" and (start < first or (not self.repeat and stop > last)):
+            self(start if start < first else stop)
+
+        values: list[float] = []
+        before_stop = min(stop, first)
+        if start < first:
+            values.extend((self._outside(start, left=True),
+                           self._outside(before_stop, left=True)))
+        inside_start = max(start, first)
+        if inside_start <= stop:
+            if not self.repeat:
+                inside_stop = min(stop, last)
+                if inside_start <= inside_stop:
+                    values.extend(self._piece_values(inside_start, inside_stop))
+                if stop > last:
+                    values.extend((self._outside(max(start, last), left=False),
+                                   self._outside(stop, left=False)))
+            else:
+                period = last - first
+                duration = stop - inside_start
+                if duration >= period:
+                    values.extend(self._piece_values(first, last))
+                else:
+                    phase_start = first + math.fmod(inside_start - first, period)
+                    phase_stop = phase_start + duration
+                    if phase_stop <= last:
+                        values.extend(self._piece_values(phase_start, phase_stop))
+                    else:
+                        values.extend(self._piece_values(phase_start, last))
+                        values.extend(self._piece_values(first, first + phase_stop - last))
+        if not values:  # a one-point interval at the first table time
+            values.append(self(start))
+        return min(values), max(values)
+
     def __call__(self, t: float) -> float:
         """Evaluate the table at absolute time ``t``."""
         t = float(t)
@@ -164,7 +246,14 @@ class ReferenceBinding:
     integer: bool = False
 
     def __call__(self, t: float) -> float | int:
-        value = self.scale * self.signal(t)
+        return self._cast(self.scale * self.signal(t))
+
+    def bounds(self, start: float, stop: float) -> tuple[float | int, float | int]:
+        """Return this converted reference's range over one simulation window."""
+        low, high = sorted(self.scale * value for value in self.signal.bounds(start, stop))
+        return self._cast(low), self._cast(high)
+
+    def _cast(self, value: float) -> float | int:
         return int(round(value)) if self.integer else value
 
 

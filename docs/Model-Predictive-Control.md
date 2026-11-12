@@ -84,9 +84,9 @@ Either predictive loop accepts `algorithm: ccs` or `algorithm: fcs`.
 | `rate_weight` (S) | Nonnegative squared duty-increment weight relative to the preceding command. |
 | `input_min`, `input_max` | Duty bounds, within `[0, 1]`, applied to every controlled leg. |
 | `current_min`, `current_max` | Optional lower/upper predicted current bounds in amperes, applied separately to each controlled coordinate. |
-| `max_iterations` | CCS solver iteration limit. |
+| `max_iterations` | CCS active-set iteration limit. |
 | `max_evaluations` | FCS search-work limit. |
-| `tolerance` | SLSQP stopping tolerance for the coefficient-normalized objective. |
+| `tolerance` | CCS optimality tolerance. |
 | `feasibility_tolerance` | Absolute tolerance used when checking constraint satisfaction. |
 | `fallback` | Action on failure: `hold`, `fixed` or `block`. |
 | `fallback_input` | Explicit duty vector for `fixed` fallback. |
@@ -173,16 +173,11 @@ one dimension-compatible affine model per stage for known disturbances or varyin
 determine the units of every weight and constraint; the feasibility tolerance is absolute in
 each coordinate.
 
-CCS-MPC solves the constrained quadratic objective with SciPy SLSQP. SciPy is already a core
-dependency; no additional optimizer package is required. Solver success alone is insufficient:
-the returned action must be finite, feasible and satisfy a KKT optimality check. Failed solves
-use a separate linear-feasibility check instead of interpreting backend-specific status codes.
-The SLSQP adapter divides the quadratic and linear objective coefficients by one common
-positive scale and omits the constant during optimization. This leaves the minimizer and
-constraints unchanged and avoids false convergence at large physical-current scales.
-Reported objective values retain their original units. `tolerance` is the stopping tolerance
-for this normalized objective, not a bound on control-action error; feasibility is checked
-separately in the configured coordinates.
+CCS-MPC uses a deterministic primal active-set solver. It starts from the supplied feasible plan
+or obtains one through a linear phase-I solve, then adds and removes active constraints in a
+reduced space. The configured positive-semidefinite objective is not regularized. Solver success
+alone is insufficient: PESLite independently checks dimensions, finiteness, feasibility and KKT
+optimality. `solve_slsqp` remains available as an explicit custom backend.
 
 `FCSMPC(actions, prediction_horizon, prediction, objective, ...)` takes a matrix of finite
 input vectors and independent callbacks: `prediction(x, u, k)` returns the next state,
@@ -285,8 +280,8 @@ The numerical status is `optimal`, `infeasible`, `inaccurate`, `solver_failure`,
 more specific failure status. Iteration/evaluation limits are deterministic work limits;
 there is no wall-clock deadline.
 
-An exhaustive FCS search reporting `infeasible` found no admissible sequence. A generic SLSQP
-`solver_failure` does not prove infeasibility; it reports that the numerical solve failed.
+An exhaustive FCS search or the active-set phase-I solve reporting `infeasible` found no
+admissible sequence. A generic backend's `solver_failure` does not prove infeasibility.
 
 Infeasibility, solver failure, nonfinite output and solver-work limits produce an unsuccessful
 result and a configured deterministic fallback:

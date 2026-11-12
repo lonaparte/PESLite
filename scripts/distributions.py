@@ -59,7 +59,7 @@ def selections() -> dict[str, set[Path]]:
             if overlap:
                 raise RuntimeError(f"{left} and {right} both own {sorted(map(str, overlap))}")
     if set().union(*(selected[name] for name in code)) != groups["all"]:
-        raise RuntimeError("the code distributions do not own every Python source file exactly once")
+        raise RuntimeError("the code distributions do not own every source file exactly once")
     staged = {name: selected[name] | _configured_files(config)
               for name, config in distributions.items()}
     names = tuple(distributions)
@@ -98,6 +98,19 @@ def stage(name: str, destination: str | Path) -> Path:
     return target
 
 
+def _run_build_steps(project: Path, config: dict) -> None:
+    """Run declarative asset builds inside a staged distribution tree."""
+    for step in config.get("build-steps", ()):
+        directory = (project / step["cwd"]).resolve()
+        if not directory.is_relative_to(project) or not directory.is_dir():
+            raise RuntimeError(f"invalid distribution build directory: {step['cwd']}")
+        command = step.get("command")
+        if not isinstance(command, list) or not command or not all(
+                isinstance(part, str) and part for part in command):
+            raise RuntimeError(f"invalid distribution build command: {command!r}")
+        subprocess.run(command, cwd=directory, check=True)
+
+
 def build(output: str | Path, *, isolation: bool = True) -> None:
     """Build every declared wheel and source archive sequentially."""
     _groups, distributions = _manifest()
@@ -108,6 +121,7 @@ def build(output: str | Path, *, isolation: bool = True) -> None:
         package_output.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=f"peslite-{name}-") as temporary:
             project = stage(name, Path(temporary) / name)
+            _run_build_steps(project, distributions[name])
             command = [sys.executable, "-m", "build", "--outdir", str(package_output)]
             if not isolation:
                 command.append("--no-isolation")

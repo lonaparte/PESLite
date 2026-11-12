@@ -10,7 +10,8 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import ConfigError, _unit_items
+from peslite.assembly.params import ConfigError, _unit_items, read_tree
+from peslite.assembly.simulation_file import parse_native_text
 from peslite.components.pwm import modulator_type
 from peslite.control.profiles import control_type
 
@@ -24,7 +25,7 @@ def _resolved(*args):
     output = io.StringIO()
     with redirect_stdout(output):
         assert peslite.main(["inspect", *args, "--resolved"]) == 0
-    return yaml.safe_load(output.getvalue())
+    return parse_native_text(output.getvalue())[0]
 
 
 def _models(*args):
@@ -74,7 +75,7 @@ def test_bridge_flag_keeps_an_incompatible_unit_with_a_warning(flag):
 @pytest.mark.parametrize("flag", ["--switching", "--pwm-averaging"])
 def test_bridge_flag_warns_and_keeps_a_model_whose_dormant_config_is_incompatible(
         flag, tmp_path):
-    tree = yaml.safe_load((EXAMPLES / "gfl-example.pes").read_text(encoding="utf-8"))
+    tree = read_tree(EXAMPLES / "gfl-example.pes")
     tree["units"]["vsc"]["bridge"] = {"model": "averaging"}
     tree["units"]["vsc"]["pwm"]["dead_time"] = 1.0
     path = tmp_path / "configured.pes"
@@ -120,7 +121,7 @@ def test_set_can_override_fixed_solver_presets(flag):
 
 
 def test_averaging_preset_overrides_file_solver_and_fixed_only_settings(tmp_path):
-    tree = yaml.safe_load((EXAMPLES / "gfl-example.pes").read_text(encoding="utf-8"))
+    tree = read_tree(EXAMPLES / "gfl-example.pes")
     tree["simulation"]["solver"].update({
         "type": "fixed", "method": "heun", "subsystems": {"vsc.dclink": 2},
     })

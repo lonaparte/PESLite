@@ -44,7 +44,8 @@ from .conduction import DiodeConduction, _LOCATOR_ITERATIONS, _MAX_COMMUTATIONS
 from .circuit import _BoundValue, _NETWORK_DECLARATION, _mode_decomposition, compile_network
 from .protection import ProtectionStats
 from .params import (BaseValues, ConfigError, SourceParams, UnitParams, _PARAMETER_RECORDER, _event_assignments,
-                     _written_out, connection_defaults, dumps, parameter_leaves)
+                     _native_text, _written_out, connection_defaults, dumps, parameter_leaves)
+from .simulation_file import PARAMETER_DOMAINS
 from .exporter import ExportResult, _exporter, _signal_names
 from .system import _source_scenario
 from .types import unit_type
@@ -955,36 +956,33 @@ def _implicit_solver(method: str, name: str, arguments: str,
         for (const auto& factor : implicit_factors)
             if (factor.h == h) return factor;
         if (implicit_factors.size() > 16) implicit_factors.clear();
-        constexpr std::size_t n = implicit_size;
-        std::vector<double> matrix(n * n);
-        for (std::size_t p = 0; p < implicit_stages; ++p)
-            for (std::size_t q = 0; q < implicit_stages; ++q)
-                for (std::size_t i = 0; i < state_count; ++i)
-                    for (std::size_t j = 0; j < state_count; ++j)
-                        matrix[(p * state_count + i) * n + q * state_count + j] =
-                            (p == q && i == j ? 1.0 : 0.0)
-                            - h * implicit_a[p][q] * implicit_jacobian[i * state_count + j];
+        const auto stage_entry = [&](std::size_t row, std::size_t column) {{
+            constexpr std::size_t stride = state_count ? state_count : 1;
+            return (row == column ? 1.0 : 0.0)
+                - h * implicit_a[row / stride][column / stride]
+                    * implicit_jacobian[(row % stride) * stride + column % stride];
+        }};
         ImplicitFactor factor{{h, {{}}, {{{interface_values}}}, {{}}}};
         const std::vector<std::vector<std::size_t>> group_indices{{{group_values}}};
         const std::size_t ni = factor.interface.size();
         std::vector<double> schur(ni * ni);
         for (std::size_t row = 0; row < ni; ++row)
             for (std::size_t column = 0; column < ni; ++column)
-                schur[row * ni + column] = matrix[factor.interface[row] * n + factor.interface[column]];
+                schur[row * ni + column] = stage_entry(factor.interface[row], factor.interface[column]);
         for (const auto& index : group_indices) {{
             const std::size_t ng = index.size();
             std::vector<double> diagonal(ng * ng), coupling(ni * ng), response(ng * ni);
             for (std::size_t row = 0; row < ng; ++row)
                 for (std::size_t column = 0; column < ng; ++column)
-                    diagonal[row * ng + column] = matrix[index[row] * n + index[column]];
+                    diagonal[row * ng + column] = stage_entry(index[row], index[column]);
             for (std::size_t row = 0; row < ni; ++row)
                 for (std::size_t column = 0; column < ng; ++column)
-                    coupling[row * ng + column] = matrix[factor.interface[row] * n + index[column]];
+                    coupling[row * ng + column] = stage_entry(factor.interface[row], index[column]);
             auto local = dense_factor(std::move(diagonal), ng);
             for (std::size_t column = 0; column < ni; ++column) {{
                 std::vector<double> rhs(ng);
                 for (std::size_t row = 0; row < ng; ++row)
-                    rhs[row] = matrix[index[row] * n + factor.interface[column]];
+                    rhs[row] = stage_entry(index[row], factor.interface[column]);
                 dense_solve(local, rhs);
                 for (std::size_t row = 0; row < ng; ++row) response[row * ni + column] = rhs[row];
             }}
@@ -2058,9 +2056,9 @@ class _RuntimeParameters:
             lines.append(f"std::cout << {_cpp_string(item.path + '  value=')} << {value} << '\\n';")
         return "\n    ".join(lines)
 
-    def resolved_template(self) -> tuple[str, list[tuple[str, str]]]:
+    def resolved_template(self, interface_text: str = "") -> tuple[str, list[tuple[str, str]]]:
         if not self.selected:
-            return dumps(self.source), []
+            return dumps(self.source, interface_text), []
         replacements: list[tuple[str, str]] = []
         public = {item.path for item in self.selected}
 
@@ -2094,7 +2092,7 @@ class _RuntimeParameters:
             body = json.dumps(tree, indent=2) + "\n"
             for marker, _expression in replacements:
                 body = body.replace(json.dumps(marker), marker)
-        return body, replacements
+        return _native_text(body, interface_text), replacements
 
 
 class _ModelGenerator:
@@ -8432,7 +8430,9 @@ class _CppGenerator:
         snapshot_values = "\n            ".join(f"states << ',' << ({value});" for value in state_values)
         output = self.p.simulation.output
         output_precision = self.runtime.value("simulation.output.precision", output.precision)
-        resolved_template, resolved_replacements = self.runtime.resolved_template()
+        resolved_template, resolved_replacements = self.runtime.resolved_template(
+            self.simulation.interface_text,
+        )
         resolved_text = _cpp_string(resolved_template)
         resolved_replace = "\n    ".join(
             f"replace_all(text, {_cpp_string(marker)}, {expression});"
@@ -8713,6 +8713,9 @@ class _CppGenerator:
         # inline the configured RHS and remove unused output paths without crossing a library ABI.
         action_times, action_cases = self._actions(model, generators)
         times = ", ".join(_number(value) for value in action_times)
+        parameter_domains = " || ".join(
+            f"key == {_cpp_string(name)}" for name in PARAMETER_DOMAINS
+        )
         return f'''// Generated by PESLite.  Do not edit: regenerate from the source simulation file.
 // Standalone C++17; no Python, NumPy, SciPy or YAML dependency at run time.
 #include <algorithm>
@@ -8844,6 +8847,7 @@ inline void load_config(RuntimeParameters& parameters, const std::filesystem::pa
     if (!input) throw std::runtime_error("cannot open config '" + file.string() + "'");
     std::vector<std::pair<std::size_t, std::string>> levels;
     std::size_t ignored = 0;
+    bool in_view = false;
     std::string line;
     while (std::getline(input, line)) {{
         std::size_t indent = 0;
@@ -8851,7 +8855,18 @@ inline void load_config(RuntimeParameters& parameters, const std::filesystem::pa
         std::string_view content = trim(std::string_view(line).substr(indent));
         if (content.empty() || content.front() == '#' || content == "---" ||
                 content == "..." || content.front() == '-') continue;
+        if (indent == 0 && content.front() == '@') {{
+            in_view = true;
+            levels.clear();
+            continue;
+        }}
         const auto colon = content.find(':');
+        if (in_view) {{
+            if (indent != 0 || colon == std::string_view::npos) continue;
+            const std::string key = yaml_key(content.substr(0, colon));
+            if (!({parameter_domains})) continue;
+            in_view = false;
+        }}
         if (colon == std::string_view::npos) continue;
         const std::string key = yaml_key(content.substr(0, colon));
         std::string_view value = trim(content.substr(colon + 1));
@@ -9172,7 +9187,8 @@ def _prepare_export(simulation, variables, reusable, *, params=None):
     token = _PARAMETER_RECORDER.set(recorder if parameterized else None)
     try:
         prepared = (simulation if reusable and not parameterized and p is simulation.p else
-                    Simulation(p, parts=simulation._factories))
+                    Simulation(p, parts=simulation._factories,
+                               interface_text=simulation.interface_text))
     finally:
         _PARAMETER_RECORDER.reset(token)
     return prepared, initializations

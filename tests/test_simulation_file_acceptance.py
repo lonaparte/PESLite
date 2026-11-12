@@ -15,6 +15,7 @@ from packaging.version import Version
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, dumps, from_dict, read_tree, to_dict
+from peslite.assembly.simulation_file import parse_native_text
 from peslite.control import LOOP_TYPES
 
 
@@ -144,7 +145,8 @@ def test_resolved_cli_prints_a_loadable_complete_file():
             "--set", "simulation.t_end=0.5",
             "--set", "units.vsc.pwm.f_sw=10000",
         ]) == 0
-    tree = yaml.safe_load(stream.getvalue())
+    tree, interface = parse_native_text(stream.getvalue())
+    assert "grid -- pcc -- vsc" in interface
     assert tree["simulation"]["t_end"] == 0.5
     assert tree["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)
     assert tree["units"]["vsc"]["ctrl"]["computation"] == pytest.approx(1e-6)
@@ -167,7 +169,7 @@ def test_saved_simulation_file_repeats_the_run(gfl, tmp_path):
 
 @pytest.mark.static
 @pytest.mark.parametrize("suffix", [".yaml", ".yml"])
-def test_yaml_suffixes_remain_supported(tmp_path, suffix):
+def test_native_document_can_be_loaded_from_an_explicit_yaml_path(tmp_path, suffix):
     copied = tmp_path / f"gfl{suffix}"
     shutil.copy(EXAMPLES / "gfl-example.pes", copied)
     assert to_dict(peslite.load(copied)) == to_dict(peslite.load(EXAMPLES / "gfl-example.pes"))

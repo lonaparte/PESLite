@@ -4,10 +4,42 @@ import numpy as np
 import pytest
 
 import peslite
+from peslite.assembly.cpp import _implicit_solver
 from conftest import EXAMPLES
 from test_cpp_export import _compiler, _final_csv, _run_generated
 
 pytestmark = pytest.mark.full
+
+
+def test_native_implicit_factor_assembles_only_required_blocks():
+    source = _implicit_solver(
+        "radau", "integrate", "", "1e-6", "1e-9", "1e-6", "",
+        n_states=5, groups=((0, 1), (2, 3)), interface=(4,),
+    )
+    assert "stage_entry" in source
+    assert "std::vector<double> matrix(n * n)" not in source
+
+
+def test_native_radau_group_interface_matches_python(tmp_path):
+    params = peslite.load(EXAMPLES / "two-converters-example.pes", **{
+        "events.connect_vsc_1.t": 0.0,
+        "events.connect_vsc_2.t": 0.0,
+        "simulation.solver.type": "fixed",
+        "simulation.solver.method": "radau",
+        "simulation.solver.circuit_model": "nodal",
+        "simulation.solver.rtol": 1e-8,
+        "simulation.solver.atol": 1e-9,
+        "simulation.solver.linearisations": 0,
+        "simulation.t_end": 2e-4,
+        "simulation.progress.enable": 0,
+        "simulation.energy_check": "off",
+        "simulation.output.states": True,
+        "simulation.output.signals": False,
+        "simulation.output.energy": False,
+    })
+    structure = peslite.System(params).model.linear_structure()
+    assert len(structure.groups) > 1 and structure.interface.size
+    _compare_native(params, tmp_path)
 
 
 def _compare_native(params, tmp_path, *, variables=(), rtol=1e-8, atol=1e-9,

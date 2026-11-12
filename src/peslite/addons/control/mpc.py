@@ -18,7 +18,7 @@ from typing import Callable
 import numpy as np
 
 __all__ = ["LinearModel", "QuadraticProblem", "SolverResult", "MPCResult",
-           "CCSMPC", "FCSMPC", "solve_slsqp"]
+           "CCSMPC", "FCSMPC", "solve_active_set", "solve_slsqp"]
 
 
 def _positive_integer(value, name):
@@ -244,6 +244,193 @@ def solve_slsqp(problem: QuadraticProblem) -> SolverResult:
                         iterations, int(result.get("nfev", 0)), str(result.message))
 
 
+def _qp_rows(problem: QuadraticProblem):
+    """Return normalized equality and upper-bound rows for one QP."""
+    size = len(problem.linear)
+    equalities, equality_limits, equality_errors = [], [], []
+    inequalities, limits, errors = [], [], []
+    impossible = False
+
+    def interval(row, low, high):
+        nonlocal impossible
+        scale = float(np.max(np.abs(row), initial=0.0))
+        if scale == 0.0:
+            impossible |= ((np.isfinite(low) and low > problem.feasibility_tolerance)
+                           or (np.isfinite(high) and high < -problem.feasibility_tolerance))
+            return
+        normalized = row / scale
+        error = problem.feasibility_tolerance / scale
+        if np.isfinite(low) and np.isfinite(high) and low == high:
+            equalities.append(normalized)
+            equality_limits.append(low / scale)
+            equality_errors.append(error)
+            return
+        if np.isfinite(high):
+            inequalities.append(normalized)
+            limits.append(high / scale)
+            errors.append(error)
+        if np.isfinite(low):
+            inequalities.append(-normalized)
+            limits.append(-low / scale)
+            errors.append(error)
+
+    for row, low, high in zip(np.eye(size), problem.lower, problem.upper):
+        interval(row, low, high)
+    for row, low, high in zip(problem.constraint_matrix,
+                              problem.constraint_lower, problem.constraint_upper):
+        interval(row, low, high)
+
+    def array(rows):
+        return np.asarray(rows, dtype=float).reshape(-1, size)
+
+    return (array(equalities), np.asarray(equality_limits), np.asarray(equality_errors),
+            array(inequalities), np.asarray(limits), np.asarray(errors), impossible)
+
+
+def solve_active_set(problem: QuadraticProblem) -> SolverResult:
+    """Solve a convex QP with a deterministic primal active-set method.
+
+    The initial plan is used directly when feasible; otherwise a linear phase-I solve finds a
+    feasible point or proves infeasibility. Equality constraints remain in the working set, and
+    dependent active inequalities are handled through rank-revealing reduced-space solves. The
+    original positive-semidefinite Hessian is not regularized, so the reported optimum is for the
+    configured objective rather than a perturbed problem.
+    """
+    from scipy.optimize import linprog, lsq_linear
+
+    size = len(problem.linear)
+    equality, equality_limit, equality_error, matrix, limit, error, impossible = _qp_rows(problem)
+    if impossible:
+        return SolverResult(None, False, "infeasible", message="The constraints are inconsistent")
+
+    coefficient_scale = max(
+        1.0,
+        float(np.max(np.abs(problem.hessian), initial=0.0)),
+        float(np.max(np.abs(problem.linear), initial=0.0)),
+    )
+    hessian = 0.5 * (problem.hessian + problem.hessian.T) / coefficient_scale
+    linear = problem.linear / coefficient_scale
+    eigenvalues = np.linalg.eigvalsh(hessian)
+    curvature_tolerance = 256.0 * np.finfo(float).eps * max(
+        1.0, float(np.max(np.abs(eigenvalues), initial=0.0)), size,
+    )
+    if eigenvalues[0] < -curvature_tolerance:
+        return SolverResult(None, False, "numerical_failure",
+                            message="The QP Hessian is not positive semidefinite")
+
+    solution = np.asarray(problem.initial, dtype=float).copy()
+
+    def feasible(value):
+        return ((not len(equality) or np.all(np.abs(equality @ value - equality_limit)
+                                             <= equality_error))
+                and (not len(matrix) or np.all(matrix @ value - limit <= error)))
+
+    if not feasible(solution):
+        phase = linprog(
+            np.zeros(size),
+            A_ub=matrix if len(matrix) else None,
+            b_ub=limit if len(matrix) else None,
+            A_eq=equality if len(equality) else None,
+            b_eq=equality_limit if len(equality) else None,
+            bounds=[(None, None)] * size,
+            method="highs",
+        )
+        if not phase.success:
+            status = "infeasible" if phase.status == 2 else "solver_failure"
+            return SolverResult(None, False, status, message=str(phase.message))
+        solution = np.asarray(phase.x, dtype=float)
+        if not feasible(solution):
+            return SolverResult(None, False, "numerical_failure",
+                                message="The phase-I solution violates the QP constraints")
+
+    stopping = max(problem.tolerance, 128.0 * np.finfo(float).eps)
+    active = [index for index, slack in enumerate(limit - matrix @ solution)
+              if slack <= stopping]
+    iterations = 0
+    while iterations < problem.max_iterations:
+        iterations += 1
+        working = (np.vstack((equality, matrix[active])) if active else equality)
+        if len(working):
+            _left, singular, right = np.linalg.svd(working, full_matrices=True)
+            rank_tolerance = np.finfo(float).eps * max(working.shape) * max(
+                1.0, float(singular[0]) if len(singular) else 1.0,
+            )
+            rank = int(np.count_nonzero(singular > rank_tolerance))
+            nullspace = right[rank:].T
+        else:
+            nullspace = np.eye(size)
+
+        gradient = hessian @ solution + linear
+        if nullspace.shape[1]:
+            reduced_hessian = nullspace.T @ hessian @ nullspace
+            reduced_gradient = nullspace.T @ gradient
+            if np.linalg.norm(reduced_gradient, ord=np.inf) <= stopping:
+                step = np.zeros(size)
+                has_flat_descent = False
+            else:
+                values, vectors = np.linalg.eigh(reduced_hessian)
+                components = vectors.T @ reduced_gradient
+                reduced_step = np.zeros_like(components)
+                curved = values > curvature_tolerance
+                reduced_step[curved] = -components[curved] / values[curved]
+                flat = ~curved
+                has_flat_descent = bool(
+                    np.any(np.abs(components[flat]) > stopping)
+                    and not np.any(np.abs(reduced_step[curved]) > stopping)
+                )
+                if has_flat_descent:
+                    reduced_step[flat] = -components[flat]
+                step = nullspace @ (vectors @ reduced_step)
+        else:
+            step = np.zeros(size)
+            has_flat_descent = False
+
+        if np.linalg.norm(step, ord=np.inf) <= stopping:
+            if not len(active):
+                return SolverResult(solution, True, "optimal", iterations, iterations, "Optimal")
+            unconstrained = np.linalg.lstsq(working.T, -gradient, rcond=None)[0]
+            inequality_multipliers = unconstrained[len(equality):]
+            residual = np.linalg.norm(working.T @ unconstrained + gradient, ord=np.inf)
+            if residual <= stopping and np.all(inequality_multipliers >= -stopping):
+                return SolverResult(solution, True, "optimal", iterations, iterations, "Optimal")
+            lower = np.r_[np.full(len(equality), -np.inf), np.zeros(len(active))]
+            multipliers = lsq_linear(
+                working.T, -gradient, bounds=(lower, np.full(len(working), np.inf)),
+                tol=max(min(stopping, 1e-12), 1e-14),
+                lsmr_tol=max(min(stopping, 1e-12), 1e-14),
+            )
+            residual = np.linalg.norm(working.T @ multipliers.x + gradient, ord=np.inf)
+            if residual <= stopping:
+                return SolverResult(solution, True, "optimal", iterations, iterations, "Optimal")
+            leaving = int(np.argmin(inequality_multipliers))
+            if inequality_multipliers[leaving] >= -stopping:
+                return SolverResult(solution, False, "numerical_failure", iterations, iterations,
+                                    "The active constraints have inconsistent multipliers")
+            del active[leaving]
+            continue
+
+        alpha, blocking = (np.inf if has_flat_descent else 1.0), None
+        active_set = set(active)
+        for index, row in enumerate(matrix):
+            if index in active_set:
+                continue
+            direction = float(row @ step)
+            if direction <= stopping:
+                continue
+            distance = float((limit[index] - row @ solution) / direction)
+            if distance <= alpha:
+                alpha, blocking = max(0.0, distance), index
+        if blocking is None and has_flat_descent:
+            return SolverResult(None, False, "unbounded", iterations, iterations,
+                                "The QP objective is unbounded")
+        solution += alpha * step
+        if blocking is not None:
+            active.append(blocking)
+
+    return SolverResult(solution, False, "iteration_limit", iterations, iterations,
+                        "Active-set iteration limit reached")
+
+
 def _linear_feasibility(lower, upper, matrix, constraint_lower, constraint_upper):
     """Return whether a bounded linear region is feasible, or ``None`` if undetermined."""
     from scipy.optimize import linprog
@@ -333,7 +520,7 @@ class CCSMPC:
         self.feasibility_tolerance = _positive(feasibility_tolerance, "feasibility_tolerance")
         if backend is not None and not callable(backend):
             raise TypeError("backend must be callable")
-        self.backend = solve_slsqp if backend is None else backend
+        self.backend = solve_active_set if backend is None else backend
 
     def solve(self, state, reference, previous_input=None, *, models=None, initial_plan=None):
         """Optimize from a copied state, optionally with one affine model per stage.
@@ -437,7 +624,7 @@ class CCSMPC:
             constraint_lower, constraint_upper, z, self.feasibility_tolerance,
         )
         stationarity_tolerance = max(
-            10.0 * np.sqrt(self.tolerance),
+            10.0 * self.tolerance,
             10.0 * self.feasibility_tolerance,
             100.0 * np.finfo(float).eps,
         )

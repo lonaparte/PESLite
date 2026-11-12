@@ -18,13 +18,14 @@ nav:
   - Getting Started: Getting-Started.md
   - Project Workspace: Project-Workspace.md
   - Simulation Files: Simulation-Files.md
+  - Graphical Interface: Graphical-Interface.md
   - Simulation:
       - Events Timeline: Events-Timeline.md
       - Solvers: Solvers.md
       - Multirate Simulation: Multirate-Simulation.md
       - Output and Results: Output-and-Results.md
   - Components:
-      - Passive Network Components: Passive-Network-Components.md
+      - Passive Components: Passive-Components.md
       - Electrical Sources: Electrical-Sources.md
       - Bridge and PWM: Bridge-and-PWM.md
       - Reference Signals: Reference-Signals.md

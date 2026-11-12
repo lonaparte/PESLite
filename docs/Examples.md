@@ -7,7 +7,7 @@ directory, so cloning the repository is not required.
 peslite gfl-example
 ```
 
-Each example is an ordinary YAML simulation file. Use it directly, print its fully resolved
+Each example is a plain-text simulation file. Use it directly, print its fully resolved
 configuration, or copy that resolved form as the starting point for another case.
 
 ```bash

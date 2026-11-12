@@ -1,6 +1,9 @@
 # PESLite 0.5.2
 # Finite-control-set current regulation on a stiff three-phase grid.
 # References use peak-phase per-unit bases; predictor currents are SI amperes.
+@circuit
+grid -- pcc -- vsc
+
 base: {s_base: 10000.0, v_ll_rms: 400.0, f0: 50.0}
 buses:
   pcc: {c_pu: 0.02, r_d_pu: 0.5}

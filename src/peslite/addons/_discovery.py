@@ -11,8 +11,8 @@ from typing import Iterable
 def discover_modules(package: str, paths: Iterable[str]) -> tuple[ModuleType, ...]:
     """Import every module directly contained in ``paths`` in deterministic order.
 
-    Importing a controller or component module executes its normal PESLite registration
-    decorators.  Python's module cache makes repeated discovery safe and inexpensive.
+    Importing an addon module executes its normal PESLite registration decorators. Python's module
+    cache makes repeated discovery safe and inexpensive.
     """
     prefix = f"{package}."
     names = sorted(

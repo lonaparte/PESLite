@@ -3,6 +3,9 @@
 # Both sides measure only their own port. Positive power leaves each converter.
 # The existing ADC averages instantaneous power over its PWM/control interval.
 
+@circuit
+primary -- charger -- secondary
+
 base:
   s_base: 5000.0
   v_ll_rms: 400.0

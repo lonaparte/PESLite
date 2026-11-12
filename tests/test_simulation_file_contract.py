@@ -1,21 +1,22 @@
 """Bundled simulation-file discovery and packaging."""
 
 import pytest
-import yaml
-
 from conftest import EXAMPLES
+from peslite.assembly.simulation_file import parse_native_text
 from peslite.solver import simulation
 from peslite.solver.simulation import _config_path
 
 pytestmark = pytest.mark.static
 
 
-def test_bundled_examples_are_named_pes_files_containing_yaml():
+def test_bundled_examples_are_native_pes_files():
     paths = {path.name: path for path in EXAMPLES.iterdir() if path.is_file()}
     assert paths and all(name.endswith("-example.pes") for name in paths)
     for path in paths.values():
         assert path.is_file()
-        assert isinstance(yaml.safe_load(path.read_text(encoding="utf-8")), dict)
+        parameters, interface = parse_native_text(path.read_text(encoding="utf-8"), path)
+        assert parameters
+        assert interface.startswith("@circuit")
 
 
 def test_command_line_finds_bundled_pes_files():
@@ -23,6 +24,16 @@ def test_command_line_finds_bundled_pes_files():
     assert found == (EXAMPLES / "gfl-example.pes").resolve()
     assert _config_path("gfl-example.pes") == found
     assert _config_path(None) == found
+
+
+def test_suffix_inference_discovers_only_native_pes_files(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "local.yaml").write_text("base: {s_base: 1}\n", encoding="utf-8")
+    with pytest.raises(FileNotFoundError):
+        _config_path("local")
+    native = tmp_path / "local.pes"
+    native.write_text("@circuit\n\nbase: {s_base: 1}\n", encoding="utf-8")
+    assert _config_path("local") == native.resolve()
 
 
 def test_installed_package_finds_examples_in_its_data_directory(tmp_path, monkeypatch):

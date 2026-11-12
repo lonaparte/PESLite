@@ -53,13 +53,27 @@ def main(directory: str = "dist") -> int:
     required = {
         "peslite-core": (
             "peslite/addons/functions/__init__.py",
+            "peslite/addons/formats/__init__.py",
             "share/peslite/examples/templates/template.pes",
         ),
         "peslite": (
+            "peslite/addons/formats/legacy_yaml.py",
             "peslite/addons/functions/small_signal.py",
             "share/peslite/examples/gfl-example.pes",
         ),
-        "peslite-gui": ("peslite/gui/service.py",),
+        "peslite-gui": (
+            "peslite/gui/legacy_yaml.py",
+            "peslite/gui/host.py",
+            "peslite/gui/service.py",
+            "peslite/gui/web_service.py",
+            "peslite/gui/workspace.py",
+            "peslite/gui/preview/dist/pes-preview.es.js",
+            "peslite/gui/preview/dist/pes-preview.iife.js",
+            "peslite/gui/preview/demo.html",
+            "peslite/gui/preview/workbench.css",
+            "peslite/gui/preview/workbench.js",
+            "peslite/gui/web_dist/index.html",
+        ),
     }
     for distribution, paths in required.items():
         for path in paths:

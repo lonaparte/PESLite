@@ -1,8 +1,8 @@
 """Implicit fixed-step integrators and shared Jacobian linear algebra.
 
 ``trapezoidal`` (Tustin) and ``radau`` (three-stage Radau IIA, order 5) solve their stage equations
-with a simplified Newton iteration. The small RK tableau is diagonalized so its Newton equation uses
-one shifted state solve per stage instead of one stage-expanded system. Exact present-mode netlist
+with a simplified Newton iteration. Diagonalizing the real RK tableau reduces its Newton equation
+to one shifted state solve per real eigenvalue or complex conjugate pair. Exact present-mode netlist
 blocks form the electrical part of the Jacobian; state columns with behavioral or cross-subsystem
 feedback and non-electrical states use finite differences of the complete ``f``.
 
@@ -427,30 +427,27 @@ class _ShiftFactor:
 
 
 class _Factor:
-    """Diagonalize the small Runge--Kutta tableau and solve one shifted state system per stage.
+    """Diagonalize a real RK tableau and solve once per real mode or conjugate pair.
 
-    Radau therefore factors three ``n``-state systems instead of one ``3n`` system. Each shifted
-    system uses the same netlist-derived group/interface partition and cached Schur elimination.
+    Three-stage Radau uses one real and one complex shifted state system. Both use the
+    netlist-derived group/interface partition and cached Schur elimination.
     """
 
     def __init__(self, J: NDArray[np.float64], structure: Structure, A: NDArray[np.float64],
                  h: float, owner: LinearSystem, method: str) -> None:
-        self.s = A.shape[0]
         values, vectors = np.linalg.eig(A)
-        self.vectors = vectors
-        self.inverse = np.linalg.inv(vectors)
-        self.parts: list[_ShiftFactor] = [None] * self.s
-        self.real: set[int] = set()
-        self.conjugate: set[int] = set()
+        self.s = A.shape[0]
+        self.real: list[tuple[int, _ShiftFactor]] = []
+        self.pairs: list[tuple[int, int, _ShiftFactor]] = []
         pending = set(range(self.s))
         factor_index = 0
         while pending:
             stage = min(pending)
             pending.remove(stage)
             value = values[stage]
+            partner = None
             if abs(value.imag) <= 1e-14 * max(1.0, abs(value.real)):
                 shift: complex | float = h * float(value.real)
-                self.real.add(stage)
             else:
                 partner = next(
                     (index for index in pending
@@ -461,26 +458,28 @@ class _Factor:
                 if partner is None:
                     raise RuntimeError("a real implicit tableau has an unpaired complex eigenvalue")
                 pending.remove(partner)
+                # Eigenvectors have arbitrary phases. Pair them before transforming real residuals.
+                vectors[:, partner] = vectors[:, stage].conjugate()
                 shift = h * value
             factor = _ShiftFactor(
                 J, structure, shift, owner, (h, method, factor_index)
             )
             factor_index += 1
-            self.parts[stage] = factor
-            if not isinstance(shift, float):
-                self.parts[partner] = factor
-                self.conjugate.add(partner)
+            if partner is None:
+                self.real.append((stage, factor))
+            else:
+                self.pairs.append((stage, partner, factor))
+        self.vectors = vectors
+        self.inverse = np.linalg.inv(vectors)
 
     def solve(self, r: NDArray[np.float64]) -> NDArray[np.float64]:
         """Solve ``(I - h A kron J) x = r`` in the tableau eigenbasis."""
         transformed = self.inverse @ np.asarray(r, dtype=complex)
-        for stage, factor in enumerate(self.parts):
-            if stage in self.real:
-                transformed[stage] = factor.solve(transformed[stage].real)
-            elif stage in self.conjugate:
-                transformed[stage] = np.conj(factor.solve(np.conj(transformed[stage])))
-            else:
-                transformed[stage] = factor.solve(transformed[stage])
+        for stage, factor in self.real:
+            transformed[stage] = factor.solve(transformed[stage].real)
+        for stage, partner, factor in self.pairs:
+            transformed[stage] = factor.solve(transformed[stage])
+            transformed[partner] = transformed[stage].conjugate()
         result = self.vectors @ transformed
         return np.asarray(result.real, dtype=float)
 
