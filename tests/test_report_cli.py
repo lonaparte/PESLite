@@ -2,13 +2,12 @@
 
 import json
 import shutil
-from types import SimpleNamespace
 
 import peslite
 import pytest
 
 from conftest import EXAMPLES
-from peslite.solver import simulation
+from peslite.addons import functions as addon_functions
 
 
 def _args(out, *options):
@@ -16,6 +15,11 @@ def _args(out, *options):
             "--set", "simulation.t_end=0.001",
             "--set", "simulation.energy_check=off",
             "--set", "simulation.progress.enable=0", *options]
+
+
+def _replace_report_resolver(monkeypatch, resolver):
+    monkeypatch.delattr(addon_functions, "small_signal_report", raising=False)
+    monkeypatch.setattr(addon_functions, "_resolve", resolver)
 
 
 def test_report_runs_the_main_simulation_once_and_preserves_config_metadata(tmp_path, monkeypatch):
@@ -57,21 +61,19 @@ def test_report_filename_does_not_change_with_the_bridge_preset(tmp_path, preset
     assert (tmp_path / "buck-example_report.json").is_file()
 
 
-@pytest.mark.parametrize("missing", ["peslite.addons.functions.small_signal", "peslite.addons.functions"])
-def test_missing_addon_warns_and_continues_the_ordinary_simulation(tmp_path, monkeypatch, missing):
+def test_missing_addon_warns_and_continues_the_ordinary_simulation(tmp_path, monkeypatch):
     def absent(_name):
-        raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+        raise addon_functions.FunctionUnavailableError("report provider is unavailable")
 
-    monkeypatch.setattr(simulation, "import_module", absent)
+    _replace_report_resolver(monkeypatch, absent)
     with pytest.warns(RuntimeWarning, match="addon is unavailable.*without a report"):
         assert peslite.main(_args(tmp_path, "--report")) == 0
     assert (tmp_path / "summary.json").is_file()
     assert not list(tmp_path.glob("*_report.json"))
 
 
-@pytest.mark.parametrize("addon", [SimpleNamespace(), SimpleNamespace(small_signal_report=None)])
-def test_addon_without_a_report_entry_point_warns_and_continues(tmp_path, monkeypatch, addon):
-    monkeypatch.setattr(simulation, "import_module", lambda _name: addon)
+def test_addon_without_a_report_entry_point_warns_and_continues(tmp_path, monkeypatch):
+    _replace_report_resolver(monkeypatch, lambda _name: None)
     with pytest.warns(RuntimeWarning, match="addon is unavailable"):
         assert peslite.main(_args(tmp_path, "--report")) == 0
     assert (tmp_path / "summary.json").is_file()
@@ -82,7 +84,7 @@ def test_an_installed_addons_missing_dependency_is_not_misreported_as_an_absent_
     def broken(_name):
         raise ModuleNotFoundError("missing analysis dependency", name="analysis_dependency")
 
-    monkeypatch.setattr(simulation, "import_module", broken)
+    _replace_report_resolver(monkeypatch, broken)
     with pytest.raises(ModuleNotFoundError, match="missing analysis dependency"):
         peslite.main(_args(tmp_path, "--report"))
     assert not (tmp_path / "summary.json").exists()
@@ -92,8 +94,7 @@ def test_report_runtime_errors_do_not_fall_back_to_running_the_simulation_again(
     def broken(*args, **kwargs):
         raise ValueError("report implementation failed")
 
-    monkeypatch.setattr(simulation, "import_module",
-                        lambda _name: SimpleNamespace(small_signal_report=broken))
+    _replace_report_resolver(monkeypatch, lambda _name: broken)
     with pytest.raises(ValueError, match="report implementation failed"):
         peslite.main(_args(tmp_path, "--report"))
     assert not (tmp_path / "summary.json").exists()
@@ -103,7 +104,7 @@ def test_without_the_flag_the_addon_is_not_imported(tmp_path, monkeypatch, capsy
     def forbidden(_name):
         raise AssertionError("normal CLI runs must not import the report addon")
 
-    monkeypatch.setattr(simulation, "import_module", forbidden)
+    _replace_report_resolver(monkeypatch, forbidden)
     assert peslite.main(_args(tmp_path)) == 0
     assert not list(tmp_path.glob("*_report.json"))
     assert "ph_verdict" not in json.loads((tmp_path / "summary.json").read_text())
@@ -131,7 +132,7 @@ def test_a_new_run_clears_its_previous_report_but_preserves_unrelated_files(tmp_
     unrelated = tmp_path / "other-case_report.json"
     unrelated.write_text('{"other": true}\n', encoding="utf-8")
     if missing_addon:
-        monkeypatch.setattr(simulation, "import_module", lambda _name: SimpleNamespace())
+        _replace_report_resolver(monkeypatch, lambda _name: None)
         with pytest.warns(RuntimeWarning, match="addon is unavailable"):
             assert peslite.main(_args(tmp_path, "--report")) == 0
     else:
@@ -141,7 +142,7 @@ def test_a_new_run_clears_its_previous_report_but_preserves_unrelated_files(tmp_
 
 
 def test_python_runs_use_the_same_report_file_lifecycle(tmp_path):
-    from peslite.addons.functions.small_signal import small_signal_report
+    from peslite.addons.functions import small_signal_report
 
     params = peslite.load(EXAMPLES / "buck-example.pes", **{
         "simulation.t_end": 0.001, "simulation.energy_check": "off",

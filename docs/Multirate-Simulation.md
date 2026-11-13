@@ -79,7 +79,10 @@ multirate, controller or PWM grid. An event inside a slow window is handled as d
 This case puts the DC link on a ten-system-step window while the remaining system uses RK4 with a
 maximum step of 25 microseconds:
 
-```yaml
+```text
+@circuit
+grid -- pcc -- vsc
+
 base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
 
 buses:

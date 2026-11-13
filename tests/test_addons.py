@@ -1,6 +1,8 @@
 """Add-on discovery plus a custom PLL assembled and run with built-in controller loops."""
 
 import importlib
+import inspect
+from pathlib import Path
 
 import numpy as np
 import peslite
@@ -80,12 +82,41 @@ class AddonElement:
     assert ELEMENT_TYPES["addon_test_element"].params.__module__ == imported[0].__name__
 
 
-def test_functions_hold_the_plotting_addon():
-    assert peslite.addons.functions.energy_closure is peslite.addons.energy_closure
-    assert peslite.addons.functions.plot_csv is peslite.addons.plot_csv
-    assert peslite.addons.functions.plot_result is peslite.addons.plot_result
-    assert set(peslite.addons.functions._ROOT_EXPORTS) <= set(peslite.addons.__all__)
-    assert "reference_csv" not in peslite.addons.__all__
+def test_functions_have_one_lazy_public_namespace():
+    functions = peslite.addons.functions
+    assert peslite.addons.__all__ == ["control", "components", "formats", "functions"]
+    assert not hasattr(peslite.addons, "plot_csv")
+    assert set(functions.__all__) == set(functions._EXPORTS)
+    assert len(set(functions._EXPORTS.values())) == len(functions._EXPORTS)
+
+    local = {}
+    for name, (module_name, attribute) in functions._EXPORTS.items():
+        value = getattr(functions, name)
+        qualified = (module_name if "." in module_name
+                     else f"{functions.__name__}.{module_name}")
+        assert callable(value)
+        assert value is getattr(importlib.import_module(qualified), attribute)
+        if "." not in module_name:
+            local.setdefault(module_name, set()).add(attribute)
+
+    directory = Path(functions.__file__).parent
+    for path in directory.glob("*.py"):
+        if path.stem.startswith("_"):
+            continue
+        module = importlib.import_module(f"{functions.__name__}.{path.stem}")
+        public_functions = {
+            name for name in module.__all__
+            if inspect.isfunction(getattr(module, name, None))
+            and getattr(module, name).__module__ == module.__name__
+        }
+        assert public_functions == local.get(path.stem, set())
+
+
+def test_missing_function_provider_has_one_facade_error(monkeypatch):
+    functions = peslite.addons.functions
+    monkeypatch.setitem(functions._EXPORTS, "missing_function", ("missing_provider", "run"))
+    with pytest.raises(functions.FunctionUnavailableError, match="missing_function"):
+        functions._resolve("missing_function")
 
 
 def test_mpc_is_a_control_addon():

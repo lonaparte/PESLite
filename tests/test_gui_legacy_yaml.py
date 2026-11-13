@@ -72,7 +72,7 @@ def test_legacy_adapter_is_a_lazy_function_addon():
 
     assert 'legacy_yaml_preview' in functions.__all__
     assert 'legacy_yaml_patch' in functions.__all__
-    assert 'legacy_yaml_preview' not in functions._ROOT_EXPORTS
+    assert functions._EXPORTS['legacy_yaml_preview'] == ('peslite.gui.legacy_yaml', 'preview')
 
 
 def test_additional_component_preserves_text_and_validates_model():
@@ -132,5 +132,5 @@ def test_addon_edits_are_public_lazy_functions():
         assert callable(function)
     assert all(function in functions.__all__ for function in (
         'legacy_yaml_add_component', 'legacy_yaml_remove_component', 'legacy_yaml_rewire'))
-    assert not any(function in functions._ROOT_EXPORTS for function in (
+    assert all(functions._EXPORTS[name][0] == 'peslite.gui.legacy_yaml' for name in (
         'legacy_yaml_add_component', 'legacy_yaml_remove_component', 'legacy_yaml_rewire'))

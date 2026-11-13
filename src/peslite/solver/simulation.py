@@ -26,7 +26,6 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
-from importlib import import_module
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from types import SimpleNamespace
@@ -422,7 +421,7 @@ class SimulationResult:
 
     def plot(self, columns: str | Iterable[str], **options: Any) -> Path:
         """Plot recorded columns from one result CSV through the optional plotting add-on."""
-        from ..addons import plot_result
+        from ..addons.functions import plot_result
 
         path = plot_result(self, columns, **options)
         if path not in self.files:
@@ -2094,8 +2093,8 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
         ap.error("--watch prints on the progress bar: add --progress")
     if args.plot:
         try:
-            from ..addons.functions import _resolve
-            _resolve("plot_result")
+            from ..addons import functions
+            _plot_result = functions.plot_result
         except (ImportError, RuntimeError) as exc:
             ap.error(f"--plot: {exc}")
     sim = _assemble_command(p, config, args.json, interface_text)
@@ -2103,14 +2102,11 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
     out = Path(args.out) if args.out else _RESULTS / f"{config.stem}{suffix}"
     reporter = None
     if args.report:
-        module_name = "peslite.addons.functions.small_signal"
         try:
-            addon = import_module(module_name)
-        except ModuleNotFoundError as exc:
-            if exc.name is None or not (exc.name == module_name or module_name.startswith(exc.name + ".")):
-                raise  # An installed addon's missing dependency is not an absent addon.
-        else:
-            reporter = getattr(addon, "small_signal_report", None)
+            from ..addons import functions
+            reporter = functions.small_signal_report
+        except functions.FunctionUnavailableError:
+            pass
         if not callable(reporter):
             warnings.warn("--report: the online stability analysis addon is unavailable; "
                           "continuing the simulation without a report", RuntimeWarning, stacklevel=2)

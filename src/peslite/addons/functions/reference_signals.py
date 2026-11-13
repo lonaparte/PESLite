@@ -37,6 +37,28 @@ _BINARY = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow)
 _UNARY = (ast.UAdd, ast.USub)
 
 
+def _sample_grid(start: float, stop: float, period: float) -> list[float]:
+    """Return a bounded, strictly increasing grid including both endpoints."""
+    for name, item in (("start", start), ("stop", stop), ("period", period)):
+        if (isinstance(item, bool) or not isinstance(item, (int, float))
+                or not math.isfinite(item)):
+            raise ValueError(f"{name} must be finite")
+    if stop <= start or period <= 0.0:
+        raise ValueError("stop must be greater than start and period must be positive")
+    count = int(math.floor((stop - start) / period))
+    if count > 1_000_000:
+        raise ValueError("the reference table would exceed one million samples")
+    times = [start + index * period for index in range(count + 1)]
+    tolerance = 1e-12 * max(1.0, abs(start), abs(stop))
+    if stop - times[-1] > tolerance:
+        times.append(stop)
+    else:
+        times[-1] = stop
+    if len(times) < 2 or any(b <= a for a, b in zip(times, times[1:])):
+        raise ValueError("the requested sample grid is not representable")
+    return times
+
+
 def _expression(source: str):
     if not isinstance(source, str) or not source.strip():
         raise ValueError("expression must be nonempty text")
@@ -152,19 +174,8 @@ def reference_expression(expression: str, *, start: float, stop: float, period: 
                          time_offset: float = 0.0, value_scale: float = 1.0,
                          value_offset: float = 0.0) -> dict:
     """Sample a safe scalar expression of ``t`` and return a native reference table."""
-    for name, item in (("start", start), ("stop", stop), ("period", period)):
-        if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item):
-            raise ValueError(f"{name} must be finite")
-    if stop <= start or period <= 0.0:
-        raise ValueError("stop must be greater than start and period must be positive")
     evaluate = _expression(expression)
-    count = int(math.floor((stop - start) / period))
-    times = [start + index * period for index in range(count + 1)]
-    tolerance = 1e-12 * max(1.0, abs(start), abs(stop))
-    if stop - times[-1] > tolerance:
-        times.append(stop)
-    else:
-        times[-1] = stop
+    times = _sample_grid(start, stop, period)
     values = [evaluate(t) for t in times]
     return reference_table(
         times, values, repeat=repeat, interpolation=interpolation,

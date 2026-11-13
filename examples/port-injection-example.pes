@@ -1,0 +1,29 @@
+# PESLite 0.5.2
+# One-ampere shunt current perturbation applied to a scalar RC network.
+
+@circuit
+stimulus -- pcc -- load
+
+base:
+  s_base: 1000.0
+  v_ll_rms: 230.0
+  f0: 50.0
+
+buses:
+  pcc: {phases: 1, c: 0.001}
+
+elements:
+  load: {type: resistor, bus: pcc, r: 10.0}
+  stimulus: {type: port_injection, bus: pcc,
+             amplitude: 1.0, frequency: 20.0}
+
+units: {}
+
+simulation:
+  t_end: 0.5
+  solver: {dt: 0.0001, linearisations: 0}
+  output: {signals: 1, states: 0}
+
+meta:
+  title: Physical current injection
+  description: Positive current is injected from ground into the PCC.

@@ -58,7 +58,7 @@ def main(directory: str = "dist") -> int:
         ),
         "peslite": (
             "peslite/addons/formats/legacy_yaml.py",
-            "peslite/addons/functions/small_signal.py",
+            "peslite/addons/functions/stability.py",
             "share/peslite/examples/gfl-example.pes",
         ),
         "peslite-gui": (

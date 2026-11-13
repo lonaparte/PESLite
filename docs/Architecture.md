@@ -1,7 +1,7 @@
 # Architecture
 
 PESLite separates physical components, controller logic, system assembly, numerical execution and
-optional add-ons. The five core directories keep ownership explicit while allowing the same
+add-ons. These directories keep ownership explicit while allowing the same
 configuration to run with different bridge and solver implementations.
 
 ## Interface versioning
@@ -22,25 +22,18 @@ src/peslite/
 └── addons/       control, component and function addons
     ├── control/      automatically discovered control-loop modules
     ├── components/   automatically discovered circuit-element modules
-    └── functions/    optional functions such as IEEE-style plotting
+    └── functions/    optional functions
 ```
 
 Dependencies point inward through small interfaces: components use the model kernel, controller
 logic uses typed signals, assembly wires both into a system, and `solver.simulation` schedules the
 assembled system.
 
-Controller and component modules in their respective add-on packages are imported once at package
-initialisation. Their decorators populate the same registries used by core types, so there is
-no add-on lookup or dispatch in the simulation hot path. Built-in function addons such as
-[plotting](Plotting.md) do not run unless explicitly invoked.
-The optional online stability analysis functions also live in `addons/functions`. They consume
-selected observations during a run and share the solver-side loop-map linearization. The runner
-exposes an optional observation callback on its existing event grid; core time stepping never
-imports the analysis implementation, and the CLI loads it only with `--report`. Split-error
-diagnostics use the same finite-difference calculation without depending on the addon. See
-[Online Stability Analysis](Online-Stability-Analysis.md).
+Addons use the same registries and runtime contracts as core implementations. Registration is
+completed before simulation, while function providers are loaded only when requested; neither adds
+dispatch to the simulation hot path. See [Extending PESLite](Extending-PESLite.md).
 
-Loading a simulation file also merges a sibling `PESaddons/` tree into these three package paths
+Loading a simulation file also merges a sibling `PESaddons/` tree into the matching package paths
 without adding run-loop work; see [Project Workspace](Project-Workspace.md).
 
 ## Components
@@ -170,7 +163,7 @@ use one integration method.
 - file events;
 - converter ADC, control, PWM load and switching instants;
 - continuous-unit measurement/protection clocks;
-- observation times requested by analyses such as the online stability report.
+- observation times requested by online system analysis.
 
 Multirate windows advance inside the solver and settle before model-changing events.
 
