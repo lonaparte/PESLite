@@ -119,8 +119,8 @@ progress is explicitly enabled; see
 peslite case.pes --report
 ```
 
-With the online stability analysis addon available, this also writes `case_report.json`; see
-[Online Stability Analysis](Online-Stability-Analysis.md#online-simulation-report).
+With the online system analysis addon available, this also writes `case_report.json`; see
+[Online System Analysis](Online-System-Analysis.md#online-simulation-report).
 
 ## Plot recorded waveforms
 

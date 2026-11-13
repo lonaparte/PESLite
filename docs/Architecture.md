@@ -29,16 +29,9 @@ Dependencies point inward through small interfaces: components use the model ker
 logic uses typed signals, assembly wires both into a system, and `solver.simulation` schedules the
 assembled system.
 
-Registration addon modules are imported once at package initialisation. Their declarations populate
-the same registries used by core types, so there is no add-on lookup or dispatch in the simulation
-hot path. Built-in function addons have one public
-facade, `peslite.addons.functions`; its catalog identifies each implementation provider and loads
-that provider only when the function is requested. Consumers never import a provider to locate a
-function. A function addon is an explicitly invoked capability outside the simulation core; merely
-installing it does not add work to a simulation. Analysis addons may consume selected observations
-through the runner's callback on its existing event grid while reusing solver-side calculations.
-Core time stepping does not import their implementations. See
-[Analysis Functions](Analysis-Functions.md).
+Addons use the same registries and runtime contracts as core implementations. Registration is
+completed before simulation, while function providers are loaded only when requested; neither adds
+dispatch to the simulation hot path. See [Extending PESLite](Extending-PESLite.md).
 
 Loading a simulation file also merges a sibling `PESaddons/` tree into the matching package paths
 without adding run-loop work; see [Project Workspace](Project-Workspace.md).
@@ -170,7 +163,7 @@ use one integration method.
 - file events;
 - converter ADC, control, PWM load and switching instants;
 - continuous-unit measurement/protection clocks;
-- observation times requested by analyses such as the online stability report.
+- observation times requested by online system analysis.
 
 Multirate windows advance inside the solver and settle before model-changing events.
 
