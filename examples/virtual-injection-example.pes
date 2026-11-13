@@ -36,7 +36,6 @@ units:
 
 simulation:
   t_end: 0.015
-  energy_check: "off"
   solver: {dt: 2.5e-6, linearisations: 0}
   output: {period: 1.0e-5, signals: 1}
 
