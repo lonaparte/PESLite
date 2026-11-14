@@ -40,21 +40,24 @@ branches:
 Branch current is positive from `bus1` to `bus2`. Both ports must use the same phase count.
 Use [Events Timeline](Events-Timeline.md) to connect or disconnect a branch.
 
-## Loads and resistors
+## Passive elements
 
 ```yaml
 elements:
   load: {type: load, bus: pcc, x_pu: 0.4, r_pu: 0.1}
   damping: {type: resistor, bus: pcc, r: 20.0}
+  compensation: {type: capacitor, bus1: input, bus2: output, c: 35.0e-9, r: 0.08}
 ```
 
 | `type` | Required fields | Optional fields | Connection |
 |---|---|---|---|
 | `load` | `bus`, `l` or `x_pu` | `r` or `r_pu` | series R-L branch from the bus to ground |
 | `resistor` | `bus`, `r` | `series` (default 0) | shunt resistor, or series resistor after the bus voltage driver |
+| `capacitor` | `bus1`, `bus2`, `c` | `r` (default 0) | capacitance with optional series resistance between two scalar terminals |
 
 `load.l` must be positive, `load.r` non-negative and `resistor.r` positive. Per-unit values use the
-system base.
+system base. Capacitor terminals must be distinct, `c` must be positive and `r` non-negative. The
+capacitor exposes `<element>.u`; energy accounting includes its stored energy and series loss.
 
 ## Connections
 
@@ -70,61 +73,3 @@ domains is rejected before simulation.
 
 Project component types registered under `PESaddons/components` use the same `elements` mapping;
 see [Extending PESLite](Extending-PESLite.md#custom-circuit-elements).
-
-## Magnetic components and compensation
-
-`magnetic_component` represents named windings through the ordinary component and netlist
-interfaces. Its `matrix` model accepts a symmetric positive-definite inductance matrix.
-`coupled_coils` is a concise configuration of the same component, not a second physical
-implementation.
-
-Each winding has positive and negative terminals connected to a named single-phase bus or scalar
-Unit port. The literal `ground` denotes the reference node. Winding names must be identifiers; the
-matrix row and column order follows `windings`. Negative mutual inductance reverses relative winding
-polarity. Optional winding `r` is the series copper resistance in ohms.
-
-Both forms publish `<element>.i_<winding>` (A), `<element>.u_<winding>` (V, including winding
-resistance), and restartable `i_mode_1`, `i_mode_2`, ... states. Stored energy includes every
-mutual-inductance term.
-
-```yaml
-buses:
-  tx_drive: {phases: 1}
-  tx_coil: {phases: 1}
-  rx_coil: {phases: 1}
-  rx_load: {phases: 1}
-
-elements:
-  drive: {type: voltage_source, bus: tx_drive, v: 24.0, r: 0.5}
-  tx_comp: {type: capacitor, bus1: tx_drive, bus2: tx_coil, c: 35.0e-9}
-  rx_comp: {type: capacitor, bus1: rx_coil, bus2: rx_load, c: 35.0e-9}
-  load: {type: resistor, bus: rx_load, r: 5.0}
-  coils:
-    type: coupled_coils
-    windings:
-      tx: {positive: tx_coil, negative: ground, r: 0.08}
-      rx: {positive: rx_coil, negative: ground, r: 0.10}
-    inductance:
-      - [100.0e-6, -20.0e-6]
-      - [-20.0e-6, 100.0e-6]
-```
-
-The equivalent general configuration replaces `type` and `inductance` with:
-
-```yaml
-    type: magnetic_component
-    model:
-      type: matrix
-      inductance:
-        - [100.0e-6, -20.0e-6]
-        - [-20.0e-6, 100.0e-6]
-```
-
-A separate `capacitor` add-on provides a two-terminal capacitance with optional series `r`
-(ESR). Combine it with existing branches, resistors and switches to construct SS, LCC or
-other compensation networks without changing the coupled magnetic component. Both elements
-reuse the ordinary circuit netlist and the same integration and energy accounting paths.
-
-The matrix model is linear and stationary; its inductance, winding count and terminals are
-assembly-time settings. All connected winding terminals use scalar electrical nodes. FEM execution
-and field reconstruction remain offline work.

@@ -31,7 +31,8 @@ meta: {}
 | Section | Contents | Reference |
 |---|---|---|
 | `base` | system power, voltage and frequency bases | [SI and per-unit values](#si-and-per-unit-values) |
-| `buses`, `branches`, `elements` | passive electrical network | [Passive Components](Passive-Components.md) |
+| `buses`, `branches`, common `elements` | passive electrical network | [Passive Components](Passive-Components.md) |
+| magnetic `elements` | coupled coils and imported magnetic models | [Magnetic Components](Magnetic-Components.md) |
 | `sources` | independent network sources | [Electrical Sources](Electrical-Sources.md) |
 | `units` with `type: vsc` | voltage-source converters | [Voltage-Source Converters](Voltage-Source-Converters.md) |
 | converter `bridge`, `pwm`, `ctrl`, `meas`, `protection` | bridge model and sampled control | [Bridge and PWM](Bridge-and-PWM.md) |

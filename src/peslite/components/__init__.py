@@ -21,7 +21,7 @@ from .pwm import (ZOH, CarrierComparison, PWM, PhaseShiftModulator, SwitchingSeq
                   SynchronousCarrier, make_modulator)
 from .wpt import (CompensatedLink, SwitchControlledCapacitor, SwitchedCompensatedLink,
                   make_wpt_link)
-from .magnetic import MagComponent, WindingParams
+from .magnetic import MagComponent, MagneticModel, WindingParams
 from .onnx import ONNXModel, ONNXStateParams
 
 __all__ = ["Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode",
@@ -35,5 +35,5 @@ __all__ = ["Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode",
            "FullBridge", "HalfBridgeDiodeConduction", "PWM", "SwitchingSequence",
            "CarrierComparison", "SynchronousCarrier", "ZOH", "PhaseShiftModulator", "make_modulator",
            "CompensatedLink", "SwitchedCompensatedLink", "SwitchControlledCapacitor", "make_wpt_link",
-           "MagComponent", "WindingParams",
+           "MagComponent", "MagneticModel", "WindingParams",
            "ONNXModel", "ONNXStateParams"]
