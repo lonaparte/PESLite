@@ -41,8 +41,9 @@ without adding run-loop work; see [Project Workspace](Project-Workspace.md).
 `components/network.py` contains grid sources, R-L branches, bus R-C nodes and registered element
 types. `components/converter.py` provides the common lossless bridge boundary, bridge topologies,
 simulation models and DC-link models. `components/wpt.py` provides compensated WPT links and
-switch-controlled capacitors. `components/adc.py` and `components/pwm.py` implement sampled
-converter peripherals.
+switch-controlled capacitors. `components/magnetic.py` implements magnetic windings through the
+same component and circuit-netlist contracts. `components/adc.py` and
+`components/pwm.py` implement sampled converter peripherals.
 
 Physical component state and parameters are SI quantities. Components declare ports, state,
 derivatives and energy/storage relationships without knowing the global system order.

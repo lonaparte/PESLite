@@ -71,19 +71,21 @@ domains is rejected before simulation.
 Project component types registered under `PESaddons/components` use the same `elements` mapping;
 see [Extending PESLite](Extending-PESLite.md#custom-circuit-elements).
 
-## Independent coupled coils and compensation
+## Magnetic components and compensation
 
-The `coupled_coils` add-on component models a symmetric positive-definite inductance matrix
-without a built-in compensation network. Each winding has its own positive and negative
-terminal, which can connect to a named single-phase bus or a scalar Unit port. The literal
-`ground` denotes the reference node. Winding names must be valid identifiers; the row and
-column order of `inductance` follows the order in `windings`. Negative mutual inductance is
-supported and reverses the relative winding polarity.
+`magnetic_component` represents named windings through the ordinary component and netlist
+interfaces. Its `matrix` model accepts a symmetric positive-definite inductance matrix.
+`coupled_coils` is a concise configuration of the same component, not a second physical
+implementation.
 
-The optional `r` on each winding is a series resistance in ohms. The model publishes
-`<element>.i_<winding>` (A), `<element>.u_<winding>` (V, across both the inductor and
-its winding resistance), and `i_mode_1`, `i_mode_2`, ... as restartable modal-current states.
-The magnetic stored energy includes all mutual-inductance terms.
+Each winding has positive and negative terminals connected to a named single-phase bus or scalar
+Unit port. The literal `ground` denotes the reference node. Winding names must be identifiers; the
+matrix row and column order follows `windings`. Negative mutual inductance reverses relative winding
+polarity. Optional winding `r` is the series copper resistance in ohms.
+
+Both forms publish `<element>.i_<winding>` (A), `<element>.u_<winding>` (V, including winding
+resistance), and restartable `i_mode_1`, `i_mode_2`, ... states. Stored energy includes every
+mutual-inductance term.
 
 ```yaml
 buses:
@@ -107,12 +109,22 @@ elements:
       - [-20.0e-6, 100.0e-6]
 ```
 
+The equivalent general configuration replaces `type` and `inductance` with:
+
+```yaml
+    type: magnetic_component
+    model:
+      type: matrix
+      inductance:
+        - [100.0e-6, -20.0e-6]
+        - [-20.0e-6, 100.0e-6]
+```
+
 A separate `capacitor` add-on provides a two-terminal capacitance with optional series `r`
 (ESR). Combine it with existing branches, resistors and switches to construct SS, LCC or
 other compensation networks without changing the coupled magnetic component. Both elements
 reuse the ordinary circuit netlist and the same integration and energy accounting paths.
 
-This initial model is linear and stationary; the inductance matrix, winding count and
-terminal connections are assembly-time settings. All connected winding terminals must
-use scalar electrical nodes (one-phase buses). FEM, geometry, magnetic saturation and
-per-winding multirate partitioning are not part of this component.
+The matrix model is linear and stationary; its inductance, winding count and terminals are
+assembly-time settings. All connected winding terminals use scalar electrical nodes. FEM execution
+and field reconstruction remain offline work.

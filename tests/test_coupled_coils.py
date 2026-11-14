@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import numpy as np
 import pytest
 from scipy.linalg import expm
@@ -9,7 +11,8 @@ from scipy.linalg import expm
 import peslite
 from peslite.assembly.params import from_dict, to_dict
 from peslite.components.network import ELEMENT_TYPES, element_buses
-from peslite.addons.components.coupled_coils import CoupledCoils, WindingParams
+from peslite.components.magnetic import MagComponent, WindingParams
+from peslite.addons.components.coupled_coils import CoupledCoils
 
 
 def _windings(n, *, r=0.0):
@@ -54,8 +57,47 @@ def test_coupled_coil_schema_round_trip_and_independent_terminals():
     bindings = assembly.port_bindings()
     assert len(bindings) == 4
     assert {name for name, _port in bindings} == {"p0", "p1", "p2", "return"}
+    assert isinstance(assembly.model, MagComponent)
     assert tuple(assembly.model.state_names) == ("i_mode_1", "i_mode_2", "i_mode_3")
     assert sum(port.grounded for port in assembly.model.ports) == 1
+
+
+def test_magnetic_components_follow_one_component_convention(tmp_path):
+    """Enforce the magnetic-component convention deliberately agreed within the project.
+
+    The general configuration and its concise coupled-coils preset must produce the same ordinary
+    component structure and physical result without maintaining separate equations. This internal
+    design contract may change only through an explicit design decision; it is not a published
+    architecture requirement or external interface standard.
+    """
+    concise = _case(2, sign=-1.0)
+    general = deepcopy(concise)
+    coils = general["elements"]["coils"]
+    inductance = coils.pop("inductance")
+    coils["type"] = "magnetic_component"
+    coils["model"] = {"type": "matrix", "inductance": inductance}
+
+    general_params = from_dict(general)
+    rebuilt = from_dict(to_dict(general_params))
+    assert rebuilt.elements["coils"] == general_params.elements["coils"]
+    assert rebuilt.elements["coils"].model.type == "matrix"
+
+    concise_simulation = peslite.Simulation(from_dict(concise))
+    general_simulation = peslite.Simulation(general_params)
+    concise_component = concise_simulation.system.named_elements["coils"].model
+    general_component = general_simulation.system.named_elements["coils"].model
+    assert type(concise_component) is type(general_component) is MagComponent
+    assert concise_component.state_names == general_component.state_names
+    np.testing.assert_array_equal(
+        concise_component.inductance,
+        general_component.inductance,
+    )
+
+    concise_result = concise_simulation.run(out_dir=tmp_path / "concise")
+    general_result = general_simulation.run(out_dir=tmp_path / "general")
+    assert concise_result.columns().keys() == general_result.columns().keys()
+    for name, values in concise_result.columns().items():
+        np.testing.assert_allclose(values, general_result.columns()[name], rtol=0.0, atol=0.0)
 
 
 @pytest.mark.parametrize("n,sign", [(2, 1.0), (3, -1.0), (4, 1.0)])
@@ -75,7 +117,7 @@ def test_coupled_coils_match_independent_full_matrix_reference(n, sign, tmp_path
 
     matrix = np.asarray(case["elements"]["coils"]["inductance"])
     resistances = np.diag([2.1 + k for k in range(n)])
-    initial = np.asarray(component._shapes) @ initial_modes
+    initial = np.linalg.eigh(matrix)[1] @ initial_modes
     target = expm(-np.linalg.solve(matrix, resistances) * result.t[-1]) @ initial
     actual = np.array([columns[f"coils.i_w{k}"][-1] for k in range(n)])
     np.testing.assert_allclose(actual, target, rtol=2e-5, atol=1e-8)
@@ -113,6 +155,7 @@ def test_coupled_coils_reject_bad_winding_and_terminal_reference():
 
 def test_compensation_capacitor_is_a_separate_registered_element():
     assert "coupled_coils" in ELEMENT_TYPES
+    assert "magnetic_component" in ELEMENT_TYPES
     assert "capacitor" in ELEMENT_TYPES
     c = ELEMENT_TYPES["capacitor"].params(bus1="p", bus2="q", c=1e-6, r=0.02)
     assert c.type == "capacitor"
@@ -175,7 +218,7 @@ def test_distinct_winding_terminals_match_full_matrix_circuit(tmp_path):
     result = simulation.run(out_dir=tmp_path)
     currents = np.array([result.columns()[f"coils.i_w{k}"][-1] for k in range(2)])
     effective_resistance = np.diag(np.array(series_resistance) + positive_loads + np.array(negative_loads))
-    starting_currents = np.asarray(component._shapes) @ initial_modes
+    starting_currents = np.linalg.eigh(inductance)[1] @ initial_modes
     expected = expm(-np.linalg.solve(inductance, effective_resistance) * result.t[-1]) @ starting_currents
     np.testing.assert_allclose(currents, expected, rtol=2e-5, atol=1e-8)
     for k in range(2):
