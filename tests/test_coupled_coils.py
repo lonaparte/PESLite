@@ -13,7 +13,7 @@ from peslite.assembly.params import from_dict, to_dict
 from peslite.components.network import ELEMENT_TYPES, element_buses
 from peslite.components.magnetic import MagComponent, WindingParams
 from peslite.addons.components.coupled_coils import CoupledCoils
-from peslite.addons.components.magport import MagPort
+from peslite.addons.components.magport import MagPort, MagPortModel
 from peslite.addons.functions import write_magport
 
 
@@ -67,10 +67,11 @@ def test_coupled_coil_schema_round_trip_and_independent_terminals():
 def test_magnetic_components_follow_one_component_convention(tmp_path):
     """Enforce the magnetic-component convention deliberately agreed within the project.
 
-    The MagPort adapter and the concrete coupled-coils implementation must use the same ordinary
-    component structure and physical equations. This internal design contract may
-    change only through an explicit design decision; it is not a published architecture requirement
-    or external interface standard.
+    The nonlinear MagPort boundary and the concrete coupled-coils implementation must use the same
+    winding, terminal and signal convention. Their runtime models deliberately differ: the core
+    component is the constant-inductance fast path, while MagPort owns flux-linkage states. This
+    internal design contract may change only through an explicit design decision; it is not a
+    published architecture requirement or external interface standard.
     """
     coupled = _case(2, sign=-1.0)
     general = deepcopy(coupled)
@@ -93,18 +94,18 @@ def test_magnetic_components_follow_one_component_convention(tmp_path):
     general_simulation = peslite.Simulation(general_params)
     coupled_component = coupled_simulation.system.named_elements["coils"].model
     general_component = general_simulation.system.named_elements["coils"].model
-    assert type(coupled_component) is type(general_component) is MagComponent
-    assert coupled_component.state_names == general_component.state_names
-    np.testing.assert_array_equal(
-        coupled_component.inductance,
-        general_component.inductance,
-    )
+    assert type(coupled_component) is MagComponent
+    assert type(general_component) is MagPortModel
+    assert coupled_component.names == general_component.names
+    assert general_component.state_names == ("lambda_w0", "lambda_w1")
 
     coupled_result = coupled_simulation.run(out_dir=tmp_path / "coupled")
     general_result = general_simulation.run(out_dir=tmp_path / "general")
-    assert coupled_result.columns().keys() == general_result.columns().keys()
-    for name, values in coupled_result.columns().items():
-        np.testing.assert_allclose(values, general_result.columns()[name], rtol=0.0, atol=0.0)
+    for name in ("coils.i_w0", "coils.i_w1", "coils.u_w0", "coils.u_w1"):
+        np.testing.assert_allclose(
+            coupled_result.columns()[name], general_result.columns()[name],
+            rtol=0.0, atol=1e-15,
+        )
 
 
 @pytest.mark.parametrize("n,sign", [(2, 1.0), (3, -1.0), (4, 1.0)])

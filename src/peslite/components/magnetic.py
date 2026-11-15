@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 import numpy as np
@@ -11,7 +11,7 @@ import numpy as np
 from ..solver import Bag, ConfigError, Empty, Port, StoragePort
 from .network import Element, NetworkComponent
 
-__all__ = ["MagComponent", "WindingParams"]
+__all__ = ["MagComponent", "MagneticParams", "WindingParams"]
 
 
 GROUND = "ground"
@@ -47,13 +47,26 @@ def _validate_windings(windings: dict[str, WindingParams]) -> tuple[str, ...]:
     return _validate_winding_names(windings)
 
 
-def _connection_buses(windings: dict[str, WindingParams]) -> dict[str, str]:
+def _winding_buses(windings: dict[str, WindingParams]) -> dict[str, str]:
     return {
         f"windings.{name}.{side}": bus
         for name, winding in windings.items()
         for side in ("positive", "negative")
         if (bus := getattr(winding, side)) != GROUND
     }
+
+
+@dataclass(frozen=True, kw_only=True)
+class MagneticParams:
+    """Common winding configuration for magnetic element adapters."""
+
+    windings: dict[str, WindingParams] = field(metadata={"structural": True})
+
+    def __post_init__(self) -> None:
+        _validate_windings(self.windings)
+
+    def connection_buses(self) -> dict[str, str]:
+        return _winding_buses(self.windings)
 
 
 def _inductance_decomposition(
@@ -140,13 +153,24 @@ class MagComponent(NetworkComponent):
             nb.linear_output(self, f"u_{name}", terminal_voltage)
         nb.losses(self)
 
+    def magnetic_signals(self) -> dict[str, float]:
+        """Return the public winding currents and terminal voltages."""
+        return {
+            field: getattr(self.output, field)
+            for field in type(self.output).__slots__
+        }
+
 
 class _MagneticElement(Element):
-    """Shared element assembly for direct and externally supplied inductance matrices."""
+    """Shared winding validation and assembly for magnetic component implementations."""
 
-    def _assemble(self, name: str, cfg: Any, windings: dict[str, WindingParams],
-                  winding_names: tuple[str, ...], inductance: Any, buses: dict) -> None:
-        self.name, self.cfg = name, cfg
+    @staticmethod
+    def _winding_data(
+        name: str,
+        windings: dict[str, WindingParams],
+        winding_names: tuple[str, ...],
+        buses: dict,
+    ) -> tuple[tuple[str, ...], tuple[float, ...], tuple[tuple[bool, bool], ...]]:
         names = _validate_windings(windings)
         if names != tuple(winding_names):
             raise ConfigError(
@@ -167,15 +191,26 @@ class _MagneticElement(Element):
                         f"elements.{name}.windings.{label}.{side}: "
                         "magnetic windings require scalar buses"
                     )
-        self.model = MagComponent(
+        return (
             names,
-            inductance,
             tuple(winding.r for winding in windings.values()),
             tuple((winding.positive == GROUND, winding.negative == GROUND)
                   for winding in windings.values()),
         )
 
-    def subsystems(self) -> dict[str, MagComponent]:
+    def _attach(self, name: str, cfg: Any, model: Any) -> None:
+        self.name, self.cfg, self.model = name, cfg, model
+
+    def _assemble(self, name: str, cfg: Any, windings: dict[str, WindingParams],
+                  winding_names: tuple[str, ...], inductance: Any, buses: dict) -> None:
+        names, resistance, terminals = self._winding_data(
+            name, windings, winding_names, buses
+        )
+        self._attach(
+            name, cfg, MagComponent(names, inductance, resistance, terminals)
+        )
+
+    def subsystems(self) -> dict[str, Any]:
         return {self.name: self.model}
 
     @staticmethod
@@ -191,5 +226,7 @@ class _MagneticElement(Element):
         )
 
     def signals(self) -> dict[str, float]:
-        return {f"{self.name}.{field}": getattr(self.model.output, field)
-                for field in type(self.model.output).__slots__}
+        return {
+            f"{self.name}.{field}": value
+            for field, value in self.model.magnetic_signals().items()
+        }

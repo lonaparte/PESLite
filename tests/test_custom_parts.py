@@ -11,7 +11,7 @@ import peslite
 from peslite.assembly import Event, register_event_type
 from peslite.assembly.params import ConfigError, from_dict
 from peslite.components import RLBranch, register_component_type
-from peslite.components.network import ELEMENT_TYPES, Element, _register_assembled_type
+from peslite.components.network import ELEMENT_TYPES, Element
 from peslite.control import ANGLE, FREQUENCY, V_AB, V_DQ, Loop, SyncLaw, register_loop_type
 from peslite.solver import SolverStep
 
@@ -148,7 +148,7 @@ class _TrackingOscillator(Loop):
         return self.phase, self.unit.base.w0, 1.0 + 0j, self.unit.base.w0, 0.0
 
 
-@_register_assembled_type
+@register_component_type
 class _ShuntRL(Element):
     @dataclass(frozen=True, kw_only=True)
     class Params:

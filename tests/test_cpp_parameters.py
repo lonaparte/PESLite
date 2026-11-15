@@ -1,8 +1,10 @@
 """One compiled model uses the ordinary parameter tree for physical and control changes."""
 
 import csv
+import gc
 import json
 import subprocess
+import weakref
 
 import numpy as np
 import pytest
@@ -86,6 +88,22 @@ def _compare_run(p, binary, changes, directory, *, rtol=3e-6, atol=3e-5, parts=N
             compared = [i for i in compared if i not in residuals]
         np.testing.assert_allclose(actual[:, compared], reference[:, compared], rtol=rtol, atol=atol)
     assert _written_out(peslite.load(native / "simulation.pes")) == _written_out(expected)
+
+
+def test_native_export_releases_its_compiler_graph(monkeypatch, tmp_path):
+    from peslite.assembly import cpp
+
+    references = []
+    initialize = cpp._ModelGenerator.__init__
+
+    def track(self, *args, **kwargs):
+        initialize(self, *args, **kwargs)
+        references.append(weakref.ref(self))
+
+    monkeypatch.setattr(cpp._ModelGenerator, "__init__", track)
+    peslite.export(_case("buck", "switching"), "cpp", tmp_path, variables=("all",))
+    gc.collect()
+    assert references and all(reference() is None for reference in references)
 
 
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])

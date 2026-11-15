@@ -144,7 +144,9 @@ class Energetic(Protocol):
 
     Members: ``storage``, ``ports``, ``dissipated_power()`` (W, >= 0) and ``supplied_power()``
     (W, zero if passive). Optional flags: ``dirac`` (lossless interconnection),
-    ``observer`` (non-loading reader), ``has_source`` (internal source).
+    ``observer`` (non-loading reader), ``has_source`` (internal source). Coupled or nonlinear
+    storage may additionally declare ``energy_states``, ``stored_energy(t)`` and
+    ``stored_energy_rate(t, derivatives)``.
     """
 
     storage: ClassVar[tuple[StoragePort, ...]]
@@ -169,7 +171,9 @@ class EnergySpec:
 
     ``kind``: ``"declared"``, ``"default"``, ``"dirac"`` or ``"observer"``.
     ``dissipated`` and ``supplied``: callables of the subsystem returning W
-    (for ``"default"``, supplied power is inferred from the neighbours).
+    (for ``"default"``, supplied power is inferred from the neighbours). ``energy_states`` and
+    its two callbacks represent coupled or nonlinear storage that is not a quadratic
+    :class:`StoragePort`.
     """
 
     kind: str
@@ -177,6 +181,9 @@ class EnergySpec:
     ports: tuple[Port, ...] = ()
     dissipated: Optional[Any] = None
     supplied: Optional[Any] = None
+    energy_states: tuple[str, ...] = ()
+    stored_energy: Optional[Any] = None
+    stored_energy_rate: Optional[Any] = None
     has_source: bool = False
 
 
@@ -189,6 +196,15 @@ def _power_law(sub: Any, name: str):
     return lambda owner: getattr(owner, name)()
 
 
+def _state_energy_law(sub: Any, name: str):
+    """Read a stored-energy method whose arguments follow the owning subsystem."""
+    method = getattr(sub, name)
+    implementation = getattr(method, "__func__", None)
+    if implementation is not None:
+        return implementation
+    return lambda owner, *args: getattr(owner, name)(*args)
+
+
 def spec_of(sub: Any) -> EnergySpec:
     """The effective declaration of a subsystem (explicit, or the default).
 
@@ -199,10 +215,32 @@ def spec_of(sub: Any) -> EnergySpec:
     if getattr(sub, "dirac", False):
         return EnergySpec("dirac")
     if isinstance(sub, Energetic):
-        return EnergySpec("declared", tuple(getattr(sub, "storage", ())), tuple(getattr(sub, "ports", ())),
-                          _power_law(sub, "dissipated_power"), _power_law(sub, "supplied_power"),
-                          has_source=bool(getattr(sub, "has_source", False)))
-    return EnergySpec("default", (), (), lambda sub: 0.0, lambda sub: 0.0, has_source=True)
+        energy_states = tuple(getattr(sub, "energy_states", ()))
+        stored = getattr(sub, "stored_energy", None)
+        rate = getattr(sub, "stored_energy_rate", None)
+        if bool(energy_states) != (callable(stored) and callable(rate)):
+            raise TypeError(
+                "functional storage requires energy_states, stored_energy(t) and "
+                "stored_energy_rate(t, derivatives)"
+            )
+        if len(set(energy_states)) != len(energy_states):
+            raise ValueError("energy_states must contain unique state names")
+        return EnergySpec(
+            kind="declared",
+            storage=tuple(getattr(sub, "storage", ())),
+            ports=tuple(getattr(sub, "ports", ())),
+            dissipated=_power_law(sub, "dissipated_power"),
+            supplied=_power_law(sub, "supplied_power"),
+            energy_states=energy_states,
+            stored_energy=(_state_energy_law(sub, "stored_energy")
+                           if energy_states else None),
+            stored_energy_rate=(_state_energy_law(sub, "stored_energy_rate")
+                                if energy_states else None),
+            has_source=bool(getattr(sub, "has_source", False)),
+        )
+    return EnergySpec(
+        "default", (), (), lambda sub: 0.0, lambda sub: 0.0, has_source=True
+    )
 
 
 def re_product(e: Any, f: Any) -> float:
@@ -329,6 +367,7 @@ class _SubsystemCheck:
     default_index: Optional[int]
     storage: tuple[_StorageCheck, ...]
     ports: tuple[_PowerCheck, ...]
+    energy_states: tuple[tuple[str, int, bool], ...]
 
 
 @dataclass(frozen=True)
@@ -403,6 +442,17 @@ class _BalancePlan:
                     dx = float(dy[storage.index])
                     rate += storage.coefficient * x * dx
                 energy += 0.5 * storage.coefficient * (abs(x) ** 2)
+            if check.energy_states:
+                derivatives = {}
+                for state, index, complex_value in check.energy_states:
+                    derivatives[state] = (
+                        complex(dy[index], dy[index + 1])
+                        if complex_value else float(dy[index])
+                    )
+                energy += float(spec.stored_energy(check.subsystem, t))
+                rate += float(
+                    spec.stored_energy_rate(check.subsystem, t, derivatives)
+                )
             p_in = sum(
                 (port.port.power() if port.port is not None else
                  port.coefficient * re_product(
@@ -447,12 +497,24 @@ def compile_balance(model: Any) -> _BalancePlan:
     for name, sub in zip(model.names, model.subsystems):
         spec = specs[name]
         storage_checks = []
+        covered_states = set()
         for storage in spec.storage:
             state_slice = model.state_slice(sub, storage.state)
+            covered_states.add(storage.state)
             storage_checks.append(_StorageCheck(
                 sub.state, storage.state, state_slice.start,
                 state_slice.stop - state_slice.start == 2,
                 storage.scale * storage.value,
+            ))
+        energy_states = []
+        for state in spec.energy_states:
+            if state in covered_states:
+                raise ValueError(f"{name}: state {state!r} has two energy declarations")
+            state_slice = model.state_slice(sub, state)
+            energy_states.append((
+                state,
+                state_slice.start,
+                state_slice.stop - state_slice.start == 2,
             ))
         power_checks = []
         for port in spec.ports:
@@ -492,7 +554,7 @@ def compile_balance(model: Any) -> _BalancePlan:
                 break
         checks.append(_SubsystemCheck(
             name, sub, spec, default_index.get(id(sub)),
-            tuple(storage_checks), tuple(power_checks),
+            tuple(storage_checks), tuple(power_checks), tuple(energy_states),
         ))
     return _BalancePlan(model, specs, tuple(checks), tuple(transfers), len(default_index))
 
@@ -598,7 +660,12 @@ class PHReport:
         for s in self.subsystems:
             extra = ""
             if s.kind == "storage":
-                extra = "; " + ", ".join(f"{st['state']}: {st['value']:.4g} x{st['scale']:g}" for st in s.storages)
+                entries = [
+                    (f"{st['state']}: {st['value']:.4g} x{st['scale']:g}"
+                     if "state" in st else f"{st['kind']} {st['states']}")
+                    for st in s.storages
+                ]
+                extra = "; " + ", ".join(entries)
             res = f", balance {s.balance_residual_rel:.1e}" if s.balance_residual_rel is not None else ""
             lines.append(f"  {s.name:12s} {s.kind:10s} {s.role:9s} states {s.states}{extra}{res}")
             for n in s.notes:
@@ -650,21 +717,25 @@ def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e
             kind, role = "dirac", "lossless"
             n_covered += n
         elif spec.kind == "declared":
-            kind = "storage" if spec.storage else "static"
+            kind = "storage" if spec.storage or spec.energy_states else "static"
             role = "source" if spec.has_source else "passive"
             n_covered += n
         else:
             kind, role = "default", "black box"
-        storages = [{
-            "state": st.state,
-            "value": st.value,
-            "scale": st.scale,
-            "power_terms": [
-                (port.name, quantity, sign)
-                for port, quantity, sign in st.power_terms
-            ],
-        }
-                    for st in spec.storage]
+        storages = [
+            {
+                "state": st.state,
+                "value": st.value,
+                "scale": st.scale,
+                "power_terms": [
+                    (port.name, quantity, sign)
+                    for port, quantity, sign in st.power_terms
+                ],
+            }
+            for st in spec.storage
+        ]
+        if spec.energy_states:
+            storages.append({"states": list(spec.energy_states), "kind": "functional"})
         ports = [
             (f"{p.name or 'port'}: voltage x current ({p.scale:g})" if p.physical else
              f"{p.effort} x {p.flow} ({p.scale:g}, {p.sign:+g})")

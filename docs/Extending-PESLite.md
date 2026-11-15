@@ -120,7 +120,7 @@ the trapezoidal (Tustin) method. The complete bundled example is
 
 ## Custom circuit elements
 
-A custom electrical component is a frozen parameter dataclass registered by
+A custom electrical component is usually a frozen parameter dataclass registered by
 `register_component_type`. Its `network()` method declares the physical primitives used by every
 circuit model.
 
@@ -169,6 +169,10 @@ Use `n.output`, `n.linear_output` or `n.port_output` to publish values. Ordinary
 capacitor storage is inferred from the declared primitives; `n.losses()` and `n.supplies()` select
 the primitives used for energy accounting. Public names are namespaced by the configured component
 name, so instances do not share state or output paths.
+
+The same decorator accepts an `Element` adapter with a nested `Params` dataclass when a component
+needs a runtime boundary that cannot be expressed as a netlist. For example, `MagPortElement`
+connects any magnetic constitutive law without repeating winding validation, ports or signals.
 
 Configured element buses may also name an assembled Unit default or named port. An optional
 `series_connections()` mapping `{bus: inlet_bus}` cuts a node that joins exactly two ports and

@@ -422,11 +422,6 @@ def _register_definition(cls: type, params: type, constructor: Callable) -> type
     return cls
 
 
-def _register_assembled_type(cls: type) -> type:
-    """Register a package-owned assembly adapter."""
-    return _register_definition(cls, getattr(cls, "Params", None), cls)
-
-
 def element_buses(cfg: Any) -> dict[str, str]:
     """Return flat bus fields and additional declared element buses."""
     buses = {f.name: getattr(cfg, f.name) for f in fields(cfg)
@@ -672,21 +667,25 @@ class _ConfiguredComponent(Element):
 
 
 def register_component_type(cls: type) -> type:
-    """Register a frozen electrical parameter dataclass declaring ``network(builder)``."""
-    if not is_dataclass(cls):
-        raise TypeError("a declarative component type must be a dataclass")
-    if not cls.__dataclass_params__.frozen:
-        raise TypeError("a declarative component parameter dataclass must be frozen")
-    if not callable(getattr(cls, "network", None)):
-        raise TypeError("a declarative component type needs network(builder)")
-    return _register_definition(
-        cls,
-        cls,
-        lambda name, cfg, buses, _params: _ConfiguredComponent(name, cfg, buses, _params),
-    )
+    """Register a declarative component or a complete :class:`Element` adapter."""
+    if isinstance(cls, type) and issubclass(cls, Element):
+        return _register_definition(cls, getattr(cls, "Params", None), cls)
+    if is_dataclass(cls):
+        if not cls.__dataclass_params__.frozen:
+            raise TypeError("a declarative component parameter dataclass must be frozen")
+        if not callable(getattr(cls, "network", None)):
+            raise TypeError("a declarative component type needs network(builder)")
+        return _register_definition(
+            cls,
+            cls,
+            lambda name, cfg, buses, _params: _ConfiguredComponent(
+                name, cfg, buses, _params
+            ),
+        )
+    raise TypeError("a component type must be a frozen parameter dataclass or Element adapter")
 
 
-@_register_assembled_type
+@register_component_type
 class Load(Element):
     """Built-in series R-L load from ``bus`` to ground; a small impedance models a fault."""
 
@@ -780,7 +779,7 @@ class _ResistorModel(NetworkComponent):
         nb.losses(self)
 
 
-@_register_assembled_type
+@register_component_type
 class Resistor(Element):
     """Shunt resistance, or a series resistance inserted after a bus's voltage driver."""
 
@@ -874,7 +873,7 @@ class _VoltageSourceModel(NetworkComponent):
         nb.supplies(self)
 
 
-@_register_assembled_type
+@register_component_type
 class VoltageSource(Element):
     """Scalar named-bus voltage source behind a positive series resistance."""
 

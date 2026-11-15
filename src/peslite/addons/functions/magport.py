@@ -11,79 +11,16 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from ...components.magnetic import _inductance_decomposition, _validate_winding_names
+from ..components.magport import (
+    _FORMAT,
+    _VERSION,
+    _MagPortData,
+    _data,
+    _load,
+)
 from ...solver import ConfigError
 
 __all__ = ["MagneticFieldResult", "write_magport", "magnetic_field"]
-
-
-_FORMAT = "peslite-magport"
-_VERSION = 1
-_REQUIRED = frozenset({"format", "version", "winding_names", "inductance"})
-_OPTIONAL = frozenset({"physical", "field_points", "field_basis"})
-
-
-@dataclass(frozen=True)
-class _MagPortData:
-    winding_names: tuple[str, ...]
-    inductance: np.ndarray
-    physical: dict[str, Any]
-    field_points: np.ndarray | None
-    field_basis: np.ndarray | None
-
-
-def _data(
-    winding_names: Sequence[str],
-    inductance: Any,
-    physical: Mapping[str, Any] | None = None,
-    field_points: Any | None = None,
-    field_basis: Any | None = None,
-) -> _MagPortData:
-    names = _validate_winding_names(winding_names)
-    matrix, _modes, _shapes = _inductance_decomposition(inductance, len(names))
-
-    try:
-        encoded = json.dumps({} if physical is None else physical,
-                             allow_nan=False, sort_keys=True)
-        source = json.loads(encoded)
-    except (TypeError, ValueError):
-        raise ConfigError("physical must contain finite JSON-compatible data") from None
-    if not isinstance(source, dict):
-        raise ConfigError("physical must be a mapping")
-
-    points, basis = field_points, field_basis
-    if (points is None) != (basis is None):
-        raise ConfigError("field_points and field_basis must be provided together")
-    if points is not None:
-        try:
-            points = np.asarray(points, dtype=float)
-            basis = np.asarray(basis, dtype=float)
-        except (TypeError, ValueError):
-            raise ConfigError("field data must be numeric") from None
-        if points.ndim != 2 or points.shape[1] != 3 or not len(points):
-            raise ConfigError("field_points must have shape (points, 3)")
-        expected = (len(points), 3, len(names))
-        if basis.shape != expected:
-            raise ConfigError(f"field_basis must have shape {expected}")
-        if not np.isfinite(points).all() or not np.isfinite(basis).all():
-            raise ConfigError("field data must be finite")
-        points.setflags(write=False)
-        basis.setflags(write=False)
-    return _MagPortData(names, matrix, source, points, basis)
-
-
-def _scalar(value: np.ndarray, name: str) -> Any:
-    array = np.asarray(value)
-    if array.ndim != 0:
-        raise ConfigError(f"{name} must be a scalar")
-    return array.item()
-
-
-def _vector_strings(value: np.ndarray, name: str) -> np.ndarray:
-    array = np.asarray(value)
-    if array.ndim != 1 or array.dtype.kind not in ("U", "S"):
-        raise ConfigError(f"{name} must be a string vector")
-    return array.astype(str)
 
 
 def _write(file: str | Path, data: _MagPortData) -> Path:
@@ -93,10 +30,14 @@ def _write(file: str | Path, data: _MagPortData) -> Path:
         "format": np.asarray(_FORMAT),
         "version": np.asarray(_VERSION),
         "winding_names": np.asarray(data.winding_names),
-        "inductance": data.inductance,
         "physical": np.asarray(json.dumps(data.physical, allow_nan=False, sort_keys=True,
                                            separators=(",", ":"))),
     }
+    if data.inductance is not None:
+        entries["inductance"] = data.inductance
+    else:
+        entries["flux_linkage"] = data.flux_linkage
+        entries["current"] = data.current
     if data.field_points is not None:
         entries["field_points"] = data.field_points
         entries["field_basis"] = data.field_basis
@@ -113,65 +54,21 @@ def _write(file: str | Path, data: _MagPortData) -> Path:
     return path
 
 
-def _load(file: str | Path) -> _MagPortData:
-    path = Path(file).expanduser().resolve()
-    if not path.is_file():
-        raise ConfigError(f"magport file does not exist: {path}")
-    try:
-        with np.load(path, allow_pickle=False) as archive:
-            keys = frozenset(archive.files)
-            missing = _REQUIRED - keys
-            unknown = keys - _REQUIRED - _OPTIONAL
-            if missing or unknown:
-                details = []
-                if missing:
-                    details.append(f"missing entries {sorted(missing)}")
-                if unknown:
-                    details.append(f"unknown entries {sorted(unknown)}")
-                raise ConfigError("; ".join(details))
-            format_name = _scalar(archive["format"], "format")
-            version = _scalar(archive["version"], "version")
-            if format_name != _FORMAT:
-                raise ConfigError(f"unknown magport format {format_name!r}")
-            if type(version) not in (int, np.int32, np.int64) or int(version) != _VERSION:
-                raise ConfigError(f"unsupported magport version {version!r}")
-            names = tuple(str(name) for name in _vector_strings(
-                archive["winding_names"], "winding_names"
-            ))
-            physical = {}
-            if "physical" in keys:
-                text = _scalar(archive["physical"], "physical")
-                if not isinstance(text, str):
-                    raise ConfigError("physical must be a JSON string")
-                try:
-                    physical = json.loads(text)
-                except json.JSONDecodeError as exc:
-                    raise ConfigError(f"physical contains invalid JSON: {exc.msg}") from None
-            return _data(
-                names,
-                archive["inductance"].copy(),
-                physical,
-                archive["field_points"].copy() if "field_points" in keys else None,
-                archive["field_basis"].copy() if "field_basis" in keys else None,
-            )
-    except ConfigError:
-        raise
-    except (OSError, ValueError, TypeError) as exc:
-        raise ConfigError(f"cannot load magport file {path}: {exc}") from None
-
-
 def write_magport(
     file: str | Path,
     *,
     winding_names: Sequence[str],
-    inductance: Any,
+    inductance: Any | None = None,
+    flux_linkage: Any | None = None,
+    current: Any | None = None,
     physical: Mapping[str, Any] | None = None,
     field_points: Any | None = None,
     field_basis: Any | None = None,
 ) -> Path:
-    """Write external inductance and optional field data in the MagPort format."""
+    """Write a linear or sampled nonlinear constitutive law in the MagPort format."""
     return _write(file, _data(
-        winding_names, inductance, physical, field_points, field_basis
+        winding_names, inductance, flux_linkage, current,
+        physical, field_points, field_basis,
     ))
 
 

@@ -38,8 +38,8 @@ _EXPORTS = {
     "loop_gain_sweep": ("loop_gain", "loop_gain_sweep"),
     "small_signal": ("stability", "small_signal"),
     "small_signal_report": ("stability", "small_signal_report"),
-    "export_magnetic_circuit": ("magnetic_circuit", "export_magnetic_circuit"),
-    "reluctance_inductance": ("magnetic_circuit", "reluctance_inductance"),
+    "export_magnetic_circuit": ("magcircuit", "export_magnetic_circuit"),
+    "reluctance_inductance": ("magcircuit", "reluctance_inductance"),
     "write_magport": ("magport", "write_magport"),
     "magnetic_field": ("magport", "magnetic_field"),
 }

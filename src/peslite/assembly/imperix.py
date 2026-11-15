@@ -661,6 +661,7 @@ def _export_imperix(simulation, out_dir, name, variables, reusable, *,
                                      "parameters": {item.path: item.member for item in runtime.selected}},
                                     indent=2) + "\n",
     }
+    model.close()
     out_dir.mkdir(parents=True, exist_ok=True)
     for filename, content in files.items():
         (out_dir / filename).write_text(content, encoding="utf-8")
