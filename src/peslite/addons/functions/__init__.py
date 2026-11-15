@@ -38,10 +38,10 @@ _EXPORTS = {
     "loop_gain_sweep": ("loop_gain", "loop_gain_sweep"),
     "small_signal": ("stability", "small_signal"),
     "small_signal_report": ("stability", "small_signal_report"),
-    "build_reluctance_model": ("magnetic", "build_reluctance_model"),
-    "import_magnetic_model": ("magnetic", "import_magnetic_model"),
-    "magnetic_field": ("magnetic", "magnetic_field"),
-    "reluctance_inductance": ("magnetic", "reluctance_inductance"),
+    "export_magnetic_circuit": ("magnetic_circuit", "export_magnetic_circuit"),
+    "reluctance_inductance": ("magnetic_circuit", "reluctance_inductance"),
+    "write_magport": ("magport", "write_magport"),
+    "magnetic_field": ("magport", "magnetic_field"),
 }
 __all__ = list(_EXPORTS)
 

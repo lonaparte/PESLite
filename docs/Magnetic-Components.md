@@ -49,20 +49,20 @@ rows and columns follow the winding declaration order. Negative mutual inductanc
 winding polarity. Compensation capacitors and other electrical elements remain separate components;
 see [Passive Components](Passive-Components.md).
 
-## External model files
+## MagPort addon
 
-The external-file interface is optional. Use it when component data comes from FEM, an analytical
-calculation or another external tool, or when the same data must be reused by several cases. The
-resulting component has the same circuit behavior as `coupled_coils`:
+`magport` is the optional external-file interface. Use it when component data comes from FEM, an
+analytical calculation or another external tool, or when the same data must be reused by several
+cases. The resulting component has the same circuit behavior as `coupled_coils`:
 
 ```yaml
 elements:
   transformer:
-    type: magnetic_component
+    type: magport
+    file: models/transformer.npz
     windings:
       primary: {positive: primary, negative: ground, r: 0.08}
       secondary: {positive: secondary, negative: ground, r: 0.10}
-    model: {file: models/transformer.npz}
 ```
 
 Relative paths start beside the simulation file. Winding names and their order must match the file
@@ -83,12 +83,12 @@ The file contains data rather than executable objects:
 PESLite checks the file format, winding order, inductance matrix and optional field data while
 assembling the circuit.
 
-Convert arrays from an external calculation into this format with `import_magnetic_model`:
+Write arrays from an external calculation in this format with `write_magport`:
 
 ```python
-from peslite.addons.functions import import_magnetic_model
+from peslite.addons.functions import write_magport
 
-import_magnetic_model(
+write_magport(
     "models/transformer.npz",
     winding_names=("primary", "secondary"),
     inductance=[[100e-6, -20e-6], [-20e-6, 100e-6]],
@@ -100,27 +100,6 @@ import_magnetic_model(
 
 `physical` is optional metadata. `field_points` has shape `(points, 3)`, and `field_basis` has shape
 `(points, 3, windings)` and maps winding currents to magnetic flux density.
-
-### Reluctance-network results
-
-`build_reluctance_model` reduces a linear reluctance network and writes the same external model
-format:
-
-```python
-from peslite.addons.functions import build_reluctance_model
-
-build_reluctance_model(
-    "models/transformer.npz",
-    winding_names=("primary", "secondary"),
-    reluctance=reluctance,
-    coupling=turns,
-    incidence=incidence,
-)
-```
-
-`reluctance` is the branch reluctance vector or matrix, `coupling` maps winding currents to branch
-magnetomotive force, and optional `incidence` enforces flux continuity. Supplying `field_points` and
-`field_per_flux` also stores a field basis.
 
 ### Field reconstruction
 
@@ -140,7 +119,28 @@ field = magnetic_field(
 array shaped `(times, points, 3)`. Pass `points=` to interpolate inside the stored field map. This
 post-processing does not add work to electrical simulation steps.
 
-### Nonlinear and stateful external models
+## Magnetic-circuit addon
+
+The magnetic-circuit addon reduces a linear reluctance network to an inductance matrix and writes
+the result through MagPort:
+
+```python
+from peslite.addons.functions import export_magnetic_circuit
+
+export_magnetic_circuit(
+    "models/transformer.npz",
+    winding_names=("primary", "secondary"),
+    reluctance=reluctance,
+    coupling=turns,
+    incidence=incidence,
+)
+```
+
+`reluctance` is the branch reluctance vector or matrix, `coupling` maps winding currents to branch
+magnetomotive force, and optional `incidence` enforces flux continuity. Supplying `field_points` and
+`field_per_flux` also stores a field basis.
+
+## Nonlinear and stateful external models
 
 The external-file interface supplies linear inductance data. A nonlinear, hysteretic or otherwise
 stateful external model uses the existing

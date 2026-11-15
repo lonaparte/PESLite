@@ -7,12 +7,12 @@ import pytest
 
 import peslite
 from peslite.addons.functions import (
-    build_reluctance_model,
-    import_magnetic_model,
+    export_magnetic_circuit,
     magnetic_field,
     reluctance_inductance,
+    write_magport,
 )
-from peslite.components.magnetic import MagneticModel
+from peslite.addons.functions.magport import _load
 from peslite.solver import BlackBoxSubsystem, ConfigError, Model
 from peslite.solver.energy import Port
 
@@ -25,7 +25,7 @@ def test_external_magnetic_model_round_trip_and_strict_schema(tmp_path):
         [0.0, 0.0, 1.0],
     ])
     basis = np.arange(24, dtype=float).reshape(4, 3, 2) * 1e-6
-    path = import_magnetic_model(
+    path = write_magport(
         tmp_path / "model.npz",
         winding_names=("primary", "secondary"),
         inductance=[[4e-3, 1e-3], [1e-3, 3e-3]],
@@ -34,7 +34,7 @@ def test_external_magnetic_model_round_trip_and_strict_schema(tmp_path):
         field_basis=basis,
     )
 
-    loaded = MagneticModel.load(path)
+    loaded = _load(path)
     assert loaded.winding_names == ("primary", "secondary")
     np.testing.assert_array_equal(loaded.inductance, [[4e-3, 1e-3], [1e-3, 3e-3]])
     np.testing.assert_array_equal(loaded.field_points, points)
@@ -45,19 +45,19 @@ def test_external_magnetic_model_round_trip_and_strict_schema(tmp_path):
     invalid = tmp_path / "invalid.npz"
     np.savez(
         invalid,
-        format="peslite-magnetic-model",
+        format="peslite-magport",
         version=1,
         winding_names=np.array(["primary"]),
         inductance=np.array([[1.0]]),
         unexpected=np.array(1.0),
     )
     with pytest.raises(ConfigError, match="unknown entries.*unexpected"):
-        MagneticModel.load(invalid)
+        _load(invalid)
 
 
 def test_simulation_file_resolves_external_magnetic_model_relative_to_itself(tmp_path):
     model_dir = tmp_path / "models"
-    path = import_magnetic_model(
+    path = write_magport(
         model_dir / "coil.npz",
         winding_names=("coil",),
         inductance=[[2e-3]],
@@ -69,10 +69,10 @@ buses:
   node: {phases: 1}
 elements:
   coil:
-    type: magnetic_component
+    type: magport
     windings:
       coil: {positive: node, negative: ground}
-    model: {file: models/coil.npz}
+    file: models/coil.npz
   load: {type: resistor, bus: node, r: 2.0}
 simulation: {t_end: 1.0e-4}
 """,
@@ -81,8 +81,8 @@ simulation: {t_end: 1.0e-4}
 
     params = peslite.load(case)
     simulation = peslite.Simulation(params)
-    assert params.elements["coil"].model.file == str(path)
-    assert simulation.system.named_elements["coil"].model.magnetic.winding_names == ("coil",)
+    assert params.elements["coil"].file == str(path)
+    assert simulation.system.named_elements["coil"].model.names == ("coil",)
 
 
 def test_linear_reluctance_network_reduces_to_reciprocal_inductance(tmp_path):
@@ -93,13 +93,13 @@ def test_linear_reluctance_network_reduces_to_reciprocal_inductance(tmp_path):
     actual = reluctance_inductance(reluctance, coupling)
     np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=0.0)
 
-    path = build_reluctance_model(
+    path = export_magnetic_circuit(
         tmp_path / "reluctance.npz",
         winding_names=("p", "s"),
         reluctance=reluctance,
         coupling=coupling,
     )
-    loaded = MagneticModel.load(path)
+    loaded = _load(path)
     np.testing.assert_allclose(loaded.inductance, expected, rtol=1e-14, atol=0.0)
     network = dict(loaded.physical)["reluctance_network"]
     assert network["coupling"] == coupling.tolist()
@@ -136,7 +136,7 @@ def test_external_field_map_reconstructs_flux_density(tmp_path):
     basis = np.zeros((4, 3, 2))
     basis[:, 0, 0] = 2.0
     basis[:, 1, 1] = -3.0
-    path = import_magnetic_model(
+    path = write_magport(
         tmp_path / "field.npz",
         winding_names=("p", "s"),
         inductance=[[2.0, 0.1], [0.1, 3.0]],

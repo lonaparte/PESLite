@@ -13,7 +13,8 @@ from peslite.assembly.params import from_dict, to_dict
 from peslite.components.network import ELEMENT_TYPES, element_buses
 from peslite.components.magnetic import MagComponent, WindingParams
 from peslite.addons.components.coupled_coils import CoupledCoils
-from peslite.addons.functions import import_magnetic_model
+from peslite.addons.components.magport import MagPort
+from peslite.addons.functions import write_magport
 
 
 def _windings(n, *, r=0.0):
@@ -66,8 +67,8 @@ def test_coupled_coil_schema_round_trip_and_independent_terminals():
 def test_magnetic_components_follow_one_component_convention(tmp_path):
     """Enforce the magnetic-component convention deliberately agreed within the project.
 
-    The general external-model component and the concrete coupled-coils implementation must use the
-    same ordinary component structure and physical equations. This internal design contract may
+    The MagPort adapter and the concrete coupled-coils implementation must use the same ordinary
+    component structure and physical equations. This internal design contract may
     change only through an explicit design decision; it is not a published architecture requirement
     or external interface standard.
     """
@@ -75,18 +76,18 @@ def test_magnetic_components_follow_one_component_convention(tmp_path):
     general = deepcopy(coupled)
     coils = general["elements"]["coils"]
     inductance = coils.pop("inductance")
-    model_file = import_magnetic_model(
+    model_file = write_magport(
         tmp_path / "coils.npz",
         winding_names=tuple(coils["windings"]),
         inductance=inductance,
     )
-    coils["type"] = "magnetic_component"
-    coils["model"] = {"file": str(model_file)}
+    coils["type"] = "magport"
+    coils["file"] = str(model_file)
 
     general_params = from_dict(general)
     rebuilt = from_dict(to_dict(general_params))
     assert rebuilt.elements["coils"] == general_params.elements["coils"]
-    assert rebuilt.elements["coils"].model.file == str(model_file)
+    assert rebuilt.elements["coils"].file == str(model_file)
 
     coupled_simulation = peslite.Simulation(from_dict(coupled))
     general_simulation = peslite.Simulation(general_params)
@@ -161,7 +162,8 @@ def test_coupled_coils_reject_bad_winding_and_terminal_reference():
 
 def test_compensation_capacitor_is_a_separate_registered_element():
     assert "coupled_coils" in ELEMENT_TYPES
-    assert "magnetic_component" in ELEMENT_TYPES
+    assert "magport" in ELEMENT_TYPES
+    assert ELEMENT_TYPES["magport"].constructor is MagPort
     assert "capacitor" in ELEMENT_TYPES
     c = ELEMENT_TYPES["capacitor"].params(bus1="p", bus2="q", c=1e-6, r=0.02)
     assert c.type == "capacitor"

@@ -66,7 +66,11 @@ def test_code_distributions_own_disjoint_source_files():
         assert owned[left].isdisjoint(owned[right])
     assert Path("src/peslite/addons/__init__.py") in owned["peslite-core"]
     assert Path("src/peslite/addons/functions/__init__.py") in owned["peslite-core"]
+    assert Path("src/peslite/components/magnetic.py") in owned["peslite-core"]
     assert Path("src/peslite/addons/components/cable.py") in owned["peslite"]
+    assert Path("src/peslite/addons/components/magport.py") in owned["peslite"]
+    assert Path("src/peslite/addons/functions/magport.py") in owned["peslite"]
+    assert Path("src/peslite/addons/functions/magnetic_circuit.py") in owned["peslite"]
     assert Path("src/peslite/addons/formats/__init__.py") in owned["peslite-core"]
     assert Path("src/peslite/addons/formats/legacy_yaml.py") in owned["peslite"]
     assert Path("src/peslite/addons/functions/stability.py") in owned["peslite"]
