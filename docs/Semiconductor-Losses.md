@@ -35,9 +35,9 @@ model and observations*, not automatically comprehensive device loss certificati
 
 ```python
 import numpy as np
-from peslite.addons.functions import (
+from peslite.addons.functions import compare_devices, circuit_heat_report
+from peslite.addons.functions.semiconductor_losses import (
     LossTable, SemiconductorLossModel, SwitchingEvent,
-    compare_devices, circuit_heat_report,
 )
 
 # Example circuit operating trace (use result.t and result.plant for actual runs).

@@ -7,8 +7,10 @@ import numpy as np
 import pytest
 
 from peslite.addons.functions import (
-    LossTable, SemiconductorLossModel, SwitchingEvent, circuit_heat_report,
-    compare_devices, device_loss_report, recorded_device_loss,
+    circuit_heat_report, compare_devices, device_loss_report, recorded_device_loss,
+)
+from peslite.addons.functions.semiconductor_losses import (
+    LossTable, SemiconductorLossModel, SwitchingEvent,
 )
 
 

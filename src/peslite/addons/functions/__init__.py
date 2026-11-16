@@ -9,11 +9,6 @@ class FunctionUnavailableError(ImportError):
 
 _EXPORTS = {
     "energy_closure": ("energy_audit", "energy_closure"),
-    "LossTable": ("semiconductor_losses", "LossTable"),
-    "SemiconductorLossModel": ("semiconductor_losses", "SemiconductorLossModel"),
-    "SwitchingEvent": ("semiconductor_losses", "SwitchingEvent"),
-    "EventLoss": ("semiconductor_losses", "EventLoss"),
-    "DeviceLossReport": ("semiconductor_losses", "DeviceLossReport"),
     "device_loss_report": ("semiconductor_losses", "device_loss_report"),
     "recorded_device_loss": ("semiconductor_losses", "recorded_device_loss"),
     "compare_devices": ("semiconductor_losses", "compare_devices"),
