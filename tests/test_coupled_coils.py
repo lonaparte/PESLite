@@ -11,8 +11,12 @@ from scipy.linalg import expm
 import peslite
 from peslite.assembly.params import from_dict, to_dict
 from peslite.components.network import ELEMENT_TYPES, element_buses
-from peslite.components.magnetic import MagComponent, WindingParams
-from peslite.addons.components.coupled_coils import CoupledCoils
+from peslite.addons.components.magnetic import (
+    CoupledCoils,
+    CoupledCoilsModel,
+    MagComponent,
+    WindingParams,
+)
 from peslite.addons.components.magport import MagPort, MagPortModel
 from peslite.addons.functions import write_magport
 
@@ -60,6 +64,7 @@ def test_coupled_coil_schema_round_trip_and_independent_terminals():
     assert len(bindings) == 4
     assert {name for name, _port in bindings} == {"p0", "p1", "p2", "return"}
     assert isinstance(assembly.model, MagComponent)
+    assert type(assembly.model) is CoupledCoilsModel
     assert tuple(assembly.model.state_names) == ("i_mode_1", "i_mode_2", "i_mode_3")
     assert sum(port.grounded for port in assembly.model.ports) == 1
 
@@ -67,11 +72,11 @@ def test_coupled_coil_schema_round_trip_and_independent_terminals():
 def test_magnetic_components_follow_one_component_convention(tmp_path):
     """Enforce the magnetic-component convention deliberately agreed within the project.
 
-    The nonlinear MagPort boundary and the concrete coupled-coils implementation must use the same
-    winding, terminal and signal convention. Their runtime models deliberately differ: the core
-    component is the constant-inductance fast path, while MagPort owns flux-linkage states. This
-    internal design contract may change only through an explicit design decision; it is not a
-    published architecture requirement or external interface standard.
+    The nonlinear MagPort boundary and the coupled-coils implementation inside MagComponent must
+    use the same winding, terminal and signal convention. Their runtime models deliberately differ:
+    the default addon uses the constant-inductance fast path, while MagPort owns flux-linkage
+    states. This internal design contract may change only through an explicit design decision; it
+    is not a published architecture requirement or external interface standard.
     """
     coupled = _case(2, sign=-1.0)
     general = deepcopy(coupled)

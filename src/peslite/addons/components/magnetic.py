@@ -1,4 +1,4 @@
-"""Coupled windings represented by the ordinary PESLite netlist contracts."""
+"""Magnetic components and their constant-inductance coupled-coil implementation."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from typing import Any, ClassVar, Mapping
 
 import numpy as np
 
-from ..solver import Bag, ConfigError, Empty, Port, StoragePort
-from .network import Element, NetworkComponent
+from ...components.network import Element, NetworkComponent, register_component_type
+from ...solver import Bag, ConfigError, Empty, Port, StoragePort
 
 __all__ = [
     "MagComponent",
@@ -18,6 +18,8 @@ __all__ = [
     "MagneticDescription",
     "MagneticParams",
     "WindingParams",
+    "CoupledCoils",
+    "CoupledCoilsModel",
 ]
 
 
@@ -326,8 +328,8 @@ class MagComponent(NetworkComponent):
         self.magnetic = magnetic
 
 
-class _InductanceMatrixModel(MagComponent):
-    """Optimized electrical representation of a constant winding-inductance matrix."""
+class CoupledCoilsModel(MagComponent):
+    """Constant winding-inductance matrix implementation of :class:`MagComponent`."""
 
     outputs_need_inputs: ClassVar[bool] = False
 
@@ -368,7 +370,7 @@ class _InductanceMatrixModel(MagComponent):
         self.ports = tuple(dict.fromkeys(port for pair in ports for port in pair))
 
     def network(self, nb: Any) -> None:
-        from ..solver import netlist as nl
+        from ...solver import netlist as nl
 
         branches = []
         for (positive, negative), resistance in zip(self.winding_ports, self.resistance):
@@ -449,7 +451,7 @@ class _MagneticElement(Element):
         )
         self._attach(
             name, cfg,
-            _InductanceMatrixModel(
+            CoupledCoilsModel(
                 names, inductance, resistance, terminals, cfg.magnetic
             ),
         )
@@ -474,3 +476,25 @@ class _MagneticElement(Element):
             f"{self.name}.{field}": value
             for field, value in self.model.magnetic_signals().items()
         }
+
+
+@register_component_type
+class CoupledCoils(_MagneticElement):
+    """Configuration adapter for :class:`CoupledCoilsModel`."""
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params(MagneticParams):
+        inductance: list[list[float]] = field(metadata={"structural": True})
+        type: str = "coupled_coils"
+
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            matrix, _modes, _shapes = _inductance_decomposition(
+                self.inductance, len(self.windings)
+            )
+            object.__setattr__(self, "inductance", matrix.tolist())
+
+    type = "coupled_coils"
+
+    def __init__(self, name: str, cfg: Any, buses: dict, _params: Any) -> None:
+        self._assemble(name, cfg, cfg.windings, tuple(cfg.windings), cfg.inductance, buses)

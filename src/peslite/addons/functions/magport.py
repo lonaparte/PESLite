@@ -18,7 +18,7 @@ from ..components.magport import (
     _data,
     _load,
 )
-from ...components.magnetic import MagneticDescription
+from ..components.magnetic import MagneticDescription
 from ...solver import ConfigError
 
 __all__ = ["MagneticFieldResult", "write_magport", "magnetic_field"]

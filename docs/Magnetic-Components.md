@@ -1,8 +1,9 @@
 # Magnetic Components
 
-`MagComponent` is the common contract for magnetic devices that connect to the electrical circuit
-through ordinary PESLite ports. Its electrical behavior may be a netlist, a constitutive law or an
-imported model; the physical magnetic description is optional.
+`MagComponent` is the magnetic component addon installed with `peslite`. It connects magnetic
+devices to the electrical circuit through ordinary PESLite ports; `peslite-core` contains no
+magnetic implementation. Its electrical behavior may be a netlist, a constitutive law or an
+imported model, and its physical magnetic description is optional.
 
 ## Component behavior
 
@@ -30,8 +31,8 @@ and preserves the electrical states across restart and continuation.
 
 ## Example: Coupled coils
 
-`coupled_coils` is one concrete `MagComponent`. Its inductance matrix is written directly in the
-simulation file, so it requires neither an external model file nor the optional full installation:
+`coupled_coils` is the constant-inductance implementation included in `MagComponent`. Its inductance matrix is written directly in the simulation file, so it requires
+neither an external model file nor the optional full installation:
 
 ```yaml
 buses:
@@ -56,8 +57,8 @@ see [Passive Components](Passive-Components.md).
 
 ## MagPort addon
 
-Install `peslite-full` to use `magport` and `magcircuit`. The lightweight component interface and
-`coupled_coils` remain available without the full installation.
+Install `peslite-full` to use `magport` and `magcircuit`. `MagComponent` and its `coupled_coils`
+implementation remain available with the default installation.
 
 `magport` connects an explicit magnetic constitutive law to ordinary electrical winding terminals.
 Each winding flux linkage is a PESLite state. The law maps the winding flux-linkage vector and any
@@ -149,7 +150,7 @@ from dataclasses import dataclass
 
 from peslite.addons.components import register_component_type
 from peslite.addons.components.magport import MagPortElement
-from peslite.components import MagneticParams
+from peslite.addons.components.magnetic import MagneticParams
 
 class CoreLaw:
     winding_names = ("coil",)

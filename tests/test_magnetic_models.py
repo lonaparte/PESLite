@@ -18,8 +18,11 @@ from peslite.addons.functions import (
     write_magport,
 )
 from peslite.assembly.params import from_dict
-from peslite.components import (MagneticBranchDescription, MagneticDescription,
-                                MagneticParams)
+from peslite.addons.components.magnetic import (
+    MagneticBranchDescription,
+    MagneticDescription,
+    MagneticParams,
+)
 from peslite.components.network import ELEMENT_TYPES
 from peslite.solver import ConfigError
 from peslite.solver.energy import spec_of
@@ -298,7 +301,7 @@ def _linear_equivalence_case(inductance):
     }
 
 
-def test_core_inductance_magport_and_magcircuit_are_numerically_equivalent(tmp_path):
+def test_base_inductance_magport_and_magcircuit_are_numerically_equivalent(tmp_path):
     """The optimized and magnetic formulations must agree for the same complete linear model."""
     inductance = np.array([[8.0e-3, -1.5e-3], [-1.5e-3, 6.0e-3]])
     _modes, shapes = np.linalg.eigh(inductance)

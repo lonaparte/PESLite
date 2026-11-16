@@ -7,7 +7,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
-from ...components.magnetic import (
+from .magnetic import (
     MagneticBranchDescription,
     MagneticParams,
     _validate_winding_names,

@@ -58,6 +58,7 @@ def main(directory: str = "dist") -> int:
             "share/peslite/examples/templates/template.pes",
         ),
         "peslite": (
+            "peslite/addons/components/magnetic.py",
             "peslite/addons/formats/legacy_yaml.py",
             "peslite/addons/functions/stability.py",
             "share/peslite/examples/gfl-example.pes",

@@ -10,7 +10,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 import numpy as np
 
-from ...components.magnetic import (
+from .magnetic import (
     MagComponent,
     MagneticDescription,
     MagneticParams,
