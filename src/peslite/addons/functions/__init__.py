@@ -9,6 +9,10 @@ class FunctionUnavailableError(ImportError):
 
 _EXPORTS = {
     "energy_closure": ("energy_audit", "energy_closure"),
+    "device_loss_report": ("semiconductor_losses", "device_loss_report"),
+    "recorded_device_loss": ("semiconductor_losses", "recorded_device_loss"),
+    "compare_devices": ("semiconductor_losses", "compare_devices"),
+    "circuit_heat_report": ("semiconductor_losses", "circuit_heat_report"),
     "plot_csv": ("plotting", "plot_csv"),
     "plot_result": ("plotting", "plot_result"),
     "reference_csv": ("reference_signals", "reference_csv"),

@@ -41,6 +41,7 @@ nav:
       - Model Predictive Control: Model-Predictive-Control.md
       - Online System Analysis: Online-System-Analysis.md
       - Offline System Analysis: Offline-System-Analysis.md
+      - Semiconductor Losses: Semiconductor-Losses.md
       - Plotting: Plotting.md
   - Reference:
       - CLI Reference: CLI-Reference.md
