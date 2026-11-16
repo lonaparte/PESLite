@@ -78,6 +78,7 @@ def main(directory: str = "dist") -> int:
         ),
         "peslite-full": (
             "peslite/addons/components/magport.py",
+            "peslite/addons/components/advanced_thermal.py",
             "peslite/addons/components/magcircuit.py",
             "peslite/addons/functions/magport.py",
             "peslite/addons/functions/magcircuit.py",
