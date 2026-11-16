@@ -94,8 +94,9 @@ def test_magnetic_components_follow_one_component_convention(tmp_path):
     general_simulation = peslite.Simulation(general_params)
     coupled_component = coupled_simulation.system.named_elements["coils"].model
     general_component = general_simulation.system.named_elements["coils"].model
-    assert type(coupled_component) is MagComponent
+    assert isinstance(coupled_component, MagComponent)
     assert type(general_component) is MagPortModel
+    assert isinstance(general_component, MagComponent)
     assert coupled_component.names == general_component.names
     assert general_component.state_names == ("lambda_w0", "lambda_w1")
 

@@ -1,18 +1,22 @@
 # Magnetic Components
 
-`MagComponent` is PESLite's optimized constant-inductance representation for magnetic devices with
-one or more coupled windings. Like a resistor, capacitor or inductor, it connects directly to the
-electrical circuit and does not require an external file.
+`MagComponent` is the common contract for magnetic devices that connect to the electrical circuit
+through ordinary PESLite ports. Its electrical behavior may be a netlist, a constitutive law or an
+imported model; the physical magnetic description is optional.
 
 ## Component behavior
 
-A `MagComponent` defines named windings, their terminal connections and their electrical coupling.
-Each winding may include copper resistance. An inductance matrix contains every self- and
-mutual-inductance term; its rows and columns follow the winding order.
+A winding component defines named windings, their terminal connections and their electrical
+coupling. Each winding may include copper resistance.
 
-PESLite checks the component while assembling the circuit and then uses the same netlist and solver
-path as other components. No separate magnetic solver runs during the simulation. This remains the
-default magnetic calculation when a case does not use `magport` or `magcircuit`.
+The ordinary component ports and `network()` declaration are the required electrical domain. An
+optional `magnetic` section records the corresponding physical branches, flux-continuity nodes and
+signed branch-to-winding coupling. The electrical model remains authoritative for simulation;
+external processing may use the magnetic domain without changing the circuit connections.
+
+PESLite checks the component while assembling the circuit and then uses the same solver path as
+other components. `coupled_coils` uses a constant inductance matrix as an optimized electrical
+representation and runs no separate magnetic solver.
 
 For every winding, the component exposes:
 
@@ -51,6 +55,9 @@ winding polarity. Compensation capacitors and other electrical elements remain s
 see [Passive Components](Passive-Components.md).
 
 ## MagPort addon
+
+Install `peslite-full` to use `magport` and `magcircuit`. The lightweight component interface and
+`coupled_coils` remain available without the full installation.
 
 `magport` connects an explicit magnetic constitutive law to ordinary electrical winding terminals.
 Each winding flux linkage is a PESLite state. The law maps the winding flux-linkage vector and any
@@ -92,6 +99,7 @@ The file contains data rather than executable objects:
 | `inductance` | one law | self- and mutual-inductance matrix in H |
 | `flux_linkage` and `current` | one law | sampled nonlinear map, shaped `(samples, windings)` |
 | `physical` | no | JSON-compatible source metadata |
+| `magnetic` | no | validated physical branch, node and winding-coupling description |
 | `field_points` and `field_basis` | no | spatial coordinates and a linear current-to-field map |
 
 Exactly one constitutive law is stored. PESLite checks the file format, winding order, constitutive
@@ -107,6 +115,7 @@ write_magport(
     winding_names=("primary", "secondary"),
     inductance=[[100e-6, -20e-6], [-20e-6, 100e-6]],
     physical=source_data,
+    magnetic=magnetic_description,
     field_points=field_points,
     field_basis=field_basis,
 )
@@ -114,6 +123,11 @@ write_magport(
 
 `physical` is optional metadata. `field_points` has shape `(points, 3)`, and `field_basis` has shape
 `(points, 3, windings)` and maps winding currents to magnetic flux density.
+
+The optional `magnetic` mapping uses named branches, nodes and couplings. A branch provides one
+constitutive description: `reluctance`; `area`, `path_length` and either `mu_r` or `bh_curve`; or
+matching `flux` and `mmf` samples. Optional `hysteresis`, `core_loss` and `eddy_current` mappings
+preserve provider parameters without implying that the selected electrical law evaluates them.
 
 Write sampled nonlinear data by replacing `inductance=` with matching arrays:
 
@@ -183,9 +197,9 @@ post-processing does not add work to electrical simulation steps.
 
 ## MagCircuit addon
 
-`magcircuit` evaluates a magnetic branch network during simulation. `coupling` maps winding
-currents to branch MMF, and optional `incidence` enforces flux continuity. A branch may use a
-constant reluctance or a monotone sampled flux-to-MMF law:
+`magcircuit` evaluates the `magnetic` branch network during simulation. `coupling` maps named
+branches to named windings, while each entry in `nodes` states one flux-continuity equation. A
+branch may use reluctance, material geometry or a monotone sampled flux-to-MMF law:
 
 ```yaml
 elements:
@@ -194,12 +208,18 @@ elements:
     windings:
       primary: {positive: primary, negative: ground, r: 0.08}
       secondary: {positive: secondary, negative: ground, r: 0.10}
-    branches:
-      core: {flux: [-0.002, 0.0, 0.002], mmf: [-60.0, 0.0, 60.0]}
-      gap: {reluctance: 2.0e6}
-    coupling:
-      - [20.0, 0.0]
-      - [0.0, 20.0]
+    magnetic:
+      branches:
+        core:
+          area: 1.0e-4
+          path_length: 0.08
+          bh_curve: [[-1.0, -800.0], [0.0, 0.0], [1.0, 800.0]]
+        gap: {reluctance: 2.0e6}
+      nodes:
+        continuity: {core: 1.0, gap: -1.0}
+      coupling:
+        core: {primary: 20.0}
+        gap: {secondary: 20.0}
 ```
 
 At each constitutive evaluation, the addon solves branch MMF relations, flux continuity and winding

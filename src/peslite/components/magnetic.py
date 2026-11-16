@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping
 
 import numpy as np
 
 from ..solver import Bag, ConfigError, Empty, Port, StoragePort
 from .network import Element, NetworkComponent
 
-__all__ = ["MagComponent", "MagneticParams", "WindingParams"]
+__all__ = [
+    "MagComponent",
+    "MagneticBranchDescription",
+    "MagneticDescription",
+    "MagneticParams",
+    "WindingParams",
+]
 
 
 GROUND = "ground"
@@ -47,6 +54,17 @@ def _validate_windings(windings: dict[str, WindingParams]) -> tuple[str, ...]:
     return _validate_winding_names(windings)
 
 
+def _validate_scoped_names(values: Any, path: str) -> tuple[str, ...]:
+    names = tuple(values)
+    if not names or any(
+        not isinstance(name, str) or not name or "." in name for name in names
+    ):
+        raise ConfigError(f"{path} names must be nonempty strings without dots")
+    if len(set(names)) != len(names):
+        raise ConfigError(f"{path} names must be unique")
+    return names
+
+
 def _winding_buses(windings: dict[str, WindingParams]) -> dict[str, str]:
     return {
         f"windings.{name}.{side}": bus
@@ -56,14 +74,228 @@ def _winding_buses(windings: dict[str, WindingParams]) -> dict[str, str]:
     }
 
 
+def _positive(value: float | None, name: str) -> None:
+    if value is not None and (not math.isfinite(value) or value <= 0.0):
+        raise ConfigError(f"{name} must be finite and > 0")
+
+
+def _model_mapping(value: Mapping[str, Any] | None, name: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Mapping):
+        raise ConfigError(f"{name} must be a mapping")
+    try:
+        json.dumps(value, allow_nan=False, sort_keys=True)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{name} must contain finite JSON-compatible data") from None
+
+
+@dataclass(frozen=True, kw_only=True)
+class MagneticBranchDescription:
+    """Physical description of one named magnetic path.
+
+    A branch has one constitutive description: direct reluctance, geometry with a linear
+    permeability or B-H curve, or explicit flux/MMF samples. Loss and history mappings are
+    provider data; the electrical solver uses them only when its selected magnetic law declares
+    the corresponding dynamics or dissipation.
+    """
+
+    reluctance: float | None = None
+    area: float | None = None
+    path_length: float | None = None
+    mu_r: float | None = None
+    bh_curve: list[list[float]] | None = None
+    flux: list[float] | None = None
+    mmf: list[float] | None = None
+    hysteresis: Mapping[str, Any] | None = None
+    core_loss: Mapping[str, Any] | None = None
+    eddy_current: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        _positive(self.reluctance, "reluctance")
+        _positive(self.area, "area")
+        _positive(self.path_length, "path_length")
+        _positive(self.mu_r, "mu_r")
+        geometry = self.area is not None or self.path_length is not None or self.mu_r is not None
+        curve = self.bh_curve is not None
+        samples = self.flux is not None or self.mmf is not None
+        modes = int(self.reluctance is not None) + int(geometry or curve) + int(samples)
+        if modes != 1:
+            raise ConfigError(
+                "a magnetic branch needs exactly one of reluctance, material geometry, "
+                "or flux/MMF samples"
+            )
+        if geometry or curve:
+            if self.area is None or self.path_length is None:
+                raise ConfigError("material geometry needs area and path_length")
+            if (self.mu_r is None) == (self.bh_curve is None):
+                raise ConfigError("material geometry needs exactly one of mu_r or bh_curve")
+        if self.bh_curve is not None:
+            values = self._curve(self.bh_curve, "bh_curve")
+            if np.any(np.diff(values[:, 0]) <= 0.0) or np.any(np.diff(values[:, 1]) <= 0.0):
+                raise ConfigError("bh_curve B and H values must be strictly increasing")
+            object.__setattr__(self, "bh_curve", values.tolist())
+        if samples:
+            if self.flux is None or self.mmf is None:
+                raise ConfigError("flux and mmf samples must be provided together")
+            try:
+                pairs = np.column_stack((self.flux, self.mmf))
+            except (TypeError, ValueError):
+                raise ConfigError("flux and mmf samples must have equal lengths") from None
+            values = self._curve(pairs, "flux/MMF samples")
+            if np.any(np.diff(values[:, 0]) <= 0.0) or np.any(np.diff(values[:, 1]) <= 0.0):
+                raise ConfigError("flux and mmf samples must be strictly increasing")
+            object.__setattr__(self, "flux", values[:, 0].tolist())
+            object.__setattr__(self, "mmf", values[:, 1].tolist())
+        for name in ("hysteresis", "core_loss", "eddy_current"):
+            _model_mapping(getattr(self, name), name)
+
+    @staticmethod
+    def _curve(value: Any, name: str) -> np.ndarray:
+        try:
+            curve = np.asarray(value, dtype=float)
+        except (TypeError, ValueError):
+            raise ConfigError(f"{name} must contain numeric pairs") from None
+        if curve.ndim != 2 or curve.shape[1] != 2 or len(curve) < 2:
+            raise ConfigError(f"{name} must contain at least two [x, y] pairs")
+        if not np.isfinite(curve).all():
+            raise ConfigError(f"{name} must contain finite values")
+        return curve
+
+    def constitutive_data(self) -> tuple[float | None, np.ndarray | None, np.ndarray | None]:
+        """Return direct reluctance or monotone flux/MMF samples in SI units."""
+        if self.reluctance is not None:
+            return self.reluctance, None, None
+        if self.mu_r is not None:
+            mu0 = 4.0e-7 * math.pi
+            return self.path_length / (mu0 * self.mu_r * self.area), None, None
+        if self.bh_curve is not None:
+            curve = np.asarray(self.bh_curve, dtype=float)
+            return None, curve[:, 0] * self.area, curve[:, 1] * self.path_length
+        return None, np.asarray(self.flux, dtype=float), np.asarray(self.mmf, dtype=float)
+
+
+@dataclass(frozen=True, kw_only=True)
+class MagneticDescription:
+    """Optional physical magnetic domain accompanying an electrical component model."""
+
+    branches: dict[str, MagneticBranchDescription] = field(
+        metadata={"entries": MagneticBranchDescription, "structural": True}
+    )
+    nodes: dict[str, dict[str, float]] = field(
+        default_factory=dict, metadata={"structural": True}
+    )
+    coupling: dict[str, dict[str, float]] = field(
+        default_factory=dict, metadata={"structural": True}
+    )
+
+    def __post_init__(self) -> None:
+        branch_names = _validate_scoped_names(self.branches, "magnetic.branches")
+        known = set(branch_names)
+        normalized = {}
+        for section, values in (("nodes", self.nodes), ("coupling", self.coupling)):
+            if not isinstance(values, dict):
+                raise ConfigError(f"magnetic.{section} must be a mapping")
+            normalized[section] = {}
+            for name, coefficients in values.items():
+                _validate_scoped_names((name,), f"magnetic.{section}")
+                if not isinstance(coefficients, dict):
+                    raise ConfigError(f"magnetic.{section}.{name} must be a mapping")
+                if section == "coupling" and name not in known:
+                    raise ConfigError(f"magnetic.coupling: unknown branch {name!r}")
+                if section == "nodes":
+                    unknown = set(coefficients) - known
+                    if unknown:
+                        raise ConfigError(
+                            f"magnetic.nodes.{name}: unknown branches {sorted(unknown)}"
+                        )
+                converted = {}
+                for target, coefficient in coefficients.items():
+                    if not isinstance(target, str) or not target or "." in target:
+                        raise ConfigError(
+                            f"magnetic.{section}.{name} targets must be nonempty strings "
+                            "without dots"
+                        )
+                    try:
+                        value = float(coefficient)
+                    except (TypeError, ValueError):
+                        raise ConfigError(
+                            f"magnetic.{section}.{name}.{target} must be finite"
+                        ) from None
+                    if isinstance(coefficient, bool) or not math.isfinite(value):
+                        raise ConfigError(
+                            f"magnetic.{section}.{name}.{target} must be finite"
+                        )
+                    converted[target] = value
+                normalized[section][name] = converted
+        object.__setattr__(self, "nodes", normalized["nodes"])
+        object.__setattr__(self, "coupling", normalized["coupling"])
+
+    def matrices(
+        self, winding_names: tuple[str, ...]
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Return branch-to-winding coupling and optional node-incidence matrices."""
+        windings = _validate_winding_names(winding_names)
+        unknown = {
+            winding
+            for coefficients in self.coupling.values()
+            for winding in coefficients
+            if winding not in windings
+        }
+        if unknown:
+            raise ConfigError(f"magnetic.coupling: unknown windings {sorted(unknown)}")
+        branch_names = tuple(self.branches)
+        coupling = np.asarray([
+            [self.coupling.get(branch, {}).get(winding, 0.0) for winding in windings]
+            for branch in branch_names
+        ], dtype=float)
+        incidence = None if not self.nodes else np.asarray([
+            [coefficients.get(branch, 0.0) for branch in branch_names]
+            for coefficients in self.nodes.values()
+        ], dtype=float)
+        return coupling, incidence
+
+
+def _magnetic_description(value: Any) -> MagneticDescription | None:
+    """Build the physical magnetic domain from its portable mapping representation."""
+    if value is None or isinstance(value, MagneticDescription):
+        return value
+    if not isinstance(value, Mapping):
+        raise ConfigError("magnetic must be a mapping")
+    unknown = set(value) - {"branches", "nodes", "coupling"}
+    if unknown:
+        raise ConfigError(f"magnetic: unknown keys {sorted(unknown)}")
+    branches = value.get("branches")
+    if not isinstance(branches, Mapping):
+        raise ConfigError("magnetic.branches must be a mapping")
+    built = {}
+    for name, branch in branches.items():
+        if not isinstance(branch, Mapping):
+            raise ConfigError(f"magnetic.branches.{name} must be a mapping")
+        try:
+            built[str(name)] = MagneticBranchDescription(**branch)
+        except TypeError as exc:
+            raise ConfigError(f"magnetic.branches.{name}: {exc}") from None
+    return MagneticDescription(
+        branches=built,
+        nodes=dict(value.get("nodes", {})),
+        coupling=dict(value.get("coupling", {})),
+    )
+
+
 @dataclass(frozen=True, kw_only=True)
 class MagneticParams:
     """Common winding configuration for magnetic element adapters."""
 
     windings: dict[str, WindingParams] = field(metadata={"structural": True})
+    magnetic: MagneticDescription | None = field(
+        default=None, metadata={"structural": True}
+    )
 
     def __post_init__(self) -> None:
-        _validate_windings(self.windings)
+        names = _validate_windings(self.windings)
+        if self.magnetic is not None:
+            self.magnetic.matrices(names)
 
     def connection_buses(self) -> dict[str, str]:
         return _winding_buses(self.windings)
@@ -88,13 +320,22 @@ def _inductance_decomposition(
 
 
 class MagComponent(NetworkComponent):
-    """PESLite component for an electrical self- and mutual-inductance matrix."""
+    """Common electrical component contract with optional physical magnetic data."""
+
+    def __init__(self, magnetic: MagneticDescription | None = None) -> None:
+        self.magnetic = magnetic
+
+
+class _InductanceMatrixModel(MagComponent):
+    """Optimized electrical representation of a constant winding-inductance matrix."""
 
     outputs_need_inputs: ClassVar[bool] = False
 
     def __init__(self, winding_names: tuple[str, ...], inductance: Any,
                  resistance: tuple[float, ...],
-                 terminals: tuple[tuple[bool, bool], ...]) -> None:
+                 terminals: tuple[tuple[bool, bool], ...],
+                 magnetic: MagneticDescription | None = None) -> None:
+        super().__init__(magnetic)
         names = _validate_winding_names(winding_names)
         if len(resistance) != len(names) or len(terminals) != len(names):
             raise ConfigError("every winding must define resistance and terminals")
@@ -207,7 +448,10 @@ class _MagneticElement(Element):
             name, windings, winding_names, buses
         )
         self._attach(
-            name, cfg, MagComponent(names, inductance, resistance, terminals)
+            name, cfg,
+            _InductanceMatrixModel(
+                names, inductance, resistance, terminals, cfg.magnetic
+            ),
         )
 
     def subsystems(self) -> dict[str, Any]:

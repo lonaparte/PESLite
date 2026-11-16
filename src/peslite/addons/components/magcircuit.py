@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
 from ...components.magnetic import (
+    MagneticBranchDescription,
     MagneticParams,
     _validate_winding_names,
 )
@@ -16,7 +16,7 @@ from ...components.network import register_component_type
 from ...solver import ConfigError
 from .magport import MagPortElement
 
-__all__ = ["MagCircuit", "MagCircuitLaw", "MagneticBranchParams"]
+__all__ = ["MagCircuit", "MagCircuitLaw"]
 
 
 def _matrix(value: Any, name: str) -> np.ndarray:
@@ -324,59 +324,31 @@ class MagCircuitLaw:
         return float(currents @ flux_rate)
 
 
-@dataclass(frozen=True, kw_only=True)
-class MagneticBranchParams:
-    """One linear reluctance or monotone sampled nonlinear branch relation."""
-
-    reluctance: float | None = None
-    flux: list[float] | None = None
-    mmf: list[float] | None = None
-
-    def __post_init__(self) -> None:
-        linear = self.reluctance is not None
-        tabulated = self.flux is not None or self.mmf is not None
-        if linear == tabulated:
-            raise ConfigError("provide either reluctance or both flux and mmf")
-        if linear:
-            if not math.isfinite(self.reluctance) or self.reluctance <= 0.0:  # type: ignore[arg-type]
-                raise ConfigError("reluctance must be finite and > 0")
-            return
-        if self.flux is None or self.mmf is None:
-            raise ConfigError("flux and mmf must be provided together")
-        try:
-            flux = np.asarray(self.flux, dtype=float)
-            mmf = np.asarray(self.mmf, dtype=float)
-        except (TypeError, ValueError):
-            raise ConfigError("flux and mmf must be numeric vectors") from None
-        if flux.ndim != 1 or len(flux) < 2 or mmf.shape != flux.shape:
-            raise ConfigError("flux and mmf must be equal-length vectors with at least two points")
-        if (not np.isfinite(flux).all() or not np.isfinite(mmf).all()
-                or np.any(np.diff(flux) <= 0.0) or np.any(np.diff(mmf) <= 0.0)):
-            raise ConfigError("flux and mmf must be finite and strictly increasing")
-
-
 def _branch_law(
-    branches: Mapping[str, MagneticBranchParams],
+    branches: Mapping[str, MagneticBranchDescription],
 ) -> tuple[Callable | None, Callable | None, np.ndarray | None, Callable | None]:
     values = tuple(branches.values())
-    if all(branch.reluctance is not None for branch in values):
-        return None, None, np.diag([branch.reluctance for branch in values]), None
+    constitutive = tuple(branch.constitutive_data() for branch in values)
+    if all(reluctance is not None for reluctance, _flux, _mmf in constitutive):
+        return None, None, np.diag([
+            reluctance for reluctance, _flux, _mmf in constitutive
+        ]), None
 
     from scipy.interpolate import PchipInterpolator
 
     laws = []
     slopes = []
     energies = []
-    for branch in values:
-        if branch.reluctance is not None:
-            reluctance = float(branch.reluctance)
+    for reluctance, flux, branch_mmf in constitutive:
+        if reluctance is not None:
+            reluctance = float(reluctance)
             laws.append(lambda value, reluctance=reluctance: reluctance * value)
             slopes.append(lambda _value, reluctance=reluctance: reluctance)
             energies.append(
                 lambda value, reluctance=reluctance: 0.5 * reluctance * value * value
             )
         else:
-            curve = PchipInterpolator(branch.flux, branch.mmf, extrapolate=True)
+            curve = PchipInterpolator(flux, branch_mmf, extrapolate=True)
             derivative = curve.derivative()
             integral = curve.antiderivative()
             origin = float(integral(0.0))
@@ -414,28 +386,26 @@ class MagCircuit(MagPortElement):
 
     @dataclass(frozen=True, kw_only=True)
     class Params(MagneticParams):
-        branches: dict[str, MagneticBranchParams] = field(
-            metadata={"entries": MagneticBranchParams, "structural": True}
-        )
-        coupling: list[list[float]] = field(metadata={"structural": True})
-        incidence: list[list[float]] | None = field(
-            default=None, metadata={"structural": True}
-        )
         type: str = "magcircuit"
 
         def __post_init__(self) -> None:
             super().__post_init__()
-            if not self.branches:
-                raise ConfigError("branches must contain at least one magnetic branch")
+            if self.magnetic is None:
+                raise ConfigError("magcircuit requires the magnetic domain")
+            coupling, _incidence = self.magnetic.matrices(tuple(self.windings))
+            if np.linalg.matrix_rank(coupling) != len(self.windings):
+                raise ConfigError("magnetic coupling must independently excite every winding")
 
     type = "magcircuit"
 
     def __init__(self, name: str, cfg: Any, buses: dict, _params: Any) -> None:
-        mmf, differential, reluctance, stored_energy = _branch_law(cfg.branches)
+        magnetic = cfg.magnetic
+        coupling, incidence = magnetic.matrices(tuple(cfg.windings))
+        mmf, differential, reluctance, stored_energy = _branch_law(magnetic.branches)
         law = MagCircuitLaw(
             tuple(cfg.windings),
-            cfg.coupling,
-            incidence=cfg.incidence,
+            coupling,
+            incidence=incidence,
             reluctance=reluctance,
             mmf=mmf,
             differential=differential,

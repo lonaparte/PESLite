@@ -18,7 +18,8 @@ from peslite.addons.functions import (
     write_magport,
 )
 from peslite.assembly.params import from_dict
-from peslite.components import MagneticParams
+from peslite.components import (MagneticBranchDescription, MagneticDescription,
+                                MagneticParams)
 from peslite.components.network import ELEMENT_TYPES
 from peslite.solver import ConfigError
 from peslite.solver.energy import spec_of
@@ -37,6 +38,19 @@ def test_external_magnetic_model_round_trip_and_strict_schema(tmp_path):
         winding_names=("primary", "secondary"),
         inductance=[[4e-3, 1e-3], [1e-3, 3e-3]],
         physical={"source": "external", "temperature": 293.15},
+        magnetic={
+            "branches": {
+                "core": {
+                    "area": 1.2e-4,
+                    "path_length": 0.08,
+                    "mu_r": 1800.0,
+                    "core_loss": {"provider": "external"},
+                },
+            },
+            "coupling": {
+                "core": {"primary": 20.0, "secondary": -12.0},
+            },
+        },
         field_points=points,
         field_basis=basis,
     )
@@ -47,6 +61,8 @@ def test_external_magnetic_model_round_trip_and_strict_schema(tmp_path):
     np.testing.assert_array_equal(loaded.field_points, points)
     np.testing.assert_array_equal(loaded.field_basis, basis)
     assert dict(loaded.physical) == {"source": "external", "temperature": 293.15}
+    assert loaded.magnetic.coupling["core"] == {"primary": 20.0, "secondary": -12.0}
+    assert loaded.magnetic.branches["core"].core_loss == {"provider": "external"}
     assert not loaded.inductance.flags.writeable
 
     invalid = tmp_path / "invalid.npz"
@@ -318,11 +334,22 @@ def test_core_inductance_magport_and_magcircuit_are_numerically_equivalent(tmp_p
     circuit["elements"]["coils"].pop("inductance")
     circuit["elements"]["coils"].update(
         type="magcircuit",
-        branches={
-            "path_1": {"reluctance": 1.0},
-            "path_2": {"reluctance": 1.0},
+        magnetic={
+            "branches": {
+                "path_1": {"reluctance": 1.0},
+                "path_2": {"reluctance": 1.0},
+            },
+            "coupling": {
+                "path_1": {
+                    "primary": float(turns[0, 0]),
+                    "secondary": float(turns[0, 1]),
+                },
+                "path_2": {
+                    "primary": float(turns[1, 0]),
+                    "secondary": float(turns[1, 1]),
+                },
+            },
         },
-        coupling=turns.tolist(),
     )
     circuit["simulation"]["initial"] = port["simulation"]["initial"]
 
@@ -396,8 +423,12 @@ def test_nonlinear_magport_file_and_magcircuit_branch_law(tmp_path):
             "magnet": {
                 "type": "magcircuit",
                 "windings": base["elements"]["magnet"]["windings"],
-                "branches": {"core": {"flux": flux.tolist(), "mmf": current.tolist()}},
-                "coupling": [[1.0]],
+                "magnetic": {
+                    "branches": {
+                        "core": {"flux": flux.tolist(), "mmf": current.tolist()},
+                    },
+                    "coupling": {"core": {"coil": 1.0}},
+                },
             },
         },
     }
@@ -412,3 +443,25 @@ def test_nonlinear_magport_file_and_magcircuit_branch_law(tmp_path):
             circuit_result.columns()[signal], port_result.columns()[signal],
             rtol=3e-11, atol=2e-13,
         )
+
+
+def test_magnetic_domain_uses_named_topology_and_material_geometry():
+    branch = MagneticBranchDescription(
+        area=2.0e-4,
+        path_length=0.1,
+        bh_curve=[[-1.0, -800.0], [0.0, 0.0], [1.0, 800.0]],
+        hysteresis={"provider": "measured"},
+    )
+    reluctance, flux, mmf = branch.constitutive_data()
+    assert reluctance is None
+    np.testing.assert_allclose(flux, [-2.0e-4, 0.0, 2.0e-4])
+    np.testing.assert_allclose(mmf, [-80.0, 0.0, 80.0])
+
+    magnetic = MagneticDescription(
+        branches={"core": branch, "gap": MagneticBranchDescription(reluctance=2.0e6)},
+        nodes={"continuity": {"core": 1.0, "gap": -1.0}},
+        coupling={"core": {"primary": 20.0}, "gap": {"secondary": 12.0}},
+    )
+    coupling, incidence = magnetic.matrices(("primary", "secondary"))
+    np.testing.assert_array_equal(coupling, [[20.0, 0.0], [0.0, 12.0]])
+    np.testing.assert_array_equal(incidence, [[1.0, -1.0]])

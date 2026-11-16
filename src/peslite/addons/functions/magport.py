@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -18,6 +18,7 @@ from ..components.magport import (
     _data,
     _load,
 )
+from ...components.magnetic import MagneticDescription
 from ...solver import ConfigError
 
 __all__ = ["MagneticFieldResult", "write_magport", "magnetic_field"]
@@ -38,6 +39,10 @@ def _write(file: str | Path, data: _MagPortData) -> Path:
     else:
         entries["flux_linkage"] = data.flux_linkage
         entries["current"] = data.current
+    if data.magnetic is not None:
+        entries["magnetic"] = np.asarray(json.dumps(
+            asdict(data.magnetic), allow_nan=False, sort_keys=True, separators=(",", ":")
+        ))
     if data.field_points is not None:
         entries["field_points"] = data.field_points
         entries["field_basis"] = data.field_basis
@@ -62,13 +67,14 @@ def write_magport(
     flux_linkage: Any | None = None,
     current: Any | None = None,
     physical: Mapping[str, Any] | None = None,
+    magnetic: MagneticDescription | Mapping[str, Any] | None = None,
     field_points: Any | None = None,
     field_basis: Any | None = None,
 ) -> Path:
     """Write a linear or sampled nonlinear constitutive law in the MagPort format."""
     return _write(file, _data(
         winding_names, inductance, flux_linkage, current,
-        physical, field_points, field_basis,
+        physical, magnetic, field_points, field_basis,
     ))
 
 

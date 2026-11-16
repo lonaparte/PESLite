@@ -13,10 +13,20 @@
       "src/peslite/addons/control/**/*.py",
       "src/peslite/addons/formats/**/*.py",
       "src/peslite/addons/functions/**/*.py",
+      "!src/peslite/addons/components/magport.py",
+      "!src/peslite/addons/components/magcircuit.py",
+      "!src/peslite/addons/functions/magport.py",
+      "!src/peslite/addons/functions/magcircuit.py",
       "!src/peslite/addons/components/__init__.py",
       "!src/peslite/addons/control/__init__.py",
       "!src/peslite/addons/formats/__init__.py",
       "!src/peslite/addons/functions/__init__.py"
+    ],
+    "full-addons": [
+      "src/peslite/addons/components/magport.py",
+      "src/peslite/addons/components/magcircuit.py",
+      "src/peslite/addons/functions/magport.py",
+      "src/peslite/addons/functions/magcircuit.py"
     ],
     "gui": [
       "src/peslite/gui/**/*.py",
@@ -31,7 +41,7 @@
     "peslite-core": {
       "project": "pyproject.toml",
       "include": ["all"],
-      "exclude": ["addons", "gui"],
+      "exclude": ["addons", "full-addons", "gui"],
       "files": ["examples/templates/*"]
     },
     "peslite": {
@@ -63,7 +73,7 @@
     },
     "peslite-full": {
       "project": "packages/full/pyproject.toml",
-      "include": []
+      "include": ["full-addons"]
     }
   }
 }

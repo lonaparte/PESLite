@@ -11,9 +11,12 @@ from typing import Any, Mapping, Protocol, Sequence
 import numpy as np
 
 from ...components.magnetic import (
+    MagComponent,
+    MagneticDescription,
     MagneticParams,
     _MagneticElement,
     _inductance_decomposition,
+    _magnetic_description,
     _validate_winding_names,
 )
 from ...components.network import register_component_type
@@ -34,7 +37,9 @@ _VERSION = 2
 _REQUIRED = frozenset({"format", "version", "winding_names"})
 _LINEAR = frozenset({"inductance"})
 _NONLINEAR = frozenset({"flux_linkage", "current"})
-_OPTIONAL = frozenset({"physical", "field_points", "field_basis"}) | _LINEAR | _NONLINEAR
+_OPTIONAL = frozenset({
+    "physical", "magnetic", "field_points", "field_basis"
+}) | _LINEAR | _NONLINEAR
 
 
 @dataclass(frozen=True)
@@ -44,6 +49,7 @@ class _MagPortData:
     flux_linkage: np.ndarray | None
     current: np.ndarray | None
     physical: dict[str, Any]
+    magnetic: MagneticDescription | None
     field_points: np.ndarray | None
     field_basis: np.ndarray | None
 
@@ -88,6 +94,7 @@ def _data(
     flux_linkage: Any | None = None,
     current: Any | None = None,
     physical: Mapping[str, Any] | None = None,
+    magnetic: MagneticDescription | Mapping[str, Any] | None = None,
     field_points: Any | None = None,
     field_basis: Any | None = None,
 ) -> _MagPortData:
@@ -134,8 +141,11 @@ def _data(
             raise ConfigError("field data must be finite")
         points.setflags(write=False)
         basis.setflags(write=False)
+    description = _magnetic_description(magnetic)
+    if description is not None:
+        description.matrices(names)
     return _MagPortData(
-        names, matrix, flux_samples, current_samples, source, points, basis
+        names, matrix, flux_samples, current_samples, source, description, points, basis
     )
 
 
@@ -193,6 +203,15 @@ def _load(file: str | Path) -> _MagPortData:
                     physical = json.loads(text)
                 except json.JSONDecodeError as exc:
                     raise ConfigError(f"physical contains invalid JSON: {exc.msg}") from None
+            magnetic = None
+            if "magnetic" in keys:
+                text = _scalar(archive["magnetic"], "magnetic")
+                if not isinstance(text, str):
+                    raise ConfigError("magnetic must be a JSON string")
+                try:
+                    magnetic = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise ConfigError(f"magnetic contains invalid JSON: {exc.msg}") from None
             return _data(
                 names,
                 inductance=(archive["inductance"].copy()
@@ -201,6 +220,7 @@ def _load(file: str | Path) -> _MagPortData:
                               if "flux_linkage" in keys else None),
                 current=(archive["current"].copy() if "current" in keys else None),
                 physical=physical,
+                magnetic=magnetic,
                 field_points=(archive["field_points"].copy()
                               if "field_points" in keys else None),
                 field_basis=(archive["field_basis"].copy()
@@ -337,7 +357,7 @@ def _numeric_vector(values: Any, size: int, label: str) -> np.ndarray:
     return vector
 
 
-class MagPortModel:
+class MagPortModel(MagComponent):
     """Dedicated magnetic state subsystem with two electrical terminals per winding."""
 
     outputs_need_inputs = False
@@ -347,7 +367,9 @@ class MagPortModel:
         law: MagneticLaw,
         resistance: Sequence[float],
         terminals: Sequence[tuple[bool, bool]],
+        magnetic: MagneticDescription | None = None,
     ) -> None:
+        super().__init__(magnetic)
         if not callable(getattr(law, "currents", None)):
             raise TypeError("a magnetic law must define currents(t, flux_linkage, state)")
         self.law = law
@@ -541,11 +563,16 @@ class MagPortModel:
 class MagPortElement(_MagneticElement):
     """Assembly adapter from any magnetic law to standard PESLite winding ports."""
 
-    def __init__(self, name: str, cfg: Any, buses: dict, law: MagneticLaw) -> None:
+    def __init__(self, name: str, cfg: Any, buses: dict, law: MagneticLaw,
+                 magnetic: MagneticDescription | None = None) -> None:
         _names, resistance, terminals = self._winding_data(
             name, cfg.windings, law.winding_names, buses
         )
-        self._attach(name, cfg, MagPortModel(law, resistance, terminals))
+        description = cfg.magnetic if magnetic is None else magnetic
+        self._attach(
+            name, cfg,
+            MagPortModel(law, resistance, terminals, description),
+        )
 
 
 @register_component_type
@@ -571,4 +598,6 @@ class MagPort(MagPortElement):
             if data.inductance is not None else
             TabulatedMagneticLaw(data.winding_names, data.flux_linkage, data.current)
         )
-        super().__init__(name, cfg, buses, law)
+        if cfg.magnetic is not None and data.magnetic is not None:
+            raise ConfigError("magnetic may be provided by the configuration or file, not both")
+        super().__init__(name, cfg, buses, law, cfg.magnetic or data.magnetic)
