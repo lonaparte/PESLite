@@ -51,12 +51,12 @@ The complete component definition is kept in the example file rather than duplic
 winding flux linkage is a PESLite state. The law maps the winding flux-linkage vector and any
 additional magnetic states to winding currents, while terminal voltage advances flux linkage:
 
-\[
+$$
 \dot{\boldsymbol\lambda}
 =\boldsymbol u-\boldsymbol R\boldsymbol i,
 \qquad
 \boldsymbol i=g(t,\boldsymbol\lambda,\boldsymbol z).
-\]
+$$
 
 For an analytical or externally coupled law, implement `currents()` and add `derivatives()` when
 the law has internal state. `MagPortElement` supplies winding ports, electrical records and state
