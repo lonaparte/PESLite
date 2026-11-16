@@ -293,7 +293,7 @@ def test_custom_inner_explicit_method_uses_the_projected_stability_model():
     assert abs(result.y[1]) < 0.1
 
 
-@pytest.mark.full
+@pytest.mark.long
 @pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda p: p.stem)
 def test_every_bundled_example_runs_with_the_solver(path, tmp_path):
     sim = peslite.Simulation(peslite.load(path, **QUIET, **{"simulation.t_end": 0.002}))
@@ -335,7 +335,7 @@ def test_multirate_rejects_a_schedule_without_continuous_states():
         make_solver(configured, model)
 
 
-@pytest.mark.full
+@pytest.mark.long
 @pytest.mark.parametrize("method", ["radau", "trapezoidal"])
 def test_a_stiff_inner_group_can_use_an_implicit_method(method, tmp_path):
     common = {
@@ -626,7 +626,7 @@ def test_multistep_methods_report_lightly_damped_circuit_modes(tmp_path):
     assert "lightly damped" in " ".join(result.summary["solver_notes"])
 
 
-@pytest.mark.full
+@pytest.mark.long
 def test_device_equations_follow_commands_changed_at_a_commutation(tmp_path):
     counts = {}
     for circuit_model in ("device", "statewise"):

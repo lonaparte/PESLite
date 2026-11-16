@@ -12,7 +12,7 @@ import pytest
 from peslite.gui.web_service import LocalServer
 
 
-pytestmark = [pytest.mark.full, pytest.mark.serial]
+pytestmark = [pytest.mark.ui, pytest.mark.serial]
 
 ROOT = Path(__file__).resolve().parents[1]
 GUI = ROOT / "src/peslite/gui"

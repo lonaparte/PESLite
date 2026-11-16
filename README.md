@@ -114,7 +114,9 @@ Run the fast test suite from the repository root:
 python -m pytest
 ```
 
-Use `python -m pytest --run-full` to include compiler, external-reference and long numerical tests.
+Use `python -m pytest --run-long` for long numerical and compiler tests,
+`python -m pytest --run-ui` for graphical-interface tests, or
+`python -m pytest --run-full` for all three suites.
 
 ## License
 

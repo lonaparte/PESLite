@@ -5,10 +5,14 @@ import json
 import threading
 import urllib.request
 
+import pytest
+
 from peslite.gui.preview_cache import PreviewLayoutCache, empty_layout, normalize_layout
 from peslite.gui.preview_host import Workspace, make_server
 from peslite.gui.service import FrontendService
 from peslite.gui.host import Host
+
+pytestmark = pytest.mark.ui
 
 LAYOUT = {"format": "peslite.preview-layout", "version": 1,
           "views": {"circuit": {"VSC": {"dx": 48, "dy": -24}}}}

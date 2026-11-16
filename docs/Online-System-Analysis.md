@@ -245,16 +245,3 @@ Each perturbation reconstructs the model through the existing factories and name
 path, leaving the completed run unchanged. Multirate configurations use the unsplit reference map
 with the configured base solver and tolerances; the result is a physical-system map, not a spectrum
 of the multirate splitting approximation.
-
-## Verification
-
-Run the focused online-analysis tests with the test dependencies installed:
-
-```bash
-python -m pytest tests/test_operating_point.py tests/test_dynamic_metrics.py
-python -m pytest --run-full tests/test_small_signal.py tests/test_small_signal_ac.py
-```
-
-`tests/benchmark_small_signal.py` separates reconstruction, period advances, transition-matrix
-assembly, eigensystem work and orchestration when profiling a supplied simulation file. Its timing
-is diagnostic and does not enter normal simulation execution.

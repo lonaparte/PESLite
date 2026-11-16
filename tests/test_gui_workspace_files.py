@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.ui
+
 MODULE = Path(__file__).resolve().parents[1] / "src/peslite/gui/workspace.py"
 spec = importlib.util.spec_from_file_location("peslite_workspace_standalone", MODULE)
 workspace = importlib.util.module_from_spec(spec)

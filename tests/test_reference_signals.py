@@ -351,7 +351,7 @@ def test_reference_signal_matches_set_event_in_nested_wpt_control(
     )
 
 
-@pytest.mark.full
+@pytest.mark.long
 @pytest.mark.parametrize(
     "example,unit,loop,targets",
     (

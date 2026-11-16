@@ -10,11 +10,7 @@ on:
       - "packages/distributions.json"
       - "packages/gui/pyproject.toml"
       - "scripts/distributions.py"
-      - "tests/test_gui_legacy_yaml.py"
-      - "tests/test_gui_preview_cache.py"
-      - "tests/test_gui_preview.py"
-      - "tests/test_gui_web_host.py"
-      - "tests/test_gui_workspace_files.py"
+      - "tests/test_gui_*.py"
       - ".github/workflows/gui.yml"
   push:
     branches:
@@ -26,11 +22,7 @@ on:
       - "packages/distributions.json"
       - "packages/gui/pyproject.toml"
       - "scripts/distributions.py"
-      - "tests/test_gui_legacy_yaml.py"
-      - "tests/test_gui_preview_cache.py"
-      - "tests/test_gui_preview.py"
-      - "tests/test_gui_web_host.py"
-      - "tests/test_gui_workspace_files.py"
+      - "tests/test_gui_*.py"
       - ".github/workflows/gui.yml"
   workflow_dispatch:
 
@@ -57,12 +49,7 @@ jobs:
         run: python -m pip install -e ".[test]"
 
       - name: Run GUI host tests
-        run: >-
-          python -m pytest -q
-          tests/test_gui_workspace_files.py
-          tests/test_gui_legacy_yaml.py
-          tests/test_gui_web_host.py
-          tests/test_gui_preview_cache.py
+        run: python -m pytest -q --run-ui
 
       - name: Set up Node.js
         uses: actions/setup-node@v6

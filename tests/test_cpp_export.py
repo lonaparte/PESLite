@@ -21,7 +21,7 @@ from peslite.components.network import Element
 from peslite.solver import BlackBoxSubsystem
 from test_measurement_network import load_case
 
-pytestmark = pytest.mark.full
+pytestmark = pytest.mark.long
 
 
 class _ConditionalState(Bag):

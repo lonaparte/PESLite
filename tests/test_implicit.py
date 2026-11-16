@@ -418,7 +418,7 @@ def test_make_solver_uses_each_configured_circuit_model():
     assert adaptive.jac.linear.n_jacobians < model.n_states
 
 
-@pytest.mark.full
+@pytest.mark.long
 @pytest.mark.parametrize("method", ["trapezoidal", "radau", "auto"])
 def test_circuit_models_preserve_the_same_simulation_equations(method, tmp_path):
     runs = 0

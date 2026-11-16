@@ -94,7 +94,7 @@ jobs:
 
       - name: Run reference comparisons
         run: >-
-          python -m pytest -x --run-full
+          python -m pytest -x --run-long
           tests/reference/test_motulator.py
           tests/reference/test_motulator_dead_time.py
 
@@ -121,7 +121,7 @@ jobs:
           python -m pip install --group onnx-test
 
       - name: Run ONNX compatibility tests
-        run: python -m pytest -x --run-full tests/test_black_box_onnx.py
+        run: python -m pytest -x --run-long tests/test_black_box_onnx.py
 
 
   gui-test:

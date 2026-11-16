@@ -34,4 +34,4 @@ jobs:
       - name: Run the fast regression suite
         run: python -m pytest -x
       - name: Run complete-loop analysis regression cases
-        run: python -m pytest -x --run-full tests/test_small_signal.py tests/test_small_signal_ac.py
+        run: python -m pytest -x --run-long tests/test_small_signal.py tests/test_small_signal_ac.py

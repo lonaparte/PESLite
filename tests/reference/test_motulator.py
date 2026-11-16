@@ -31,7 +31,7 @@ from motulator.grid import model as motulator_model
 
 
 MOTULATOR_VERSION = "0.21.0"
-pytestmark = [pytest.mark.full, pytest.mark.motulator]
+pytestmark = [pytest.mark.long, pytest.mark.motulator]
 
 S_BASE = 10e3
 V_LL_RMS = 400.0

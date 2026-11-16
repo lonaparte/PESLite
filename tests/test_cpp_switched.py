@@ -10,7 +10,7 @@ import peslite
 from peslite.assembly.params import from_dict
 from test_cpp_export import _compiler
 
-pytestmark = pytest.mark.full
+pytestmark = pytest.mark.long
 
 
 def _interleaved(units: int, *, t_end: float = 0.004) -> dict:

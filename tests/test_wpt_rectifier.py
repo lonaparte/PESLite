@@ -15,7 +15,7 @@ from peslite.assembly.params import ConfigError, from_dict, read_initial
 from peslite.components import FullBridge
 from wpt_reference import Circuit, rectify
 
-pytestmark = pytest.mark.full
+pytestmark = pytest.mark.long
 
 F = 85e3
 V1 = 400.0

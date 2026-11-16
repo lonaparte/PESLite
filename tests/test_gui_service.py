@@ -13,6 +13,9 @@ from peslite.gui import FrontendService, Topology
 import peslite
 
 
+pytestmark = pytest.mark.ui
+
+
 def _serve(tmp_path, *requests):
     out = io.StringIO()
     service = FrontendService(out, root=tmp_path, output_root=tmp_path / "output")
@@ -73,7 +76,6 @@ def test_protocol_loads_simulates_and_streams(tmp_path):
     assert (tmp_path / "output" / "buck-example" / "gui-snapshot.json").is_file()
 
 
-@pytest.mark.full
 def test_small_signal_modes_follow_the_frontend_schema(tmp_path):
     overrides = {"simulation.t_end": 0.050025, "simulation.energy_check": "off",
                  "simulation.solver.linearisations": 0}

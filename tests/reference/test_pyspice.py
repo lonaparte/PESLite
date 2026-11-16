@@ -29,7 +29,7 @@ from PySpice.Spice.NgSpice.Shared import NgSpiceCommandError, NgSpiceShared
 
 
 PYSPICE_VERSION = "1.5"
-pytestmark = [pytest.mark.full, pytest.mark.pyspice]
+pytestmark = [pytest.mark.long, pytest.mark.pyspice]
 
 
 class _ReferenceNgSpice(NgSpiceShared):

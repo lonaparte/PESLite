@@ -17,7 +17,7 @@ from peslite.solver import Bag, Model
 from test_cpp_equations import _Feedback
 from test_cpp_parameters import _case, _compare_run, _compile, _table
 
-pytestmark = pytest.mark.full
+pytestmark = pytest.mark.long
 
 
 @dataclass(frozen=True)

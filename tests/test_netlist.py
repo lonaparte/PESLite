@@ -239,7 +239,7 @@ def _numeric_input_reach(topology):
     )
 
 
-@pytest.mark.full
+@pytest.mark.long
 @pytest.mark.parametrize("form", FORMS)
 def test_large_numeric_stage_dependencies_follow_the_network_structure(
         form, monkeypatch):
@@ -778,7 +778,7 @@ def test_device_stability_matrix_matches_the_current_netlist_mode(example):
         )
 
 
-@pytest.mark.full
+@pytest.mark.long
 def test_transformed_device_runtime_is_stable_at_grazing_commutations(tmp_path):
     params = peslite.load(
         EXAMPLES / "wpt-phase-shift-example.pes",
@@ -789,7 +789,7 @@ def test_transformed_device_runtime_is_stable_at_grazing_commutations(tmp_path):
     assert all(np.isfinite(value) for value in result.final_states().values())
 
 
-@pytest.mark.full
+@pytest.mark.long
 @pytest.mark.parametrize("example", ["wpt-phase-shift-example", "wpt-scc-example"])
 def test_switching_wpt_netlists_match_device_equations(example, tmp_path):
     def run(circuit_model):

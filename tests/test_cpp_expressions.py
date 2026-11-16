@@ -9,7 +9,7 @@ import pytest
 from peslite.assembly.cpp import _Expression, _ModelGenerator
 from test_cpp_export import _compiler
 
-pytestmark = pytest.mark.full
+pytestmark = pytest.mark.long
 
 
 def _function(name, equation, statements=None):

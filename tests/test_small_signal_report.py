@@ -17,7 +17,7 @@ from peslite.solver.linearization import linearize_loop
 from peslite.solver.model import Empty, Model
 from peslite.solver.simulation import SystemLoop
 
-pytestmark = pytest.mark.full
+pytestmark = pytest.mark.long
 
 
 def _params(**overrides):
