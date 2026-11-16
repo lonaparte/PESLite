@@ -47,8 +47,8 @@ class Port:
 
     A physical port stores its voltage and the current entering ``component``. A causal
     black-box component may also name the input/output paths adapting that port to its
-    callable model. Signal subsystems use :meth:`signals` for a power pair without a
-    physical connection.
+    callable model, with optional output paths for their total rates. Signal subsystems use
+    :meth:`signals` for a power pair without a physical connection.
     """
 
     component: Any = field(default=None, repr=False, compare=False)
@@ -62,6 +62,8 @@ class Port:
     grounded: bool = field(default=False, repr=False)
     effort: Optional[str] = field(default=None, repr=False)
     flow: Optional[str] = field(default=None, repr=False)
+    effort_rate: Optional[str] = field(default=None, repr=False)
+    flow_rate: Optional[str] = field(default=None, repr=False)
     sign: float = field(default=1.0, repr=False)
 
     def __post_init__(self) -> None:
@@ -83,7 +85,14 @@ class Port:
             raise ValueError("a grounded port does not take a standalone boundary")
         if (self.effort is None) != (self.flow is None):
             raise ValueError("a signal port needs both effort and flow paths")
-        for label, path in (("effort", self.effort), ("flow", self.flow)):
+        if self.effort is None and (self.effort_rate is not None or self.flow_rate is not None):
+            raise ValueError("port rates require effort and flow paths")
+        for label, path in (
+            ("effort", self.effort),
+            ("flow", self.flow),
+            ("effort_rate", self.effort_rate),
+            ("flow_rate", self.flow_rate),
+        ):
             if path is None:
                 continue
             record, separator, field_name = path.partition(".")
@@ -91,12 +100,16 @@ class Port:
                 raise ValueError(
                     f"port {label} must be an input, output or state path, got {path!r}"
                 )
+            if label.endswith("_rate") and record != "output":
+                raise ValueError(f"port {label} must be an output path, got {path!r}")
         self._validate_component()
 
     def _validate_component(self) -> None:
         if self.component is None or self.effort is None:
             return
-        for path in (self.effort, self.flow):
+        for path in (self.effort, self.flow, self.effort_rate, self.flow_rate):
+            if path is None:
+                continue
             record_name, _, field_name = path.partition(".")
             if not hasattr(getattr(self.component, record_name), field_name):
                 raise ValueError(

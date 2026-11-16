@@ -8,13 +8,14 @@ command line.
 
 from .model import (Bag, BlackBoxSubsystem, ConfigError, Empty, GroupPlan, Model, OutputMethod,
                     StateRegistry, Stateful, Subsystem)
+from .differentiation import directional_derivative
 from .energy import Energetic, Port, StoragePort
 from .integrators import (ADAPTIVE_METHODS, CIRCUIT_MODELS, FIXED_METHODS, RHS, AdaptiveSolver, AutoSolver,
                           DormandPrince45, FixedStepSolver, Solver, SolverStep)
 from .multirate import HeldStorage, MultirateSolver, make_solver
 
 __all__ = ["Model", "GroupPlan", "Bag", "Empty", "ConfigError", "Subsystem", "BlackBoxSubsystem",
-           "OutputMethod", "Energetic",
+           "OutputMethod", "directional_derivative", "Energetic",
            "StoragePort", "Port", "Solver", "SolverStep", "Stateful", "StateRegistry", "RHS",
            "FixedStepSolver", "AdaptiveSolver", "AutoSolver", "DormandPrince45", "MultirateSolver", "HeldStorage",
            "make_solver", "FIXED_METHODS", "ADAPTIVE_METHODS", "CIRCUIT_MODELS"]

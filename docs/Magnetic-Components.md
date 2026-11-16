@@ -54,9 +54,10 @@ The complete component definition is kept in the example file rather than duplic
 
 ## MagPort addon
 
-`magport` connects a magnetic constitutive law to ordinary electrical winding terminals. Each
-winding flux linkage is a PESLite state. The law maps the winding flux-linkage vector and any
-additional magnetic states to winding currents, while terminal voltage advances flux linkage:
+`magport` connects a magnetic constitutive law to ordinary electrical winding terminals. A constant
+inductance matrix uses the ordinary coupled-inductor netlist model. A nonlinear law uses winding
+flux linkages as PESLite states and maps them, together with any additional magnetic states, to
+winding currents:
 
 $$
 \dot{\boldsymbol\lambda}
@@ -70,6 +71,11 @@ the law has internal state. `MagPortElement` supplies winding ports, electrical 
 registration, so a project-defined component only supplies its constitutive behavior. Every entry
 in `initial_state` becomes an ordinary restartable PESLite state. A conservative law may also
 provide `stored_energy()` and `stored_energy_rate()` for energy accounting.
+
+When the surrounding circuit needs a winding-current rate, PESLite differentiates the
+constitutive law along its registered state derivatives and solves the resulting algebraic group
+with the circuit. Series inductors and other rate-dependent network structures therefore use the
+same law without a separate magnetic topology.
 
 ## MagCircuit addon
 
@@ -91,8 +97,9 @@ elements:
           path_length: 0.08
           bh_curve: [[-1.0, -800.0], [0.0, 0.0], [1.0, 800.0]]
         gap: {reluctance: 2.0e6}
+        leakage: {reluctance: 2.0e7}
       nodes:
-        continuity: {core: 1.0, gap: -1.0}
+        split: {core: 1.0, gap: -1.0, leakage: -1.0}
       coupling:
         core: {primary: 20.0}
         gap: {secondary: 20.0}

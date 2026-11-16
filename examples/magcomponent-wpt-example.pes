@@ -1,10 +1,9 @@
 # PESLite 0.5.2
-# Two-winding wireless power transfer built from a MagComponent and ordinary circuit components.
-# The magnetic component defines the winding terminals and coupling; the source and receiver load
-# remain independent electrical components.
+# Series-series compensated wireless power transfer built from a MagComponent and ordinary
+# circuit components. The magnetic component defines only the winding terminals and coupling.
 
 @circuit
-excitation -- primary -- magnetic_link -- secondary -- receiver_load
+excitation -- primary_compensation -- magnetic_link -- secondary_compensation -- receiver_load
 
 base:
   s_base: 5000.0
@@ -12,18 +11,25 @@ base:
   f0: 85000.0
 
 buses:
+  source: {phases: 1}
   primary: {phases: 1}
   secondary: {phases: 1}
+  receiver: {phases: 1}
 
 sources:
   excitation:
-    bus: primary
+    bus: source
     l: 1.0e-6
     r: 0.1
     v: 400.0
     f: 85000.0
 
 elements:
+  primary_compensation:
+    type: capacitor
+    bus1: source
+    bus2: primary
+    c: 35.056e-9
   magnetic_link:
     type: coupled_coils
     windings:
@@ -32,9 +38,14 @@ elements:
     inductance:
       - [100.0e-6, 20.0e-6]
       - [20.0e-6, 100.0e-6]
+  secondary_compensation:
+    type: capacitor
+    bus1: secondary
+    bus2: receiver
+    c: 35.056e-9
   receiver_load:
     type: resistor
-    bus: secondary
+    bus: receiver
     r: 20.0
 
 simulation:
@@ -49,4 +60,4 @@ simulation:
 
 meta:
   title: MagComponent WPT
-  description: Two coupled windings transfer power from a sinusoidal source to a resistive receiver.
+  description: A series-series compensated link connects a sinusoidal source to a resistive receiver.

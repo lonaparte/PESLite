@@ -844,18 +844,20 @@ class VoltageSource(Element):
     where a C/V loop needs it)."""
 
     def __init__(self, a: Port, b: Port, value: Value, derivative: Optional[Value] = None,
-                 name: str = "") -> None:
+                 name: str = "", *, rate_available: bool = True) -> None:
         _port(a, b)
         self.ports, self.name, self.value, self.derivative = ((a, b),), name, value, derivative
+        self.rate_available = rate_available
 
 
 class CurrentSource(Element):
     """``i = value(t)``; ``derivative(t)`` as for :class:`VoltageSource` (used in L/I cutsets)."""
 
     def __init__(self, a: Port, b: Port, value: Value, derivative: Optional[Value] = None,
-                 name: str = "") -> None:
+                 name: str = "", *, rate_available: bool = True) -> None:
         _port(a, b)
         self.ports, self.name, self.value, self.derivative = ((a, b),), name, value, derivative
+        self.rate_available = rate_available
 
 
 class CurrentState(Element):
@@ -1849,6 +1851,19 @@ class Topology:
         if row != n_z:  # pragma: no cover - the classification guarantees a square system
             raise AssertionError(f"derivative MNA has {row} equations for {n_z} unknowns")
         self.n_z = n_z
+        unavailable = [
+            net._ports[id(source)][0]
+            for index, (source, _offset) in enumerate(net._sources)
+            if needs[index] and not source.rate_available
+        ]
+        if unavailable:
+            related = sorted(set(dep_c + dep_l))
+            raise _Degenerate(
+                "behavioral source has no declared total derivative but its loop or cutset "
+                f"needs one: {names(unavailable)} (with {names(related)})",
+                unavailable + related,
+                loop=all(roles[index] == "vsrc" for index in unavailable),
+            )
         self.needs_rate, self.any_rate = needs, bool(needs.any())
         self.component = [uf.find(v) for v in range(nv)]  # sub-network of each vertex (0: grounded)
         self.blocking = [k for k, br in enumerate(brs) if roles[k] is None and isinstance(br.element, Diode)

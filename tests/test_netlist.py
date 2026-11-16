@@ -91,6 +91,26 @@ def test_behavioral_current_state_is_one_physical_branch(form):
     assert net.dissipated_power() == pytest.approx(12.0)
 
 
+@pytest.mark.parametrize("kind", ("current", "voltage"))
+def test_required_source_rate_must_be_declared_instead_of_assumed_zero(kind):
+    net = Netlist("device")
+    node = Node()
+    if kind == "current":
+        source = CurrentSource(
+            node, None, lambda _t: 1.0, rate_available=False, name="behavior"
+        )
+        storage = Inductor(node, None, 1.0e-3, [0], name="inductor")
+    else:
+        source = VoltageSource(
+            node, None, lambda _t: 1.0, rate_available=False, name="behavior"
+        )
+        storage = Capacitor(node, None, 1.0e-3, [0], name="capacitor")
+    net.add(source, storage)
+
+    with pytest.raises(ValueError, match="no declared total derivative"):
+        net.topology()
+
+
 @pytest.mark.parametrize("form", FORMS)
 def test_netlist_rc_rl_and_rlc_match_closed_state_equations(form):
     voltage, resistance, inductance, capacitance = 10.0, 2.0, 1e-3, 1e-4

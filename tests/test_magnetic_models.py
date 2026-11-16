@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 
 import numpy as np
 import pytest
+from scipy.integrate import solve_ivp
+from scipy.interpolate import PchipInterpolator
 from scipy.linalg import expm
 from scipy.optimize import brentq
 
@@ -523,6 +526,46 @@ def test_nonlinear_magport_file_and_magcircuit_branch_law(tmp_path):
             circuit_result.columns()[signal], port_result.columns()[signal],
             rtol=3e-11, atol=2e-13,
         )
+
+    interpolator = PchipInterpolator(flux, current)
+    slope = interpolator.derivative()
+    initial_current = float(interpolator(2.0e-3))
+    series_results = []
+    for label, case in (("port", base), ("circuit", circuit)):
+        series = deepcopy(case)
+        series["buses"]["return"] = {"phases": 1}
+        series["elements"]["magnet"]["windings"]["coil"]["negative"] = "return"
+        series["elements"]["return"] = {
+            "type": "load", "bus": "return", "l": 1.0e-3, "r": 0.5,
+        }
+        series["simulation"]["initial"]["states"]["return.branch.i"] = initial_current
+        simulation = peslite.Simulation(from_dict(series))
+        result = simulation.run(out_dir=tmp_path / f"nonlinear_{label}_series")
+        assert not simulation.energy_problems
+        series_results.append(result)
+
+    reference = solve_ivp(
+        lambda _t, linkage: (
+            -1.6 * interpolator(linkage[0])
+            / (1.0 + 1.0e-3 * slope(linkage[0])),
+        ),
+        (series_results[0].t[0], series_results[0].t[-1]),
+        (2.0e-3,),
+        t_eval=series_results[0].t,
+        rtol=1.0e-11,
+        atol=1.0e-13,
+    )
+    expected_current = interpolator(reference.y[0])
+    for result in series_results:
+        np.testing.assert_allclose(
+            result.columns()["magnet.i_coil"], expected_current,
+            rtol=3.0e-6, atol=2.0e-10,
+        )
+    np.testing.assert_allclose(
+        series_results[1].columns()["magnet.i_coil"],
+        series_results[0].columns()["magnet.i_coil"],
+        rtol=3.0e-8, atol=2.0e-11,
+    )
 
 
 def test_magnetic_domain_uses_named_topology_and_material_geometry():

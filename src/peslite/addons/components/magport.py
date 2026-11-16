@@ -20,7 +20,7 @@ from .magnetic import (
     _validate_winding_names,
 )
 from ...components.network import register_component_type
-from ...solver import Bag, ConfigError, OutputMethod, Port
+from ...solver import Bag, ConfigError, OutputMethod, Port, directional_derivative
 
 __all__ = [
     "MagneticLaw",
@@ -381,8 +381,20 @@ class MagPortModel(MagComponent):
             for name in self.names
             for field in (f"i_positive_{name}", f"i_negative_{name}")
         )
+        current_rate_outputs = tuple(
+            field
+            for name in self.names
+            for field in (f"_di_positive_{name}", f"_di_negative_{name}")
+        )
+        voltage_inputs = tuple(
+            field
+            for name in self.names
+            for field in (f"u_positive_{name}", f"u_negative_{name}")
+        )
+        rate_inputs = (*voltage_inputs, *(("temperature_K",)
+                                         if self.temperature_coefficient_per_K != 0.0 else ()))
         loss_outputs = ("copper_loss_W", "core_loss_W", "loss_W")
-        output_names = (*current_outputs, *loss_outputs)
+        output_names = (*current_outputs, *current_rate_outputs, *loss_outputs)
         input_type = type("_MagPortInput", (Bag,), {"__slots__": input_names})
         output_type = type("_MagPortOutput", (Bag,), {"__slots__": output_names})
         self.input = input_type(
@@ -397,6 +409,11 @@ class MagPortModel(MagComponent):
             *temperature_stage,
             OutputMethod("set_currents", (), current_outputs),
             OutputMethod(
+                "set_current_rates",
+                rate_inputs,
+                current_rate_outputs,
+            ),
+            OutputMethod(
                 "set_loss_outputs",
                 (("temperature_K",) if self.temperature_coefficient_per_K != 0.0 else ()),
                 loss_outputs,
@@ -404,6 +421,7 @@ class MagPortModel(MagComponent):
             ),
         )
         self._output_dependencies = {
+            "set_current_rates": ((self, "set_currents"),),
             "set_loss_outputs": ((self, "set_currents"),),
         }
 
@@ -416,6 +434,7 @@ class MagPortModel(MagComponent):
                     grounded=bool(positive_ground),
                     effort=f"input.u_positive_{name}",
                     flow=f"output.i_positive_{name}",
+                    flow_rate=f"output._di_positive_{name}",
                 ),
                 Port(
                     self,
@@ -423,6 +442,7 @@ class MagPortModel(MagComponent):
                     grounded=bool(negative_ground),
                     effort=f"input.u_negative_{name}",
                     flow=f"output.i_negative_{name}",
+                    flow_rate=f"output._di_negative_{name}",
                 ),
             ))
         self.winding_ports = tuple(ports)
@@ -470,9 +490,10 @@ class MagPortModel(MagComponent):
 
     def set_outputs(self, t: float) -> None:
         self.set_currents(t)
+        self.set_current_rates(t)
         self.set_loss_outputs(t)
 
-    def rhs(self, t: float) -> tuple[float, ...]:
+    def _state_derivatives(self, t: float) -> np.ndarray:
         currents = self._currents()
         voltage = np.fromiter(
             (
@@ -485,7 +506,7 @@ class MagPortModel(MagComponent):
         )
         flux_rate = voltage - self._effective_resistance() * currents
         if not self.internal_state_names:
-            return tuple(float(value) for value in flux_rate)
+            return flux_rate
         derivative = self.law.derivatives(
             t, self._flux_linkage(), currents, self._internal_state()
         )
@@ -498,7 +519,37 @@ class MagPortModel(MagComponent):
             len(self.internal_state_names),
             "magnetic law derivatives",
         )
-        return (*map(float, flux_rate), *map(float, internal))
+        return np.concatenate((flux_rate, internal))
+
+    def set_current_rates(self, t: float) -> None:
+        state_rate = self._state_derivatives(t)
+        flux = self._flux_linkage()
+        internal = np.fromiter(
+            (getattr(self.state, name) for name in self.internal_state_names),
+            dtype=float,
+            count=len(self.internal_state_names),
+        )
+        point = np.concatenate(([t], flux, internal))
+        direction = np.concatenate(([1.0], state_rate))
+        count = len(self.names)
+
+        def evaluate(candidate: np.ndarray) -> np.ndarray:
+            values = self.law.currents(
+                float(candidate[0]),
+                candidate[1:1 + count],
+                dict(zip(self.internal_state_names, candidate[1 + count:])),
+            )
+            return _numeric_vector(values, count, "magnetic law currents")
+
+        rates = directional_derivative(evaluate, point, direction)
+        if rates.shape != (count,) or not np.isfinite(rates).all():
+            raise ConfigError("magnetic law current rate must contain finite numeric values")
+        for name, rate in zip(self.names, rates):
+            setattr(self.output, f"_di_positive_{name}", float(rate))
+            setattr(self.output, f"_di_negative_{name}", -float(rate))
+
+    def rhs(self, t: float) -> tuple[float, ...]:
+        return tuple(map(float, self._state_derivatives(t)))
 
     def stored_energy(self, t: float) -> float:
         value = self.law.stored_energy(  # type: ignore[attr-defined]

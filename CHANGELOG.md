@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Behavioral electrical sources now carry total-rate declarations into the netlist. Stateful
+  black boxes and nonlinear magnetic laws therefore retain series-inductor and parallel-capacitor
+  dynamics instead of treating a recorded source value as constant in time.
 - Unified constant-inductance magnetic models on the ordinary netlist path, reduced nonlinear
   magnetic circuits with a damped Newton solve, rejected multi-winding sampled-law extrapolation
   and removed the redundant native-export cleanup lifecycle.

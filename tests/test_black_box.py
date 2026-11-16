@@ -120,6 +120,52 @@ class _Load(Element):
 
 
 @register_component_type
+class _StateCurrentBranch(Element):
+    """State-backed two-terminal current law used to exercise total-rate propagation."""
+
+    type = "test_state_current_branch"
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        positive: str
+        negative: str
+        inductance: float
+        type: str = "test_state_current_branch"
+
+    def __init__(self, name, cfg, buses, p):
+        self.name, self.cfg = name, cfg
+        positive = Port(
+            name="positive", effort="input.u_positive", flow="output.i_positive"
+        )
+        negative = Port(
+            name="negative", effort="input.u_negative", flow="output.i_negative"
+        )
+        self.model = BlackBoxSubsystem(
+            lambda _t, state, _inputs: (state[0], -state[0]),
+            inputs=("u_positive", "u_negative"),
+            outputs=("i_positive", "i_negative"),
+            state={"current": 0.0},
+            rhs=lambda _t, _state, inputs: (
+                (inputs[0] - inputs[1]) / cfg.inductance,
+            ),
+            feedthrough=(),
+            ports=(positive, negative),
+        )
+        positive.bind(self.model)
+        negative.bind(self.model)
+
+    def subsystems(self):
+        return {self.name: self.model}
+
+    def connections(self):
+        return {}
+
+    def port_bindings(self):
+        return ((self.cfg.positive, self.model.ports[0]),
+                (self.cfg.negative, self.model.ports[1]))
+
+
+@register_component_type
 class _WindowedSampler(Element):
     """A clocked model sampling a continuous neighbour inside its solver window."""
 
@@ -221,6 +267,67 @@ def test_stateful_black_box_state_is_owned_by_model():
     model.set_states(np.array([2.5]))
     model.evaluate_outputs(0.0)
     assert block.output.y == pytest.approx(2.5)
+
+
+def test_state_backed_physical_output_propagates_its_total_rate(tmp_path):
+    case = from_dict({
+        "base": {"s_base": 1.0},
+        "buses": {"positive": {"phases": 1}, "return": {"phases": 1}},
+        "elements": {
+            "dynamic": {
+                "type": "test_state_current_branch",
+                "positive": "positive",
+                "negative": "return",
+                "inductance": 2.0e-3,
+            },
+            "positive_resistance": {"type": "resistor", "bus": "positive", "r": 1.0},
+            "return": {"type": "load", "bus": "return", "l": 1.0e-3, "r": 0.5},
+        },
+        "simulation": {
+            "t_end": 1.0e-3,
+            "initial": {"states": {
+                "dynamic.current": 0.4,
+                "return.branch.i": 0.4,
+            }},
+            "solver": {"dt": 1.0e-5},
+            "output": {"period": 1.0e-4, "precision": 17, "states": True},
+        },
+    })
+
+    simulation = Simulation(case)
+    assert any(len(loop.tears) > 1 for loop in simulation.system.model.algebraic_loops)
+    result = simulation.run(out_dir=tmp_path / "state_current")
+
+    expected = 0.4 * np.exp(-1.5 * result.t / 3.0e-3)
+    np.testing.assert_allclose(
+        result.states["dynamic.current"], expected, rtol=2.0e-5, atol=2.0e-8
+    )
+
+
+def test_state_backed_physical_effort_rate_includes_time_and_state_dependence():
+    frequency = 85.0e3
+    omega = 2.0 * np.pi * frequency
+    time = 1.23e-6
+    capacitance = 2.0e-3
+    port = Port(name="power", effort="output.u", flow="input.i")
+    block = BlackBoxSubsystem(
+        lambda t, state, _inputs: (state[0] + np.sin(omega * t) / omega,),
+        inputs=("i",),
+        outputs=("u",),
+        state={"voltage": 0.4},
+        rhs=lambda _t, _state, inputs: (inputs[0] / capacitance,),
+        feedthrough=(),
+        ports=(port,),
+    )
+    port.bind(block)
+    block.input.i = 0.6
+
+    block.set_output_rates(time)
+
+    rate_field = port.effort_rate.partition(".")[2]
+    assert getattr(block.output, rate_field) == pytest.approx(
+        0.6 / capacitance + np.cos(omega * time), rel=2.0e-5
+    )
 
 
 def test_discrete_black_box_restores_boolean_state_without_changing_its_type():

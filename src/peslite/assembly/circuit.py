@@ -479,7 +479,7 @@ class Circuit:
         self.groups: list[_Group] = []
         self.port_values: list[tuple[Port, Optional[_Group], str, str]] = []
         self.standalone_ports: tuple[Port, ...] = ()
-        self.behavioral_sources: list[tuple[Port, _Group, str, str]] = []
+        self.behavioral_sources: list[tuple[Port, _Group, str, Optional[str], str]] = []
         self.copies: list[tuple[Any, str, str]] = []  # (component, input field, input key)
         self.published: dict[tuple[int, str], str] = {}  # (id(component), out field) -> out key
         self.inputs: dict[str, Any] = {}  # input key -> initial value
@@ -609,23 +609,32 @@ class Circuit:
         }
         for comp in self.components:
             self.declarations[id(comp)].materialize(nb)
-        for port, group, key, kind in self.behavioral_sources:
+        for port, group, key, rate_key, kind in self.behavioral_sources:
             nb.owner = port.component
             source = _BoundValue(self.input, key)
+            derivative = None if rate_key is None else _BoundValue(self.input, rate_key)
             primitive = (
-                CurrentSource(node_of[id(group)], None, source)
+                CurrentSource(
+                    node_of[id(group)], None, source, derivative,
+                    rate_available=rate_key is not None,
+                )
                 if kind == "current" else
-                VoltageSource(node_of[id(group)], None, source)
+                VoltageSource(
+                    node_of[id(group)], None, source, derivative,
+                    rate_available=rate_key is not None,
+                )
             )
             nb.add(primitive)
         for port in self.standalone_ports:
             if port.standalone == "voltage":
                 net.add(VoltageSource(
-                    nodes[id(port)], None, lambda _t, port=port: port.voltage
+                    nodes[id(port)], None, lambda _t, port=port: port.voltage,
+                    _BoundValue(port, "voltage", factor=0.0),
                 ))
             elif port.standalone == "current":
                 net.add(CurrentSource(
-                    None, nodes[id(port)], lambda _t, port=port: port.current
+                    None, nodes[id(port)], lambda _t, port=port: port.current,
+                    _BoundValue(port, "current", factor=0.0),
                 ))
         declared = set(net.states.tolist())
         missing = sorted(f"{type(c).__name__}.{n}" for c, n, _z, i in self.layout if i not in declared)
@@ -681,15 +690,18 @@ class Circuit:
         self._direct_mode_key = None
         self._numeric_stages = False
         self._stage_signature = None
-        if self.form == "device":
-            (self.scalar_derivatives, self.scalar_outputs,
-             self.scalar_output_evaluator) = net.scalar_evaluators()
-            compiled = (
-                self._compile_equation_stages()
-                or (not self._standalone_runtime and self._compile_device_runtime())
-            )
-        else:
-            compiled = self._compile_equation_stages()
+        try:
+            if self.form == "device":
+                (self.scalar_derivatives, self.scalar_outputs,
+                 self.scalar_output_evaluator) = net.scalar_evaluators()
+                compiled = (
+                    self._compile_equation_stages()
+                    or (not self._standalone_runtime and self._compile_device_runtime())
+                )
+            else:
+                compiled = self._compile_equation_stages()
+        except _Degenerate as exc:
+            raise self._degenerate(exc, self.t) from None
         if not compiled:
             self._use_runtime_stages()
         if rebuilding:
@@ -2520,9 +2532,11 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
             voltage_key, current_key = port_sources[id(port)]
             if (effort_record, flow_record) == ("input", "output"):
                 source_field, target_field = flow_field, effort_field
+                rate_path = port.flow_rate
                 target_key, kind = voltage_key, "current"
             elif (effort_record, flow_record) == ("output", "input"):
                 source_field, target_field = effort_field, flow_field
+                rate_path = port.effort_rate
                 target_key, kind = current_key, "voltage"
             else:
                 raise ConfigError(
@@ -2535,8 +2549,19 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
                 output=False,
             )
             boundary[(circuit, key)] = (port.component, source_field)
+            rate_key = None
+            if rate_path is not None:
+                rate_field = rate_path.partition(".")[2]
+                rate_key = circuit.key(
+                    f"{owner}.{port.name}.{kind}_rate",
+                    getattr(port.component.output, rate_field),
+                    output=False,
+                )
+                boundary[(circuit, rate_key)] = (port.component, rate_field)
             lowered[(port.component, target_field)] = (circuit, target_key)
-            circuit.behavioral_sources.append((port, group_of[id(port)], key, kind))
+            circuit.behavioral_sources.append(
+                (port, group_of[id(port)], key, rate_key, kind)
+            )
     if any(
         spec_of(port.component).kind == "default"
         for group in members for port in group
