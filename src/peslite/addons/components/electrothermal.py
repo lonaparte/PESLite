@@ -8,38 +8,24 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from functools import lru_cache
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping
 
 import numpy as np
 
 from ...components.network import Element, register_component_type
 from ...solver import Bag, ConfigError, Empty
 from ..functions.semiconductor_losses import SemiconductorLossModel, SwitchingEvent, _lookup
-from .thermal_network import FosterImpedance, LumpedThermalNetwork
+from .thermal_network import FosterImpedance, LumpedThermalNetwork, _positive, _record
 
 __all__ = ["ElectroThermalModel", "ElectroThermal"]
 
 
-def _positive(name: str, value: float) -> float:
-    if isinstance(value, bool) or not isinstance(value, (float, int)) or (
-        not math.isfinite(value) or value <= 0.0
-    ):
-        raise ConfigError(f"{name} must be finite and > 0")
-    return float(value)
-
-
-@lru_cache(maxsize=None)
-def _record(names: tuple[str, ...]) -> type[Bag]:
-    return type("_ThermalState_" + "_".join(names), (Bag,), {"__slots__": names})
-
-
 class _ThermalInput(Bag):
-    __slots__ = ("accounted_heat_W", "current_A", "voltage_V", "conduction_fraction")
+    __slots__ = ("heat_W", "current_A", "voltage_V", "conduction_fraction")
 
 
 class _ThermalOutput(Bag):
-    __slots__ = ("junction_K", "case_K", "sink_K", "heat_W", "accounted_heat_W",
+    __slots__ = ("temperature_K", "case_K", "sink_K", "heat_W", "accounted_heat_W",
                  "estimated_heat_W", "cooling_W")
 
 
@@ -72,15 +58,17 @@ class ElectroThermalModel:
             if self._foster else
             tuple(f"T_{name}_K" for name in network.names)
         )
-        self.state_names = (*self._temperature_names, "last_transition_id")
+        self.state_names = self._temperature_names
+        self.discrete_state_names = ("last_transition_id",)
         reference = (network.ambient_K if initial_temperature_K is None
-                     else _positive("initial_temperature_K", initial_temperature_K))
+                     else _positive(initial_temperature_K, "initial_temperature_K"))
         values = ([reference - network.ambient_K] * len(self._temperature_names)
                   if self._foster else [reference] * len(self._temperature_names))
-        self.state = _record(self.state_names)(
-            **dict(zip(self._temperature_names, values)), last_transition_id=-1.0
+        self.state = _record("_ThermalState", self.state_names)(
+            **dict(zip(self._temperature_names, values))
         )
-        self.input = _ThermalInput(accounted_heat_W=0.0, current_A=0.0,
+        self.last_transition_id = -1
+        self.input = _ThermalInput(heat_W=0.0, current_A=0.0,
                                    voltage_V=0.0, conduction_fraction=1.0)
         self.output = _ThermalOutput()
         self.set_outputs(0.0)
@@ -89,12 +77,12 @@ class ElectroThermalModel:
         return np.asarray([getattr(self.state, name) for name in self._temperature_names],
                           dtype=float)
 
-    def junction_K(self) -> float:
+    def temperature_K(self) -> float:
         values = self._states()
         return (self.network.junction_K(values) if self._foster else float(values[0]))
 
     def _heat(self) -> tuple[float, float]:
-        realized = float(self.input.accounted_heat_W)
+        realized = float(self.input.heat_W)
         current = float(self.input.current_A)
         voltage = float(self.input.voltage_V)
         fraction = float(self.input.conduction_fraction)
@@ -103,14 +91,14 @@ class ElectroThermalModel:
             raise ValueError("thermal heat/current/voltage inputs must be finite and physical")
         curve = None if self.loss_model is None else self.loss_model.conduction_voltage_V
         additional = float(fraction * abs(current) * _lookup(
-            curve, current, voltage, self.junction_K()
+            curve, current, voltage, self.temperature_K()
         ))
         return realized, additional
 
     def set_outputs(self, t: float) -> None:
         values = self._states()
         realized, additional = self._heat()
-        self.output.junction_K = self.junction_K()
+        self.output.temperature_K = self.temperature_K()
         self.output.case_K = (math.nan if self._foster or len(values) < 2
                               else float(values[1]))
         self.output.sink_K = (math.nan if self._foster or len(values) < 3
@@ -127,7 +115,20 @@ class ElectroThermalModel:
         state = self._states()
         derivatives = (self.network.rates(state, p) if self._foster
                        else self.network.rates(state, {self.network.names[0]: p}))
-        return (*tuple(float(value) for value in derivatives), 0.0)
+        return tuple(float(value) for value in derivatives)
+
+    def get_state(self) -> dict[str, int]:
+        return {"last_transition_id": self.last_transition_id}
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        unknown = set(values) - {"last_transition_id"}
+        if unknown:
+            raise KeyError(f"unknown electrothermal state {sorted(unknown)}")
+        if "last_transition_id" in values:
+            value = values["last_transition_id"]
+            if isinstance(value, bool) or not isinstance(value, int) or value < -1:
+                raise ValueError("last_transition_id must be an integer >= -1")
+            self.last_transition_id = value
 
     def apply_committed_transition(self, event: SwitchingEvent, *, event_id: int) -> float:
         """Apply one accepted event in J, once per monotonic device event sequence.
@@ -141,7 +142,7 @@ class ElectroThermalModel:
             raise TypeError("event must be a confirmed SwitchingEvent")
         if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 0:
             raise ValueError("event_id must be a nonnegative integer")
-        if event_id <= self.state.last_transition_id:
+        if event_id <= self.last_transition_id:
             raise ValueError("event_id has already been committed or is out of order")
         if self.loss_model is None:
             raise ValueError("switching events require a semiconductor loss model")
@@ -154,7 +155,7 @@ class ElectroThermalModel:
         if curve is None:
             raise ValueError(f"no {event.kind} energy curve was provided")
         energy = float(_lookup(curve, event.current_A, event.voltage_V,
-                               self.junction_K()))
+                               self.temperature_K()))
         states = self._states()
         if self._foster:
             updated = self.network.committed_impulse(states, energy)
@@ -164,7 +165,7 @@ class ElectroThermalModel:
             )
         for name, value in zip(self._temperature_names, updated):
             setattr(self.state, name, float(value))
-        self.state.last_transition_id = float(event_id)
+        self.last_transition_id = event_id
         self.set_outputs(event.time_s)
         return energy
 
@@ -194,9 +195,12 @@ class ElectroThermal(Element):
         type: str = "electrothermal"
 
         def __post_init__(self):
-            for name in ("c_j_J_K", "r_jc_K_W", "c_c_J_K", "r_ca_K_W",
-                         "ambient_K", "initial_K"):
-                _positive(name, getattr(self, name))
+            try:
+                for name in ("c_j_J_K", "r_jc_K_W", "c_c_J_K", "r_ca_K_W",
+                             "ambient_K", "initial_K"):
+                    _positive(getattr(self, name), name)
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from None
             if self.conduction_voltage_V is not None:
                 if (not math.isfinite(self.conduction_voltage_V)
                         or self.conduction_voltage_V < 0):
@@ -231,8 +235,7 @@ class ElectroThermal(Element):
 
     def connections(self) -> dict:
         source = self.cfg.heat_source or self.cfg.current_source
-        field = ("accounted_heat_W" if self.cfg.heat_source is not None
-                 else "current_A")
+        field = "heat_W" if self.cfg.heat_source is not None else "current_A"
         return {(self.model, field): source}
 
     @staticmethod
@@ -240,7 +243,7 @@ class ElectroThermal(Element):
         return ()
 
     def signals(self) -> dict[str, float]:
-        return {f"{self.name}.junction_K": self.model.output.junction_K,
+        return {f"{self.name}.temperature_K": self.model.output.temperature_K,
                 f"{self.name}.case_K": self.model.output.case_K,
                 f"{self.name}.heat_W": self.model.output.heat_W,
                 f"{self.name}.cooling_W": self.model.output.cooling_W}

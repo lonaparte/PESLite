@@ -20,7 +20,7 @@ from .magnetic import (
     _validate_winding_names,
 )
 from ...components.network import register_component_type
-from ...solver import Bag, ConfigError, Port
+from ...solver import Bag, ConfigError, OutputMethod, Port
 
 __all__ = [
     "MagneticLaw",
@@ -330,8 +330,15 @@ class MagPortModel(MagComponent):
         resistance: Sequence[float],
         terminals: Sequence[tuple[bool, bool]],
         magnetic: MagneticDescription | None = None,
+        temperature_coefficient_per_K: float = 0.0,
+        temperature_reference_K: float = 298.15,
     ) -> None:
-        super().__init__(magnetic)
+        super().__init__(
+            magnetic,
+            tuple(resistance),
+            temperature_coefficient_per_K,
+            temperature_reference_K,
+        )
         if not callable(getattr(law, "currents", None)):
             raise TypeError("a magnetic law must define currents(t, flux_linkage, state)")
         self.law = law
@@ -341,8 +348,6 @@ class MagPortModel(MagComponent):
             raise ConfigError("every winding must define resistance and terminals")
         if any(not math.isfinite(value) or value < 0.0 for value in resistance):
             raise ConfigError("winding resistance must be finite and >= 0")
-        self.resistance = np.asarray(resistance, dtype=float)
-
         flux_names = tuple(f"lambda_{name}" for name in self.names)
         initial = dict(getattr(law, "initial_state", {}))
         if any(not isinstance(name, str) or not name.isidentifier() for name in initial):
@@ -363,20 +368,44 @@ class MagPortModel(MagComponent):
             **{name: float(value) for name, value in initial.items()},
         })
 
-        input_names = tuple(
-            field
-            for name in self.names
-            for field in (f"u_positive_{name}", f"u_negative_{name}")
+        input_names = (
+            *tuple(
+                field
+                for name in self.names
+                for field in (f"u_positive_{name}", f"u_negative_{name}")
+            ),
+            "temperature_K",
         )
-        output_names = tuple(
+        current_outputs = tuple(
             field
             for name in self.names
             for field in (f"i_positive_{name}", f"i_negative_{name}")
         )
+        loss_outputs = ("copper_loss_W", "core_loss_W", "loss_W")
+        output_names = (*current_outputs, *loss_outputs)
         input_type = type("_MagPortInput", (Bag,), {"__slots__": input_names})
         output_type = type("_MagPortOutput", (Bag,), {"__slots__": output_names})
-        self.input = input_type(**dict.fromkeys(input_names, 0.0))
+        self.input = input_type(
+            **{**dict.fromkeys(input_names, 0.0),
+               "temperature_K": self.temperature_reference_K}
+        )
         self.output = output_type(**dict.fromkeys(output_names, 0.0))
+        temperature_stage = (() if self.temperature_coefficient_per_K == 0.0 else (
+            OutputMethod("prepare_temperature", ("temperature_K",), ()),
+        ))
+        self.output_stages = (
+            *temperature_stage,
+            OutputMethod("set_currents", (), current_outputs),
+            OutputMethod(
+                "set_loss_outputs",
+                (("temperature_K",) if self.temperature_coefficient_per_K != 0.0 else ()),
+                loss_outputs,
+                rhs=False,
+            ),
+        )
+        self._output_dependencies = {
+            "set_loss_outputs": ((self, "set_currents"),),
+        }
 
         ports = []
         for name, (positive_ground, negative_ground) in zip(self.names, terminals):
@@ -426,7 +455,10 @@ class MagPortModel(MagComponent):
             dtype=float, count=len(self.names),
         )
 
-    def set_outputs(self, t: float) -> None:
+    def prepare_temperature(self, _t: float) -> None:
+        pass
+
+    def set_currents(self, t: float) -> None:
         currents = _numeric_vector(
             self.law.currents(t, self._flux_linkage(), self._internal_state()),
             len(self.names),
@@ -435,6 +467,10 @@ class MagPortModel(MagComponent):
         for name, current in zip(self.names, currents):
             setattr(self.output, f"i_positive_{name}", float(current))
             setattr(self.output, f"i_negative_{name}", -float(current))
+
+    def set_outputs(self, t: float) -> None:
+        self.set_currents(t)
+        self.set_loss_outputs(t)
 
     def rhs(self, t: float) -> tuple[float, ...]:
         currents = self._currents()
@@ -447,7 +483,7 @@ class MagPortModel(MagComponent):
             dtype=float,
             count=len(self.names),
         )
-        flux_rate = voltage - self.resistance * currents
+        flux_rate = voltage - self._effective_resistance() * currents
         if not self.internal_state_names:
             return tuple(float(value) for value in flux_rate)
         derivative = self.law.derivatives(
@@ -495,17 +531,14 @@ class MagPortModel(MagComponent):
             raise ConfigError("magnetic stored-energy rate must be finite")
         return float(value)
 
-    def dissipated_power(self) -> float:
-        currents = self._currents()
-        loss = float(np.dot(self.resistance, currents * currents))
+    def _winding_currents(self) -> np.ndarray:
+        return self._currents()
+
+    def _material_loss(self) -> float:
         material = getattr(self.law, "dissipated_power", None)
-        if material is not None:
-            loss += float(material(
-                self._flux_linkage(), currents, self._internal_state()
-            ))
-        if not math.isfinite(loss):
-            raise ConfigError("magnetic dissipated power must be finite")
-        return loss
+        return 0.0 if material is None else float(material(
+            self._flux_linkage(), self._currents(), self._internal_state()
+        ))
 
     @staticmethod
     def supplied_power() -> float:
@@ -519,6 +552,11 @@ class MagPortModel(MagComponent):
                 getattr(self.input, f"u_positive_{name}")
                 - getattr(self.input, f"u_negative_{name}")
             )
+        signals.update(
+            copper_loss_W=self.output.copper_loss_W,
+            core_loss_W=self.output.core_loss_W,
+            loss_W=self.output.loss_W,
+        )
         return signals
 
 
@@ -533,7 +571,14 @@ class MagPortElement(_MagneticElement):
         description = cfg.magnetic if magnetic is None else magnetic
         self._attach(
             name, cfg,
-            MagPortModel(law, resistance, terminals, description),
+            MagPortModel(
+                law,
+                resistance,
+                terminals,
+                description,
+                cfg.temperature_coefficient_per_K,
+                cfg.temperature_reference_K,
+            ),
         )
 
 

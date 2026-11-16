@@ -8,7 +8,8 @@ import pytest
 
 from peslite.addons.components.advanced_thermal import (
     ReducedThermalElement, ReducedThermalModel, SharedThermalModel,
-    SharedThermalNetwork, foster_step_response, load_thermal_rom,
+    SharedThermalNetwork, ThermalPortModel, foster_step_response,
+    load_thermal_rom,
 )
 from peslite.addons.components.thermal_network import LumpedThermalNetwork, ThermalLink
 from peslite.solver.model import Model
@@ -110,6 +111,45 @@ def test_rom_matches_first_order_analytic_response():
         [t], P, [R], [C], ambient_K=300)[0])
 
 
+def test_thermal_port_uses_an_independent_constitutive_law():
+    class Law:
+        initial_state = {"temperature_K": 300.0}
+
+        @staticmethod
+        def rhs(_t, state, heat_W):
+            return np.array([heat_W - (state[0] - 300.0)])
+
+        @staticmethod
+        def temperature_K(_t, state, _heat_W):
+            return state[0]
+
+    model = ThermalPortModel(Law())
+    model.input.heat_W = 5.0
+    model.set_outputs(0.0)
+    assert model.output.temperature_K == pytest.approx(300.0)
+    assert model.rhs(0.0) == pytest.approx((5.0,))
+
+
+def test_thermal_port_allows_a_stateless_constitutive_law():
+    class Law:
+        initial_state = {}
+
+        @staticmethod
+        def rhs(_t, _state, _heat_W):
+            return np.empty(0)
+
+        @staticmethod
+        def temperature_K(_t, _state, heat_W):
+            return 300.0 + 0.5 * heat_W
+
+    model = ThermalPortModel(Law())
+    model.input.heat_W = 4.0
+    circuit = Model({"thermal": model}, {})
+    circuit.sync(0.0, np.empty(0))
+    assert model.output.temperature_K == pytest.approx(302.0)
+    assert circuit.rhs(0.0, np.empty(0)).size == 0
+
+
 def test_rom_json_requires_declared_si_and_stable_matrices(tmp_path):
     file = tmp_path / "thermal.json"
     data = {"format": "peslite-thermal-rom-v1", "units": "SI",
@@ -135,7 +175,7 @@ def test_reduced_thermal_adapter_consumes_a_physical_heat_source():
     element = ReducedThermalElement("rom", config, {}, None)
     assert element.connections() == {(element.model, "heat_W"): "load.power"}
     assert element.subsystems() == {"rom": element.model}
-    assert element.signals()["rom.junction_K"] == pytest.approx(300.0)
+    assert element.signals()["rom.temperature_K"] == pytest.approx(300.0)
 
 
 def test_shared_sink_and_rom_do_not_change_core_only_electrical_install():
@@ -147,3 +187,44 @@ def test_shared_sink_and_rom_do_not_change_core_only_electrical_install():
     for name in ("shared_thermal_network", "thermal_rom"):
         assert name in ELEMENT_TYPES
     assert callable(peslite.Simulation)
+
+
+def test_magnetic_and_thermal_ports_couple_without_owning_each_other(tmp_path):
+    import peslite
+    from peslite.assembly.params import from_dict
+
+    case = {
+        "base": {"s_base": 1.0},
+        "buses": {"node": {"phases": 1}},
+        "elements": {
+            "magnet": {
+                "type": "coupled_coils",
+                "windings": {
+                    "coil": {"positive": "node", "negative": "ground", "r": 1.0},
+                },
+                "inductance": [[0.01]],
+                "temperature_source": "thermal.temperature_K",
+                "temperature_coefficient_per_K": 0.004,
+                "temperature_reference_K": 300.0,
+            },
+            "load": {"type": "resistor", "bus": "node", "r": 1.0},
+            "thermal": {
+                "type": "thermal_rom",
+                "heat_source": "magnet.loss_W",
+                "A_per_s": [[-1.0]],
+                "B_K_per_J": [1.0],
+                "C": [1.0],
+                "D_K_W": 0.0,
+                "ambient_K": 300.0,
+            },
+        },
+        "simulation": {
+            "t_end": 1.0e-3,
+            "initial": {"states": {"magnet.i_mode_1": 1.0}},
+            "solver": {"dt": 1.0e-5, "linearisations": 0},
+            "output": {"period": 1.0e-4, "precision": 17, "signals": True},
+        },
+    }
+    result = peslite.Simulation(from_dict(case)).run(out_dir=tmp_path)
+    assert np.max(result.plant["magnet.loss_W"]) > 0.0
+    assert result.plant["thermal.temperature_K"][-1] > 300.0

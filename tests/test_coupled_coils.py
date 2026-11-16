@@ -69,6 +69,40 @@ def test_coupled_coil_schema_round_trip_and_independent_terminals():
     assert sum(port.grounded for port in assembly.model.ports) == 1
 
 
+def test_magnetic_component_exposes_general_thermal_coupling_signals():
+    model = CoupledCoilsModel(
+        ("coil",),
+        [[1.0]],
+        (2.0,),
+        ((False, True),),
+        temperature_coefficient_per_K=0.01,
+        temperature_reference_K=300.0,
+    )
+    model.state.i_mode_1 = 1.0
+    model.set_loss_outputs(0.0)
+    assert model.output.copper_loss_W == pytest.approx(2.0)
+    assert model.output.core_loss_W == 0.0
+    model.input.temperature_K = 400.0
+    model.set_loss_outputs(0.0)
+    assert model.output.loss_W == pytest.approx(4.0)
+    assert model._winding_drop(0, 0.0) == pytest.approx(4.0)
+
+    cfg = CoupledCoils.Params(
+        windings={"coil": WindingParams(
+            positive="node", negative="ground", r=2.0
+        )},
+        inductance=[[1.0]],
+        temperature_source="thermal.temperature_K",
+        temperature_coefficient_per_K=0.01,
+    )
+    element = CoupledCoils(
+        "magnet", cfg, {"node": type("Bus", (), {"phases": 1})()}, None
+    )
+    assert element.connections() == {
+        (element.model, "temperature_K"): "thermal.temperature_K"
+    }
+
+
 def test_magnetic_components_follow_one_component_convention(tmp_path):
     """Enforce the magnetic-component convention deliberately agreed within the project.
 

@@ -226,6 +226,35 @@ def test_magport_owns_nonlinear_and_internal_magnetic_states_without_black_box()
         multiple.currents(0.0, np.array([0.75, 0.75]), {})
 
 
+def test_magport_matches_magnetic_loss_and_temperature_coupling_signals():
+    class LinearLaw:
+        winding_names = ("coil",)
+        initial_state = {}
+
+        @staticmethod
+        def currents(_t, flux_linkage, _state):
+            return flux_linkage
+
+    model = MagPortModel(
+        LinearLaw(),
+        resistance=(2.0,),
+        terminals=((False, True),),
+        temperature_coefficient_per_K=0.01,
+        temperature_reference_K=300.0,
+    )
+    model.state.lambda_coil = 1.0
+    model.input.u_positive_coil = 10.0
+    model.set_outputs(0.0)
+    assert model.rhs(0.0) == pytest.approx((8.0,))
+    assert model.output.copper_loss_W == pytest.approx(2.0)
+    assert model.output.core_loss_W == 0.0
+
+    model.input.temperature_K = 400.0
+    model.set_outputs(0.0)
+    assert model.rhs(0.0) == pytest.approx((6.0,))
+    assert model.output.loss_W == pytest.approx(4.0)
+
+
 def test_project_addon_replaces_the_magnetic_law_through_public_interfaces(tmp_path):
     """A project addon only defines its parameters and law; common assembly stays shared."""
 

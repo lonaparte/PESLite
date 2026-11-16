@@ -28,9 +28,16 @@ path as other components. Every winding publishes:
 |---|---|
 | `<element>.i_<winding>` | winding current in A |
 | `<element>.u_<winding>` | terminal voltage, including winding resistance, in V |
+| `<element>.copper_loss_W` | winding loss in W |
+| `<element>.core_loss_W` | loss reported by the magnetic constitutive law in W |
+| `<element>.loss_W` | total magnetic-component loss in W |
 
 The component owns its electrical states, stored energy and losses, so restart, continuation and
 energy accounting use the normal PESLite mechanisms.
+
+For temperature-dependent winding resistance, set `temperature_source`,
+`temperature_coefficient_per_K` and `temperature_reference_K`. The source is an ordinary public
+temperature signal; the magnetic model remains independent of the thermal model that provides it.
 
 ## Example
 

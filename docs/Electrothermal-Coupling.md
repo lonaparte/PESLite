@@ -1,4 +1,4 @@
-# Electrothermal Coupling (Issue #40, Level 2)
+# Electrothermal Coupling
 
 The standard `peslite` add-on integrates heat dynamics into the **existing**
 `Model`, numerical solvers, result columns and restartable state registry.
@@ -53,7 +53,7 @@ elements:
 This example observes the electrical dissipation of the same `load`
 element; it does not create another electrical resistor or subtract the
 same energy twice. The additional thermal subsystem publishes
-`thermal_load.junction_K`, `thermal_load.case_K`,
+`thermal_load.temperature_K`, `thermal_load.case_K`,
 `thermal_load.heat_W` and `thermal_load.cooling_W`. Its stored
 temperature states and last committed transition ID are restartable.
 Enable `simulation.output.signals: 1` for the public outputs.
@@ -73,10 +73,9 @@ a solved thermal state.
 
 ## Temperature feedback into actual electrical equations
 
-Where the model supports it, `thermal_resistor` implements a
-nonideal scalar R-L electrical element whose **actual voltage drop**
-is `R(T) * i` and whose electrically dissipated power is
-`R(T) * i²`. This is different from estimating heat on an ideal
+`thermal_resistor` implements a memoryless scalar electrical resistance whose actual current is
+`u / R(T)` and whose electrically dissipated power is `R(T) * i²`. It does not add an artificial
+electrical state. This is different from estimating heat on an ideal
 electrical switch. Connect its temperature input to the thermal
 element's physical output:
 
@@ -85,9 +84,8 @@ elements:
   load:
     type: thermal_resistor
     bus: output
-    temperature_source: thermal_load.junction_K
+    temperature_source: thermal_load.temperature_K
     r_reference_Ohm: 2.0
-    l_H: 0.001
     alpha_per_K: 0.004
     reference_K: 300.0
 
@@ -135,8 +133,8 @@ heat_J = component.apply_committed_transition(event, event_id=1)
 Only use a **confirmed** device transition (not a proposed RHS step,
 rejected integrator step or coarse sampled PWM edge). Each per-device
 `event_id` must be monotonically increasing. The state
-`last_transition_id` is saved with temperature so continuation
-rejects a repeated impulse. After applying a committed event at a
+`last_transition_id` is saved as a discrete state alongside the temperature states, so continuation
+rejects a repeated impulse without adding another differential state. After applying a committed event at a
 simulation boundary, repack the same model vector with
 `model.get_initial_values()` before advancing. This explicit
 observer interface does not imply that every bridge already exposes

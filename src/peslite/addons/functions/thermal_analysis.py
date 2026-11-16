@@ -42,7 +42,7 @@ def thermal_report(
     max_temp = float(maximum_junction_K)
     if not np.isfinite(max_temp) or max_temp <= 0:
         raise ValueError("maximum_junction_K must be finite positive K")
-    junction = _array("junction_K", plant[f"{name}.junction_K"], len(t))
+    junction = _array("temperature_K", plant[f"{name}.temperature_K"], len(t))
     case = _array("case_K", plant[f"{name}.case_K"], len(t))
     heat = _array("heat_W", plant[f"{name}.heat_W"], len(t))
     cooling_key = cooling_column or f"{name}.cooling_W"

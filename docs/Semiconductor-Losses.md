@@ -1,8 +1,7 @@
 # Semiconductor Loss Estimates
 
 The optional `peslite` add-on `peslite.addons.functions.semiconductor_losses` provides the
-**Level 1 circuit heat/loss analysis** for [Issue #40](https://github.com/lonaparte/PESLite/issues/40).
-It operates on existing electrical simulation traces and does **not** create a second
+semiconductor heat/loss analysis. It operates on existing electrical simulation traces and does not create a second
 network, change solver equations, allocate thermal states, or require `peslite-full`.
 Core-only simulations continue to work without this add-on.
 
@@ -108,7 +107,7 @@ covers before combining budgets.
 
 - Exact switching energy requires externally supplied *committed* `SwitchingEvent`
   records. Neither sparse waveform snapshots nor rejected solver steps provide
-  reliable transition counts. This phase does **not** introduce a simulator event
+  reliable transition counts. The analysis does not introduce a simulator event
   hook or infer events from sampled gate commands.
 - The `turn_on_includes_reverse_recovery=True` flag rejects separate
   reverse-recovery events, avoiding a common datasheet double count.
@@ -116,12 +115,7 @@ covers before combining budgets.
   but do not invent switching events. If the trace does not represent actual
   semiconductor currents or RMS effects, precise semiconductor losses are
   **unsupported** until the electrical model supplies that information.
-- `temperature_K` is a **fixed loss-evaluation temperature**, not a predicted
-  thermal state. Junction/case RC transients, loss-temperature feedback, shared
-  heatsinks and magnetic/thermal coupling are subsequent phases of Issue #40.
+- `temperature_K` is a fixed loss-evaluation temperature for post-processing. Use an
+  electrothermal component when temperature must evolve during simulation.
 - This post-processing is Python-only; no silent change is made to standalone
   C++ electrical energy accounting or `.pes` configurations.
-
-The staged architecture and division between standard `peslite` and advanced
-`peslite-full` integrations are recorded in the
-[Issue #40 implementation plan](https://github.com/lonaparte/PESLite/issues/40#issuecomment-6911919041).

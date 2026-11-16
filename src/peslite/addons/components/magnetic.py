@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, ClassVar, Mapping
 
 import numpy as np
 
 from ...components.network import Element, NetworkComponent, register_component_type
-from ...solver import Bag, ConfigError, Empty, Port, StoragePort
+from ...solver import Bag, ConfigError, OutputMethod, Port, StoragePort
 
 __all__ = [
     "MagComponent",
@@ -301,9 +302,22 @@ class MagneticParams:
     magnetic: MagneticDescription | None = field(
         default=None, metadata={"structural": True}
     )
+    temperature_source: str | None = field(
+        default=None, metadata={"runtime": False}
+    )
+    temperature_coefficient_per_K: float = 0.0
+    temperature_reference_K: float = 298.15
 
     def __post_init__(self) -> None:
         names = _validate_winding_names(self.windings)
+        if (not math.isfinite(self.temperature_coefficient_per_K)
+                or not math.isfinite(self.temperature_reference_K)
+                or self.temperature_reference_K <= 0.0):
+            raise ConfigError("magnetic temperature parameters must be finite and physical")
+        if (self.temperature_source is not None
+                and (not isinstance(self.temperature_source, str)
+                     or not self.temperature_source)):
+            raise ConfigError("temperature_source must name a physical output")
         if self.magnetic is not None:
             self.magnetic.matrices(names)
 
@@ -330,10 +344,59 @@ def _inductance_decomposition(
 
 
 class MagComponent(NetworkComponent):
-    """Common electrical component contract with optional physical magnetic data."""
+    """Common magnetic component contract and cross-domain coupling signals."""
 
-    def __init__(self, magnetic: MagneticDescription | None = None) -> None:
+    def __init__(
+        self,
+        magnetic: MagneticDescription | None = None,
+        resistance: tuple[float, ...] = (),
+        temperature_coefficient_per_K: float = 0.0,
+        temperature_reference_K: float = 298.15,
+    ) -> None:
         self.magnetic = magnetic
+        self.resistance = np.asarray(resistance, dtype=float)
+        self.temperature_coefficient_per_K = float(temperature_coefficient_per_K)
+        self.temperature_reference_K = float(temperature_reference_K)
+
+    def _effective_resistance(self) -> np.ndarray:
+        if self.temperature_coefficient_per_K == 0.0:
+            return self.resistance
+        temperature = float(self.input.temperature_K)
+        factor = 1.0 + self.temperature_coefficient_per_K * (
+            temperature - self.temperature_reference_K
+        )
+        if (not math.isfinite(temperature) or temperature <= 0.0
+                or not math.isfinite(factor) or factor < 0.0):
+            raise ConfigError("magnetic winding resistance became nonphysical")
+        return self.resistance * factor
+
+    def _winding_currents(self) -> np.ndarray:
+        raise NotImplementedError
+
+    def _material_loss(self) -> float:
+        return 0.0
+
+    def _loss_parts(self) -> tuple[float, float]:
+        current = self._winding_currents()
+        copper = float(np.dot(self._effective_resistance(), current * current))
+        material = float(self._material_loss())
+        if (not math.isfinite(copper) or not math.isfinite(material)
+                or copper < 0.0 or material < 0.0):
+            raise ConfigError("magnetic losses must be nonnegative finite W")
+        return copper, material
+
+    def set_loss_outputs(self, _t: float) -> None:
+        copper, material = self._loss_parts()
+        self.output.copper_loss_W = copper
+        self.output.core_loss_W = material
+        self.output.loss_W = copper + material
+
+    def dissipated_power(self) -> float:
+        return sum(self._loss_parts())
+
+
+class _MagneticInput(Bag):
+    __slots__ = ("temperature_K",)
 
 
 class CoupledCoilsModel(MagComponent):
@@ -344,26 +407,44 @@ class CoupledCoilsModel(MagComponent):
     def __init__(self, winding_names: tuple[str, ...], inductance: Any,
                  resistance: tuple[float, ...],
                  terminals: tuple[tuple[bool, bool], ...],
-                 magnetic: MagneticDescription | None = None) -> None:
-        super().__init__(magnetic)
+                 magnetic: MagneticDescription | None = None,
+                 temperature_coefficient_per_K: float = 0.0,
+                 temperature_reference_K: float = 298.15) -> None:
+        super().__init__(
+            magnetic,
+            resistance,
+            temperature_coefficient_per_K,
+            temperature_reference_K,
+        )
         names = _validate_winding_names(winding_names)
         if len(resistance) != len(names) or len(terminals) != len(names):
             raise ConfigError("every winding must define resistance and terminals")
         matrix, modes, shapes = _inductance_decomposition(inductance, len(names))
 
         self.names = names
-        self.resistance = resistance
         self.inductance = matrix
-        self._shapes = tuple(tuple(float(value) for value in row) for row in shapes)
+        self._shapes = shapes
         self.state_names = tuple(f"i_mode_{index + 1}" for index in range(len(names)))
         self.state = type("_MagneticState", (Bag,), {"__slots__": self.state_names})(
             **dict.fromkeys(self.state_names, 0.0)
         )
-        output_names = tuple(label for name in names for label in (f"i_{name}", f"u_{name}"))
+        output_names = (
+            *tuple(label for name in names for label in (f"i_{name}", f"u_{name}")),
+            "copper_loss_W", "core_loss_W", "loss_W",
+        )
         self.output = type("_MagneticOutput", (Bag,), {"__slots__": output_names})(
             **dict.fromkeys(output_names, 0.0)
         )
-        self.input = Empty()
+        self.input = _MagneticInput(temperature_K=self.temperature_reference_K)
+        self.output_stages = (
+            OutputMethod(
+                "set_loss_outputs",
+                (("temperature_K",)
+                 if self.temperature_coefficient_per_K != 0.0 else ()),
+                ("copper_loss_W", "core_loss_W", "loss_W"),
+                rhs=False,
+            ),
+        )
         self.storage = tuple(StoragePort(name, float(mode), kind="inductor")
                              for name, mode in zip(self.state_names, modes))
 
@@ -380,12 +461,23 @@ class CoupledCoilsModel(MagComponent):
     def network(self, nb: Any) -> None:
         from ...solver import netlist as nl
 
+        temperature_dependent = self.temperature_coefficient_per_K != 0.0
         branches = []
-        for (positive, negative), resistance in zip(self.winding_ports, self.resistance):
+        for index, ((positive, negative), resistance) in enumerate(
+            zip(self.winding_ports, self.resistance)
+        ):
             high, low = nb.node(positive), nb.node(negative)
             if resistance:
                 inner = nb.internal()
-                nb.add(nl.Resistor(high, inner, resistance))
+                if temperature_dependent:
+                    drop = nb.function(
+                        partial(self._winding_drop, index),
+                        ("temperature_K",),
+                        states=self.state_names,
+                    )
+                    nb.add(nl.VoltageSource(high, inner, drop))
+                else:
+                    nb.add(nl.Resistor(high, inner, resistance))
                 high = inner
             branches.append((high, low))
         coupled = nb.add(nl.CoupledInductors(
@@ -402,7 +494,28 @@ class CoupledCoilsModel(MagComponent):
             if not negative.grounded:
                 terminal_voltage.append((-1.0, ("node_voltage", nb.node(negative))))
             nb.linear_output(self, f"u_{name}", terminal_voltage)
+        if temperature_dependent and np.any(self.resistance):
+            nb.add(nl.Dissipation(nb.function(
+                self._copper_loss,
+                ("temperature_K",),
+                states=self.state_names,
+            )))
         nb.losses(self)
+
+    def _winding_currents(self) -> np.ndarray:
+        modal = np.fromiter(
+            (getattr(self.state, name) for name in self.state_names),
+            dtype=float,
+            count=len(self.state_names),
+        )
+        return self._shapes @ modal
+
+    def _winding_drop(self, index: int, _t: float) -> float:
+        return float(self._effective_resistance()[index] * self._winding_currents()[index])
+
+    def _copper_loss(self, _t: float) -> float:
+        current = self._winding_currents()
+        return float(np.dot(self._effective_resistance(), current * current))
 
     def magnetic_signals(self) -> dict[str, float]:
         """Return the public winding currents and terminal voltages."""
@@ -460,15 +573,23 @@ class _MagneticElement(Element):
         )
         self._attach(
             name, cfg,
-            CoupledCoilsModel(names, inductance, resistance, terminals, magnetic),
+            CoupledCoilsModel(
+                names,
+                inductance,
+                resistance,
+                terminals,
+                magnetic,
+                cfg.temperature_coefficient_per_K,
+                cfg.temperature_reference_K,
+            ),
         )
 
     def subsystems(self) -> dict[str, Any]:
         return {self.name: self.model}
 
-    @staticmethod
-    def connections() -> dict:
-        return {}
+    def connections(self) -> dict:
+        source = self.cfg.temperature_source
+        return {(self.model, "temperature_K"): source} if source is not None else {}
 
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         return tuple(

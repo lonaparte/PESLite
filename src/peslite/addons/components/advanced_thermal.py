@@ -9,50 +9,126 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Mapping, Protocol, Sequence
+from typing import Any, ClassVar, Mapping, Protocol, Sequence
 
 import numpy as np
 
 from ...components.network import Element, register_component_type
 from ...solver import Bag, ConfigError
-from .thermal_network import LumpedThermalNetwork, ThermalLink
+from .thermal_network import LumpedThermalNetwork, ThermalLink, _finite, _record
 
 __all__ = [
-    "ThermalLaw", "SharedThermalModel", "SharedThermalNetwork",
+    "ThermalLaw", "ThermalPortModel", "ThermalPortElement",
+    "SharedThermalModel", "SharedThermalNetwork", "ReducedThermalLaw",
     "ReducedThermalModel", "ReducedThermalElement", "load_thermal_rom",
     "foster_step_response",
 ]
 
 
-def _finite(value: float, label: str) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be finite")
-    try:
-        answer = float(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{label} must be finite") from None
-    if not math.isfinite(answer):
-        raise ValueError(f"{label} must be finite")
-    return answer
-
-
-@lru_cache(maxsize=None)
-def _fields(prefix: str, names: tuple[str, ...]) -> type[Bag]:
-    return type(prefix, (Bag,), {"__slots__": names})
-
-
 class ThermalLaw(Protocol):
-    """Custom FEM/co-simulation law called from the existing Model RHS.
+    """Independent thermal constitutive law behind a thermal port.
 
-    Implementations must be pure for fixed (t, state, heat) during speculative
-    integrator stages and may not send side effects to an external solver.
-    External exchange belongs at committed scheduling boundaries.
+    The law receives heat flow and returns temperature and thermal-state rates.
+    It has no dependency on an electrical or magnetic port implementation.
     """
+
+    initial_state: Mapping[str, float]
 
     def rhs(self, t: float, state: np.ndarray, heat_W: float) -> np.ndarray: ...
     def temperature_K(self, t: float, state: np.ndarray, heat_W: float) -> float: ...
+
+
+class _ThermalPortInput(Bag):
+    __slots__ = ("heat_W",)
+
+
+class _ThermalPortOutput(Bag):
+    __slots__ = ("temperature_K", "heat_W")
+
+
+class ThermalPortModel:
+    """Adapt one thermal law to PESLite heat-flow and temperature signals."""
+
+    outputs_need_inputs: ClassVar[bool] = True
+    observer: ClassVar[bool] = True
+
+    def __init__(self, law: ThermalLaw) -> None:
+        if not callable(getattr(law, "rhs", None)) or not callable(
+            getattr(law, "temperature_K", None)
+        ):
+            raise TypeError("a thermal law must define rhs() and temperature_K()")
+        initial = dict(getattr(law, "initial_state", {}))
+        if (any(not isinstance(name, str) or not name.isidentifier()
+                for name in initial)
+                or any(isinstance(value, bool) or not math.isfinite(float(value))
+                       for value in initial.values())):
+            raise ValueError("thermal-law initial states must be named and finite")
+        self.law = law
+        self.state_names = tuple(initial)
+        self.state = _record("_ThermalPortState", self.state_names)(
+            **{name: float(value) for name, value in initial.items()}
+        )
+        self.input = _ThermalPortInput(heat_W=0.0)
+        self.output = _ThermalPortOutput()
+        self.set_outputs(0.0)
+
+    def _state_vector(self) -> np.ndarray:
+        return np.fromiter(
+            (getattr(self.state, name) for name in self.state_names),
+            dtype=float,
+            count=len(self.state_names),
+        )
+
+    def _heat(self) -> float:
+        heat = _finite(self.input.heat_W, "heat_W")
+        if heat < 0.0:
+            raise ValueError("thermal-port heat must be nonnegative")
+        return heat
+
+    def set_outputs(self, t: float) -> None:
+        heat = self._heat()
+        temperature = _finite(
+            self.law.temperature_K(t, self._state_vector(), heat),
+            "temperature_K",
+        )
+        if temperature <= 0.0:
+            raise ValueError("thermal-port temperature must be positive")
+        self.output.temperature_K = temperature
+        self.output.heat_W = heat
+
+    def rhs(self, t: float) -> tuple[float, ...]:
+        derivative = np.asarray(
+            self.law.rhs(t, self._state_vector(), self._heat()),
+            dtype=float,
+        )
+        if derivative.shape != (len(self.state_names),) or not np.isfinite(derivative).all():
+            raise ValueError("thermal law rhs must match its finite state vector")
+        return tuple(float(value) for value in derivative)
+
+
+class ThermalPortElement(Element):
+    """Connect an independent thermal law to one configured heat source."""
+
+    def __init__(self, name: str, cfg: Any, law: ThermalLaw) -> None:
+        self.name, self.cfg = name, cfg
+        self.model = ThermalPortModel(law)
+
+    def subsystems(self) -> dict[str, ThermalPortModel]:
+        return {self.name: self.model}
+
+    def connections(self) -> dict:
+        return {(self.model, "heat_W"): self.cfg.heat_source}
+
+    @staticmethod
+    def port_bindings() -> tuple:
+        return ()
+
+    def signals(self) -> dict[str, float]:
+        return {
+            f"{self.name}.temperature_K": self.model.output.temperature_K,
+            f"{self.name}.heat_W": self.model.output.heat_W,
+        }
 
 
 class SharedThermalModel:
@@ -78,17 +154,20 @@ class SharedThermalModel:
         self.source_nodes = dict(sources)
         self.state_names = tuple(f"T_{node}_K" for node in network.names)
         self.input_names = tuple(f"heat_{name}_W" for name in sources)
-        self.output_names = (*self.state_names, "heat_total_W", "cooling_W")
+        self.temperature_names = tuple(
+            f"temperature_{node}_K" for node in network.names
+        )
+        self.output_names = (*self.temperature_names, "heat_total_W", "cooling_W")
         initial = (network.ambient_K if initial_K is None else _finite(initial_K, "initial_K"))
         if initial <= 0:
             raise ValueError("initial_K must be positive")
-        self.state = _fields("_SharedThermalState", self.state_names)(
+        self.state = _record("_SharedThermalState", self.state_names)(
             **dict.fromkeys(self.state_names, initial)
         )
-        self.input = _fields("_SharedThermalInput", self.input_names)(
+        self.input = _record("_SharedThermalInput", self.input_names)(
             **dict.fromkeys(self.input_names, 0.0)
         )
-        self.output = _fields("_SharedThermalOutput", self.output_names)()
+        self.output = _record("_SharedThermalOutput", self.output_names)()
         self.set_outputs(0.0)
 
     def _temperatures(self) -> np.ndarray:
@@ -108,7 +187,7 @@ class SharedThermalModel:
 
     def set_outputs(self, t: float) -> None:
         temperatures = self._temperatures()
-        for name, temperature in zip(self.state_names, temperatures):
+        for name, temperature in zip(self.temperature_names, temperatures):
             setattr(self.output, name, float(temperature))
         self.output.heat_total_W = sum(self._heat().values())
         self.output.cooling_W = self.network.cooling_power_W(temperatures)
@@ -185,16 +264,13 @@ class SharedThermalNetwork(Element):
         }
 
 
-class ReducedThermalModel:
-    """Stable reduced-order thermal state, imported from an external FEM/ROM.
+class ReducedThermalLaw:
+    """Stable reduced-order thermal law imported from an external FEM/ROM.
 
     A: 1/s, B: K/J, C: dimensionless, D: K/W.
     xdot = A*x + B*P; T_j = T_ambient + C*x + D*P.
     B/C/D are user-supplied reduced coefficients, never inferred geometry.
     """
-
-    outputs_need_inputs: ClassVar[bool] = True
-    observer: ClassVar[bool] = True
 
     def __init__(self, A_per_s: Any, B_K_per_J: Any, C: Any, D_K_W: float,
                  *, ambient_K: float = 298.15, initial: Sequence[float] | None = None):
@@ -223,35 +299,35 @@ class ReducedThermalModel:
             raise ValueError("ROM initial state must be a finite vector of length N")
         self.A_per_s, self.B_K_per_J, self.C, self.D_K_W = A, B, C, D
         self.ambient_K = ambient
-        self.state_names = tuple(f"rom_{k}_K" for k in range(len(B)))
-        self.state = _fields("_ReducedThermalState", self.state_names)(
-            **dict(zip(self.state_names, initial_values))
-        )
-        self.input = _fields("_ReducedThermalInput", ("heat_W",))(heat_W=0.0)
-        self.output = _fields("_ReducedThermalOutput", ("junction_K", "heat_W"))()
-        self.set_outputs(0.0)
+        self.initial_state = {
+            f"rom_{index}_K": float(value)
+            for index, value in enumerate(initial_values)
+        }
 
-    def _vector(self) -> np.ndarray:
-        return np.fromiter((getattr(self.state, k) for k in self.state_names), dtype=float)
+    def temperature_K(self, _t: float, state: np.ndarray, heat_W: float) -> float:
+        return self.ambient_K + float(self.C @ state) + self.D_K_W * heat_W
 
-    def set_outputs(self, t: float) -> None:
-        heat = _finite(self.input.heat_W, "heat_W")
-        if heat < 0:
-            raise ValueError("thermal ROM heat must be nonnegative")
-        self.output.heat_W = heat
-        self.output.junction_K = (
-            self.ambient_K + float(self.C @ self._vector()) + self.D_K_W * heat
-        )
+    def rhs(self, _t: float, state: np.ndarray, heat_W: float) -> np.ndarray:
+        return self.A_per_s @ state + self.B_K_per_J * heat_W
 
-    def rhs(self, t: float) -> tuple[float, ...]:
-        p = _finite(self.input.heat_W, "heat_W")
-        if p < 0:
-            raise ValueError("thermal ROM heat must be nonnegative")
-        return tuple(float(x) for x in self.A_per_s @ self._vector() + self.B_K_per_J * p)
+
+class ReducedThermalModel(ThermalPortModel):
+    """Thermal-port adapter for a reduced-order thermal law."""
+
+    def __init__(self, A_per_s: Any, B_K_per_J: Any, C: Any, D_K_W: float,
+                 *, ambient_K: float = 298.15, initial: Sequence[float] | None = None):
+        super().__init__(ReducedThermalLaw(
+            A_per_s,
+            B_K_per_J,
+            C,
+            D_K_W,
+            ambient_K=ambient_K,
+            initial=initial,
+        ))
 
 
 @register_component_type
-class ReducedThermalElement(Element):
+class ReducedThermalElement(ThermalPortElement):
     """Use one imported reduced-order thermal backend in the original circuit."""
 
     @dataclass(frozen=True, kw_only=True)
@@ -268,39 +344,31 @@ class ReducedThermalElement(Element):
             if not isinstance(self.heat_source, str) or not self.heat_source:
                 raise ConfigError("heat_source must be an existing physical output path")
             try:
-                ReducedThermalModel(self.A_per_s, self.B_K_per_J, self.C,
-                                    self.D_K_W, ambient_K=self.ambient_K)
+                ReducedThermalLaw(self.A_per_s, self.B_K_per_J, self.C,
+                                  self.D_K_W, ambient_K=self.ambient_K)
             except ValueError as exc:
                 raise ConfigError(str(exc)) from None
 
     type = "thermal_rom"
 
     def __init__(self, name: str, cfg: Any, buses: dict, p: Any):
-        self.name, self.cfg = name, cfg
-        self.model = ReducedThermalModel(
-            cfg.A_per_s, cfg.B_K_per_J, cfg.C, cfg.D_K_W, ambient_K=cfg.ambient_K
+        super().__init__(
+            name,
+            cfg,
+            ReducedThermalLaw(
+                cfg.A_per_s,
+                cfg.B_K_per_J,
+                cfg.C,
+                cfg.D_K_W,
+                ambient_K=cfg.ambient_K,
+            ),
         )
-
-    def subsystems(self) -> dict:
-        return {self.name: self.model}
-
-    def connections(self) -> dict:
-        return {(self.model, "heat_W"): self.cfg.heat_source}
-
-    @staticmethod
-    def port_bindings() -> tuple:
-        return ()
-
-    def signals(self) -> dict[str, float]:
-        return {f"{self.name}.junction_K": self.model.output.junction_K,
-                f"{self.name}.heat_W": self.model.output.heat_W}
 
 
 def load_thermal_rom(file: str | Path) -> ReducedThermalModel:
     """Read a declared-SI JSON ROM exported by a FEM or identification backend.
 
-    This does not pretend that raw field data is a coupled PDE solver: the file
-    must already contain a validated reduced-order state-space model.
+    The file must contain a reduced-order state-space model, not raw field data.
     """
     with Path(file).open(encoding="utf-8") as stream:
         data = json.load(stream)

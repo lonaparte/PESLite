@@ -8,9 +8,12 @@ These equations are evaluated by PESLite's existing Model and solver.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Mapping, Sequence
 
 import numpy as np
+
+from ...solver import Bag
 
 __all__ = ["ThermalLink", "LumpedThermalNetwork", "FosterImpedance"]
 
@@ -37,6 +40,12 @@ def _finite(value: float, label: str) -> float:
     if not np.isfinite(number):
         raise ValueError(f"{label} must be finite")
     return number
+
+
+@lru_cache(maxsize=None)
+def _record(prefix: str, names: tuple[str, ...]) -> type[Bag]:
+    """Return one cached state/input/output record type for a field layout."""
+    return type(prefix, (Bag,), {"__slots__": names})
 
 
 @dataclass(frozen=True)

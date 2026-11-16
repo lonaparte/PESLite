@@ -1,4 +1,4 @@
-"""Analytical RC references, restartable thermal states and circuit attachments (Issue #40)."""
+"""Analytical RC references, restartable thermal states and circuit attachments."""
 
 import math
 from types import SimpleNamespace
@@ -61,7 +61,7 @@ def test_foster_step_response_and_restricted_temperature_outputs():
     assert network.committed_impulse([0, 0], 2) == pytest.approx([1, 0.5])
     component = ElectroThermalModel(network)
     assert math.isnan(component.output.case_K)
-    assert component.state_names == ("rise_0_K", "rise_1_K", "last_transition_id")
+    assert component.state_names == ("rise_0_K", "rise_1_K")
 
 
 def test_temperature_dependent_loss_updates_model_rhs_without_thermal_solver():
@@ -77,7 +77,7 @@ def test_temperature_dependent_loss_updates_model_rhs_without_thermal_solver():
     assert component.output.estimated_heat_W == pytest.approx(10)
     derivative = component.rhs(0)
     assert derivative[0] == pytest.approx(10)
-    assert derivative[-1] == 0.0
+    assert len(derivative) == 2
     component.state.T_node_0_K = 400
     component.set_outputs(0)
     assert component.output.estimated_heat_W == pytest.approx(20)
@@ -91,13 +91,13 @@ def test_confirmed_impulse_is_exact_and_restart_id_is_a_registered_state():
     )
     circuit = Model({"thermal": component}, {})
     initial = circuit.get_initial_values()
-    assert len(initial) == 3
+    assert len(initial) == 2
     energy = component.apply_committed_transition(
         SwitchingEvent(0.001, "turn_on", 2, 400), event_id=10)
     assert energy == pytest.approx(0.2)
     current = circuit.get_initial_values()
     assert current[0] == pytest.approx(302)
-    assert current[2] == pytest.approx(10)
+    assert component.get_state() == {"last_transition_id": 10}
     with pytest.raises(ValueError, match="already been committed"):
         component.apply_committed_transition(
             SwitchingEvent(0.001, "turn_on", 2, 400), event_id=10)
@@ -108,10 +108,11 @@ def test_confirmed_impulse_is_exact_and_restart_id_is_a_registered_state():
     )
     second = Model({"thermal": resumed}, {})
     second.set_states(current)
+    resumed.set_state(component.get_state())
     with pytest.raises(ValueError, match="already been committed"):
         resumed.apply_committed_transition(
             SwitchingEvent(0.001, "turn_on", 2, 400), event_id=10)
-    np.testing.assert_allclose(initial, [300, 300, -1])
+    np.testing.assert_allclose(initial, [300, 300])
 
 
 def test_electrothermal_element_uses_existing_source_not_an_electrical_netlist():
@@ -122,7 +123,7 @@ def test_electrothermal_element_uses_existing_source_not_an_electrical_netlist()
     element = ElectroThermal("thermal_load", cfg, {}, None)
     assert element.port_bindings() == ()
     assert element.subsystems()["thermal_load"] is element.model
-    assert element.connections() == {(element.model, "accounted_heat_W"): "load.power"}
+    assert element.connections() == {(element.model, "heat_W"): "load.power"}
     assert math.isfinite(element.model.output.case_K)
     with pytest.raises(ValueError, match="exactly one"):
         ElectroThermal.Params(c_j_J_K=1, r_jc_K_W=1, c_c_J_K=1, r_ca_K_W=1)
@@ -154,7 +155,7 @@ def test_model_runs_thermal_dynamics_from_a_connected_power_source():
     thermal = ElectroThermalModel(
         LumpedThermalNetwork.cauer([1, 1], [1, 1], ambient_K=300))
     model = Model({"source": source, "thermal": thermal},
-                  {(thermal, "accounted_heat_W"): (source, "power")})
+                  {(thermal, "heat_W"): (source, "power")})
     state = model.get_initial_values()
     assert model.rhs(0, state)[0] == pytest.approx(10.0)
     assert model.rhs(0, state)[1] == pytest.approx(0.0)
@@ -165,7 +166,7 @@ def test_model_runs_thermal_dynamics_from_a_connected_power_source():
 def test_temperature_reports_and_device_comparison():
     t = np.array([0, 1, 2], dtype=float)
     result = SimpleNamespace(t=t, plant={
-        "thermal.junction_K": np.array([300, 315, 320]),
+        "thermal.temperature_K": np.array([300, 315, 320]),
         "thermal.case_K": np.array([300, 305, 310]),
         "thermal.heat_W": np.array([5, 5, 5]),
         "thermal.cooling_W": np.array([0, 1, 2]),
@@ -207,6 +208,6 @@ def test_end_to_end_attachment_in_existing_buck_circuit(tmp_path):
     result = simulation.run(out_dir=tmp_path)
     assert "thermal_load.T_node_0_K" in result.states
     assert "thermal_load.last_transition_id" in result.states
-    assert result.plant["thermal_load.junction_K"][-1] >= 300.0
+    assert result.plant["thermal_load.temperature_K"][-1] >= 300.0
     assert np.max(result.plant["thermal_load.heat_W"]) >= 0.0
     assert result.summary["status"] == "completed"
