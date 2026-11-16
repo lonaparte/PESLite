@@ -2141,7 +2141,6 @@ class _ModelGenerator:
         self.zoh_initial: dict[str, Any] = {}
         self._coefficient_plans = {}
         self._coefficient_topologies = {}
-        self._temporary_netlists = {}
         self._dynamic_netlist_traces = {}
         # symbolic eliminations by their inputs' codes, shared by every term pool
         self._dynamic_netlist_solutions = {}
@@ -2225,27 +2224,6 @@ class _ModelGenerator:
         for circuit in self.system.circuits:
             self._circuit_coefficients(circuit)
         self.resolve_equations()
-
-    def close(self) -> None:
-        """Release the one-shot compiler graph after its generated source is complete.
-
-        Traced callbacks and object-valued equation arrays form cycles which Python's cyclic
-        collector cannot see in full.  The native source owns no references into this graph, so
-        dropping the compiler's roots is the natural end of its lifetime.
-        """
-        if not self.__dict__:
-            return
-        topologies = {
-            id(topology): topology
-            for modes in self._coefficient_topologies.values()
-            for topology in modes.values()
-            if id(topology._store[0]) in self._temporary_netlists
-        }
-        for topology in topologies.values():
-            topology.__dict__.clear()
-        for netlist in self._temporary_netlists.values():
-            netlist.__dict__.clear()
-        self.__dict__.clear()
 
     def resolve_equations(self) -> None:
         """Lower equations after native lifecycle writers have been bound."""
@@ -3167,7 +3145,6 @@ class _ModelGenerator:
         if coefficients:
             original = circuit.netlist
             net = copy.copy(original)
-            self._temporary_netlists[id(net)] = net
             restored.append((circuit, "netlist", original))
             circuit.netlist = net
             net._compiled = lambda mode: self._equation_topology(circuit, mode)
@@ -9243,8 +9220,6 @@ def _parameter_generator(prepared, name, variables, initializations, *, constant
             })
             excluded.update(sensitive)
     if excluded:
-        if model is not None:
-            model.close()
         generator = _CppGenerator(prepared, name, variables, initializations, exclude=excluded)
         model = None
     return generator, model, diagnostics
@@ -9292,10 +9267,7 @@ def _export_cpp(simulation: Any, out_dir: Path, name: str,
         generated_model = _ModelGenerator(
             prepared, generator.runtime, zoh_initial=generator.zoh_initial
         )
-    try:
-        code = generator.source(generated_model)
-    finally:
-        generated_model.close()
+    code = generator.source(generated_model)
     out_dir.mkdir(parents=True, exist_ok=True)
     source = out_dir / "peslite.cpp"
     source.write_text(code, encoding="utf-8")

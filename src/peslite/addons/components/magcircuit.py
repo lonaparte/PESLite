@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
-from .magnetic import (
-    MagneticBranchDescription,
-    MagneticParams,
-    _validate_winding_names,
-)
+from .magnetic import MagneticParams, _validate_winding_names
 from ...components.network import register_component_type
 from ...solver import ConfigError
 from .magport import MagPortElement
 
 __all__ = ["MagCircuit", "MagCircuitLaw"]
+
+_NEWTON_ITERATIONS = 50
+_NEWTON_TOLERANCE = 1.0e-9
 
 
 def _matrix(value: Any, name: str) -> np.ndarray:
@@ -79,13 +79,14 @@ def _linear_circuit(
 
 
 class MagCircuitLaw:
-    """Winding law obtained from magnetic flux continuity and branch MMF relations.
+    """Winding law obtained from magnetic flux continuity and nonlinear branch MMF relations.
 
-    A numeric ``reluctance`` gives the exact linear solution. A callable ``mmf`` receives
-    ``(t, branch_flux, state)`` and may implement nonlinear or state-dependent material behavior.
-    The optional ``differential`` callable returns its branch-MMF Jacobian. Optional internal state
-    is advanced by ``state_derivatives(t, branch_flux, winding_current, state)``. Conservative
-    nonlinear laws may provide stored-energy callbacks for exact energy accounting.
+    ``mmf`` receives ``(t, branch_flux, state)`` and may implement nonlinear or state-dependent
+    material behavior. ``differential`` returns its branch-MMF Jacobian. A linear magnetic circuit
+    is reduced to its winding-inductance matrix and assembled through the ordinary netlist model.
+    Optional internal state is advanced by
+    ``state_derivatives(t, branch_flux, winding_current, state)``. Conservative nonlinear laws may
+    provide stored-energy callbacks for exact energy accounting.
     """
 
     def __init__(
@@ -94,11 +95,8 @@ class MagCircuitLaw:
         coupling: Any,
         *,
         incidence: Any | None = None,
-        reluctance: Any | None = None,
-        mmf: Callable[[float, np.ndarray, Mapping[str, float]], Sequence[float]] | None = None,
-        differential: Callable[
-            [float, np.ndarray, Mapping[str, float]], Any
-        ] | None = None,
+        mmf: Callable[[float, np.ndarray, Mapping[str, float]], Sequence[float]],
+        differential: Callable[[float, np.ndarray, Mapping[str, float]], Any],
         initial_state: Mapping[str, float] | None = None,
         state_derivatives: Callable[
             [float, np.ndarray, np.ndarray, Mapping[str, float]], Mapping[str, float]
@@ -129,18 +127,30 @@ class MagCircuitLaw:
             raise ConfigError("coupling must independently excite every winding")
         self.flux_basis = _flux_basis(incidence, branches)
         self._linkage_map = self.coupling.T @ self.flux_basis
-        if np.linalg.matrix_rank(self._linkage_map) != windings:
+        left, singular, right = np.linalg.svd(self._linkage_map, full_matrices=True)
+        tolerance = (
+            singular.max(initial=0.0)
+            * max(self._linkage_map.shape)
+            * np.finfo(float).eps
+        )
+        if len(singular) < windings or singular[-1] <= tolerance:
             raise ConfigError(
                 "flux constraints and coupling must independently define every winding linkage"
             )
+        # Path fluxes q = linked @ lambda + free @ y satisfy every winding linkage exactly.
+        # The remaining equations balance MMF only in the unconstrained flux directions.
+        self._linked = (right[:windings].T / singular) @ left.T
+        self._free = right[windings:].T
+        self._drive_current = self._linked.T
+        self._free_reduction = self.flux_basis @ self._free
         self.initial_state = dict(initial_state or {})
         self._state_derivatives = state_derivatives
         if bool(self.initial_state) != (state_derivatives is not None):
             raise ConfigError(
                 "magnetic-circuit internal states require state_derivatives and vice versa"
             )
-        if (reluctance is None) == (mmf is None):
-            raise ConfigError("provide exactly one of reluctance or mmf")
+        if not callable(mmf) or not callable(differential):
+            raise ConfigError("mmf and differential must be callable")
         if stored_energy is None and stored_energy_rate is not None:
             raise ConfigError("stored_energy_rate requires stored_energy")
         if stored_energy is not None and self.initial_state and stored_energy_rate is None:
@@ -152,51 +162,31 @@ class MagCircuitLaw:
         self._differential = differential
         self._stored_energy = stored_energy
         self._stored_energy_rate = stored_energy_rate
-        self._linear_current: np.ndarray | None = None
-        self._linear_flux: np.ndarray | None = None
-        self._guess = np.zeros(self.flux_basis.shape[1] + windings)
+        self._free_flux = np.zeros(self._free.shape[1])
         self._last_flux = np.zeros(branches)
         self._last_key: tuple | None = None
         self._last_current = np.zeros(windings)
-        if reluctance is not None:
-            inductance, response, matrix = _linear_circuit(
-                reluctance, self.coupling, incidence
-            )
-            self.reluctance = matrix
-            self._linear_current = np.linalg.solve(
-                inductance, np.eye(len(inductance))
-            )
-            self._linear_flux = response @ self._linear_current
-            self._stored_energy = lambda _t, flux, _state: float(
-                0.5 * flux @ matrix @ flux
-            )
-        else:
-            self.reluctance = None
-            self._validate_nonlinear_origin()
+        self._validate_nonlinear_origin()
         if self._stored_energy is not None:
             self.stored_energy = self._energy_value
             self.stored_energy_rate = self._energy_rate
 
-    def _constrained_guess(
-        self, t: float, flux_linkage: np.ndarray, state: Mapping[str, float]
+    def _drive(self, t: float, flux: np.ndarray, state: Mapping[str, float]) -> np.ndarray:
+        """Return MMF around each independent flux path."""
+        return self.flux_basis.T @ self._branch_mmf(t, flux, state)
+
+    def _free_stiffness(
+        self, t: float, flux: np.ndarray, state: Mapping[str, float]
     ) -> np.ndarray:
-        """Project the previous flux onto the requested linkage before nonlinear iteration."""
-        paths = self.flux_basis.shape[1]
-        q = self._guess[:paths].copy()
-        linkage_error = flux_linkage - self._linkage_map @ q
-        gram = self._linkage_map @ self._linkage_map.T
-        q += self._linkage_map.T @ np.linalg.solve(gram, linkage_error)
-        flux = self.flux_basis @ q
-        magnetic_drive = self.flux_basis.T @ self._branch_mmf(t, flux, state)
-        current_drive = self.flux_basis.T @ self.coupling
-        current = np.linalg.lstsq(current_drive, magnetic_drive, rcond=None)[0]
-        return np.concatenate((q, current))
+        """Differentiate free-path MMF with respect to free-path flux."""
+        return self._free_reduction.T @ self._branch_jacobian(
+            t, flux, state
+        ) @ self._free_reduction
 
     def _validate_nonlinear_origin(self) -> None:
         flux = np.zeros(self.coupling.shape[0])
         self._branch_mmf(0.0, flux, self.initial_state)
-        if self._differential is not None:
-            self._branch_jacobian(0.0, flux, self.initial_state)
+        self._branch_jacobian(0.0, flux, self.initial_state)
 
     def _branch_mmf(
         self, t: float, flux: np.ndarray, state: Mapping[str, float]
@@ -230,11 +220,6 @@ class MagCircuitLaw:
     def currents(
         self, t: float, flux_linkage: np.ndarray, state: Mapping[str, float]
     ) -> np.ndarray:
-        if self._linear_current is not None:
-            current = self._linear_current @ flux_linkage
-            self._last_flux = self._linear_flux @ flux_linkage
-            self._last_current = current.copy()
-            return current
         key = (
             float(t),
             *map(float, flux_linkage),
@@ -243,44 +228,49 @@ class MagCircuitLaw:
         if key == self._last_key:
             return self._last_current.copy()
 
-        basis, turns = self.flux_basis, self.coupling
-        paths = basis.shape[1]
-
-        def residual(value: np.ndarray) -> np.ndarray:
-            flux = basis @ value[:paths]
-            current = value[paths:]
-            return np.concatenate((
-                basis.T @ (self._branch_mmf(t, flux, state) - turns @ current),
-                turns.T @ flux - flux_linkage,
-            ))
-
-        jacobian = None
-        if self._differential is not None:
-            def jacobian(value: np.ndarray) -> np.ndarray:
-                flux = basis @ value[:paths]
-                top_left = basis.T @ self._branch_jacobian(t, flux, state) @ basis
-                return np.block([
-                    [top_left, -basis.T @ turns],
-                    [turns.T @ basis, np.zeros((len(self.winding_names),
-                                                len(self.winding_names)))],
-                ])
-
-        from scipy.optimize import root
-
-        initial = self._constrained_guess(t, flux_linkage, state)
-        scale = 1.0 + np.linalg.norm(flux_linkage, ord=np.inf)
-        if np.linalg.norm(residual(initial), ord=np.inf) <= 1e-9 * scale:
-            solution_value = initial
+        linked = self._linked @ flux_linkage
+        free_flux = self._free_flux
+        paths = linked + self._free @ free_flux
+        flux = self.flux_basis @ paths
+        drive = self._drive(t, flux, state)
+        residual = self._free.T @ drive
+        for _ in range(_NEWTON_ITERATIONS):
+            residual_norm = float(np.abs(residual).max(initial=0.0))
+            drive_norm = float(np.abs(drive).max(initial=0.0))
+            if residual_norm <= _NEWTON_TOLERANCE * drive_norm:
+                break
+            try:
+                step = np.linalg.solve(
+                    self._free_stiffness(t, flux, state), residual
+                )
+            except np.linalg.LinAlgError:
+                raise ConfigError(
+                    "magnetic-circuit differential is singular on its free flux paths"
+                ) from None
+            if not np.isfinite(step).all():
+                raise ConfigError(
+                    "magnetic-circuit differential produced a non-finite Newton step"
+                )
+            for _ in range(_NEWTON_ITERATIONS):
+                trial_free_flux = free_flux - step
+                trial_paths = linked + self._free @ trial_free_flux
+                trial_flux = self.flux_basis @ trial_paths
+                trial_drive = self._drive(t, trial_flux, state)
+                trial_residual = self._free.T @ trial_drive
+                if np.abs(trial_residual).max(initial=0.0) < residual_norm:
+                    break
+                step *= 0.5
+            else:
+                raise ConfigError(
+                    "magnetic-circuit solve cannot reduce its path MMF residual"
+                )
+            free_flux, paths, flux = trial_free_flux, trial_paths, trial_flux
+            drive, residual = trial_drive, trial_residual
         else:
-            solution = root(residual, initial, jac=jacobian)
-            if not solution.success or not np.isfinite(solution.x).all():
-                raise ConfigError(f"magnetic-circuit solve failed: {solution.message}")
-            solution_value = solution.x
-        if np.linalg.norm(residual(solution_value), ord=np.inf) > 1e-9 * scale:
-            raise ConfigError("magnetic-circuit solve did not satisfy its constitutive equations")
-        self._guess = solution_value.copy()
-        self._last_flux = basis @ solution_value[:paths]
-        self._last_current = solution_value[paths:].copy()
+            raise ConfigError("magnetic-circuit solve did not converge")
+        self._free_flux = free_flux
+        self._last_flux = flux
+        self._last_current = self._drive_current @ drive
         self._last_key = key
         return self._last_current.copy()
 
@@ -325,15 +315,9 @@ class MagCircuitLaw:
 
 
 def _branch_law(
-    branches: Mapping[str, MagneticBranchDescription],
-) -> tuple[Callable | None, Callable | None, np.ndarray | None, Callable | None]:
-    values = tuple(branches.values())
-    constitutive = tuple(branch.constitutive_data() for branch in values)
-    if all(reluctance is not None for reluctance, _flux, _mmf in constitutive):
-        return None, None, np.diag([
-            reluctance for reluctance, _flux, _mmf in constitutive
-        ]), None
-
+    constitutive: Sequence[tuple[float | None, np.ndarray | None, np.ndarray | None]],
+) -> tuple[Callable, Callable, Callable]:
+    """Return branch MMF, its Jacobian and stored energy."""
     from scipy.interpolate import PchipInterpolator
 
     laws = []
@@ -377,7 +361,7 @@ def _branch_law(
     ) -> float:
         return float(sum(energy(value) for energy, value in zip(energies, flux)))
 
-    return mmf, differential, None, stored_energy
+    return mmf, differential, stored_energy
 
 
 @register_component_type
@@ -400,13 +384,35 @@ class MagCircuit(MagPortElement):
 
     def __init__(self, name: str, cfg: Any, buses: dict, _params: Any) -> None:
         magnetic = cfg.magnetic
-        coupling, incidence = magnetic.matrices(tuple(cfg.windings))
-        mmf, differential, reluctance, stored_energy = _branch_law(magnetic.branches)
+        names = tuple(cfg.windings)
+        coupling, incidence = magnetic.matrices(names)
+        unused = sorted(
+            f"elements.{name}.magnetic.branches.{branch_name}.{field_name}"
+            for branch_name, branch in magnetic.branches.items()
+            for field_name in branch.provider_data()
+        )
+        if unused:
+            warnings.warn(
+                "magcircuit retains but does not evaluate " + ", ".join(unused)
+                + "; these fields do not affect the simulation",
+                stacklevel=3,
+            )
+        constitutive = tuple(
+            branch.constitutive_data() for branch in magnetic.branches.values()
+        )
+        if all(reluctance is not None for reluctance, _flux, _mmf in constitutive):
+            inductance, _response, _matrix = _linear_circuit(
+                [reluctance for reluctance, _flux, _mmf in constitutive],
+                coupling,
+                incidence,
+            )
+            self._assemble(name, cfg, names, inductance, buses, magnetic)
+            return
+        mmf, differential, stored_energy = _branch_law(constitutive)
         law = MagCircuitLaw(
-            tuple(cfg.windings),
+            names,
             coupling,
             incidence=incidence,
-            reluctance=reluctance,
             mmf=mmf,
             differential=differential,
             stored_energy=stored_energy,

@@ -6,11 +6,18 @@ from dataclasses import dataclass
 
 import numpy as np
 import pytest
+from scipy.linalg import expm
+from scipy.optimize import brentq
 
 import peslite
 from peslite.addons.components import register_component_type
 from peslite.addons.components.magcircuit import MagCircuitLaw
-from peslite.addons.components.magport import MagPortElement, MagPortModel, _load
+from peslite.addons.components.magport import (
+    MagPortElement,
+    MagPortModel,
+    TabulatedMagneticLaw,
+    _load,
+)
 from peslite.addons.functions import (
     export_magnetic_circuit,
     magnetic_field,
@@ -210,6 +217,14 @@ def test_magport_owns_nonlinear_and_internal_magnetic_states_without_black_box()
     assert model.rhs(0.0) == pytest.approx((2.89375, 0.78125))
     assert spec_of(model).kind == "default"
 
+    grid = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    multiple = TabulatedMagneticLaw(("p", "s"), grid, 2.0 * grid)
+    np.testing.assert_allclose(
+        multiple.currents(0.0, np.array([0.25, 0.25]), {}), [0.5, 0.5]
+    )
+    with pytest.raises(ConfigError, match="outside the sampled magnetic current map"):
+        multiple.currents(0.0, np.array([0.75, 0.75]), {})
+
 
 def test_project_addon_replaces_the_magnetic_law_through_public_interfaces(tmp_path):
     """A project addon only defines its parameters and law; common assembly stays shared."""
@@ -279,17 +294,22 @@ def test_project_addon_replaces_the_magnetic_law_through_public_interfaces(tmp_p
 def _linear_equivalence_case(inductance):
     return {
         "base": {"s_base": 100.0},
-        "buses": {"p": {"phases": 1}, "s": {"phases": 1}},
+        "buses": {
+            "p": {"phases": 1},
+            "s": {"phases": 1},
+            "n": {"phases": 1},
+        },
         "elements": {
             "coils": {
                 "type": "coupled_coils",
                 "windings": {
-                    "primary": {"positive": "p", "negative": "ground", "r": 0.15},
+                    "primary": {"positive": "p", "negative": "n", "r": 0.15},
                     "secondary": {"positive": "s", "negative": "ground", "r": 0.2},
                 },
                 "inductance": np.asarray(inductance).tolist(),
             },
             "p_load": {"type": "resistor", "bus": "p", "r": 1.2},
+            "return": {"type": "load", "bus": "n", "l": 2.0e-3, "r": 0.4},
             "s_load": {"type": "resistor", "bus": "s", "r": 1.7},
         },
         "simulation": {
@@ -307,13 +327,13 @@ def test_base_inductance_magport_and_magcircuit_are_numerically_equivalent(tmp_p
     _modes, shapes = np.linalg.eigh(inductance)
     modal_initial = np.array([0.35, -0.2])
     physical_initial = shapes @ modal_initial
-    linkage_initial = inductance @ physical_initial
 
     core = _linear_equivalence_case(inductance)
     core["simulation"]["initial"] = {
         "states": {
             "coils.i_mode_1": float(modal_initial[0]),
             "coils.i_mode_2": float(modal_initial[1]),
+            "return.branch.i": float(physical_initial[0]),
         }
     }
 
@@ -325,12 +345,7 @@ def test_base_inductance_magport_and_magcircuit_are_numerically_equivalent(tmp_p
     )
     port["elements"]["coils"].pop("inductance")
     port["elements"]["coils"].update(type="magport", file=str(file))
-    port["simulation"]["initial"] = {
-        "states": {
-            "coils.lambda_primary": float(linkage_initial[0]),
-            "coils.lambda_secondary": float(linkage_initial[1]),
-        }
-    }
+    port["simulation"]["initial"] = core["simulation"]["initial"]
 
     circuit = _linear_equivalence_case(inductance)
     turns = np.linalg.cholesky(inductance).T
@@ -356,16 +371,25 @@ def test_base_inductance_magport_and_magcircuit_are_numerically_equivalent(tmp_p
     )
     circuit["simulation"]["initial"] = port["simulation"]["initial"]
 
-    results = [
-        peslite.Simulation(from_dict(case)).run(out_dir=tmp_path / label)
-        for label, case in (("core", core), ("port", port), ("circuit", circuit))
-    ]
+    simulations = [peslite.Simulation(from_dict(case)) for case in (core, port, circuit)]
+    models = [simulation.system.named_elements["coils"].model for simulation in simulations]
+    assert {type(model) for model in models} == {type(models[0])}
+    results = [simulation.run(out_dir=tmp_path / label)
+               for label, simulation in zip(("core", "port", "circuit"), simulations)]
     columns = [result.columns() for result in results]
     for signal in (
         "coils.i_primary", "coils.i_secondary", "coils.u_primary", "coils.u_secondary"
     ):
         np.testing.assert_allclose(columns[1][signal], columns[0][signal], rtol=2e-12, atol=2e-13)
         np.testing.assert_allclose(columns[2][signal], columns[0][signal], rtol=2e-12, atol=2e-13)
+
+    loop_inductance = inductance + np.diag([2.0e-3, 0.0])
+    loop_resistance = np.diag([0.15 + 1.2 + 0.4, 0.2 + 1.7])
+    expected = expm(
+        -np.linalg.solve(loop_inductance, loop_resistance) * results[0].t[-1]
+    ) @ physical_initial
+    actual = [columns[0]["coils.i_primary"][-1], columns[0]["coils.i_secondary"][-1]]
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=1e-8)
 
 
 def test_nonlinear_magport_file_and_magcircuit_branch_law(tmp_path):
@@ -396,6 +420,30 @@ def test_nonlinear_magport_file_and_magcircuit_branch_law(tmp_path):
     # For one branch, phi=lambda/N and i=F(phi)/N.
     expected = (20.0 * 0.02 + 3.0e4 * 0.02**3) / 4.0
     assert law.currents(0.0, linkage, {}) == pytest.approx([expected])
+
+    legs = np.array([[2.0e5, 4.0e14], [3.0e5, 1.0e14], [1.0e5, 2.0e14]])
+    three_leg = MagCircuitLaw(
+        ("coil",),
+        [[0.0], [0.0], [50.0]],
+        incidence=[[1.0, 1.0, -1.0]],
+        mmf=lambda _t, phi, _state: legs[:, 0] * phi + legs[:, 1] * phi**3,
+        differential=lambda _t, phi, _state: (
+            legs[:, 0] + 3.0 * legs[:, 1] * phi**2
+        ),
+    )
+
+    def leg(phi, index):
+        return legs[index, 0] * phi + legs[index, 1] * phi**3
+
+    for value in np.linspace(-2.0e-2, 2.0e-2, 41):
+        centre = value / 50.0
+        outer = brentq(
+            lambda phi: leg(phi, 0) - leg(centre - phi, 1), -1.0, 1.0
+        )
+        reference = (leg(outer, 0) + leg(centre, 2)) / 50.0
+        assert three_leg.currents(0.0, np.array([value]), {}) == pytest.approx(
+            [reference], rel=1e-8, abs=1e-12
+        )
 
     base = {
         "base": {"s_base": 1.0},
@@ -468,3 +516,45 @@ def test_magnetic_domain_uses_named_topology_and_material_geometry():
     coupling, incidence = magnetic.matrices(("primary", "secondary"))
     np.testing.assert_array_equal(coupling, [[20.0, 0.0], [0.0, 12.0]])
     np.testing.assert_array_equal(incidence, [[1.0, -1.0]])
+
+    providers = {
+        "hysteresis": {"provider": "measured"},
+        "core_loss": {"provider": "measured"},
+        "eddy_current": {"provider": "measured"},
+    }
+    case = {
+        "base": {"s_base": 1.0},
+        "buses": {"p": {"phases": 1}, "s": {"phases": 1}},
+        "elements": {
+            "magnet": {
+                "type": "magcircuit",
+                "windings": {
+                    "primary": {"positive": "p", "negative": "ground"},
+                    "secondary": {"positive": "s", "negative": "ground"},
+                },
+                "magnetic": {
+                    "branches": {
+                        "core": {
+                            "area": 2.0e-4,
+                            "path_length": 0.1,
+                            "bh_curve": [[-1.0, -800.0], [0.0, 0.0], [1.0, 800.0]],
+                            **providers,
+                        },
+                        "gap": {"reluctance": 2.0e6},
+                    },
+                    "coupling": {
+                        "core": {"primary": 20.0},
+                        "gap": {"secondary": 12.0},
+                    },
+                },
+            },
+            "p_load": {"type": "resistor", "bus": "p", "r": 1.0},
+            "s_load": {"type": "resistor", "bus": "s", "r": 1.0},
+        },
+        "simulation": {"t_end": 1.0e-6},
+    }
+    with pytest.warns(UserWarning, match="retains but does not evaluate") as caught:
+        peslite.Simulation(from_dict(case))
+    message = str(caught[0].message)
+    for field in providers:
+        assert f"core.{field}" in message

@@ -1,38 +1,44 @@
 # Magnetic Components
 
-`MagComponent` is the magnetic component addon installed with `peslite`. It connects magnetic
-devices to the electrical circuit through ordinary PESLite ports; `peslite-core` contains no
-magnetic implementation. Its electrical behavior may be a netlist, a constitutive law or an
-imported model, and its physical magnetic description is optional.
+PESLite connects magnetic devices to the electrical circuit through named windings. The magnetic
+component addon defines `MagComponent` as the common component contract; it is not a separate type
+written in a simulation file. `coupled_coils` is its constant-inductance implementation.
 
-## Component behavior
+The default `peslite` installation includes this addon, while `peslite-core` contains no magnetic
+implementation. Install `peslite-full` for `magcircuit` and `magport`.
 
-A winding component defines named windings, their terminal connections and their electrical
-coupling. Each winding may include copper resistance.
+Use `coupled_coils` when an inductance matrix describes the device. Use the `magcircuit` addon to
+evaluate a branch-based magnetic network during simulation. Use `magport` when a constitutive model
+is supplied as reusable external data. All three use the same winding terminals and published
+electrical signals.
 
-The ordinary component ports and `network()` declaration are the required electrical domain. An
-optional `magnetic` section records the corresponding physical branches, flux-continuity nodes and
-signed branch-to-winding coupling. The electrical model remains authoritative for simulation;
-external processing may use the magnetic domain without changing the circuit connections.
+## Winding interface
 
-PESLite checks the component while assembling the circuit and then uses the same solver path as
-other components. `coupled_coils` uses a constant inductance matrix as an optimized electrical
-representation and runs no separate magnetic solver.
+A magnetic component declares each winding by name, its positive and negative electrical terminals
+and its copper resistance. A terminal may be `ground`, a scalar bus or a scalar Unit port.
 
-For every winding, the component exposes:
+Every winding publishes:
 
 | Signal | Meaning |
 |---|---|
 | `<element>.i_<winding>` | winding current in A |
 | `<element>.u_<winding>` | terminal voltage, including winding resistance, in V |
 
-PESLite includes all self- and mutual-inductance terms in stored energy, accounts for copper loss
-and preserves the electrical states across restart and continuation.
+PESLite includes self- and mutual-inductance terms in stored energy, accounts for copper loss and
+preserves the electrical states across restart and continuation. Compensation capacitors and other
+electrical elements remain separate components; see
+[Passive Components](Passive-Components.md).
 
-## Example: Coupled coils
+| Component type | Constitutive input | Runtime representation | Installation |
+|---|---|---|---|
+| `coupled_coils` | inductance matrix in the simulation file | constant-inductance netlist model | `peslite` |
+| `magcircuit` | magnetic branches, continuity nodes and winding coupling | linear reduction or nonlinear magnetic solve | `peslite-full` |
+| `magport` | reusable constitutive data in a MagPort file | constant-inductance netlist model or nonlinear flux-linkage states | `peslite-full` |
 
-`coupled_coils` is the constant-inductance implementation included in `MagComponent`. Its inductance matrix is written directly in the simulation file, so it requires
-neither an external model file nor the optional full installation:
+## Constant inductance
+
+`coupled_coils` is the standard constant-inductance implementation. It requires neither an external
+model file nor `peslite-full`:
 
 ```yaml
 buses:
@@ -50,157 +56,18 @@ elements:
       - [-20.0e-6, 100.0e-6]
 ```
 
-`ground` is the reference node; other terminals name a single-phase bus or scalar Unit port. Matrix
-rows and columns follow the winding declaration order. Negative mutual inductance reverses relative
-winding polarity. Compensation capacitors and other electrical elements remain separate components;
-see [Passive Components](Passive-Components.md).
+Matrix rows and columns follow the winding declaration order. Diagonal entries are self
+inductances; off-diagonal entries are mutual inductances. A negative mutual inductance reverses the
+relative winding polarity. The matrix must be symmetric and positive definite.
 
-## MagPort addon
-
-Install `peslite-full` to use `magport` and `magcircuit`. `MagComponent` and its `coupled_coils`
-implementation remain available with the default installation.
-
-`magport` connects an explicit magnetic constitutive law to ordinary electrical winding terminals.
-Each winding flux linkage is a PESLite state. The law maps the winding flux-linkage vector and any
-additional magnetic states to winding currents, while terminal voltage advances flux linkage:
-
-\[
-\dot{\boldsymbol\lambda}
-=\boldsymbol u-\boldsymbol R\boldsymbol i,
-\qquad
-\boldsymbol i=g(t,\boldsymbol\lambda,\boldsymbol z).
-\]
-
-A MagPort file can contain either a constant inductance matrix or a sampled nonlinear
-`flux_linkage`-to-`current` map. Use it for results from FEM, an analytical calculation or another
-external tool, or when the same constitutive data is reused by several cases:
-
-```yaml
-elements:
-  transformer:
-    type: magport
-    file: models/transformer.npz
-    windings:
-      primary: {positive: primary, negative: ground, r: 0.08}
-      secondary: {positive: secondary, negative: ground, r: 0.10}
-```
-
-Relative paths start beside the simulation file. Winding names and their order must match the file
-exactly.
-
-External tools may calculate geometry, materials and optional field data. PESLite reads the
-constitutive result and owns all simulation states; it does not run the external tool during a
-simulation.
-
-The file contains data rather than executable objects:
-
-| Data | Required | Meaning |
-|---|---:|---|
-| `winding_names` | yes | ordered winding names |
-| `inductance` | one law | self- and mutual-inductance matrix in H |
-| `flux_linkage` and `current` | one law | sampled nonlinear map, shaped `(samples, windings)` |
-| `physical` | no | JSON-compatible source metadata |
-| `magnetic` | no | validated physical branch, node and winding-coupling description |
-| `field_points` and `field_basis` | no | spatial coordinates and a linear current-to-field map |
-
-Exactly one constitutive law is stored. PESLite checks the file format, winding order, constitutive
-data and optional field data while assembling the circuit.
-
-Write arrays from an external calculation in this format with `write_magport`:
-
-```python
-from peslite.addons.functions import write_magport
-
-write_magport(
-    "models/transformer.npz",
-    winding_names=("primary", "secondary"),
-    inductance=[[100e-6, -20e-6], [-20e-6, 100e-6]],
-    physical=source_data,
-    magnetic=magnetic_description,
-    field_points=field_points,
-    field_basis=field_basis,
-)
-```
-
-`physical` is optional metadata. `field_points` has shape `(points, 3)`, and `field_basis` has shape
-`(points, 3, windings)` and maps winding currents to magnetic flux density.
-
-The optional `magnetic` mapping uses named branches, nodes and couplings. A branch provides one
-constitutive description: `reluctance`; `area`, `path_length` and either `mu_r` or `bh_curve`; or
-matching `flux` and `mmf` samples. Optional `hysteresis`, `core_loss` and `eddy_current` mappings
-preserve provider parameters without implying that the selected electrical law evaluates them.
-
-Write sampled nonlinear data by replacing `inductance=` with matching arrays:
-
-```python
-write_magport(
-    "models/saturating-core.npz",
-    winding_names=("primary", "secondary"),
-    flux_linkage=flux_linkage_samples,
-    current=current_samples,
-)
-```
-
-For an analytical or externally coupled law, implement `currents()` and add `derivatives()` when
-the law declares internal state. `MagPortElement` turns that law into a configurable addon without
-reimplementing winding ports:
-
-```python
-from dataclasses import dataclass
-
-from peslite.addons.components import register_component_type
-from peslite.addons.components.magport import MagPortElement
-from peslite.addons.components.magnetic import MagneticParams
-
-class CoreLaw:
-    winding_names = ("coil",)
-    initial_state = {"memory": 0.0}
-
-    def currents(self, t, flux_linkage, state):
-        return constitutive_current(t, flux_linkage, state)
-
-    def derivatives(self, t, flux_linkage, currents, state):
-        return {"memory": memory_rate(t, flux_linkage, currents, state)}
-
-@register_component_type
-class CoreElement(MagPortElement):
-    type = "core_model"
-
-    @dataclass(frozen=True, kw_only=True)
-    class Params(MagneticParams):
-        type: str = "core_model"
-
-    def __init__(self, name, cfg, buses, _params):
-        super().__init__(name, cfg, buses, CoreLaw())
-```
-
-Every entry in `initial_state` becomes an ordinary restartable PESLite state. A conservative law
-may also implement `stored_energy()` and `stored_energy_rate()` for strict energy accounting;
-otherwise its constitutive calculation remains available with the default energy declaration.
-
-### Field reconstruction
-
-When the external model contains field data, reconstruct the field after simulation:
-
-```python
-from peslite.addons.functions import magnetic_field
-
-field = magnetic_field(
-    result,
-    "models/transformer.npz",
-    element="transformer",
-)
-```
-
-`field.time`, `field.points` and `field.flux_density` contain the recorded times, coordinates and an
-array shaped `(times, points, 3)`. Pass `points=` to interpolate inside the stored field map. This
-post-processing does not add work to electrical simulation steps.
+PESLite reduces the matrix to modal current states during assembly and then uses the ordinary
+netlist and solver path. There is no separate magnetic iteration in this representation.
 
 ## MagCircuit addon
 
-`magcircuit` evaluates the `magnetic` branch network during simulation. `coupling` maps named
-branches to named windings, while each entry in `nodes` states one flux-continuity equation. A
-branch may use reluctance, material geometry or a monotone sampled flux-to-MMF law:
+The `magcircuit` addon describes a magnetic network directly in the simulation file. Each named
+branch has one constitutive description, `nodes` define flux-continuity equations and `coupling`
+gives the signed winding turns on each branch:
 
 ```yaml
 elements:
@@ -216,23 +83,168 @@ elements:
           path_length: 0.08
           bh_curve: [[-1.0, -800.0], [0.0, 0.0], [1.0, 800.0]]
         gap: {reluctance: 2.0e6}
+        leakage: {reluctance: 2.0e7}
       nodes:
-        continuity: {core: 1.0, gap: -1.0}
+        split: {core: 1.0, gap: -1.0, leakage: -1.0}
       coupling:
         core: {primary: 20.0}
         gap: {secondary: 20.0}
 ```
 
-At each constitutive evaluation, the addon solves branch MMF relations, flux continuity and winding
-flux linkages as one magnetic system. A fully linear circuit is reduced analytically once; nonlinear
-branches use the same winding state and electrical port path through `MagPortModel`.
+A branch provides exactly one of:
 
-Programmatic models use `MagCircuitLaw`. Its `mmf(t, branch_flux, state)` callback may contain
-coupled nonlinear material behavior, and optional internal states use the same `initial_state` and
-`state_derivatives` contract as MagPort. Supplying a branch-MMF Jacobian through `differential`
-accelerates the nonlinear solve but is not required.
+- `reluctance`;
+- `area`, `path_length` and `mu_r`;
+- `area`, `path_length` and a monotone `bh_curve`;
+- matching monotone `flux` and `mmf` samples.
 
-For offline linear reduction, write the exact equivalent through MagPort:
+If every branch is linear, the addon reduces the complete circuit once to its exact winding
+inductance and passes the same netlist model as `coupled_coils` to the PESLite solver. If any branch
+is nonlinear, the winding flux linkages are PESLite states and a reduced damped Newton iteration
+solves only the remaining independent magnetic paths.
+
+Optional `hysteresis`, `core_loss` and `eddy_current` mappings retain parameters for a provider.
+The built-in branch laws do not evaluate those mappings, so `magcircuit` emits a construction-time
+warning when they are present.
+
+Programmatic magnetic circuits use `MagCircuitLaw`. Its `mmf(t, branch_flux, state)` callback
+returns branch MMF, and its required `differential(t, branch_flux, state)` callback returns the
+branch-MMF Jacobian. Optional internal states use `initial_state` and `state_derivatives`.
+
+## Custom constitutive laws
+
+`peslite-full` also provides `MagPortElement` for a device that is easier to express as a direct
+winding constitutive law than as a branch network. For a nonlinear law, PESLite advances winding
+flux linkage according to
+
+\[
+\dot{\boldsymbol\lambda}
+=\boldsymbol u-\boldsymbol R\boldsymbol i,
+\qquad
+\boldsymbol i=g(t,\boldsymbol\lambda,\boldsymbol z).
+\]
+
+The law supplies currents and, when it declares internal state, its state derivatives. The shared
+element adapter supplies winding ports, electrical records and state registration:
+
+```python
+from dataclasses import dataclass
+
+from peslite.addons.components import register_component_type
+from peslite.addons.components.magnetic import MagneticParams
+from peslite.addons.components.magport import MagPortElement
+
+
+class CoreLaw:
+    winding_names = ("coil",)
+    initial_state = {"memory": 0.0}
+
+    def currents(self, t, flux_linkage, state):
+        return constitutive_current(t, flux_linkage, state)
+
+    def derivatives(self, t, flux_linkage, currents, state):
+        return {"memory": memory_rate(t, flux_linkage, currents, state)}
+
+
+@register_component_type
+class CoreElement(MagPortElement):
+    type = "core_model"
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params(MagneticParams):
+        type: str = "core_model"
+
+    def __init__(self, name, cfg, buses, _params):
+        super().__init__(name, cfg, buses, CoreLaw())
+```
+
+Every `initial_state` entry becomes an ordinary restartable PESLite state. A conservative law may
+also implement `stored_energy()` and `stored_energy_rate()` for strict energy accounting.
+
+## External magnetic data
+
+External files are optional. PESLite does not require FEM or another magnetic tool to use magnetic
+components. A MagPort file is useful when an external calculation or measurement supplies a
+constitutive model, or when several simulation cases reuse the same data.
+
+### MagPort files
+
+The `magport` component connects a MagPort file to ordinary winding terminals:
+
+```yaml
+elements:
+  transformer:
+    type: magport
+    file: models/transformer.npz
+    windings:
+      primary: {positive: primary, negative: ground, r: 0.08}
+      secondary: {positive: secondary, negative: ground, r: 0.10}
+```
+
+Relative paths start beside the simulation file. Winding names and their order must match the file.
+PESLite loads the constitutive result and owns all simulation states; it does not run the external
+tool during simulation.
+
+| Data | Required | Meaning |
+|---|---:|---|
+| `winding_names` | yes | ordered winding names |
+| `inductance` | one law | self- and mutual-inductance matrix in H |
+| `flux_linkage` and `current` | one law | sampled nonlinear map shaped `(samples, windings)` |
+| `physical` | no | JSON-compatible source metadata |
+| `magnetic` | no | physical branches, continuity nodes and winding coupling |
+| `field_points` and `field_basis` | no | spatial coordinates and a linear current-to-field map |
+
+Exactly one constitutive law is stored. A constant inductance matrix uses the same netlist model as
+`coupled_coils`. A sampled nonlinear map uses winding flux linkages as states. For several
+windings, interpolation is defined only inside the convex hull of the sampled flux-linkage vectors;
+the samples must cover the complete operating range.
+
+Create a MagPort file with `write_magport`:
+
+```python
+from peslite.addons.functions import write_magport
+
+write_magport(
+    "models/transformer.npz",
+    winding_names=("primary", "secondary"),
+    inductance=[[100e-6, -20e-6], [-20e-6, 100e-6]],
+    physical=source_data,
+    magnetic=magnetic_description,
+    field_points=field_points,
+    field_basis=field_basis,
+)
+```
+
+Replace `inductance=` with matching `flux_linkage=` and `current=` arrays for a sampled nonlinear
+law. `physical` is optional metadata. The optional `magnetic` value records the same named branch,
+node and winding-coupling structure used by `magcircuit`, but does not replace the stored
+constitutive law.
+
+`field_points` has shape `(points, 3)`. `field_basis` has shape `(points, 3, windings)` and maps
+winding currents to magnetic flux density.
+
+### Field reconstruction
+
+When a MagPort file contains field data, reconstruct the field after simulation:
+
+```python
+from peslite.addons.functions import magnetic_field
+
+field = magnetic_field(
+    result,
+    "models/transformer.npz",
+    element="transformer",
+)
+```
+
+`field.time`, `field.points` and `field.flux_density` contain the recorded times, coordinates and an
+array shaped `(times, points, 3)`. Pass `points=` to interpolate inside the stored field map. Field
+reconstruction is post-processing and adds no work to electrical simulation steps.
+
+### Exporting a linear magnetic circuit
+
+Reduce an externally prepared linear magnetic circuit to a reusable MagPort file with
+`export_magnetic_circuit`:
 
 ```python
 from peslite.addons.functions import export_magnetic_circuit
@@ -247,5 +259,5 @@ export_magnetic_circuit(
 ```
 
 `reluctance` is the branch reluctance vector or matrix. Supplying `field_points` and
-`field_per_flux` also stores a linear field-reconstruction basis. This offline helper is an
-optimization for a linear circuit, not a limitation on the online `magcircuit` component.
+`field_per_flux` also stores a linear field-reconstruction basis. This helper performs the linear
+reduction offline; `magcircuit` performs the corresponding reduction during assembly.

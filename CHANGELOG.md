@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Unified constant-inductance magnetic models on the ordinary netlist path, reduced nonlinear
+  magnetic circuits with a damped Newton solve, rejected multi-winding sampled-law extrapolation
+  and removed the redundant native-export cleanup lifecycle.
 - Radau reuses one shifted solve for each complex conjugate stage pair, and generated C++ implicit
   solvers assemble their group and interface factors without a full stage-expanded matrix.
 - Full-model and multirate evaluation share one straight-line operation lowering, and grouped RHS

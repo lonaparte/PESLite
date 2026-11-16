@@ -52,10 +52,6 @@ def _validate_winding_names(winding_names: Any) -> tuple[str, ...]:
     return names
 
 
-def _validate_windings(windings: dict[str, WindingParams]) -> tuple[str, ...]:
-    return _validate_winding_names(windings)
-
-
 def _validate_scoped_names(values: Any, path: str) -> tuple[str, ...]:
     names = tuple(values)
     if not names or any(
@@ -113,6 +109,10 @@ class MagneticBranchDescription:
     core_loss: Mapping[str, Any] | None = None
     eddy_current: Mapping[str, Any] | None = None
 
+    _provider_fields: ClassVar[tuple[str, ...]] = (
+        "hysteresis", "core_loss", "eddy_current",
+    )
+
     def __post_init__(self) -> None:
         _positive(self.reluctance, "reluctance")
         _positive(self.area, "area")
@@ -149,8 +149,16 @@ class MagneticBranchDescription:
                 raise ConfigError("flux and mmf samples must be strictly increasing")
             object.__setattr__(self, "flux", values[:, 0].tolist())
             object.__setattr__(self, "mmf", values[:, 1].tolist())
-        for name in ("hysteresis", "core_loss", "eddy_current"):
-            _model_mapping(getattr(self, name), name)
+        for name, value in self.provider_data().items():
+            _model_mapping(value, name)
+
+    def provider_data(self) -> dict[str, Mapping[str, Any]]:
+        """Return configured loss and history provider data by field name."""
+        return {
+            name: value
+            for name in self._provider_fields
+            if (value := getattr(self, name)) is not None
+        }
 
     @staticmethod
     def _curve(value: Any, name: str) -> np.ndarray:
@@ -295,7 +303,7 @@ class MagneticParams:
     )
 
     def __post_init__(self) -> None:
-        names = _validate_windings(self.windings)
+        names = _validate_winding_names(self.windings)
         if self.magnetic is not None:
             self.magnetic.matrices(names)
 
@@ -414,7 +422,7 @@ class _MagneticElement(Element):
         winding_names: tuple[str, ...],
         buses: dict,
     ) -> tuple[tuple[str, ...], tuple[float, ...], tuple[tuple[bool, bool], ...]]:
-        names = _validate_windings(windings)
+        names = _validate_winding_names(windings)
         if names != tuple(winding_names):
             raise ConfigError(
                 f"elements.{name}: winding order {names!r} does not match "
@@ -444,16 +452,15 @@ class _MagneticElement(Element):
     def _attach(self, name: str, cfg: Any, model: Any) -> None:
         self.name, self.cfg, self.model = name, cfg, model
 
-    def _assemble(self, name: str, cfg: Any, windings: dict[str, WindingParams],
-                  winding_names: tuple[str, ...], inductance: Any, buses: dict) -> None:
+    def _assemble(self, name: str, cfg: Any, winding_names: tuple[str, ...], inductance: Any,
+                  buses: dict, magnetic: MagneticDescription | None) -> None:
+        """Assemble a constant winding-inductance law through the shared netlist model."""
         names, resistance, terminals = self._winding_data(
-            name, windings, winding_names, buses
+            name, cfg.windings, winding_names, buses
         )
         self._attach(
             name, cfg,
-            CoupledCoilsModel(
-                names, inductance, resistance, terminals, cfg.magnetic
-            ),
+            CoupledCoilsModel(names, inductance, resistance, terminals, magnetic),
         )
 
     def subsystems(self) -> dict[str, Any]:
@@ -497,4 +504,4 @@ class CoupledCoils(_MagneticElement):
     type = "coupled_coils"
 
     def __init__(self, name: str, cfg: Any, buses: dict, _params: Any) -> None:
-        self._assemble(name, cfg, cfg.windings, tuple(cfg.windings), cfg.inductance, buses)
+        self._assemble(name, cfg, tuple(cfg.windings), cfg.inductance, buses, cfg.magnetic)

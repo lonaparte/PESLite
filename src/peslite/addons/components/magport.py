@@ -23,7 +23,6 @@ from ...components.network import register_component_type
 from ...solver import Bag, ConfigError, Port
 
 __all__ = [
-    "LinearMagneticLaw",
     "MagneticLaw",
     "MagPort",
     "MagPortElement",
@@ -248,39 +247,6 @@ class MagneticLaw(Protocol):
         self, t: float, flux_linkage: np.ndarray, state: Mapping[str, float]
     ) -> Sequence[float]: ...
 
-class LinearMagneticLaw:
-    """Reciprocal constant-inductance constitutive law ``i = L^-1 lambda``."""
-
-    initial_state: Mapping[str, float] = {}
-
-    def __init__(self, winding_names: Sequence[str], inductance: Any) -> None:
-        self.winding_names = _validate_winding_names(winding_names)
-        matrix, _modes, _shapes = _inductance_decomposition(
-            inductance, len(self.winding_names)
-        )
-        self.inductance = matrix
-        self._inverse = np.linalg.solve(matrix, np.eye(len(matrix)))
-
-    def currents(
-        self, _t: float, flux_linkage: np.ndarray, _state: Mapping[str, float]
-    ) -> np.ndarray:
-        return self._inverse @ flux_linkage
-
-    def stored_energy(
-        self, _t: float, flux_linkage: np.ndarray, _state: Mapping[str, float]
-    ) -> float:
-        return float(0.5 * flux_linkage @ self._inverse @ flux_linkage)
-
-    @staticmethod
-    def stored_energy_rate(
-        _t: float,
-        _flux_linkage: np.ndarray,
-        currents: np.ndarray,
-        _state: Mapping[str, float],
-        flux_rate: np.ndarray,
-        _state_rate: Mapping[str, float],
-    ) -> float:
-        return float(currents @ flux_rate)
 
 class TabulatedMagneticLaw:
     """Memoryless nonlinear current map sampled over winding flux-linkage space."""
@@ -301,19 +267,15 @@ class TabulatedMagneticLaw:
             )
             self._energy_integral = self._interpolator.antiderivative()
             self._energy_origin = float(self._energy_integral(0.0))
-            self._extrapolator = None
             self.stored_energy = self._stored_energy
             self.stored_energy_rate = self._stored_energy_rate
         else:
             try:
-                from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+                from scipy.interpolate import LinearNDInterpolator
                 from scipy.spatial import QhullError
 
                 self._interpolator = LinearNDInterpolator(
                     self.flux_linkage, self.current, fill_value=np.nan
-                )
-                self._extrapolator = NearestNDInterpolator(
-                    self.flux_linkage, self.current
                 )
             except (ValueError, QhullError) as exc:
                 raise ConfigError(f"cannot construct the magnetic current map: {exc}") from None
@@ -325,10 +287,10 @@ class TabulatedMagneticLaw:
     ) -> np.ndarray:
         argument = flux_linkage[0] if len(self.winding_names) == 1 else flux_linkage
         value = np.asarray(self._interpolator(argument), dtype=float).reshape(-1)
-        if self._extrapolator is not None and not np.isfinite(value).all():
-            value = np.asarray(self._extrapolator(argument), dtype=float).reshape(-1)
         if value.shape != (len(self.winding_names),) or not np.isfinite(value).all():
-            raise ConfigError("magnetic current interpolation returned invalid values")
+            raise ConfigError(
+                f"flux linkage {flux_linkage.tolist()} lies outside the sampled magnetic current map"
+            )
         return value
 
     def _stored_energy(
@@ -593,11 +555,11 @@ class MagPort(MagPortElement):
 
     def __init__(self, name: str, cfg: Any, buses: dict, _params: Any) -> None:
         data = _load(cfg.file)
-        law = (
-            LinearMagneticLaw(data.winding_names, data.inductance)
-            if data.inductance is not None else
-            TabulatedMagneticLaw(data.winding_names, data.flux_linkage, data.current)
-        )
         if cfg.magnetic is not None and data.magnetic is not None:
             raise ConfigError("magnetic may be provided by the configuration or file, not both")
-        super().__init__(name, cfg, buses, law, cfg.magnetic or data.magnetic)
+        magnetic = cfg.magnetic or data.magnetic
+        if data.inductance is not None:
+            self._assemble(name, cfg, data.winding_names, data.inductance, buses, magnetic)
+            return
+        law = TabulatedMagneticLaw(data.winding_names, data.flux_linkage, data.current)
+        super().__init__(name, cfg, buses, law, magnetic)

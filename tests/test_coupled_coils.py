@@ -72,11 +72,10 @@ def test_coupled_coil_schema_round_trip_and_independent_terminals():
 def test_magnetic_components_follow_one_component_convention(tmp_path):
     """Enforce the magnetic-component convention deliberately agreed within the project.
 
-    The nonlinear MagPort boundary and the coupled-coils implementation inside MagComponent must
-    use the same winding, terminal and signal convention. Their runtime models deliberately differ:
-    the default addon uses the constant-inductance fast path, while MagPort owns flux-linkage
-    states. This internal design contract may change only through an explicit design decision; it
-    is not a published architecture requirement or external interface standard.
+    Every constant inductance law, inline or file-backed, uses the same winding, terminal, signal
+    and netlist-state convention. MagPort owns flux-linkage states only for nonlinear laws. This
+    internal design contract may change only through an explicit design decision; it is not a
+    published architecture requirement or external interface standard.
     """
     coupled = _case(2, sign=-1.0)
     general = deepcopy(coupled)
@@ -100,17 +99,17 @@ def test_magnetic_components_follow_one_component_convention(tmp_path):
     coupled_component = coupled_simulation.system.named_elements["coils"].model
     general_component = general_simulation.system.named_elements["coils"].model
     assert isinstance(coupled_component, MagComponent)
-    assert type(general_component) is MagPortModel
-    assert isinstance(general_component, MagComponent)
+    assert type(general_component) is type(coupled_component)
+    assert not isinstance(general_component, MagPortModel)
     assert coupled_component.names == general_component.names
-    assert general_component.state_names == ("lambda_w0", "lambda_w1")
+    assert general_component.state_names == coupled_component.state_names
 
     coupled_result = coupled_simulation.run(out_dir=tmp_path / "coupled")
     general_result = general_simulation.run(out_dir=tmp_path / "general")
     for name in ("coils.i_w0", "coils.i_w1", "coils.u_w0", "coils.u_w1"):
         np.testing.assert_allclose(
             coupled_result.columns()[name], general_result.columns()[name],
-            rtol=0.0, atol=1e-15,
+            rtol=0.0, atol=0.0,
         )
 
 
