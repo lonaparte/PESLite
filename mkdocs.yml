@@ -42,6 +42,8 @@ nav:
       - Offline System Analysis: Offline-System-Analysis.md
       - Semiconductor Losses: Semiconductor-Losses.md
       - Electrothermal Coupling: Electrothermal-Coupling.md
+      - Magnetic Components: Magnetic-Components.md
+      - Advanced Thermal Coupling: Advanced-Thermal-Coupling.md
       - Plotting: Plotting.md
   - Reference:
       - CLI Reference: CLI-Reference.md

@@ -176,4 +176,4 @@ conditions.
 
 Advanced magnetic loss exchange, external field models and reduced-order
 thermal coupling are documented in
-advanced thermal coupling (Level 3).
+[Advanced Thermal Coupling](Advanced-Thermal-Coupling.md).
