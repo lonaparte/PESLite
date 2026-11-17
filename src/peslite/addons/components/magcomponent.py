@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import numbers
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, ClassVar, Mapping
@@ -373,26 +374,27 @@ class MagComponent(NetworkComponent):
     def _winding_currents(self) -> np.ndarray:
         raise NotImplementedError
 
-    def _material_loss(self) -> float:
+    def _material_loss(self, _t: float) -> float:
         return 0.0
 
-    def _loss_parts(self) -> tuple[float, float]:
+    def _loss_parts(self, t: float) -> tuple[Any, Any]:
         current = self._winding_currents()
-        copper = float(np.dot(self._effective_resistance(), current * current))
-        material = float(self._material_loss())
-        if (not math.isfinite(copper) or not math.isfinite(material)
-                or copper < 0.0 or material < 0.0):
-            raise ConfigError("magnetic losses must be nonnegative finite W")
+        copper = np.dot(self._effective_resistance(), current * current)
+        material = self._material_loss(t)
+        if isinstance(copper, numbers.Number) and isinstance(material, numbers.Number):
+            if (not math.isfinite(copper) or not math.isfinite(material)
+                    or copper < 0.0 or material < 0.0):
+                raise ConfigError("magnetic losses must be nonnegative finite W")
         return copper, material
 
-    def set_loss_outputs(self, _t: float) -> None:
-        copper, material = self._loss_parts()
+    def set_loss_outputs(self, t: float) -> None:
+        copper, material = self._loss_parts(t)
         self.output.copper_loss_W = copper
         self.output.core_loss_W = material
         self.output.loss_W = copper + material
 
     def dissipated_power(self) -> float:
-        return sum(self._loss_parts())
+        return self.output.loss_W
 
 
 class _MagneticInput(Bag):
@@ -503,11 +505,7 @@ class CoupledCoilsModel(MagComponent):
         nb.losses(self)
 
     def _winding_currents(self) -> np.ndarray:
-        modal = np.fromiter(
-            (getattr(self.state, name) for name in self.state_names),
-            dtype=float,
-            count=len(self.state_names),
-        )
+        modal = np.asarray([getattr(self.state, name) for name in self.state_names])
         return self._shapes @ modal
 
     def _winding_drop(self, index: int, _t: float) -> float:
@@ -515,7 +513,7 @@ class CoupledCoilsModel(MagComponent):
 
     def _copper_loss(self, _t: float) -> float:
         current = self._winding_currents()
-        return float(np.dot(self._effective_resistance(), current * current))
+        return np.dot(self._effective_resistance(), current * current)
 
     def magnetic_signals(self) -> dict[str, float]:
         """Return the public winding currents and terminal voltages."""

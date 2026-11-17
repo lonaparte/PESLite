@@ -10,7 +10,7 @@ import numpy as np
 
 from .magcomponent import MagneticParams, _MagneticElement, _validate_winding_names
 from ...components.network import register_component_type
-from ...solver import ConfigError
+from ...solver import ConfigError, directional_derivative
 from .magport import _attach_magnetic_law
 
 __all__ = ["MagCircuit", "MagCircuitLaw"]
@@ -86,7 +86,8 @@ class MagCircuitLaw:
     is reduced to its winding-inductance matrix and assembled through the ordinary netlist model.
     Optional internal state is advanced by
     ``state_derivatives(t, branch_flux, winding_current, state)``. Conservative nonlinear laws may
-    provide stored-energy callbacks for exact energy accounting.
+    provide stored-energy callbacks for exact energy accounting. A material-loss callback receives
+    the solved branch flux and its rate, and returns the total magnetic loss in W.
     """
 
     def __init__(
@@ -114,6 +115,9 @@ class MagCircuitLaw:
                 Mapping[str, float],
             ],
             float,
+        ] | None = None,
+        dissipated_power: Callable[
+            [float, np.ndarray, np.ndarray, np.ndarray, Mapping[str, float], float], float
         ] | None = None,
     ) -> None:
         self.winding_names = _validate_winding_names(winding_names)
@@ -157,11 +161,14 @@ class MagCircuitLaw:
             raise ConfigError(
                 "state-dependent magnetic energy requires stored_energy_rate"
             )
+        if dissipated_power is not None and not callable(dissipated_power):
+            raise ConfigError("dissipated_power must be callable")
 
         self._mmf = mmf
         self._differential = differential
         self._stored_energy = stored_energy
         self._stored_energy_rate = stored_energy_rate
+        self._dissipated_power = dissipated_power
         self._free_flux = np.zeros(self._free.shape[1])
         self._last_flux = np.zeros(branches)
         self._last_key: tuple | None = None
@@ -170,6 +177,8 @@ class MagCircuitLaw:
         if self._stored_energy is not None:
             self.stored_energy = self._energy_value
             self.stored_energy_rate = self._energy_rate
+        if self._dissipated_power is not None:
+            self.dissipated_power = self._loss_value
 
     def _drive(self, t: float, flux: np.ndarray, state: Mapping[str, float]) -> np.ndarray:
         """Return MMF around each independent flux path."""
@@ -312,6 +321,59 @@ class MagCircuitLaw:
                 state_rate,
             ))
         return float(currents @ flux_rate)
+
+    def _branch_flux_rate(
+        self,
+        t: float,
+        state: Mapping[str, float],
+        flux_linkage_rate: np.ndarray,
+        state_rate: Mapping[str, float],
+    ) -> np.ndarray:
+        """Map the winding and material-state rates to the solved branch flux rates."""
+        flux = self._last_flux
+        base = self.flux_basis @ self._linked @ flux_linkage_rate
+        if not self._free.shape[1]:
+            return base
+
+        names = tuple(self.initial_state)
+        point = np.asarray([t, *(state[name] for name in names)], dtype=float)
+        direction = np.asarray([1.0, *(state_rate[name] for name in names)], dtype=float)
+
+        def source(candidate: np.ndarray) -> np.ndarray:
+            values = dict(zip(names, candidate[1:]))
+            return self._branch_mmf(float(candidate[0]), flux, values)
+
+        imposed = directional_derivative(source, point, direction)
+        jacobian = self._branch_jacobian(t, flux, state)
+        rhs = -self._free_reduction.T @ (jacobian @ base + imposed)
+        try:
+            free_rate = np.linalg.solve(self._free_stiffness(t, flux, state), rhs)
+        except np.linalg.LinAlgError:
+            raise ConfigError(
+                "magnetic-circuit differential is singular on its free flux paths"
+            ) from None
+        return base + self._free_reduction @ free_rate
+
+    def _loss_value(
+        self,
+        t: float,
+        flux_linkage: np.ndarray,
+        currents: np.ndarray,
+        state: Mapping[str, float],
+        flux_linkage_rate: np.ndarray,
+        state_rate: Mapping[str, float],
+        temperature_K: float,
+    ) -> float:
+        self.currents(t, flux_linkage, state)
+        branch_rate = self._branch_flux_rate(t, state, flux_linkage_rate, state_rate)
+        return self._dissipated_power(  # type: ignore[misc]
+            t,
+            self._last_flux.copy(),
+            branch_rate,
+            currents.copy(),
+            state,
+            temperature_K,
+        )
 
 
 def _branch_law(

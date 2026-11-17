@@ -117,7 +117,10 @@ states and a reduced damped Newton iteration solves the independent magnetic pat
 
 Programmatic magnetic circuits use `MagCircuitLaw`. Its `mmf(t, branch_flux, state)` callback
 returns branch MMF, and `differential(t, branch_flux, state)` returns the branch-MMF Jacobian.
-Optional internal states use `initial_state` and `state_derivatives`.
+Optional internal states use `initial_state` and `state_derivatives`. A dissipative law may provide
+`dissipated_power(t, branch_flux, branch_flux_rate, winding_current, state, temperature_K)`;
+PESLite adds the returned material loss to winding loss and publishes the result through the
+ordinary magnetic component loss signals.
 
 Optional `hysteresis`, `core_loss` and `eddy_current` mappings retain provider data. The built-in
 branch laws do not evaluate those mappings, so PESLite emits a construction-time warning when they

@@ -574,6 +574,62 @@ def test_nonlinear_magport_file_and_magcircuit_branch_law(tmp_path):
     )
 
 
+def test_magcircuit_material_loss_uses_solved_branch_flux_and_rate():
+    observed = {}
+
+    def loss(t, branch_flux, branch_rate, winding_current, state, temperature_K):
+        observed.update(
+            t=t,
+            flux=branch_flux.copy(),
+            rate=branch_rate.copy(),
+            current=winding_current.copy(),
+            state=dict(state),
+            temperature=temperature_K,
+        )
+        return 3.0 * branch_rate[0] ** 2
+
+    law = MagCircuitLaw(
+        ("coil",),
+        [[4.0]],
+        mmf=lambda _t, branch_flux, _state: 20.0 * branch_flux,
+        differential=lambda _t, branch_flux, _state: np.full_like(branch_flux, 20.0),
+        dissipated_power=loss,
+    )
+    model = MagPortModel(law, resistance=(2.0,), terminals=((False, True),))
+    model.state.lambda_coil = 0.08
+    model.input.u_positive_coil = 4.2
+    model.set_outputs(0.25)
+
+    np.testing.assert_allclose(observed["flux"], [0.02])
+    np.testing.assert_allclose(observed["rate"], [1.0])
+    np.testing.assert_allclose(observed["current"], [0.1])
+    assert observed["t"] == 0.25
+    assert observed["state"] == {}
+    assert observed["temperature"] == 298.15
+    assert model.output.copper_loss_W == pytest.approx(0.02)
+    assert model.output.core_loss_W == pytest.approx(3.0)
+    assert model.output.loss_W == pytest.approx(3.02)
+    assert model.dissipated_power() == pytest.approx(3.02)
+
+    observed.clear()
+    reluctance = np.array([2.0, 3.0, 5.0])
+    constrained = MagCircuitLaw(
+        ("coil",),
+        [[0.0], [0.0], [5.0]],
+        incidence=[[1.0, 1.0, -1.0]],
+        mmf=lambda _t, flux, _state: reluctance * flux,
+        differential=lambda _t, _flux, _state: reluctance,
+        dissipated_power=loss,
+    )
+    model = MagPortModel(constrained, resistance=(0.0,), terminals=((False, True),))
+    model.state.lambda_coil = 0.1
+    model.input.u_positive_coil = 0.5
+    model.set_outputs(0.0)
+    np.testing.assert_allclose(observed["flux"], [0.012, 0.008, 0.02])
+    np.testing.assert_allclose(observed["rate"], [0.06, 0.04, 0.1])
+    assert model.output.core_loss_W == pytest.approx(3.0 * 0.06**2)
+
+
 def test_magnetic_domain_uses_named_topology_and_material_geometry():
     branch = MagneticBranchDescription(
         area=2.0e-4,

@@ -299,3 +299,34 @@ def test_magnetic_and_thermal_ports_couple_without_owning_each_other(tmp_path):
     result = peslite.Simulation(from_dict(case)).run(out_dir=tmp_path)
     assert np.max(result.plant["magnet.loss_W"]) > 0.0
     assert result.plant["thermal.temperature_junction_K"][-1] > 300.0
+
+
+def test_magcircuit_material_loss_enters_the_common_thermal_connection():
+    from peslite.addons.components.magcircuit import MagCircuitLaw
+    from peslite.addons.components.magport import MagPortModel
+
+    law = MagCircuitLaw(
+        ("coil",),
+        [[4.0]],
+        mmf=lambda _t, flux, _state: 20.0 * flux,
+        differential=lambda _t, flux, _state: np.full_like(flux, 20.0),
+        dissipated_power=lambda _t, _flux, rate, _current, _state, _temperature: (
+            2.0 * rate[0] ** 2
+        ),
+    )
+    magnet = MagPortModel(law, resistance=(0.0,), terminals=((False, True),))
+    magnet.state.lambda_coil = 0.08
+    magnet.input.u_positive_coil = 4.0
+    network = LumpedThermalNetwork(
+        {"core": 1.0}, [ThermalLink("core", None, 1.0e6)], ambient_K=300.0
+    )
+    thermal = SharedThermalModel(network, {"magnetic": "core"}, initial_K=300.0)
+    model = Model(
+        {"magnet": magnet, "thermal": thermal},
+        {(thermal, "heat_magnetic_W"): (magnet, "loss_W")},
+    )
+
+    derivative = model.rhs(0.0, model.get_initial_values())
+    assert magnet.output.core_loss_W == pytest.approx(2.0)
+    assert thermal.input.heat_magnetic_W == pytest.approx(2.0)
+    assert derivative[-1] == pytest.approx(2.0)

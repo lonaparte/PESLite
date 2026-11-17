@@ -237,6 +237,7 @@ class MagneticLaw(Protocol):
     currents. PESLite owns and integrates every declared state. A stateful law also provides
     ``derivatives``. A conservative law may provide ``stored_energy`` and
     ``stored_energy_rate``; the electrical adapter then exposes an exact energy declaration.
+    A dissipative law may provide ``dissipated_power`` using the same state and rate arguments.
     """
 
     winding_names: tuple[str, ...]
@@ -393,6 +394,10 @@ class MagPortModel(MagComponent):
         rate_inputs = (*voltage_inputs, *(("temperature_K",)
                                          if self.temperature_coefficient_per_K != 0.0 else ()))
         loss_outputs = ("copper_loss_W", "core_loss_W", "loss_W")
+        loss_inputs = ((*voltage_inputs, "temperature_K")
+                       if callable(getattr(law, "dissipated_power", None)) else
+                       (("temperature_K",)
+                        if self.temperature_coefficient_per_K != 0.0 else ()))
         output_names = (*current_outputs, *current_rate_outputs, *loss_outputs)
         input_type = type("_MagPortInput", (Bag,), {"__slots__": input_names})
         output_type = type("_MagPortOutput", (Bag,), {"__slots__": output_names})
@@ -414,7 +419,7 @@ class MagPortModel(MagComponent):
             ),
             OutputMethod(
                 "set_loss_outputs",
-                (("temperature_K",) if self.temperature_coefficient_per_K != 0.0 else ()),
+                loss_inputs,
                 loss_outputs,
                 rhs=False,
             ),
@@ -584,11 +589,21 @@ class MagPortModel(MagComponent):
     def _winding_currents(self) -> np.ndarray:
         return self._currents()
 
-    def _material_loss(self) -> float:
+    def _material_loss(self, t: float) -> float:
         material = getattr(self.law, "dissipated_power", None)
-        return 0.0 if material is None else float(material(
-            self._flux_linkage(), self._currents(), self._internal_state()
-        ))
+        if material is None:
+            return 0.0
+        derivatives = self._state_derivatives(t)
+        count = len(self.names)
+        return material(
+            t,
+            self._flux_linkage(),
+            self._currents(),
+            self._internal_state(),
+            derivatives[:count],
+            dict(zip(self.internal_state_names, derivatives[count:])),
+            float(self.input.temperature_K),
+        )
 
     @staticmethod
     def supplied_power() -> float:
