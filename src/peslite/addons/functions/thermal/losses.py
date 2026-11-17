@@ -168,10 +168,15 @@ class SwitchingEvent:
     kind: str
     current_A: float
     voltage_V: float
+    device: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in _EVENT_KINDS:
             raise ValueError(f"unknown switching event kind: {self.kind!r}")
+        if self.device is not None and (
+                not isinstance(self.device, str) or not self.device
+                or any(not part.isidentifier() for part in self.device.split("."))):
+            raise ValueError("device must contain dot-separated identifiers")
         for name in ("time_s", "current_A", "voltage_V"):
             object.__setattr__(self, name, _scalar(name, getattr(self, name)))
 
@@ -276,7 +281,7 @@ def device_loss_report(
     ))
     estimated = np.broadcast_to(np.asarray(estimated, dtype=float), t.shape).copy()
     event_losses: list[EventLoss] = []
-    seen: set[tuple[str, float]] = set()
+    seen: set[tuple[str | None, str, float]] = set()
     curves = {"turn_on": model.turn_on_energy_J, "turn_off": model.turn_off_energy_J,
               "reverse_recovery": model.reverse_recovery_energy_J}
     for event in events:
@@ -284,9 +289,10 @@ def device_loss_report(
             raise TypeError("events must be SwitchingEvent instances")
         if not t[0] <= event.time_s <= t[-1]:
             raise ValueError("switching events must lie within the recorded trace")
-        if (event.kind, event.time_s) in seen:
+        identity = event.device, event.kind, event.time_s
+        if identity in seen:
             raise ValueError("duplicate switching event would double-count its energy")
-        seen.add((event.kind, event.time_s))
+        seen.add(identity)
         if event.kind == "reverse_recovery" and model.turn_on_includes_reverse_recovery:
             raise ValueError("reverse-recovery energy is already included in turn-on data")
         curve = curves[event.kind]

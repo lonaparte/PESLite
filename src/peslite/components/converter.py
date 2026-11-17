@@ -46,6 +46,14 @@ class _HalfBridgeOutput(Bag):
     __slots__ = ("u_c", "i_dc", "i_lower")
 
 
+class _SwitchingTransition(NamedTuple):
+    time_s: float
+    kind: str
+    current_A: float
+    voltage_V: float
+    device: str
+
+
 class _LegGates:
     """Read complementary leg gates from the held or selected switching state."""
 
@@ -199,6 +207,7 @@ class _BridgeModel(NetworkComponent):
         self.lower_port = None
         self.modulator = None
         self.state_owner = self
+        self._switching_devices = ()
         self.continuous = True
         self.enabled = False
         self._current_transfer = False
@@ -292,6 +301,7 @@ class _BridgeModel(NetworkComponent):
         gate = self._leg_gates if self.state_names else _LegGates(self)
         upper = topology.upper_controlled and topology.controlled
         lower = topology.lower_controlled and topology.controlled
+        devices = []
 
         def leg(midpoint, high, low, index):
             pair = (
@@ -309,6 +319,7 @@ class _BridgeModel(NetworkComponent):
                 ),
             )
             nb.add(*pair)
+            devices.extend(pair)
             return pair
 
         ac, dc = nb.node(self.power_port), nb.node(self.dc_port)
@@ -345,7 +356,66 @@ class _BridgeModel(NetworkComponent):
                         chain[index], chain[index + 1], midpoint, None,
                         tuple((value,) for value in column),
                     ))
+        nb.bind(self._bind_switching_devices, tuple(devices))
         nb.losses(self)
+
+    def _bind_switching_devices(self, _netlist, devices) -> None:
+        """Bind the physical device positions created by the ordinary netlist plan."""
+        self._switching_devices = tuple(devices)
+
+    def committed_transition_state(self) -> tuple[tuple[bool | None, ...], tuple[bool | None, ...]]:
+        """Return committed gate commands and diode conduction by device position."""
+        poles = (
+            tuple(bool(value > 0.5) for value in self.topology.pole_gates(self.input.q, True))
+            if self.topology.controlled else
+            (False,) * len(self.topology.duty_names)
+        )
+        gates = tuple(
+            value
+            for pole in poles
+            for value in (
+                self.enabled and pole
+                if self.topology.controlled and self.topology.upper_controlled else None,
+                self.enabled and not pole
+                if self.topology.controlled and self.topology.lower_controlled else None,
+            )
+        )
+        diodes = (
+            tuple(bool(device.conducting) for device in self._switching_devices)
+            if len(self._switching_devices) == len(gates)
+            else (None,) * len(gates)
+        )
+        return gates, diodes
+
+    def has_committed_transitions(self) -> bool:
+        """Whether carrier or natural-conduction edges are physically resolved."""
+        return self.has_switching_events or (
+            not self.topology.controlled and bool(self._switching_devices)
+        )
+
+    def committed_transitions(self, t: float, before, after):
+        """Describe actual device transitions at one committed circuit boundary."""
+        before_gates, before_diodes = before
+        after_gates, after_diodes = after
+        currents = tuple(abs(float(value)) for value in self.topology.pole_currents(
+            self.input.i_c
+        ))
+        voltage = abs(float(self.input.u_dc - getattr(self.input, "u_lower", 0.0)))
+        events = []
+        for index, (old_gate, new_gate, old_diode, new_diode) in enumerate(zip(
+                before_gates, after_gates, before_diodes, after_diodes)):
+            leg = index // 2
+            device = f"leg_{leg + 1}.{'upper' if index % 2 == 0 else 'lower'}"
+            if old_gate is not None and old_gate != new_gate:
+                events.append(_SwitchingTransition(
+                    float(t), "turn_on" if new_gate else "turn_off",
+                    currents[leg], voltage, device,
+                ))
+            elif old_diode is True and new_diode is False:
+                events.append(_SwitchingTransition(
+                    float(t), "reverse_recovery", currents[leg], voltage, device,
+                ))
+        return tuple(events)
 
     def _capacitive_devices(self, capacitance, resistance, switching) -> None:
         """Compose finite device conductances with the existing capacitor and algebraic solver."""

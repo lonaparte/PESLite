@@ -7,6 +7,8 @@
   dynamics instead of treating a recorded source value as constant in time.
 - Magnetic-circuit laws can publish material loss from solved branch flux and flux rate through
   the ordinary magnetic-component and thermal-coupling signals.
+- Confirmed bridge and diode transitions can apply semiconductor switching-energy impulses to
+  restartable thermal states and reports without inferring edges from sampled signals.
 - Unified constant-inductance magnetic models on the ordinary netlist path, reduced nonlinear
   magnetic circuits with a damped Newton solve, rejected multi-winding sampled-law extrapolation
   and removed the redundant native-export cleanup lifecycle.

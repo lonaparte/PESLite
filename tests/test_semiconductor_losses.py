@@ -176,3 +176,13 @@ def test_existing_streamed_result_columns_can_feed_the_heat_analysis():
     assert result.t.flags.writeable  # Reports must not mutate the caller's trace.
     with pytest.raises(ValueError, match="plant column"):
         recorded_device_loss(result, "missing.current", model)
+
+
+def test_simultaneous_switching_events_are_distinguished_by_device():
+    model = SemiconductorLossModel(turn_on_energy_J=0.1)
+    events = [
+        SwitchingEvent(0.5, "turn_on", 2, 400, "leg_1.upper"),
+        SwitchingEvent(0.5, "turn_on", 2, 400, "leg_2.upper"),
+    ]
+    report = device_loss_report([0, 1], [0, 0], model, events=events)
+    assert report.to_dict()["turn_on_J"] == pytest.approx(0.2)

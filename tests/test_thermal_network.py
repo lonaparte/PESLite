@@ -14,7 +14,7 @@ from peslite.addons.functions.thermal import (
     LossTable, SemiconductorLossModel, SwitchingEvent,
     thermal_report, compare_thermal_reports,
 )
-from peslite.solver.model import Model
+from peslite.solver.model import ConfigError, Model
 
 
 def test_single_node_cauer_matches_analytical_step_and_energy_balance():
@@ -95,7 +95,10 @@ def test_confirmed_impulse_is_exact_and_restart_id_is_a_registered_state():
     assert energy == pytest.approx(0.2)
     current = circuit.get_initial_values()
     assert current[0] == pytest.approx(302)
-    assert component.get_state() == {"last_transition_id": 10}
+    assert component.get_state() == {
+        "last_transition_id": 10,
+        "switching_energy_J": pytest.approx(0.2),
+    }
     with pytest.raises(ValueError, match="already been committed"):
         component.apply_committed_transition(
             SwitchingEvent(0.001, "turn_on", 2, 400), event_id=10)
@@ -123,7 +126,7 @@ def test_electrothermal_element_uses_existing_source_not_an_electrical_netlist()
     assert element.subsystems()["thermal_load"] is element.model
     assert element.connections() == {(element.model, "heat_W"): "load.power"}
     assert math.isfinite(element.model.output.case_K)
-    with pytest.raises(ValueError, match="exactly one"):
+    with pytest.raises(ValueError, match="heat, current or switching source"):
         ElectroThermal.Params(c_j_J_K=1, r_jc_K_W=1, c_c_J_K=1, r_ca_K_W=1)
     with pytest.raises(ValueError, match="overlap"):
         ElectroThermal.Params(
@@ -179,6 +182,11 @@ def test_temperature_reports_and_device_comparison():
     second = {**report, "safety_margin_K": 0, "junction_peak_K": 325}
     assert list(compare_thermal_reports({"B": second, "A": report})) == ["A", "B"]
 
+    result.plant["thermal.switching_energy_J"] = np.array([0.2, 0.3, 0.5])
+    report = thermal_report(result, "thermal", maximum_junction_K=325)
+    assert report["switching_heat_J"] == pytest.approx(0.3)
+    assert report["heat_integrated_J"] == pytest.approx(10.3)
+
 
 def test_end_to_end_attachment_in_existing_buck_circuit(tmp_path):
     import peslite
@@ -209,3 +217,92 @@ def test_end_to_end_attachment_in_existing_buck_circuit(tmp_path):
     assert result.plant["thermal_load.temperature_K"][-1] >= 300.0
     assert np.max(result.plant["thermal_load.heat_W"]) >= 0.0
     assert result.summary["status"] == "completed"
+
+
+def test_committed_pwm_edges_apply_online_switching_heat_once(tmp_path):
+    import peslite
+    from pathlib import Path
+
+    params = peslite.load(Path(__file__).resolve().parents[1]
+                          / "examples" / "buck-open-loop-example.pes", **{
+        "units.converter.bridge.model": "switching",
+        "simulation.t_end": 70.0e-6,
+        "simulation.output.period": 2.5e-6,
+        "simulation.solver.linearisations": 0,
+    }).replace(**{
+        "elements.switching_heat": {
+            "type": "electrothermal",
+            "switching_source": "converter.bridge",
+            "turn_on_energy_J": 1.0e-3,
+            "turn_off_energy_J": 1.0e-3,
+            "c_j_J_K": 0.1,
+            "r_jc_K_W": 1000.0,
+            "c_c_J_K": 1.0,
+            "r_ca_K_W": 1000.0,
+            "ambient_K": 300.0,
+            "initial_K": 300.0,
+        }
+    })
+    simulation = peslite.Simulation(params)
+    result = simulation.run(out_dir=tmp_path)
+    thermal = simulation.system.named_elements["switching_heat"].model
+
+    # Initial command binding is not an event. Later committed enable/PWM boundaries contain five
+    # device transitions in total, each dispatched once after the circuit accepts the new mode.
+    assert thermal.switching_energy_J == pytest.approx(5.0e-3)
+    assert thermal.last_transition_id == 4
+    assert result.plant["switching_heat.switching_energy_J"][-1] == pytest.approx(5.0e-3)
+    assert result.plant["switching_heat.temperature_K"][-1] > 300.04
+    with pytest.raises(ConfigError, match="switching-energy impulses"):
+        peslite.export(params, "cpp", tmp_path / "native")
+
+
+def test_averaged_bridge_warns_instead_of_inventing_switching_edges(tmp_path):
+    import peslite
+    from pathlib import Path
+
+    params = peslite.load(Path(__file__).resolve().parents[1]
+                          / "examples" / "buck-open-loop-example.pes", **{
+        "simulation.t_end": 70.0e-6,
+        "simulation.solver.linearisations": 0,
+    }).replace(**{
+        "elements.switching_heat": {
+            "type": "electrothermal",
+            "switching_source": "converter.bridge",
+            "turn_on_energy_J": 1.0e-3,
+            "c_j_J_K": 0.1,
+            "r_jc_K_W": 1.0,
+            "c_c_J_K": 1.0,
+            "r_ca_K_W": 1.0,
+        }
+    })
+    with pytest.warns(UserWarning, match="no resolved switching edges"):
+        simulation = peslite.Simulation(params)
+    simulation.run(out_dir=tmp_path)
+    assert simulation.system.named_elements["switching_heat"].model.switching_energy_J == 0.0
+
+
+def test_natural_diode_commutations_apply_online_recovery_heat(tmp_path):
+    import peslite
+    from peslite.assembly.params import from_dict
+    from test_wpt_rectifier import SS, _tree
+
+    tree = _tree(SS, 200.0, 30.0e-6, dt=20.0e-9)
+    tree["elements"] = {"switching_heat": {
+        "type": "electrothermal",
+        "switching_source": "charger.secondary.bridge",
+        "reverse_recovery_energy_J": 1.0e-3,
+        "c_j_J_K": 0.1,
+        "r_jc_K_W": 1000.0,
+        "c_c_J_K": 1.0,
+        "r_ca_K_W": 1000.0,
+        "ambient_K": 300.0,
+        "initial_K": 300.0,
+    }}
+    simulation = peslite.Simulation(from_dict(tree))
+    simulation.run(out_dir=tmp_path)
+    thermal = simulation.system.named_elements["switching_heat"].model
+
+    assert thermal.switching_energy_J == pytest.approx(6.0e-3)
+    assert thermal.last_transition_id == 5
+    assert thermal.output.temperature_K > 300.05

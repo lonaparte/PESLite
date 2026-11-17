@@ -7802,6 +7802,10 @@ class _CppGenerator:
         self.simulation = simulation
         self.p = simulation.p
         self.system = simulation.system
+        if self.system.transition_bindings:
+            raise ConfigError(
+                "C++ export does not yet lower online switching-energy impulses"
+            )
         self.model = self.system.model
         self.zoh_initial = {
             label: getattr(targets[0][0], targets[0][1])

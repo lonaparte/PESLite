@@ -36,6 +36,7 @@ import copy
 import itertools
 import math
 import re
+import warnings
 from contextvars import ContextVar
 from types import MethodType
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -530,6 +531,8 @@ class Circuit:
         self._device_bindings: dict[tuple, tuple[Topology, Callable, Callable]] = {}
         self._device_runtime: Optional[list] = None  # [netlist, topology, evaluator] once compiled
         self._device_commands: Optional[tuple] = None  # boundary commands the runtime was bound for
+        self._transition_consumers: dict[int, tuple[Any, list[Any]]] = {}
+        self._transition_states: dict[int, Any] = {}
         self._structure_plan: Optional["_CircuitPlan"] = None
         self._mode_decompositions: dict[tuple, Optional["_ModeDecomposition"]] = {}
         self.plan_changed = False
@@ -682,6 +685,7 @@ class Circuit:
         self.commutation_active = self.locate_commutations or bool(self._hooks)
         self._mirrored_valid = False
         self._boundary_signature = None
+        self._transition_states.clear()
         self._mode_targets, self._discrete_mode_targets, held_ratios = (
             self._mode_input_targets(net)
         )
@@ -1608,7 +1612,9 @@ class Circuit:
             return None
         return runtime[1]
 
-    def held_inputs_changed(self, targets: Sequence[tuple[Any, str]]) -> None:
+    def held_inputs_changed(
+        self, targets: Sequence[tuple[Any, str]], t: float | None = None
+    ) -> bool:
         """Select the compiled mode after held circuit inputs changed at a boundary."""
         if any((id(record), field) in self._mode_targets for record, field in targets):
             boundary = self._boundary_mode()
@@ -1618,8 +1624,11 @@ class Circuit:
                     and boundary[1] != previous[1]
                     and self._commutate_state_diodes()):
                 self._boundary_signature = boundary
-                return
+                return t is not None and self._commit_transitions(t)
             self._refresh_device_evaluator()
+            if t is not None:
+                return self._commit_transitions(t)
+        return False
 
     def _refresh_device_mode(self, topology: Optional[Topology] = None) -> None:
         """Bind or regenerate the equations selected by the current structural mode."""
@@ -1730,6 +1739,7 @@ class Circuit:
                 and boundary[1] != previous_boundary[1]
                 and self._commutate_state_diodes()):
             self._boundary_signature = boundary
+            self._commit_transitions(t)
             return
         net, before = self.netlist, self.gather()
         try:
@@ -1750,6 +1760,7 @@ class Circuit:
             self._mirrored_valid = True
         self._boundary_signature = boundary
         self._refresh_device_mode()
+        self._commit_transitions(t)
 
     def _boundary_mode(self) -> tuple:
         """Discrete commands that can change the netlist constraints at an outer boundary."""
@@ -1766,6 +1777,58 @@ class Circuit:
             self.commutate(t)
         else:
             self._refresh_device_evaluator()
+            self._commit_transitions(t)
+
+    def bind_transitions(self, source: Any, consumer: Any) -> bool:
+        """Bind one committed-transition source to a restartable impulse consumer."""
+        if not any(source is component for component in self.components):
+            raise ConfigError("a transition source must belong to its assembled circuit")
+        if not callable(getattr(source, "committed_transition_state", None)) or not callable(
+                getattr(source, "committed_transitions", None)):
+            raise ConfigError(
+                f"{self.names.get(id(source), type(source).__name__)} does not expose "
+                "committed transitions"
+            )
+        if not callable(getattr(consumer, "apply_committed_transitions", None)):
+            raise ConfigError("a transition consumer must implement apply_committed_transitions()")
+        available = getattr(source, "has_committed_transitions", None)
+        if not callable(available) or not available():
+            warnings.warn(
+                f"{self.names.get(id(source), type(source).__name__)} has no resolved switching "
+                "edges; its switching-loss attachment is inactive",
+                stacklevel=4,
+            )
+            return False
+        entry = self._transition_consumers.setdefault(id(source), (source, []))
+        if any(consumer is existing for existing in entry[1]):
+            raise ConfigError("a transition consumer is already bound to this source")
+        entry[1].append(consumer)
+        return True
+
+    def _initialize_transition_states(self) -> None:
+        self._transition_states = {
+            key: source.committed_transition_state()
+            for key, (source, _consumers) in self._transition_consumers.items()
+        }
+
+    def _commit_transitions(self, t: float) -> bool:
+        """Dispatch only transitions visible after a physical circuit boundary commits."""
+        if not self._transition_consumers:
+            return False
+        self.receive()
+        changed = False
+        for key, (source, consumers) in self._transition_consumers.items():
+            after = source.committed_transition_state()
+            before = self._transition_states.get(key)
+            if before is None or before == after:
+                self._transition_states[key] = after
+                continue
+            events = source.committed_transitions(t, before, after)
+            if events:
+                for consumer in consumers:
+                    changed |= bool(consumer.apply_committed_transitions(events))
+            self._transition_states[key] = after
+        return changed
 
     def _commutate_state_diodes(self) -> bool:
         """Apply a gate-only mode change through proved current relations."""
@@ -1790,12 +1853,14 @@ class Circuit:
         self._consistent_constraints = topology.constraint_key()
         self._boundary_signature = self._boundary_mode()
         self._refresh_device_mode()
+        self._initialize_transition_states()
 
     def initialize_mode(self) -> None:
         """Bind the topology established by initial commands without changing physical states."""
         topology = self.netlist.topology()
         self._boundary_signature = self._boundary_mode()
         self._refresh_device_mode(topology)
+        self._initialize_transition_states()
 
     def dissipated_power_of(self, component: Any) -> float:
         """The power dissipated in ``component``'s resistive primitives at the last evaluation."""

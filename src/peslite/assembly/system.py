@@ -481,6 +481,19 @@ class System:
         )
         for element in elements:
             _merge_unique(subsystems, element.subsystems(), "subsystem name")
+        transition_bindings = []
+        for element in elements:
+            declare = getattr(element, "transition_bindings", None)
+            if not callable(declare):
+                continue
+            for source_name, consumer in declare():
+                source = subsystems.get(source_name)
+                if source is None:
+                    raise ConfigError(
+                        f"{type(element).__name__}.transition_bindings(): "
+                        f"unknown subsystem {source_name!r}"
+                    )
+                transition_bindings.append((source, consumer))
         physical_bindings = assembled.attached_ports + tuple(
             binding for _element, bindings, _series in element_ports for binding in bindings
         )
@@ -612,6 +625,17 @@ class System:
             circuit_model, subsystems, connections, zoh, bus_ports, declarations
         )
         self.circuits = () if circuit is None else (circuit,)
+        active_transitions = []
+        for source, consumer in transition_bindings:
+            owners = [candidate for candidate in self.circuits
+                      if any(source is component for component in candidate.components)]
+            if len(owners) != 1:
+                raise ConfigError(
+                    "a committed transition source must belong to exactly one electrical circuit"
+                )
+            if owners[0].bind_transitions(source, consumer):
+                active_transitions.append((source, consumer))
+        self.transition_bindings = tuple(active_transitions)
         self.model = Model(
             subsystems, connections, zoh,
             linear_structure=partial(circuit_structure, circuits=self.circuits),

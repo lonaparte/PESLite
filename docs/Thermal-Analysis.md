@@ -39,6 +39,27 @@ Exact switching losses require confirmed `SwitchingEvent` records. Rejected solv
 sparsely recorded gate commands are not switching events. `turn_on_includes_reverse_recovery=True`
 prevents the same recovery energy from being counted again.
 
+An `electrothermal` element can consume exact bridge transitions during simulation:
+
+```yaml
+elements:
+  switch_heat:
+    type: electrothermal
+    switching_source: converter.bridge
+    switching_devices: [leg_1.upper]
+    turn_on_energy_J: 2.0e-4
+    turn_off_energy_J: 1.5e-4
+    c_j_J_K: 0.2
+    r_jc_K_W: 1.5
+    c_c_J_K: 1.0
+    r_ca_K_W: 3.0
+```
+
+Omit `switching_devices` to combine every device position into the same thermal network. Device
+positions are named `leg_<index>.upper` and `leg_<index>.lower`. The attachment may also use
+`heat_source` or `current_source` for continuous loss. Averaged bridges have no resolved edges, so
+their switching attachment remains inactive with a warning.
+
 ## Temperature-dependent components
 
 `ThermalComponent` is the common runtime contract for physical components whose constitutive
@@ -161,10 +182,10 @@ It publishes `temperature_<node>_K`, total incoming heat and heat rejected to am
 
 ## Confirmed heat impulses
 
-`ElectroThermalModel.apply_committed_transition(...)` applies a confirmed switching-energy impulse
-at an accepted simulation boundary. The nonnegative event ID must increase monotonically. It is
-stored as a discrete restart state, preventing continuation from applying the same event twice
-without adding a differential state.
+The circuit automatically applies configured switching-energy impulses after accepting a physical
+mode transition. `ElectroThermalModel.apply_committed_transition(...)` remains available for an
+independently confirmed event. Its monotonic event ID and cumulative `switching_energy_J` are
+restart states, so continuation does not reapply an old event.
 
 ## Reports and limits
 
@@ -177,6 +198,8 @@ initial conditions and observation interval.
 - Averaged models require a justified conduction fraction and do not provide exact switching events.
 - Imported reduced-order models contain only the declared temperature dynamics; they do not imply a
   field reconstruction or a general thermal PDE solver.
+- Standalone C++ export rejects online switching-energy attachments rather than omitting their heat
+  impulses.
 - Python callbacks that are unsupported by standalone export are rejected rather than approximated.
 
 Connections between thermal, electrical and magnetic models are described in

@@ -71,8 +71,9 @@ class Plant:
             self._sync_zoh(t)
         self.zoh_changed = False
 
-    def hold(self, label: str, value: Any) -> None:
-        self.model.set_zoh_input(label, value)
+    def hold(self, label: str, value: Any, t: float | None = None) -> None:
+        if self.model.set_zoh_input(label, value, t):
+            self.read_state()
         self.zoh_changed = True
 
     @contextmanager
@@ -455,7 +456,7 @@ class Unit(ABC):
         """Apply pending protection, bridge, gate and ADC-window transitions."""
         tripped_now = self._actuate_sampled(t, plant, self.branch_f is not None or self.breaker)
         if not self.continuous and self.branch_f is None and not self.gates:
-            plant.hold(self.zoh, self.bridge.topology.zero)
+            plant.hold(self.zoh, self.bridge.topology.zero, t)
         return tripped_now
 
     def summary(self) -> dict[str, Any]:
@@ -521,7 +522,7 @@ class Unit(ABC):
             with plant.change(t):
                 self._set_gates(active)
         for value in changes:
-            plant.hold(self.zoh, value)
+            plant.hold(self.zoh, value, t)
         self._write_due = None
 
     def _update_terminal(self) -> None:

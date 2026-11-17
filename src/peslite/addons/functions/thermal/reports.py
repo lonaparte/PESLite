@@ -33,9 +33,9 @@ def thermal_report(
     Optional electrical efficiency is calculated only with explicitly supplied
     delivered output power, not inferred from gross circuit supply.
     """
-    plant, states = result.plant, result.states
-    if not isinstance(plant, Mapping) or not isinstance(states, Mapping):
-        raise TypeError("result needs streamed plant and state mappings")
+    plant = result.plant
+    if not isinstance(plant, Mapping):
+        raise TypeError("result needs a streamed plant mapping")
     t = _array("time", result.t)
     if len(t) < 2 or np.any(np.diff(t) <= 0):
         raise ValueError("thermal report requires two increasing recorded times")
@@ -53,7 +53,16 @@ def thermal_report(
     def integrate(x):
         return float(np.dot(dt, 0.5 * (x[1:] + x[:-1])))
 
-    heat_j = integrate(heat)
+    continuous_heat_j = integrate(heat)
+    switching_trace = plant.get(f"{name}.switching_energy_J")
+    if switching_trace is None:
+        switching_heat_j = 0.0
+    else:
+        switching = _array("switching_energy_J", switching_trace, len(t))
+        if np.any(np.diff(switching) < 0.0):
+            raise ValueError("switching_energy_J must be nondecreasing")
+        switching_heat_j = float(switching[-1] - switching[0])
+    heat_j = continuous_heat_j + switching_heat_j
     cooling_j = integrate(rejected)
     peak = float(np.max(junction))
     peak_index = int(np.argmax(junction))
@@ -84,6 +93,8 @@ def thermal_report(
         "junction_limit_K": max_temp,
         "safety_margin_K": max_temp - peak,
         "within_rating": bool(peak <= max_temp),
+        "continuous_heat_integrated_J": continuous_heat_j,
+        "switching_heat_J": switching_heat_j,
         "heat_integrated_J": heat_j,
         "heat_average_W": heat_j / duration,
         "cooling_integrated_J": cooling_j,

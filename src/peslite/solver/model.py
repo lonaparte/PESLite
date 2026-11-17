@@ -2116,7 +2116,7 @@ class Model:
         raise KeyError(f"{type(sub).__name__} has no state {name!r}")
 
     # --------------------------------------------------------- evaluation
-    def set_zoh_input(self, label: str, value: Any) -> None:
+    def set_zoh_input(self, label: str, value: Any, t: float | None = None) -> bool:
         """Set a held external input (e.g. the switching state) by label."""
         targets = self._zoh_targets[label]
         if isinstance(value, np.generic):  # generated equations run on Python scalars
@@ -2131,10 +2131,12 @@ class Model:
                 if not same:
                     changed.append((input, name))
         if not changed:
-            return
+            return False
+        state_changed = False
         for refresh in self._held_input_refresh:
-            refresh(changed)
+            state_changed |= refresh(changed, t) is True
         self.invalidate_equations()
+        return state_changed
 
     def evaluate_outputs(self, t: float) -> None:
         """Run the ordered output-method / input-copy plan for the current states."""
