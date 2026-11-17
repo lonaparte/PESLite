@@ -1,14 +1,14 @@
 # Magnetic Components
 
+The standard PESLite installation includes the `magnetic` addon, which provides `MagComponent`
+and constant inductance-matrix simulation. `peslite-full` additionally provides the `magport` and
+`magcircuit` addons.
+
 PESLite connects magnetic devices to the electrical circuit through ordinary component ports.
 `MagComponent` is the abstract component boundary for project-defined magnetic devices: it adds an
 optional physical magnetic description to the normal electrical component contract without
 prescribing a device type. Its electrical behavior may be supplied by a netlist, a constitutive law
 or imported data.
-
-The default `peslite` installation provides the magnetic component addon, while `peslite-core`
-contains no magnetic implementation. Install `peslite-full` for the `magport` and `magcircuit`
-addons.
 
 ## MagComponent interface
 

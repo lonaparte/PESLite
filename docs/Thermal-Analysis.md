@@ -1,8 +1,12 @@
 # Thermal Analysis
 
-PESLite supports attributed semiconductor-loss analysis and dynamic thermal models. Thermal states
-use the existing simulation model, solvers, result files and restart mechanism; there is no separate
-thermal solver or duplicated electrical network.
+The standard PESLite installation includes the `semiconductor_losses`, `thermal_analysis`,
+`thermal_network`, `electrothermal` and `thermal_resistor` addons. `peslite-full` additionally
+provides the `advanced_thermal` addon for shared thermal networks, imported thermal ROMs and
+general thermal laws.
+
+Thermal states use the existing simulation model, solvers, result files and restart mechanism;
+there is no separate thermal solver or duplicated electrical network.
 
 ## Heat sources
 

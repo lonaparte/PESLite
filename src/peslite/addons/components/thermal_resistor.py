@@ -98,7 +98,7 @@ class ThermalResistorModel:
 class ThermalResistor(Element):
     """Bind an electrical resistor to an electrothermal output.
 
-    Install ``peslite`` and use ``elements`` of type ``thermal_resistor``.
+    Use an ``elements`` entry of type ``thermal_resistor``.
     The temperature path is a scalar physical output, e.g. ``chip.temperature_K``.
     """
 
