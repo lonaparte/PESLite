@@ -102,12 +102,15 @@ Store the model in a `thermalport` file:
   "format": "peslite-thermalport",
   "version": 1,
   "units": "SI",
+  "heat_names": ["loss"],
+  "temperature_names": ["junction"],
   "A_per_s": [[-0.125]],
-  "B_K_per_J": [0.5],
-  "C": [1.0],
-  "D_K_W": 0.0,
-  "ambient_K": 300.0,
-  "initial": [0.0]
+  "B_K_per_J": [[0.5]],
+  "C": [[1.0]],
+  "D_K_W": [[0.0]],
+  "ambient_K": [300.0],
+  "initial": [0.0],
+  "signals": {}
 }
 ```
 
@@ -117,11 +120,16 @@ Connect it to an existing heat signal:
 elements:
   thermal:
     type: thermalport
-    heat_source: magnet.loss_W
+    sources: {loss: magnet.loss_W}
     file: models/magnet-thermal.json
 ```
 
 Use `load_thermalport()` to load the same file through the Python API.
+
+For multiple heat inputs or temperature outputs, list their names in `heat_names` and
+`temperature_names`; the component publishes `heat_<name>_W` and `temperature_<name>_K`.
+The `signals` mapping may add linear outputs such as `cooling_W` without changing the thermal
+state interface.
 
 `shared_thermal_network` maps every configured source path to a named thermal node:
 
@@ -164,4 +172,4 @@ initial conditions and observation interval.
 - Python callbacks that are unsupported by standalone export are rejected rather than approximated.
 
 Connections between thermal, electrical and magnetic models are described in
-[Multiphysics Coupling](Multiphysics-Coupling.md).
+[Multiphysics Analysis](Multiphysics-Analysis.md).

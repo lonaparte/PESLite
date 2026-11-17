@@ -21,12 +21,15 @@ def _thermalport_file(path, *, A=None, B=None, C=None, D=0.0, ambient=300.0):
         "format": "peslite-thermalport",
         "version": 1,
         "units": "SI",
+        "heat_names": ["source"],
+        "temperature_names": ["junction"],
         "A_per_s": [[-1.0]] if A is None else A,
-        "B_K_per_J": [1.0] if B is None else B,
-        "C": [1.0] if C is None else C,
-        "D_K_W": D,
-        "ambient_K": ambient,
+        "B_K_per_J": [[1.0]] if B is None else B,
+        "C": [[1.0]] if C is None else C,
+        "D_K_W": [[D]],
+        "ambient_K": [ambient],
         "initial": [0.0],
+        "signals": {},
     }
     path.write_text(json.dumps(data), encoding="utf-8")
     return path
@@ -110,16 +113,60 @@ def test_shared_thermal_registration_is_configuration_driven():
         )
 
 
+def test_named_thermalport_replaces_a_multi_source_network(tmp_path):
+    file = tmp_path / "shared.json"
+    file.write_text(json.dumps({
+        "format": "peslite-thermalport",
+        "version": 1,
+        "units": "SI",
+        "heat_names": ["electric", "magnetic"],
+        "temperature_names": ["junction", "sink"],
+        "A_per_s": [[-1.0, 1.0], [0.5, -0.75]],
+        "B_K_per_J": [[1.0, 0.0], [0.0, 0.5]],
+        "C": [[1.0, 0.0], [0.0, 1.0]],
+        "D_K_W": [[0.0, 0.0], [0.0, 0.0]],
+        "ambient_K": [300.0, 300.0],
+        "initial": [0.0, 0.0],
+        "signals": {
+            "cooling_W": {
+                "state": [0.0, 0.5],
+                "heat": [0.0, 0.0],
+                "offset": 0.0,
+            },
+        },
+    }), encoding="utf-8")
+    cfg = ThermalPort.Params(
+        sources={"electric": "load.power", "magnetic": "magnet.loss_W"},
+        file=str(file),
+    )
+    element = ThermalPort("thermal", cfg, {}, None)
+    model = element.model
+    model.input.heat_electric_W = 10.0
+    model.input.heat_magnetic_W = 4.0
+    assert model.rhs(0.0) == pytest.approx((10.0, 2.0))
+    model.state.state_0 = 20.0
+    model.state.state_1 = 10.0
+    model.set_outputs(0.0)
+    assert model.output.temperature_junction_K == pytest.approx(320.0)
+    assert model.output.temperature_sink_K == pytest.approx(310.0)
+    assert model.output.heat_total_W == pytest.approx(14.0)
+    assert model.output.cooling_W == pytest.approx(5.0)
+    assert element.connections() == {
+        (model, "heat_electric_W"): "load.power",
+        (model, "heat_magnetic_W"): "magnet.loss_W",
+    }
+
+
 def test_thermalport_matches_first_order_analytic_response(tmp_path):
     # dx/dt = -x/(R*C) + P/C; T = ambient + x
     R, C, P = 4.0, 2.0, 10.0
     model = load_thermalport(_thermalport_file(
         tmp_path / "thermal.json",
         A=[[-1.0 / (R * C)]],
-        B=[1.0 / C],
-        C=[1.0],
+        B=[[1.0 / C]],
+        C=[[1.0]],
     ))
-    model.input.heat_W = P
+    model.input.heat_source_W = P
     model.set_outputs(0)
     assert model.rhs(0) == pytest.approx([P / C])
     state = Model({"rom": model}, {})
@@ -132,25 +179,34 @@ def test_thermalport_matches_first_order_analytic_response(tmp_path):
 
 def test_thermal_port_uses_an_independent_constitutive_law():
     class Law:
+        heat_names = ("source",)
+        temperature_names = ("junction",)
+        signal_names = ()
         initial_state = {"temperature_K": 300.0}
 
         @staticmethod
         def rhs(_t, state, heat_W):
-            return np.array([heat_W - (state[0] - 300.0)])
+            return np.array([heat_W["source"] - (state[0] - 300.0)])
 
         @staticmethod
-        def temperature_K(_t, state, _heat_W):
-            return state[0]
+        def temperatures_K(_t, state, _heat_W):
+            return {"junction": state[0]}
+
+        @staticmethod
+        def signals(_t, _state, _heat_W):
+            return {}
 
     model = ThermalPortModel(Law())
-    model.input.heat_W = 5.0
+    model.input.heat_source_W = 5.0
     model.set_outputs(0.0)
-    assert model.output.temperature_K == pytest.approx(300.0)
+    assert model.output.temperature_junction_K == pytest.approx(300.0)
     assert model.rhs(0.0) == pytest.approx((5.0,))
 
 
 def test_thermal_port_allows_a_stateless_constitutive_law():
     class Law:
+        heat_names = ("source",)
+        temperature_names = ("junction",)
         initial_state = {}
 
         @staticmethod
@@ -158,14 +214,14 @@ def test_thermal_port_allows_a_stateless_constitutive_law():
             return np.empty(0)
 
         @staticmethod
-        def temperature_K(_t, _state, heat_W):
-            return 300.0 + 0.5 * heat_W
+        def temperatures_K(_t, _state, heat_W):
+            return {"junction": 300.0 + 0.5 * heat_W["source"]}
 
     model = ThermalPortModel(Law())
-    model.input.heat_W = 4.0
+    model.input.heat_source_W = 4.0
     circuit = Model({"thermal": model}, {})
     circuit.sync(0.0, np.empty(0))
-    assert model.output.temperature_K == pytest.approx(302.0)
+    assert model.output.temperature_junction_K == pytest.approx(302.0)
     assert circuit.rhs(0.0, np.empty(0)).size == 0
 
 
@@ -188,13 +244,13 @@ def test_thermalport_requires_declared_si_and_stable_matrices(tmp_path):
 
 def test_thermalport_consumes_a_physical_heat_source(tmp_path):
     config = ThermalPort.Params(
-        heat_source="load.power",
+        sources={"source": "load.power"},
         file=str(_thermalport_file(tmp_path / "thermal.json")),
     )
     element = ThermalPort("thermal", config, {}, None)
-    assert element.connections() == {(element.model, "heat_W"): "load.power"}
+    assert element.connections() == {(element.model, "heat_source_W"): "load.power"}
     assert element.subsystems() == {"thermal": element.model}
-    assert element.signals()["thermal.temperature_K"] == pytest.approx(300.0)
+    assert element.signals()["thermal.temperature_junction_K"] == pytest.approx(300.0)
 
 
 def test_thermal_component_types_share_the_component_registry():
@@ -222,14 +278,14 @@ def test_magnetic_and_thermal_ports_couple_without_owning_each_other(tmp_path):
                     "coil": {"positive": "node", "negative": "ground", "r": 1.0},
                 },
                 "inductance": [[0.01]],
-                "temperature_source": "thermal.temperature_K",
+                "temperature_source": "thermal.temperature_junction_K",
                 "temperature_coefficient_per_K": 0.004,
                 "temperature_reference_K": 300.0,
             },
             "load": {"type": "resistor", "bus": "node", "r": 1.0},
             "thermal": {
                 "type": "thermalport",
-                "heat_source": "magnet.loss_W",
+                "sources": {"source": "magnet.loss_W"},
                 "file": str(model_file),
             },
         },
@@ -242,4 +298,4 @@ def test_magnetic_and_thermal_ports_couple_without_owning_each_other(tmp_path):
     }
     result = peslite.Simulation(from_dict(case)).run(out_dir=tmp_path)
     assert np.max(result.plant["magnet.loss_W"]) > 0.0
-    assert result.plant["thermal.temperature_K"][-1] > 300.0
+    assert result.plant["thermal.temperature_junction_K"][-1] > 300.0

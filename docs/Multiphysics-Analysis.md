@@ -1,4 +1,4 @@
-# Multiphysics Coupling
+# Multiphysics Analysis
 
 Electrical, magnetic and thermal components are independent PESLite subsystems. Coupling does not
 make one physical domain an implementation of another: assembly only connects compatible public
@@ -72,9 +72,10 @@ electrical state. A nonpositive resistance is rejected.
 
 ## Custom boundaries
 
-`ThermalPort` accepts an external thermal law with `initial_state`, `rhs()` and `temperature_K()`.
-`initial_state` may be empty for an algebraic thermal law. Magnetic constitutive laws use the
-independent `MagComponent` and `MagPort` interfaces described in
+`ThermalPort` accepts an external thermal law with named heat inputs, named temperature outputs,
+`initial_state`, `rhs()` and `temperatures_K()`. `initial_state` may be empty for an algebraic
+thermal law. A law may declare additional `signal_names` and provide `signals()`. Magnetic
+constitutive laws use the independent `MagComponent` and `MagPort` interfaces described in
 [Magnetic Components](Magnetic-Components.md).
 
 Custom laws are evaluated during speculative solver stages and must be deterministic and free of

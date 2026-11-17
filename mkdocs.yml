@@ -42,7 +42,7 @@ nav:
       - Online System Analysis: Online-System-Analysis.md
       - Offline System Analysis: Offline-System-Analysis.md
       - Thermal Analysis: Thermal-Analysis.md
-      - Multiphysics Coupling: Multiphysics-Coupling.md
+      - Multiphysics Analysis: Multiphysics-Analysis.md
       - Plotting: Plotting.md
   - Reference:
       - CLI Reference: CLI-Reference.md
