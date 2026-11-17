@@ -58,6 +58,8 @@ _ZERO_COEFFICIENTS: ContextVar[dict | None] = ContextVar("peslite_cpp_zero_coeff
 _CONDITIONAL_DEPENDENCIES: ContextVar[tuple | None] = ContextVar(
     "peslite_cpp_conditional_dependencies", default=None)
 _SCALAR_TERMS: ContextVar[tuple | None] = ContextVar("peslite_cpp_scalar_terms", default=None)
+# Keep generated expression nesting below the default depth accepted by common C++ compilers.
+_TERM_BRACKETS = 128
 _TRACE_WORK_BUDGET = (1 << 13) - 1  # bound work instead of the depth of a narrow equation
 
 _CSV_STREAM = r'''class CsvStream {
@@ -2661,57 +2663,110 @@ class _ModelGenerator:
 
     @staticmethod
     def _term_declarations(prefix, terms, lines):
+        """Place shared expressions in the narrowest scope that contains their uses."""
         references = re.compile(rf"\b{prefix}\d+\b")
         guarded = re.compile(r"\?|&&|\|\||\b(?:if|for|while|switch)\s*\(")
-        needed = set(references.findall("\n".join(lines)))
-        eager = set()
+        # name -> (scope evaluating the use, certain in that scope, held by another term)
+        uses: dict[str, list[tuple[str | None, bool, bool]]] = {}
+        leading = True
         for line in lines:
             # Statement scopes may guard later lines. Only the leading straight-line
             # region is guaranteed to execute when this declaration scope is entered.
             if re.search(r"[{}]|\b(?:if|for|while|switch|else|try|catch)\b", line):
-                break
-            if not guarded.search(line):
-                eager.update(references.findall(line))
-        retained = []
-        for code, (name, lazy, kind) in reversed(tuple(terms.items())):
-            if name not in needed:
-                continue
-            dependencies = references.findall(code)
-            needed.update(dependencies)
-            if (name in eager or not lazy) and not guarded.search(code):
-                eager.update(dependencies)
-            retained.append((code, name, lazy, kind))
+                leading = False
+            certain = leading and not guarded.search(line)
+            for name in references.findall(line):
+                uses.setdefault(name, []).append((None, certain, False))
 
-        # Unconditional uses need ordinary temporaries. Only expressions beneath a guard
-        # need first-use caching; emitting a lambda for every DAG node burdens the compiler.
+        scope: dict[str, str | None] = {}
+        depth: dict[str | None, int] = {None: 0}
+        eager, inline, retained = set(), set(), {}
+        deepest = max((
+            max(itertools.accumulate((char in "([{") - (char in ")]}") for char in code))
+            for code in terms
+        ), default=0)
+        limit = max(1, _TERM_BRACKETS // (deepest + 2))
+
+        def enclosing(first, second):
+            while first != second:
+                if depth[first] < depth[second]:
+                    second = scope[second]
+                else:
+                    first = scope[first]
+            return first
+
+        for code, (name, lazy, kind) in reversed(tuple(terms.items())):
+            found = uses.get(name)
+            if not found:
+                continue
+            owner = None
+            if lazy:
+                owner = found[0][0]
+                for other, _certain, _term in found[1:]:
+                    owner = enclosing(owner, other)
+                while depth[owner] >= limit:
+                    owner = scope[owner]
+            scope[name] = owner
+            if not lazy or any(where == owner and certain for where, certain, _term in found):
+                eager.add(name)
+                inside = owner
+            else:
+                depth[name] = depth[owner] + 1
+                inside = name
+                if len(found) == 1 and found[0][2] and found[0][0] == owner:
+                    inline.add(name)
+            certain = not guarded.search(code)
+            for dependency in references.findall(code):
+                uses.setdefault(dependency, []).append((inside, certain, True))
+            retained[name] = code, kind
+
+        members: dict[str | None, list[str]] = {}
+        for name in reversed(retained):
+            members.setdefault(scope[name], []).append(name)
         calls = re.compile(rf"\b({prefix}\d+)\(\)")
 
-        def bind(code):
-            return calls.sub(lambda match: match[1] if match[1] in eager else match[0], code)
+        def result(kind):
+            if kind.startswith("array:"):
+                return f"std::array<double, {kind.partition(':')[2]}>"
+            return _CPP_TYPES[kind]
 
-        declarations = []
-        for code, name, lazy, kind in reversed(retained):
+        def written(match):
+            name = match[1]
+            if name in eager:
+                return name
+            if name not in inline:
+                return match[0]
+            code, kind = retained[name]
+            inner = "".join(f"{line} " for line in declare(name))
             code = bind(code)
-            if lazy and name not in eager:
-                if kind.startswith("array:"):
-                    scalar = f"std::array<double, {kind.partition(':')[2]}>"
-                    declarations.append(
-                        f"bool {name}_ready = false; {scalar} {name}_value{{}}; "
-                        f"const auto {name} = [&]() -> const {scalar}& {{ "
-                        f"if (!{name}_ready) {{ {name}_value = {code}; {name}_ready = true; }} "
-                        f"return {name}_value; }};"
-                    )
-                else:
-                    scalar = _CPP_TYPES[kind]
-                    declarations.append(
-                        f"bool {name}_ready = false; {scalar} {name}_value{{}}; "
-                        f"const auto {name} = [&]() -> {scalar} {{ "
-                        f"if (!{name}_ready) {{ {name}_value = {code}; {name}_ready = true; }} "
-                        f"return {name}_value; }};"
-                    )
-            else:
-                declarations.append(f"const auto {name} = {code};")
-        return [*declarations, *(bind(line) for line in lines)]
+            return (f"([&]() -> {result(kind)} {{ {inner}return {code}; }}())"
+                    if inner else f"({code})")
+
+        def bind(code):
+            return calls.sub(written, code)
+
+        def declare(owner):
+            declarations = []
+            for name in members.get(owner, ()):
+                if name in inline:
+                    continue
+                code, kind = retained[name]
+                if name in eager:
+                    declarations.append(f"const auto {name} = {bind(code)};")
+                    continue
+                scalar = result(kind)
+                returned = f"const {scalar}&" if kind.startswith("array:") else scalar
+                inner = "".join(f"{line} " for line in declare(name))
+                declarations.append(
+                    f"bool {name}_ready = false; {scalar} {name}_value{{}}; "
+                    f"const auto {name} = [&]() -> {returned} {{ "
+                    f"if (!{name}_ready) {{ {inner}{name}_value = {bind(code)}; "
+                    f"{name}_ready = true; }} "
+                    f"return {name}_value; }};"
+                )
+            return declarations
+
+        return [*declare(None), *(bind(line) for line in lines)]
 
     def trace_outputs(self, method: Any,
                       attributes: dict[str, _Expression] | None = None) -> list[str]:

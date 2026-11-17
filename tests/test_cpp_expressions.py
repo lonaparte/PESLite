@@ -1,5 +1,6 @@
 """Scalar lowering shares arithmetic without evaluating inactive branches or opaque calls."""
 
+import itertools
 import subprocess
 from types import SimpleNamespace
 
@@ -20,6 +21,28 @@ def _function(name, equation, statements=None):
     lines = [f"return {value.code};"] if statements is None else statements(value.code)
     body = generator._term_declarations(prefix, terms, lines)
     return f"double {name}(double input_value) {{\n" + "\n".join(body) + "\n}"
+
+
+def _rows(tmp_path, compiler, functions, main):
+    source = tmp_path / "expressions.cpp"
+    source.write_text('''#include <cfenv>
+#include <cmath>
+#include <complex>
+#include <iomanip>
+#include <iostream>
+using Complex = std::complex<double>;
+int calls = 0;
+double probe(double value) { ++calls; return value; }
+double next_value() { return ++calls; }
+''' + "\n".join(functions) + '''
+int main() {
+    std::cout << std::setprecision(17);
+''' + main + "}\n", encoding="utf-8")
+    binary = tmp_path / "expressions"
+    subprocess.run([compiler, "-std=c++17", "-O0", str(source), "-o", str(binary)],
+                   check=True, capture_output=True, text=True, timeout=60)
+    result = subprocess.run([str(binary)], check=True, capture_output=True, text=True, timeout=10)
+    return [[float(value) for value in row.split()] for row in result.stdout.splitlines()]
 
 
 def test_shared_expressions_keep_linear_work_and_guarded_evaluation(tmp_path):
@@ -53,19 +76,7 @@ def test_shared_expressions_keep_linear_work_and_guarded_evaluation(tmp_path):
                   lambda value: ["if (input_value > 2.0) {", f"return {value};", "}", "return 7.0;"]),
         _function("opaque", opaque),
     ]
-    source = tmp_path / "expressions.cpp"
-    source.write_text('''#include <cfenv>
-#include <cmath>
-#include <complex>
-#include <iomanip>
-#include <iostream>
-using Complex = std::complex<double>;
-int calls = 0;
-double probe(double value) { ++calls; return value; }
-double next_value() { return ++calls; }
-''' + "\n".join(functions) + '''
-int main() {
-    std::cout << std::setprecision(17);
+    rows = _rows(tmp_path, compiler, functions, '''
     for (int depth : {8, 12}) {
         calls = 0;
         const double value = depth == 8 ? chain8(1.5) : chain12(1.5);
@@ -81,13 +92,7 @@ int main() {
     calls = 0;
     const double opaque_value = opaque(0.0);
     std::cout << opaque_value << " " << calls << "\\n";
-}
-''', encoding="utf-8")
-    binary = tmp_path / "expressions"
-    subprocess.run([compiler, "-std=c++17", "-O0", str(source), "-o", str(binary)],
-                   check=True, capture_output=True, text=True, timeout=30)
-    result = subprocess.run([str(binary)], check=True, capture_output=True, text=True, timeout=10)
-    rows = [[float(value) for value in row.split()] for row in result.stdout.splitlines()]
+''')
     for row, depth in zip(rows[:2], (8, 12)):
         expected = 1.5
         for _ in range(depth):
@@ -98,3 +103,56 @@ int main() {
     assert rows[3][0] == pytest.approx(1.0 / 6.0)
     assert rows[4] == [7.0, 0.0]
     assert rows[5] == [3.0, 2.0]
+
+
+def test_guarded_terms_are_set_up_on_the_branch_that_uses_them(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    depth = 200
+
+    def nested():
+        value = _Expression("input_value", "real")
+        slow = _Expression("probe(input_value)", "real", pure=True)
+        partial = np.sqrt((value - 2.0) * (slow + value) * (slow + 2.0))
+        inner = np.where(value > 3.0, partial / (value + value), partial + partial)
+        return np.where(value > 2.0, inner * (value - 1.0), 7.0)
+
+    def chain():
+        value = _Expression("input_value", "real")
+        result = np.sqrt(value - float(depth)) / (value + value)
+        for level in reversed(range(depth)):
+            result = np.where(value > float(level),
+                              np.sqrt(value - float(level)) / (value + value) + result,
+                              float(level))
+        return result
+
+    functions = {"nested": _function("nested", nested), "chain": _function("chain", chain)}
+    assert "_ready" in functions["nested"]
+    assert "_ready" not in functions["nested"].partition("?")[0]
+    assert max(itertools.accumulate(
+        (char in "([{") - (char in ")]}") for char in functions["chain"])) < 256
+
+    rows = _rows(tmp_path, compiler, functions.values(), '''
+    for (double input : {0.0, 2.5, 4.0}) {
+        calls = 0;
+        std::feclearexcept(FE_ALL_EXCEPT);
+        const double value = nested(input);
+        std::cout << value << " " << calls << " "
+                  << std::fetestexcept(FE_INVALID | FE_DIVBYZERO) << "\\n";
+    }
+    std::cout << chain(-1.0) << " " << chain(50.5) << " " << chain(500.0) << "\\n";
+''')
+
+    def expected(value, level=0):
+        if level == depth:
+            return np.sqrt(value - depth) / (value + value)
+        if value <= level:
+            return float(level)
+        return np.sqrt(value - level) / (value + value) + expected(value, level + 1)
+
+    assert rows[0] == [7.0, 0.0, 0.0]
+    assert rows[1] == [pytest.approx(2.0 * np.sqrt(11.25) * 1.5, rel=1e-14), 2.0, 0.0]
+    assert rows[2] == [pytest.approx(np.sqrt(96.0) / 8.0 * 3.0, rel=1e-14), 2.0, 0.0]
+    assert rows[3] == [pytest.approx(expected(value), rel=1e-12)
+                       for value in (-1.0, 50.5, 500.0)]
