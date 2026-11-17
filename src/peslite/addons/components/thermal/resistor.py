@@ -11,8 +11,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from ...components.network import Element, register_component_type
-from ...solver import Bag, ConfigError, Empty, OutputMethod, Port
+from ....components.network import Element, register_component_type
+from ....solver import Bag, ConfigError, Empty, OutputMethod, Port
 
 __all__ = ["ThermalResistor", "ThermalResistorModel"]
 

@@ -12,10 +12,11 @@ from typing import Any, ClassVar, Mapping
 
 import numpy as np
 
-from ...components.network import Element, register_component_type
-from ...solver import Bag, ConfigError, Empty
-from ..functions.semiconductor_losses import SemiconductorLossModel, SwitchingEvent, _lookup
-from .thermal_network import FosterImpedance, LumpedThermalNetwork, _positive, _record
+from ....components.network import Element, register_component_type
+from ....solver import Bag, ConfigError, Empty
+from ...functions.thermal import SemiconductorLossModel, SwitchingEvent
+from ...functions.thermal.losses import _lookup
+from .network import FosterImpedance, LumpedThermalNetwork, _positive, _record
 
 __all__ = ["ElectroThermalModel", "ElectroThermal"]
 
@@ -209,7 +210,9 @@ class ElectroThermal(Element):
                 raise ConfigError("select exactly one of heat_source or current_source")
             if (self.heat_source is not None and
                     self.conduction_voltage_V is not None):
-                raise ConfigError("electrically accounted and estimated conduction must not overlap")
+                raise ConfigError(
+                    "electrically accounted and estimated conduction must not overlap"
+                )
             if (self.current_source is not None and self.conduction_voltage_V is None):
                 raise ConfigError("current_source requires a conduction voltage estimate")
 

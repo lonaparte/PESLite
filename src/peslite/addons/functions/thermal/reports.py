@@ -1,4 +1,4 @@
-"""Thermal reports from the existing restartable PESLite result histories."""
+"""Reports from restartable PESLite thermal histories."""
 
 from __future__ import annotations
 

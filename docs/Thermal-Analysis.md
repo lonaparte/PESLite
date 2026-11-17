@@ -1,9 +1,7 @@
 # Thermal Analysis
 
-The standard PESLite installation includes the `semiconductor_losses`, `thermal_analysis`,
-`thermal_network`, `electrothermal` and `thermal_resistor` addons. `peslite-full` additionally
-provides the `advanced_thermal` addon for shared thermal networks, imported thermal ROMs and
-general thermal laws.
+The standard PESLite installation includes the `thermal` addon. `peslite-full` additionally
+includes the `thermalport` addon for external thermal models.
 
 Thermal states use the existing simulation model, solvers, result files and restart mechanism;
 there is no separate thermal solver or duplicated electrical network.
@@ -50,7 +48,7 @@ watt (K/W).
   builds a junction-to-case-to-ambient ladder and can participate in shared cooling networks.
 - `FosterImpedance` represents parallel transient-impedance branches relative to fixed ambient. Its
   branches do not represent physical case or heat-sink nodes.
-- `thermal_rom` evaluates a supplied stable continuous-time reduced-order model.
+- `thermalport` evaluates a stable continuous-time model imported from an external file.
 - `shared_thermal_network` assigns several named heat inputs to nodes in one thermal network.
 
 Thermal dynamics use the configured PESLite integrator. A first-order RC network follows
@@ -97,19 +95,33 @@ $$
 T=T_{\mathrm{ambient}}+\boldsymbol{C}\boldsymbol{x}+DP.
 $$
 
-Configure it directly or load the same SI matrices with `load_thermal_rom()`:
+Store the model in a `thermalport` file:
+
+```json
+{
+  "format": "peslite-thermalport",
+  "version": 1,
+  "units": "SI",
+  "A_per_s": [[-0.125]],
+  "B_K_per_J": [0.5],
+  "C": [1.0],
+  "D_K_W": 0.0,
+  "ambient_K": 300.0,
+  "initial": [0.0]
+}
+```
+
+Connect it to an existing heat signal:
 
 ```yaml
 elements:
   thermal:
-    type: thermal_rom
+    type: thermalport
     heat_source: magnet.loss_W
-    A_per_s: [[-0.125]]
-    B_K_per_J: [0.5]
-    C: [1.0]
-    D_K_W: 0.0
-    ambient_K: 300.0
+    file: models/magnet-thermal.json
 ```
+
+Use `load_thermalport()` to load the same file through the Python API.
 
 `shared_thermal_network` maps every configured source path to a named thermal node:
 

@@ -72,7 +72,7 @@ electrical state. A nonpositive resistance is rejected.
 
 ## Custom boundaries
 
-`ThermalPortModel` accepts a thermal law with `initial_state`, `rhs()` and `temperature_K()`.
+`ThermalPort` accepts an external thermal law with `initial_state`, `rhs()` and `temperature_K()`.
 `initial_state` may be empty for an algebraic thermal law. Magnetic constitutive laws use the
 independent `MagComponent` and `MagPort` interfaces described in
 [Magnetic Components](Magnetic-Components.md).

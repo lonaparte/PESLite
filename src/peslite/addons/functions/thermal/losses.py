@@ -1,4 +1,4 @@
-"""Post-run semiconductor heat accounting on existing PESLite circuit traces.
+"""Semiconductor heat accounting for the thermal addon.
 
 Estimated losses are not an electrical energy sink. Switching energies must come from
 explicitly supplied, *committed* transitions, never from sampled gate traces.

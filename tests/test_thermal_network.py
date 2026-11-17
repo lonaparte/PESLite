@@ -6,14 +6,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from peslite.addons.components.electrothermal import ElectroThermal, ElectroThermalModel
-from peslite.addons.components.thermal_network import (
+from peslite.addons.components.thermal import (
+    ElectroThermal, ElectroThermalModel,
     FosterImpedance, LumpedThermalNetwork, ThermalLink,
 )
-from peslite.addons.functions.semiconductor_losses import (
+from peslite.addons.functions.thermal import (
     LossTable, SemiconductorLossModel, SwitchingEvent,
-)
-from peslite.addons.functions.thermal_analysis import (
     thermal_report, compare_thermal_reports,
 )
 from peslite.solver.model import Model

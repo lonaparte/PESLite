@@ -59,7 +59,9 @@ def main(directory: str = "dist") -> int:
         ),
         "peslite": (
             "peslite/addons/components/magcomponent.py",
+            "peslite/addons/components/thermal/__init__.py",
             "peslite/addons/formats/legacy_yaml.py",
+            "peslite/addons/functions/thermal/__init__.py",
             "peslite/addons/functions/stability.py",
             "share/peslite/examples/gfl-example.pes",
         ),
@@ -78,7 +80,7 @@ def main(directory: str = "dist") -> int:
         ),
         "peslite-full": (
             "peslite/addons/components/magport.py",
-            "peslite/addons/components/advanced_thermal.py",
+            "peslite/addons/components/thermalport.py",
             "peslite/addons/components/magcircuit.py",
             "peslite/addons/functions/magport.py",
             "peslite/addons/functions/magcircuit.py",

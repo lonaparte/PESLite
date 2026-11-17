@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from peslite.addons.components.thermal_resistor import (
+from peslite.addons.components.thermal import (
     ThermalResistor, ThermalResistorModel,
 )
 from peslite.solver.model import Model
@@ -95,6 +95,7 @@ def test_temperature_dependent_resistor_is_memoryless_in_a_complete_circuit(tmp_
             "simulation.output.period": 1.0e-5,
             "simulation.output.precision": 17,
             "simulation.solver.linearisations": 0,
+            "simulation.energy_check": "off",
         },
     ).replace(**{
         "elements.load": {
@@ -106,13 +107,14 @@ def test_temperature_dependent_resistor_is_memoryless_in_a_complete_circuit(tmp_
             "reference_K": 300.0,
         },
         "elements.thermal": {
-            "type": "thermal_rom",
+            "type": "electrothermal",
             "heat_source": "load.heat_W",
-            "A_per_s": [[-1.0]],
-            "B_K_per_J": [1.0],
-            "C": [1.0],
-            "D_K_W": 0.0,
+            "c_j_J_K": 1.0,
+            "r_jc_K_W": 1.0,
+            "c_c_J_K": 1.0,
+            "r_ca_K_W": 1.0,
             "ambient_K": 300.0,
+            "initial_K": 300.0,
         },
     })
     simulation = peslite.Simulation(params)

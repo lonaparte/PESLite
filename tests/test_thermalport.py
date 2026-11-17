@@ -1,4 +1,4 @@
-"""Advanced shared cooling, imported reduced thermal models and magnetic feedback."""
+"""Shared cooling and external thermalport models."""
 
 import json
 from types import SimpleNamespace
@@ -6,13 +6,30 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from peslite.addons.components.advanced_thermal import (
-    ReducedThermalElement, ReducedThermalModel, SharedThermalModel,
-    SharedThermalNetwork, ThermalPortModel, foster_step_response,
-    load_thermal_rom,
+from peslite.addons.components.thermal import (
+    LumpedThermalNetwork, SharedThermalModel, SharedThermalNetwork, ThermalLink,
 )
-from peslite.addons.components.thermal_network import LumpedThermalNetwork, ThermalLink
+from peslite.addons.components.thermalport import (
+    ThermalPort, ThermalPortModel,
+)
+from peslite.addons.functions import foster_step_response, load_thermalport
 from peslite.solver.model import Model
+
+
+def _thermalport_file(path, *, A=None, B=None, C=None, D=0.0, ambient=300.0):
+    data = {
+        "format": "peslite-thermalport",
+        "version": 1,
+        "units": "SI",
+        "A_per_s": [[-1.0]] if A is None else A,
+        "B_K_per_J": [1.0] if B is None else B,
+        "C": [1.0] if C is None else C,
+        "D_K_W": D,
+        "ambient_K": ambient,
+        "initial": [0.0],
+    }
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
 
 
 def test_shared_electrical_and_magnetic_loss_inputs_conserve_heat():
@@ -93,18 +110,20 @@ def test_shared_thermal_registration_is_configuration_driven():
         )
 
 
-def test_rom_matches_first_order_analytic_response():
+def test_thermalport_matches_first_order_analytic_response(tmp_path):
     # dx/dt = -x/(R*C) + P/C; T = ambient + x
     R, C, P = 4.0, 2.0, 10.0
-    model = ReducedThermalModel(
-        A_per_s=[[-1.0 / (R * C)]], B_K_per_J=[1.0 / C],
-        C=[1.0], D_K_W=0.0, ambient_K=300,
-    )
+    model = load_thermalport(_thermalport_file(
+        tmp_path / "thermal.json",
+        A=[[-1.0 / (R * C)]],
+        B=[1.0 / C],
+        C=[1.0],
+    ))
     model.input.heat_W = P
     model.set_outputs(0)
     assert model.rhs(0) == pytest.approx([P / C])
     state = Model({"rom": model}, {})
-    assert state.state_labels() == ["rom.rom_0_K"]
+    assert state.state_labels() == ["rom.state_0"]
     t = 2.0
     exact = 300 + R * P * (1 - np.exp(-t / (R * C)))
     assert exact == pytest.approx(foster_step_response(
@@ -150,41 +169,40 @@ def test_thermal_port_allows_a_stateless_constitutive_law():
     assert circuit.rhs(0.0, np.empty(0)).size == 0
 
 
-def test_rom_json_requires_declared_si_and_stable_matrices(tmp_path):
-    file = tmp_path / "thermal.json"
-    data = {"format": "peslite-thermal-rom-v1", "units": "SI",
-            "A_per_s": [[-1.0]], "B_K_per_J": [1.0],
-            "C": [1.0], "D_K_W": 0.0, "ambient_K": 300}
-    file.write_text(json.dumps(data), encoding="utf-8")
-    imported = load_thermal_rom(file)
+def test_thermalport_requires_declared_si_and_stable_matrices(tmp_path):
+    file = _thermalport_file(tmp_path / "thermal.json")
+    imported = load_thermalport(file)
     assert imported.rhs(0) == (0.0,)
-    assert isinstance(imported, ReducedThermalModel)
+    assert isinstance(imported, ThermalPortModel)
+    data = json.loads(file.read_text(encoding="utf-8"))
     data["units"] = "imperial"
     file.write_text(json.dumps(data), encoding="utf-8")
-    with pytest.raises(ValueError, match="SI units"):
-        load_thermal_rom(file)
+    with pytest.raises(ValueError, match="format, version, and SI units"):
+        load_thermalport(file)
+    data["units"] = "SI"
+    data["A_per_s"] = [[0.0]]
+    file.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ValueError, match="strictly stable"):
-        ReducedThermalModel([[0]], [1], [1], 0)
+        load_thermalport(file)
 
 
-def test_reduced_thermal_adapter_consumes_a_physical_heat_source():
-    config = ReducedThermalElement.Params(
-        heat_source="load.power", A_per_s=[[-1]], B_K_per_J=[1],
-        C=[1], D_K_W=0, ambient_K=300,
+def test_thermalport_consumes_a_physical_heat_source(tmp_path):
+    config = ThermalPort.Params(
+        heat_source="load.power",
+        file=str(_thermalport_file(tmp_path / "thermal.json")),
     )
-    element = ReducedThermalElement("rom", config, {}, None)
+    element = ThermalPort("thermal", config, {}, None)
     assert element.connections() == {(element.model, "heat_W"): "load.power"}
-    assert element.subsystems() == {"rom": element.model}
-    assert element.signals()["rom.temperature_K"] == pytest.approx(300.0)
+    assert element.subsystems() == {"thermal": element.model}
+    assert element.signals()["thermal.temperature_K"] == pytest.approx(300.0)
 
 
-def test_shared_sink_and_rom_do_not_change_core_only_electrical_install():
+def test_thermal_component_types_share_the_component_registry():
     import peslite
-    from peslite.assembly.params import from_dict
 
-    # All optional component types register through the shared element registry.
+    # Standard and full addon types use the same component registry.
     from peslite.components.network import ELEMENT_TYPES
-    for name in ("shared_thermal_network", "thermal_rom"):
+    for name in ("shared_thermal_network", "thermalport"):
         assert name in ELEMENT_TYPES
     assert callable(peslite.Simulation)
 
@@ -193,6 +211,7 @@ def test_magnetic_and_thermal_ports_couple_without_owning_each_other(tmp_path):
     import peslite
     from peslite.assembly.params import from_dict
 
+    model_file = _thermalport_file(tmp_path / "thermal.json")
     case = {
         "base": {"s_base": 1.0},
         "buses": {"node": {"phases": 1}},
@@ -209,13 +228,9 @@ def test_magnetic_and_thermal_ports_couple_without_owning_each_other(tmp_path):
             },
             "load": {"type": "resistor", "bus": "node", "r": 1.0},
             "thermal": {
-                "type": "thermal_rom",
+                "type": "thermalport",
                 "heat_source": "magnet.loss_W",
-                "A_per_s": [[-1.0]],
-                "B_K_per_J": [1.0],
-                "C": [1.0],
-                "D_K_W": 0.0,
-                "ambient_K": 300.0,
+                "file": str(model_file),
             },
         },
         "simulation": {

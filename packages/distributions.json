@@ -21,14 +21,14 @@
       "!src/peslite/addons/control/__init__.py",
       "!src/peslite/addons/formats/__init__.py",
       "!src/peslite/addons/functions/__init__.py",
-      "!src/peslite/addons/components/advanced_thermal.py"
+      "!src/peslite/addons/components/thermalport.py"
     ],
     "full-addons": [
       "src/peslite/addons/components/magport.py",
       "src/peslite/addons/components/magcircuit.py",
       "src/peslite/addons/functions/magport.py",
       "src/peslite/addons/functions/magcircuit.py",
-      "src/peslite/addons/components/advanced_thermal.py"
+      "src/peslite/addons/components/thermalport.py"
     ],
     "gui": [
       "src/peslite/gui/**/*.py",

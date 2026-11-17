@@ -1,4 +1,4 @@
-"""Compact, passive, SI thermal RC networks for the standard PESLite add-on.
+"""Compact, passive, SI thermal RC networks for the thermal addon.
 
 One thermal state belongs to each capacitive node. Positive heat (W) enters a
 node; conduction through R (K/W) and convection to fixed ambient remove heat.
@@ -13,7 +13,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from ...solver import Bag
+from ....solver import Bag
 
 __all__ = ["ThermalLink", "LumpedThermalNetwork", "FosterImpedance"]
 
