@@ -43,8 +43,11 @@ signal contract remains unchanged.
 
 ## Electrical and thermal coupling
 
-`thermal_resistor` is an electrical resistance whose constitutive equation uses an external
-temperature signal:
+`ThermalComponent` is the thermal addon's common contract for physical components whose
+constitutive properties depend on temperature. Concrete components keep ordinary electrical ports
+and solvers while a `ThermalPropertyLaw` supplies their current physical properties.
+
+`thermal_resistor` is one implementation:
 
 ```yaml
 elements:
@@ -58,7 +61,7 @@ elements:
 
   thermal_load:
     type: electrothermal
-    heat_source: load.heat_W
+    heat_source: load.loss_W
     c_j_J_K: 0.2
     r_jc_K_W: 1.5
     c_c_J_K: 1.0
@@ -67,7 +70,7 @@ elements:
     initial_K: 300.0
 ```
 
-Its current is `u / R(T)` and its published heat is `R(T) i²`; it introduces no artificial
+Its current is `u / R(T)` and its published loss is `R(T) i²`; it introduces no artificial
 electrical state. A nonpositive resistance is rejected.
 
 ## Custom boundaries

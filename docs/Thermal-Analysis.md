@@ -39,6 +39,14 @@ Exact switching losses require confirmed `SwitchingEvent` records. Rejected solv
 sparsely recorded gate commands are not switching events. `turn_on_includes_reverse_recovery=True`
 prevents the same recovery energy from being counted again.
 
+## Temperature-dependent components
+
+`ThermalComponent` is the common runtime contract for physical components whose constitutive
+properties depend on temperature. It uses the ordinary component ports and solvers, consumes a
+`temperature_K` signal and publishes realized `loss_W`. A `ThermalPropertyLaw` returns the named
+physical properties used by its concrete component. `thermal_resistor` provides the standard
+temperature-dependent resistance implementation.
+
 ## Thermal networks
 
 Thermal quantities use kelvin (K), watts (W), joules (J), joules per kelvin (J/K) and kelvin per

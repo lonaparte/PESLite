@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from peslite.addons.components.thermal import (
-    ThermalResistor, ThermalResistorModel,
+    ThermalComponent, ThermalResistor, ThermalResistorModel,
 )
 from peslite.solver.model import Model
 
@@ -22,7 +22,27 @@ def test_r_of_temperature_changes_real_electrical_voltage_equation():
     assert cold == pytest.approx(5.0)
     assert hot == pytest.approx(2.5)
     assert resistor.resistance() == pytest.approx(4.0)
+    assert isinstance(resistor, ThermalComponent)
     assert resistor.dissipated_power() == pytest.approx(25.0)
+
+
+def test_thermal_component_accepts_an_independent_property_law():
+    class MeasuredResistance:
+        property_names = ("resistance_Ohm",)
+
+        @staticmethod
+        def properties(temperature_K):
+            return (2.0 if temperature_K < 350.0 else 5.0,)
+
+    resistor = ThermalResistorModel(
+        1.0, 0.0, 300.0, thermal_law=MeasuredResistance()
+    )
+    resistor.input.voltage = 10.0
+    resistor.input.temperature_K = 400.0
+    resistor.set_outputs(0.0)
+    assert resistor.output.resistance_Ohm == pytest.approx(5.0)
+    assert resistor.output.current == pytest.approx(2.0)
+    assert resistor.output.loss_W == pytest.approx(20.0)
 
 
 def test_electrical_temperature_connection_uses_existing_model_graph():
@@ -75,7 +95,7 @@ def test_registered_thermal_resistor_uses_the_bus_power_convention():
     three_phase.model.input.voltage = 10 + 5j
     three_phase.model.set_outputs(0.0)
     assert three_phase.model.output.current == pytest.approx((10 + 5j) / 2)
-    assert three_phase.model.output.heat_W == pytest.approx(1.5 * 125 / 2)
+    assert three_phase.model.output.loss_W == pytest.approx(1.5 * 125 / 2)
     with pytest.raises(ValueError, match="positive"):
         ThermalResistor.Params(
             bus="dc", temperature_source="thermal.temperature_K",
@@ -108,7 +128,7 @@ def test_temperature_dependent_resistor_is_memoryless_in_a_complete_circuit(tmp_
         },
         "elements.thermal": {
             "type": "electrothermal",
-            "heat_source": "load.heat_W",
+            "heat_source": "load.loss_W",
             "c_j_J_K": 1.0,
             "r_jc_K_W": 1.0,
             "c_c_J_K": 1.0,
@@ -122,4 +142,4 @@ def test_temperature_dependent_resistor_is_memoryless_in_a_complete_circuit(tmp_
         label.startswith("load.") for label in simulation.system.model.state_labels()
     )
     result = simulation.run(out_dir=tmp_path)
-    assert np.max(result.plant["load.heat_W"]) > 0.0
+    assert np.max(result.plant["load.loss_W"]) > 0.0
