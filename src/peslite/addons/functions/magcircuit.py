@@ -1,4 +1,4 @@
-"""Offline magnetic-circuit reduction and MagPort exchange helpers."""
+"""Offline magnetic-circuit reduction and magport exchange helpers."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def export_magnetic_circuit(
     field_points: Any | None = None,
     field_per_flux: Any | None = None,
 ) -> Path:
-    """Write the exact linear reduction of one magnetic circuit through MagPort."""
+    """Write the exact linear reduction of one magnetic circuit through magport."""
     inductance, response, matrix = _linear_circuit(
         reluctance, coupling, incidence
     )

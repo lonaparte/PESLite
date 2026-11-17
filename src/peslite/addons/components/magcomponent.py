@@ -1,4 +1,4 @@
-"""Magnetic components and their constant-inductance coupled-coil implementation."""
+"""MagComponent contract and its coupled-coil implementation."""
 
 from __future__ import annotations
 

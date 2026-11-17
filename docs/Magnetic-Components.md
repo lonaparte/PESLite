@@ -1,14 +1,13 @@
 # Magnetic Components
 
-The standard PESLite installation includes the `magnetic` addon, which provides `MagComponent`
-and constant inductance-matrix simulation. `peslite-full` additionally provides the `magport` and
-`magcircuit` addons.
-
 PESLite connects magnetic devices to the electrical circuit through ordinary component ports.
 `MagComponent` is the abstract component boundary for project-defined magnetic devices: it adds an
 optional physical magnetic description to the normal electrical component contract without
 prescribing a device type. Its electrical behavior may be supplied by a netlist, a constitutive law
 or imported data.
+
+The standard PESLite installation includes the `magcomponent` addon. `peslite-full` additionally
+includes the `magport` and `magcircuit` addons.
 
 ## MagComponent interface
 
@@ -30,7 +29,7 @@ path as other components. Every winding publishes:
 | `<element>.u_<winding>` | terminal voltage, including winding resistance, in V |
 | `<element>.copper_loss_W` | winding loss in W |
 | `<element>.core_loss_W` | loss reported by the magnetic constitutive law in W |
-| `<element>.loss_W` | total magnetic-component loss in W |
+| `<element>.loss_W` | total magnetic component loss in W |
 
 The component owns its electrical states, stored energy and losses, so restart, continuation and
 energy accounting use the normal PESLite mechanisms.
@@ -52,9 +51,9 @@ peslite magcomponent-wpt-example
 
 The complete component definition is kept in the example file rather than duplicated here.
 
-## MagPort addon
+## `magport` addon
 
-`magport` connects a magnetic constitutive law to ordinary electrical winding terminals. A constant
+`MagPort` connects a magnetic constitutive law to ordinary electrical winding terminals. A constant
 inductance matrix uses the ordinary coupled-inductor netlist model. A nonlinear law uses winding
 flux linkages as PESLite states and maps them, together with any additional magnetic states, to
 winding currents:
@@ -67,8 +66,8 @@ $$
 $$
 
 For an analytical or externally coupled law, implement `currents()` and add `derivatives()` when
-the law has internal state. `MagPortElement` supplies winding ports, electrical records and state
-registration, so a project-defined component only supplies its constitutive behavior. Every entry
+the law has internal state. Project-defined elements may inherit `MagPort` and pass the law to its
+constructor; winding ports, electrical records and state registration remain shared. Every entry
 in `initial_state` becomes an ordinary restartable PESLite state. A conservative law may also
 provide `stored_energy()` and `stored_energy_rate()` for energy accounting.
 
@@ -77,9 +76,9 @@ constitutive law along its registered state derivatives and solves the resulting
 with the circuit. Series inductors and other rate-dependent network structures therefore use the
 same law without a separate magnetic topology.
 
-## MagCircuit addon
+## `magcircuit` addon
 
-`magcircuit` evaluates a branch-based magnetic network during simulation. Each branch supplies one
+`MagCircuit` evaluates a branch-based magnetic network during simulation. Each branch supplies one
 constitutive description, `nodes` define flux-continuity equations and `coupling` gives the signed
 winding turns on each branch:
 
@@ -131,9 +130,9 @@ constitutive model, or when several simulation cases reuse the same data. PESLit
 constitutive result and owns all simulation states; it does not run the external tool during a
 simulation.
 
-### MagPort files
+### `magport` files
 
-A MagPort file may contain either a constant inductance matrix or a sampled nonlinear
+A `magport` file may contain either a constant inductance matrix or a sampled nonlinear
 flux-linkage-to-current map:
 
 ```yaml
@@ -161,7 +160,7 @@ Exactly one constitutive law is stored. For several windings, nonlinear interpol
 only inside the convex hull of the sampled flux-linkage vectors, so the samples must cover the
 complete operating range.
 
-Create a MagPort file with `write_magport`:
+Create a `magport` file with `write_magport`:
 
 ```python
 from peslite.addons.functions import write_magport
@@ -183,7 +182,7 @@ by `magcircuit`, but does not replace the stored constitutive law.
 
 ### Field reconstruction
 
-When a MagPort file contains field data, reconstruct the field after simulation:
+When a `magport` file contains field data, reconstruct the field after simulation:
 
 ```python
 from peslite.addons.functions import magnetic_field
@@ -201,7 +200,7 @@ reconstruction is post-processing and adds no work to electrical simulation step
 
 ### Exporting a linear magnetic circuit
 
-Reduce an externally prepared linear magnetic circuit to a reusable MagPort file with
+Reduce an externally prepared linear magnetic circuit to a reusable `magport` file with
 `export_magnetic_circuit`:
 
 ```python

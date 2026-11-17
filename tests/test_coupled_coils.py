@@ -11,7 +11,7 @@ from scipy.linalg import expm
 import peslite
 from peslite.assembly.params import from_dict, to_dict
 from peslite.components.network import ELEMENT_TYPES, element_buses
-from peslite.addons.components.magnetic import (
+from peslite.addons.components.magcomponent import (
     CoupledCoils,
     CoupledCoilsModel,
     MagComponent,

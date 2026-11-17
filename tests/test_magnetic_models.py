@@ -16,7 +16,7 @@ import peslite
 from peslite.addons.components import register_component_type
 from peslite.addons.components.magcircuit import MagCircuitLaw
 from peslite.addons.components.magport import (
-    MagPortElement,
+    MagPort,
     MagPortModel,
     TabulatedMagneticLaw,
     _load,
@@ -28,7 +28,7 @@ from peslite.addons.functions import (
     write_magport,
 )
 from peslite.assembly.params import from_dict
-from peslite.addons.components.magnetic import (
+from peslite.addons.components.magcomponent import (
     MagneticBranchDescription,
     MagneticDescription,
     MagneticParams,
@@ -285,12 +285,18 @@ def test_project_addon_replaces_the_magnetic_law_through_public_interfaces(tmp_p
         gain: float
         type: str = "test_project_magnet"
 
-    class ProjectMagnet(MagPortElement):
+    class ProjectMagnet(MagPort):
         type = "test_project_magnet"
         Params = ProjectParams
 
         def __init__(self, name, cfg, buses, _params):
-            super().__init__(name, cfg, buses, ProjectLaw(cfg.windings, cfg.gain))
+            super().__init__(
+                name,
+                cfg,
+                buses,
+                _params,
+                law=ProjectLaw(cfg.windings, cfg.gain),
+            )
 
     register_component_type(ProjectMagnet)
     try:

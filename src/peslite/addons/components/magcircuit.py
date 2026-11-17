@@ -1,4 +1,4 @@
-"""Nonlinear magnetic-circuit laws connected through the MagPort state boundary."""
+"""Nonlinear magnetic-circuit laws connected through the magnetic-law state boundary."""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
-from .magnetic import MagneticParams, _validate_winding_names
+from .magcomponent import MagneticParams, _MagneticElement, _validate_winding_names
 from ...components.network import register_component_type
 from ...solver import ConfigError
-from .magport import MagPortElement
+from .magport import _attach_magnetic_law
 
 __all__ = ["MagCircuit", "MagCircuitLaw"]
 
@@ -365,7 +365,7 @@ def _branch_law(
 
 
 @register_component_type
-class MagCircuit(MagPortElement):
+class MagCircuit(_MagneticElement):
     """Magnetic branch network evaluated through a dedicated nonlinear magnetic law."""
 
     @dataclass(frozen=True, kw_only=True)
@@ -417,4 +417,4 @@ class MagCircuit(MagPortElement):
             differential=differential,
             stored_energy=stored_energy,
         )
-        super().__init__(name, cfg, buses, law)
+        _attach_magnetic_law(self, name, cfg, buses, law)

@@ -10,7 +10,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 import numpy as np
 
-from .magnetic import (
+from .magcomponent import (
     MagComponent,
     MagneticDescription,
     MagneticParams,
@@ -25,7 +25,6 @@ from ...solver import Bag, ConfigError, OutputMethod, Port, directional_derivati
 __all__ = [
     "MagneticLaw",
     "MagPort",
-    "MagPortElement",
     "MagPortModel",
     "TabulatedMagneticLaw",
 ]
@@ -611,30 +610,35 @@ class MagPortModel(MagComponent):
         return signals
 
 
-class MagPortElement(_MagneticElement):
-    """Assembly adapter from any magnetic law to standard PESLite winding ports."""
-
-    def __init__(self, name: str, cfg: Any, buses: dict, law: MagneticLaw,
-                 magnetic: MagneticDescription | None = None) -> None:
-        _names, resistance, terminals = self._winding_data(
-            name, cfg.windings, law.winding_names, buses
-        )
-        description = cfg.magnetic if magnetic is None else magnetic
-        self._attach(
-            name, cfg,
-            MagPortModel(
-                law,
-                resistance,
-                terminals,
-                description,
-                cfg.temperature_coefficient_per_K,
-                cfg.temperature_reference_K,
-            ),
-        )
+def _attach_magnetic_law(
+    element: _MagneticElement,
+    name: str,
+    cfg: Any,
+    buses: dict,
+    law: MagneticLaw,
+    magnetic: MagneticDescription | None = None,
+) -> None:
+    """Attach one magnetic law through the common winding and signal contracts."""
+    _names, resistance, terminals = element._winding_data(
+        name, cfg.windings, law.winding_names, buses
+    )
+    description = cfg.magnetic if magnetic is None else magnetic
+    element._attach(
+        name,
+        cfg,
+        MagPortModel(
+            law,
+            resistance,
+            terminals,
+            description,
+            cfg.temperature_coefficient_per_K,
+            cfg.temperature_reference_K,
+        ),
+    )
 
 
 @register_component_type
-class MagPort(MagPortElement):
+class MagPort(_MagneticElement):
     """Connect a file-backed linear or nonlinear magnetic law to electrical windings."""
 
     @dataclass(frozen=True, kw_only=True)
@@ -649,7 +653,19 @@ class MagPort(MagPortElement):
 
     type = "magport"
 
-    def __init__(self, name: str, cfg: Any, buses: dict, _params: Any) -> None:
+    def __init__(
+        self,
+        name: str,
+        cfg: Any,
+        buses: dict,
+        _params: Any,
+        *,
+        law: MagneticLaw | None = None,
+        magnetic: MagneticDescription | None = None,
+    ) -> None:
+        if law is not None:
+            _attach_magnetic_law(self, name, cfg, buses, law, magnetic)
+            return
         data = _load(cfg.file)
         if cfg.magnetic is not None and data.magnetic is not None:
             raise ConfigError("magnetic may be provided by the configuration or file, not both")
@@ -658,4 +674,4 @@ class MagPort(MagPortElement):
             self._assemble(name, cfg, data.winding_names, data.inductance, buses, magnetic)
             return
         law = TabulatedMagneticLaw(data.winding_names, data.flux_linkage, data.current)
-        super().__init__(name, cfg, buses, law, magnetic)
+        _attach_magnetic_law(self, name, cfg, buses, law, magnetic)

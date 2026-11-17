@@ -18,7 +18,7 @@ from ..components.magport import (
     _data,
     _load,
 )
-from ..components.magnetic import MagneticDescription
+from ..components.magcomponent import MagneticDescription
 from ...solver import ConfigError
 
 __all__ = ["MagneticFieldResult", "write_magport", "magnetic_field"]
@@ -71,7 +71,7 @@ def write_magport(
     field_points: Any | None = None,
     field_basis: Any | None = None,
 ) -> Path:
-    """Write a linear or sampled nonlinear constitutive law in the MagPort format."""
+    """Write a linear or sampled nonlinear constitutive law in the magport format."""
     return _write(file, _data(
         winding_names, inductance, flux_linkage, current,
         physical, magnetic, field_points, field_basis,
