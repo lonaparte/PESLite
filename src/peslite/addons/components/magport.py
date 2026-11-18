@@ -634,7 +634,7 @@ def _attach_magnetic_law(
     magnetic: MagneticDescription | None = None,
 ) -> None:
     """Attach one magnetic law through the common winding and signal contracts."""
-    _names, resistance, terminals = element._winding_data(
+    _names, resistance, endpoints = element._winding_data(
         name, cfg.windings, law.winding_names, buses
     )
     description = cfg.magnetic if magnetic is None else magnetic
@@ -644,11 +644,12 @@ def _attach_magnetic_law(
         MagPortModel(
             law,
             resistance,
-            terminals,
+            tuple(tuple(endpoint.grounded for endpoint in pair) for pair in endpoints),
             description,
             cfg.temperature_coefficient_per_K,
             cfg.temperature_reference_K,
         ),
+        endpoints,
     )
 
 

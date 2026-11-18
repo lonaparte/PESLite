@@ -11,7 +11,8 @@ from typing import Any, ClassVar, Mapping
 
 import numpy as np
 
-from ...components.network import Element, NetworkComponent, register_component_type
+from ...components.network import (GROUND, Element, NetworkComponent, register_component_type,
+                                   resolve_endpoints)
 from ...solver import Bag, ConfigError, OutputMethod, Port, StoragePort
 
 __all__ = [
@@ -23,9 +24,6 @@ __all__ = [
     "CoupledCoils",
     "CoupledCoilsModel",
 ]
-
-
-GROUND = "ground"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -67,10 +65,9 @@ def _validate_scoped_names(values: Any, path: str) -> tuple[str, ...]:
 
 def _winding_buses(windings: dict[str, WindingParams]) -> dict[str, str]:
     return {
-        f"windings.{name}.{side}": bus
+        f"windings.{name}.{side}": getattr(winding, side)
         for name, winding in windings.items()
         for side in ("positive", "negative")
-        if (bus := getattr(winding, side)) != GROUND
     }
 
 
@@ -532,41 +529,37 @@ class _MagneticElement(Element):
         windings: dict[str, WindingParams],
         winding_names: tuple[str, ...],
         buses: dict,
-    ) -> tuple[tuple[str, ...], tuple[float, ...], tuple[tuple[bool, bool], ...]]:
+    ) -> tuple[tuple[str, ...], tuple[float, ...], tuple[tuple[Any, Any], ...]]:
         names = _validate_winding_names(windings)
         if names != tuple(winding_names):
             raise ConfigError(
                 f"elements.{name}: winding order {names!r} does not match "
                 f"model order {tuple(winding_names)!r}"
             )
-        for label, winding in windings.items():
-            for side in ("positive", "negative"):
-                bus = getattr(winding, side)
-                if bus == GROUND:
-                    continue
-                if bus not in buses:
-                    raise ConfigError(
-                        f"elements.{name}.windings.{label}.{side}: unknown bus {bus!r}"
-                    )
-                if buses[bus].phases != 1:
-                    raise ConfigError(
-                        f"elements.{name}.windings.{label}.{side}: "
-                        "magnetic windings require scalar buses"
-                    )
+        endpoints = resolve_endpoints(
+            _winding_buses(windings), buses, f"elements.{name}", same_phases=True
+        )
+        if any(endpoint.phases != 1 for endpoint in endpoints.values()):
+            raise ConfigError(f"elements.{name}: magnetic windings require scalar endpoints")
+        pairs = tuple(
+            (endpoints[f"windings.{label}.positive"],
+             endpoints[f"windings.{label}.negative"])
+            for label in names
+        )
         return (
             names,
             tuple(winding.r for winding in windings.values()),
-            tuple((winding.positive == GROUND, winding.negative == GROUND)
-                  for winding in windings.values()),
+            pairs,
         )
 
-    def _attach(self, name: str, cfg: Any, model: Any) -> None:
+    def _attach(self, name: str, cfg: Any, model: Any, endpoints: Any) -> None:
         self.name, self.cfg, self.model = name, cfg, model
+        self._winding_endpoints = endpoints
 
     def _assemble(self, name: str, cfg: Any, winding_names: tuple[str, ...], inductance: Any,
                   buses: dict, magnetic: MagneticDescription | None) -> None:
         """Assemble a constant winding-inductance law through the shared netlist model."""
-        names, resistance, terminals = self._winding_data(
+        names, resistance, endpoints = self._winding_data(
             name, cfg.windings, winding_names, buses
         )
         self._attach(
@@ -575,11 +568,12 @@ class _MagneticElement(Element):
                 names,
                 inductance,
                 resistance,
-                terminals,
+                tuple(tuple(endpoint.grounded for endpoint in pair) for pair in endpoints),
                 magnetic,
                 cfg.temperature_coefficient_per_K,
                 cfg.temperature_reference_K,
             ),
+            endpoints,
         )
 
     def subsystems(self) -> dict[str, Any]:
@@ -591,10 +585,10 @@ class _MagneticElement(Element):
 
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         return tuple(
-            (bus, port)
-            for winding, pair in zip(self.cfg.windings.values(), self.model.winding_ports)
-            for bus, port in zip((winding.positive, winding.negative), pair)
-            if bus != GROUND
+            (endpoint.name, port)
+            for endpoints, ports in zip(self._winding_endpoints, self.model.winding_ports)
+            for endpoint, port in zip(endpoints, ports)
+            if not endpoint.grounded
         )
 
     def signals(self) -> dict[str, float]:

@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from types import SimpleNamespace
-from typing import Any, Callable, ClassVar, Optional
+from typing import Any, Callable, ClassVar, Mapping, Optional
 
 import numpy as np
 
@@ -18,8 +18,69 @@ from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _complex, _rea
 
 __all__ = [
     "Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode", "register_component_type",
-    "element_buses", "Load", "Resistor", "VoltageSource",
+    "element_buses", "resolve_endpoints", "GROUND", "Load", "Resistor", "VoltageSource",
 ]
+
+
+GROUND = "ground"
+
+
+@dataclass(frozen=True)
+class ElectricalEndpoint:
+    """One resolved electrical connection target used only during assembly."""
+
+    name: str
+    target: Any | None
+    phases: int
+
+    @property
+    def grounded(self) -> bool:
+        return self.target is None
+
+    @property
+    def electrical_domain(self) -> Optional[str]:
+        return None if self.target is None else getattr(self.target, "electrical_domain", None)
+
+
+def resolve_endpoints(
+    connections: Mapping[str, str], endpoints: Mapping[str, Any], where: str, *,
+    same_phases: bool = False,
+) -> dict[str, ElectricalEndpoint]:
+    """Resolve bus and Unit-port names, treating ``ground`` as the shared zero reference.
+
+    Ground has no phase representation of its own. Its representation is inferred from the
+    component's non-ground terminals, so a component connected only to ground is invalid and a
+    ground terminal beside mixed scalar and space-vector terminals is ambiguous.
+    """
+    targets: dict[str, Any | None] = {}
+    for field_name, endpoint_name in connections.items():
+        if endpoint_name == GROUND:
+            targets[field_name] = None
+            continue
+        try:
+            targets[field_name] = endpoints[endpoint_name]
+        except KeyError:
+            raise ConfigError(
+                f"{where}.{field_name}: unknown electrical endpoint {endpoint_name!r}; "
+                f"known: {sorted(endpoints)}"
+            ) from None
+    phases = {int(target.phases) for target in targets.values() if target is not None}
+    if not phases:
+        raise ConfigError(f"{where}: an electrical component cannot connect only to ground")
+    if same_phases and len(phases) != 1:
+        raise ConfigError(f"{where}: all electrical endpoints must have the same phase count")
+    if any(target is None for target in targets.values()) and len(phases) != 1:
+        raise ConfigError(
+            f"{where}: ground phase representation is ambiguous beside mixed-phase endpoints"
+        )
+    ground_phases = next(iter(phases)) if len(phases) == 1 else 0
+    return {
+        field_name: ElectricalEndpoint(
+            connections[field_name], target,
+            ground_phases if target is None else int(target.phases),
+        )
+        for field_name, target in targets.items()
+    }
 
 
 class NetworkComponent:
@@ -604,21 +665,31 @@ class _DeclaredComponent(NetworkComponent):
         self.storage: tuple[StoragePort, ...] = ()
         self.has_source = False
         self.port_by_field: dict[str, Port] = {}
-        for field_name, bus_name in element_buses(config).items():
-            bus = buses[bus_name]
-            phases = int(bus.phases)
+        self.endpoint_by_field = resolve_endpoints(
+            element_buses(config), buses, f"elements.{element.name}"
+        )
+        ground = None
+        for field_name, endpoint in self.endpoint_by_field.items():
+            phases = endpoint.phases
             scale, zero, _initial = _phase_convention(phases)
             name = "power" if field_name == "bus" else field_name[3:]
-            port = Port(
-                self, name, voltage=zero, current=zero, scale=scale,
-                electrical_domain=getattr(bus, "electrical_domain", None),
-                standalone="voltage",
-            )
+            if endpoint.grounded:
+                if ground is None:
+                    ground = Port(
+                        self, GROUND, voltage=zero, current=zero, scale=scale, grounded=True,
+                    )
+                port = ground
+            else:
+                port = Port(
+                    self, name, voltage=zero, current=zero, scale=scale,
+                    electrical_domain=endpoint.electrical_domain,
+                    standalone="voltage",
+                )
             self.port_by_field[field_name] = port
             setattr(self, f"port_{field_name}", port)
         if not self.port_by_field:
             raise TypeError(f"{type(config).__name__} needs a bus or busN parameter")
-        self.ports = tuple(self.port_by_field.values())
+        self.ports = tuple(dict.fromkeys(self.port_by_field.values()))
 
     def network(self, builder):
         network = _ComponentNetwork(self, builder)
@@ -644,8 +715,9 @@ class _ConfiguredComponent(Element):
 
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         return tuple(
-            (bus, self.model.port_by_field[field])
-            for field, bus in element_buses(self.cfg).items()
+            (endpoint.name, self.model.port_by_field[field])
+            for field, endpoint in self.model.endpoint_by_field.items()
+            if not endpoint.grounded
         )
 
     def signals(self) -> dict[str, complex | float]:

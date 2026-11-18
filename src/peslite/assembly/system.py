@@ -10,7 +10,8 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Mapping, Optional
 
-from ..components.network import ACVoltageSource, Bus, ELEMENT_TYPES, RCNode, RLBranch, Port
+from ..components.network import (ACVoltageSource, Bus, ELEMENT_TYPES, GROUND, RCNode, RLBranch,
+                                  Port, resolve_endpoints)
 from ..components.adc import _PortMeasurement
 from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
@@ -144,7 +145,9 @@ def _validate_electrical_domains(
         return resolved
 
     for group in passive_groups:
-        buses = tuple(dict.fromkeys(node(name) for name, _terminal in group))
+        buses = tuple(dict.fromkeys(
+            node(name) for name, _terminal in group if name != GROUND
+        ))
         if buses:
             first = buses[0]
             for other in buses[1:]:
@@ -159,7 +162,7 @@ def _validate_electrical_domains(
         seen_ports.add(id(port))
         constraints.append((node(port.bus), port.electrical_domain, f"unit port {name}"))
     for bus, port in physical_bindings:
-        if port.electrical_domain is not None:
+        if bus != GROUND and port.electrical_domain is not None:
             label = f"{type(port.component).__name__}.{port.name}"
             constraints.append((node(bus), port.electrical_domain, label))
 
@@ -456,14 +459,18 @@ class System:
             )
             for name, cfg in p.sources.items()
         }
-        for name, cfg in p.branches.items():
-            if network_buses[cfg.bus1].phases != network_buses[cfg.bus2].phases:
-                raise ConfigError(f"branches.{name}: both buses must have the same phase count")
+        branch_endpoints = {
+            name: resolve_endpoints(
+                {"bus1": cfg.bus1, "bus2": cfg.bus2}, network_buses,
+                f"branches.{name}", same_phases=True,
+            )
+            for name, cfg in p.branches.items()
+        }
         self.branches = {name: _parameterized(lambda values: RLBranch(
                              values[0].l,
                              values[0].r,
                              phases=values[1],
-                         ), (cfg, network_buses[cfg.bus1].phases))
+                         ), (cfg, next(iter(branch_endpoints[name].values())).phases))
                          for name, cfg in p.branches.items()}
         self.named_elements = {name: _parameterized(
                                   lambda values, name=name: ELEMENT_TYPES[values[0].type](
@@ -505,6 +512,8 @@ class System:
             assembled.endpoints, passive_groups, physical_bindings, resolve_bus
         )
 
+        bound_endpoints: dict[int, str] = {}
+
         def attach_bindings(element: Any, bindings: tuple[tuple[str, Port], ...]) -> None:
             for bus_name, port in bindings:
                 if not isinstance(port, Port):
@@ -512,10 +521,25 @@ class System:
                         f"{type(element).__name__}.port_bindings() returned "
                         f"{type(port).__name__}, not Port"
                     )
-                bus_ports.setdefault(resolve_bus(bus_name), []).append(port)
+                endpoint = GROUND if bus_name == GROUND else resolve_bus(bus_name)
+                previous = bound_endpoints.setdefault(id(port), endpoint)
+                if previous != endpoint:
+                    raise ConfigError(
+                        f"{type(element).__name__}.{port.name} is connected to both "
+                        f"{previous!r} and {endpoint!r}"
+                    )
+                if endpoint == GROUND:
+                    port.standalone = None
+                    port.grounded = True
+                else:
+                    if port.grounded:
+                        raise ConfigError(
+                            f"{type(element).__name__}.{port.name} is internally grounded and "
+                            f"cannot also connect to {endpoint!r}"
+                        )
+                    bus_ports.setdefault(endpoint, []).append(port)
 
-        for bus_name, port in assembled.attached_ports:
-            bus_ports.setdefault(bus_name, []).append(port)
+        attach_bindings(assembled, assembled.attached_ports)
         configured_elements = {id(element) for element in self.named_elements.values()}
 
         def attach_order(entry: tuple) -> int:

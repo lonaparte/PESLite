@@ -8,8 +8,8 @@ commands from the same control graph.
 """
 
 from ..solver import Bag, ConfigError, Empty, Port, StoragePort
-from .network import (ACVoltageSource, Bus, Load, Resistor, RCNode, RLBranch,
-                      VoltageSource, register_component_type)
+from .network import (ACVoltageSource, Bus, GROUND, Load, Resistor, RCNode, RLBranch,
+                      VoltageSource, register_component_type, resolve_endpoints)
 from .converter import (AveragingModel, PWMAveragingModel, SwitchingModel,
                         ThreePhaseBridge,
                         DCCapacitor, DCCurrentSource, DCLink,
@@ -25,7 +25,8 @@ from .onnx import ONNXModel, ONNXStateParams
 
 __all__ = ["Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode",
            "Bag", "Empty", "ConfigError", "StoragePort",
-           "register_component_type", "Load", "Resistor", "VoltageSource",
+           "register_component_type", "resolve_endpoints", "GROUND",
+           "Load", "Resistor", "VoltageSource",
            "ThreePhaseBridge", "SwitchingModel",
            "PWMAveragingModel", "make_bridge", "DCLink",
            "DCCapacitor", "DCCurrentSource", "DCVoltageSource",

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Optional
 
 from ..components.converter import make_topology
 from ..components.pwm import validate_modulator
-from ..components.network import element_buses
+from ..components.network import GROUND, element_buses
 from ..control.controller import continuous_control
 from ..control.profiles import control_type
 from ..solver.integrators import (ADAPTIVE_METHODS, EXPLICIT_FIXED_METHODS, FIXED_METHODS,
@@ -470,6 +470,8 @@ def _network(p: Params) -> None:
         name: unit for name, unit in _unit_items(p.units)
         if unit.bus is not None
     }
+    if GROUND in p.buses:
+        raise ConfigError(f"buses.{GROUND}: {GROUND!r} is the reserved electrical reference")
     for name, bus in p.buses.items():
         if bus.c is not None and bus.c <= 0.0:
             raise ConfigError(f"buses.{name}.c must be > 0 when specified")
@@ -483,7 +485,9 @@ def _network(p: Params) -> None:
         if bus not in p.buses:
             raise ConfigError(f"{where}: unknown bus {bus!r}; known: {sorted(p.buses)}")
 
-    def _element_bus(where: str, bus: str) -> None:
+    def _element_bus(where: str, bus: str, *, allow_ground: bool = False) -> None:
+        if allow_ground and bus == GROUND:
+            return
         name = _unit_path(p.units, bus)
         if name is not None:
             spec = unit_type(p.unit(name).type)
@@ -491,8 +495,8 @@ def _network(p: Params) -> None:
                 return
         _bus_of(where, bus)
     for name, br in p.branches.items():
-        _element_bus(f"branches.{name}.bus1", br.bus1)
-        _element_bus(f"branches.{name}.bus2", br.bus2)
+        _element_bus(f"branches.{name}.bus1", br.bus1, allow_ground=True)
+        _element_bus(f"branches.{name}.bus2", br.bus2, allow_ground=True)
         if br.bus1 == br.bus2:
             raise ConfigError(f"branches.{name}: both ends are {br.bus1!r}")
         if br.l <= 0.0:
@@ -517,8 +521,11 @@ def _network(p: Params) -> None:
                 f"units.{name}.bus: unit type {u.type!r} needs a {phase_name}-phase bus"
             )
     for name, element in p.elements.items():
-        for key, bus in element_buses(element).items():
-            _element_bus(f"elements.{name}.{key}", bus)
+        endpoints = element_buses(element)
+        if endpoints and all(bus == GROUND for bus in endpoints.values()):
+            raise ConfigError(f"elements.{name}: an electrical component cannot connect only to ground")
+        for key, bus in endpoints.items():
+            _element_bus(f"elements.{name}.{key}", bus, allow_ground=True)
         for key, value in vars(element).items():
             if isinstance(value, float) and not math.isfinite(value):
                 raise ConfigError(f"elements.{name}.{key} must be finite")
