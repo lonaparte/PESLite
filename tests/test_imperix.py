@@ -20,7 +20,7 @@ from peslite.solver.simulation import main
 from conftest import EXAMPLES
 from test_cpp_export import _compiler, _run_generated
 
-pytestmark = pytest.mark.full
+pytestmark = pytest.mark.long
 
 
 def _simulation(name="buck"):

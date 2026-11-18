@@ -14,7 +14,7 @@ from peslite.solver import Model
 from peslite.solver.simulation import SystemLoop
 
 
-pytestmark = [pytest.mark.full, pytest.mark.onnx]
+pytestmark = [pytest.mark.long, pytest.mark.onnx]
 
 
 def _session(nodes, inputs, outputs, initializers=()):

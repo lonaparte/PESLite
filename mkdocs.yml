@@ -25,12 +25,13 @@ nav:
       - Multirate Simulation: Multirate-Simulation.md
       - Output and Results: Output-and-Results.md
   - Components:
-      - Passive Components: Passive-Components.md
       - Electrical Sources: Electrical-Sources.md
       - Bridge and PWM: Bridge-and-PWM.md
       - Reference Signals: Reference-Signals.md
       - Voltage-Source Converters: Voltage-Source-Converters.md
       - DC converters and WPT: DC-Converters-and-WPT.md
+      - Passive Components: Passive-Components.md
+      - Magnetic Components: Magnetic-Components.md
       - Black-box Models: Black-Box-Models.md
   - Advanced:
       - Architecture: Architecture.md
@@ -40,6 +41,8 @@ nav:
       - Model Predictive Control: Model-Predictive-Control.md
       - Online System Analysis: Online-System-Analysis.md
       - Offline System Analysis: Offline-System-Analysis.md
+      - Thermal Analysis: Thermal-Analysis.md
+      - Multiphysics Analysis: Multiphysics-Analysis.md
       - Plotting: Plotting.md
   - Reference:
       - CLI Reference: CLI-Reference.md
@@ -52,3 +55,6 @@ markdown_extensions:
   - tables
   - toc:
       permalink: true
+
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js

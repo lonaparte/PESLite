@@ -36,6 +36,7 @@ import copy
 import itertools
 import math
 import re
+import warnings
 from contextvars import ContextVar
 from types import MethodType
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -45,15 +46,16 @@ import numpy as np
 from ..components.network import Port
 from ..solver.energy import Energetic, spec_of
 from ..solver.model import (
-    Bag, ConfigError, Empty, OutputMethod, _InlineProgram, _compile_straight_line,
+    Bag, ConfigError, Empty, OutputMethod, SolverCheck, SolverRegion, SpectralBound,
+    _InlineProgram, _compile_straight_line,
 )
 from ..solver.netlist import (QUANTITIES, CoupledInductors, CurrentSource, Diode, Element, Mode,
                               Netlist, Node, Topology, VoltageSource, _DENSE_GROUP, _Degenerate,
                               _Evaluation, _linear_expression, _numeric_values, _roles, _UnionFind)
 
 __all__ = ["NetlistBuilder", "NetworkPlan", "Circuit", "NetworkView", "circuit_structure",
-           "circuit_mode_key", "circuit_linear_blocks", "circuit_linear_modes",
-           "circuit_linear_certificates",
+           "circuit_mode_key", "circuit_linear_blocks",
+           "circuit_solver_check",
            "lower", "bind_device", "compile_network"]
 
 
@@ -479,7 +481,7 @@ class Circuit:
         self.groups: list[_Group] = []
         self.port_values: list[tuple[Port, Optional[_Group], str, str]] = []
         self.standalone_ports: tuple[Port, ...] = ()
-        self.behavioral_sources: list[tuple[Port, _Group, str, str]] = []
+        self.behavioral_sources: list[tuple[Port, _Group, str, Optional[str], str]] = []
         self.copies: list[tuple[Any, str, str]] = []  # (component, input field, input key)
         self.published: dict[tuple[int, str], str] = {}  # (id(component), out field) -> out key
         self.inputs: dict[str, Any] = {}  # input key -> initial value
@@ -530,6 +532,8 @@ class Circuit:
         self._device_bindings: dict[tuple, tuple[Topology, Callable, Callable]] = {}
         self._device_runtime: Optional[list] = None  # [netlist, topology, evaluator] once compiled
         self._device_commands: Optional[tuple] = None  # boundary commands the runtime was bound for
+        self._transition_consumers: dict[int, tuple[Any, list[Any]]] = {}
+        self._transition_states: dict[int, Any] = {}
         self._structure_plan: Optional["_CircuitPlan"] = None
         self._mode_decompositions: dict[tuple, Optional["_ModeDecomposition"]] = {}
         self.plan_changed = False
@@ -609,23 +613,32 @@ class Circuit:
         }
         for comp in self.components:
             self.declarations[id(comp)].materialize(nb)
-        for port, group, key, kind in self.behavioral_sources:
+        for port, group, key, rate_key, kind in self.behavioral_sources:
             nb.owner = port.component
             source = _BoundValue(self.input, key)
+            derivative = None if rate_key is None else _BoundValue(self.input, rate_key)
             primitive = (
-                CurrentSource(node_of[id(group)], None, source)
+                CurrentSource(
+                    node_of[id(group)], None, source, derivative,
+                    rate_available=rate_key is not None,
+                )
                 if kind == "current" else
-                VoltageSource(node_of[id(group)], None, source)
+                VoltageSource(
+                    node_of[id(group)], None, source, derivative,
+                    rate_available=rate_key is not None,
+                )
             )
             nb.add(primitive)
         for port in self.standalone_ports:
             if port.standalone == "voltage":
                 net.add(VoltageSource(
-                    nodes[id(port)], None, lambda _t, port=port: port.voltage
+                    nodes[id(port)], None, lambda _t, port=port: port.voltage,
+                    _BoundValue(port, "voltage", factor=0.0),
                 ))
             elif port.standalone == "current":
                 net.add(CurrentSource(
-                    None, nodes[id(port)], lambda _t, port=port: port.current
+                    None, nodes[id(port)], lambda _t, port=port: port.current,
+                    _BoundValue(port, "current", factor=0.0),
                 ))
         declared = set(net.states.tolist())
         missing = sorted(f"{type(c).__name__}.{n}" for c, n, _z, i in self.layout if i not in declared)
@@ -673,6 +686,7 @@ class Circuit:
         self.commutation_active = self.locate_commutations or bool(self._hooks)
         self._mirrored_valid = False
         self._boundary_signature = None
+        self._transition_states.clear()
         self._mode_targets, self._discrete_mode_targets, held_ratios = (
             self._mode_input_targets(net)
         )
@@ -681,15 +695,18 @@ class Circuit:
         self._direct_mode_key = None
         self._numeric_stages = False
         self._stage_signature = None
-        if self.form == "device":
-            (self.scalar_derivatives, self.scalar_outputs,
-             self.scalar_output_evaluator) = net.scalar_evaluators()
-            compiled = (
-                self._compile_equation_stages()
-                or (not self._standalone_runtime and self._compile_device_runtime())
-            )
-        else:
-            compiled = self._compile_equation_stages()
+        try:
+            if self.form == "device":
+                (self.scalar_derivatives, self.scalar_outputs,
+                 self.scalar_output_evaluator) = net.scalar_evaluators()
+                compiled = (
+                    self._compile_equation_stages()
+                    or (not self._standalone_runtime and self._compile_device_runtime())
+                )
+            else:
+                compiled = self._compile_equation_stages()
+        except _Degenerate as exc:
+            raise self._degenerate(exc, self.t) from None
         if not compiled:
             self._use_runtime_stages()
         if rebuilding:
@@ -1419,22 +1436,19 @@ class Circuit:
             y[index] = T @ y[index]
         return y
 
-    def linear_mode(self) -> tuple[
-        tuple, Callable[[], np.ndarray], Optional[tuple[object, float]]
-    ]:
-        """Return the present linear-mode identity, matrix builder and stability certificate."""
+    def linear_mode(self) -> tuple[tuple, Callable[[], np.ndarray]]:
+        """Return the present linear-mode identity and lazy matrix builder."""
         topology = self._bound_device_topology()
         if topology is None:
             return self.netlist.linear_mode()
-        return (topology.state_matrix_key(), lambda: topology.state_space.A,
-                topology.state_matrix_stability_certificate())
+        return topology.state_matrix_key(), lambda: topology.state_space.A
 
-    def stability_certificate(self) -> Optional[tuple[object, float]]:
-        """Return the present mode's stability certificate without its identity or matrix."""
+    def spectral_bound(self) -> Optional[tuple[object, float]]:
+        """Return the present mode's proved spectral bound without its exact matrix."""
         topology = self._bound_device_topology()
         if topology is None:
-            return self.netlist.stability_certificate()
-        return topology.state_matrix_stability_certificate()
+            return self.netlist.spectral_bound()
+        return topology.state_matrix_spectral_bound()
 
     def _store(self, y: np.ndarray) -> None:
         """Write a netlist state vector back into the components."""
@@ -1596,7 +1610,9 @@ class Circuit:
             return None
         return runtime[1]
 
-    def held_inputs_changed(self, targets: Sequence[tuple[Any, str]]) -> None:
+    def held_inputs_changed(
+        self, targets: Sequence[tuple[Any, str]], t: float | None = None
+    ) -> tuple[Any, ...]:
         """Select the compiled mode after held circuit inputs changed at a boundary."""
         if any((id(record), field) in self._mode_targets for record, field in targets):
             boundary = self._boundary_mode()
@@ -1606,8 +1622,12 @@ class Circuit:
                     and boundary[1] != previous[1]
                     and self._commutate_state_diodes()):
                 self._boundary_signature = boundary
-                return
+                return (self._commit_transitions(t)
+                        if t is not None and self._transition_consumers else ())
             self._refresh_device_evaluator()
+            if t is not None and self._transition_consumers:
+                return self._commit_transitions(t)
+        return ()
 
     def _refresh_device_mode(self, topology: Optional[Topology] = None) -> None:
         """Bind or regenerate the equations selected by the current structural mode."""
@@ -1718,6 +1738,8 @@ class Circuit:
                 and boundary[1] != previous_boundary[1]
                 and self._commutate_state_diodes()):
             self._boundary_signature = boundary
+            if self._transition_consumers:
+                self._commit_transitions(t)
             return
         net, before = self.netlist, self.gather()
         try:
@@ -1738,6 +1760,8 @@ class Circuit:
             self._mirrored_valid = True
         self._boundary_signature = boundary
         self._refresh_device_mode()
+        if self._transition_consumers:
+            self._commit_transitions(t)
 
     def _boundary_mode(self) -> tuple:
         """Discrete commands that can change the netlist constraints at an outer boundary."""
@@ -1754,6 +1778,59 @@ class Circuit:
             self.commutate(t)
         else:
             self._refresh_device_evaluator()
+            if self._transition_consumers:
+                self._commit_transitions(t)
+
+    def bind_transitions(self, source: Any, consumer: Any) -> bool:
+        """Bind one committed-transition source to a restartable impulse consumer."""
+        if not any(source is component for component in self.components):
+            raise ConfigError("a transition source must belong to its assembled circuit")
+        if not callable(getattr(source, "committed_transition_state", None)) or not callable(
+                getattr(source, "committed_transitions", None)):
+            raise ConfigError(
+                f"{self.names.get(id(source), type(source).__name__)} does not expose "
+                "committed transitions"
+            )
+        if not callable(getattr(consumer, "apply_committed_transitions", None)):
+            raise ConfigError("a transition consumer must implement apply_committed_transitions()")
+        available = getattr(source, "has_committed_transitions", None)
+        if not callable(available) or not available():
+            warnings.warn(
+                f"{self.names.get(id(source), type(source).__name__)} has no resolved switching "
+                "edges; its switching-loss attachment is inactive",
+                stacklevel=4,
+            )
+            return False
+        entry = self._transition_consumers.setdefault(id(source), (source, []))
+        if any(consumer is existing for existing in entry[1]):
+            raise ConfigError("a transition consumer is already bound to this source")
+        entry[1].append(consumer)
+        return True
+
+    def _initialize_transition_states(self) -> None:
+        self._transition_states = {
+            key: source.committed_transition_state()
+            for key, (source, _consumers) in self._transition_consumers.items()
+        }
+
+    def _commit_transitions(self, t: float) -> tuple[Any, ...]:
+        """Dispatch only transitions visible after a physical circuit boundary commits."""
+        self.receive()
+        changed = []
+        for key, (source, consumers) in self._transition_consumers.items():
+            after = source.committed_transition_state()
+            before = self._transition_states.get(key)
+            if before is None or before == after:
+                self._transition_states[key] = after
+                continue
+            events = source.committed_transitions(t, before, after)
+            if events:
+                for consumer in consumers:
+                    if (consumer.apply_committed_transitions(events)
+                            and not any(consumer is existing for existing in changed)):
+                        changed.append(consumer)
+            self._transition_states[key] = after
+        return tuple(changed)
 
     def _commutate_state_diodes(self) -> bool:
         """Apply a gate-only mode change through proved current relations."""
@@ -1778,12 +1855,14 @@ class Circuit:
         self._consistent_constraints = topology.constraint_key()
         self._boundary_signature = self._boundary_mode()
         self._refresh_device_mode()
+        self._initialize_transition_states()
 
     def initialize_mode(self) -> None:
         """Bind the topology established by initial commands without changing physical states."""
         topology = self.netlist.topology()
         self._boundary_signature = self._boundary_mode()
         self._refresh_device_mode(topology)
+        self._initialize_transition_states()
 
     def dissipated_power_of(self, component: Any) -> float:
         """The power dissipated in ``component``'s resistive primitives at the last evaluation."""
@@ -2520,9 +2599,11 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
             voltage_key, current_key = port_sources[id(port)]
             if (effort_record, flow_record) == ("input", "output"):
                 source_field, target_field = flow_field, effort_field
+                rate_path = port.flow_rate
                 target_key, kind = voltage_key, "current"
             elif (effort_record, flow_record) == ("output", "input"):
                 source_field, target_field = effort_field, flow_field
+                rate_path = port.effort_rate
                 target_key, kind = current_key, "voltage"
             else:
                 raise ConfigError(
@@ -2535,8 +2616,19 @@ def lower(circuit_model: str, subsystems: Mapping[str, Any], connections: Mappin
                 output=False,
             )
             boundary[(circuit, key)] = (port.component, source_field)
+            rate_key = None
+            if rate_path is not None:
+                rate_field = rate_path.partition(".")[2]
+                rate_key = circuit.key(
+                    f"{owner}.{port.name}.{kind}_rate",
+                    getattr(port.component.output, rate_field),
+                    output=False,
+                )
+                boundary[(circuit, rate_key)] = (port.component, rate_field)
             lowered[(port.component, target_field)] = (circuit, target_key)
-            circuit.behavioral_sources.append((port, group_of[id(port)], key, kind))
+            circuit.behavioral_sources.append(
+                (port, group_of[id(port)], key, rate_key, kind)
+            )
     if any(
         spec_of(port.component).kind == "default"
         for group in members for port in group
@@ -2623,6 +2715,21 @@ class _ModeDecomposition:
             values = closed if field == "closed" else conducting
             values[index] = not values[index]
         return Mode(closed, conducting, self.reference.ratios if ratios is None else ratios)
+
+    def topology(self, net: Netlist, changed: frozenset[int]) -> Topology:
+        """Return the physically resolved topology for one selection of local families."""
+        mode = self.modes.get(changed)
+        if mode is None:
+            owners = {
+                owner for owner, cluster in enumerate(self.clusters)
+                if any(variable in changed for variable in cluster)
+            }
+            allowed = {
+                self.variables[variable]
+                for owner in owners for variable in self.clusters[owner]
+            }
+            mode = _resolved_local_mode(net, self.mode(changed), allowed)
+        return net._compiled(mode)
 
 
 def circuit_structure(model: Any, circuits: Sequence[Circuit]):
@@ -2760,27 +2867,59 @@ def _placed_linear_matrix(circuit: Circuit, matrix: np.ndarray) -> np.ndarray:
     return plan.inverse @ placed @ plan.transform
 
 
-def _placed_certificate(circuit: Circuit, certificate: Optional[tuple[object, float]]):
-    # Similarity preserves the spectrum, so the netlist bound also certifies the placed matrix.
-    return None if certificate is None else ((id(circuit.netlist), certificate[0]), certificate[1])
-
-
-def circuit_linear_modes(circuits: Sequence[Circuit]):
-    """Return each assembled circuit's present-mode identity and the builder of its exact state
-    matrix (a solver builds it only for a mode it has not seen)."""
+def _circuit_exact_modes(circuits: Sequence[Circuit]):
+    """Return present-mode identities and lazy exact state matrices."""
     return tuple(
         ((id(circuit.netlist), key),
-         lambda circuit=circuit, matrix=matrix: _placed_linear_matrix(circuit, matrix()),
-         _placed_certificate(circuit, certificate))
+         lambda circuit=circuit, matrix=matrix: _placed_linear_matrix(circuit, matrix()))
         for circuit in circuits
-        for key, matrix, certificate in (circuit.linear_mode(),)
+        for key, matrix in (circuit.linear_mode(),)
     )
 
 
-def circuit_linear_certificates(circuits: Sequence[Circuit]):
-    """Return present-mode certificates without materializing identities or matrices."""
-    return tuple(_placed_certificate(circuit, circuit.stability_certificate())
+def _placed_spectral_bound(
+    circuit: Circuit, bound: Optional[tuple[object, float]],
+) -> Optional[SpectralBound]:
+    # Similarity preserves the spectrum, so the netlist bound also covers the placed matrix.
+    return None if bound is None else SpectralBound(
+        (id(circuit.netlist), bound[0]), float(bound[1])
+    )
+
+
+def _circuit_spectral_bounds(circuits: Sequence[Circuit]):
+    """Return present proved bounds without materializing exact mode identities or matrices."""
+    return tuple(_placed_spectral_bound(circuit, circuit.spectral_bound())
                  for circuit in circuits)
+
+
+def _circuit_solver_regions(circuit: Circuit) -> tuple[SolverRegion, ...]:
+    """Return known discrete regions with their declared continuous coefficient ranges."""
+    coefficient_ranges = []
+    for transformer in circuit.netlist._transformers:
+        if transformer.constant is not None:
+            continue
+        if transformer.bounds is None:
+            coefficient_ranges.extend([None] * math.prod(transformer.shape))
+        else:
+            lower, upper = transformer.bounds
+            coefficient_ranges.extend(
+                (float(minimum), float(maximum))
+                for minimum, maximum in zip(lower.flat, upper.flat)
+            )
+    return tuple(
+        SolverRegion((*structure[0], *structure[1]), tuple(coefficient_ranges), maximum)
+        for structure, maximum in circuit.netlist.ratio_range_spectral_bounds()
+    )
+
+
+def circuit_solver_check(_model: Any, circuits: Sequence[Circuit]) -> SolverCheck:
+    """Build the shared numerical solver check after circuit state assembly."""
+    circuits = tuple(circuits)
+    return SolverCheck(
+        exact_modes=lambda: _circuit_exact_modes(circuits),
+        spectral_bounds=lambda: _circuit_spectral_bounds(circuits),
+        regions=_circuit_solver_regions,
+    )
 
 
 _VOLTAGE_ROLES = ("vsrc", "short", "cap")
@@ -2790,6 +2929,29 @@ _CURRENT_ROLES = ("ind", "isrc", "state_current")
 def _binary_role(resistance: Any) -> Optional[str]:
     """Return the branch role of one binary-device resistance."""
     return "short" if resistance == 0.0 else None if resistance == math.inf else "res"
+
+
+def _resolved_local_mode(net: Netlist, mode: Mode,
+                         allowed: set[tuple[str, int]]) -> Mode:
+    """Resolve a degenerate pattern only when recovery remains inside its device families."""
+    try:
+        net._compiled(mode)
+        return mode
+    except _Degenerate:
+        gated = {index for index, _callback in net._gates}
+        if any(field == "conducting" and index in gated for field, index in allowed):
+            raise
+        resolved = net.resolved_topology(mode).mode
+        changed_diodes = {
+            ("conducting", index)
+            for index, (before, after) in enumerate(
+                zip(mode.conducting, resolved.conducting)
+            )
+            if before != after
+        }
+        if not changed_diodes <= allowed:
+            raise
+        return resolved
 
 
 class _ModeStructure:
@@ -3112,6 +3274,27 @@ class _ModeStructure:
         entries[size + 1] |= changed
         return [sorted(owners) for owners in entries]
 
+    def post_owners(self, net: Netlist, size: int) -> tuple[tuple[int, ...], ...]:
+        """Return owners of diode guards, projected states and reverse-impulse flags."""
+        rows = [set(owners) for owners in self.equation_owners(net)]
+        diode_cluster = {
+            index: number
+            for number, cluster in enumerate(self.clusters)
+            for variable in cluster
+            for field, index in (self.variables[variable],)
+            if field == "conducting"
+        }
+        diode_owners = []
+        for index, diode in enumerate(net._diodes):
+            output = net.n_x + net.n_e + net._branches[net._ports[id(diode)][0]].output
+            owners = rows[output] | rows[output + net.n_bd]
+            if index in diode_cluster:
+                owners.add(diode_cluster[index])
+            diode_owners.append(tuple(sorted(owners)))
+        jumps = self.jump_owners(net, size)
+        state_owners = [tuple(jumps[int(position)]) for position in net.states]
+        return tuple((*diode_owners, *state_owners, *diode_owners, *state_owners))
+
 
 def _mode_decomposition(
     circuit: Circuit,
@@ -3149,9 +3332,11 @@ def _mode_decomposition(
             variables, base, structure,
         )
         for cluster in structure.clusters:
-            decomposition.modes.update(
-                (changed, decomposition.mode(changed)) for changed in combinations(cluster)
-            )
+            own = {variables[variable] for variable in cluster}
+            for changed in combinations(cluster):
+                decomposition.modes[changed] = _resolved_local_mode(
+                    net, decomposition.mode(changed), own
+                )
         decomposition.topologies = tuple(
             net._compiled(mode) for mode in decomposition.modes.values()
         )

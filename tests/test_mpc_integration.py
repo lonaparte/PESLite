@@ -665,7 +665,7 @@ def test_mpc_composes_with_control_and_component_addons(examples, tmp_path):
     assert not result.tripped
 
 
-@pytest.mark.full
+@pytest.mark.long
 def test_mpc_results_work_with_function_addons(tmp_path):
     params = _dc("averaging", **{
         "simulation.t_end": 0.02,
@@ -719,7 +719,7 @@ def _assert_native_mpc_result(actual_dir, expected_dir):
         )
 
 
-@pytest.mark.full
+@pytest.mark.long
 @pytest.mark.parametrize("example", [
     "mpc-buck-example.pes",
     "mpc-vsc-example.pes",

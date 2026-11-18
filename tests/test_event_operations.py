@@ -9,7 +9,7 @@ import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, from_dict, read_tree, to_dict
 from peslite.components import RLBranch, register_component_type
-from peslite.components.network import Element, _register_assembled_type
+from peslite.components.network import Element
 from peslite.control import Measurement
 from peslite.solver import netlist as nl
 
@@ -37,7 +37,7 @@ def _measurement(p, t):
     return Measurement(t, 0j, 0j, p.unit("vsc").dclink.vdc_ref, np.zeros(3))
 
 
-@_register_assembled_type
+@register_component_type
 class _PassiveShunt(Element):
     """Test element without switching or retuning support."""
 
@@ -123,12 +123,10 @@ def test_element_names_are_section_scoped_and_registrations_are_checked():
         class Params:
             bus: str
 
-    with pytest.raises(TypeError, match="must be a dataclass"):
+    with pytest.raises(TypeError, match="needs a name"):
         register_component_type(NoType)
-    with pytest.raises(TypeError, match="must be a dataclass"):
-        register_component_type(_PassiveShunt)
     with pytest.raises(ValueError, match="already registered"):
-        _register_assembled_type(_PassiveShunt)
+        register_component_type(_PassiveShunt)
 
 
 def test_system_checks_optional_custom_element_operations():

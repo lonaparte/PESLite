@@ -16,12 +16,12 @@ import yaml
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import from_dict, to_dict
-from peslite.components import Bag, Port
-from peslite.components.network import Element, _register_assembled_type
+from peslite.components import Bag, Port, register_component_type
+from peslite.components.network import Element
 from peslite.solver import BlackBoxSubsystem
 from test_measurement_network import load_case
 
-pytestmark = pytest.mark.full
+pytestmark = pytest.mark.long
 
 
 class _ConditionalState(Bag):
@@ -62,7 +62,7 @@ class _ConditionalModel:
         return ((self.input.u - resistance * self.state.i) / self.inductance,)
 
 
-@_register_assembled_type
+@register_component_type
 class _ConditionalElement(Element):
     type = "test_conditional_element"
 
@@ -95,7 +95,7 @@ class _ConditionalElement(Element):
                 f"{self.name}.i_mag": abs(self.model.output.i)}
 
 
-@_register_assembled_type
+@register_component_type
 class _BlackBoxElement(Element):
     type = "test_black_box"
 
@@ -132,7 +132,7 @@ class _BlackBoxElement(Element):
         return {f"{self.name}.y": self.model.output.y}
 
 
-@_register_assembled_type
+@register_component_type
 class _DiscreteBlackBoxElement(Element):
     type = "test_discrete_black_box"
 
@@ -961,10 +961,11 @@ def test_generated_cpp_matches_composite_wpt_with_independent_clocks(mode, tmp_p
             "simulation.solver.max_step": 50.0e-9,
         })
     params = peslite.load(EXAMPLES / "wpt-example.pes").replace(**changes)
-    _source, cpp_out, python_out = _run_generated(
+    source, cpp_out, python_out = _run_generated(
         params, tmp_path / f"wpt-{mode}", compiler
     )
 
+    assert "class DiodeConduction" not in source.read_text(encoding="utf-8")
     expected = _final_csv(python_out / "states.csv")
     actual = _final_csv(cpp_out / "states.csv")
     assert actual.keys() == expected.keys()
@@ -1100,18 +1101,30 @@ def test_generated_cpp_matches_composite_wpt_switching_events(tmp_path):
     assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * scale
 
 
-def test_generated_cpp_runs_custom_cable_equations(tmp_path):
+def test_generated_cpp_runs_custom_cable_equations_with_a_range_bound(tmp_path):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
     params = peslite.load(EXAMPLES / "cable-gfl-example.pes", **{
+        "units.vsc.bridge.model": "pwm_averaging",
         "simulation.t_end": 0.01,
         "simulation.solver.linearisations": 0,
         "simulation.energy_check": "strict",
         "simulation.output.signals": 1,
     })
     project = tmp_path / "cable"
-    _source, cpp_out, python_out = _run_generated(params, project, compiler)
+    source, cpp_out, python_out = _run_generated(params, project, compiler)
+
+    stability = next(
+        line for line in source.read_text(encoding="utf-8").splitlines()
+        if "explicit_circuit_step_allowed(explicit_step_modes_0" in line
+    )
+    region, exact_fallback = stability.split("&& !explicit_circuit_step_allowed", 1)
+    assert "selected[0]" in region
+    assert "<= selected[2]" in region
+    assert "selected[2] <=" in region
+    assert "selected[2] ==" not in region
+    assert "selected[2]" in exact_fallback
 
     expected = _final_csv(python_out / "states.csv")
     actual = _final_csv(cpp_out / "states.csv")

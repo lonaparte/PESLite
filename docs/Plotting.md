@@ -1,6 +1,6 @@
 # Plotting
 
-Plotting is a built-in addon included with the default package; see
+The `plotting` addon is included with the standard PESLite installation; see
 [Install](Getting-Started.md#install) for the installation matrix.
 
 ## Command line

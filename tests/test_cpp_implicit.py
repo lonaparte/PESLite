@@ -8,7 +8,7 @@ from peslite.assembly.cpp import _implicit_solver
 from conftest import EXAMPLES
 from test_cpp_export import _compiler, _final_csv, _run_generated
 
-pytestmark = pytest.mark.full
+pytestmark = pytest.mark.long
 
 
 def test_native_implicit_factor_assembles_only_required_blocks():

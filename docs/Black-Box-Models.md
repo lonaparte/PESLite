@@ -95,6 +95,11 @@ The physical port remains acausal; `effort` and `flow` only adapt the causal cal
 electrical network. Use `Port.signals(effort, flow)` for an energy pair that is not a physical
 connection.
 
+A physical output with `feedthrough=()` receives its total rate from the same registered state and
+`rhs` declaration when the circuit needs it. A direct-feedthrough source may instead name an
+explicit output with `effort_rate` or `flow_rate`; a rate-dependent topology is rejected if that
+rate is unavailable rather than assuming zero.
+
 ## Callable boundary
 
 Inputs, outputs and states have identifier names and use ordered one-dimensional NumPy-compatible

@@ -9,6 +9,14 @@ class FunctionUnavailableError(ImportError):
 
 _EXPORTS = {
     "energy_closure": ("energy_audit", "energy_closure"),
+    "thermal_report": ("thermal", "thermal_report"),
+    "compare_thermal_reports": ("thermal", "compare_thermal_reports"),
+    "foster_step_response": ("thermal", "foster_step_response"),
+    "load_thermalport": ("peslite.addons.components.thermalport", "load_thermalport"),
+    "device_loss_report": ("thermal", "device_loss_report"),
+    "recorded_device_loss": ("thermal", "recorded_device_loss"),
+    "compare_devices": ("thermal", "compare_devices"),
+    "circuit_heat_report": ("thermal", "circuit_heat_report"),
     "plot_csv": ("plotting", "plot_csv"),
     "plot_result": ("plotting", "plot_result"),
     "reference_csv": ("reference_signals", "reference_csv"),
@@ -38,6 +46,10 @@ _EXPORTS = {
     "loop_gain_sweep": ("loop_gain", "loop_gain_sweep"),
     "small_signal": ("stability", "small_signal"),
     "small_signal_report": ("stability", "small_signal_report"),
+    "export_magnetic_circuit": ("magcircuit", "export_magnetic_circuit"),
+    "reluctance_inductance": ("magcircuit", "reluctance_inductance"),
+    "write_magport": ("magport", "write_magport"),
+    "magnetic_field": ("magport", "magnetic_field"),
 }
 __all__ = list(_EXPORTS)
 

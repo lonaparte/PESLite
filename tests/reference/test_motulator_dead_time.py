@@ -24,7 +24,7 @@ from peslite.control.blocks import abc2complex
 MOTULATOR_VERSION = "0.21.0"
 PERIOD = 100e-6
 DEAD_TIME = 2e-6
-pytestmark = [pytest.mark.full, pytest.mark.motulator]
+pytestmark = [pytest.mark.long, pytest.mark.motulator]
 
 
 def _record_difference(record_property, name, actual, expected):

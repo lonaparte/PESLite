@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
-from ...components.network import Element, NetworkComponent, _register_assembled_type
+from ...components.network import Element, NetworkComponent, register_component_type
 from ...solver import ConfigError, Empty, Port
 from ...solver import netlist as nl
 
@@ -108,7 +108,7 @@ class PortInjectionModel(NetworkComponent):
         builder.supplies(self)
 
 
-@_register_assembled_type
+@register_component_type
 class PortInjection(Element):
     """An add-on component supporting series-voltage and shunt-current injection."""
 

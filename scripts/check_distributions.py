@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from email.parser import Parser
 from pathlib import Path
 from zipfile import ZipFile
 
-
-EXPECTED = {"peslite-core", "peslite", "peslite-gui", "peslite-full"}
+MANIFEST = Path(__file__).resolve().parents[1] / "packages/distributions.json"
+EXPECTED = set(json.loads(MANIFEST.read_text(encoding="utf-8"))["distributions"])
 
 
 def _installed_path(name: str) -> str:
@@ -43,7 +44,7 @@ def main(directory: str = "dist") -> int:
         if len(artifacts) != 2:
             raise RuntimeError(f"{distribution} must have one wheel and one source archive")
 
-    code = ("peslite-core", "peslite", "peslite-gui")
+    code = tuple(EXPECTED)
     for index, left in enumerate(code):
         for right in code[index + 1:]:
             overlap = wheels[left] & wheels[right]
@@ -57,7 +58,10 @@ def main(directory: str = "dist") -> int:
             "share/peslite/examples/templates/template.pes",
         ),
         "peslite": (
+            "peslite/addons/components/magcomponent.py",
+            "peslite/addons/components/thermal/__init__.py",
             "peslite/addons/formats/legacy_yaml.py",
+            "peslite/addons/functions/thermal/__init__.py",
             "peslite/addons/functions/stability.py",
             "share/peslite/examples/gfl-example.pes",
         ),
@@ -74,13 +78,18 @@ def main(directory: str = "dist") -> int:
             "peslite/gui/preview/workbench.js",
             "peslite/gui/web_dist/index.html",
         ),
+        "peslite-full": (
+            "peslite/addons/components/magport.py",
+            "peslite/addons/components/thermalport.py",
+            "peslite/addons/components/magcircuit.py",
+            "peslite/addons/functions/magport.py",
+            "peslite/addons/functions/magcircuit.py",
+        ),
     }
     for distribution, paths in required.items():
         for path in paths:
             if path not in wheels[distribution]:
                 raise RuntimeError(f"{distribution} does not own {path}")
-    if wheels["peslite-full"]:
-        raise RuntimeError("peslite-full must not own runtime files")
     print("validated distributions:", ", ".join(sorted(wheels)))
     return 0
 

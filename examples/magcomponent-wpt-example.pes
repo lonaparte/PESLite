@@ -1,0 +1,63 @@
+# PESLite 0.5.2
+# Series-series compensated wireless power transfer built from a MagComponent and ordinary
+# circuit components. The magnetic component defines only the winding terminals and coupling.
+
+@circuit
+excitation -- primary_compensation -- magnetic_link -- secondary_compensation -- receiver_load
+
+base:
+  s_base: 5000.0
+  v_ll_rms: 400.0
+  f0: 85000.0
+
+buses:
+  source: {phases: 1}
+  primary: {phases: 1}
+  secondary: {phases: 1}
+  receiver: {phases: 1}
+
+sources:
+  excitation:
+    bus: source
+    l: 1.0e-6
+    r: 0.1
+    v: 400.0
+    f: 85000.0
+
+elements:
+  primary_compensation:
+    type: capacitor
+    bus1: source
+    bus2: primary
+    c: 35.056e-9
+  magnetic_link:
+    type: coupled_coils
+    windings:
+      primary: {positive: primary, negative: ground, r: 0.5}
+      secondary: {positive: secondary, negative: ground, r: 0.5}
+    inductance:
+      - [100.0e-6, 20.0e-6]
+      - [20.0e-6, 100.0e-6]
+  secondary_compensation:
+    type: capacitor
+    bus1: secondary
+    bus2: receiver
+    c: 35.056e-9
+  receiver_load:
+    type: resistor
+    bus: receiver
+    r: 20.0
+
+simulation:
+  t_end: 200.0e-6
+  solver:
+    dt: 50.0e-9
+    linearisations: 0
+  output:
+    period: 1.0e-6
+    record_every: 4
+    signals: 1
+
+meta:
+  title: MagComponent WPT
+  description: A series-series compensated link connects a sinusoidal source to a resistive receiver.

@@ -16,30 +16,70 @@ sys.path.insert(0, str(ROOT / "src"))
 import peslite  # noqa: E402
 
 QUIET = {"simulation.solver.linearisations": 0, "simulation.progress.enable": 0}
-FULL_TEST_PROCESS_TIMEOUT = 120
+BOUNDED_TEST_PROCESS_TIMEOUT = 120
+SUITES = ("fast", "long", "ui")
 
 
 def pytest_addoption(parser):
     parser.addoption(
+        "--run-long",
+        action="store_true",
+        help="run only long numerical, compiler and external-reference tests",
+    )
+    parser.addoption(
+        "--run-ui",
+        action="store_true",
+        help="run only graphical-interface tests",
+    )
+    parser.addoption(
         "--run-full",
         action="store_true",
-        help="include the full test suite",
+        help="run the fast, long and UI test suites",
     )
 
 
+def _selected_suite(config):
+    requested = [
+        suite for suite in ("long", "ui", "full")
+        if config.getoption(f"--run-{suite}")
+    ]
+    if len(requested) > 1:
+        raise pytest.UsageError("choose only one of --run-long, --run-ui and --run-full")
+    return None if requested == ["full"] else (requested[0] if requested else "fast")
+
+
+def pytest_configure(config):
+    """Reject conflicting suite selections before test collection starts."""
+    _selected_suite(config)
+
+
 def pytest_collection_modifyitems(config, items):
-    """Run static checks first and expensive tests last; omit full tests by default."""
-    if not config.getoption("--run-full"):
-        selected = [item for item in items if item.get_closest_marker("full") is None]
-        deselected = [item for item in items if item.get_closest_marker("full") is not None]
+    """Assign one suite to every test, select it and leave long tests until last."""
+    categories = {}
+    for item in items:
+        marked = [name for name in SUITES if item.get_closest_marker(name) is not None]
+        if len(marked) > 1:
+            raise pytest.UsageError(
+                f"{item.nodeid} belongs to multiple test suites: {', '.join(marked)}"
+            )
+        category = marked[0] if marked else "fast"
+        if not marked:
+            item.add_marker("fast")
+        categories[item] = category
+
+    selected_suite = _selected_suite(config)
+    if selected_suite is not None:
+        selected = [item for item in items if categories[item] == selected_suite]
+        deselected = [item for item in items if categories[item] != selected_suite]
         items[:] = selected
         config.hook.pytest_deselected(items=deselected)
     parallel_workers = getattr(config.option, "numprocesses", None)
     serial = [item for item in items if item.get_closest_marker("serial") is not None]
     if serial and parallel_workers not in (None, 0, "0", 1, "1"):
         raise pytest.UsageError("tests marked serial require a non-parallel pytest run")
+    order = {"fast": 0, "ui": 1, "long": 2}
     items.sort(key=lambda item: (
-        item.get_closest_marker("full") is not None,
+        order[categories[item]],
         item.get_closest_marker("static") is None,
         item.get_closest_marker("serial") is not None,
     ))
@@ -88,9 +128,9 @@ def _quiet():
 
 
 @pytest.fixture(autouse=True)
-def _bound_full_test_processes(request):
-    """Keep every subprocess launched by an opt-in full test time-bounded."""
-    if request.node.get_closest_marker("full") is None:
+def _bound_heavy_test_processes(request):
+    """Keep subprocesses launched by long and UI tests time-bounded."""
+    if all(request.node.get_closest_marker(name) is None for name in ("long", "ui")):
         yield
         return
 
@@ -98,7 +138,7 @@ def _bound_full_test_processes(request):
     run = subprocess.run
 
     def bounded_run(*args, **kwargs):
-        kwargs.setdefault("timeout", FULL_TEST_PROCESS_TIMEOUT)
+        kwargs.setdefault("timeout", BOUNDED_TEST_PROCESS_TIMEOUT)
         return run(*args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", bounded_run)

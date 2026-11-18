@@ -41,7 +41,7 @@ def test_bundled_examples_use_control_loop_classes_directly(name):
             if unit.get("type") == "wpt":
                 yield from units({side: unit[side] for side in ("primary", "secondary")})
 
-    for unit in units(tree["units"]):
+    for unit in units(tree.get("units", {})):
         for loop_name, parameters in unit.get("ctrl", {}).get("loops", {}).items():
             assert loop_name in class_names
             assert parameters is None or "type" not in parameters

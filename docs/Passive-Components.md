@@ -40,21 +40,24 @@ branches:
 Branch current is positive from `bus1` to `bus2`. Both ports must use the same phase count.
 Use [Events Timeline](Events-Timeline.md) to connect or disconnect a branch.
 
-## Loads and resistors
+## Passive elements
 
 ```yaml
 elements:
   load: {type: load, bus: pcc, x_pu: 0.4, r_pu: 0.1}
   damping: {type: resistor, bus: pcc, r: 20.0}
+  compensation: {type: capacitor, bus1: input, bus2: output, c: 35.0e-9, r: 0.08}
 ```
 
 | `type` | Required fields | Optional fields | Connection |
 |---|---|---|---|
 | `load` | `bus`, `l` or `x_pu` | `r` or `r_pu` | series R-L branch from the bus to ground |
 | `resistor` | `bus`, `r` | `series` (default 0) | shunt resistor, or series resistor after the bus voltage driver |
+| `capacitor` | `bus1`, `bus2`, `c` | `r` (default 0) | capacitance with optional series resistance between two scalar terminals |
 
 `load.l` must be positive, `load.r` non-negative and `resistor.r` positive. Per-unit values use the
-system base.
+system base. Capacitor terminals must be distinct, `c` must be positive and `r` non-negative. The
+capacitor exposes `<element>.u`; energy accounting includes its stored energy and series loss.
 
 ## Connections
 

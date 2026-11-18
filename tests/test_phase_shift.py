@@ -11,7 +11,7 @@ from peslite.components.pwm import PhaseShiftModulator, PulseSequence, phase_shi
 
 from phase_shift_reference import level as reference_level, waveform
 
-pytestmark = pytest.mark.full
+pytestmark = pytest.mark.long
 
 
 def _phase_modulator(frequency, update):

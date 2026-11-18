@@ -165,7 +165,7 @@ def test_explicit_default_does_not_add_policy_or_state(example, mode):
 
 
 @pytest.mark.parametrize("example", ["gfl", "buck", "wpt"])
-@pytest.mark.full
+@pytest.mark.long
 def test_default_configuration_generates_identical_cpp(example, tmp_path):
     params = _case(example, "switching")
     explicit = _with_explicit_pwm_defaults(params)
@@ -215,7 +215,7 @@ def test_switching_continuation_restores_the_applied_waveform(
 ])
 @pytest.mark.parametrize("restart", [False, True])
 @pytest.mark.parametrize("variables", [("common",), ("all",)])
-@pytest.mark.full
+@pytest.mark.long
 def test_native_carrier_pulse_updates_match_python(example, synchronous, update, control_offset, restart,
                                                    variables, tmp_path):
     params = _case(example, "switching")

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "peslite-full"
 version = "0.5.2"
-description = "Complete PESLite installation with GUI and ONNX support."
+description = "Complete PESLite installation with advanced magnetic modeling, GUI and ONNX support."
 readme = "README.md"
 requires-python = ">=3.10.1"
 license = "AGPL-3.0-only"
@@ -21,5 +21,7 @@ Homepage = "https://github.com/lonaparte/PESLite"
 Repository = "https://github.com/lonaparte/PESLite"
 Issues = "https://github.com/lonaparte/PESLite/issues"
 
-[tool.setuptools]
-packages = []
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["peslite.addons.components*", "peslite.addons.functions*"]
+namespaces = true

@@ -1,0 +1,69 @@
+# PESLite 0.5.2
+# CIGRE MV 14-node feeder with pi-line shunts, distributed loads and a 5 MVA GFM converter.
+@circuit
+grid -- bus1 -- bus2 -- bus3 -- bus4 -- bus5 -- bus6
+bus3 -- bus8 -- bus7
+bus8 -- bus9 -- bus10 -- bus11
+bus9 -- vsg
+
+base: {s_base: 25.0e6, v_ll_rms: 20.0e3, f0: 50.0}
+buses:
+  bus1: {c_pu: 0.00107144208}
+  bus2: {c_pu: 0.00275079456}
+  bus3: {c_pu: 0.00240504552}
+  bus4: {c_pu: 0.00044453448}
+  bus5: {c_pu: 0.00079788240}
+  bus6: {c_pu: 0.00058511376}
+  bus7: {c_pu: 0.00063450648}
+  bus8: {c_pu: 0.00125001576}
+  bus9: {c_pu: 0.00041413896}
+  bus10: {c_pu: 0.00041793840}
+  bus11: {c_pu: 0.00012538152}
+branches:
+  line_1_2: {bus1: bus1, bus2: bus2, x_pu: 0.126195, r_pu: 0.0883}
+  line_2_3: {bus1: bus2, bus2: bus3, x_pu: 0.197795, r_pu: 0.13840125}
+  line_3_4: {bus1: bus3, bus2: bus4, x_pu: 0.0272975, r_pu: 0.019100625}
+  line_3_8: {bus1: bus3, bus2: bus8, x_pu: 0.058175, r_pu: 0.04070625}
+  line_4_5: {bus1: bus4, bus2: bus5, x_pu: 0.02506, r_pu: 0.017535}
+  line_5_6: {bus1: bus5, bus2: bus6, x_pu: 0.068915, r_pu: 0.04822125}
+  line_7_8: {bus1: bus7, bus2: bus8, x_pu: 0.0747325, r_pu: 0.052291875}
+  line_8_9: {bus1: bus8, bus2: bus9, x_pu: 0.01432, r_pu: 0.01002}
+  line_9_10: {bus1: bus9, bus2: bus10, x_pu: 0.0344575, r_pu: 0.024110625}
+  line_10_11: {bus1: bus10, bus2: bus11, x_pu: 0.0147675, r_pu: 0.010333125}
+sources:
+  grid: {bus: bus1, x_pu: 0.124975185951, r_pu: 0.001497518595, v_pu: 1.0}
+elements:
+  load1: {type: load, bus: bus1, x_pu: 0.2792856825, r_pu: 1.1948643729}
+  load3: {type: load, bus: bus3, x_pu: 17.6818289189, r_pu: 42.4687635523}
+  load4: {type: load, bus: bus4, x_pu: 13.6575795294, r_pu: 54.4943820225}
+  load5: {type: load, bus: bus5, x_pu: 8.1034971874, r_pu: 32.3333333333}
+  load6: {type: load, bus: bus6, x_pu: 10.7568546736, r_pu: 42.9203539823}
+  load7: {type: load, bus: bus7, x_pu: 146.3285243452, r_pu: 236.1111111111}
+  load8: {type: load, bus: bus8, x_pu: 10.0456576704, r_pu: 40.0826446281}
+  load9: {type: load, bus: bus9, x_pu: 19.5104699127, r_pu: 31.4814814815}
+  load10: {type: load, bus: bus10, x_pu: 12.5524265176, r_pu: 42.2892420265}
+  load11: {type: load, bus: bus11, x_pu: 17.8753614429, r_pu: 71.3235294118}
+units:
+  vsg:
+    type: vsc
+    bus: bus9
+    s_base: 5.0e6
+    ac_filter: {l_f_pu: 0.07}
+    dclink: {vdc_ref: 48989.7948557, source: {type: voltage}}
+    pwm: {f_sw: 100.0e3}
+    bridge: {model: averaging}
+    ctrl:
+      type: gfm
+      computation: 0.0
+      loops:
+        PSC: {k_p_pu: 15.7079632679}
+        VirtualImpedance: {x_v_pu: 0.3, r_v_pu: 0.1}
+        ThreePhaseModulation: {}
+      references: {p_ref_pu: 1.0, v_ref_pu: 1.1}
+events:
+  grid_off: {type: set, t: 0.2, set: {sources.grid.v_pu: 0.0}}
+simulation:
+  t_end: 0.5
+  solver: {type: adaptive, method: DP45, rtol: 1.0e-8, atol: 1.0e-6}
+  stop_on_trip: 0
+  output: {period: 1.0e-3}

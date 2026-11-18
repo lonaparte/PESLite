@@ -91,6 +91,26 @@ def test_behavioral_current_state_is_one_physical_branch(form):
     assert net.dissipated_power() == pytest.approx(12.0)
 
 
+@pytest.mark.parametrize("kind", ("current", "voltage"))
+def test_required_source_rate_must_be_declared_instead_of_assumed_zero(kind):
+    net = Netlist("device")
+    node = Node()
+    if kind == "current":
+        source = CurrentSource(
+            node, None, lambda _t: 1.0, rate_available=False, name="behavior"
+        )
+        storage = Inductor(node, None, 1.0e-3, [0], name="inductor")
+    else:
+        source = VoltageSource(
+            node, None, lambda _t: 1.0, rate_available=False, name="behavior"
+        )
+        storage = Capacitor(node, None, 1.0e-3, [0], name="capacitor")
+    net.add(source, storage)
+
+    with pytest.raises(ValueError, match="no declared total derivative"):
+        net.topology()
+
+
 @pytest.mark.parametrize("form", FORMS)
 def test_netlist_rc_rl_and_rlc_match_closed_state_equations(form):
     voltage, resistance, inductance, capacitance = 10.0, 2.0, 1e-3, 1e-4
@@ -239,7 +259,7 @@ def _numeric_input_reach(topology):
     )
 
 
-@pytest.mark.full
+@pytest.mark.long
 @pytest.mark.parametrize("form", FORMS)
 def test_large_numeric_stage_dependencies_follow_the_network_structure(
         form, monkeypatch):
@@ -642,7 +662,7 @@ def test_export_planning_covers_default_device_circuits_and_diode_modes():
     assert set(solve.inputs) == set(circuit.inputs)
 
 
-def test_device_ratio_stability_certificate_avoids_exact_mode_spectra(
+def test_device_ratio_spectral_bound_avoids_exact_mode_spectra(
         monkeypatch, tmp_path):
     count = 0
     original = nl._DenseSolve.__init__
@@ -674,7 +694,7 @@ def test_device_ratio_stability_certificate_avoids_exact_mode_spectra(
     assert count - initial <= new_structures
 
 
-def test_transformer_ratio_range_certificate_bounds_the_full_declared_box():
+def test_transformer_ratio_range_bound_covers_the_full_declared_box():
     simulation = peslite.Simulation(peslite.load(
         EXAMPLES / "gfl-example.pes", **QUIET, **{
             "simulation.solver.circuit_model": "device",
@@ -682,8 +702,8 @@ def test_transformer_ratio_range_certificate_bounds_the_full_declared_box():
     ))
     circuit, = simulation.system.circuits
     topology = circuit.netlist.topology()
-    certificate = topology._state_matrix_range_certificate()
-    assert certificate is not None
+    bound = topology._ratio_range_spectral_bound()
+    assert bound is not None
     rng = np.random.default_rng(8317)
     for _ in range(20):
         ratios = tuple(
@@ -695,8 +715,8 @@ def test_transformer_ratio_range_certificate_bounds_the_full_declared_box():
         matrix = circuit.netlist._compiled(mode).state_space.A
         scale = topology._stability_scale()
         scaled = scale[:, None] * matrix / scale[None, :]
-        assert np.linalg.norm(scaled, 2) <= certificate[1] * (1.0 + 1e-12)
-        assert np.max(np.abs(np.linalg.eigvals(matrix))) <= certificate[1] * (1.0 + 1e-12)
+        assert np.linalg.norm(scaled, 2) <= bound[1] * (1.0 + 1e-12)
+        assert np.max(np.abs(np.linalg.eigvals(matrix))) <= bound[1] * (1.0 + 1e-12)
 
 
 def test_symmetrizing_scale_bounds_a_stiff_cable_by_its_spectral_radius():
@@ -735,9 +755,13 @@ def test_cable_ratio_modes_are_certified_without_spectra(circuit_model, monkeypa
     simulation = peslite.Simulation(params)
     simulation.run(out_dir=tmp_path)
     (circuit,) = simulation.system.circuits
-    certificate = circuit.netlist.topology()._state_matrix_range_certificate()
-    assert certificate is not None
-    assert params.simulation.solver.dt * certificate[1] <= 2.6
+    topology = circuit.netlist.topology()
+    bound = topology._ratio_range_spectral_bound()
+    assert bound is not None
+    assert params.simulation.solver.dt * bound[1] <= 2.6
+    assert (topology.mode.key[:2], bound[1]) in (
+        circuit.netlist.ratio_range_spectral_bounds()
+    )
     assert count == 0
 
 
@@ -757,9 +781,9 @@ def test_transformer_ratio_outside_the_declared_box_uses_its_exact_mode():
     mode = nl.Mode(topology.mode.closed, topology.mode.conducting, ratios)
     outside = circuit.netlist._compiled(mode)
 
-    certificate = outside.state_matrix_stability_certificate()
-    assert certificate is not None
-    assert certificate[0] == outside.state_matrix_key()
+    bound = outside.state_matrix_spectral_bound()
+    assert bound is not None
+    assert bound[0] == outside.state_matrix_key()
 
 
 @pytest.mark.parametrize("example", [
@@ -771,14 +795,14 @@ def test_device_stability_matrix_matches_the_current_netlist_mode(example):
     ))
     for circuit in simulation.system.circuits:
         circuit.receive()
-        _key, build, _bound = circuit.linear_mode()
+        _key, build = circuit.linear_mode()
         np.testing.assert_allclose(
             build(), circuit.netlist.topology().state_space.A,
             rtol=1e-10, atol=1e-9,
         )
 
 
-@pytest.mark.full
+@pytest.mark.long
 def test_transformed_device_runtime_is_stable_at_grazing_commutations(tmp_path):
     params = peslite.load(
         EXAMPLES / "wpt-phase-shift-example.pes",
@@ -789,7 +813,7 @@ def test_transformed_device_runtime_is_stable_at_grazing_commutations(tmp_path):
     assert all(np.isfinite(value) for value in result.final_states().values())
 
 
-@pytest.mark.full
+@pytest.mark.long
 @pytest.mark.parametrize("example", ["wpt-phase-shift-example", "wpt-scc-example"])
 def test_switching_wpt_netlists_match_device_equations(example, tmp_path):
     def run(circuit_model):
@@ -900,3 +924,18 @@ def test_device_outputs_evaluate_each_published_value_once():
               and "(" in line.split(" = ", 1)[1]]
     published = [value for value in values if "1j" in value or "*" in value]
     assert published and len(published) == len(set(published))
+
+
+def test_projection_parts_use_their_own_scale():
+    """An unrelated large state must not hide a physical jump in another KKT block."""
+    import scipy.sparse as sp
+
+    projector = nl._Projector(
+        sp.identity(2, format="csr"), sp.identity(2, format="csr"),
+        sp.csr_matrix((2, 0)), sp.csr_matrix((2, 0)), np.array([0, 1]),
+    )
+    assert [states for states, _rows, _inputs in projector.blocks] == [(0,), (1,)]
+    state = np.array([1.0e-11, 100.0])
+    assert projector.changed_states(state, [0.0, 100.0]) == [True, False]
+    assert projector.significant(state, np.array([0.0, 100.0]), 0.0)
+    assert not projector.significant(state, state.copy(), 0.0)

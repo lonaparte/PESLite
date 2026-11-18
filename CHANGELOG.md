@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Behavioral electrical sources now carry total-rate declarations into the netlist. Stateful
+  black boxes and nonlinear magnetic laws therefore retain series-inductor and parallel-capacitor
+  dynamics instead of treating a recorded source value as constant in time.
+- Magnetic-circuit laws can publish material loss from solved branch flux and flux rate through
+  the ordinary magnetic-component and thermal-coupling signals.
+- Confirmed bridge and diode transitions can apply semiconductor switching-energy impulses to
+  restartable thermal states and reports without inferring edges from sampled signals.
+- Unified constant-inductance magnetic models on the ordinary netlist path, reduced nonlinear
+  magnetic circuits with a damped Newton solve, rejected multi-winding sampled-law extrapolation
+  and removed the redundant native-export cleanup lifecycle.
 - Radau reuses one shifted solve for each complex conjugate stage pair, and generated C++ implicit
   solvers assemble their group and interface factors without a full stage-expanded matrix.
 - Full-model and multirate evaluation share one straight-line operation lowering, and grouped RHS
@@ -28,6 +38,11 @@
 - Frozen transformer-ratio modes create their compiled topology only when it is actually required.
 - Reduced per-interval overhead by bypassing inactive conduction planning and accepted-step
   observers and by keeping common scalar ratio and limiting operations on their scalar paths.
+- Native mode tables now add entries from independent device clusters instead of enumerating their
+  Cartesian product, while source and transformer branches choose the cheaper whole or partitioned
+  trace from measured tracing work.
+- Charge and flux projections use their independent KKT blocks for jump and impulse tolerances;
+  native loss selection and physical-network caching reuse the same mode decomposition.
 
 ## 0.5.1
 

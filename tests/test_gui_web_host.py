@@ -4,7 +4,12 @@ import http.client
 import json
 import threading
 
+import pytest
+
 from peslite.gui.web_service import LocalServer
+
+
+pytestmark = pytest.mark.ui
 
 
 def test_local_http_requires_origin_token_and_version(tmp_path):

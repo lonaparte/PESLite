@@ -36,7 +36,7 @@ from ..solver.integrators import DormandPrince45, FixedStepSolver, TABLEAUS, _ST
 from ..solver.implicit import (ImplicitSolver, _JACOBIAN_STEP, _MAX_SPLITS, _TABLEAUX,
                                _NEWTON_ITERATIONS, _NEWTON_SCALE, _THETA_MAX)
 from ..solver.model import _dependency_plan, commutation_tolerance
-from ..solver.netlist import (Element as NetlistElement, Mode, Netlist, Topology,
+from ..solver.netlist import (Dissipation, Element as NetlistElement, Mode, Netlist, Topology,
                               _Degenerate, _FLOAT_RTOL, _MARGIN_RTOL, _MAX_PATTERNS,
                               _Symbolic, _constant, _symbolic_solve, _symbolic_source)
 from ..solver.timing import TIME_EPS
@@ -58,6 +58,8 @@ _ZERO_COEFFICIENTS: ContextVar[dict | None] = ContextVar("peslite_cpp_zero_coeff
 _CONDITIONAL_DEPENDENCIES: ContextVar[tuple | None] = ContextVar(
     "peslite_cpp_conditional_dependencies", default=None)
 _SCALAR_TERMS: ContextVar[tuple | None] = ContextVar("peslite_cpp_scalar_terms", default=None)
+# Keep generated expression nesting below the default depth accepted by common C++ compilers.
+_TERM_BRACKETS = 128
 _TRACE_WORK_BUDGET = (1 << 13) - 1  # bound work instead of the depth of a narrow equation
 
 _CSV_STREAM = r'''class CsvStream {
@@ -521,7 +523,7 @@ def _fixed_step(method: str) -> str:
     return "\n".join(lines)
 
 
-def _stability_polynomial(method: str) -> tuple[float, ...]:
+def _rk_stability_polynomial(method: str) -> tuple[float, ...]:
     """Return the scalar RK stability polynomial in ascending powers of ``z``."""
     _nodes, rows, weights = TABLEAUS[method]
 
@@ -543,35 +545,58 @@ def _stability_polynomial(method: str) -> tuple[float, ...]:
     return tuple(add([1.0], [0.0, *contribution]))
 
 
-def _explicit_stability(
+def _explicit_step_check(
     method: str,
-    plans: Sequence[tuple[int, Sequence[str], Sequence[int]]],
+    plans: Sequence[
+        tuple[
+            int,
+            Sequence[str],
+            Sequence[int],
+            Sequence[tuple[float, Sequence[tuple[int, float, float]]]],
+        ]
+    ],
 ) -> str:
-    """Emit the same exact circuit-mode RK stability check used by Python."""
-    coefficients = ", ".join(_number(value) for value in _stability_polynomial(method))
+    """Emit the shared range-bound check with the exact-mode fallback."""
+    coefficients = ", ".join(_number(value) for value in _rk_stability_polynomial(method))
     half_disk = _STABILITY_HALF_DISK.get(method, 0.0)
     members, checks = [], []
-    for number, (size, lines, positions) in enumerate(plans):
+    for number, (size, lines, positions, regions) in enumerate(plans):
         key = ", ".join(f"selected[{int(index)}]" for index in positions)
-        held = f"ExplicitStabilityMode<{len(positions)}>"
-        members.append(f"""std::vector<{held}> explicit_stability_modes_{number};
+        held = f"ExplicitStepMode<{len(positions)}>"
+        members.append(f"""std::vector<{held}> explicit_step_modes_{number};
 
-    void stability_derivatives_{number}(double t, const double* x, double* out) {{
+    void step_check_derivatives_{number}(double t, const double* x, double* out) {{
         (void)t;
         (void)x;
         std::fill(out, out + {int(size)}, 0.0);
         {chr(10).join(lines)}
     }}""")
+        certified_modes = []
+        if half_disk > 0.0:
+            for bound, expected in regions:
+                matches = " && ".join(
+                    (f"selected[{int(position)}] == {_number(lower)}"
+                     if lower == upper else
+                     f"{_number(lower)} <= selected[{int(position)}]"
+                     f" && selected[{int(position)}] <= {_number(upper)}")
+                    for position, lower, upper in expected
+                )
+                certified_modes.append(
+                    f"(h * {_number(bound)} <= {_number(half_disk)}"
+                    + (f" && {matches}" if matches else "") + ")"
+                )
+        certified = "(" + " || ".join(certified_modes) + ")" if certified_modes else "false"
         checks.append(
-            f"if (!explicit_circuit_stable(explicit_stability_modes_{number}, "
+            f"if (!{certified} && "
+            f"!explicit_circuit_step_allowed(explicit_step_modes_{number}, "
             f"{held}::Key{{{{{key}}}}}, {int(size)}, h, "
             f"[&](const double* x, double* out) "
-            f"{{ stability_derivatives_{number}(t, x, out); }})) return false;"
+            f"{{ step_check_derivatives_{number}(t, x, out); }})) return false;"
         )
     joined_members = "\n\n    ".join(members)
     joined_checks = "\n        ".join(checks)
     return f"""
-    template <std::size_t Positions> struct ExplicitStabilityMode {{
+    template <std::size_t Positions> struct ExplicitStepMode {{
         using Key = std::array<double, Positions>;
         std::size_t epoch;
         Key key;
@@ -582,21 +607,21 @@ def _explicit_stability(
         bool spectrum;
         bool converged;
     }};
-    struct ExplicitStabilityBlock {{
+    struct ExplicitStepBlock {{
         std::vector<Complex> matrix;
         std::vector<Complex> eigenvalues;
         bool converged;
     }};
-    struct ExplicitStabilityPattern {{
+    struct ExplicitStepPattern {{
         std::vector<unsigned char> nonzero;
         std::vector<std::vector<std::size_t>> components;
         bool decomposed;
     }};
-    std::vector<ExplicitStabilityBlock> explicit_stability_blocks;
-    std::vector<ExplicitStabilityPattern> explicit_stability_patterns;
+    std::vector<ExplicitStepBlock> explicit_step_blocks;
+    std::vector<ExplicitStepPattern> explicit_step_patterns;
     {joined_members}
 
-    static std::vector<std::vector<std::size_t>> stability_components(
+    static std::vector<std::vector<std::size_t>> step_check_components(
             const std::vector<Complex>& matrix, std::size_t n) {{
         const std::size_t missing = std::numeric_limits<std::size_t>::max();
         std::vector<std::size_t> index(n, missing), low(n), stack;
@@ -732,7 +757,7 @@ def _explicit_stability(
         return active == 0;
     }}
 
-    template <class Held> static bool explicit_mode_stable(Held& held, double h) {{
+    template <class Held> static bool explicit_mode_step_allowed(Held& held, double h) {{
         if (!held.spectrum) {{
             if ({_number(half_disk)} > 0.0
                     && h * held.norm_bound <= {_number(half_disk)}) return true;
@@ -756,8 +781,9 @@ def _explicit_stability(
     }}
 
     template <class Held, class Evaluate>
-    bool explicit_circuit_stable(std::vector<Held>& modes, const typename Held::Key& key,
-                                 std::size_t n, double h, Evaluate&& evaluate) {{
+    bool explicit_circuit_step_allowed(std::vector<Held>& modes,
+                                       const typename Held::Key& key,
+                                       std::size_t n, double h, Evaluate&& evaluate) {{
         auto found = std::find_if(modes.begin(), modes.end(), [&](const auto& item) {{
             return item.epoch == implicit_epoch && item.key == key;
         }});
@@ -790,20 +816,20 @@ def _explicit_stability(
             std::transform(matrix.begin(), matrix.end(), pattern.begin(),
                            [](Complex value) {{ return value != Complex{{}}; }});
             auto structure = std::find_if(
-                explicit_stability_patterns.begin(), explicit_stability_patterns.end(),
+                explicit_step_patterns.begin(), explicit_step_patterns.end(),
                 [&](const auto& item) {{ return item.nonzero == pattern; }}
             );
-            if (structure == explicit_stability_patterns.end()) {{
-                if (explicit_stability_patterns.size() >= 64)
-                    explicit_stability_patterns.erase(explicit_stability_patterns.begin());
-                explicit_stability_patterns.push_back({{std::move(pattern), {{}}, false}});
+            if (structure == explicit_step_patterns.end()) {{
+                if (explicit_step_patterns.size() >= 64)
+                    explicit_step_patterns.erase(explicit_step_patterns.begin());
+                explicit_step_patterns.push_back({{std::move(pattern), {{}}, false}});
                 found->converged = explicit_eigenvalues(
                     std::move(matrix), n, found->eigenvalues
                 );
-                return explicit_mode_stable(*found, h);
+                return explicit_mode_step_allowed(*found, h);
             }}
             if (!structure->decomposed) {{
-                structure->components = stability_components(matrix, n);
+                structure->components = step_check_components(matrix, n);
                 structure->decomposed = true;
             }}
             if (structure->components.size() == 1
@@ -811,7 +837,7 @@ def _explicit_stability(
                 found->converged = explicit_eigenvalues(
                     std::move(matrix), n, found->eigenvalues
                 );
-                return explicit_mode_stable(*found, h);
+                return explicit_mode_step_allowed(*found, h);
             }}
             found->converged = true;
             for (const auto& component : structure->components) {{
@@ -821,16 +847,16 @@ def _explicit_stability(
                         block[row * component.size() + column]
                             = matrix[component[row] * n + component[column]];
                 auto cached = std::find_if(
-                    explicit_stability_blocks.begin(), explicit_stability_blocks.end(),
+                    explicit_step_blocks.begin(), explicit_step_blocks.end(),
                     [&](const auto& item) {{
                         return item.matrix == block;
                     }}
                 );
-                if (cached == explicit_stability_blocks.end()) {{
-                    if (explicit_stability_blocks.size() >= 256)
-                        explicit_stability_blocks.erase(explicit_stability_blocks.begin());
-                    explicit_stability_blocks.push_back({{block, {{}}, false}});
-                    cached = explicit_stability_blocks.end() - 1;
+                if (cached == explicit_step_blocks.end()) {{
+                    if (explicit_step_blocks.size() >= 256)
+                        explicit_step_blocks.erase(explicit_step_blocks.begin());
+                    explicit_step_blocks.push_back({{block, {{}}, false}});
+                    cached = explicit_step_blocks.end() - 1;
                     cached->converged = explicit_eigenvalues(
                         std::move(block), component.size(), cached->eigenvalues
                     );
@@ -840,10 +866,10 @@ def _explicit_stability(
                                           cached->eigenvalues.begin(), cached->eigenvalues.end());
             }}
         }}
-        return explicit_mode_stable(*found, h);
+        return explicit_mode_step_allowed(*found, h);
     }}
 
-    bool explicit_stable(double t, double h) {{
+    bool explicit_step_allowed(double t, double h) {{
         const StructuralMode selected = structural_mode();
         {joined_checks}
         return true;
@@ -1608,6 +1634,10 @@ class _TraceBranch(Exception):
         self.condition = condition
 
 
+class _TraceBudgetExceeded(TypeError):
+    """Tracing stopped before its branch tree could grow beyond the shared work limit."""
+
+
 @dataclass
 class _TraceFailure:
     error: ValueError
@@ -2144,6 +2174,7 @@ class _ModelGenerator:
         self._dynamic_netlist_traces = {}
         # symbolic eliminations by their inputs' codes, shared by every term pool
         self._dynamic_netlist_solutions = {}
+        self._dynamic_netlist_sources = {}
         self.event_parameter_bindings: dict[str, tuple[bool, str | None]] = {}
         self._runtime_networks = {}
         self.equation_bindings = {}
@@ -2413,7 +2444,7 @@ class _ModelGenerator:
         budget = [0] if budget is None else budget
         budget[0] += 1
         if budget[0] > _TRACE_WORK_BUDGET:
-            raise TypeError("equation tracing exceeds its branch-work budget")
+            raise _TraceBudgetExceeded("equation tracing exceeds its branch-work budget")
         if guards is None:
             parent = _TRACE_CONTROL.get()
             guards = parent.guards if parent is not None else frozenset(self.runtime.guards)
@@ -2449,7 +2480,7 @@ class _ModelGenerator:
         def explore(decisions: Mapping[str, bool]) -> None:
             budget[0] += 1
             if budget[0] > _TRACE_WORK_BUDGET:
-                raise TypeError("declaration tracing exceeds its branch-work budget")
+                raise _TraceBudgetExceeded("declaration tracing exceeds its branch-work budget")
             token = _TRACE_CONTROL.set(_TraceControl(decisions, frozenset(self.runtime.guards)))
             branch = None
             try:
@@ -2661,57 +2692,110 @@ class _ModelGenerator:
 
     @staticmethod
     def _term_declarations(prefix, terms, lines):
+        """Place shared expressions in the narrowest scope that contains their uses."""
         references = re.compile(rf"\b{prefix}\d+\b")
         guarded = re.compile(r"\?|&&|\|\||\b(?:if|for|while|switch)\s*\(")
-        needed = set(references.findall("\n".join(lines)))
-        eager = set()
+        # name -> (scope evaluating the use, certain in that scope, held by another term)
+        uses: dict[str, list[tuple[str | None, bool, bool]]] = {}
+        leading = True
         for line in lines:
             # Statement scopes may guard later lines. Only the leading straight-line
             # region is guaranteed to execute when this declaration scope is entered.
             if re.search(r"[{}]|\b(?:if|for|while|switch|else|try|catch)\b", line):
-                break
-            if not guarded.search(line):
-                eager.update(references.findall(line))
-        retained = []
-        for code, (name, lazy, kind) in reversed(tuple(terms.items())):
-            if name not in needed:
-                continue
-            dependencies = references.findall(code)
-            needed.update(dependencies)
-            if (name in eager or not lazy) and not guarded.search(code):
-                eager.update(dependencies)
-            retained.append((code, name, lazy, kind))
+                leading = False
+            certain = leading and not guarded.search(line)
+            for name in references.findall(line):
+                uses.setdefault(name, []).append((None, certain, False))
 
-        # Unconditional uses need ordinary temporaries. Only expressions beneath a guard
-        # need first-use caching; emitting a lambda for every DAG node burdens the compiler.
+        scope: dict[str, str | None] = {}
+        depth: dict[str | None, int] = {None: 0}
+        eager, inline, retained = set(), set(), {}
+        deepest = max((
+            max(itertools.accumulate((char in "([{") - (char in ")]}") for char in code))
+            for code in terms
+        ), default=0)
+        limit = max(1, _TERM_BRACKETS // (deepest + 2))
+
+        def enclosing(first, second):
+            while first != second:
+                if depth[first] < depth[second]:
+                    second = scope[second]
+                else:
+                    first = scope[first]
+            return first
+
+        for code, (name, lazy, kind) in reversed(tuple(terms.items())):
+            found = uses.get(name)
+            if not found:
+                continue
+            owner = None
+            if lazy:
+                owner = found[0][0]
+                for other, _certain, _term in found[1:]:
+                    owner = enclosing(owner, other)
+                while depth[owner] >= limit:
+                    owner = scope[owner]
+            scope[name] = owner
+            if not lazy or any(where == owner and certain for where, certain, _term in found):
+                eager.add(name)
+                inside = owner
+            else:
+                depth[name] = depth[owner] + 1
+                inside = name
+                if len(found) == 1 and found[0][2] and found[0][0] == owner:
+                    inline.add(name)
+            certain = not guarded.search(code)
+            for dependency in references.findall(code):
+                uses.setdefault(dependency, []).append((inside, certain, True))
+            retained[name] = code, kind
+
+        members: dict[str | None, list[str]] = {}
+        for name in reversed(retained):
+            members.setdefault(scope[name], []).append(name)
         calls = re.compile(rf"\b({prefix}\d+)\(\)")
 
-        def bind(code):
-            return calls.sub(lambda match: match[1] if match[1] in eager else match[0], code)
+        def result(kind):
+            if kind.startswith("array:"):
+                return f"std::array<double, {kind.partition(':')[2]}>"
+            return _CPP_TYPES[kind]
 
-        declarations = []
-        for code, name, lazy, kind in reversed(retained):
+        def written(match):
+            name = match[1]
+            if name in eager:
+                return name
+            if name not in inline:
+                return match[0]
+            code, kind = retained[name]
+            inner = "".join(f"{line} " for line in declare(name))
             code = bind(code)
-            if lazy and name not in eager:
-                if kind.startswith("array:"):
-                    scalar = f"std::array<double, {kind.partition(':')[2]}>"
-                    declarations.append(
-                        f"bool {name}_ready = false; {scalar} {name}_value{{}}; "
-                        f"const auto {name} = [&]() -> const {scalar}& {{ "
-                        f"if (!{name}_ready) {{ {name}_value = {code}; {name}_ready = true; }} "
-                        f"return {name}_value; }};"
-                    )
-                else:
-                    scalar = _CPP_TYPES[kind]
-                    declarations.append(
-                        f"bool {name}_ready = false; {scalar} {name}_value{{}}; "
-                        f"const auto {name} = [&]() -> {scalar} {{ "
-                        f"if (!{name}_ready) {{ {name}_value = {code}; {name}_ready = true; }} "
-                        f"return {name}_value; }};"
-                    )
-            else:
-                declarations.append(f"const auto {name} = {code};")
-        return [*declarations, *(bind(line) for line in lines)]
+            return (f"([&]() -> {result(kind)} {{ {inner}return {code}; }}())"
+                    if inner else f"({code})")
+
+        def bind(code):
+            return calls.sub(written, code)
+
+        def declare(owner):
+            declarations = []
+            for name in members.get(owner, ()):
+                if name in inline:
+                    continue
+                code, kind = retained[name]
+                if name in eager:
+                    declarations.append(f"const auto {name} = {bind(code)};")
+                    continue
+                scalar = result(kind)
+                returned = f"const {scalar}&" if kind.startswith("array:") else scalar
+                inner = "".join(f"{line} " for line in declare(name))
+                declarations.append(
+                    f"bool {name}_ready = false; {scalar} {name}_value{{}}; "
+                    f"const auto {name} = [&]() -> {returned} {{ "
+                    f"if (!{name}_ready) {{ {inner}{name}_value = {bind(code)}; "
+                    f"{name}_ready = true; }} "
+                    f"return {name}_value; }};"
+                )
+            return declarations
+
+        return [*declare(None), *(bind(line) for line in lines)]
 
     def trace_outputs(self, method: Any,
                       attributes: dict[str, _Expression] | None = None) -> list[str]:
@@ -3439,7 +3523,9 @@ class _ModelGenerator:
                 varying.add((row, column))
         return topology, matrices, matrix, pattern.dense(topology.mode.ratios), varying
 
-    def _runtime_network_case(self, circuit: Any, topology: Topology) -> tuple[np.ndarray, tuple]:
+    def _runtime_network_case(self, circuit: Any, topology: Topology, *,
+                              shared_scales: bool = False,
+                              state_flags: bool = False) -> tuple[np.ndarray, tuple]:
         """Compile one mode into its affine physical map and shared post-processing program."""
         net = circuit.netlist
         state_space = topology.state_space
@@ -3454,6 +3540,14 @@ class _ModelGenerator:
             for index in range(affine.shape[0])
         )
         output_values = physical[net.n_x:]
+        scales = None
+        potential_scale = None
+        if shared_scales:
+            voltage_scale, current_scale, potential_scale = (
+                _Symbolic.value(str(argument_count + affine.shape[0] + index))
+                for index in range(3)
+            )
+            scales = voltage_scale, current_scale
         state_extent = max(map(int, net.states), default=-1) + 1
         initial: list[Any] = [0.0] * state_extent
         for index, position in enumerate(net.states):
@@ -3475,29 +3569,30 @@ class _ModelGenerator:
             for diode, conducting in zip(net._diodes, topology.mode.conducting):
                 diode.conducting = conducting
             net._gated_state = (False,) * len(net._diodes)
-            margins = net._diode_margins(topology, output_values)
+            margins = net._diode_margins(topology, output_values, potential_scale)
             impulses = net._scalar_impulse_flags(
-                topology, initial, input_values, output_values, projection_values
+                topology, initial, input_values, output_values, projection_values,
+                scales=scales,
             )
         finally:
             net._gated_state = previous_gated
             for diode, conducting in zip(net._diodes, previous_conduction):
                 diode.conducting = conducting
 
-        local_state = {int(position): index for index, position in enumerate(net.states)}
-        inconsistent: Any = False
+        moved: dict[int, Any] = {}
         for projector in topology.projectors():
             if projector is None:
                 continue
-            reference: Any = 0.0
-            for position in projector.index:
-                reference = np.maximum(reference, abs(arguments[local_state[int(position)]]))
-            tolerance = _MARGIN_RTOL * reference
-            for position in projector.index:
-                index = local_state[int(position)]
-                inconsistent |= abs(projected[int(position)] - arguments[index]) > tolerance
+            values = projection_values[id(projector)][0]
+            for position, changed in zip(
+                    projector.index, projector.changed_states(initial, values)):
+                moved[int(position)] = changed
+        state_moved = tuple(moved.get(int(position), False) for position in net.states)
+        inconsistent: Any = False
+        for changed in state_moved:
+            inconsistent |= changed
         post = (*margins, *(projected[int(position)] for position in net.states),
-                *impulses, inconsistent)
+                *impulses, *(state_moved if state_flags else (inconsistent,)))
         return affine, tuple(post)
 
     @staticmethod
@@ -3546,6 +3641,214 @@ class _ModelGenerator:
         roots = tuple(lower(value) for value in values)
         return tuple(instructions), roots
 
+    def _cheapest_trace(self, whole: Callable[[], Any], partitioned: Callable[[list[int]], Any]):
+        """Choose the equivalent trace that explores fewer branch leaves."""
+        candidates = []
+        failures = []
+        for run in (lambda budget: self._trace(whole, budget=budget), partitioned):
+            budget = [0]
+            try:
+                candidates.append((budget[0], run(budget)))
+            except _TraceBudgetExceeded as exc:
+                failures.append(exc)
+        if not candidates:
+            raise failures[0]
+        return min(candidates, key=lambda candidate: candidate[0])[1]
+
+    def _traced_sources(self, net: Netlist, t: Any, needed: Optional[Sequence[bool]] = None,
+                        ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        """Trace source values together or independently, whichever has less branch work."""
+        def entries(evaluate: Callable[[], Any], dimension: int, budget: list[int]) -> tuple[Any, ...]:
+            def run():
+                value = evaluate()
+                if dimension == 1:
+                    return (value,)
+                if dimension == 2:
+                    return (value.real, value.imag)
+                return tuple(value)
+            return tuple(self._trace(run, budget=budget))
+
+        def whole():
+            return net.source_values(t), net.source_rates(t, needed)
+
+        def partitioned(budget: list[int]):
+            inputs: list[Any] = [0.0] * net.n_u
+            for value, offset, dimension, _name in net._source_slots:
+                inputs[offset:offset + dimension] = entries(
+                    lambda value=value: value(t), dimension, budget
+                )
+            rates: list[Any] = [0.0] * net.n_u
+            for number, (source, offset) in enumerate(net._sources):
+                if needed is not None and not needed[number]:
+                    continue
+                dimension = net._branch(source).dim
+                rates[offset:offset + dimension] = entries(
+                    lambda source=source: net.source_rate(source, t), dimension, budget
+                )
+            return tuple(inputs), tuple(rates)
+
+        values, rates = self._cheapest_trace(whole, partitioned)
+        return tuple(values), tuple(rates)
+
+    def _traced_ratios(self, net: Netlist) -> tuple[np.ndarray, ...]:
+        """Trace varying transformer ratios together or independently by branch work."""
+        ratios = [transformer.constant for transformer in net._transformers]
+        varying = [index for index, transformer in enumerate(net._transformers)
+                   if transformer.constant is None]
+        if not varying:
+            return tuple(np.asarray(ratio) for ratio in ratios)
+        shapes = [net._transformers[index].shape for index in varying]
+
+        def flattened(index: int) -> tuple[Any, ...]:
+            return tuple(np.asarray(self._ratio_matrix(net._transformers[index]),
+                                    dtype=object).flat)
+
+        def whole():
+            return tuple(flattened(index) for index in varying)
+
+        def partitioned(budget: list[int]):
+            return tuple(self._trace(lambda index=index: flattened(index), budget=budget)
+                         for index in varying)
+
+        traced = self._cheapest_trace(whole, partitioned)
+        for index, shape, values in zip(varying, shapes, traced):
+            ratios[index] = np.asarray(values, dtype=object).reshape(shape)
+        return tuple(np.asarray(ratio) for ratio in ratios)
+
+    def _cluster_runtime_values(
+        self, circuit: Any, decomposition: Any, flags: Sequence[_Expression],
+        t: Any, states: Sequence[Any], *, postprocess: bool,
+    ):
+        """Compile independent mode families as additive native table entries."""
+        clusters = decomposition.clusters
+        if len(clusters) < 2:
+            return None
+        width = max(map(len, clusters))
+        if width + len(clusters).bit_length() >= 8 * np.dtype(np.uintp).itemsize:
+            return None
+
+        net = circuit.netlist
+        post_owners = decomposition.structure.post_owners(net, len(states))
+        if any(len(owners) > 1 for owners in post_owners):
+            return None
+        physical_count = net.n_x + net.n_out
+        count = physical_count + 2 * len(net._diodes) + net.n_x + 1
+        descriptor = self._runtime_network(
+            circuit, count=count, bits=len(flags), physical_count=physical_count,
+            groups=(width, clusters), moved=net.n_x,
+            scales=(net.n_x, net.n_e, net.n_bd, net.n_out,
+                    tuple(net.n_x + int(net._e_off[vertex])
+                          for vertex in range(1, net.n_vertices))),
+            parameters=(*(f"x{index}" for index in range(net.n_x)),
+                        *(f"u{index}" for index in range(net.n_u)),
+                        *(f"du{index}" for index in range(net.n_u))),
+        )
+
+        if not descriptor["modes"]:
+            rows = [set(owners) for owners in decomposition.owners]
+
+            def compiled(changed: frozenset[int]):
+                control, terms = _TRACE_CONTROL.set(None), _SCALAR_TERMS.set(None)
+                try:
+                    topology = net._compiled(decomposition.modes[changed])
+                    return self._runtime_network_case(
+                        circuit, topology, shared_scales=True, state_flags=True
+                    )
+                except (_Degenerate, ValueError, np.linalg.LinAlgError) as exc:
+                    return str(exc)
+                finally:
+                    _SCALAR_TERMS.reset(terms)
+                    _TRACE_CONTROL.reset(control)
+
+            base = compiled(frozenset())
+            if not isinstance(base, tuple):
+                self._runtime_networks.pop(id(circuit), None)
+                return None
+            base_affine = np.asarray(base[0], dtype=float)
+
+            def register(key: int, case: Any, owner: int | None, matrix: Any) -> None:
+                if not isinstance(case, tuple):
+                    descriptor["modes"][key] = case
+                    return
+                _affine, post = case
+                selected = [
+                    position for position, owners in enumerate(post_owners)
+                    if (not owners if owner is None else owners == (owner,))
+                ]
+                program, roots = self._runtime_program([post[position] for position in selected])
+                placed: list[Optional[int]] = [None] * len(post)
+                for position, root in zip(selected, roots):
+                    placed[position] = root
+                descriptor["modes"][key] = matrix, program, tuple(placed)
+
+            shared = np.asarray([len(owners) != 1 for owners in rows])
+            register(0, base, None, np.where(shared[:, None], base_affine, 0.0))
+            for number, cluster in enumerate(clusters):
+                members = set(cluster)
+                choices = [frozenset(), *(changed for changed in decomposition.modes
+                                           if changed and changed <= members)]
+                for changed in choices:
+                    local = sum(1 << position for position, variable in enumerate(cluster)
+                                if variable in changed)
+                    key = (number + 1) << width | local
+                    case = base if not changed else compiled(changed)
+                    matrix = None
+                    if isinstance(case, tuple):
+                        affine = np.asarray(case[0], dtype=float)
+                        matrix = np.zeros_like(affine)
+                        for row, owners in enumerate(rows):
+                            if owners == {number}:
+                                matrix[row] = affine[row]
+                            elif number in owners:
+                                matrix[row] = affine[row] - base_affine[row]
+                    register(key, case, number, matrix)
+
+        codes = (
+            " | ".join(
+                f"(static_cast<std::size_t>(!({flags[variable].code})) << {position})"
+                for position, variable in enumerate(cluster)
+            ) or "0"
+            for cluster in clusters
+        )
+        key = f"std::array<std::size_t, {len(clusters)}>{{{{{', '.join(codes)}}}}}"
+        return self._runtime_network_result(
+            net, descriptor, key, t, states, postprocess=postprocess
+        )
+
+    def _runtime_network_result(
+        self, net: Netlist, descriptor: Mapping[str, Any], key: str, t: Any,
+        states: Sequence[Any], *, postprocess: bool,
+    ):
+        """Return one generated network call in the common netlist result layout."""
+        traced_inputs, traced_rates = self._traced_sources(net, t)
+        inputs = tuple(_Expression.of(value) for value in traced_inputs)
+        rates = tuple(_Expression.of(value) for value in traced_rates)
+        state_values = tuple(_Expression.of(states[int(index)]) for index in net.states)
+        arguments = ", ".join(value.code for value in (*state_values, *inputs, *rates))
+        method = descriptor["name"] if postprocess else descriptor["name"] + "_physical"
+        call = f"{method}({key}{', ' if arguments else ''}{arguments})"
+        descriptor["physical_uses"] = descriptor.get("physical_uses", 0) + 1
+        physical_count = descriptor["physical_count"]
+        value_count = descriptor["count"] if postprocess else physical_count
+        pool = _SCALAR_TERMS.get()
+        if pool is not None:
+            prefix, terms, _runtime, _results = pool
+            if call not in terms:
+                terms[call] = f"{prefix}{len(terms)}", True, f"array:{value_count}"
+            call = terms[call][0] + "()"
+        values = tuple(_Expression(f"{call}[{index}]", "real", pure=True)
+                       for index in range(value_count))
+        if not postprocess:
+            return (net._place_scalar_derivatives(values[:net.n_x], len(states)),
+                    values[net.n_x:physical_count])
+        margins = values[physical_count:physical_count + len(net._diodes)]
+        projected_start = physical_count + len(net._diodes)
+        projected = values[projected_start:projected_start + net.n_x]
+        impulses_start = projected_start + net.n_x
+        impulses = values[impulses_start:impulses_start + len(net._diodes)]
+        return (net._place_scalar_derivatives(values[:net.n_x], len(states)),
+                values[net.n_x:physical_count], margins, projected, impulses, values[-1])
+
     @staticmethod
     def _symbolic_inputs(values: Sequence[Any]) -> tuple[Any, ...]:
         """Return scalar leaves in first-use order from an equation expression DAG."""
@@ -3578,6 +3881,14 @@ class _ModelGenerator:
         if (not net._diodes or circuit._cpp_coefficients
                 or any(transformer.constant is None for transformer in net._transformers)):
             return None
+        selected = self._runtime_mode_decomposition(circuit)
+        if selected is not None:
+            decomposition, flags = selected
+            grouped = self._cluster_runtime_values(
+                circuit, decomposition, flags, t, states, postprocess=postprocess
+            )
+            if grouped is not None:
+                return grouped
         closed: list[Any] = []
         for switch in net._switches:
             flag = self._switch_flag(switch)
@@ -3647,37 +3958,13 @@ class _ModelGenerator:
                 _SCALAR_TERMS.reset(terms)
                 _TRACE_CONTROL.reset(control)
 
-        inputs = tuple(_Expression.of(value) for value in net.source_values(t))
-        rates = tuple(_Expression.of(value) for value in net.source_rates(t))
-        state_values = tuple(_Expression.of(states[int(index)]) for index in net.states)
         key = " | ".join(
             f"(static_cast<std::size_t>({value.code}) << {index})"
             for index, value in enumerate(mode_values)
         ) or "0"
-        arguments = ", ".join(
-            value.code for value in (*state_values, *inputs, *rates)
+        return self._runtime_network_result(
+            net, descriptor, key, t, states, postprocess=postprocess
         )
-        method = descriptor["name"] if postprocess else descriptor["name"] + "_physical"
-        call = f"{method}({key}{', ' if arguments else ''}{arguments})"
-        value_count = count if postprocess else physical_count
-        pool = _SCALAR_TERMS.get()
-        if pool is not None:
-            prefix, terms, _runtime, _results = pool
-            if call not in terms:
-                terms[call] = f"{prefix}{len(terms)}", True, f"array:{value_count}"
-            call = terms[call][0] + "()"
-        values = tuple(_Expression(f"{call}[{index}]", "real", pure=True)
-                       for index in range(value_count))
-        if not postprocess:
-            return (net._place_scalar_derivatives(values[:net.n_x], len(states)),
-                    values[net.n_x:physical_count])
-        margins = values[physical_count:physical_count + len(net._diodes)]
-        projected_start = physical_count + len(net._diodes)
-        projected = values[projected_start:projected_start + net.n_x]
-        impulses_start = projected_start + net.n_x
-        impulses = values[impulses_start:impulses_start + len(net._diodes)]
-        return (net._place_scalar_derivatives(values[:net.n_x], len(states)),
-                values[net.n_x:physical_count], margins, projected, impulses, values[-1])
 
     def _runtime_network(self, circuit: Any, **layout: Any) -> dict:
         """The circuit's generated network function: its value count, mode bits, physical
@@ -3697,8 +3984,8 @@ class _ModelGenerator:
         self, circuit: Any, t: Any, states: list[Any], *, topology=None, raw=False,
     ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
         """Eliminate the shared netlist equations through the netlist's expression DAG."""
-        def generated(values: Sequence[Any]) -> tuple[_Expression, ...]:
-            shared, rendered = _symbolic_source(values)
+        def generated(source: tuple[Sequence[str], Sequence[str]]) -> tuple[_Expression, ...]:
+            shared, rendered = source
             names: dict[str, str] = {}
 
             def resolve(code: str) -> str:
@@ -3715,7 +4002,7 @@ class _ModelGenerator:
             return tuple(expression(code) for code in rendered)
 
         net = circuit.netlist
-        ratios = tuple(self._ratio_matrix(transformer) for transformer in net._transformers)
+        ratios = self._traced_ratios(net)
         topology = net.topology() if topology is None else topology
         pool = _SCALAR_TERMS.get()
         control = _TRACE_CONTROL.get()
@@ -3737,8 +4024,7 @@ class _ModelGenerator:
         )
         pattern = topology._pattern
 
-        inputs = net.source_values(t)
-        rates = net.source_rates(t, topology.needs_rate)
+        inputs, rates = self._traced_sources(net, t, topology.needs_rate)
         state_values = tuple(states[int(index)] for index in net.states)
 
         def codes(values) -> tuple:
@@ -3772,7 +4058,12 @@ class _ModelGenerator:
         if raw:
             result = tuple(derivative), tuple(output)
         else:
-            values = generated((*derivative, *output))
+            source = self._dynamic_netlist_sources.get(solve_key)
+            if source is None:
+                source = self._dynamic_netlist_sources[solve_key] = _symbolic_source(
+                    (*derivative, *output)
+                )
+            values = generated(source)
             count = len(derivative)
             result = net._place_scalar_derivatives(values[:count], len(states)), values[count:]
         self._dynamic_netlist_traces[cache_key] = result
@@ -4151,8 +4442,8 @@ class _ModelGenerator:
         circuit.t = t
         return tuple(circuit.derivatives), tuple(all_outputs)
 
-    def trace_stability_derivatives(self, circuit: Any) -> list[str]:
-        """Lower the exact present-mode circuit derivative matrix source for native checks."""
+    def trace_step_check_derivatives(self, circuit: Any) -> list[str]:
+        """Lower exact present-mode circuit derivatives for the native solver check."""
         def run():
             with self._netlist_symbols(circuit):
                 circuit.receive()
@@ -4250,37 +4541,55 @@ class _ModelGenerator:
                 outputs, elements, t=_Expression("t", "real")
             )
         decomposition, flags = selected
-        branches = tuple(branch for element in elements for branch in net._ports[id(element)])
         base = decomposition.topologies[0]
-        relevant: list[int] = []
-        for owner, cluster in enumerate(decomposition.clusters):
-            choices = (opened for opened in decomposition.modes
-                       if opened and opened <= set(cluster))
-            if any(
-                any(net._compiled(decomposition.modes[opened]).roles[branch]
-                    != base.roles[branch] for branch in branches)
-                for opened in choices
-            ):
-                relevant.extend(cluster)
-        if not relevant:
-            return net.scalar_dissipated_power(
-                outputs, elements, t=_Expression("t", "real"), topology=base
-            )
+        roles = {
+            changed: decomposition.topology(net, changed).roles
+            for changed in decomposition.modes
+        }
+        owner_of = {
+            variable: number
+            for number, cluster in enumerate(decomposition.clusters)
+            for variable in cluster
+        }
 
-        def select(position: int, changed: frozenset[int]) -> Any:
-            if position == len(relevant):
-                return net.scalar_dissipated_power(
-                    outputs, elements, t=_Expression("t", "real"),
-                    topology=net._compiled(decomposition.mode(changed)),
+        def select(owners: Sequence[int], value: Callable[[frozenset[int]], Any]) -> Any:
+            variables = tuple(variable for owner in owners
+                              for variable in decomposition.clusters[owner])
+            def build(position: int, changed: frozenset[int]) -> Any:
+                if position == len(variables):
+                    return value(changed)
+                variable = variables[position]
+                return self._merge_trace(
+                    flags[variable],
+                    build(position + 1, changed | {variable}),
+                    build(position + 1, changed),
                 )
-            variable = relevant[position]
-            return self._merge_trace(
-                flags[variable],
-                select(position + 1, changed | {variable}),
-                select(position + 1, changed),
-            )
+            return build(0, frozenset())
 
-        return select(0, frozenset())
+        power: Any = 0.0
+        for element in elements:
+            if isinstance(element, Dissipation):
+                power += element.value(_Expression("t", "real"))
+                continue
+            for port, branch in enumerate(net._ports[id(element)]):
+                owners = sorted({
+                    owner_of[next(iter(changed))]
+                    for changed, mode_roles in roles.items()
+                    if changed and mode_roles[branch] != base.roles[branch]
+                })
+                loss = net._scalar_port_power(outputs, element, port)
+                if not owners:
+                    if base.roles[branch] == "res":
+                        power += loss
+                    continue
+                power += select(
+                    owners,
+                    lambda changed, branch=branch, loss=loss: (
+                        loss if decomposition.topology(net, changed).roles[branch] == "res"
+                        else _Expression.of(0.0)
+                    ),
+                )
+        return power
 
     def trace_netlist_outputs(self, owner: Any, method: Any, circuit: Any,
                               fields: tuple[str, ...]) -> list[str]:
@@ -4311,24 +4620,46 @@ class _ModelGenerator:
 
     def structural_mode_values(
         self,
-    ) -> tuple[tuple[Any, tuple[_Expression, ...], tuple[bool, ...]], ...]:
-        """Return circuit mode values and those which can change its state matrix."""
+    ) -> tuple[
+        tuple[
+            Any,
+            tuple[_Expression, ...],
+            tuple[tuple[float, tuple[tuple[float, float] | None, ...]], ...],
+        ],
+        ...,
+    ]:
+        """Return structural values and the solver-check regions that cover them."""
         modes = []
         for circuit in self.system.circuits:
             with self._netlist_symbols(circuit):
                 gates, conduction = self._gated_conduction(circuit.netlist)
                 values: list[_Expression] = []
-                stability: list[bool] = []
-                for switch in circuit.netlist._switches:
+                coverage: list[tuple[str, int] | None] = []
+                fixed: list[tuple[int, bool]] = []
+                conduction_offset = len(circuit.netlist._switches)
+                for index, switch in enumerate(circuit.netlist._switches):
                     flag = self._switch_flag(switch)
                     if flag is None:
                         flag = self._trace(switch.closed)
-                    if flag.code not in ("true", "false"):
+                    if flag.code in ("true", "false"):
+                        fixed.append((index, flag.code == "true"))
+                    else:
                         values.append(flag)
-                        stability.append(True)
+                        coverage.append(("selector", index))
                 values.extend(conduction)
                 values.extend(gates.values())
-                stability.extend([True] * (len(conduction) + len(gates)))
+                coverage.extend(
+                    ("selector", conduction_offset + index)
+                    if value.code not in ("true", "false") else None
+                    for index, value in enumerate(conduction)
+                )
+                coverage.extend([None] * len(gates))
+                fixed.extend(
+                    (conduction_offset + index, value.code == "true")
+                    for index, value in enumerate(conduction)
+                    if value.code in ("true", "false")
+                )
+                coefficient = 0
                 for transformer in circuit.netlist._transformers:
                     if transformer.constant is None:
                         ratio = tuple(
@@ -4338,8 +4669,30 @@ class _ModelGenerator:
                             ).flat
                         )
                         values.extend(ratio)
-                        stability.extend([True] * len(ratio))
-            modes.append((circuit, tuple(values), tuple(stability)))
+                        coverage.extend(
+                            ("coefficient", index)
+                            for index in range(coefficient, coefficient + len(ratio))
+                        )
+                        coefficient += len(ratio)
+            check = self.model.solver_check
+            regions = () if check is None else check.regions(circuit)
+            regions = tuple(
+                (
+                    region.spectral_bound,
+                    tuple(
+                        None if selector is None else
+                        region.coefficient_ranges[selector[1]]
+                        if selector[0] == "coefficient" else
+                        (float(region.selectors[selector[1]]),) * 2
+                        for selector in coverage
+                    ),
+                )
+                for region in regions
+                if all(
+                    region.selectors[index] == expected for index, expected in fixed
+                )
+            )
+            modes.append((circuit, tuple(values), regions))
         return tuple(modes)
 
     def trace_circuit_commutation_margin(self, circuit: Any) -> str:
@@ -4858,6 +5211,20 @@ class _ModelGenerator:
             arguments = [f"double {name}" for name in argument_names]
             mode_keys = tuple(sorted(descriptor["modes"]))
             mode_count = len(mode_keys)
+            groups = descriptor.get("groups")
+            grouped = groups is not None
+            selector = (f"const std::array<std::size_t, {len(groups[1])}>& mode"
+                        if grouped else "std::size_t mode")
+            if grouped:
+                width, clusters = groups
+                slot_expressions = [f"{descriptor['name']}_slot(0)"] + [
+                    f"{descriptor['name']}_slot(({number + 1}ull << {width}) | mode[{number}])"
+                    for number in range(len(clusters))
+                ]
+            else:
+                slot_expressions = [f"{descriptor['name']}_slot(mode)"]
+            slots = (f"    const std::array<std::size_t, {len(slot_expressions)}> slots{{{{"
+                     f"{', '.join(slot_expressions)}}}}};")
             physical_offsets, positions, physical_values = [0], [], []
             program_offsets, opcodes, first, second, third = [0], [], [], [], []
             roots, errors = [], []
@@ -4872,6 +5239,8 @@ class _ModelGenerator:
                 return coefficient_indices[numeric]
 
             post_count = descriptor["count"] - descriptor["physical_count"]
+            moved = descriptor.get("moved")
+            internal_count = post_count if moved is None else post_count - 1 + moved
             maximum_program = 0
             for mode in mode_keys:
                 compiled = descriptor["modes"][mode]
@@ -4897,13 +5266,15 @@ class _ModelGenerator:
                         first.append(int(operands[0]) if operands else 0)
                         second.append(int(operands[1]) if len(operands) > 1 else 0)
                         third.append(int(operands[2]) if len(operands) > 2 else 0)
-                    roots.extend(map(int, mode_roots))
+                    roots.extend(None if root is None else int(root) for root in mode_roots)
                     maximum_program = max(maximum_program, len(program))
                 else:
-                    roots.extend([0] * post_count)
+                    roots.extend([None] * internal_count)
                 physical_offsets.append(len(positions))
                 program_offsets.append(len(opcodes))
             entry_count, instruction_count = len(positions), len(opcodes)
+            unused = max(1, maximum_program)
+            roots = [unused if root is None else root for root in roots]
             error_values = ",\n        ".join(_cpp_string(value) for value in errors)
             coefficients_method = "\n".join([
                 f"double {descriptor['name']}_coefficient(std::size_t index) {{",
@@ -4926,11 +5297,47 @@ class _ModelGenerator:
                 "}",
             ]))
             column_count = max(1, len(argument_names))
+            accumulate = [
+                "for (std::size_t index = physical_offsets[slot]; "
+                "index < physical_offsets[slot + 1]; ++index) {",
+                f"    const std::size_t row = positions[index] / {column_count};",
+                f"    const std::size_t column = positions[index] % {column_count};",
+                f"    result[row] += {descriptor['name']}_coefficient(coefficients[index])",
+                "        * inputs[column];",
+                "}",
+            ]
+            physical_accumulation = (
+                [f"    {line}" for line in accumulate]
+                if not grouped else
+                ["    for (const std::size_t slot : slots) {",
+                 *(f"        {line}" for line in accumulate),
+                 "    }"]
+            )
+            cached = descriptor.get("physical_uses", 0) > 1
+            cache_type = (f"std::array<std::size_t, {len(groups[1])}>"
+                          if grouped else "std::size_t")
+            cache_lines = ([
+                "    static thread_local bool cache_valid = false;",
+                f"    static thread_local {cache_type} cached_mode{{}};",
+                f"    static thread_local std::array<double, {len(argument_names)}> cached_inputs{{}};",
+                f"    static thread_local std::array<double, {descriptor['physical_count']}> cached_result{{}};",
+                "    bool same_inputs = true;",
+                "    for (std::size_t index = 0; index < inputs.size(); ++index)",
+                "        same_inputs = same_inputs && std::memcmp(&inputs[index], &cached_inputs[index],",
+                "                                                   sizeof(double)) == 0;",
+                "    if (cache_valid && mode == cached_mode && same_inputs) return cached_result;",
+            ] if cached else [])
+            cache_store = ([
+                "    cache_valid = true;",
+                "    cached_mode = mode;",
+                "    cached_inputs = inputs;",
+                "    cached_result = result;",
+            ] if cached else [])
             methods.append("\n".join([
                 f"std::array<double, {descriptor['physical_count']}> "
-                f"{descriptor['name']}_physical(std::size_t mode"
+                f"{descriptor['name']}_physical({selector}"
                 f"{', ' if arguments else ''}{', '.join(arguments)}) {{",
-                f"    static constexpr std::array<std::size_t, {len(physical_offsets)}> offsets{{{{",
+                f"    static constexpr std::array<std::size_t, {len(physical_offsets)}> physical_offsets{{{{",
                 f"        {initializer(physical_offsets)}",
                 "    }};",
                 f"    static constexpr std::array<std::size_t, {entry_count}> positions{{{{",
@@ -4939,23 +5346,128 @@ class _ModelGenerator:
                 f"    static constexpr std::array<std::size_t, {entry_count}> coefficients{{{{",
                 f"        {initializer(physical_values)}",
                 "    }};",
-                f"    const std::size_t slot = {descriptor['name']}_slot(mode);",
                 f"    const std::array<double, {len(argument_names)}> inputs{{{{"
                 f"{', '.join(argument_names)}}}}};",
+                *cache_lines,
+                slots if grouped else f"    const std::size_t slot = {slot_expressions[0]};",
                 f"    std::array<double, {descriptor['physical_count']}> result{{}};",
-                "    for (std::size_t index = offsets[slot]; index < offsets[slot + 1]; ++index) {",
-                f"        const std::size_t row = positions[index] / {column_count};",
-                f"        const std::size_t column = positions[index] % {column_count};",
-                f"        result[row] += {descriptor['name']}_coefficient(coefficients[index])",
-                "            * inputs[column];",
-                "    }",
+                *physical_accumulation,
+                *cache_store,
                 "    return result;",
                 "}",
             ]))
+
+            argument_end = len(argument_names) + descriptor["physical_count"]
+            if descriptor.get("scales") is None:
+                read_input = [
+                    f"        case 1: values[index] = a < {len(argument_names)} ? inputs[a]",
+                    f"            : physical[a - {len(argument_names)}]; break;",
+                ]
+                scale_lines = []
+            else:
+                read_input = [
+                    f"        case 1: values[index] = a < {len(argument_names)} ? inputs[a]",
+                    f"            : a < {argument_end} ? physical[a - {len(argument_names)}]",
+                    f"            : scales[a - {argument_end}]; break;",
+                ]
+                first_state, nodes, branches, outputs, potentials = descriptor["scales"]
+                scale_lines = [
+                    "    double voltage_scale = 0.0, current_scale = 0.0, potential_scale = 0.0;",
+                    f"    for (std::size_t row = {first_state}; row < {first_state + nodes}; ++row)",
+                    "        voltage_scale = std::max(voltage_scale, std::abs(physical[row]));",
+                    f"    for (std::size_t row = {first_state + nodes + branches}; "
+                    f"row < {first_state + outputs}; ++row)",
+                    "        current_scale = std::max(current_scale, std::abs(physical[row]));",
+                    f"    static constexpr std::array<std::size_t, {len(potentials)}> potentials{{{{"
+                    f"{', '.join(map(str, potentials))}}}}};",
+                    "    for (const std::size_t row : potentials)",
+                    "        potential_scale = std::max(potential_scale, std::abs(physical[row]));",
+                    "    const std::array<double, 3> scales{{voltage_scale, current_scale, potential_scale}};",
+                ]
+
+            interpret = [
+                "const std::size_t begin = program_offsets[slot];",
+                "for (std::size_t absolute = begin; absolute < program_offsets[slot + 1]; ++absolute) {",
+                "    const std::size_t index = absolute - begin;",
+                "    const auto a = first[absolute], b = second[absolute], c = third[absolute];",
+                "    switch (operations[absolute]) {",
+                f"    case 0: values[index] = {descriptor['name']}_coefficient(a); break;",
+                *(line[4:] for line in read_input),
+                "    case 2: values[index] = -values[a]; break;",
+                "    case 3: values[index] = std::abs(values[a]); break;",
+                "    case 4: values[index] = values[a] + values[b]; break;",
+                "    case 5: values[index] = values[a] - values[b]; break;",
+                "    case 6: values[index] = values[a] * values[b]; break;",
+                "    case 7: values[index] = values[a] / values[b]; break;",
+                "    case 8: values[index] = std::max(values[a], values[b]); break;",
+                "    case 9: values[index] = std::min(values[a], values[b]); break;",
+                "    case 10: values[index] = values[a] < values[b]; break;",
+                "    case 11: values[index] = values[a] <= values[b]; break;",
+                "    case 12: values[index] = values[a] > values[b]; break;",
+                "    case 13: values[index] = values[a] >= values[b]; break;",
+                "    case 14: values[index] = values[a] == values[b]; break;",
+                "    case 15: values[index] = values[a] != values[b]; break;",
+                "    case 16: values[index] = values[a] != 0.0 && values[b] != 0.0; break;",
+                "    case 17: values[index] = values[a] != 0.0 || values[b] != 0.0; break;",
+                "    case 18: values[index] = values[a] != 0.0 ? values[b] : values[c]; break;",
+                "    default: throw std::runtime_error(\"invalid netlist instruction\");",
+                "    }",
+                "}",
+            ]
+            kept = post_count if moved is None else post_count - 1
+            common = [
+                slots if grouped else f"    const std::size_t slot = {slot_expressions[0]};",
+                *(["    for (const std::size_t slot : slots)",
+                   "        if (*errors[slot]) throw std::runtime_error(errors[slot]);"]
+                  if grouped else
+                  ["    if (*errors[slot]) throw std::runtime_error(errors[slot]);"]),
+                f"    const std::array<double, {len(argument_names)}> inputs{{{{"
+                f"{', '.join(argument_names)}}}}};",
+                f"    const auto physical = {descriptor['name']}_physical(mode"
+                f"{', ' if argument_names else ''}{', '.join(argument_names)});",
+                *scale_lines,
+                f"    std::array<double, {unused}> values{{}};",
+            ]
+            if grouped:
+                evaluation = [
+                    *common,
+                    f"    std::array<double, {max(1, internal_count)}> post{{}};",
+                    "    for (const std::size_t slot : slots) {",
+                    *(f"        {line}" for line in interpret),
+                    f"        for (std::size_t index = 0; index < {internal_count}; ++index) {{",
+                    f"            const std::size_t root = roots[slot * {internal_count} + index];",
+                    f"            if (root < {unused}) post[index] = values[root];",
+                    "        }",
+                    "    }",
+                    f"    std::array<double, {descriptor['count']}> result{{}};",
+                    "    std::copy(physical.begin(), physical.end(), result.begin());",
+                    f"    for (std::size_t index = 0; index < {kept}; ++index)",
+                    f"        result[{descriptor['physical_count']} + index] = post[index];",
+                ]
+            else:
+                evaluation = [
+                    *common,
+                    *(f"    {line}" for line in interpret),
+                    f"    std::array<double, {descriptor['count']}> result{{}};",
+                    "    std::copy(physical.begin(), physical.end(), result.begin());",
+                    f"    for (std::size_t index = 0; index < {kept}; ++index)",
+                    f"        result[{descriptor['physical_count']} + index] = "
+                    f"values[roots[slot * {internal_count} + index]];",
+                ]
+            if moved is not None:
+                source = "post[index]" if grouped else (
+                    f"values[roots[slot * {internal_count} + index]]"
+                )
+                evaluation.extend([
+                    "    bool changed = false;",
+                    f"    for (std::size_t index = {kept}; index < {internal_count}; ++index)",
+                    f"        changed = changed || {source} != 0.0;",
+                    f"    result[{descriptor['count'] - 1}] = changed ? 1.0 : 0.0;",
+                ])
             methods.append("\n".join([
                 f"std::array<double, {descriptor['count']}> {descriptor['name']}("
-                f"std::size_t mode{', ' if arguments else ''}{', '.join(arguments)}) {{",
-                f"    static constexpr std::array<std::size_t, {len(program_offsets)}> offsets{{{{",
+                f"{selector}{', ' if arguments else ''}{', '.join(arguments)}) {{",
+                f"    static constexpr std::array<std::size_t, {len(program_offsets)}> program_offsets{{{{",
                 f"        {initializer(program_offsets)}",
                 "    }};",
                 f"    static constexpr std::array<unsigned char, {instruction_count}> operations{{{{",
@@ -4976,46 +5488,7 @@ class _ModelGenerator:
                 f"    static constexpr std::array<const char*, {mode_count}> errors{{{{",
                 f"        {error_values}",
                 "    }};",
-                f"    const std::size_t slot = {descriptor['name']}_slot(mode);",
-                "    if (*errors[slot]) throw std::runtime_error(errors[slot]);",
-                f"    const std::array<double, {len(argument_names)}> inputs{{{{"
-                f"{', '.join(argument_names)}}}}};",
-                f"    const auto physical = {descriptor['name']}_physical(mode"
-                f"{', ' if argument_names else ''}{', '.join(argument_names)});",
-                f"    std::array<double, {max(1, maximum_program)}> values{{}};",
-                "    const std::size_t begin = offsets[slot];",
-                "    for (std::size_t absolute = begin; absolute < offsets[slot + 1]; ++absolute) {",
-                "        const std::size_t index = absolute - begin;",
-                "        const auto a = first[absolute], b = second[absolute], c = third[absolute];",
-                "        switch (operations[absolute]) {",
-                f"        case 0: values[index] = {descriptor['name']}_coefficient(a); break;",
-                f"        case 1: values[index] = a < {len(argument_names)} ? inputs[a]",
-                f"            : physical[a - {len(argument_names)}]; break;",
-                "        case 2: values[index] = -values[a]; break;",
-                "        case 3: values[index] = std::abs(values[a]); break;",
-                "        case 4: values[index] = values[a] + values[b]; break;",
-                "        case 5: values[index] = values[a] - values[b]; break;",
-                "        case 6: values[index] = values[a] * values[b]; break;",
-                "        case 7: values[index] = values[a] / values[b]; break;",
-                "        case 8: values[index] = std::max(values[a], values[b]); break;",
-                "        case 9: values[index] = std::min(values[a], values[b]); break;",
-                "        case 10: values[index] = values[a] < values[b]; break;",
-                "        case 11: values[index] = values[a] <= values[b]; break;",
-                "        case 12: values[index] = values[a] > values[b]; break;",
-                "        case 13: values[index] = values[a] >= values[b]; break;",
-                "        case 14: values[index] = values[a] == values[b]; break;",
-                "        case 15: values[index] = values[a] != values[b]; break;",
-                "        case 16: values[index] = values[a] != 0.0 && values[b] != 0.0; break;",
-                "        case 17: values[index] = values[a] != 0.0 || values[b] != 0.0; break;",
-                "        case 18: values[index] = values[a] != 0.0 ? values[b] : values[c]; break;",
-                "        default: throw std::runtime_error(\"invalid netlist instruction\");",
-                "        }",
-                "    }",
-                f"    std::array<double, {descriptor['count']}> result{{}};",
-                "    std::copy(physical.begin(), physical.end(), result.begin());",
-                f"    for (std::size_t index = 0; index < {post_count}; ++index)",
-                f"        result[{descriptor['physical_count']} + index] = "
-                f"values[roots[slot * {post_count} + index]];",
+                *evaluation,
                 "    return result;",
                 "}",
             ]))
@@ -7747,6 +8220,10 @@ class _CppGenerator:
         self.simulation = simulation
         self.p = simulation.p
         self.system = simulation.system
+        if self.system.transition_bindings:
+            raise ConfigError(
+                "C++ export does not yet lower online switching-energy impulses"
+            )
         self.model = self.system.model
         self.zoh_initial = {
             label: getattr(targets[0][0], targets[0][1])
@@ -8047,6 +8524,12 @@ class _CppGenerator:
         from ..solver.energy import compile_balance
 
         plan = compile_balance(self.model)
+        functional = [check.name for check in plan.subsystems if check.energy_states]
+        if functional:
+            raise TypeError(
+                "C++ export does not support functional stored-energy declarations: "
+                + ", ".join(functional)
+            )
         lines = ["    double total_energy = 0.0, total_supplied = 0.0, total_dissipated = 0.0;",
                  "    double tellegen = 0.0, max_residual = 0.0, scale = 1e-300;"]
         columns = ["energy_J", "power_supplied_W", "power_dissipated_W",
@@ -8161,12 +8644,8 @@ class _CppGenerator:
         lines.append(f"    return std::array<double, {len(all_values)}>{{{{{', '.join(all_values)}}}}};")
         return lines, columns
 
-    def source(self, model: _ModelGenerator | None = None) -> str:
+    def source(self, model: _ModelGenerator) -> str:
         """Return the complete generated translation unit."""
-        if model is None:
-            model = _ModelGenerator(
-                self.simulation, self.runtime, zoh_initial=self.zoh_initial
-            )
         self.diagnostics = model.diagnostics
         sampled = {name: _make_unit_generator(name, unit, model)
                    for name, unit in self.system.units.items() if not unit.continuous}
@@ -8282,9 +8761,12 @@ class _CppGenerator:
                                     if callable(getattr(sub, "next_commutation_time", None))
                                     else "std::numeric_limits<double>::infinity()")
             commutation_transitions.append(model.trace_transition(sub, "commutate"))
+        native_conduction = bool(
+            diode_current_states or diode_step_limits or commutation_margins
+        )
         boundary_members, boundary_method = self._circuit_boundaries(model)
         boundary_call = "reconcile_circuits(t);" if boundary_method else ""
-        raw_projection_call = "" if diode_conduction else projection_call
+        raw_projection_call = "" if native_conduction else projection_call
         member_lines = model.members(generators.values())
         member_lines.extend(event_members)
         member_lines.extend(boundary_members)
@@ -8313,20 +8795,22 @@ class _CppGenerator:
             circuit._structure_plan for circuit in self.system.circuits
             if circuit._structure_plan is not None
         )
-        stability_plans = tuple(
+        solver_check_plans = tuple(
             plan for plan in circuit_plans
             if plan.local_to_model.size
         )
         stiff_fallback = (
             isinstance(self.simulation.solver, FixedStepSolver)
-            and bool(stability_plans)
+            and bool(solver_check_plans)
         )
         uses_implicit_linearization = native_implicit or stiff_fallback
         mode_size = 0
         mode_lines: list[str] = []
-        mode_layout: dict[int, list[int]] = {}
-        stability_mode_layout: dict[int, list[int]] = {}
-        stability_equations: dict[int, list[str]] = {}
+        step_check_layout: dict[int, list[int]] = {}
+        step_check_regions: dict[
+            int, list[tuple[float, list[tuple[int, float, float]]]]
+        ] = {}
+        step_check_equations: dict[int, list[str]] = {}
         if uses_implicit_linearization:
             entries: list[str] = []
 
@@ -8340,19 +8824,27 @@ class _CppGenerator:
                     entries.append(f"static_cast<double>({code})")
                 return tuple(range(start, len(entries)))
 
-            for circuit, mode_values, stability_values in model.structural_mode_values():
-                positions = mode_layout[id(circuit.netlist)] = []
-                stability_positions = stability_mode_layout[id(circuit.netlist)] = []
-                for value, affects_stability in zip(mode_values, stability_values):
+            for circuit, mode_values, regions in model.structural_mode_values():
+                positions = step_check_layout[id(circuit.netlist)] = []
+                region_positions = [[] for _region in regions]
+                for index, value in enumerate(mode_values):
                     selected = entry(value)
                     positions.extend(selected)
-                    if affects_stability:
-                        stability_positions.extend(selected)
+                    for region, expected in zip(regions, region_positions):
+                        covered = region[1][index]
+                        if covered is not None:
+                            if len(selected) != 1:
+                                raise ValueError("a solver-check region field must be scalar")
+                            expected.append((selected[0], *covered))
+                step_check_regions[id(circuit.netlist)] = [
+                    (region[0], expected)
+                    for region, expected in zip(regions, region_positions)
+                ]
             mode_size = len(entries)
             if stiff_fallback:
-                stability_equations = {
-                    id(plan): model.trace_stability_derivatives(plan.circuit)
-                    for plan in stability_plans
+                step_check_equations = {
+                    id(plan): model.trace_step_check_derivatives(plan.circuit)
+                    for plan in solver_check_plans
                 }
             mode_lines = [
                 "StructuralMode structural_mode() {",
@@ -8550,7 +9042,7 @@ class _CppGenerator:
         adaptive_safety = "" if fixed else _number(self.simulation.solver.safety)
         run_end = self.runtime.value("simulation.t_end", self.p.simulation.t_end)
         output_period_value = self.runtime.value("simulation.output.period", output.period)
-        integration_name = "integrate_solver" if diode_conduction else "integrate"
+        integration_name = "integrate_solver" if native_conduction else "integrate"
         local_limit = bool(diode_step_limits)
         integration_args = (", double maximum_step = std::numeric_limits<double>::infinity()"
                             if local_limit else "")
@@ -8573,23 +9065,24 @@ class _CppGenerator:
                     mode_size=mode_size,
                     groups=groups, interface=interface,
                 )
-                stability_code = _explicit_stability(solver.method, [
+                step_check_code = _explicit_step_check(solver.method, [
                     (
                         plan.circuit.n_states,
-                        stability_equations[id(plan)],
-                        stability_mode_layout[id(plan.circuit.netlist)],
+                        step_check_equations[id(plan)],
+                        step_check_layout[id(plan.circuit.netlist)],
+                        step_check_regions[id(plan.circuit.netlist)],
                     )
-                    for plan in stability_plans
+                    for plan in solver_check_plans
                 ])
                 stiff_call = (
                     "integrate_stiff(t, target, maximum_step);"
                     if local_limit else "integrate_stiff(t, target);"
                 )
                 stiffness = f'''{implicit_code}
-{stability_code}
+{step_check_code}
 '''
                 stiffness_dispatch = f'''
-        if (!explicit_stable(t, h)) {{ {stiff_call} return; }}'''
+        if (!explicit_step_allowed(t, h)) {{ {stiff_call} return; }}'''
             else:
                 stiffness = ""
                 stiffness_dispatch = ""
@@ -8652,7 +9145,7 @@ class _CppGenerator:
         advance_method = "integrate"
         diode_declaration = ""
         conduction_sync = ""
-        if diode_conduction:
+        if native_conduction:
             callbacks = [f"bool diode_blocks_reverse_current_{k}() {{ return {guard}; }}"
                          for k, guard in enumerate(diode_blocking_guards)]
             callbacks += [f"double diode_maximum_step_{k}() {{ return {value}; }}"
@@ -8716,7 +9209,7 @@ class _CppGenerator:
         parameter_domains = " || ".join(
             f"key == {_cpp_string(name)}" for name in PARAMETER_DOMAINS
         )
-        return f'''// Generated by PESLite.  Do not edit: regenerate from the source simulation file.
+        source = f'''// Generated by PESLite.  Do not edit: regenerate from the source simulation file.
 // Standalone C++17; no Python, NumPy, SciPy or YAML dependency at run time.
 #include <algorithm>
 #include <array>
@@ -8726,6 +9219,7 @@ class _CppGenerator:
 #include <cmath>
 #include <complex>
 #include <cstddef>
+#include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -9164,6 +9658,7 @@ int main(int argc, char** argv) {{
     }}
 }}
 '''
+        return source
 
 
 def _prepare_export(simulation, variables, reusable, *, params=None):
@@ -9260,6 +9755,10 @@ def _export_cpp(simulation: Any, out_dir: Path, name: str,
         prepared, name, variables, initializations
     )
 
+    if generated_model is None:
+        generated_model = _ModelGenerator(
+            prepared, generator.runtime, zoh_initial=generator.zoh_initial
+        )
     code = generator.source(generated_model)
     out_dir.mkdir(parents=True, exist_ok=True)
     source = out_dir / "peslite.cpp"

@@ -29,10 +29,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from . import energy as _energy
+from .differentiation import directional_derivative
 from .timing import TIME_EPS, PeriodicClock
 
 __all__ = ["ConfigError", "LocatedZero", "Bag", "Empty", "OutputMethod", "Subsystem",
-           "BlackBoxSubsystem", "Model",
+           "BlackBoxSubsystem", "Model", "SolverCheck", "SolverRegion", "SpectralBound",
            "GroupPlan", "Stateful", "StateRegistry", "join", "gather", "scatter", "flatten", "resolve",
            "expand_aliases", "assign"]
 
@@ -330,7 +331,51 @@ class BlackBoxSubsystem:
         if unknown:
             raise ValueError(f"feedthrough contains unknown inputs {sorted(unknown)}")
         self.outputs_need_inputs = bool(dependencies)
-        self.output_stages = (OutputMethod("set_outputs", tuple(dependencies), self.output_names),)
+
+        rate_fields: dict[int, str] = {}
+        rate_by_source: dict[str, str] = {}
+        used_names = set(self.output_names)
+        if not dependencies:
+            for port in tuple(ports or ()):
+                effort_record, _, effort_field = (port.effort or "").partition(".")
+                flow_record, _, flow_field = (port.flow or "").partition(".")
+                if (effort_record, flow_record) == ("input", "output"):
+                    rate_attribute, source_field = "flow_rate", flow_field
+                elif (effort_record, flow_record) == ("output", "input"):
+                    rate_attribute, source_field = "effort_rate", effort_field
+                else:
+                    continue
+                if getattr(port, rate_attribute) is not None:
+                    continue
+                if source_field not in self.output_names:
+                    raise ValueError(
+                        f"physical port source {source_field!r} is not a black-box output"
+                    )
+                rate_name = rate_by_source.get(source_field)
+                if rate_name is None:
+                    rate_name = f"_rate_{source_field}"
+                    suffix = 1
+                    while rate_name in used_names:
+                        suffix += 1
+                        rate_name = f"_rate_{source_field}_{suffix}"
+                    used_names.add(rate_name)
+                    rate_by_source[source_field] = rate_name
+                    rate_fields[self.output_names.index(source_field)] = rate_name
+                setattr(port, rate_attribute, f"output.{rate_name}")
+
+        if rate_fields:
+            initial = {name: getattr(self.output, name) for name in self.output_names}
+            initial.update({name: 0.0 for name in rate_fields.values()})
+            _all_output_names, self.output = _black_box_record(initial, "outputs")
+        self._rate_fields = tuple(rate_fields.items())
+        stages = [OutputMethod("set_outputs", tuple(dependencies), self.output_names)]
+        if self._rate_fields:
+            rate_inputs = self.input_names if continuous else ()
+            stages.append(OutputMethod(
+                "set_output_rates", tuple(rate_inputs),
+                tuple(name for _index, name in self._rate_fields),
+            ))
+        self.output_stages = tuple(stages)
 
         self._input_values = _black_box_values(self.input, self.input_names)
         self._state_values = _black_box_values(self.state, self._state_names)
@@ -368,6 +413,27 @@ class BlackBoxSubsystem:
         values = self._result(self._call_output(t, state, inputs), len(self.output_names), "output")
         for name, value in zip(self.output_names, values):
             setattr(self.output, name, self._scalar(value))
+
+    def set_output_rates(self, t: float) -> None:
+        """Publish total rates of non-feedthrough physical outputs."""
+        state, inputs = self._arguments()
+        state_rate = (
+            self._result(self._call_rhs(t, state, inputs), len(self._state_names), "rhs")
+            if self._call_rhs is not None else np.zeros(len(self._state_names))
+        )
+        point = np.concatenate(([t], state))
+        direction = np.concatenate(([1.0], state_rate))
+
+        def evaluate(candidate: np.ndarray) -> NDArray:
+            return self._result(
+                self._call_output(candidate[0], candidate[1:], inputs),
+                len(self.output_names),
+                "output",
+            )
+
+        rates = directional_derivative(evaluate, point, direction)
+        for index, name in self._rate_fields:
+            setattr(self.output, name, self._scalar(rates[index]))
 
     def rhs(self, t: float) -> Sequence[complex | float]:
         if self._call_rhs is None:
@@ -972,12 +1038,13 @@ class _AlgebraicLoop:
     """Automatically solved strongly connected group of output stages and signal copies.
 
     A small set of connection copies is selected as tear variables while the model is assembled.
-    The remaining operations are acyclic. Scalar groups use warm-started secant iteration;
-    general groups use Gauss--Seidel sweeps. No participating subsystem owns the loop solve.
+    The remaining operations are acyclic. Scalar groups use warm-started secant iteration,
+    groups of real scalars use a cached Newton iteration and other groups use Gauss--Seidel
+    sweeps. No participating subsystem owns the loop solve.
     """
 
     __slots__ = ("operations", "tears", "owners", "labels", "max_sweeps", "rtol", "atol",
-                 "_inverse", "_scalar_sweep", "_hooks")
+                 "_inverse", "_vector_inverse", "_scalar_sweep", "_hooks")
     step_limit = 10.0
 
     def __init__(self, operations: tuple, tears: tuple, owners: tuple,
@@ -998,6 +1065,7 @@ class _AlgebraicLoop:
         self.rtol = rtol
         self.atol = atol
         self._inverse: complex | float | None = None
+        self._vector_inverse: NDArray[np.float64] | None = None
         self._scalar_sweep = self._compile_scalar_sweep() if len(tears) == 1 else None
 
     def _compile_scalar_sweep(self):
@@ -1051,6 +1119,69 @@ class _AlgebraicLoop:
             f"{self.max_sweeps} scalar iterations: " + ", ".join(self.labels)
         )
 
+    def _vector(self, t: float) -> None:
+        """Newton solve for a feedback group whose tear signals are real scalars."""
+        tears, atol, rtol, limit = self.tears, self.atol, self.rtol, self.step_limit
+
+        def sweep(values: NDArray[np.float64]) -> NDArray[np.float64]:
+            for value, item in zip(values, tears):
+                setattr(item[0], item[1], float(value))
+            for operation in self.operations:
+                _run_output_operation(operation, t)
+            return np.fromiter((_copy_value(item) for item in tears), float, len(tears))
+
+        def converged(values: NDArray[np.float64], targets: NDArray[np.float64]) -> bool:
+            scale = np.maximum(1.0, np.maximum(np.abs(values), np.abs(targets)))
+            return bool(np.all(np.abs(targets - values) <= atol + rtol * scale))
+
+        def acceptable(candidate: NDArray[np.float64], reference: NDArray[np.float64]) -> bool:
+            scale = np.maximum(1.0, np.abs(reference))
+            return bool(np.isfinite(candidate).all()
+                        and np.all(np.abs(candidate - reference) <= limit * scale))
+
+        def inverse_jacobian(
+            values: NDArray[np.float64], residual: NDArray[np.float64]
+        ) -> NDArray[np.float64]:
+            jacobian = np.empty((len(values), len(values)))
+            for column in range(len(values)):
+                step = np.cbrt(np.finfo(float).eps) * max(
+                    1.0, abs(values[column]), float(np.max(np.abs(residual), initial=0.0))
+                )
+                shifted = values.copy()
+                shifted[column] += step
+                jacobian[:, column] = (sweep(shifted) - shifted - residual) / step
+            return np.linalg.pinv(jacobian)
+
+        values = np.fromiter(
+            (getattr(item[0], item[1]) for item in tears), float, len(tears)
+        )
+        targets = sweep(values)
+        residual = targets - values
+        if converged(values, targets):
+            inverse = self._vector_inverse
+            candidate = values - inverse @ residual if inverse is not None else values
+            sweep(candidate if acceptable(candidate, values) else values)
+            return
+        for _iteration in range(self.max_sweeps - 1):
+            inverse = self._vector_inverse
+            if inverse is None:
+                inverse = self._vector_inverse = inverse_jacobian(values, residual)
+            candidate = values - inverse @ residual
+            if not acceptable(candidate, values):
+                self._vector_inverse = inverse = inverse_jacobian(values, residual)
+                candidate = values - inverse @ residual
+                if not acceptable(candidate, values):
+                    candidate = targets
+            targets = sweep(candidate)
+            if converged(candidate, targets):
+                return
+            values, residual = candidate, targets - candidate
+            self._vector_inverse = inverse_jacobian(values, residual)
+        raise FloatingPointError(
+            "algebraic loop did not converge after "
+            f"{self.max_sweeps} vector iterations: " + ", ".join(self.labels)
+        )
+
     def __call__(self, t: float) -> None:
         for begin, _end in self._hooks:
             begin()
@@ -1061,6 +1192,13 @@ class _AlgebraicLoop:
                 if isinstance(getattr(dst, field), (int, float, complex)):
                     self._scalar(t)
                     return
+            if all(
+                isinstance(getattr(item[0], item[1]), numbers.Real)
+                and not isinstance(getattr(item[0], item[1]), (bool, np.bool_))
+                for item in self.tears
+            ):
+                self._vector(t)
+                return
             worst = math.inf
             for _sweep in range(self.max_sweeps):
                 for item in self.tears:
@@ -1274,6 +1412,46 @@ def _no_linear_data():
     return ()
 
 
+@dataclass(frozen=True)
+class SpectralBound:
+    """A proved upper bound on the spectral radius of one equation region."""
+
+    identity: object
+    maximum: float
+
+
+@dataclass(frozen=True)
+class SolverRegion:
+    """One discrete equation region covered over continuous coefficient ranges."""
+
+    selectors: tuple[bool, ...]
+    coefficient_ranges: tuple[tuple[float, float] | None, ...]
+    spectral_bound: float
+
+
+class SolverCheck:
+    """Numerical checks shared by assembled Python solvers and generated backends."""
+
+    def __init__(
+        self,
+        exact_modes: Callable[[], Sequence[tuple]],
+        spectral_bounds: Callable[[], Sequence[SpectralBound | None]] | None = None,
+        regions: Callable[[Any], Sequence[SolverRegion]] | None = None,
+    ) -> None:
+        self._exact_modes = exact_modes
+        self._spectral_bounds = spectral_bounds or _no_linear_data
+        self._regions = regions
+
+    def exact_modes(self) -> tuple:
+        return tuple(self._exact_modes())
+
+    def spectral_bounds(self) -> tuple[SpectralBound | None, ...]:
+        return tuple(self._spectral_bounds())
+
+    def regions(self, owner: Any) -> tuple[SolverRegion, ...]:
+        return () if self._regions is None else tuple(self._regions(owner))
+
+
 class _LinearModelView:
     """Solver metadata projected onto a fixed subset of an assembled model's states."""
 
@@ -1284,6 +1462,10 @@ class _LinearModelView:
         self.positions[indices] = np.arange(indices.size)
         self._mode_positions = tuple(
             self._selected_positions(block[0]) for block in model.linear_blocks()
+        )
+        self.solver_check = (
+            None if model.solver_check is None else
+            SolverCheck(self._exact_modes, self._spectral_bounds)
         )
 
     def _selected_positions(self, indices: Sequence[int]) -> NDArray[np.intp]:
@@ -1316,19 +1498,29 @@ class _LinearModelView:
             if (projected := self._project(block))[0].size
         )
 
-    def linear_modes(self) -> tuple:
-        modes = self.model.linear_modes()
+    def _exact_modes(self) -> tuple:
+        modes = self.model.solver_check.exact_modes()
         if len(modes) != len(self._mode_positions):
             raise RuntimeError("linear modes and blocks describe different circuits")
         projected = []
         for mode, selected in zip(modes, self._mode_positions):
             if not selected.size:
                 continue
-            key, build, *metadata = mode
+            key, build = mode
             item = (key, lambda build=build, selected=selected:
                     np.asarray(build())[np.ix_(selected, selected)])
-            projected.append((*item, *metadata))
+            projected.append(item)
         return tuple(projected)
+
+    def _spectral_bounds(self) -> tuple[SpectralBound | None, ...]:
+        bounds = self.model.solver_check.spectral_bounds()
+        if not bounds:
+            return ()
+        if len(bounds) != len(self._mode_positions):
+            raise RuntimeError("solver bounds and blocks describe different circuits")
+        return tuple(
+            bound for bound, selected in zip(bounds, self._mode_positions) if selected.size
+        )
 
 
 class Model:
@@ -1349,15 +1541,12 @@ class Model:
         *, linear_structure: Callable[[Model], Any] | None = None,
         linear_mode_key: Callable[[], Any] | None = None,
         linear_blocks: Callable[[], Sequence[Any]] | None = None,
-        linear_modes: Callable[[], Sequence[Any]] | None = None,
-        linear_certificates: Callable[[], Sequence[Any]] | None = None,
+        solver_check: SolverCheck | Callable[[Model], SolverCheck] | None = None,
     ) -> None:
         self._linear_structure_builder = linear_structure
+        self._solver_check_builder = solver_check
         self.linear_mode_key = linear_mode_key or _no_linear_mode
         self.linear_blocks = linear_blocks or _no_linear_data
-        self.linear_modes = linear_modes or _no_linear_data
-        # Certificates alone let an explicit solver avoid materializing present mode identities.
-        self.linear_certificates = linear_certificates
         self.equation_revision = 0
         if isinstance(subsystems, Mapping):
             names = [str(n) for n in subsystems]
@@ -1400,6 +1589,7 @@ class Model:
         self._compile()
         self._structure = (self._linear_structure_builder(self)
                            if self._linear_structure_builder is not None else None)
+        self.solver_check = solver_check(self) if callable(solver_check) else solver_check
         # energy declaration per subsystem (default if none declared)
         self.energy_specs: dict[str, _energy.EnergySpec] = {n: _energy.spec_of(s) for n, s in zip(names, subsystems)}
         self._held_input_refresh = tuple(
@@ -1415,6 +1605,8 @@ class Model:
         self._external_state_dependency_cache.clear()
         self._structure = (self._linear_structure_builder(self)
                            if self._linear_structure_builder is not None else None)
+        if callable(self._solver_check_builder):
+            self.solver_check = self._solver_check_builder(self)
         self.plan_revision += 1
 
     def linear_structure(self):
@@ -1510,6 +1702,11 @@ class Model:
                         break
             rhs_layout.append((sub, tuple(entries)))
         self._rhs_layout = tuple(rhs_layout)
+        self._state_entries = {
+            id(subsystem): (subsystem, entries)
+            for subsystem, entries in rhs_layout
+            if entries
+        }
         bounds = []
         for sub, entries in rhs_layout:
             declared = getattr(sub, "state_bounds", {})
@@ -1896,6 +2093,20 @@ class Model:
                 y[idx] = v
         return y
 
+    def update_state_values(
+        self, values: NDArray[np.float64], subsystems: Sequence[Any]
+    ) -> None:
+        """Write committed state changes from selected subsystems into ``values`` in place."""
+        for subsystem in subsystems:
+            entry = self._state_entries.get(id(subsystem))
+            if entry is None or entry[0] is not subsystem:
+                raise ValueError("a committed state owner is not a stateful model subsystem")
+            for name, (index, is_complex) in zip(subsystem.state_names, entry[1]):
+                value = getattr(subsystem.state, name)
+                values[index] = value.real if is_complex else value
+                if is_complex:
+                    values[index + 1] = value.imag
+
     def set_states(self, y: NDArray[np.float64]) -> None:
         self._load(y.tolist())
 
@@ -1978,7 +2189,9 @@ class Model:
         raise KeyError(f"{type(sub).__name__} has no state {name!r}")
 
     # --------------------------------------------------------- evaluation
-    def set_zoh_input(self, label: str, value: Any) -> None:
+    def set_zoh_input(
+        self, label: str, value: Any, t: float | None = None
+    ) -> tuple[Any, ...]:
         """Set a held external input (e.g. the switching state) by label."""
         targets = self._zoh_targets[label]
         if isinstance(value, np.generic):  # generated equations run on Python scalars
@@ -1993,10 +2206,17 @@ class Model:
                 if not same:
                     changed.append((input, name))
         if not changed:
-            return
+            return ()
+        state_owners = []
         for refresh in self._held_input_refresh:
-            refresh(changed)
+            reported = refresh(changed, t)
+            if reported is None:
+                continue
+            for owner in reported:
+                if not any(owner is existing for existing in state_owners):
+                    state_owners.append(owner)
         self.invalidate_equations()
+        return tuple(state_owners)
 
     def evaluate_outputs(self, t: float) -> None:
         """Run the ordered output-method / input-copy plan for the current states."""

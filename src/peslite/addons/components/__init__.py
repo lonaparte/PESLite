@@ -1,8 +1,9 @@
 """Entry point for optional and custom PESLite component modules.
 
-Place modules in this package and register their parameter dataclasses with
-``register_component_type``. PESLite imports each module during package initialisation, so its
-types enter the same registry and configuration search path as built-in circuit elements.
+Place modules in this package and register their declarative parameters or complete element
+adapters with ``register_component_type``. PESLite imports each module during package
+initialisation, so its types enter the same registry and configuration search path as built-in
+circuit elements.
 """
 
 from __future__ import annotations

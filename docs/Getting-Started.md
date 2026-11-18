@@ -8,13 +8,14 @@ new simulation file.
 | Installation | pip | Conda |
 | --- | --- | --- |
 | Core runtime | `python -m pip install peslite-core` | `conda install peslite-core` |
-| Default, including core addons | `python -m pip install peslite` | `conda install peslite` |
+| Default, including standard addons | `python -m pip install peslite` | `conda install peslite` |
 | GUI and default features | `python -m pip install peslite-gui` | `conda install peslite-gui` |
 | All features | `python -m pip install peslite-full` | `conda install peslite-full` |
 
 All four distributions use the same `peslite` Python package and command. `peslite-core` provides
-the simulation runtime and extension interfaces, `peslite` adds the built-in core addons,
-`peslite-gui` adds the graphical workbench, and `peslite-full` installs all addon support.
+the simulation runtime and extension interfaces, `peslite` adds the default addons,
+`peslite-gui` adds the graphical workbench, and `peslite-full` installs all addon support, including
+advanced magnetic modeling and ONNX integration.
 
 Check the command-line interface:
 

@@ -60,16 +60,28 @@ def test_distribution_names_versions_and_dependencies_form_the_install_matrix():
 
 def test_code_distributions_own_disjoint_source_files():
     owned = selections()
-    for left, right in (("peslite-core", "peslite"),
-                        ("peslite-core", "peslite-gui"),
-                        ("peslite", "peslite-gui")):
-        assert owned[left].isdisjoint(owned[right])
+    code = tuple(owned)
+    for index, left in enumerate(code):
+        for right in code[index + 1:]:
+            assert owned[left].isdisjoint(owned[right])
     assert Path("src/peslite/addons/__init__.py") in owned["peslite-core"]
     assert Path("src/peslite/addons/functions/__init__.py") in owned["peslite-core"]
+    assert Path("src/peslite/addons/components/magcomponent.py") in owned["peslite"]
+    assert Path("src/peslite/addons/components/magcomponent.py") not in owned["peslite-core"]
+    assert Path("src/peslite/addons/components/coupled_coils.py") not in set().union(
+        *owned.values()
+    )
     assert Path("src/peslite/addons/components/cable.py") in owned["peslite"]
+    assert Path("src/peslite/addons/components/magport.py") in owned["peslite-full"]
+    assert Path("src/peslite/addons/functions/magport.py") in owned["peslite-full"]
+    assert Path("src/peslite/addons/functions/magcircuit.py") in owned["peslite-full"]
+    assert Path("src/peslite/addons/components/magcircuit.py") in owned["peslite-full"]
     assert Path("src/peslite/addons/formats/__init__.py") in owned["peslite-core"]
     assert Path("src/peslite/addons/formats/legacy_yaml.py") in owned["peslite"]
     assert Path("src/peslite/addons/functions/stability.py") in owned["peslite"]
+    assert Path("src/peslite/addons/functions/thermal/__init__.py") in owned["peslite"]
+    assert Path("src/peslite/addons/components/thermal/__init__.py") in owned["peslite"]
+    assert Path("src/peslite/addons/components/thermalport.py") in owned["peslite-full"]
     assert Path("src/peslite/addons/control/mpc.py") in owned["peslite"]
     assert Path("src/peslite/addons/control/predictive.py") in owned["peslite"]
     assert Path("src/peslite/addons/control/_native_mpc.py") in owned["peslite"]
