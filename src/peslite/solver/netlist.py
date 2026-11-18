@@ -1519,6 +1519,37 @@ class _Projector:
             self._equations[:self.n, :self.n] = expressions
         self._affine: Optional[tuple[NDArray[np.float64], ...]] = None
         self._numeric_projection: Optional[Callable] = None
+        self.blocks = self._independent_blocks(W, G_x, G_f, G_u)
+
+    def _independent_blocks(self, W, G_x, G_f, G_u) -> tuple[tuple[tuple[int, ...], ...], ...]:
+        """Return the independent state, constraint and input parts of the KKT system."""
+        count = G_x.shape[0]
+        joined = _UnionFind(self.n + self.n_free + count)
+        for matrix, offset in ((G_x, 0), (G_f, self.n)):
+            entries = sp.coo_matrix(matrix)
+            for row, column in zip(entries.row.tolist(), entries.col.tolist()):
+                joined.union(self.n + self.n_free + row, offset + column)
+        weights = sp.coo_matrix(W)
+        for row, column in zip(weights.row.tolist(), weights.col.tolist()):
+            joined.union(row, column)
+
+        inputs = sp.csr_matrix(G_u)
+        parts: dict[int, tuple[list[int], list[int], set[int]]] = {}
+        for state in range(self.n):
+            parts.setdefault(joined.find(state), ([], [], set()))[0].append(state)
+        for row in range(count):
+            part = parts.setdefault(
+                joined.find(self.n + self.n_free + row), ([], [], set())
+            )
+            part[1].append(row)
+            part[2].update(
+                inputs.indices[inputs.indptr[row]:inputs.indptr[row + 1]].tolist()
+            )
+        return tuple(
+            (tuple(states), tuple(rows), tuple(sorted(used)))
+            for states, rows, used in parts.values()
+            if states or rows
+        )
 
     def _affine_maps(self) -> tuple[NDArray[np.float64], ...]:
         """Dense state/input maps formed once from the projection factorization."""
@@ -1548,12 +1579,15 @@ class _Projector:
                 _linear_terms(x_row, names_x) + _linear_terms(u_row, names_u)
             ) or "0.0"
             lines.append(f"    d_{index} = ({expression}) - x_{index}")
-        changes = ", ".join(f"abs(d_{index})" for index in range(self.n))
-        references = ", ".join(f"abs(x_{index})" for index in range(self.n))
-        lines.extend((
-            f"    if max(({changes},)) <= _rtol * max(({references},)):",
-            *(f"        d_{index} = 0.0" for index in range(self.n)),
-        ))
+        for states, _rows, _inputs in self.blocks:
+            if not states:
+                continue
+            changes = ", ".join(f"abs(d_{index})" for index in states)
+            references = ", ".join(f"abs(x_{index})" for index in states)
+            lines.extend((
+                f"    if max(({changes},)) <= _rtol * max(({references},)):",
+                *(f"        d_{index} = 0.0" for index in states),
+            ))
         for index, (x_row, u_row) in enumerate(zip(mx, mu)):
             expression = " + ".join(
                 _linear_terms(x_row, names_x) + _linear_terms(u_row, names_u)
@@ -1585,14 +1619,41 @@ class _Projector:
         sol = self.lu.solve(np.concatenate([self.W @ x, np.zeros(self.n_free), self.G_u @ u]))
         projected, multipliers = sol[:self.n], sol[self.n + self.n_free:]
         dx = projected - x
-        if float(np.max(np.abs(dx), initial=0.0)) <= _NOOP_RTOL * float(np.max(np.abs(x), initial=0.0)):
-            dx[:] = 0.0
+        for states, _rows, _inputs in self.blocks:
+            if not states:
+                continue
+            part = list(states)
+            if (float(np.max(np.abs(dx[part]), initial=0.0))
+                    <= _NOOP_RTOL * float(np.max(np.abs(x[part]), initial=0.0))):
+                dx[part] = 0.0
         return x + dx, multipliers, 0.5 * float(dx @ (self.W @ dx))
 
     def significant(self, y: NDArray[np.float64], x: NDArray[np.float64], scale: float) -> bool:
-        """Whether the jump from ``y`` to the projected ``x`` exceeds round-off of the circuit's ``scale``."""
-        reference = max(scale, float(np.max(np.abs(y[self.index]), initial=0.0)))
-        return float(np.max(np.abs(x - y[self.index]), initial=0.0)) > _MARGIN_RTOL * reference
+        """Whether any independent part moves beyond its own state and circuit scale."""
+        before = y[self.index]
+        for states, _rows, _inputs in self.blocks:
+            if not states:
+                continue
+            part = list(states)
+            reference = max(scale, float(np.max(np.abs(before[part]), initial=0.0)))
+            if (float(np.max(np.abs(x[part] - before[part]), initial=0.0))
+                    > _MARGIN_RTOL * reference):
+                return True
+        return False
+
+    def changed_states(self, y: Sequence[Any], projected: Sequence[Any]) -> list[Any]:
+        """Return per-state jump flags evaluated on each state's independent part."""
+        changed: list[Any] = [False] * self.n
+        for states, _rows, _inputs in self.blocks:
+            if not states:
+                continue
+            reference = _maximum_all([abs(y[int(self.index[state])]) for state in states])
+            tolerance = _MARGIN_RTOL * reference
+            for state in states:
+                changed[state] = (
+                    abs(projected[state] - y[int(self.index[state])]) > tolerance
+                )
+        return changed
 
     def expression_solution(self, y: Sequence[Any], u: Sequence[Any]
                             ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
@@ -3311,8 +3372,7 @@ class Netlist:
             if needed is not None and not needed[index]:
                 continue
             dimension = self._branch(source).dim
-            value = (source.derivative(t) if source.derivative is not None else
-                     (source.value(t + _DELTA_T) - source.value(t - _DELTA_T)) / (2.0 * _DELTA_T))
+            value = self.source_rate(source, t)
             if dimension == 1:
                 rates[offset] = value
             elif dimension == 2:
@@ -3320,6 +3380,13 @@ class Netlist:
             else:
                 rates[offset:offset + dimension] = value
         return tuple(rates)
+
+    @staticmethod
+    def source_rate(source: Any, t: Any) -> Any:
+        """Return one source derivative, using a central difference when none is supplied."""
+        return (source.derivative(t) if source.derivative is not None else
+                (source.value(t + _DELTA_T) - source.value(t - _DELTA_T))
+                / (2.0 * _DELTA_T))
 
     def rates(self, t: float, needed: Optional[NDArray[np.bool_]] = None) -> NDArray[np.float64]:
         """The source derivatives ``du/dt`` at ``t`` (zero where ``needed`` is false)."""
@@ -4052,7 +4119,8 @@ class Netlist:
         return (float(np.max(np.abs(out[:self.n_e]), initial=0.0)),
                 float(np.max(np.abs(out[self.n_e + self.n_bd:]), initial=0.0)))
 
-    def _blocking_voltages(self, top: Topology, potential: NDArray[np.float64]) -> dict[int, float]:
+    def _blocking_voltages(self, top: Topology, potential: NDArray[np.float64],
+                           scale: Any = None) -> dict[int, float]:
         """Voltages across blocking diodes between sub-networks, from vertex ``potential``s (gauge 0 at
         each floating sub-network's first node) shifted by the offsets that maximize the smallest
         blocking margin: a floating sub-network takes the midpoint of the offsets that keep its diodes
@@ -4060,7 +4128,16 @@ class Netlist:
         comp = top.component
         edges = [(k, comp[self._branches[k].a], comp[self._branches[k].b],
                   potential[self._branches[k].a] - potential[self._branches[k].b]) for k in top.blocking]
-        scale = _maximum_all([abs(value) for value in potential])
+        if scale is None:
+            terminals: dict[int, list[Any]] = {}
+            for k in top.blocking:
+                branch = self._branches[k]
+                values = (abs(potential[branch.a]), abs(potential[branch.b]))
+                for side in (comp[branch.a], comp[branch.b]):
+                    terminals.setdefault(side, []).extend(values)
+            distance = {side: _maximum_all(values) for side, values in terminals.items()}
+        else:
+            distance = {side: scale for _k, ca, cb, _value in edges for side in (ca, cb)}
         fixed = {0: 0.0}
         while True:  # v_D = v + c_a - c_b <= 0
             lo: dict[int, float] = {}
@@ -4078,9 +4155,9 @@ class Netlist:
                 if c in lo and c in hi:
                     fixed[c] = 0.5 * (lo[c] + hi[c])
                 elif c in lo:
-                    fixed[c] = lo[c] + scale
+                    fixed[c] = lo[c] + distance[c]
                 else:
-                    fixed[c] = hi[c] - scale
+                    fixed[c] = hi[c] - distance[c]
         return {k: v + fixed.get(ca, 0.0) - fixed.get(cb, 0.0) for k, ca, cb, v in edges}
 
     def scalar_margins(
@@ -4149,7 +4226,8 @@ class Netlist:
         return (_maximum_all([abs(value) for value in out[:self.n_e]]),
                 _maximum_all([abs(value) for value in out[self.n_e + self.n_bd:]]))
 
-    def _diode_margins(self, top: Topology, out: Sequence[Any]) -> tuple[Any, ...]:
+    def _diode_margins(self, top: Topology, out: Sequence[Any],
+                       scale: Any = None) -> tuple[Any, ...]:
         """Interpret diode branch outputs in the current conduction state."""
         if self._diode_branches is None:
             self._diode_branches = tuple(self._ports[id(diode)][0] for diode in self._diodes)
@@ -4172,7 +4250,9 @@ class Netlist:
         potential: list[Any] = [0.0] * self.n_vertices
         for vertex in range(1, self.n_vertices):
             potential[vertex] = out[int(self._e_off[vertex])]
-        blocking = self._blocking_voltages(top, potential)
+        if scale is None:
+            scale = _maximum_all([abs(value) for value in potential])
+        blocking = self._blocking_voltages(top, potential, scale)
         voltage = [blocking.get(k, value) for k, value in zip(branches, voltage)]
         current = [out[index + self.n_bd] for index in base]
         margins = [_select(diode.conducting, current[k], -voltage[k])
@@ -4237,10 +4317,8 @@ class Netlist:
         inputs, inconsistent = self.source_values(t), False
         for projector in (item for item in self.topology().projectors() if item is not None):
             projected = projector.values(y, inputs)[0]
-            reference = _maximum_all([abs(y[int(index)]) for index in projector.index])
-            tolerance = _MARGIN_RTOL * reference
-            for index, value in zip(projector.index, projected):
-                inconsistent = _logical_or(inconsistent, abs(value - y[int(index)]) > tolerance)
+            for changed in projector.changed_states(y, projected):
+                inconsistent = _logical_or(inconsistent, changed)
         return inconsistent
 
     def _outputs_in_topology(
@@ -4266,62 +4344,83 @@ class Netlist:
     def _scalar_impulse_flags(
         self, top: Topology, y: Sequence[Any], inputs: Sequence[Any], output: Sequence[Any],
         projections: Optional[Mapping[int, tuple[Sequence[Any], Sequence[Any]]]] = None,
+        scales: Optional[tuple[Any, Any]] = None,
     ) -> tuple[Any, ...]:
         """Per-diode reverse impulse flags from one already evaluated scalar topology."""
         capacitor, inductor = top.projectors()
         if capacitor is None and inductor is None:
             return (False,) * len(self._diodes)
-        voltage_scale, current_scale = self._output_scales(output)
+        voltage_scale, current_scale = scales or self._output_scales(output)
         projections = {} if projections is None else projections
         flags: list[Any] = [False] * len(self._diodes)
         gated = self._gated()
 
-        def projected(projector: _Projector) -> tuple[Sequence[Any], Sequence[Any]]:
-            return projections.get(id(projector), projector.values(y, inputs))
+        def parts(projector: _Projector, scale: Any
+                  ) -> tuple[Sequence[Any], list[tuple[Any, Any]], list[int]]:
+            values, multipliers = projections.get(id(projector), projector.values(y, inputs))
+            decisions: list[tuple[Any, Any]] = []
+            owner = [-1] * len(multipliers)
+            for number, (states, rows, _used) in enumerate(projector.blocks):
+                reference = _maximum(
+                    scale,
+                    _maximum_all([abs(y[int(projector.index[state])]) for state in states]),
+                )
+                moved: Any = False
+                for state in states:
+                    moved = _logical_or(
+                        moved,
+                        abs(values[state] - y[int(projector.index[state])])
+                        > _MARGIN_RTOL * reference,
+                    )
+                tolerance = _MARGIN_RTOL * _maximum_all(
+                    [abs(multipliers[row]) for row in rows]
+                )
+                decisions.append((moved, tolerance))
+                for row in rows:
+                    owner[row] = number
+            if any(number < 0 for number in owner):
+                raise RuntimeError("projection constraint is outside its independent block")
+            return multipliers, decisions, owner
 
         if capacitor is not None:
-            values, multipliers = projected(capacitor)
-            reference = _maximum(
-                voltage_scale, _maximum_all([abs(y[int(index)]) for index in capacitor.index])
-            )
-            changed: Any = False
-            for index, value in zip(capacitor.index, values):
-                changed = _logical_or(
-                    changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
-                )
-            tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
+            multipliers, decisions, owner = parts(capacitor, voltage_scale)
             rows = dict(top._wrows)
             for index, diode in enumerate(self._diodes):
                 branch = self._ports[id(diode)][0]
                 if top.roles[branch] == "short" and not gated[index]:
+                    row = rows[branch]
+                    moved, tolerance = decisions[owner[row]]
                     flags[index] = _logical_or(
-                        flags[index],
-                        _logical_and(changed, multipliers[rows[branch]] < -tolerance),
+                        flags[index], _logical_and(moved, multipliers[row] < -tolerance),
                     )
         if inductor is not None:
-            values, multipliers = projected(inductor)
-            reference = _maximum(
-                current_scale, _maximum_all([abs(y[int(index)]) for index in inductor.index])
-            )
-            changed = False
-            for index, value in zip(inductor.index, values):
-                changed = _logical_or(
-                    changed, abs(value - y[int(index)]) > _MARGIN_RTOL * reference
-                )
-            tolerance = _MARGIN_RTOL * _maximum_all([abs(value) for value in multipliers])
+            multipliers, decisions, owner = parts(inductor, current_scale)
             _net, _c, _l, _cd, _p, _r, _w, offsets, supernodes = top._store
+            roots = [supernodes.find(vertex) for vertex in range(self.n_vertices)]
             potential = [multipliers[offsets[root]] if offsets[root] >= 0 else 0.0
-                         for root in map(supernodes.find, range(self.n_vertices))]
+                         for root in roots]
             blocking = self._blocking_voltages(top, potential)
             for index, diode in enumerate(self._diodes):
                 branch = self._ports[id(diode)][0]
                 if top.roles[branch] is None:
                     primitive = self._branches[branch]
+                    touched = sorted({
+                        owner[offsets[roots[vertex]]]
+                        for vertex in (primitive.a, primitive.b)
+                        if offsets[roots[vertex]] >= 0
+                    })
+                    if not touched:
+                        continue
+                    moved: Any = False
+                    tolerance: Any = 0.0
+                    for number in touched:
+                        moved = _logical_or(moved, decisions[number][0])
+                        tolerance = _maximum(tolerance, decisions[number][1])
                     voltage = blocking.get(
                         branch, potential[primitive.a] - potential[primitive.b]
                     )
                     flags[index] = _logical_or(
-                        flags[index], _logical_and(changed, voltage > tolerance)
+                        flags[index], _logical_and(moved, voltage > tolerance)
                     )
         return tuple(flags)
 

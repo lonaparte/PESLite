@@ -1614,7 +1614,7 @@ class Circuit:
 
     def held_inputs_changed(
         self, targets: Sequence[tuple[Any, str]], t: float | None = None
-    ) -> bool:
+    ) -> tuple[Any, ...]:
         """Select the compiled mode after held circuit inputs changed at a boundary."""
         if any((id(record), field) in self._mode_targets for record, field in targets):
             boundary = self._boundary_mode()
@@ -1624,11 +1624,12 @@ class Circuit:
                     and boundary[1] != previous[1]
                     and self._commutate_state_diodes()):
                 self._boundary_signature = boundary
-                return t is not None and self._commit_transitions(t)
+                return (self._commit_transitions(t)
+                        if t is not None and self._transition_consumers else ())
             self._refresh_device_evaluator()
-            if t is not None:
+            if t is not None and self._transition_consumers:
                 return self._commit_transitions(t)
-        return False
+        return ()
 
     def _refresh_device_mode(self, topology: Optional[Topology] = None) -> None:
         """Bind or regenerate the equations selected by the current structural mode."""
@@ -1739,7 +1740,8 @@ class Circuit:
                 and boundary[1] != previous_boundary[1]
                 and self._commutate_state_diodes()):
             self._boundary_signature = boundary
-            self._commit_transitions(t)
+            if self._transition_consumers:
+                self._commit_transitions(t)
             return
         net, before = self.netlist, self.gather()
         try:
@@ -1760,7 +1762,8 @@ class Circuit:
             self._mirrored_valid = True
         self._boundary_signature = boundary
         self._refresh_device_mode()
-        self._commit_transitions(t)
+        if self._transition_consumers:
+            self._commit_transitions(t)
 
     def _boundary_mode(self) -> tuple:
         """Discrete commands that can change the netlist constraints at an outer boundary."""
@@ -1777,7 +1780,8 @@ class Circuit:
             self.commutate(t)
         else:
             self._refresh_device_evaluator()
-            self._commit_transitions(t)
+            if self._transition_consumers:
+                self._commit_transitions(t)
 
     def bind_transitions(self, source: Any, consumer: Any) -> bool:
         """Bind one committed-transition source to a restartable impulse consumer."""
@@ -1811,12 +1815,10 @@ class Circuit:
             for key, (source, _consumers) in self._transition_consumers.items()
         }
 
-    def _commit_transitions(self, t: float) -> bool:
+    def _commit_transitions(self, t: float) -> tuple[Any, ...]:
         """Dispatch only transitions visible after a physical circuit boundary commits."""
-        if not self._transition_consumers:
-            return False
         self.receive()
-        changed = False
+        changed = []
         for key, (source, consumers) in self._transition_consumers.items():
             after = source.committed_transition_state()
             before = self._transition_states.get(key)
@@ -1826,9 +1828,11 @@ class Circuit:
             events = source.committed_transitions(t, before, after)
             if events:
                 for consumer in consumers:
-                    changed |= bool(consumer.apply_committed_transitions(events))
+                    if (consumer.apply_committed_transitions(events)
+                            and not any(consumer is existing for existing in changed)):
+                        changed.append(consumer)
             self._transition_states[key] = after
-        return changed
+        return tuple(changed)
 
     def _commutate_state_diodes(self) -> bool:
         """Apply a gate-only mode change through proved current relations."""
@@ -2714,6 +2718,21 @@ class _ModeDecomposition:
             values[index] = not values[index]
         return Mode(closed, conducting, self.reference.ratios if ratios is None else ratios)
 
+    def topology(self, net: Netlist, changed: frozenset[int]) -> Topology:
+        """Return the physically resolved topology for one selection of local families."""
+        mode = self.modes.get(changed)
+        if mode is None:
+            owners = {
+                owner for owner, cluster in enumerate(self.clusters)
+                if any(variable in changed for variable in cluster)
+            }
+            allowed = {
+                self.variables[variable]
+                for owner in owners for variable in self.clusters[owner]
+            }
+            mode = _resolved_local_mode(net, self.mode(changed), allowed)
+        return net._compiled(mode)
+
 
 def circuit_structure(model: Any, circuits: Sequence[Circuit]):
     """Build the common state partition after any circuit formulation has been lowered."""
@@ -2880,6 +2899,29 @@ _CURRENT_ROLES = ("ind", "isrc", "state_current")
 def _binary_role(resistance: Any) -> Optional[str]:
     """Return the branch role of one binary-device resistance."""
     return "short" if resistance == 0.0 else None if resistance == math.inf else "res"
+
+
+def _resolved_local_mode(net: Netlist, mode: Mode,
+                         allowed: set[tuple[str, int]]) -> Mode:
+    """Resolve a degenerate pattern only when recovery remains inside its device families."""
+    try:
+        net._compiled(mode)
+        return mode
+    except _Degenerate:
+        gated = {index for index, _callback in net._gates}
+        if any(field == "conducting" and index in gated for field, index in allowed):
+            raise
+        resolved = net.resolved_topology(mode).mode
+        changed_diodes = {
+            ("conducting", index)
+            for index, (before, after) in enumerate(
+                zip(mode.conducting, resolved.conducting)
+            )
+            if before != after
+        }
+        if not changed_diodes <= allowed:
+            raise
+        return resolved
 
 
 class _ModeStructure:
@@ -3202,6 +3244,27 @@ class _ModeStructure:
         entries[size + 1] |= changed
         return [sorted(owners) for owners in entries]
 
+    def post_owners(self, net: Netlist, size: int) -> tuple[tuple[int, ...], ...]:
+        """Return owners of diode guards, projected states and reverse-impulse flags."""
+        rows = [set(owners) for owners in self.equation_owners(net)]
+        diode_cluster = {
+            index: number
+            for number, cluster in enumerate(self.clusters)
+            for variable in cluster
+            for field, index in (self.variables[variable],)
+            if field == "conducting"
+        }
+        diode_owners = []
+        for index, diode in enumerate(net._diodes):
+            output = net.n_x + net.n_e + net._branches[net._ports[id(diode)][0]].output
+            owners = rows[output] | rows[output + net.n_bd]
+            if index in diode_cluster:
+                owners.add(diode_cluster[index])
+            diode_owners.append(tuple(sorted(owners)))
+        jumps = self.jump_owners(net, size)
+        state_owners = [tuple(jumps[int(position)]) for position in net.states]
+        return tuple((*diode_owners, *state_owners, *diode_owners, *state_owners))
+
 
 def _mode_decomposition(
     circuit: Circuit,
@@ -3239,9 +3302,11 @@ def _mode_decomposition(
             variables, base, structure,
         )
         for cluster in structure.clusters:
-            decomposition.modes.update(
-                (changed, decomposition.mode(changed)) for changed in combinations(cluster)
-            )
+            own = {variables[variable] for variable in cluster}
+            for changed in combinations(cluster):
+                decomposition.modes[changed] = _resolved_local_mode(
+                    net, decomposition.mode(changed), own
+                )
         decomposition.topologies = tuple(
             net._compiled(mode) for mode in decomposition.modes.values()
         )

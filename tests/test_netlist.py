@@ -920,3 +920,18 @@ def test_device_outputs_evaluate_each_published_value_once():
               and "(" in line.split(" = ", 1)[1]]
     published = [value for value in values if "1j" in value or "*" in value]
     assert published and len(published) == len(set(published))
+
+
+def test_projection_parts_use_their_own_scale():
+    """An unrelated large state must not hide a physical jump in another KKT block."""
+    import scipy.sparse as sp
+
+    projector = nl._Projector(
+        sp.identity(2, format="csr"), sp.identity(2, format="csr"),
+        sp.csr_matrix((2, 0)), sp.csr_matrix((2, 0)), np.array([0, 1]),
+    )
+    assert [states for states, _rows, _inputs in projector.blocks] == [(0,), (1,)]
+    state = np.array([1.0e-11, 100.0])
+    assert projector.changed_states(state, [0.0, 100.0]) == [True, False]
+    assert projector.significant(state, np.array([0.0, 100.0]), 0.0)
+    assert not projector.significant(state, state.copy(), 0.0)

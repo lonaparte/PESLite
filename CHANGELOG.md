@@ -38,6 +38,11 @@
 - Frozen transformer-ratio modes create their compiled topology only when it is actually required.
 - Reduced per-interval overhead by bypassing inactive conduction planning and accepted-step
   observers and by keeping common scalar ratio and limiting operations on their scalar paths.
+- Native mode tables now add entries from independent device clusters instead of enumerating their
+  Cartesian product, while source and transformer branches choose the cheaper whole or partitioned
+  trace from measured tracing work.
+- Charge and flux projections use their independent KKT blocks for jump and impulse tolerances;
+  native loss selection and physical-network caching reuse the same mode decomposition.
 
 ## 0.5.1
 

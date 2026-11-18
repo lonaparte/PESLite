@@ -1648,6 +1648,11 @@ class Model:
                         break
             rhs_layout.append((sub, tuple(entries)))
         self._rhs_layout = tuple(rhs_layout)
+        self._state_entries = {
+            id(subsystem): (subsystem, entries)
+            for subsystem, entries in rhs_layout
+            if entries
+        }
         bounds = []
         for sub, entries in rhs_layout:
             declared = getattr(sub, "state_bounds", {})
@@ -2034,6 +2039,20 @@ class Model:
                 y[idx] = v
         return y
 
+    def update_state_values(
+        self, values: NDArray[np.float64], subsystems: Sequence[Any]
+    ) -> None:
+        """Write committed state changes from selected subsystems into ``values`` in place."""
+        for subsystem in subsystems:
+            entry = self._state_entries.get(id(subsystem))
+            if entry is None or entry[0] is not subsystem:
+                raise ValueError("a committed state owner is not a stateful model subsystem")
+            for name, (index, is_complex) in zip(subsystem.state_names, entry[1]):
+                value = getattr(subsystem.state, name)
+                values[index] = value.real if is_complex else value
+                if is_complex:
+                    values[index + 1] = value.imag
+
     def set_states(self, y: NDArray[np.float64]) -> None:
         self._load(y.tolist())
 
@@ -2116,7 +2135,9 @@ class Model:
         raise KeyError(f"{type(sub).__name__} has no state {name!r}")
 
     # --------------------------------------------------------- evaluation
-    def set_zoh_input(self, label: str, value: Any, t: float | None = None) -> bool:
+    def set_zoh_input(
+        self, label: str, value: Any, t: float | None = None
+    ) -> tuple[Any, ...]:
         """Set a held external input (e.g. the switching state) by label."""
         targets = self._zoh_targets[label]
         if isinstance(value, np.generic):  # generated equations run on Python scalars
@@ -2131,12 +2152,17 @@ class Model:
                 if not same:
                     changed.append((input, name))
         if not changed:
-            return False
-        state_changed = False
+            return ()
+        state_owners = []
         for refresh in self._held_input_refresh:
-            state_changed |= refresh(changed, t) is True
+            reported = refresh(changed, t)
+            if reported is None:
+                continue
+            for owner in reported:
+                if not any(owner is existing for existing in state_owners):
+                    state_owners.append(owner)
         self.invalidate_equations()
-        return state_changed
+        return tuple(state_owners)
 
     def evaluate_outputs(self, t: float) -> None:
         """Run the ordered output-method / input-copy plan for the current states."""

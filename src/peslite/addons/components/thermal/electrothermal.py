@@ -143,7 +143,9 @@ class ElectroThermalModel:
                 raise ValueError("switching_energy_J must be finite and nonnegative")
             self.switching_energy_J = value
 
-    def _transition_energy(self, event: SwitchingEvent, *, strict: bool) -> float | None:
+    def _transition_energy(
+        self, event: Any, *, strict: bool, temperature_K: float | None = None
+    ) -> float | None:
         if self.loss_model is None:
             if strict:
                 raise ValueError("switching events require a semiconductor loss model")
@@ -154,16 +156,20 @@ class ElectroThermalModel:
                 raise ValueError("reverse recovery is already included in turn-on energy")
             return None
         field = {"turn_on": "turn_on_energy_J", "turn_off": "turn_off_energy_J",
-                 "reverse_recovery": "reverse_recovery_energy_J"}[event.kind]
+                 "reverse_recovery": "reverse_recovery_energy_J"}.get(event.kind)
+        if field is None:
+            raise ValueError(f"unknown switching event kind: {event.kind!r}")
         curve = getattr(self.loss_model, field)
         if curve is None:
             if strict:
                 raise ValueError(f"no {event.kind} energy curve was provided")
             return None
-        return float(_lookup(curve, event.current_A, event.voltage_V,
-                             self.temperature_K()))
+        temperature = self.temperature_K() if temperature_K is None else temperature_K
+        return float(_lookup(curve, event.current_A, event.voltage_V, temperature))
 
-    def _apply_transition_energy(self, energy: float, time_s: float) -> None:
+    def _apply_transition_energy(
+        self, energy: float, time_s: float, *, refresh_outputs: bool = True
+    ) -> None:
         states = self._states()
         if self._foster:
             updated = self.network.committed_impulse(states, energy)
@@ -174,7 +180,9 @@ class ElectroThermalModel:
         for name, value in zip(self._temperature_names, updated):
             setattr(self.state, name, float(value))
         self.switching_energy_J += energy
-        self.set_outputs(time_s)
+        self.output.switching_energy_J = self.switching_energy_J
+        if refresh_outputs:
+            self.set_outputs(time_s)
 
     def apply_committed_transition(self, event: SwitchingEvent, *, event_id: int) -> float:
         """Apply one accepted event in J, once per monotonic device event sequence.
@@ -198,21 +206,24 @@ class ElectroThermalModel:
 
     def apply_committed_transitions(self, events: Any) -> float:
         """Apply selected, available device energies from one committed circuit boundary."""
-        accepted = []
-        for raw in events:
-            event = raw if isinstance(raw, SwitchingEvent) else SwitchingEvent(
-                raw.time_s, raw.kind, raw.current_A, raw.voltage_V, raw.device
-            )
+        temperature = self.temperature_K()
+        energy = 0.0
+        count = 0
+        time_s = 0.0
+        for event in events:
             if self.switching_devices and event.device not in self.switching_devices:
                 continue
-            energy = self._transition_energy(event, strict=False)
-            if energy is not None:
-                accepted.append((event, energy))
-        if not accepted:
+            value = self._transition_energy(
+                event, strict=False, temperature_K=temperature
+            )
+            if value is not None:
+                energy += value
+                count += 1
+                time_s = event.time_s
+        if count == 0:
             return 0.0
-        energy = sum(value for _event, value in accepted)
-        self._apply_transition_energy(energy, accepted[-1][0].time_s)
-        self.last_transition_id += len(accepted)
+        self._apply_transition_energy(energy, time_s, refresh_outputs=False)
+        self.last_transition_id += count
         return energy
 
 

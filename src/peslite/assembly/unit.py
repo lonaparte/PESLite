@@ -72,8 +72,10 @@ class Plant:
         self.zoh_changed = False
 
     def hold(self, label: str, value: Any, t: float | None = None) -> None:
-        if self.model.set_zoh_input(label, value, t):
-            self.read_state()
+        changed = self.model.set_zoh_input(label, value, t)
+        if changed:
+            self.model.update_state_values(self.state, changed)
+            self.invalidate()
         self.zoh_changed = True
 
     @contextmanager

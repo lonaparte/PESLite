@@ -73,6 +73,46 @@ def test_single_phase_source_cpp_export_matches_python(tmp_path):
         )
 
 
+@pytest.mark.long
+def test_independent_rectifiers_export_additive_mode_tables(tmp_path):
+    """Independent device clusters add native table entries instead of multiplying them."""
+    from test_cpp_export import _compiler, _final_csv, _run_generated
+
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    tree = {
+        "base": {"s_base": 1000.0, "v_ll_rms": 230.0, "f0": 50.0},
+        "buses": {"ac": {"phases": 1, "c": 20.0e-6}},
+        "sources": {"line": {"bus": "ac", "l": 0.5e-3, "r": 0.2, "v": 325.0}},
+        "units": {f"rectifier{index}": {
+            "type": "dc_converter", "bus": "ac",
+            "filter": {"l_f": (0.4 + 0.1 * index) * 1.0e-3, "r_f": 0.05},
+            "dclink": {
+                "vdc_ref": 300.0, "capacitor": {"c": 1.0e-3},
+                "source": {"type": "current", "i": 2.0 + index},
+            },
+            "bridge": {
+                "type": "full_bridge", "model": "switching",
+                "upper_controlled": False, "lower_controlled": False,
+            },
+        } for index in range(3)},
+        "simulation": {
+            "t_end": 6.0e-3,
+            "solver": {"dt": 1.0e-6, "linearisations": 0},
+            "output": {"period": 1.0e-4},
+        },
+    }
+    source, cpp_out, python_out = _run_generated(
+        from_dict(tree), tmp_path / "rectifiers", compiler
+    )
+    generated = source.read_text(encoding="utf-8")
+    assert "const std::array<std::size_t, 4>& mode" in generated
+    assert _final_csv(cpp_out / "states.csv") == pytest.approx(
+        _final_csv(python_out / "states.csv"), rel=1.0e-9, abs=1.0e-10
+    )
+
+
 def test_ac_source_cannot_connect_to_the_converter_dc_port():
     with pytest.raises(ConfigError, match="electrical-domain conflict"):
         peslite.Simulation(from_dict(_rectifier_tree("rectifier.dc")))
