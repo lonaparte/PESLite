@@ -755,9 +755,13 @@ def test_cable_ratio_modes_are_certified_without_spectra(circuit_model, monkeypa
     simulation = peslite.Simulation(params)
     simulation.run(out_dir=tmp_path)
     (circuit,) = simulation.system.circuits
-    certificate = circuit.netlist.topology()._state_matrix_range_certificate()
+    topology = circuit.netlist.topology()
+    certificate = topology._state_matrix_range_certificate()
     assert certificate is not None
     assert params.simulation.solver.dt * certificate[1] <= 2.6
+    assert (topology.mode.key[:2], certificate[1]) in (
+        circuit.netlist.stability_range_certificates()
+    )
     assert count == 0
 
 

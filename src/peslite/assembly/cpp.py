@@ -547,13 +547,20 @@ def _stability_polynomial(method: str) -> tuple[float, ...]:
 
 def _explicit_stability(
     method: str,
-    plans: Sequence[tuple[int, Sequence[str], Sequence[int]]],
+    plans: Sequence[
+        tuple[
+            int,
+            Sequence[str],
+            Sequence[int],
+            Sequence[tuple[float, Sequence[tuple[int, float, float]]]],
+        ]
+    ],
 ) -> str:
-    """Emit the same exact circuit-mode RK stability check used by Python."""
+    """Emit Python's range-certificate check with the exact-mode fallback."""
     coefficients = ", ".join(_number(value) for value in _stability_polynomial(method))
     half_disk = _STABILITY_HALF_DISK.get(method, 0.0)
     members, checks = [], []
-    for number, (size, lines, positions) in enumerate(plans):
+    for number, (size, lines, positions, certificates) in enumerate(plans):
         key = ", ".join(f"selected[{int(index)}]" for index in positions)
         held = f"ExplicitStabilityMode<{len(positions)}>"
         members.append(f"""std::vector<{held}> explicit_stability_modes_{number};
@@ -564,8 +571,24 @@ def _explicit_stability(
         std::fill(out, out + {int(size)}, 0.0);
         {chr(10).join(lines)}
     }}""")
+        certified_modes = []
+        if half_disk > 0.0:
+            for bound, expected in certificates:
+                matches = " && ".join(
+                    (f"selected[{int(position)}] == {_number(lower)}"
+                     if lower == upper else
+                     f"{_number(lower)} <= selected[{int(position)}]"
+                     f" && selected[{int(position)}] <= {_number(upper)}")
+                    for position, lower, upper in expected
+                )
+                certified_modes.append(
+                    f"(h * {_number(bound)} <= {_number(half_disk)}"
+                    + (f" && {matches}" if matches else "") + ")"
+                )
+        certified = "(" + " || ".join(certified_modes) + ")" if certified_modes else "false"
         checks.append(
-            f"if (!explicit_circuit_stable(explicit_stability_modes_{number}, "
+            f"if (!{certified} && "
+            f"!explicit_circuit_stable(explicit_stability_modes_{number}, "
             f"{held}::Key{{{{{key}}}}}, {int(size)}, h, "
             f"[&](const double* x, double* out) "
             f"{{ stability_derivatives_{number}(t, x, out); }})) return false;"
@@ -4590,24 +4613,51 @@ class _ModelGenerator:
 
     def structural_mode_values(
         self,
-    ) -> tuple[tuple[Any, tuple[_Expression, ...], tuple[bool, ...]], ...]:
-        """Return circuit mode values and those which can change its state matrix."""
+    ) -> tuple[
+        tuple[
+            Any,
+            tuple[_Expression, ...],
+            tuple[bool, ...],
+            tuple[tuple[float, tuple[tuple[float, float] | None, ...]], ...],
+        ],
+        ...,
+    ]:
+        """Return structural values, exact-mode fields and known range certificates."""
         modes = []
         for circuit in self.system.circuits:
             with self._netlist_symbols(circuit):
                 gates, conduction = self._gated_conduction(circuit.netlist)
                 values: list[_Expression] = []
                 stability: list[bool] = []
-                for switch in circuit.netlist._switches:
+                selectors: list[tuple[str, int] | None] = []
+                ranges: list[tuple[float, float] | None] = []
+                fixed: list[tuple[str, int, bool]] = []
+                for index, switch in enumerate(circuit.netlist._switches):
                     flag = self._switch_flag(switch)
                     if flag is None:
                         flag = self._trace(switch.closed)
-                    if flag.code not in ("true", "false"):
+                    if flag.code in ("true", "false"):
+                        fixed.append(("closed", index, flag.code == "true"))
+                    else:
                         values.append(flag)
                         stability.append(True)
+                        selectors.append(("closed", index))
+                        ranges.append(None)
                 values.extend(conduction)
                 values.extend(gates.values())
                 stability.extend([True] * (len(conduction) + len(gates)))
+                selectors.extend(
+                    ("conducting", index)
+                    if value.code not in ("true", "false") else None
+                    for index, value in enumerate(conduction)
+                )
+                selectors.extend([None] * len(gates))
+                ranges.extend([None] * (len(conduction) + len(gates)))
+                fixed.extend(
+                    ("conducting", index, value.code == "true")
+                    for index, value in enumerate(conduction)
+                    if value.code in ("true", "false")
+                )
                 for transformer in circuit.netlist._transformers:
                     if transformer.constant is None:
                         ratio = tuple(
@@ -4618,7 +4668,36 @@ class _ModelGenerator:
                         )
                         values.extend(ratio)
                         stability.extend([True] * len(ratio))
-            modes.append((circuit, tuple(values), tuple(stability)))
+                        selectors.extend([None] * len(ratio))
+                        if transformer.bounds is None:
+                            ranges.extend([None] * len(ratio))
+                        else:
+                            lower, upper = transformer.bounds
+                            ranges.extend(
+                                (float(minimum), float(maximum))
+                                for minimum, maximum in zip(lower.flat, upper.flat)
+                            )
+            certificates = tuple(
+                (
+                    bound,
+                    tuple(
+                        range_ if range_ is not None else
+                        None if selector is None else
+                        (
+                            float(structure[
+                                0 if selector[0] == "closed" else 1
+                            ][selector[1]]),
+                        ) * 2
+                        for selector, range_ in zip(selectors, ranges)
+                    ),
+                )
+                for structure, bound in circuit.netlist.stability_range_certificates()
+                if all(
+                    structure[0 if field == "closed" else 1][index] == expected
+                    for field, index, expected in fixed
+                )
+            )
+            modes.append((circuit, tuple(values), tuple(stability), certificates))
         return tuple(modes)
 
     def trace_circuit_commutation_margin(self, circuit: Any) -> str:
@@ -8731,6 +8810,9 @@ class _CppGenerator:
         mode_lines: list[str] = []
         mode_layout: dict[int, list[int]] = {}
         stability_mode_layout: dict[int, list[int]] = {}
+        stability_certificates: dict[
+            int, list[tuple[float, list[tuple[int, float, float]]]]
+        ] = {}
         stability_equations: dict[int, list[str]] = {}
         if uses_implicit_linearization:
             entries: list[str] = []
@@ -8745,14 +8827,27 @@ class _CppGenerator:
                     entries.append(f"static_cast<double>({code})")
                 return tuple(range(start, len(entries)))
 
-            for circuit, mode_values, stability_values in model.structural_mode_values():
+            for circuit, mode_values, stability_values, certificates in model.structural_mode_values():
                 positions = mode_layout[id(circuit.netlist)] = []
                 stability_positions = stability_mode_layout[id(circuit.netlist)] = []
-                for value, affects_stability in zip(mode_values, stability_values):
+                certificate_positions = [[] for _certificate in certificates]
+                for index, (value, affects_stability) in enumerate(
+                    zip(mode_values, stability_values)
+                ):
                     selected = entry(value)
                     positions.extend(selected)
                     if affects_stability:
                         stability_positions.extend(selected)
+                    for certificate, expected in zip(certificates, certificate_positions):
+                        covered = certificate[1][index]
+                        if covered is not None:
+                            if len(selected) != 1:
+                                raise ValueError("a stability certificate field must be scalar")
+                            expected.append((selected[0], *covered))
+                stability_certificates[id(circuit.netlist)] = [
+                    (certificate[0], expected)
+                    for certificate, expected in zip(certificates, certificate_positions)
+                ]
             mode_size = len(entries)
             if stiff_fallback:
                 stability_equations = {
@@ -8983,6 +9078,7 @@ class _CppGenerator:
                         plan.circuit.n_states,
                         stability_equations[id(plan)],
                         stability_mode_layout[id(plan.circuit.netlist)],
+                        stability_certificates[id(plan.circuit.netlist)],
                     )
                     for plan in stability_plans
                 ])

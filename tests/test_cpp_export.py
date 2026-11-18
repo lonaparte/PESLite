@@ -1100,18 +1100,30 @@ def test_generated_cpp_matches_composite_wpt_switching_events(tmp_path):
     assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * scale
 
 
-def test_generated_cpp_runs_custom_cable_equations(tmp_path):
+def test_generated_cpp_runs_custom_cable_equations_with_range_certificate(tmp_path):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
     params = peslite.load(EXAMPLES / "cable-gfl-example.pes", **{
+        "units.vsc.bridge.model": "pwm_averaging",
         "simulation.t_end": 0.01,
         "simulation.solver.linearisations": 0,
         "simulation.energy_check": "strict",
         "simulation.output.signals": 1,
     })
     project = tmp_path / "cable"
-    _source, cpp_out, python_out = _run_generated(params, project, compiler)
+    source, cpp_out, python_out = _run_generated(params, project, compiler)
+
+    stability = next(
+        line for line in source.read_text(encoding="utf-8").splitlines()
+        if "explicit_circuit_stable(explicit_stability_modes_0" in line
+    )
+    certificate, exact_fallback = stability.split("&& !explicit_circuit_stable", 1)
+    assert "selected[0]" in certificate
+    assert "<= selected[2]" in certificate
+    assert "selected[2] <=" in certificate
+    assert "selected[2] ==" not in certificate
+    assert "selected[2]" in exact_fallback
 
     expected = _final_csv(python_out / "states.csv")
     actual = _final_csv(cpp_out / "states.csv")

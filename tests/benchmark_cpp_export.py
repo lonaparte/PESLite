@@ -130,6 +130,7 @@ def _case_params(config: Path, mode: str, settings: Mapping[str, Any]):
         "simulation.solver.type": solver[0],
         "simulation.solver.method": solver[1],
         "simulation.solver.subsystems": {},
+        "simulation.stop_on_trip": False,
         "simulation.progress.enable": False,
         "simulation.output.period": settings["output_period"],
         "simulation.output.record_every": 1,

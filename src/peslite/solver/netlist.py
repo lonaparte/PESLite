@@ -3268,6 +3268,17 @@ class Netlist:
             return certificate
         return self.topology().state_matrix_stability_certificate()
 
+    def stability_range_certificates(
+        self,
+    ) -> tuple[tuple[tuple[tuple[bool, ...], tuple[bool, ...]], float], ...]:
+        """Return range bounds already proved for known discrete structures."""
+        certificates = []
+        for structure, topology in self._structures.items():
+            certificate = topology._state_matrix_range_certificate()
+            if certificate is not None:
+                certificates.append((structure, float(certificate[1])))
+        return tuple(certificates)
+
     def linear_mode(self) -> tuple[tuple, Callable[[], NDArray[np.float64]],
                                    Optional[tuple[object, float]]]:
         """Return the present state-matrix identity, builder and stability certificate."""
