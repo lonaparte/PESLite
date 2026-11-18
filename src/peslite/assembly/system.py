@@ -616,8 +616,8 @@ class System:
                     target = (unit.ctrl, channel)
                     claim_connections((target,), where)
                     connections[target] = (subsystem, output)
-        from .circuit import (circuit_linear_blocks, circuit_linear_certificates,
-                              circuit_linear_modes, circuit_mode_key,
+        from .circuit import (circuit_linear_blocks, circuit_mode_key,
+                              circuit_solver_check,
                               circuit_structure, compile_network, lower)
         declarations = {id(subsystem): compile_network(subsystem)
                         for subsystem in subsystems.values()}
@@ -641,8 +641,7 @@ class System:
             linear_structure=partial(circuit_structure, circuits=self.circuits),
             linear_mode_key=partial(circuit_mode_key, circuits=self.circuits),
             linear_blocks=partial(circuit_linear_blocks, circuits=self.circuits),
-            linear_modes=partial(circuit_linear_modes, circuits=self.circuits),
-            linear_certificates=partial(circuit_linear_certificates, circuits=self.circuits),
+            solver_check=partial(circuit_solver_check, circuits=self.circuits),
         )
         self.event_subsystems = tuple(
             (name, subsystem)

@@ -46,15 +46,16 @@ import numpy as np
 from ..components.network import Port
 from ..solver.energy import Energetic, spec_of
 from ..solver.model import (
-    Bag, ConfigError, Empty, OutputMethod, _InlineProgram, _compile_straight_line,
+    Bag, ConfigError, Empty, OutputMethod, SolverCheck, SolverRegion, SpectralBound,
+    _InlineProgram, _compile_straight_line,
 )
 from ..solver.netlist import (QUANTITIES, CoupledInductors, CurrentSource, Diode, Element, Mode,
                               Netlist, Node, Topology, VoltageSource, _DENSE_GROUP, _Degenerate,
                               _Evaluation, _linear_expression, _numeric_values, _roles, _UnionFind)
 
 __all__ = ["NetlistBuilder", "NetworkPlan", "Circuit", "NetworkView", "circuit_structure",
-           "circuit_mode_key", "circuit_linear_blocks", "circuit_linear_modes",
-           "circuit_linear_certificates",
+           "circuit_mode_key", "circuit_linear_blocks",
+           "circuit_solver_check",
            "lower", "bind_device", "compile_network"]
 
 
@@ -1435,22 +1436,19 @@ class Circuit:
             y[index] = T @ y[index]
         return y
 
-    def linear_mode(self) -> tuple[
-        tuple, Callable[[], np.ndarray], Optional[tuple[object, float]]
-    ]:
-        """Return the present linear-mode identity, matrix builder and stability certificate."""
+    def linear_mode(self) -> tuple[tuple, Callable[[], np.ndarray]]:
+        """Return the present linear-mode identity and lazy matrix builder."""
         topology = self._bound_device_topology()
         if topology is None:
             return self.netlist.linear_mode()
-        return (topology.state_matrix_key(), lambda: topology.state_space.A,
-                topology.state_matrix_stability_certificate())
+        return topology.state_matrix_key(), lambda: topology.state_space.A
 
-    def stability_certificate(self) -> Optional[tuple[object, float]]:
-        """Return the present mode's stability certificate without its identity or matrix."""
+    def spectral_bound(self) -> Optional[tuple[object, float]]:
+        """Return the present mode's proved spectral bound without its exact matrix."""
         topology = self._bound_device_topology()
         if topology is None:
-            return self.netlist.stability_certificate()
-        return topology.state_matrix_stability_certificate()
+            return self.netlist.spectral_bound()
+        return topology.state_matrix_spectral_bound()
 
     def _store(self, y: np.ndarray) -> None:
         """Write a netlist state vector back into the components."""
@@ -2869,27 +2867,59 @@ def _placed_linear_matrix(circuit: Circuit, matrix: np.ndarray) -> np.ndarray:
     return plan.inverse @ placed @ plan.transform
 
 
-def _placed_certificate(circuit: Circuit, certificate: Optional[tuple[object, float]]):
-    # Similarity preserves the spectrum, so the netlist bound also certifies the placed matrix.
-    return None if certificate is None else ((id(circuit.netlist), certificate[0]), certificate[1])
-
-
-def circuit_linear_modes(circuits: Sequence[Circuit]):
-    """Return each assembled circuit's present-mode identity and the builder of its exact state
-    matrix (a solver builds it only for a mode it has not seen)."""
+def _circuit_exact_modes(circuits: Sequence[Circuit]):
+    """Return present-mode identities and lazy exact state matrices."""
     return tuple(
         ((id(circuit.netlist), key),
-         lambda circuit=circuit, matrix=matrix: _placed_linear_matrix(circuit, matrix()),
-         _placed_certificate(circuit, certificate))
+         lambda circuit=circuit, matrix=matrix: _placed_linear_matrix(circuit, matrix()))
         for circuit in circuits
-        for key, matrix, certificate in (circuit.linear_mode(),)
+        for key, matrix in (circuit.linear_mode(),)
     )
 
 
-def circuit_linear_certificates(circuits: Sequence[Circuit]):
-    """Return present-mode certificates without materializing identities or matrices."""
-    return tuple(_placed_certificate(circuit, circuit.stability_certificate())
+def _placed_spectral_bound(
+    circuit: Circuit, bound: Optional[tuple[object, float]],
+) -> Optional[SpectralBound]:
+    # Similarity preserves the spectrum, so the netlist bound also covers the placed matrix.
+    return None if bound is None else SpectralBound(
+        (id(circuit.netlist), bound[0]), float(bound[1])
+    )
+
+
+def _circuit_spectral_bounds(circuits: Sequence[Circuit]):
+    """Return present proved bounds without materializing exact mode identities or matrices."""
+    return tuple(_placed_spectral_bound(circuit, circuit.spectral_bound())
                  for circuit in circuits)
+
+
+def _circuit_solver_regions(circuit: Circuit) -> tuple[SolverRegion, ...]:
+    """Return known discrete regions with their declared continuous coefficient ranges."""
+    coefficient_ranges = []
+    for transformer in circuit.netlist._transformers:
+        if transformer.constant is not None:
+            continue
+        if transformer.bounds is None:
+            coefficient_ranges.extend([None] * math.prod(transformer.shape))
+        else:
+            lower, upper = transformer.bounds
+            coefficient_ranges.extend(
+                (float(minimum), float(maximum))
+                for minimum, maximum in zip(lower.flat, upper.flat)
+            )
+    return tuple(
+        SolverRegion((*structure[0], *structure[1]), tuple(coefficient_ranges), maximum)
+        for structure, maximum in circuit.netlist.ratio_range_spectral_bounds()
+    )
+
+
+def circuit_solver_check(_model: Any, circuits: Sequence[Circuit]) -> SolverCheck:
+    """Build the shared numerical solver check after circuit state assembly."""
+    circuits = tuple(circuits)
+    return SolverCheck(
+        exact_modes=lambda: _circuit_exact_modes(circuits),
+        spectral_bounds=lambda: _circuit_spectral_bounds(circuits),
+        regions=_circuit_solver_regions,
+    )
 
 
 _VOLTAGE_ROLES = ("vsrc", "short", "cap")

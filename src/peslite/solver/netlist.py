@@ -2108,7 +2108,7 @@ class Topology:
             )
         return norm
 
-    def _state_matrix_range_certificate(self) -> Optional[tuple[object, float]]:
+    def _ratio_range_spectral_bound(self) -> Optional[tuple[object, float]]:
         """Certify one spectral-radius bound over every declared transformer ratio.
 
         The interval matrix bounds the low-rank ratio correction entry by entry.  If its
@@ -2116,20 +2116,20 @@ class Topology:
         matrix in the range is nonsingular and bounds its state matrix in one diagonal similarity.
         """
         base = self._shared["ratio_base"]
-        cached = self._shared.get("state_matrix_range_certificate", _PENDING)
+        cached = self._shared.get("ratio_range_spectral_bound", _PENDING)
         if cached is not _PENDING:
             return cached
         net = base._store[0]
         bounds = tuple(transformer.bounds for transformer in net._transformers)
         if any(bound is None for bound in bounds):
-            certificate = None
+            result = None
         elif (not base._pattern.slot_pos.size
               or all(np.array_equal(lower, upper) for lower, upper in bounds)):
-            certificate = (base, self._base_scaled_norm())
+            result = (base, self._base_scaled_norm())
         else:
             _ = base.lu
             plan = base._ratio_plan()
-            certificate = None
+            result = None
             if plan is not None:
                 lower, upper = base._pattern.value_bounds(bounds)
                 change = plan.change_bound(lower, upper)
@@ -2152,24 +2152,24 @@ class Topology:
                     )
                     bound = self._base_scaled_norm() + correction
                     if math.isfinite(bound):
-                        certificate = (base, bound)
-        self._shared["state_matrix_range_certificate"] = certificate
-        return certificate
+                        result = (base, bound)
+        self._shared["ratio_range_spectral_bound"] = result
+        return result
 
-    def range_stability_certificate(
+    def ratio_range_spectral_bound(
         self, ratios: Sequence[NDArray[np.float64]]
     ) -> Optional[tuple[object, float]]:
-        """Return the structure's range certificate when it covers ``ratios``."""
+        """Return the structure's spectral bound when its ratio range covers ``ratios``."""
         for transformer, ratio in zip(self._store[0]._transformers, ratios):
             if not transformer.within_bounds(ratio):
                 return None
-        return self._state_matrix_range_certificate()
+        return self._ratio_range_spectral_bound()
 
-    def state_matrix_stability_certificate(self) -> Optional[tuple[object, float]]:
-        """Return a reusable range certificate, or a bound for this exact ratio mode."""
-        certificate = self.range_stability_certificate(self.mode.ratios)
-        if certificate is not None:
-            return certificate
+    def state_matrix_spectral_bound(self) -> Optional[tuple[object, float]]:
+        """Return a reusable ratio-range bound, or one for this exact ratio mode."""
+        bound = self.ratio_range_spectral_bound(self.mode.ratios)
+        if bound is not None:
+            return bound
         bound = self.state_matrix_norm_bound()
         return None if bound is None else (self.state_matrix_key(), bound)
 
@@ -3238,7 +3238,7 @@ class Netlist:
         """Reuse the current mode until the enclosing smooth interval ends.
 
         A previously resolved switch and diode structure needs only its transformer-ratio copy;
-        that copy is created on first topology access, which a conclusive certificate avoids.
+        that copy is created on first topology access, which a conclusive bound avoids.
         """
         if self._frozen_mode is None:
             requested = self.mode()
@@ -3253,42 +3253,40 @@ class Netlist:
                 if key in self._scalar_functions:
                     self._frozen_scalar = self._scalar_function(self.topology(), "all")
 
-    def _frozen_range_certificate(self) -> tuple[Optional[Topology], Optional[tuple[object, float]]]:
-        """Return the frozen mode's structure and covering range certificate, if available."""
+    def _frozen_spectral_bound(self) -> tuple[Optional[Topology], Optional[tuple[object, float]]]:
+        """Return the frozen mode's structure and covering spectral bound, if available."""
         mode = self._frozen_mode
         if mode is None or self._frozen_topology is not None:
             return None, None
         base = self._structures.get((mode.closed, mode.conducting))
-        return base, None if base is None else base.range_stability_certificate(mode.ratios)
+        return base, None if base is None else base.ratio_range_spectral_bound(mode.ratios)
 
-    def stability_certificate(self) -> Optional[tuple[object, float]]:
-        """Return the present stability certificate without its identity or matrix."""
-        _base, certificate = self._frozen_range_certificate()
-        if certificate is not None:
-            return certificate
-        return self.topology().state_matrix_stability_certificate()
+    def spectral_bound(self) -> Optional[tuple[object, float]]:
+        """Return the present mode's proved spectral bound without its exact matrix."""
+        _base, bound = self._frozen_spectral_bound()
+        if bound is not None:
+            return bound
+        return self.topology().state_matrix_spectral_bound()
 
-    def stability_range_certificates(
+    def ratio_range_spectral_bounds(
         self,
     ) -> tuple[tuple[tuple[tuple[bool, ...], tuple[bool, ...]], float], ...]:
         """Return range bounds already proved for known discrete structures."""
-        certificates = []
+        bounds = []
         for structure, topology in self._structures.items():
-            certificate = topology._state_matrix_range_certificate()
-            if certificate is not None:
-                certificates.append((structure, float(certificate[1])))
-        return tuple(certificates)
+            bound = topology._ratio_range_spectral_bound()
+            if bound is not None:
+                bounds.append((structure, float(bound[1])))
+        return tuple(bounds)
 
-    def linear_mode(self) -> tuple[tuple, Callable[[], NDArray[np.float64]],
-                                   Optional[tuple[object, float]]]:
-        """Return the present state-matrix identity, builder and stability certificate."""
-        base, certificate = self._frozen_range_certificate()
-        if certificate is not None:
+    def linear_mode(self) -> tuple[tuple, Callable[[], NDArray[np.float64]]]:
+        """Return the present state-matrix identity and lazy matrix builder."""
+        base, bound = self._frozen_spectral_bound()
+        if bound is not None:
             return (base.state_matrix_key(self._frozen_mode),
-                    lambda: self.topology().state_space.A, certificate)
+                    lambda: self.topology().state_space.A)
         topology = self.topology()
-        return (topology.state_matrix_key(), lambda: topology.state_space.A,
-                topology.state_matrix_stability_certificate())
+        return topology.state_matrix_key(), lambda: topology.state_space.A
 
     def release_topology(self) -> None:
         """Allow topology callbacks to be read at the next model-changing boundary."""

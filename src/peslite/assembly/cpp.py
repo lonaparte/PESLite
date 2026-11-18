@@ -523,7 +523,7 @@ def _fixed_step(method: str) -> str:
     return "\n".join(lines)
 
 
-def _stability_polynomial(method: str) -> tuple[float, ...]:
+def _rk_stability_polynomial(method: str) -> tuple[float, ...]:
     """Return the scalar RK stability polynomial in ascending powers of ``z``."""
     _nodes, rows, weights = TABLEAUS[method]
 
@@ -545,7 +545,7 @@ def _stability_polynomial(method: str) -> tuple[float, ...]:
     return tuple(add([1.0], [0.0, *contribution]))
 
 
-def _explicit_stability(
+def _explicit_step_check(
     method: str,
     plans: Sequence[
         tuple[
@@ -556,16 +556,16 @@ def _explicit_stability(
         ]
     ],
 ) -> str:
-    """Emit Python's range-certificate check with the exact-mode fallback."""
-    coefficients = ", ".join(_number(value) for value in _stability_polynomial(method))
+    """Emit the shared range-bound check with the exact-mode fallback."""
+    coefficients = ", ".join(_number(value) for value in _rk_stability_polynomial(method))
     half_disk = _STABILITY_HALF_DISK.get(method, 0.0)
     members, checks = [], []
-    for number, (size, lines, positions, certificates) in enumerate(plans):
+    for number, (size, lines, positions, regions) in enumerate(plans):
         key = ", ".join(f"selected[{int(index)}]" for index in positions)
-        held = f"ExplicitStabilityMode<{len(positions)}>"
-        members.append(f"""std::vector<{held}> explicit_stability_modes_{number};
+        held = f"ExplicitStepMode<{len(positions)}>"
+        members.append(f"""std::vector<{held}> explicit_step_modes_{number};
 
-    void stability_derivatives_{number}(double t, const double* x, double* out) {{
+    void step_check_derivatives_{number}(double t, const double* x, double* out) {{
         (void)t;
         (void)x;
         std::fill(out, out + {int(size)}, 0.0);
@@ -573,7 +573,7 @@ def _explicit_stability(
     }}""")
         certified_modes = []
         if half_disk > 0.0:
-            for bound, expected in certificates:
+            for bound, expected in regions:
                 matches = " && ".join(
                     (f"selected[{int(position)}] == {_number(lower)}"
                      if lower == upper else
@@ -588,15 +588,15 @@ def _explicit_stability(
         certified = "(" + " || ".join(certified_modes) + ")" if certified_modes else "false"
         checks.append(
             f"if (!{certified} && "
-            f"!explicit_circuit_stable(explicit_stability_modes_{number}, "
+            f"!explicit_circuit_step_allowed(explicit_step_modes_{number}, "
             f"{held}::Key{{{{{key}}}}}, {int(size)}, h, "
             f"[&](const double* x, double* out) "
-            f"{{ stability_derivatives_{number}(t, x, out); }})) return false;"
+            f"{{ step_check_derivatives_{number}(t, x, out); }})) return false;"
         )
     joined_members = "\n\n    ".join(members)
     joined_checks = "\n        ".join(checks)
     return f"""
-    template <std::size_t Positions> struct ExplicitStabilityMode {{
+    template <std::size_t Positions> struct ExplicitStepMode {{
         using Key = std::array<double, Positions>;
         std::size_t epoch;
         Key key;
@@ -607,21 +607,21 @@ def _explicit_stability(
         bool spectrum;
         bool converged;
     }};
-    struct ExplicitStabilityBlock {{
+    struct ExplicitStepBlock {{
         std::vector<Complex> matrix;
         std::vector<Complex> eigenvalues;
         bool converged;
     }};
-    struct ExplicitStabilityPattern {{
+    struct ExplicitStepPattern {{
         std::vector<unsigned char> nonzero;
         std::vector<std::vector<std::size_t>> components;
         bool decomposed;
     }};
-    std::vector<ExplicitStabilityBlock> explicit_stability_blocks;
-    std::vector<ExplicitStabilityPattern> explicit_stability_patterns;
+    std::vector<ExplicitStepBlock> explicit_step_blocks;
+    std::vector<ExplicitStepPattern> explicit_step_patterns;
     {joined_members}
 
-    static std::vector<std::vector<std::size_t>> stability_components(
+    static std::vector<std::vector<std::size_t>> step_check_components(
             const std::vector<Complex>& matrix, std::size_t n) {{
         const std::size_t missing = std::numeric_limits<std::size_t>::max();
         std::vector<std::size_t> index(n, missing), low(n), stack;
@@ -757,7 +757,7 @@ def _explicit_stability(
         return active == 0;
     }}
 
-    template <class Held> static bool explicit_mode_stable(Held& held, double h) {{
+    template <class Held> static bool explicit_mode_step_allowed(Held& held, double h) {{
         if (!held.spectrum) {{
             if ({_number(half_disk)} > 0.0
                     && h * held.norm_bound <= {_number(half_disk)}) return true;
@@ -781,8 +781,9 @@ def _explicit_stability(
     }}
 
     template <class Held, class Evaluate>
-    bool explicit_circuit_stable(std::vector<Held>& modes, const typename Held::Key& key,
-                                 std::size_t n, double h, Evaluate&& evaluate) {{
+    bool explicit_circuit_step_allowed(std::vector<Held>& modes,
+                                       const typename Held::Key& key,
+                                       std::size_t n, double h, Evaluate&& evaluate) {{
         auto found = std::find_if(modes.begin(), modes.end(), [&](const auto& item) {{
             return item.epoch == implicit_epoch && item.key == key;
         }});
@@ -815,20 +816,20 @@ def _explicit_stability(
             std::transform(matrix.begin(), matrix.end(), pattern.begin(),
                            [](Complex value) {{ return value != Complex{{}}; }});
             auto structure = std::find_if(
-                explicit_stability_patterns.begin(), explicit_stability_patterns.end(),
+                explicit_step_patterns.begin(), explicit_step_patterns.end(),
                 [&](const auto& item) {{ return item.nonzero == pattern; }}
             );
-            if (structure == explicit_stability_patterns.end()) {{
-                if (explicit_stability_patterns.size() >= 64)
-                    explicit_stability_patterns.erase(explicit_stability_patterns.begin());
-                explicit_stability_patterns.push_back({{std::move(pattern), {{}}, false}});
+            if (structure == explicit_step_patterns.end()) {{
+                if (explicit_step_patterns.size() >= 64)
+                    explicit_step_patterns.erase(explicit_step_patterns.begin());
+                explicit_step_patterns.push_back({{std::move(pattern), {{}}, false}});
                 found->converged = explicit_eigenvalues(
                     std::move(matrix), n, found->eigenvalues
                 );
-                return explicit_mode_stable(*found, h);
+                return explicit_mode_step_allowed(*found, h);
             }}
             if (!structure->decomposed) {{
-                structure->components = stability_components(matrix, n);
+                structure->components = step_check_components(matrix, n);
                 structure->decomposed = true;
             }}
             if (structure->components.size() == 1
@@ -836,7 +837,7 @@ def _explicit_stability(
                 found->converged = explicit_eigenvalues(
                     std::move(matrix), n, found->eigenvalues
                 );
-                return explicit_mode_stable(*found, h);
+                return explicit_mode_step_allowed(*found, h);
             }}
             found->converged = true;
             for (const auto& component : structure->components) {{
@@ -846,16 +847,16 @@ def _explicit_stability(
                         block[row * component.size() + column]
                             = matrix[component[row] * n + component[column]];
                 auto cached = std::find_if(
-                    explicit_stability_blocks.begin(), explicit_stability_blocks.end(),
+                    explicit_step_blocks.begin(), explicit_step_blocks.end(),
                     [&](const auto& item) {{
                         return item.matrix == block;
                     }}
                 );
-                if (cached == explicit_stability_blocks.end()) {{
-                    if (explicit_stability_blocks.size() >= 256)
-                        explicit_stability_blocks.erase(explicit_stability_blocks.begin());
-                    explicit_stability_blocks.push_back({{block, {{}}, false}});
-                    cached = explicit_stability_blocks.end() - 1;
+                if (cached == explicit_step_blocks.end()) {{
+                    if (explicit_step_blocks.size() >= 256)
+                        explicit_step_blocks.erase(explicit_step_blocks.begin());
+                    explicit_step_blocks.push_back({{block, {{}}, false}});
+                    cached = explicit_step_blocks.end() - 1;
                     cached->converged = explicit_eigenvalues(
                         std::move(block), component.size(), cached->eigenvalues
                     );
@@ -865,10 +866,10 @@ def _explicit_stability(
                                           cached->eigenvalues.begin(), cached->eigenvalues.end());
             }}
         }}
-        return explicit_mode_stable(*found, h);
+        return explicit_mode_step_allowed(*found, h);
     }}
 
-    bool explicit_stable(double t, double h) {{
+    bool explicit_step_allowed(double t, double h) {{
         const StructuralMode selected = structural_mode();
         {joined_checks}
         return true;
@@ -2173,6 +2174,7 @@ class _ModelGenerator:
         self._dynamic_netlist_traces = {}
         # symbolic eliminations by their inputs' codes, shared by every term pool
         self._dynamic_netlist_solutions = {}
+        self._dynamic_netlist_sources = {}
         self.event_parameter_bindings: dict[str, tuple[bool, str | None]] = {}
         self._runtime_networks = {}
         self.equation_bindings = {}
@@ -3982,8 +3984,8 @@ class _ModelGenerator:
         self, circuit: Any, t: Any, states: list[Any], *, topology=None, raw=False,
     ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
         """Eliminate the shared netlist equations through the netlist's expression DAG."""
-        def generated(values: Sequence[Any]) -> tuple[_Expression, ...]:
-            shared, rendered = _symbolic_source(values)
+        def generated(source: tuple[Sequence[str], Sequence[str]]) -> tuple[_Expression, ...]:
+            shared, rendered = source
             names: dict[str, str] = {}
 
             def resolve(code: str) -> str:
@@ -4056,7 +4058,12 @@ class _ModelGenerator:
         if raw:
             result = tuple(derivative), tuple(output)
         else:
-            values = generated((*derivative, *output))
+            source = self._dynamic_netlist_sources.get(solve_key)
+            if source is None:
+                source = self._dynamic_netlist_sources[solve_key] = _symbolic_source(
+                    (*derivative, *output)
+                )
+            values = generated(source)
             count = len(derivative)
             result = net._place_scalar_derivatives(values[:count], len(states)), values[count:]
         self._dynamic_netlist_traces[cache_key] = result
@@ -4435,8 +4442,8 @@ class _ModelGenerator:
         circuit.t = t
         return tuple(circuit.derivatives), tuple(all_outputs)
 
-    def trace_stability_derivatives(self, circuit: Any) -> list[str]:
-        """Lower the exact present-mode circuit derivative matrix source for native checks."""
+    def trace_step_check_derivatives(self, circuit: Any) -> list[str]:
+        """Lower exact present-mode circuit derivatives for the native solver check."""
         def run():
             with self._netlist_symbols(circuit):
                 circuit.receive()
@@ -4617,47 +4624,42 @@ class _ModelGenerator:
         tuple[
             Any,
             tuple[_Expression, ...],
-            tuple[bool, ...],
             tuple[tuple[float, tuple[tuple[float, float] | None, ...]], ...],
         ],
         ...,
     ]:
-        """Return structural values, exact-mode fields and known range certificates."""
+        """Return structural values and the solver-check regions that cover them."""
         modes = []
         for circuit in self.system.circuits:
             with self._netlist_symbols(circuit):
                 gates, conduction = self._gated_conduction(circuit.netlist)
                 values: list[_Expression] = []
-                stability: list[bool] = []
-                selectors: list[tuple[str, int] | None] = []
-                ranges: list[tuple[float, float] | None] = []
-                fixed: list[tuple[str, int, bool]] = []
+                coverage: list[tuple[str, int] | None] = []
+                fixed: list[tuple[int, bool]] = []
+                conduction_offset = len(circuit.netlist._switches)
                 for index, switch in enumerate(circuit.netlist._switches):
                     flag = self._switch_flag(switch)
                     if flag is None:
                         flag = self._trace(switch.closed)
                     if flag.code in ("true", "false"):
-                        fixed.append(("closed", index, flag.code == "true"))
+                        fixed.append((index, flag.code == "true"))
                     else:
                         values.append(flag)
-                        stability.append(True)
-                        selectors.append(("closed", index))
-                        ranges.append(None)
+                        coverage.append(("selector", index))
                 values.extend(conduction)
                 values.extend(gates.values())
-                stability.extend([True] * (len(conduction) + len(gates)))
-                selectors.extend(
-                    ("conducting", index)
+                coverage.extend(
+                    ("selector", conduction_offset + index)
                     if value.code not in ("true", "false") else None
                     for index, value in enumerate(conduction)
                 )
-                selectors.extend([None] * len(gates))
-                ranges.extend([None] * (len(conduction) + len(gates)))
+                coverage.extend([None] * len(gates))
                 fixed.extend(
-                    ("conducting", index, value.code == "true")
+                    (conduction_offset + index, value.code == "true")
                     for index, value in enumerate(conduction)
                     if value.code in ("true", "false")
                 )
+                coefficient = 0
                 for transformer in circuit.netlist._transformers:
                     if transformer.constant is None:
                         ratio = tuple(
@@ -4667,37 +4669,30 @@ class _ModelGenerator:
                             ).flat
                         )
                         values.extend(ratio)
-                        stability.extend([True] * len(ratio))
-                        selectors.extend([None] * len(ratio))
-                        if transformer.bounds is None:
-                            ranges.extend([None] * len(ratio))
-                        else:
-                            lower, upper = transformer.bounds
-                            ranges.extend(
-                                (float(minimum), float(maximum))
-                                for minimum, maximum in zip(lower.flat, upper.flat)
-                            )
-            certificates = tuple(
+                        coverage.extend(
+                            ("coefficient", index)
+                            for index in range(coefficient, coefficient + len(ratio))
+                        )
+                        coefficient += len(ratio)
+            check = self.model.solver_check
+            regions = () if check is None else check.regions(circuit)
+            regions = tuple(
                 (
-                    bound,
+                    region.spectral_bound,
                     tuple(
-                        range_ if range_ is not None else
                         None if selector is None else
-                        (
-                            float(structure[
-                                0 if selector[0] == "closed" else 1
-                            ][selector[1]]),
-                        ) * 2
-                        for selector, range_ in zip(selectors, ranges)
+                        region.coefficient_ranges[selector[1]]
+                        if selector[0] == "coefficient" else
+                        (float(region.selectors[selector[1]]),) * 2
+                        for selector in coverage
                     ),
                 )
-                for structure, bound in circuit.netlist.stability_range_certificates()
+                for region in regions
                 if all(
-                    structure[0 if field == "closed" else 1][index] == expected
-                    for field, index, expected in fixed
+                    region.selectors[index] == expected for index, expected in fixed
                 )
             )
-            modes.append((circuit, tuple(values), tuple(stability), certificates))
+            modes.append((circuit, tuple(values), regions))
         return tuple(modes)
 
     def trace_circuit_commutation_margin(self, circuit: Any) -> str:
@@ -8766,9 +8761,12 @@ class _CppGenerator:
                                     if callable(getattr(sub, "next_commutation_time", None))
                                     else "std::numeric_limits<double>::infinity()")
             commutation_transitions.append(model.trace_transition(sub, "commutate"))
+        native_conduction = bool(
+            diode_current_states or diode_step_limits or commutation_margins
+        )
         boundary_members, boundary_method = self._circuit_boundaries(model)
         boundary_call = "reconcile_circuits(t);" if boundary_method else ""
-        raw_projection_call = "" if diode_conduction else projection_call
+        raw_projection_call = "" if native_conduction else projection_call
         member_lines = model.members(generators.values())
         member_lines.extend(event_members)
         member_lines.extend(boundary_members)
@@ -8797,23 +8795,22 @@ class _CppGenerator:
             circuit._structure_plan for circuit in self.system.circuits
             if circuit._structure_plan is not None
         )
-        stability_plans = tuple(
+        solver_check_plans = tuple(
             plan for plan in circuit_plans
             if plan.local_to_model.size
         )
         stiff_fallback = (
             isinstance(self.simulation.solver, FixedStepSolver)
-            and bool(stability_plans)
+            and bool(solver_check_plans)
         )
         uses_implicit_linearization = native_implicit or stiff_fallback
         mode_size = 0
         mode_lines: list[str] = []
-        mode_layout: dict[int, list[int]] = {}
-        stability_mode_layout: dict[int, list[int]] = {}
-        stability_certificates: dict[
+        step_check_layout: dict[int, list[int]] = {}
+        step_check_regions: dict[
             int, list[tuple[float, list[tuple[int, float, float]]]]
         ] = {}
-        stability_equations: dict[int, list[str]] = {}
+        step_check_equations: dict[int, list[str]] = {}
         if uses_implicit_linearization:
             entries: list[str] = []
 
@@ -8827,32 +8824,27 @@ class _CppGenerator:
                     entries.append(f"static_cast<double>({code})")
                 return tuple(range(start, len(entries)))
 
-            for circuit, mode_values, stability_values, certificates in model.structural_mode_values():
-                positions = mode_layout[id(circuit.netlist)] = []
-                stability_positions = stability_mode_layout[id(circuit.netlist)] = []
-                certificate_positions = [[] for _certificate in certificates]
-                for index, (value, affects_stability) in enumerate(
-                    zip(mode_values, stability_values)
-                ):
+            for circuit, mode_values, regions in model.structural_mode_values():
+                positions = step_check_layout[id(circuit.netlist)] = []
+                region_positions = [[] for _region in regions]
+                for index, value in enumerate(mode_values):
                     selected = entry(value)
                     positions.extend(selected)
-                    if affects_stability:
-                        stability_positions.extend(selected)
-                    for certificate, expected in zip(certificates, certificate_positions):
-                        covered = certificate[1][index]
+                    for region, expected in zip(regions, region_positions):
+                        covered = region[1][index]
                         if covered is not None:
                             if len(selected) != 1:
-                                raise ValueError("a stability certificate field must be scalar")
+                                raise ValueError("a solver-check region field must be scalar")
                             expected.append((selected[0], *covered))
-                stability_certificates[id(circuit.netlist)] = [
-                    (certificate[0], expected)
-                    for certificate, expected in zip(certificates, certificate_positions)
+                step_check_regions[id(circuit.netlist)] = [
+                    (region[0], expected)
+                    for region, expected in zip(regions, region_positions)
                 ]
             mode_size = len(entries)
             if stiff_fallback:
-                stability_equations = {
-                    id(plan): model.trace_stability_derivatives(plan.circuit)
-                    for plan in stability_plans
+                step_check_equations = {
+                    id(plan): model.trace_step_check_derivatives(plan.circuit)
+                    for plan in solver_check_plans
                 }
             mode_lines = [
                 "StructuralMode structural_mode() {",
@@ -9050,7 +9042,7 @@ class _CppGenerator:
         adaptive_safety = "" if fixed else _number(self.simulation.solver.safety)
         run_end = self.runtime.value("simulation.t_end", self.p.simulation.t_end)
         output_period_value = self.runtime.value("simulation.output.period", output.period)
-        integration_name = "integrate_solver" if diode_conduction else "integrate"
+        integration_name = "integrate_solver" if native_conduction else "integrate"
         local_limit = bool(diode_step_limits)
         integration_args = (", double maximum_step = std::numeric_limits<double>::infinity()"
                             if local_limit else "")
@@ -9073,24 +9065,24 @@ class _CppGenerator:
                     mode_size=mode_size,
                     groups=groups, interface=interface,
                 )
-                stability_code = _explicit_stability(solver.method, [
+                step_check_code = _explicit_step_check(solver.method, [
                     (
                         plan.circuit.n_states,
-                        stability_equations[id(plan)],
-                        stability_mode_layout[id(plan.circuit.netlist)],
-                        stability_certificates[id(plan.circuit.netlist)],
+                        step_check_equations[id(plan)],
+                        step_check_layout[id(plan.circuit.netlist)],
+                        step_check_regions[id(plan.circuit.netlist)],
                     )
-                    for plan in stability_plans
+                    for plan in solver_check_plans
                 ])
                 stiff_call = (
                     "integrate_stiff(t, target, maximum_step);"
                     if local_limit else "integrate_stiff(t, target);"
                 )
                 stiffness = f'''{implicit_code}
-{stability_code}
+{step_check_code}
 '''
                 stiffness_dispatch = f'''
-        if (!explicit_stable(t, h)) {{ {stiff_call} return; }}'''
+        if (!explicit_step_allowed(t, h)) {{ {stiff_call} return; }}'''
             else:
                 stiffness = ""
                 stiffness_dispatch = ""
@@ -9153,7 +9145,7 @@ class _CppGenerator:
         advance_method = "integrate"
         diode_declaration = ""
         conduction_sync = ""
-        if diode_conduction:
+        if native_conduction:
             callbacks = [f"bool diode_blocks_reverse_current_{k}() {{ return {guard}; }}"
                          for k, guard in enumerate(diode_blocking_guards)]
             callbacks += [f"double diode_maximum_step_{k}() {{ return {value}; }}"

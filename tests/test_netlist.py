@@ -662,7 +662,7 @@ def test_export_planning_covers_default_device_circuits_and_diode_modes():
     assert set(solve.inputs) == set(circuit.inputs)
 
 
-def test_device_ratio_stability_certificate_avoids_exact_mode_spectra(
+def test_device_ratio_spectral_bound_avoids_exact_mode_spectra(
         monkeypatch, tmp_path):
     count = 0
     original = nl._DenseSolve.__init__
@@ -694,7 +694,7 @@ def test_device_ratio_stability_certificate_avoids_exact_mode_spectra(
     assert count - initial <= new_structures
 
 
-def test_transformer_ratio_range_certificate_bounds_the_full_declared_box():
+def test_transformer_ratio_range_bound_covers_the_full_declared_box():
     simulation = peslite.Simulation(peslite.load(
         EXAMPLES / "gfl-example.pes", **QUIET, **{
             "simulation.solver.circuit_model": "device",
@@ -702,8 +702,8 @@ def test_transformer_ratio_range_certificate_bounds_the_full_declared_box():
     ))
     circuit, = simulation.system.circuits
     topology = circuit.netlist.topology()
-    certificate = topology._state_matrix_range_certificate()
-    assert certificate is not None
+    bound = topology._ratio_range_spectral_bound()
+    assert bound is not None
     rng = np.random.default_rng(8317)
     for _ in range(20):
         ratios = tuple(
@@ -715,8 +715,8 @@ def test_transformer_ratio_range_certificate_bounds_the_full_declared_box():
         matrix = circuit.netlist._compiled(mode).state_space.A
         scale = topology._stability_scale()
         scaled = scale[:, None] * matrix / scale[None, :]
-        assert np.linalg.norm(scaled, 2) <= certificate[1] * (1.0 + 1e-12)
-        assert np.max(np.abs(np.linalg.eigvals(matrix))) <= certificate[1] * (1.0 + 1e-12)
+        assert np.linalg.norm(scaled, 2) <= bound[1] * (1.0 + 1e-12)
+        assert np.max(np.abs(np.linalg.eigvals(matrix))) <= bound[1] * (1.0 + 1e-12)
 
 
 def test_symmetrizing_scale_bounds_a_stiff_cable_by_its_spectral_radius():
@@ -756,11 +756,11 @@ def test_cable_ratio_modes_are_certified_without_spectra(circuit_model, monkeypa
     simulation.run(out_dir=tmp_path)
     (circuit,) = simulation.system.circuits
     topology = circuit.netlist.topology()
-    certificate = topology._state_matrix_range_certificate()
-    assert certificate is not None
-    assert params.simulation.solver.dt * certificate[1] <= 2.6
-    assert (topology.mode.key[:2], certificate[1]) in (
-        circuit.netlist.stability_range_certificates()
+    bound = topology._ratio_range_spectral_bound()
+    assert bound is not None
+    assert params.simulation.solver.dt * bound[1] <= 2.6
+    assert (topology.mode.key[:2], bound[1]) in (
+        circuit.netlist.ratio_range_spectral_bounds()
     )
     assert count == 0
 
@@ -781,9 +781,9 @@ def test_transformer_ratio_outside_the_declared_box_uses_its_exact_mode():
     mode = nl.Mode(topology.mode.closed, topology.mode.conducting, ratios)
     outside = circuit.netlist._compiled(mode)
 
-    certificate = outside.state_matrix_stability_certificate()
-    assert certificate is not None
-    assert certificate[0] == outside.state_matrix_key()
+    bound = outside.state_matrix_spectral_bound()
+    assert bound is not None
+    assert bound[0] == outside.state_matrix_key()
 
 
 @pytest.mark.parametrize("example", [
@@ -795,7 +795,7 @@ def test_device_stability_matrix_matches_the_current_netlist_mode(example):
     ))
     for circuit in simulation.system.circuits:
         circuit.receive()
-        _key, build, _bound = circuit.linear_mode()
+        _key, build = circuit.linear_mode()
         np.testing.assert_allclose(
             build(), circuit.netlist.topology().state_space.A,
             rtol=1e-10, atol=1e-9,

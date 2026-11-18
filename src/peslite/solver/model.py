@@ -33,7 +33,7 @@ from .differentiation import directional_derivative
 from .timing import TIME_EPS, PeriodicClock
 
 __all__ = ["ConfigError", "LocatedZero", "Bag", "Empty", "OutputMethod", "Subsystem",
-           "BlackBoxSubsystem", "Model",
+           "BlackBoxSubsystem", "Model", "SolverCheck", "SolverRegion", "SpectralBound",
            "GroupPlan", "Stateful", "StateRegistry", "join", "gather", "scatter", "flatten", "resolve",
            "expand_aliases", "assign"]
 
@@ -1412,6 +1412,46 @@ def _no_linear_data():
     return ()
 
 
+@dataclass(frozen=True)
+class SpectralBound:
+    """A proved upper bound on the spectral radius of one equation region."""
+
+    identity: object
+    maximum: float
+
+
+@dataclass(frozen=True)
+class SolverRegion:
+    """One discrete equation region covered over continuous coefficient ranges."""
+
+    selectors: tuple[bool, ...]
+    coefficient_ranges: tuple[tuple[float, float] | None, ...]
+    spectral_bound: float
+
+
+class SolverCheck:
+    """Numerical checks shared by assembled Python solvers and generated backends."""
+
+    def __init__(
+        self,
+        exact_modes: Callable[[], Sequence[tuple]],
+        spectral_bounds: Callable[[], Sequence[SpectralBound | None]] | None = None,
+        regions: Callable[[Any], Sequence[SolverRegion]] | None = None,
+    ) -> None:
+        self._exact_modes = exact_modes
+        self._spectral_bounds = spectral_bounds or _no_linear_data
+        self._regions = regions
+
+    def exact_modes(self) -> tuple:
+        return tuple(self._exact_modes())
+
+    def spectral_bounds(self) -> tuple[SpectralBound | None, ...]:
+        return tuple(self._spectral_bounds())
+
+    def regions(self, owner: Any) -> tuple[SolverRegion, ...]:
+        return () if self._regions is None else tuple(self._regions(owner))
+
+
 class _LinearModelView:
     """Solver metadata projected onto a fixed subset of an assembled model's states."""
 
@@ -1422,6 +1462,10 @@ class _LinearModelView:
         self.positions[indices] = np.arange(indices.size)
         self._mode_positions = tuple(
             self._selected_positions(block[0]) for block in model.linear_blocks()
+        )
+        self.solver_check = (
+            None if model.solver_check is None else
+            SolverCheck(self._exact_modes, self._spectral_bounds)
         )
 
     def _selected_positions(self, indices: Sequence[int]) -> NDArray[np.intp]:
@@ -1454,19 +1498,29 @@ class _LinearModelView:
             if (projected := self._project(block))[0].size
         )
 
-    def linear_modes(self) -> tuple:
-        modes = self.model.linear_modes()
+    def _exact_modes(self) -> tuple:
+        modes = self.model.solver_check.exact_modes()
         if len(modes) != len(self._mode_positions):
             raise RuntimeError("linear modes and blocks describe different circuits")
         projected = []
         for mode, selected in zip(modes, self._mode_positions):
             if not selected.size:
                 continue
-            key, build, *metadata = mode
+            key, build = mode
             item = (key, lambda build=build, selected=selected:
                     np.asarray(build())[np.ix_(selected, selected)])
-            projected.append((*item, *metadata))
+            projected.append(item)
         return tuple(projected)
+
+    def _spectral_bounds(self) -> tuple[SpectralBound | None, ...]:
+        bounds = self.model.solver_check.spectral_bounds()
+        if not bounds:
+            return ()
+        if len(bounds) != len(self._mode_positions):
+            raise RuntimeError("solver bounds and blocks describe different circuits")
+        return tuple(
+            bound for bound, selected in zip(bounds, self._mode_positions) if selected.size
+        )
 
 
 class Model:
@@ -1487,15 +1541,12 @@ class Model:
         *, linear_structure: Callable[[Model], Any] | None = None,
         linear_mode_key: Callable[[], Any] | None = None,
         linear_blocks: Callable[[], Sequence[Any]] | None = None,
-        linear_modes: Callable[[], Sequence[Any]] | None = None,
-        linear_certificates: Callable[[], Sequence[Any]] | None = None,
+        solver_check: SolverCheck | Callable[[Model], SolverCheck] | None = None,
     ) -> None:
         self._linear_structure_builder = linear_structure
+        self._solver_check_builder = solver_check
         self.linear_mode_key = linear_mode_key or _no_linear_mode
         self.linear_blocks = linear_blocks or _no_linear_data
-        self.linear_modes = linear_modes or _no_linear_data
-        # Certificates alone let an explicit solver avoid materializing present mode identities.
-        self.linear_certificates = linear_certificates
         self.equation_revision = 0
         if isinstance(subsystems, Mapping):
             names = [str(n) for n in subsystems]
@@ -1538,6 +1589,7 @@ class Model:
         self._compile()
         self._structure = (self._linear_structure_builder(self)
                            if self._linear_structure_builder is not None else None)
+        self.solver_check = solver_check(self) if callable(solver_check) else solver_check
         # energy declaration per subsystem (default if none declared)
         self.energy_specs: dict[str, _energy.EnergySpec] = {n: _energy.spec_of(s) for n, s in zip(names, subsystems)}
         self._held_input_refresh = tuple(
@@ -1553,6 +1605,8 @@ class Model:
         self._external_state_dependency_cache.clear()
         self._structure = (self._linear_structure_builder(self)
                            if self._linear_structure_builder is not None else None)
+        if callable(self._solver_check_builder):
+            self.solver_check = self._solver_check_builder(self)
         self.plan_revision += 1
 
     def linear_structure(self):

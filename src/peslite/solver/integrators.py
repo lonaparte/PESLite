@@ -23,7 +23,7 @@ from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
-from .model import _component_plan, commutation_tolerance
+from .model import SpectralBound, _component_plan, commutation_tolerance
 from .netlist import FORMS as CIRCUIT_MODELS
 
 __all__ = ["RHS", "SolverStep", "Solver", "FIXED_METHODS", "ADAPTIVE_METHODS", "EXPLICIT_FIXED_METHODS",
@@ -178,7 +178,7 @@ TABLEAUS: dict[str, tuple[tuple[float, ...], tuple[tuple[float, ...], ...], tupl
 # The closed left half-disk of radius 2.6 is inside classical RK4's absolute-stability region: by the
 # maximum principle |R(z)| on it is largest on its boundary, at most 0.982 on the arc and at most
 # one on the imaginary segment (|R(iy)| <= 1 for |y| <= 2 sqrt(2)). Euler and Heun touch the
-# imaginary axis only at zero, so they have no positive half-disk certificate.
+# imaginary axis only at zero, so they have no positive half-disk bound.
 _STABILITY_HALF_DISK = {"RK4": 2.6}
 
 
@@ -319,24 +319,24 @@ class FixedStepSolver:
             values.append(eigenvalues)
         return np.concatenate(values) if values else np.empty(0, dtype=complex)
 
-    def _explicit_stable(
+    def _explicit_step_allowed(
         self,
         step: float,
         modes: Sequence[tuple],
-        certificates: Sequence[tuple[object, float] | None] | None = None,
+        bounds: Sequence[SpectralBound | None] | None = None,
     ) -> bool:
         """Check assembled linear modes against this Runge-Kutta stability region."""
         _c, rows, weights = TABLEAUS[self.method]
         radius = _STABILITY_HALF_DISK.get(self.method, 0.0)
-        if certificates is None:
-            certificates = tuple(
-                mode[2] if radius and len(mode) > 2 else None for mode in modes
-            )
-        for mode, certificate in zip(modes, certificates):
-            key, build, *metadata = mode
+        if bounds is None:
+            bounds = (None,) * len(modes)
+        if len(bounds) != len(modes):
+            raise RuntimeError("solver bounds and exact modes describe different circuits")
+        for mode, bound in zip(modes, bounds):
+            key, build = mode
             eigenvalues = self._mode_eigenvalues.get(key)
             if eigenvalues is None:
-                if certificate is not None and step * certificate[1] <= radius:
+                if bound is not None and step * bound.maximum <= radius:
                     continue
                 eigenvalues = self._eigenvalues(build())
                 self._mode_eigenvalues[key] = eigenvalues
@@ -360,35 +360,30 @@ class FixedStepSolver:
         return True
 
     def _stiff(self, step: float) -> bool:
-        provider = getattr(self.model, "linear_modes", None)
-        if not callable(provider):
+        check = getattr(self.model, "solver_check", None)
+        if check is None:
             return False
         radius = _STABILITY_HALF_DISK.get(self.method, 0.0)
-        certify = getattr(self.model, "linear_certificates", None)
-        if radius and callable(certify) and all(
-            certificate is not None and step * certificate[1] <= radius
-            for certificate in certify()
+        bounds = check.spectral_bounds()
+        if bounds and radius and all(
+            bound is not None and step * bound.maximum <= radius for bound in bounds
         ):
             return False
-        modes = tuple(provider())
-        certificates = tuple(
-            mode[2] if radius and len(mode) > 2 else None for mode in modes
-        )
-        if all(
-            certificate is not None and step * certificate[1] <= radius
-            for certificate in certificates
-        ):
-            return False
+        modes = check.exact_modes()
+        if not bounds:
+            bounds = (None,) * len(modes)
+        if len(bounds) != len(modes):
+            raise RuntimeError("solver bounds and exact modes describe different circuits")
         identities = tuple(
-            ("certificate", certificate[0])
-            if certificate is not None and step * certificate[1] <= radius
+            ("spectral_bound", bound.identity)
+            if bound is not None and step * bound.maximum <= radius
             else ("mode", mode[0])
-            for mode, certificate in zip(modes, certificates)
+            for mode, bound in zip(modes, bounds)
         )
         key = identities, step
         stable = self._stability_results.get(key)
         if stable is None:
-            stable = self._explicit_stable(step, modes, certificates)
+            stable = self._explicit_step_allowed(step, modes, bounds)
             self._stability_results[key] = stable
             self._stability_results.move_to_end(key)
             while len(self._stability_results) > 64:
@@ -645,11 +640,11 @@ class AdaptiveSolver:
     def _check_modes(self) -> None:
         """Report lightly damped circuit modes once for multistep integration."""
         self._modes_checked = True
-        modes = getattr(self.model, "linear_modes", None)
-        if not callable(modes):
+        check = getattr(self.model, "solver_check", None)
+        if check is None:
             return
         damping: list[float] = []
-        for mode in modes():
+        for mode in check.exact_modes():
             build = mode[1]
             values = np.linalg.eigvals(build())
             oscillatory = values[np.abs(values.imag) > 0.0]

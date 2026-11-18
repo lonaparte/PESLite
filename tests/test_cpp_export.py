@@ -961,10 +961,11 @@ def test_generated_cpp_matches_composite_wpt_with_independent_clocks(mode, tmp_p
             "simulation.solver.max_step": 50.0e-9,
         })
     params = peslite.load(EXAMPLES / "wpt-example.pes").replace(**changes)
-    _source, cpp_out, python_out = _run_generated(
+    source, cpp_out, python_out = _run_generated(
         params, tmp_path / f"wpt-{mode}", compiler
     )
 
+    assert "class DiodeConduction" not in source.read_text(encoding="utf-8")
     expected = _final_csv(python_out / "states.csv")
     actual = _final_csv(cpp_out / "states.csv")
     assert actual.keys() == expected.keys()
@@ -1100,7 +1101,7 @@ def test_generated_cpp_matches_composite_wpt_switching_events(tmp_path):
     assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * scale
 
 
-def test_generated_cpp_runs_custom_cable_equations_with_range_certificate(tmp_path):
+def test_generated_cpp_runs_custom_cable_equations_with_a_range_bound(tmp_path):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
@@ -1116,13 +1117,13 @@ def test_generated_cpp_runs_custom_cable_equations_with_range_certificate(tmp_pa
 
     stability = next(
         line for line in source.read_text(encoding="utf-8").splitlines()
-        if "explicit_circuit_stable(explicit_stability_modes_0" in line
+        if "explicit_circuit_step_allowed(explicit_step_modes_0" in line
     )
-    certificate, exact_fallback = stability.split("&& !explicit_circuit_stable", 1)
-    assert "selected[0]" in certificate
-    assert "<= selected[2]" in certificate
-    assert "selected[2] <=" in certificate
-    assert "selected[2] ==" not in certificate
+    region, exact_fallback = stability.split("&& !explicit_circuit_step_allowed", 1)
+    assert "selected[0]" in region
+    assert "<= selected[2]" in region
+    assert "selected[2] <=" in region
+    assert "selected[2] ==" not in region
     assert "selected[2]" in exact_fallback
 
     expected = _final_csv(python_out / "states.csv")
