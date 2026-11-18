@@ -35,6 +35,7 @@ peslite case.pes
 | `mpc-vsc-matrices-example` | CCS-MPC three-phase current control with full Q, R and S weight matrices. |
 | `reference-signal-example` | Open-loop Buck driven by a repeating inline duty-ratio table on the existing controller schedule. |
 | `two-converters-example` | A GFM and a GFL unit on separate buses, with different ratings and switching frequencies. |
+| `cigre-14-example` | CIGRE MV 14-node feeder represented by its electrical buses, pi-line shunts, loads and one grid-forming converter. |
 | `magcomponent-wpt-example` | Series-series WPT assembled from a `MagComponent` and ordinary compensation components. |
 | `wpt-example` | A composite series-series compensated WPT unit whose independently clocked full-bridge primary and secondary are assembled from its single nested unit tree. |
 | `wpt-ss-example` | SS WPT with local primary-side power feedback controlling modulation amplitude, including a 1200 to 1800 W reference step. |
