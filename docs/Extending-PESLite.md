@@ -20,10 +20,8 @@ uses a filtered measured-voltage magnitude and grid-frequency state, then joins 
 as the built-in current and DC-voltage loops.
 
 The bundled `cable-gfl-example` similarly keeps its case in `examples/`, while
-`peslite.addons.components.cable` declares a distributed R-L/G-C network through the same component
-interface. It is a two-port custom element rather than a renamed built-in branch: both port currents
-are positive into the cable, and its internal inductor currents and capacitor voltages are ordinary
-restartable PESLite states.
+`peslite.addons.components.cable` implements both delayed Bergeron and segmented lumped cable
+models through the same component interface.
 
 ## Custom control loops
 
@@ -187,12 +185,14 @@ Every entry returned by `signals()` follows the same output path. Complex values
 phase columns with `_a`, `_b` and `_c` suffixes, while scalar values retain their declared name;
 custom signal names do not require recorder-specific code.
 
-The cable add-on is a complete multi-port reference implementation:
+The cable add-on is a complete multi-port reference implementation. This selects its segmented
+lumped model so the internal continuous states remain visible:
 
 ```yaml
 elements:
   cable1:
     type: cable
+    model: lumped
     bus1: grid_bus
     bus2: pcc
     length_km: 5.0
@@ -204,7 +204,8 @@ elements:
 ```
 
 Its per-kilometre parameters are SI values. `sections` changes the spatial discretisation and
-therefore the state layout, so it is fixed when the simulation is assembled.
+therefore the state layout, so it is fixed when the simulation is assembled. See
+[Passive Components](Passive-Components.md#cables) for the cable models and fields.
 
 ## Custom events
 

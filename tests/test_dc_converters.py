@@ -663,12 +663,15 @@ def test_ratio_one_solver_schedule_still_honours_the_dcm_local_step():
     })
     simulation = peslite.Simulation(params)
     assert type(simulation.solver) is peslite.FixedStepSolver
-    simulation.unit().conduction.diode_maximum_step = lambda: 5.0e-6
+    simulation.unit().conduction.solver_maximum_step = lambda: 5.0e-6
 
     stage = DiodeConduction(simulation.system.model, simulation.solver)
     initial = simulation.system.model.get_initial_values()
     before = simulation.solver.n_rhs
-    stage.advance(0.0, 50.0e-6, initial)
+    stage.advance(
+        0.0, 50.0e-6, initial,
+        max_step=simulation.unit().conduction.solver_maximum_step(),
+    )
 
     assert simulation.solver.n_rhs - before >= 40
 

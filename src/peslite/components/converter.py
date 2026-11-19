@@ -969,7 +969,7 @@ class HalfBridgeDiodeConduction:
     def rhs(self, _t: float):
         return ()
 
-    def diode_maximum_step(self) -> float:
+    def solver_maximum_step(self) -> float:
         """Return the state-dependent resolution limit produced by the latest evaluation."""
         return self.output.maximum_step
 

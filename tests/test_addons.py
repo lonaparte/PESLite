@@ -9,13 +9,16 @@ import peslite
 import pytest
 from peslite.addons import components as addon_components
 from peslite.addons import control as addon_control
-from peslite.addons.components.cable import CableModel
-from peslite.assembly.params import runtime_changeable
+from peslite.addons.components.cable import (BergeronCableModel, Cable,
+                                             LumpedCableModel)
+from peslite.assembly.params import from_dict, runtime_changeable
 from peslite.addons.control.voltage_adaptive_pll import VoltageAdaptivePLL
 from peslite.addons.control.predictive import (PredictiveCurrentControl,
                                                ThreePhasePredictiveCurrentControl)
 from peslite.components.network import ELEMENT_TYPES
 from peslite.control import LOOP_TYPES, Loop
+from peslite.solver import ConfigError
+from peslite.solver.history import DelayHistory
 
 
 def test_control_addon_path_registers_loops(tmp_path, monkeypatch):
@@ -139,7 +142,7 @@ def test_addon_entry_points_match_builtin_public_apis():
 
 
 def test_cable_model_has_two_inward_ports_and_closes_its_power_balance():
-    cable = CableModel(
+    cable = LumpedCableModel(
         length_km=2.0,
         r_per_km=0.08,
         l_per_km=0.6e-3,
@@ -170,6 +173,34 @@ def test_cable_model_has_two_inward_ports_and_closes_its_power_balance():
     assert sum(cable.series_r) == pytest.approx(0.16)
     assert sum(cable.series_l) == pytest.approx(1.2e-3)
     assert power_in == pytest.approx(stored_rate + cable.dissipated_power())
+
+
+def test_delay_history_interpolates_committed_values_and_restores_checkpoints():
+    history = DelayHistory(1.0, 0.0)
+    history.accept(0.0, 0.0)
+    history.accept(0.5, 1.0)
+    checkpoint = history.checkpoint()
+    history.accept(1.0, 1.0)
+
+    assert history(0.25) == pytest.approx(0.5)
+    assert history.derivative(0.5) == pytest.approx(2.0)
+    assert history.integral_squared(1.0) == pytest.approx(2.0 / 3.0)
+    history.accept(1.5, 2.0)
+    assert history.derivative(0.5) == pytest.approx(2.0)
+
+    history.restore(checkpoint)
+    assert history.times == [0.0, 0.5]
+    assert history.values == [0.0, 1.0]
+
+
+def test_cable_defaults_to_bergeron_and_rejects_unsupported_shunt_loss():
+    values = {
+        "bus1": "left", "bus2": "right", "length_km": 5.0,
+        "r_per_km": 0.05, "l_per_km": 0.4e-3, "c_per_km": 0.2e-6,
+    }
+    assert Cable.Params(**values).model == "bergeron"
+    with pytest.raises(ConfigError, match="requires g_per_km=0"):
+        Cable.Params(**values, g_per_km=1.0e-8)
 
 
 def test_pesaddons_beside_simulation_file_merges_project_paths(examples, tmp_path):
@@ -351,3 +382,97 @@ def test_custom_cable_parameters_can_change_at_an_event(examples, tmp_path):
         for index, case in enumerate((initial, event))
     ]
     assert finals[1] == pytest.approx(finals[0], rel=1e-9)
+
+
+def test_bergeron_cable_runs_with_adaptive_steps_and_strict_energy(examples, tmp_path):
+    params = peslite.load(
+        examples / "cable-gfl-example.pes",
+        **{
+            "elements.cable1.model": "bergeron",
+            "elements.cable1.g_per_km": 0.0,
+            "elements.cable1.r_per_km": 0.0,
+            "units.vsc.bridge.model": "averaging",
+            "simulation.t_end": 2.0e-4,
+            "simulation.solver.type": "adaptive",
+            "simulation.solver.method": "DP45",
+            "simulation.solver.max_step": 50.0e-6,
+            "simulation.solver.linearisations": 0,
+            "simulation.energy_check": "strict",
+            "simulation.output.period": 25.0e-6,
+            "simulation.output.signals": 1,
+        },
+    )
+    simulation = peslite.Simulation(params)
+    cable = simulation.system.named_elements["cable1"].model
+    result = simulation.run(out_dir=tmp_path / "bergeron")
+
+    assert isinstance(cable, BergeronCableModel)
+    assert cable.segment_delay < params.simulation.solver.max_step
+    assert not any(name.startswith("cable1.") for name in result.states)
+    assert np.isfinite(result.plant["cable1.i1_a"]).all()
+    assert np.isfinite(result.plant["cable1.i2_a"]).all()
+    assert simulation.ph_report.verdict == "port-hamiltonian"
+
+
+@pytest.mark.long
+def test_lumped_cable_converges_to_bergeron_terminal_behavior(tmp_path):
+    inductance_per_km = 0.4e-3
+    capacitance_per_km = 0.2e-6
+    surge_impedance = np.sqrt(inductance_per_km / capacitance_per_km)
+
+    def run(model, sections=4):
+        line = {
+            "type": "cable", "model": model,
+            "bus1": "send", "bus2": "receive", "length_km": 5.0,
+            "r_per_km": 0.0, "l_per_km": inductance_per_km,
+            "c_per_km": capacitance_per_km,
+        }
+        if model == "lumped":
+            line["sections"] = sections
+        params = from_dict({
+            "base": {"s_base": 1.0e6, "v_ll_rms": 10.0e3, "f0": 50.0},
+            "buses": {"send": {"phases": 3}, "receive": {"phases": 3}},
+            "sources": {
+                "grid": {"bus": "send", "l": 1.0e-6, "r": surge_impedance},
+            },
+            "elements": {"line": line},
+            "simulation": {
+                "t_end": 3.0e-4,
+                "solver": {
+                    "type": "fixed", "method": "rk4", "dt": 1.0e-7,
+                    "linearisations": 0,
+                },
+                "energy_check": "off",
+                "progress": {"enable": False},
+                "output": {
+                    "period": 2.0e-6, "precision": 17,
+                    "states": False, "signals": True, "energy": False,
+                },
+            },
+        })
+        simulation = peslite.Simulation(params)
+        result = simulation.run(out_dir=tmp_path / f"{model}-{sections}")
+        trajectory = np.column_stack([
+            result.plant[name]
+            for name in ("receive.u_a", "line.i1_a")
+        ])
+        return simulation, np.asarray(result.t), trajectory
+
+    reference_simulation, times, reference = run("bergeron")
+    travel_time = reference_simulation.system.named_elements["line"].model.travel_time
+    before_wavefront = times < 0.9 * travel_time
+    assert np.ptp(reference[before_wavefront, 0]) < 1.0e-10
+
+    comparison = times >= 2.0 * travel_time
+    scale = np.maximum(1.0, np.max(np.abs(reference[comparison]), axis=0))
+    rms_errors, maximum_errors = [], []
+    for sections in (2, 8, 32):
+        _simulation, actual_times, actual = run("lumped", sections)
+        np.testing.assert_array_equal(actual_times, times)
+        normalized = (actual[comparison] - reference[comparison]) / scale
+        rms_errors.append(float(np.sqrt(np.mean(normalized ** 2))))
+        maximum_errors.append(float(np.max(np.abs(normalized))))
+
+    assert rms_errors[0] > rms_errors[1] > rms_errors[2]
+    assert rms_errors[2] < 2.0e-6
+    assert maximum_errors[2] < 2.0e-5

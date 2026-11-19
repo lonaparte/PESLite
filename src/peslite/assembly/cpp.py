@@ -27,13 +27,14 @@ import numpy as np
 
 from ..defaults import (DEFAULT_COMMUTATION_LOCATOR_ITERATIONS,
                         DEFAULT_COMMUTATION_MAX_TRANSITIONS)
-from ..components.network import ACVoltageSource, RLBranch
+from ..components.network import ACVoltageSource, NetworkComponent, RLBranch
 from ..components.pwm import (_EPS, _SNAP, CarrierComparison, SynchronousCarrier, PhaseClock,
                                PhaseShiftModulator, ZOH)
 from ..control.profiles import PHASE_SHIFT_MODES
 from ..control.blocks import OutputLimit
 from ..control.controller import GraphController, VSCController
 from ..solver.energy import Port, re_product
+from ..solver.history import DelayedSignal
 from ..solver.integrators import DormandPrince45, FixedStepSolver, TABLEAUS, _STABILITY_HALF_DISK
 from ..solver.implicit import (ImplicitSolver, _JACOBIAN_STEP, _MAX_SPLITS, _TABLEAUX,
                                _NEWTON_ITERATIONS, _NEWTON_SCALE, _THETA_MAX)
@@ -277,6 +278,89 @@ PESLITE_FORCEINLINE void solve_algebraic(Sweep sweep, Value& current, Value& inv
 '''
 
 
+_DELAY_HISTORY = r'''inline double history_norm(double value) { return value * value; }
+inline double history_norm(Complex value) { return std::norm(value); }
+inline double history_cross(double left, double right) { return left * right; }
+inline double history_cross(Complex left, Complex right) {
+    return std::real(left * std::conj(right));
+}
+
+template <class Value> class DelayHistory {
+public:
+    struct Snapshot {
+        std::vector<double> times;
+        std::vector<Value> values;
+    };
+
+    DelayHistory(double interval, Value initial_value)
+        : delay(interval), initial(initial_value) {}
+
+    Value value(double t) const {
+        if (times.empty() || t < times.front()) return initial;
+        const auto found = std::upper_bound(times.begin(), times.end(), t);
+        if (found == times.end()) return values.back();
+        const std::size_t after = static_cast<std::size_t>(found - times.begin());
+        if (after == 0) return initial;
+        const std::size_t before = after - 1;
+        const double fraction = (t - times[before]) / (times[after] - times[before]);
+        return values[before] + fraction * (values[after] - values[before]);
+    }
+
+    Value derivative(double t) const {
+        if (times.size() < 2 || t <= times.front() || t > times.back()) return Value{};
+        const auto found = std::lower_bound(times.begin(), times.end(), t);
+        if (found == times.end()) return Value{};
+        const std::size_t after = static_cast<std::size_t>(found - times.begin());
+        const std::size_t before = after - 1;
+        return (values[after] - values[before]) / (times[after] - times[before]);
+    }
+
+    void accept(double t, Value value) {
+        if (!times.empty() && t < times.back() - time_eps)
+            throw std::runtime_error("delay-history samples must be chronological");
+        if (!times.empty() && std::abs(t - times.back()) <= time_eps) {
+            times.back() = t;
+            values.back() = value;
+        }
+        else { times.push_back(t); values.push_back(value); }
+        const double cutoff = t - delay;
+        while (times.size() > 2 && times[1] < cutoff - time_eps) {
+            times.erase(times.begin());
+            values.erase(values.begin());
+        }
+    }
+
+    double integral_squared(double stop) const {
+        const double start = stop - delay;
+        std::vector<double> knots{start};
+        for (const double t : times) if (start < t && t < stop) knots.push_back(t);
+        knots.push_back(stop);
+        double total = 0.0;
+        for (std::size_t index = 1; index < knots.size(); ++index) {
+            const double t0 = knots[index - 1], t1 = knots[index];
+            const Value a = value(t0), b = value(t1);
+            total += (t1 - t0) * (
+                history_norm(a) + history_norm(b) + history_cross(a, b)
+            ) / 3.0;
+        }
+        return total;
+    }
+
+    Snapshot checkpoint() const { return {times, values}; }
+    void restore(const Snapshot& snapshot) {
+        times = snapshot.times;
+        values = snapshot.values;
+    }
+
+private:
+    double delay;
+    Value initial;
+    std::vector<double> times;
+    std::vector<Value> values;
+};
+'''
+
+
 _CONDUCTION_KERNEL = r'''
     class DiodeConduction {
         Simulator& sim;
@@ -285,8 +369,10 @@ _CONDUCTION_KERNEL = r'''
 
         static double tolerance(double t) { return @@TOLERANCE@@; }
 
-        void raw_advance(double begin, double end, const State& initial) {
+        void raw_advance(double begin, double end, const State& initial,
+                         const HistoryCheckpoint& history) {
             sim.y = initial;
+            sim.history_restore(history);
             double at = begin;
             @@RAW_ADVANCE@@
         }
@@ -336,15 +422,18 @@ _CONDUCTION_KERNEL = r'''
 
         void advance(double& t, double target) {
             synchronize(t);
+            sim.accept_history(t);
             int stalled = 0;
             while (t < target - tolerance(target)) {
                 const double begin = t;
                 const double scheduled = next_time();
                 double end = std::min({target, begin + (@@PROBE@@), scheduled});
                 const State initial = sim.y;
+                const auto initial_history = sim.history_checkpoint();
                 const Guards guarded{{@@GUARDS@@}};
-                raw_advance(begin, end, initial);
+                raw_advance(begin, end, initial, initial_history);
                 State trial = sim.y;
+                auto trial_history = sim.history_checkpoint();
                 double upper_margin = margin(end, trial, guarded);
                 if (upper_margin < 0.0) {
                     double lower = begin, upper = end;
@@ -364,17 +453,23 @@ _CONDUCTION_KERNEL = r'''
                             }
                         }
                         bisect_next = interpolated;
-                        raw_advance(begin, middle, initial);
+                        raw_advance(begin, middle, initial, initial_history);
                         double value = margin(middle, sim.y, guarded);
                         const bool invalid = value < 0.0;
-                        if (invalid) { upper = middle; upper_margin = value; trial = sim.y; }
+                        if (invalid) {
+                            upper = middle; upper_margin = value; trial = sim.y;
+                            trial_history = sim.history_checkpoint();
+                        }
                         else { lower = middle; lower_margin = value; }
                         if (interpolated) {
                             const double adjacent = middle + (invalid ? -resolution : resolution);
                             if (lower < adjacent && adjacent < upper) {
-                                raw_advance(begin, adjacent, initial);
+                                raw_advance(begin, adjacent, initial, initial_history);
                                 value = margin(adjacent, sim.y, guarded);
-                                if (value < 0.0) { upper = adjacent; upper_margin = value; trial = sim.y; }
+                                if (value < 0.0) {
+                                    upper = adjacent; upper_margin = value; trial = sim.y;
+                                    trial_history = sim.history_checkpoint();
+                                }
                                 else { lower = adjacent; lower_margin = value; }
                             }
                         }
@@ -383,7 +478,11 @@ _CONDUCTION_KERNEL = r'''
                     @@CLAMP_CURRENTS@@
                 }
                 sim.y = trial;
-                if (upper_margin < 0.0 || scheduled <= end) synchronize(end);
+                sim.history_restore(trial_history);
+                if (upper_margin < 0.0 || scheduled <= end) {
+                    synchronize(end);
+                    sim.accept_history(end);
+                }
                 if (end == target) { @@PROJECT@@ t = target; return; }
                 stalled = end - begin <= tolerance(begin) ? stalled + 1 : 0;
                 if (stalled >= @@MAX_COMMUTATIONS@@)
@@ -505,7 +604,7 @@ def _assign_values(prefix, assignments):
             + [f"{target} = {name};" for (target, _value), name in zip(assignments, temporary)])
 
 
-def _fixed_step(method: str) -> str:
+def _fixed_step(method: str, accepted: str = "") -> str:
     c, a, b = TABLEAUS[method]
     names = tuple(f"k{index}" for index in range(len(c)))
     lines = ["    inline void step(double& t, double h) {",
@@ -521,7 +620,10 @@ def _fixed_step(method: str) -> str:
                              (name + "[i]" for name in names))
     lines += ["        for (std::size_t i = 0; i < state_count; ++i) "
               f"y[i] += (h / {_number(1.0 / factor)}) * ({weighted});",
-              "        t += h;", "    }"]
+              "        t += h;"]
+    if accepted:
+        lines.append(f"        {accepted}")
+    lines.append("    }")
     return "\n".join(lines)
 
 
@@ -883,7 +985,7 @@ def _implicit_solver(method: str, name: str, arguments: str,
                      n_states: int,
                      mode_size: int = 0,
                      groups: Sequence[Sequence[int]] = (),
-                     interface: Sequence[int] = ()) -> str:
+                     interface: Sequence[int] = (), accepted: str = "") -> str:
     """Lower the configured implicit tableau and Newton controls over the ordinary generated RHS."""
     tableau, c, e0 = _TABLEAUX[method]
     stages = c.size
@@ -1133,7 +1235,10 @@ def _implicit_solver(method: str, name: str, arguments: str,
         State f0{{}};
         rhs(begin, y, f0);
         implicit_select(begin, y, f0);
-        for (std::size_t k = 0; k < count; ++k) implicit_step(begin + k * h, y, h, f0, 0);
+        for (std::size_t k = 0; k < count; ++k) {{
+            implicit_step(begin + k * h, y, h, f0, 0);
+            {accepted}
+        }}
         {projection}
         t = target;
     }}'''
@@ -1643,6 +1748,27 @@ class _TraceBudgetExceeded(TypeError):
 @dataclass
 class _TraceFailure:
     error: ValueError
+
+
+class _NativeDelayHistory:
+    """Equation-time view of one generated accepted-signal history."""
+
+    def __init__(self, member: str, kind: str) -> None:
+        self.member, self.kind = member, kind
+
+    def __call__(self, t: Any) -> _Expression:
+        time = _Expression.of(t)
+        return _Expression(f"{self.member}.value({time.code})", self.kind, pure=False)
+
+    def integral_squared(self, stop: Any) -> _Expression:
+        time = _Expression.of(stop)
+        return _Expression(
+            f"{self.member}.integral_squared({time.code})", "real", pure=False,
+        )
+
+    def derivative(self, t: Any) -> _Expression:
+        time = _Expression.of(t)
+        return _Expression(f"{self.member}.derivative({time.code})", self.kind, pure=False)
 
 
 _TRACE_CONTROL: ContextVar[_TraceControl | None] = ContextVar(
@@ -2229,6 +2355,26 @@ class _ModelGenerator:
             for record, field in targets:
                 self.zoh_fields[id(record), field] = member
         self._discover_records()
+        self.accepted_histories = tuple(
+            signal
+            for subsystem in self.model.subsystems
+            for signal in getattr(subsystem, "accepted_histories", ())
+        )
+        histories = [signal.history for signal in self.accepted_histories]
+        if len({id(history) for history in histories}) != len(histories):
+            raise TypeError("an accepted history must be bound to exactly one signal")
+        self.history_members = {
+            id(history): f"accepted_history_{index}"
+            for index, history in enumerate(histories)
+        }
+        self.history_proxies = {
+            id(history): _NativeDelayHistory(
+                self.history_members[id(history)],
+                "complex" if isinstance(history.initial, complex) else "real",
+            )
+            for history in histories
+        }
+        self.equation_references.update(self.history_proxies)
         physical_ports = tuple(
             (subsystem, port, voltage, current)
             for subsystem in self.model.subsystems
@@ -2560,6 +2706,17 @@ class _ModelGenerator:
             if isinstance(value, Port) and value.component is owner:
                 port = copy.copy(value)
                 port.component = clone
+                physical = getattr(self, "physical_port_fields", {}).get(id(value))
+                if physical is not None:
+                    effort_record, effort_field, flow_record, flow_field = physical
+                    port.voltage = _Expression(
+                        self.value(effort_record, effort_field),
+                        self.record_types[id(effort_record), effort_field],
+                    )
+                    port.current = _Expression(
+                        self.value(flow_record, flow_field),
+                        self.record_types[id(flow_record), flow_field],
+                    )
                 setattr(clone, name, port)
                 ports[id(value)] = port
         # Composite parts may alias a parent's state record (for example a DC capacitor).
@@ -2855,6 +3012,20 @@ class _ModelGenerator:
         def run():
             clone = self._equation_clone(sub, attributes)
             return self._rebind(method, clone)()
+
+        with self._shared_terms() as (prefix, terms):
+            value = self._trace(run)
+        lines = self._term_declarations(prefix, terms, [f"return {value.code};"])
+        return value.code if len(lines) == 1 else f"([&]() {{ {' '.join(lines)} }}())"
+
+    def trace_scalar_call(self, sub: Any, name: str, *arguments: Any,
+                          attributes: dict[str, _Expression] | None = None) -> str:
+        """Trace a scalar method call whose arguments belong to the generated equation."""
+        method = getattr(sub, name)
+
+        def run():
+            clone = self._equation_clone(sub, attributes)
+            return self._rebind(method, clone)(*arguments)
 
         with self._shared_terms() as (prefix, terms):
             value = self._trace(run)
@@ -3665,6 +3836,26 @@ class _ModelGenerator:
     def _traced_sources(self, net: Netlist, t: Any, needed: Optional[Sequence[bool]] = None,
                         ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
         """Trace source values together or independently, whichever has less branch work."""
+        def source_value(value: Callable, at: Any) -> Any:
+            if not isinstance(value, DelayedSignal):
+                return value(at)
+            try:
+                history = self.history_proxies[id(value.history)]
+            except KeyError as exc:
+                raise TypeError("a delayed source has no accepted-signal binding") from exc
+            return value.scale * history(_Expression.of(at) - value.history.delay)
+
+        def source_rate(source: Any, at: Any) -> Any:
+            if isinstance(source.value, DelayedSignal):
+                delayed = source.value
+                history = self.history_proxies[id(delayed.history)]
+                return delayed.scale * history.derivative(
+                    _Expression.of(at) - delayed.history.delay
+                )
+            if source.derivative is not None:
+                return source_value(source.derivative, at)
+            return net.source_rate(source, at)
+
         def entries(evaluate: Callable[[], Any], dimension: int, budget: list[int]) -> tuple[Any, ...]:
             def run():
                 value = evaluate()
@@ -3682,7 +3873,7 @@ class _ModelGenerator:
             inputs: list[Any] = [0.0] * net.n_u
             for value, offset, dimension, _name in net._source_slots:
                 inputs[offset:offset + dimension] = entries(
-                    lambda value=value: value(t), dimension, budget
+                    lambda value=value: source_value(value, t), dimension, budget
                 )
             rates: list[Any] = [0.0] * net.n_u
             for number, (source, offset) in enumerate(net._sources):
@@ -3690,10 +3881,13 @@ class _ModelGenerator:
                     continue
                 dimension = net._branch(source).dim
                 rates[offset:offset + dimension] = entries(
-                    lambda source=source: net.source_rate(source, t), dimension, budget
+                    lambda source=source: source_rate(source, t), dimension, budget
                 )
             return tuple(inputs), tuple(rates)
 
+        if any(isinstance(value, DelayedSignal)
+               for value, _offset, _dimension, _name in net._source_slots):
+            return partitioned([0])
         values, rates = self._cheapest_trace(whole, partitioned)
         return tuple(values), tuple(rates)
 
@@ -8484,12 +8678,6 @@ class _CppGenerator:
         from ..solver.energy import compile_balance
 
         plan = compile_balance(self.model)
-        functional = [check.name for check in plan.subsystems if check.energy_states]
-        if functional:
-            raise TypeError(
-                "C++ export does not support functional stored-energy declarations: "
-                + ", ".join(functional)
-            )
         lines = ["    double total_energy = 0.0, total_supplied = 0.0, total_dissipated = 0.0;",
                  "    double tellegen = 0.0, max_residual = 0.0, scale = 1e-300;"]
         columns = ["energy_J", "power_supplied_W", "power_dissipated_W",
@@ -8518,10 +8706,21 @@ class _CppGenerator:
                 circuit = getattr(owner, "_circuit", None)
                 component = getattr(owner, "equation_owner", owner)
                 if circuit is not None and component is not owner:
-                    return (
-                        model.trace_circuit_component_power(circuit, component, supplied=True),
-                        model.trace_circuit_component_power(circuit, component, supplied=False),
+                    supplied = (
+                        model.trace_scalar_method(component, "supplied_power")
+                        if type(component).supplied_power is not NetworkComponent.supplied_power
+                        else model.trace_circuit_component_power(
+                            circuit, component, supplied=True,
+                        )
                     )
+                    dissipated = (
+                        model.trace_scalar_method(component, "dissipated_power")
+                        if type(component).dissipated_power is not NetworkComponent.dissipated_power
+                        else model.trace_circuit_component_power(
+                            circuit, component, supplied=False,
+                        )
+                    )
+                    return supplied, dissipated
                 attributes = model._equation_attributes(sub)
                 return (model.trace_scalar_method(sub, "supplied_power", attributes),
                         model.trace_scalar_method(sub, "dissipated_power", attributes))
@@ -8571,6 +8770,26 @@ class _CppGenerator:
                     (id(storage.record), storage.field), storage.coefficient)
                 energy_terms.append(f"0.5 * {_number(coefficient)} * ({norm})")
                 rate_terms.append(f"{_number(coefficient)} * ({rate})")
+            if check.spec.stored_energy is not None:
+                derivatives = {
+                    name: _Expression(
+                        f"Complex{{dy[{index}], dy[{index + 1}]}}" if complex_value
+                        else f"dy[{index}]",
+                        "complex" if complex_value else "real",
+                    )
+                    for name, index, complex_value in check.energy_states
+                }
+                component = getattr(check.subsystem, "equation_owner", check.subsystem)
+                attributes = model._equation_attributes(component)
+                energy_terms.append(model.trace_scalar_call(
+                    component, "stored_energy", _Expression("t", "real"),
+                    attributes=attributes,
+                ))
+                rate_terms.append(model.trace_scalar_call(
+                    component, "stored_energy_rate",
+                    _Expression("t", "real"), derivatives,
+                    attributes=attributes,
+                ))
             port_terms = []
             for port in check.ports:
                 fields = (model.physical_port_fields[id(port.port)] if port.port is not None else
@@ -8712,13 +8931,15 @@ class _CppGenerator:
                 subsystem, "diode_blocks_reverse_current", attributes
             )
             diode_blocking_guards.append(guard)
-        diode_step_limits = []
-        for subsystem in diode_conduction.resolution_subsystems:
+        solver_step_limits = []
+        for subsystem in self.model.subsystems:
+            if not callable(getattr(subsystem, "solver_maximum_step", None)):
+                continue
             enabled = model.enabled_by.get(id(subsystem))
             attributes = ({"enabled": _Expression(enabled, "bool")}
                           if enabled is not None else None)
-            diode_step_limits.append(model.trace_solver_method(
-                subsystem, "diode_maximum_step", attributes
+            solver_step_limits.append(model.trace_solver_method(
+                subsystem, "solver_maximum_step", attributes
             ))
         commutation_margins, commutation_times, commutation_transitions = [], [], []
         for sub in diode_conduction.commutating:
@@ -8728,7 +8949,7 @@ class _CppGenerator:
                                     else "std::numeric_limits<double>::infinity()")
             commutation_transitions.append(model.trace_transition(sub, "commutate"))
         native_conduction = bool(
-            diode_current_states or diode_step_limits or commutation_margins
+            diode_current_states or commutation_margins
         )
         boundary_members, boundary_method = self._circuit_boundaries(model)
         boundary_call = "reconcile_circuits(t);" if boundary_method else ""
@@ -8736,6 +8957,16 @@ class _CppGenerator:
         member_lines = model.members(generators.values())
         member_lines.extend(event_members)
         member_lines.extend(boundary_members)
+        history_types = []
+        for signal in model.accepted_histories:
+            kind = model.history_proxies[id(signal.history)].kind
+            scalar = _CPP_TYPES[kind]
+            member = model.history_members[id(signal.history)]
+            member_lines.append(
+                f"DelayHistory<{scalar}> {member}{{{_number(signal.history.delay)}, "
+                f"{_literal(signal.history.initial)}}};"
+            )
+            history_types.append(f"DelayHistory<{scalar}>::Snapshot")
         for generator in (*sampled.values(), *(item for item in continuous.values() if item.ctrl is None)):
             member_lines.extend(generator.members())
         for generator in generators.values():
@@ -8817,6 +9048,10 @@ class _CppGenerator:
                 "    return {{" + ", ".join(entries) + "}};",
                 "}",
             ]
+        history_values = [
+            model.solver_expression(model.value(signal.record, signal.field))
+            for signal in model.accepted_histories
+        ]
         observation_members, observation_assignments = model.observations(generators)
         tracking = {generator.name: generator.tracking_method()
                     for generator in generators.values()}
@@ -8825,6 +9060,24 @@ class _CppGenerator:
                             for generator in generators.values()
                             if tracking[generator.name] and generator.name not in self.simulation._continued]
         observations = "\n        ".join(observation_assignments)
+        checkpoint_type = f"std::tuple<{', '.join(history_types)}>" if history_types else "std::tuple<>"
+        history_members = [model.history_members[id(signal.history)]
+                           for signal in model.accepted_histories]
+        history_method = "\n".join([
+            f"using HistoryCheckpoint = {checkpoint_type};",
+            "HistoryCheckpoint history_checkpoint() const {",
+            "    return {" + ", ".join(f"{member}.checkpoint()" for member in history_members) + "};",
+            "}",
+            "void history_restore(const HistoryCheckpoint& value) {",
+            *(f"    {member}.restore(std::get<{index}>(value));"
+              for index, member in enumerate(history_members)),
+            "}",
+            "void accept_history(double t) {",
+            *(["    sync(t);"] if history_members else []),
+            *(f"    {member}.accept(t, {value});"
+              for member, value in zip(history_members, history_values)),
+            "}",
+        ])
         methods = [boundary_method, *tracking.values()]
         for generator in sampled.values():
             methods += [generator.controller_method(), generator.switching_method(),
@@ -9009,7 +9262,11 @@ class _CppGenerator:
         run_end = self.runtime.value("simulation.t_end", self.p.simulation.t_end)
         output_period_value = self.runtime.value("simulation.output.period", output.period)
         integration_name = "integrate_solver" if native_conduction else "integrate"
-        local_limit = bool(diode_step_limits)
+        local_limit = bool(solver_step_limits)
+        accepted_step = "accept_history(t);" if history_members else ""
+        accepted_implicit = (
+            "accept_history(begin + (k + 1) * h);" if history_members else ""
+        )
         integration_args = (", double maximum_step = std::numeric_limits<double>::infinity()"
                             if local_limit else "")
         if local_limit:
@@ -9020,9 +9277,10 @@ class _CppGenerator:
                                            fixed_dt, adaptive_atol, adaptive_rtol, raw_projection_call,
                                            n_states=self.model.n_states,
                                            mode_size=mode_size,
-                                           groups=groups, interface=interface)
+                                           groups=groups, interface=interface,
+                                           accepted=accepted_implicit)
         elif fixed:
-            step_code = _fixed_step(solver.method)
+            step_code = _fixed_step(solver.method, accepted_step)
             if stiff_fallback:
                 implicit_code = _implicit_solver(
                     "radau", "integrate_stiff", integration_args,
@@ -9030,6 +9288,7 @@ class _CppGenerator:
                     n_states=self.model.n_states,
                     mode_size=mode_size,
                     groups=groups, interface=interface,
+                    accepted=accepted_implicit,
                 )
                 step_check_code = _explicit_step_check(solver.method, [
                     (
@@ -9095,6 +9354,7 @@ class _CppGenerator:
                 t += h;
                 y = y1;
                 k1 = k7;
+                {accepted_step}
                 double factor = error == 0.0 ? 5.0 : {adaptive_safety} * std::pow(error, -0.14) * std::pow(adaptive_error, 0.08);
                 factor = std::clamp(factor, 0.2, 5.0);
                 adaptive_error = std::max(error, 1e-4);
@@ -9108,14 +9368,36 @@ class _CppGenerator:
         {raw_projection_call}
         t = target;
     }}'''
+        step_limit_code = ""
+        if local_limit:
+            limit_callbacks = [
+                f"double solver_maximum_step_{k}() {{ return {value}; }}"
+                for k, value in enumerate(solver_step_limits)
+            ]
+            step_limit_code = "\n".join([
+                *limit_callbacks,
+                "double solver_maximum_step() {",
+                "    double value = std::numeric_limits<double>::infinity();",
+                *(f"    value = std::min(value, solver_maximum_step_{k}());"
+                  for k in range(len(solver_step_limits))),
+                "    if (!(value > 0.0)) throw std::runtime_error("
+                '        "a component integration step is below time resolution");',
+                "    return value;",
+                "}",
+            ])
+            solver_code += "\n" + step_limit_code
         advance_method = "integrate"
+        if local_limit and not native_conduction:
+            solver_code += (
+                "\nvoid integrate_limited(double& t, double target) { "
+                "sync(t); integrate(t, target, solver_maximum_step()); }"
+            )
+            advance_method = "integrate_limited"
         diode_declaration = ""
         conduction_sync = ""
         if native_conduction:
             callbacks = [f"bool diode_blocks_reverse_current_{k}() {{ return {guard}; }}"
                          for k, guard in enumerate(diode_blocking_guards)]
-            callbacks += [f"double diode_maximum_step_{k}() {{ return {value}; }}"
-                          for k, value in enumerate(diode_step_limits)]
             callbacks += ["double commutation_margin(std::size_t index, double t) { switch (index) {",
                           *[f"case {k}: return {expression};"
                             for k, expression in enumerate(commutation_margins)],
@@ -9130,11 +9412,8 @@ class _CppGenerator:
                           "default: break; } }"]
             raw = "sim.integrate_solver(at, end);"
             if local_limit:
-                raw = ("sim.sync(begin); double maximum_step = std::numeric_limits<double>::infinity(); "
-                       + " ".join(f"maximum_step = std::min(maximum_step, sim.diode_maximum_step_{k}());"
-                                  for k in range(len(diode_step_limits)))
-                       + ' if (!(maximum_step > 0.0)) throw std::runtime_error("diode conduction step is below time resolution");'
-                       + " sim.integrate_solver(at, end, maximum_step);")
+                raw = ("sim.sync(begin); "
+                       "sim.integrate_solver(at, end, sim.solver_maximum_step());")
             tolerance = model._trace(lambda: commutation_tolerance(_Expression("t", "real"))).code
             probe = (self.runtime.value("simulation.solver.dt", solver.dt) if fixed else
                      self.runtime.value("simulation.solver.max_step", solver.max_step))
@@ -9218,6 +9497,8 @@ constexpr std::size_t state_count = {len(state_names)};
 using State = std::array<double, state_count>;
 constexpr double pi = 3.141592653589793238462643383279502884;
 constexpr double time_eps = {_number(TIME_EPS)};
+
+{_DELAY_HISTORY if history_members else ""}
 
 {_ALGEBRAIC_SOLVER if any(len(loop.tears) == 1 for loop in self.model.algebraic_loops) else ""}
 
@@ -9437,6 +9718,8 @@ public:
         {sync_update}
     }}
 
+{history_method}
+
 {solver_code}
 
     {methods_text}
@@ -9471,6 +9754,7 @@ public:
         {diode_declaration}
         {conduction_sync}
         {projection_call}
+        {"accept_history(t);" if history_members else ""}
         const double end = {run_end};
         const double output_period = {output_period_value};
         long long output_index = std::max<long long>(0, static_cast<long long>(std::ceil(t / output_period - 1e-9)));
@@ -9542,6 +9826,7 @@ public:
                 }}
                 {'if (circuit_due || trip_now) sync<true>(t);' if adc_seed else ''}
             }}
+            {"accept_history(t);" if history_members else ""}
             if (t >= end - time_eps) {{ snapshot(true); break; }}
             if (std::abs(next_output - t) < time_eps) {{
                 snapshot();

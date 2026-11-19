@@ -280,19 +280,131 @@ class _AcceptedEnergy:
         }
 
 
-def _compile_interval_integrator(solver, rhs, conduction, settle, project):
+class _AcceptedHistory:
+    """Commit declared signal histories only at accepted physical states."""
+
+    def __init__(self, model, signals: tuple[Any, ...]) -> None:
+        self.model, self.signals = model, signals
+        self.last_t = -math.inf
+        self.history: list[tuple[float, tuple]] = []
+
+    def _state(self, history_size: int | None = None) -> tuple:
+        return (
+            self.last_t,
+            tuple(signal.history.checkpoint() for signal in self.signals),
+            len(self.history) if history_size is None else history_size,
+        )
+
+    def _remember(self) -> None:
+        same = self.history and abs(self.history[-1][0] - self.last_t) <= TIME_EPS
+        size = len(self.history) if same else len(self.history) + 1
+        entry = (self.last_t, self._state(size))
+        if same:
+            self.history[-1] = entry
+        else:
+            self.history.append(entry)
+
+    def begin_interval(self, t: float, y: np.ndarray) -> None:
+        """Refresh the wave accepted at a boundary after any event at that boundary."""
+        self.accept(t, y)
+        self.history[:] = self.history[-1:]
+
+    def accept(self, t: float, y: np.ndarray) -> None:
+        if t < self.last_t - TIME_EPS:
+            raise RuntimeError("accepted history steps must be chronological")
+        self.model.sync(t, y)
+        for signal in self.signals:
+            signal.history.accept(t, signal.value())
+        self.last_t = t
+        self._remember()
+
+    def checkpoint(self) -> tuple:
+        return self._state()
+
+    def checkpoint_at(self, t: float) -> tuple:
+        for when, checkpoint in reversed(self.history):
+            if abs(when - t) <= TIME_EPS:
+                return checkpoint
+        raise RuntimeError(f"accepted-history checkpoint missing at t = {t:.12g} s")
+
+    def restore(self, checkpoint: tuple) -> None:
+        self.last_t, histories, size = checkpoint
+        for signal, state in zip(self.signals, histories):
+            signal.history.restore(state)
+        del self.history[size:]
+
+
+class _AcceptedObservers:
+    """One accepted-step interface shared by independent observer lifecycles."""
+
+    def __init__(self, *observers: Any) -> None:
+        self.observers = tuple(observer for observer in observers if observer is not None)
+
+    @property
+    def last_t(self) -> float:
+        return min(observer.last_t for observer in self.observers)
+
+    def begin_interval(self, t: float, y: np.ndarray) -> None:
+        for observer in self.observers:
+            observer.begin_interval(t, y)
+
+    def accept(self, t: float, y: np.ndarray) -> None:
+        for observer in self.observers:
+            observer.accept(t, y)
+
+    def checkpoint(self) -> tuple:
+        return tuple(observer.checkpoint() for observer in self.observers)
+
+    def checkpoint_at(self, t: float) -> tuple:
+        return tuple(observer.checkpoint_at(t) for observer in self.observers)
+
+    def restore(self, checkpoint: tuple) -> None:
+        for observer, state in zip(self.observers, checkpoint):
+            observer.restore(state)
+
+
+class _StepLimits:
+    """Evaluate component-owned integration limits through one model-level interface."""
+
+    def __init__(self, model) -> None:
+        self.model = model
+        self.owners = tuple(
+            subsystem for subsystem in model.subsystems
+            if callable(getattr(subsystem, "solver_maximum_step", None))
+        )
+
+    def __bool__(self) -> bool:
+        return bool(self.owners)
+
+    def __call__(self, t: float, y: np.ndarray) -> float:
+        self.model.sync(t, y)
+        maximum = min(owner.solver_maximum_step() for owner in self.owners)
+        if not maximum > 0.0:
+            raise FloatingPointError("a component integration step is below time resolution")
+        return float(maximum)
+
+
+def _compile_interval_integrator(solver, rhs, conduction, settle, project, step_limits=None):
     """Compile the assembled interval stages so structural choices leave the run loop.
 
     Conduction participation, solver settlement and state bounds cannot change during a run.
     Only whether the current boundary is an event remains dynamic.
     """
     env = {"solver": solver, "rhs": rhs}
+    if step_limits:
+        env["step_limits"] = step_limits
+        body = ["maximum_step = step_limits(t_a, y)"]
+    else:
+        body = []
     if conduction:
         env["conduction"] = conduction
-        advance = "conduction.advance(t_a, t_b, y)"
+        advance = ("conduction.advance(t_a, t_b, y, max_step=maximum_step)"
+                   if step_limits else "conduction.advance(t_a, t_b, y)")
+    elif step_limits:
+        advance = "solver.advance(rhs, t_a, t_b, y, max_step=maximum_step).y"
     else:
         advance = "solver(rhs, t_a, t_b, y).y"
-    body = [f"y = {advance}"]
+    body.append(f"y = {advance}")
     if settle is not None:
         env["settle"] = settle
         body += ["if event:", "    y = settle(t_b, y)"]
@@ -1183,6 +1295,18 @@ class Simulation:
         accepted_energy = (
             _AcceptedEnergy(mdl, energy_balance) if energy_on and output.energy else None
         )
+        accepted_history = _AcceptedHistory(
+            mdl,
+            tuple(
+                signal
+                for subsystem in mdl.subsystems
+                for signal in getattr(subsystem, "accepted_histories", ())
+            ),
+        )
+        accepted_steps = _AcceptedObservers(
+            accepted_energy,
+            accepted_history if accepted_history.signals else None,
+        )
         phs_check_step = p.simulation.solver.phs_check_step
         snapshot_index = 0
         continuous_record_index = 0
@@ -1281,30 +1405,35 @@ class Simulation:
                                   f"known: {sorted(values)}")
             return "".join(f"   {name} = {values[name]:.6g}" for name in watch)
 
+        step_limits = _StepLimits(mdl)
+        validate_local_step = getattr(solver, "validate_local_step", None)
+        if validate_local_step is not None:
+            validate_local_step(step_limits.owners)
         integrate = _compile_interval_integrator(
             solver, mdl.rhs, diode_conduction, settle, project,
+            step_limits if step_limits else None,
         )
 
         def advance(t_a: float, t_b: float, event: bool = False) -> bool:
             """Integrate over ``[t_a, t_b]``; ``event`` means the model changes at ``t_b``."""
             nonlocal t_local, stop_reason, termination, coarse_reported
             plant.invalidate()
-            energy_checkpoint = None
-            if accepted_energy is not None:
-                accepted_energy.begin_interval(t_a, plant.state)
-                energy_checkpoint = accepted_energy.checkpoint()
+            accepted_checkpoint = None
+            if accepted_steps.observers:
+                accepted_steps.begin_interval(t_a, plant.state)
+                accepted_checkpoint = accepted_steps.checkpoint()
             try:
-                if accepted_energy is None:  # no observer to install
+                if not accepted_steps.observers:
                     plant.state = integrate(t_a, t_b, plant.state, event)
                 else:
-                    with _accepted_steps(accepted_energy):
+                    with _accepted_steps(accepted_steps):
                         plant.state = integrate(t_a, t_b, plant.state, event)
-                if (accepted_energy is not None
-                        and accepted_energy.last_t < t_b - TIME_EPS):
-                    accepted_energy.accept(t_b, plant.state)
+                if (accepted_steps.observers
+                        and accepted_steps.last_t < t_b - TIME_EPS):
+                    accepted_steps.accept(t_b, plant.state)
             except (OverflowError, FloatingPointError):
-                if accepted_energy is not None:
-                    accepted_energy.restore(energy_checkpoint)
+                if accepted_steps.observers:
+                    accepted_steps.restore(accepted_checkpoint)
                 termination = "diverged"
                 stop_reason = (f"diverged: the states overflowed between t = {t_a:.6g} s "
                                f"and {t_b:.6g} s")

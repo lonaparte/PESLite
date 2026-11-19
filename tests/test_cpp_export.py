@@ -1139,6 +1139,51 @@ def test_generated_cpp_runs_custom_cable_equations_with_a_range_bound(tmp_path):
     assert {"cable1.i1_a", "cable1.i2_a"} <= actual_plant.keys()
 
 
+def test_generated_cpp_bergeron_history_matches_python(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "cable-gfl-example.pes", **{
+        "elements.cable1.model": "bergeron",
+        "elements.cable1.g_per_km": 0.0,
+        "elements.cable1.r_per_km": 0.0,
+        "units.vsc.bridge.model": "averaging",
+        "simulation.t_end": 2.0e-4,
+        "simulation.solver.type": "fixed",
+        "simulation.solver.method": "rk4",
+        "simulation.solver.dt": 5.0e-6,
+        "simulation.solver.linearisations": 0,
+        "simulation.energy_check": "warn",
+        "simulation.output.period": 25.0e-6,
+        "simulation.output.signals": 1,
+        "simulation.output.energy": 1,
+    })
+    source, cpp_out, python_out = _run_generated(
+        params, tmp_path / "bergeron", compiler,
+    )
+
+    generated = source.read_text(encoding="utf-8")
+    assert "class DelayHistory" in generated
+    assert "accepted_history_0.value(" in generated
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
+    assert actual.keys() == expected.keys()
+    np.testing.assert_allclose(
+        list(actual.values()), list(expected.values()), rtol=2e-8, atol=2e-9,
+    )
+    expected_plant = _final_csv(python_out / "plant.csv")
+    actual_plant = _final_csv(cpp_out / "plant.csv")
+    for name in ("cable1.i1_a", "cable1.i2_a"):
+        assert actual_plant[name] == pytest.approx(expected_plant[name], rel=2e-8, abs=2e-9)
+    expected_energy = _final_csv(python_out / "energy.csv")
+    actual_energy = _final_csv(cpp_out / "energy.csv")
+    assert actual_energy.keys() == expected_energy.keys()
+    for name in ("energy_J", "power_dissipated_W", "cable1.energy_J"):
+        assert actual_energy[name] == pytest.approx(
+            expected_energy[name], rel=2e-8, abs=2e-9,
+        )
+
+
 def test_generated_cpp_runs_black_box_outputs_and_peslite_state_equations(tmp_path):
     compiler = _compiler()
     if compiler is None:

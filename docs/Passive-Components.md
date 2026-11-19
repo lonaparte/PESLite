@@ -61,6 +61,28 @@ elements:
 system base. Capacitor terminals must be distinct, `c` must be positive and `r` non-negative. The
 capacitor exposes `<element>.u`; energy accounting includes its stored energy and series loss.
 
+## Cables
+
+The bundled cable component is a two-port element whose currents are positive into the cable:
+
+```yaml
+elements:
+  line:
+    type: cable
+    bus1: sending
+    bus2: receiving
+    length_km: 5.0
+    r_per_km: 0.05
+    l_per_km: 0.4e-3
+    c_per_km: 0.2e-6
+```
+
+`model: bergeron` is the default. It represents distributed L-C propagation with an exact travel
+delay and splits the total series resistance into quarter-half-quarter sections. Use
+`model: lumped` for the segmented R-L/G-C model; `sections` selects its number of shunt G-C cells
+and `g_per_km` its shunt conductance. All per-kilometre fields use SI units, and the Bergeron model
+requires `g_per_km: 0`.
+
 ## Connections
 
 Component ports accept a public bus name, Unit-port path or the reserved `ground` reference.

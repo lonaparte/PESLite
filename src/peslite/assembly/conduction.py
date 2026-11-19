@@ -12,7 +12,7 @@ from ..defaults import (DEFAULT_COMMUTATION_LOCATOR_ITERATIONS,
                         DEFAULT_COMMUTATION_MAX_TRANSITIONS)
 from .params import ConfigError
 from ..solver.integrators import (_accepted_checkpoint, _accepted_checkpoint_at,
-                                  _accepted_restore)
+                                  _accepted, _accepted_restore)
 from ..solver.model import commutation_tolerance
 
 __all__ = ["DiodeConduction", "CommutationError"]
@@ -28,8 +28,6 @@ class DiodeConduction:
 
     * an ideal diode in series with one current state declares a zero lower state bound and
       ``diode_blocks_reverse_current()``; the state is clamped at its located zero;
-    * an averaged diode law declares ``diode_maximum_step()``, a local resolution limit passed to
-      the solver through its generic per-call ``advance`` interface;
     * a *commutating* subsystem holds a discrete state (for example the conducting pair of a diode
       bridge or a switch position) that is valid while ``commutation_margin()`` is nonnegative.
       ``commutate(t)`` changes it at the located instant where the margin becomes negative, and
@@ -57,10 +55,6 @@ class DiodeConduction:
             if callable(getattr(subsystem, "diode_blocks_reverse_current", None))
             for state, (lower, _upper) in getattr(subsystem, "state_bounds", {}).items()
             if lower == 0.0
-        )
-        self.resolution_subsystems = tuple(
-            subsystem for subsystem in model.subsystems
-            if callable(getattr(subsystem, "diode_maximum_step", None))
         )
         self.commutating = tuple(
             subsystem for subsystem in model.subsystems
@@ -108,26 +102,23 @@ class DiodeConduction:
                 )
         guarded = getattr(solver, "advance_guarded", None)
         self._guarded_advance = guarded if callable(guarded) else None
-        validate = getattr(solver, "validate_local_step", None)
-        if validate is not None:
-            validate(self.resolution_subsystems)
 
     def __bool__(self) -> bool:
-        return bool(self.current_states or self.resolution_subsystems
-                    or self.commutating or self._topology_owners)
+        return bool(self.current_states or self.commutating or self._topology_owners)
 
     def synchronize(self, t: float, state: NDArray[np.float64]) -> None:
         """Resolve boundary modes before measurements, controls or observations read them."""
         self._settle(t, state)
 
     def advance(
-            self, t0: float, t1: float, state: NDArray[np.float64]
+            self, t0: float, t1: float, state: NDArray[np.float64], *,
+            max_step: float = math.inf,
     ) -> NDArray[np.float64]:
         """Advance all conduction guards through one locator and one boundary dispatcher."""
         if self.solver is None:
             raise RuntimeError("diode conduction cannot advance without a solver")
         if not (self.commutating or self.current_states or self.located or self._scheduled):
-            return self._smooth(t0, t1, state)  # no guard to plan or observe
+            return self._smooth(t0, t1, state, max_step=max_step)  # no guard to plan or observe
         initial_guarded, initial_located = self._guard_plan(state)
         scheduled_due = any(
             float(subsystem.next_commutation_time()) <= t0 + commutation_tolerance(t0)
@@ -143,7 +134,7 @@ class DiodeConduction:
             state = self._settle(t0, state)
             initial_guarded = initial_located = None
         if not self.current_states and not self.located and not self._scheduled:
-            return self._smooth(t0, t1, state)
+            return self._smooth(t0, t1, state, max_step=max_step)
         t = t0
         end = t1 - commutation_tolerance(t1)
         stalled = 0
@@ -167,7 +158,9 @@ class DiodeConduction:
             origin_checkpoint = _accepted_checkpoint()
             lower_margin = None
             if observe_steps:
-                step = self._guarded(t, target, state.copy(), guarded, located)
+                step = self._guarded(
+                    t, target, state.copy(), guarded, located, max_step=max_step,
+                )
                 trial, upper_margin = step.y, step.margin
                 if step.crossed:
                     origin_t, origin_state = step.previous_t, step.previous_y
@@ -175,7 +168,9 @@ class DiodeConduction:
                     lower_margin = step.previous_margin
                     target = step.t
             else:
-                trial, upper_margin = self._trial(t, target, state.copy(), guarded, located)
+                trial, upper_margin = self._trial(
+                    t, target, state.copy(), guarded, located, max_step=max_step,
+                )
             if upper_margin < 0.0:
                 upper_checkpoint = _accepted_checkpoint()
                 lower, upper = origin_t, target
@@ -199,7 +194,8 @@ class DiodeConduction:
                     bisect_next = interpolated
                     _accepted_restore(origin_checkpoint)
                     value, margin = self._trial(
-                        origin_t, middle, origin_state.copy(), guarded, located
+                        origin_t, middle, origin_state.copy(), guarded, located,
+                        max_step=max_step,
                     )
                     candidate_checkpoint = _accepted_checkpoint()
                     invalid = margin < 0.0
@@ -215,7 +211,8 @@ class DiodeConduction:
                         if lower < adjacent < upper:
                             _accepted_restore(origin_checkpoint)
                             value, margin = self._trial(
-                                origin_t, adjacent, origin_state.copy(), guarded, located
+                                origin_t, adjacent, origin_state.copy(), guarded, located,
+                                max_step=max_step,
                             )
                             candidate_checkpoint = _accepted_checkpoint()
                             if margin < 0.0:
@@ -252,15 +249,13 @@ class DiodeConduction:
             guarded += tuple((index, direction, True) for index, direction in replacements)
         return guarded, tuple(located)
 
-    def _guarded(self, t0: float, t1: float, state: NDArray[np.float64], guarded, located):
+    def _guarded(self, t0: float, t1: float, state: NDArray[np.float64], guarded, located, *,
+                 max_step: float = math.inf):
         """Observe margins inside one solver call while reusing a fixed topology."""
-        maximum_step = self._probe if self._probe is not None else math.inf
-        if self.resolution_subsystems:
-            self.model.sync(t0, state)
-            maximum_step = min(
-                maximum_step,
-                *(subsystem.diode_maximum_step() for subsystem in self.resolution_subsystems),
-            )
+        maximum_step = min(
+            max_step,
+            self._probe if self._probe is not None else math.inf,
+        )
         for subsystem in self._topology_owners:
             subsystem.freeze_topology()
         try:
@@ -277,18 +272,29 @@ class DiodeConduction:
             for subsystem in self._topology_owners:
                 subsystem.release_topology()
 
-    def _trial(self, t0: float, t1: float, state: NDArray[np.float64], guarded, located
+    def _trial(self, t0: float, t1: float, state: NDArray[np.float64], guarded, located, *,
+               max_step: float = math.inf,
                ) -> tuple[NDArray[np.float64], float]:
         """Integrate and test one smooth interval while reusing its compiled topology."""
-        value = self._smooth(t0, t1, state)
+        value = self._smooth(t0, t1, state, max_step=max_step)
         return value, self._margin(t1, value, guarded, located)
 
-    def _smooth(self, t0: float, t1: float, state: NDArray[np.float64]) -> NDArray[np.float64]:
+    def _smooth(self, t0: float, t1: float, state: NDArray[np.float64], *,
+                max_step: float = math.inf) -> NDArray[np.float64]:
         """Integrate one interval while every topology owner reuses its boundary mode."""
         for subsystem in self._topology_owners:
             subsystem.freeze_topology()
         try:
-            return self._advance_with_resolution(t0, t1, state)
+            advance = getattr(self.solver, "advance", None)
+            if advance is not None:
+                return advance(
+                    self.model.rhs, t0, t1, state, max_step=max_step,
+                ).y
+            if math.isfinite(max_step):
+                raise ConfigError(
+                    "a model-imposed step limit requires a solver with advance(..., max_step=...)"
+                )
+            return self.solver(self.model.rhs, t0, t1, state).y
         finally:
             for subsystem in self._topology_owners:
                 subsystem.release_topology()
@@ -328,6 +334,7 @@ class DiodeConduction:
                     invalidate = getattr(self.model, "invalidate_equations", None)
                     if invalidate is not None:
                         invalidate()
+                    _accepted(t, state)
                 return state
             changed = False
             for sub in self.commutating:
@@ -347,35 +354,3 @@ class DiodeConduction:
             f"t = {t:.12g} s: {names} commutated {self.max_transitions} times without time "
             "advancing; the configured circuit has no consistent conduction state here"
         )
-
-    def _advance_with_resolution(
-            self, t0: float, t1: float, state: NDArray[np.float64]
-    ) -> NDArray[np.float64]:
-        """Advance with any local resolution required by an averaged diode law."""
-        if not self.resolution_subsystems:
-            return self.solver(self.model.rhs, t0, t1, state).y
-
-        self.model.sync(t0, state)
-        maximum_step = min(
-            subsystem.diode_maximum_step()
-            for subsystem in self.resolution_subsystems
-        )
-        advance = getattr(self.solver, "advance", None)
-        if advance is not None:
-            return advance(
-                self.model.rhs, t0, t1, state, max_step=maximum_step,
-            ).y
-
-        t = t0
-        while t < t1 - 1e-15:
-            self.model.sync(t, state)
-            maximum_step = min(
-                subsystem.diode_maximum_step()
-                for subsystem in self.resolution_subsystems
-            )
-            target = min(t1, t + maximum_step)
-            if target <= t:
-                raise FloatingPointError("diode conduction step is below time resolution")
-            state = self.solver(self.model.rhs, t, target, state).y
-            t = target
-        return state
