@@ -3,6 +3,7 @@ export type Operation =
   | 'tree' | 'file.read' | 'file.write' | 'file.create' | 'file.rename' | 'file.delete'
   | 'preview' | 'parameter.patch' | 'component.add' | 'component.remove'
   | 'connection.rewire' | 'csv.read' | 'summary.read'
+  | 'debug.inspect'
   | 'preview.layout.load' | 'preview.layout.save' | 'preview.layout.clear'
   | 'run.start' | 'run.stop' | 'run.status'
   | 'workspace.active' | 'editor.reveal' | 'editor.applyPatch';
@@ -25,6 +26,15 @@ export type CsvResponse = {
   nextOffset: number; nextByteOffset: number; eof: boolean;
 };
 export type RunStatus = { running: boolean; exitCode: number | null; path: string; log: string };
+export type DebugOperation = {
+  kind: 'connect' | 'disconnect' | 'set'; source: string; target: string;
+  path: string; value: unknown;
+};
+export type DebugPreview = {
+  modelPath: string; modelText: string; preview: PreviewResponse;
+  operations: DebugOperation[]; sources: string[]; probes: Record<string, string>;
+  analyses: string[]; checks: string[]; watch: string[];
+};
 
 interface VSCodeAPI { postMessage(message: unknown): void }
 declare const acquireVsCodeApi: undefined | (() => VSCodeAPI);

@@ -36,6 +36,7 @@ export interface GraphEdge {
   directed: boolean;
   line: number;
   source: SourceRange;
+  debug?: 'connect' | 'disconnect';
 }
 export interface GraphGroup {
   id: string;

@@ -45,8 +45,16 @@ peslite case.pes
 | `wpt-scc-example` | Square-wave WPT with primary power feedback commanding an SCC conduction angle. |
 
 The files are also available in the repository's
-[`examples/`](https://github.com/lonaparte/PESLite/tree/main/examples) directory. The root
-directory contains only simulation files, not Python example programs.
+[`examples/`](https://github.com/lonaparte/PESLite/tree/main/examples) directory. Its root contains
+plain-text simulation files, while related plain-text resources use named subdirectories; it does
+not contain Python example programs.
+
+`gfl-debug-example.pesdbg` demonstrates a control-loop bypass, an injected source, probes, a
+frequency-response measurement and a quantitative check. Run it with:
+
+```bash
+peslite debug gfl-example --plan examples/debug/gfl-debug-example.pesdbg
+```
 
 ## Compare bridge models
 

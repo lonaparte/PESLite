@@ -1,6 +1,6 @@
 # CLI Reference
 
-PESLite installs one `peslite` command with five operations:
+PESLite installs one `peslite` command with six operations:
 
 ```bash
 peslite create case.pes
@@ -8,6 +8,7 @@ peslite run case.pes
 peslite validate case.pes
 peslite inspect case.pes
 peslite export case.pes
+peslite debug case.pes --plan control.pesdbg
 ```
 
 `peslite case.pes` is the short form of `peslite run case.pes`. Use `peslite --help` or
@@ -169,6 +170,7 @@ peslite validate case.pes --json
 peslite inspect case.pes --json
 peslite run case.pes --out output/case --json
 peslite export case.pes common --json
+peslite debug case.pes --plan control.pesdbg --json
 ```
 
 Standard output then contains one strict JSON object with schema `peslite.cli/v1`. Its envelope
@@ -180,7 +182,18 @@ Execution success does not assert that the configured physical system is correct
 protection results and numerical diagnostics remain separate fields.
 
 Exit codes are `0` for a completed command, `2` for command or configuration errors, `3` for
-assembly errors, `4` for simulation failures, `5` for a run limit and `70` for an internal error.
+assembly errors, `4` for simulation failures, `5` for a run limit, `6` for failed debug checks and
+`70` for an internal error.
+
+## Debug a control graph
+
+```bash
+peslite debug case.pes --plan control.pesdbg
+peslite debug ls case.pes
+```
+
+Debug runs use the normal model, control graph and solver with a file-backed overlay. See
+[Debugging](Debugging.md) for connection edits, sources, probes, analyses, checks and run history.
 
 ## Run limits
 

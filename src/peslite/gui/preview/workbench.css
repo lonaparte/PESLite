@@ -1,5 +1,7 @@
 html,body,.workbench { height:100%; }
 body { margin:0; font:13px/1.4 system-ui,sans-serif; color:#263c50; background:#f1f5f9; }
+.pp-edge-debug-connect { stroke:#0b8f55 !important; stroke-dasharray:7 4; }
+.pp-edge-debug-disconnect { stroke:#c2413b !important; stroke-dasharray:3 4; opacity:.55; }
 .workbench { display:flex; flex-direction:column; }
 header,footer { display:flex; align-items:center; gap:14px; padding:6px 12px; background:#e3eaf1;
   border-bottom:1px solid #d0dbe5; }

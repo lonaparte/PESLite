@@ -28,3 +28,4 @@ namespaces = true
 
 [tool.setuptools.data-files]
 "share/peslite/examples" = ["examples/*.pes"]
+"share/peslite/examples/debug" = ["examples/debug/*.pesdbg"]

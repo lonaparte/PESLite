@@ -111,7 +111,9 @@ def test_templates_and_cases_have_distinct_owners():
     with (ROOT / "packages/distributions.json").open(encoding="utf-8") as handle:
         distributions = json.load(handle)["distributions"]
     assert distributions["peslite-core"]["files"] == ["examples/templates/*"]
-    assert distributions["peslite"]["files"] == ["examples/*.pes"]
+    assert distributions["peslite"]["files"] == [
+        "examples/*.pes", "examples/debug/*.pesdbg",
+    ]
 
 
 def test_public_documentation_describes_the_distribution_matrix_and_gui():

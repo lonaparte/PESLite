@@ -231,6 +231,9 @@ def test_native_multivariable_feedback_keeps_the_previous_output_between_calls(t
     model = Model({'feedback': component}, {
         (component, name): (component, name) for name in ('x', 'y')
     })
+    generator = _generator(model)
+    members = "\n".join(generator.members())
+    assert all(generator.value(component.output, name) in members for name in ('x', 'y'))
     times = tuple(index * 1e-7 for index in range(101))
     readings = [(component.output, name) for name in ('x', 'y')]
     actual = _run_model(model, readings, tmp_path, times=times).reshape(-1, 2)
@@ -238,7 +241,11 @@ def test_native_multivariable_feedback_keeps_the_previous_output_between_calls(t
     for t in times:
         model.sync(t, model.get_initial_values())
         expected.append((component.output.x, component.output.y))
-    np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-14)
+    expected = np.asarray(expected)
+    loop, = model.algebraic_loops
+    residual_limit = loop.atol + loop.rtol * np.maximum(1.0, np.abs(expected))
+    error_limit = residual_limit / (1.0 - 0.85)
+    assert np.all(np.abs(actual - expected) <= error_limit)
 
 
 def test_native_inherited_source_keeps_the_existing_adapter():

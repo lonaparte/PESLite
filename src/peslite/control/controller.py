@@ -39,7 +39,7 @@ from .profiles import (DutyReferenceParams, PhaseShiftReferenceParams, Reference
 
 __all__ = ["Measurement", "ConverterMeasurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
            "ControlInterface", "CONTROL_INTERFACE", "SAMPLED_VSC_INTERFACE",
-           "ControlGraph", "default_wiring",
+           "ControlGraph", "ControlGraphOverlay", "default_wiring",
            "VSCController", "BridgeControlOutput", "GraphController",
            "make_controller"]
 
@@ -301,6 +301,32 @@ class ContinuousStartup:
 _HELD, _MEASURED, _CONSTANT, _REFERENCE = 0, 1, 2, 3
 
 
+@dataclass(frozen=True)
+class ControlGraphOverlay:
+    """Construction-time connection, source and observation changes to one control graph."""
+
+    connections: Mapping[str, str | None] = field(default_factory=dict)
+    sources: Mapping[str, tuple[SignalType, Any]] = field(default_factory=dict)
+    probes: Mapping[str, str] = field(default_factory=dict)
+    retained: frozenset[str] = frozenset()
+    policies: Mapping[str, str] = field(default_factory=dict)
+    initial_t: float = 0.0
+
+
+def _control_connections(defaults: Mapping[str, str], ctrl: Any) -> dict[str, str]:
+    """Apply normal and optional construction-time connection changes through one merge."""
+    result = {**defaults, **ctrl.connections}
+    overlay = getattr(ctrl, "_control_overlay", None)
+    if overlay is None:
+        return result
+    for target, source in overlay.connections.items():
+        if source is None:
+            result.pop(target, None)
+        else:
+            result[target] = source
+    return result
+
+
 def _reference_bindings(ctrl) -> Mapping:
     """Return optional time-varying bindings from a controller configuration."""
     return getattr(ctrl, "_reference_bindings", {})
@@ -385,7 +411,7 @@ def continuous_control(unit: Any) -> bool:
     if profile.wiring is None:
         return False
     connections, outputs = profile.wiring(unit, continuous=True)
-    connections = {**connections, **ctrl.connections}
+    connections = _control_connections(connections, ctrl)
     outputs = {**outputs, **ctrl.outputs}
     required = {
         name for name in profile.interface.outputs
@@ -394,7 +420,14 @@ def continuous_control(unit: Any) -> bool:
     if not required <= outputs.keys():
         return False
     classes = {name: loop_type(params.type) for name, params in ctrl.loops.items()}
-    active = _active_loop_names(classes, connections, outputs.values())
+    overlay = getattr(ctrl, "_control_overlay", None)
+    sources = list(outputs.values())
+    if overlay is not None:
+        sources.extend(overlay.probes.values())
+        sources.extend(overlay.retained)
+        if "tracking" in overlay.policies.values():
+            return False
+    active = _active_loop_names(classes, connections, sources)
     return all(classes[name].supports_continuous() for name in active)
 
 
@@ -422,7 +455,8 @@ class ControlGraph:
         self.interface = interface
         self._pending: list[Any] = []
         self.on_retune = None
-        self.connections = {**connections, **cfg.ctrl.connections}
+        self.overlay = getattr(cfg.ctrl, "_control_overlay", None)
+        self.connections = _control_connections(connections, cfg.ctrl)
         self.outputs = {**outputs, **cfg.ctrl.outputs}
         self.nodes = {}
         self.periods = {}
@@ -438,6 +472,7 @@ class ControlGraph:
         self.updated = set()
         refs = cfg.ctrl.references
         self.reference_bindings = dict(_reference_bindings(cfg.ctrl))
+        self._overlay_bindings = {}
         self._reference_validator = control_type(cfg.ctrl.type).reference_validator
         self.references = _reference_values(
             refs, attributes=bool(self.reference_bindings and self._reference_validator),
@@ -457,6 +492,14 @@ class ControlGraph:
                 raise ConfigError(f"ctrl.loops.{name}: no loop type {loop.type!r} is registered")
             classes[name] = cls
             types.update({f"{name}.{port}": spec for port, spec in cls.outputs.items()})
+        if self.overlay is not None:
+            for name, (spec, signal) in self.overlay.sources.items():
+                if name in types:
+                    raise ConfigError(f"control overlay source {name!r} conflicts with a controller port")
+                types[name] = spec
+                self.references[name] = signal(self.overlay.initial_t)
+                self._overlay_bindings[name] = signal
+        self._bindings = (*self.reference_bindings.items(), *self._overlay_bindings.items())
         targets = {
             f"{name}.{port}": spec
             for name, cls in classes.items()
@@ -503,6 +546,13 @@ class ControlGraph:
             if source not in types or not types[source].compatible(spec):
                 raise ConfigError(f"ctrl.outputs.{port}: missing or incompatible source {source!r}")
             pending_sources.append(source)
+        if self.overlay is not None:
+            for alias, source in self.overlay.probes.items():
+                source = self.connections.get(source, source)
+                if source not in types:
+                    raise ConfigError(f"control overlay probe {alias!r}: unknown source {source!r}")
+                pending_sources.append(source)
+            pending_sources.extend(self.overlay.retained)
         if interface.optional_outputs:
             retained = frozenset(port for port in interface.optional_outputs
                                  if port in self.outputs)
@@ -536,6 +586,35 @@ class ControlGraph:
                                           for port, spec in node.outputs.items())
             self.periods[name] = loop.period
             self._store(name, node.initial_outputs(), real=_real, complex=_complex)
+        policies = {} if self.overlay is None else dict(self.overlay.policies)
+        unknown_policies = set(policies) - set(self.nodes)
+        if unknown_policies:
+            raise ConfigError(
+                f"control overlay state policy: inactive or unknown loops {sorted(unknown_policies)}"
+            )
+        invalid_policies = {
+            name: policy for name, policy in policies.items()
+            if policy not in {"continue", "freeze", "tracking"}
+        }
+        if invalid_policies:
+            raise ConfigError(f"control overlay state policy: unsupported values {invalid_policies}")
+        if self.continuous and "tracking" in policies.values():
+            raise ConfigError("control overlay state policy 'tracking' requires sampled control")
+        unsupported_tracking = [
+            name for name, policy in policies.items()
+            if policy == "tracking" and not callable(getattr(self.nodes[name], "track", None))
+        ]
+        if unsupported_tracking:
+            raise ConfigError(
+                "control overlay state policy 'tracking' is unsupported by loops "
+                f"{unsupported_tracking}"
+            )
+        self._frozen = frozenset(
+            name for name, policy in policies.items() if policy == "freeze"
+        )
+        self._tracking = frozenset(
+            name for name, policy in policies.items() if policy == "tracking"
+        )
         self.observation_names = tuple(
             f"{name}.{field}"
             for name, node in self.nodes.items()
@@ -556,9 +635,12 @@ class ControlGraph:
             name: {port: self.values[key] for port, key, _complex in self._out_specs[name]}
             for name in self.nodes
         }
-        self._samples = {name: node.sample_into for name, node in self.nodes.items()}
+        self._samples = {name: self._sample_method(name, node)
+                         for name, node in self.nodes.items()}
         dependencies = {name: set() for name in self.nodes}
         for name, node in self.nodes.items():
+            if name in self._frozen:
+                continue
             for port, spec in node.inputs.items():
                 target = f"{name}.{port}"
                 source = self.connections[target]
@@ -608,6 +690,7 @@ class ControlGraph:
                 affected.update(group)
         self.dc_affected = frozenset(affected)
         self._rewire()
+        self._prepare_probes(types)
         if self.continuous:
             self._prepare_flow()
         self._every = (() if self.continuous else
@@ -616,8 +699,11 @@ class ControlGraph:
         self._every_interrupt = (None if self.continuous else
                                  frozenset(name for name, every in self._every)
                                  if all(every == 1 for _name, every in self._every) else None)
+        self._due = self.due if not self._frozen else self._due_without_frozen
         self._sample_runner = (
-            self._compile_sample_runner() if self._every_interrupt is not None else None
+            self._compile_sample_runner()
+            if self._every_interrupt is not None and not (self._frozen or self._tracking)
+            else None
         )
         angles = []
         for name, node in self.nodes.items():
@@ -635,6 +721,20 @@ class ControlGraph:
         """Interrupt count per loop update; configuration validation requires an integer ratio."""
         return np.maximum(1.0, np.rint(period / interrupt_period))
 
+    def _sample_method(self, name, node):
+        if name not in self._tracking:
+            return node.sample_into
+
+        def tracking_sample(t, inputs, outputs):
+            tracked = node.track(inputs)
+            if tracked is None:
+                raise FloatingPointError(
+                    f"control overlay tracking failed for loop {name!r} at t = {t}"
+                )
+            outputs.update(tracked)
+
+        return tracking_sample
+
     def limit_output(self, name, port, limit):
         """Attach a controller-owned limit to one sampled loop output."""
         if self.continuous:
@@ -643,7 +743,7 @@ class ControlGraph:
         if node is None or port not in node.outputs:
             raise ConfigError(f"controller limit: unknown output {name}.{port}")
         self._limits[name] = (port, limit)
-        sample = node.sample_into
+        sample = self._sample_method(name, node)
 
         def limited_sample(t, inputs, outputs):
             sample(t, inputs, outputs)
@@ -653,7 +753,7 @@ class ControlGraph:
 
     def clear_limit(self, name):
         if self._limits.pop(name, None) is not None:
-            self._samples[name] = self.nodes[name].sample_into
+            self._samples[name] = self._sample_method(name, self.nodes[name])
 
     def _rewire(self):
         """Resolve loop inputs and graph outputs against the current references."""
@@ -670,11 +770,45 @@ class ControlGraph:
                 )
             else:  # ControlInterface is a package-owned declaration, not user input.
                 raise RuntimeError(f"unknown controller input owner {owner!r}")
+        for name in self._overlay_bindings:
+            self._boundary_sources[name] = (_REFERENCE, name)
         self._wiring = {}
         for name, node in self.nodes.items():
             wiring = tuple((port,) + self._resolve(self.connections[f"{name}.{port}"]) for port in node.inputs)
             self._wiring[name] = wiring
         self._output_source = {port: self._resolve(source) for port, source in self.outputs.items()}
+
+    def _prepare_probes(self, types: Mapping[str, SignalType]) -> None:
+        """Resolve overlay probes once and expose a stable scalar log schema."""
+        self._probes = ()
+        self.probe_names = ()
+        if self.overlay is None:
+            return
+        probes = []
+        names = []
+        for alias, written in self.overlay.probes.items():
+            source = self.connections.get(written, written)
+            if source not in types:
+                raise ConfigError(f"control overlay probe {alias!r}: unknown source {source!r}")
+            complex_value = types[source].complex_value
+            probes.append((alias, self._resolve(source), complex_value))
+            names.extend((f"{alias}.re", f"{alias}.im", f"{alias}.abs")
+                         if complex_value else (alias,))
+        self._probes = tuple(probes)
+        self.probe_names = tuple(names)
+
+    def probe_values(self, meas) -> dict[str, float]:
+        """Read scalar overlay probes from the already evaluated graph."""
+        values = {}
+        for alias, source, complex_value in self._probes:
+            value = self._read(*source, meas)
+            if complex_value:
+                value = complex(value)
+                values.update({f"{alias}.re": value.real, f"{alias}.im": value.imag,
+                               f"{alias}.abs": abs(value)})
+            else:
+                values[alias] = float(value)
+        return values
 
     def _prepare_flow(self):
         """Build the fixed buffers and runner for continuous loop-flow evaluations."""
@@ -704,14 +838,19 @@ class ControlGraph:
             group: tuple(key for name in group for _port, key, _complex in self._out_specs[name])
             for group in self._continuous_cycles
         }
-        steps = {
-            name: (
-                name, node.flow_into, self._wiring[name], self._flow_inputs[name],
+        steps = {}
+        for name, node in self.nodes.items():
+            evaluate, wiring = node.flow_into, self._wiring[name]
+            if name in self._frozen:
+                def freeze(_t, _inputs, _outputs, derivatives):
+                    for state in derivatives:
+                        derivatives[state] = 0.0
+                evaluate, wiring = freeze, ()
+            steps[name] = (
+                name, evaluate, wiring, self._flow_inputs[name],
                 self._flow_outputs[name], self._flow_derivatives[name],
                 self._out_specs[name], self._flow_derivative_specs[name],
             )
-            for name, node in self.nodes.items()
-        }
         self._flow_plan = tuple(
             (group, self._flow_cycle_keys.get(group, ()), tuple(steps[name] for name in group))
             for group in self._continuous_plan
@@ -847,6 +986,10 @@ class ControlGraph:
                 self.references = _reference_values(
                     ctrl.references, attributes=bool(bindings and self._reference_validator),
                 )
+                for name, signal in self._overlay_bindings.items():
+                    self.references[name] = signal(self.overlay.initial_t)
+                self._bindings = (*self.reference_bindings.items(),
+                                  *self._overlay_bindings.items())
                 self._reference_time = None
                 self._rewire()
                 if self.continuous:
@@ -880,7 +1023,7 @@ class ControlGraph:
                 f"states than before ({exc}), so it cannot continue from them") from None
         fresh.retuned(old)
         self.nodes[name] = fresh
-        self._samples[name] = fresh.sample_into
+        self._samples[name] = self._sample_method(name, fresh)
         if self.continuous:
             self._prepare_flow()
         if self.on_retune is not None:
@@ -904,14 +1047,16 @@ class ControlGraph:
         """Evaluate every time-varying reference once at this graph boundary."""
         if self._reference_time == t:
             return
-        for name, signal in self.reference_bindings.items():
+        for name, signal in self._bindings:
             try:
                 value = signal(t)
             except (ArithmeticError, ValueError) as exc:
                 raise FloatingPointError(
                     f"controller reference {name!r} failed at t = {t}: {exc}"
                 ) from None
-            if not math.isfinite(value):
+            finite = (math.isfinite(value.real) and math.isfinite(value.imag)
+                      if isinstance(value, complex) else math.isfinite(value))
+            if not finite:
                 raise FloatingPointError(
                     f"controller reference {name!r} returned a non-finite value at t = {t}"
                 )
@@ -964,10 +1109,13 @@ class ControlGraph:
         k = int(round((t - self._t0) / self._T))
         return {name for name, every in self._every if k % every == 0}
 
+    def _due_without_frozen(self, t):
+        return self.due(t) - self._frozen
+
     # ------------------------------------------------------------ running
     def track(self, meas):
         """Pre-synchronise every loop that supports ``track(inputs)``."""
-        if self.reference_bindings:
+        if self._bindings:
             self._update_references(meas.t)
         done = set()
         for name in self.order:
@@ -990,7 +1138,7 @@ class ControlGraph:
         """
         if self._pending:
             self._apply_pending()
-        if self.reference_bindings:
+        if self._bindings:
             self._update_references(t)
         if self._sample_runner is not None:
             self._sample_runner(t, meas)
@@ -999,7 +1147,7 @@ class ControlGraph:
                 finalize(t, meas, updated)
             return updated
         self.updated = updated = set()
-        due = self.due(t)
+        due = self._due(t)
         if not due:
             return updated
         samples, wiring = self._samples, self._wiring
@@ -1035,7 +1183,7 @@ class ControlGraph:
         """
         if self._pending:
             self._apply_pending()
-        if self.reference_bindings:
+        if self._bindings:
             self._update_references(t)
         named = derivatives is None
         if derivatives is None:
@@ -1687,6 +1835,7 @@ class VSCController(_GraphRuntime):
         names += (["id_ref_pu", "freq_dev", "angle_rel"] if self._is_gfl else
                   ["p_pu", "q_pu", "p_ref_pu", "v_ref_pu", "freq_dev", "angle_rel"])
         names += self.graph.observation_names
+        names += self.graph.probe_names
         return tuple(names)
 
     def mode_log_sources(self) -> Mapping[str, str]:
@@ -1763,6 +1912,8 @@ class VSCController(_GraphRuntime):
                    **self._raw_log(meas, frame)}
             log.update(self._mode_log(t, control_meas))
             log.update(graph.observations())
+            if graph.probe_names:
+                log.update(graph.probe_values(control_meas))
             self.last_log = log
         commands = ({port: self.graph.output(port, control_meas) for port in self._carried_outputs}
                     if self._carried_outputs else None)
@@ -1835,6 +1986,8 @@ class VSCController(_GraphRuntime):
                "in_service": 1.0 if self.startup.active else 0.0}
         log.update(self._mode_log(t, meas))
         log.update(self.graph.observations())
+        if self.graph.probe_names:
+            log.update(self.graph.probe_values(meas))
         self.last_log = log
         return log
 
@@ -2096,6 +2249,7 @@ class GraphController(_GraphRuntime):
             **{f"{name}.{port}": f"{name}.{port}"
                for name, node in self.graph.nodes.items() for port in node.log_outputs},
             **{name: name for name in self.graph.observation_names},
+            **{name: name for name in self.graph.probe_names},
         })
         self._logs_loop_outputs = any(
             source in self.graph.values for source in self._log_sources.values()
@@ -2198,6 +2352,8 @@ class GraphController(_GraphRuntime):
         if self._logs_loop_outputs:
             values.update(self.graph.values)
         values.update(self.graph.observations())
+        if self.graph.probe_names:
+            values.update(self.graph.probe_values(measurement))
         self.last_log = {name: values[source] for name, source in self._log_sources.items()}
         return self.last_log
 

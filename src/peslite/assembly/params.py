@@ -453,6 +453,8 @@ class ControlParams:
     _reference_bindings: dict[str, ReferenceBinding] = field(
         default_factory=dict, repr=False, metadata={"internal": True},
     )
+    _control_overlay: Any = field(default=None, repr=False, compare=False,
+                                  metadata={"internal": True})
 
 
 @dataclass(frozen=True)

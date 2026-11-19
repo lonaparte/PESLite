@@ -64,6 +64,7 @@ def main(directory: str = "dist") -> int:
             "peslite/addons/functions/thermal/__init__.py",
             "peslite/addons/functions/stability.py",
             "share/peslite/examples/gfl-example.pes",
+            "share/peslite/examples/debug/gfl-debug-example.pesdbg",
         ),
         "peslite-gui": (
             "peslite/gui/legacy_yaml.py",

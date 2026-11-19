@@ -517,7 +517,8 @@ class Renderer implements PESPreviewInstance {
       const a = this.anchor(from.point, sides[0], edge.fromPort, view);
       const b = this.anchor(to.point, sides[1], edge.toPort, view);
       const inactive = disconnected.has(edge.from) || disconnected.has(edge.to) || disconnected.has(edge.id);
-      const line = svg('path', { class: `pp-edge${inactive ? ' pp-edge-inactive' : ''}`,
+      const debug = edge.debug ? ` pp-edge-debug-${edge.debug}` : '';
+      const line = svg('path', { class: `pp-edge${inactive ? ' pp-edge-inactive' : ''}${debug}`,
         d: pathData(routeEdge(a, b)) });
       if (edge.directed && !inactive) line.setAttribute('marker-end', `url(#${this.markerId})`);
       if (this.options.onEdgeSelect) {

@@ -52,7 +52,8 @@
         "addons"
       ],
       "files": [
-        "examples/*.pes"
+        "examples/*.pes",
+        "examples/debug/*.pesdbg"
       ]
     },
     "peslite-gui": {

@@ -2016,7 +2016,7 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
     """Run a simulation file and save its states, summary and configured signals."""
     ap = _command_parser(
         prog=prog, description=_run_main.__doc__,
-        epilog="commands: run, create, validate, inspect, export; a simulation file without a command implies run",
+        epilog="commands: run, create, validate, inspect, export, debug; a simulation file without a command implies run",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_configuration_arguments(ap, optional=True)
@@ -2361,6 +2361,139 @@ def _export_main(argv=None) -> int | _CommandOutcome:
     return 0
 
 
+def _debug_main(argv=None) -> int | _CommandOutcome:
+    """Run a file-backed control-graph debug overlay and write structured evidence."""
+    try:
+        from ..addons.functions.debug import (
+            DebugPlan, debug_history, debug_root, execute_debug, parse_operation, read_debug_plan,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "peslite.addons.functions.debug":
+            raise ConfigError("the debug command requires the standard peslite installation") from None
+        raise
+
+    values = list(argv or ())
+    listing = bool(values and values[0] == "ls")
+    if listing:
+        values.pop(0)
+        ap = _command_parser(prog="peslite debug ls", description="List debug runs for a case.")
+        ap.add_argument("config", help="simulation file path or bundled example name")
+        ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
+        args = ap.parse_args(values)
+        try:
+            config = _config_path(args.config)
+        except FileNotFoundError as exc:
+            ap.error(str(exc))
+        runs = debug_history(config, _RESULTS)
+        records = [{"id": path.name, "directory": _absolute(path),
+                    "plan": _absolute(path / "debug.pesdbg"),
+                    "report": _absolute(path / "report.json")}
+                   for path in runs]
+        if args.json:
+            return _CommandOutcome(0, _payload("debug", config=config, runs=records))
+        if records:
+            print("\n".join(f"{item['id']}  {item['directory']}" for item in records))
+        else:
+            print(f"No debug runs for {config.stem}.")
+        return 0
+
+    ap = _command_parser(prog="peslite debug", description=_debug_main.__doc__)
+    _add_configuration_arguments(ap)
+    ap.add_argument("operations", nargs="*", metavar="OPERATION",
+                    help="quoted +/− connection or ~ parameter operation")
+    origin = ap.add_mutually_exclusive_group()
+    origin.add_argument("--plan", metavar="FILE", help="read this .pesdbg plan")
+    origin.add_argument("--from", dest="from_run", metavar="RUN",
+                        help="inherit one run ID or .pesdbg path")
+    origin.add_argument("--fresh", action="store_true", help="do not inherit the latest run")
+    ap.add_argument("--state-policy", choices=("continue", "freeze", "tracking"),
+                    help="state handling for bypassed loop producers")
+    ap.add_argument("--probe", action="append", default=[], metavar="NAME=PATH",
+                    help="observe a typed graph source or input; repeatable")
+    ap.add_argument("--analysis", action="append", default=[], metavar="NAME",
+                    help="add small_signal, or retain a named analysis configured in .pesdbg")
+    ap.add_argument("--timeout", type=float, default=None, metavar="SECONDS")
+    ap.add_argument("--max-rhs", type=int, default=None, metavar="COUNT")
+    ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
+    args = _parse_command_args(ap, values)
+    if args.timeout is not None and (not math.isfinite(args.timeout) or args.timeout <= 0.0):
+        ap.error("--timeout must be finite and positive")
+    if args.max_rhs is not None and args.max_rhs <= 0:
+        ap.error("--max-rhs must be positive")
+    try:
+        config, p, _model, interface_text = _load_command_params(args, {
+            "simulation.progress.enable": False,
+        })
+    except FileNotFoundError as exc:
+        ap.error(str(exc))
+    history = debug_history(config, _RESULTS)
+    plan_path = None
+    if args.plan:
+        plan_path = Path(args.plan)
+    elif args.from_run:
+        candidate = Path(args.from_run)
+        plan_path = (candidate if candidate.suffix == ".pesdbg"
+                     else debug_root(config, _RESULTS) / candidate / "debug.pesdbg")
+    elif not args.fresh and history:
+        plan_path = history[0] / "debug.pesdbg"
+    plan = read_debug_plan(plan_path) if plan_path is not None else DebugPlan()
+    if plan.model:
+        planned = Path(plan.model).expanduser()
+        if not planned.is_absolute() and plan_path is not None:
+            planned = plan_path.resolve().parent / planned
+        if planned.resolve() != config.resolve():
+            ap.error(f"debug plan model {plan.model!r} does not match {config}")
+    missing_analysis = [name for name in args.analysis
+                        if name != "small_signal" and name not in plan.analyses]
+    if missing_analysis:
+        ap.error(
+            "--analysis needs a configured .pesdbg entry except for small_signal: "
+            + ", ".join(missing_analysis)
+        )
+    operations = tuple(parse_operation(value, where="command line") for value in args.operations)
+    probes = {}
+    for written in args.probe:
+        alias, separator, path = written.partition("=")
+        if not separator or not alias or not path:
+            ap.error("--probe requires NAME=PATH")
+        probes[alias] = path
+    plan = plan.with_updates(model=str(config.resolve()), operations=operations,
+                             probes=probes, analyses=tuple(args.analysis))
+    if args.state_policy is not None:
+        plan = dataclasses.replace(plan, state_policy=args.state_policy)
+    directory = plan_path.resolve().parent if plan_path is not None else config.resolve().parent
+    try:
+        run_dir, report = execute_debug(
+            config, p, interface_text, plan, plan_directory=directory, output=_RESULTS,
+            timeout=args.timeout, max_rhs=args.max_rhs,
+        )
+    except ConfigError as exc:
+        if args.json:
+            raise _CommandFailure(2, "configuration_error", str(exc), config=config) from None
+        raise
+    except OSError as exc:
+        if args.json:
+            raise _CommandFailure(2, "input_error", str(exc), config=config) from None
+        raise
+    except (RuntimeError, FloatingPointError, ValueError) as exc:
+        if args.json:
+            raise _CommandFailure(4, "debug_error", str(exc), config=config) from None
+        raise
+    status = report["status"]
+    code = 0 if status == "passed" else 6 if status == "failed" else 4
+    if args.json:
+        return _CommandOutcome(code, _payload(
+            "debug", config=config, status="ok" if code == 0 else "error", code=code,
+            output={"directory": _absolute(run_dir),
+                    "summary": _absolute(run_dir / "report.json"),
+                    "files": [_absolute(run_dir / "debug.pesdbg"),
+                              _absolute(run_dir / "report.json")]},
+            debug={"status": status, "checks": report["checks"]},
+        ))
+    print(f"Debug {status}: {run_dir}")
+    return code
+
+
 def _warning_diagnostics(caught) -> list[dict[str, str]]:
     return [{
         "severity": "warning",
@@ -2412,9 +2545,9 @@ def _json_command(command: str, invoke: Callable[[], int | _CommandOutcome]) -> 
 
 
 def main(argv=None) -> int:
-    """Create, run, validate, inspect or export a PESLite simulation."""
+    """Create, run, validate, inspect, export or debug a PESLite simulation."""
     values = list(sys.argv[1:] if argv is None else argv)
-    commands = {"run", "create", "validate", "inspect", "export"}
+    commands = {"run", "create", "validate", "inspect", "export", "debug"}
     explicit_command = bool(values and values[0] in commands)
     command = values.pop(0) if explicit_command else "run"
     json_output = "--json" in values
@@ -2426,6 +2559,8 @@ def main(argv=None) -> int:
         invoke = lambda: _inspect_main(values)
     elif command == "create":
         invoke = lambda: _create_main(values)
+    elif command == "debug":
+        invoke = lambda: _debug_main(values)
     else:
         invoke = lambda: _export_main(values)
     if json_output:

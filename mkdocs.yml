@@ -19,6 +19,7 @@ nav:
   - Project Workspace: Project-Workspace.md
   - Simulation Files: Simulation-Files.md
   - Graphical Interface: Graphical-Interface.md
+  - Debugging: Debugging.md
   - Simulation:
       - Events Timeline: Events-Timeline.md
       - Solvers: Solvers.md

@@ -123,6 +123,35 @@ def test_native_preview_detection_does_not_depend_on_section_order(tmp_path):
     }
 
 
+def test_debug_plan_is_a_workspace_file_and_previews_its_model(tmp_path):
+    from shutil import copyfile
+    from conftest import EXAMPLES
+    from peslite.gui.host import Host
+
+    copyfile(EXAMPLES / "gfl-example.pes", tmp_path / "case.pes")
+    text = (
+        "model: case.pes\n\n@debug\n"
+        "- vsc.CurrentLoop.u_dq -> vsc.ThreePhaseModulation.u_dq\n"
+        "+ Test.out -> vsc.ThreePhaseModulation.u_dq\n\n"
+        "@sources\nTest: 0.1\n\n"
+        "@probe\neffective: vsc.ThreePhaseModulation.u_dq\n"
+    )
+    (tmp_path / "control.pesdbg").write_text(text, encoding="utf-8")
+    host = Host(tmp_path)
+    try:
+        assert "control.pesdbg" in {entry["name"] for entry in host.dispatch("tree", {})["files"]}
+        result = host.dispatch("debug.inspect", {"path": "control.pesdbg", "text": text})
+    finally:
+        host.close()
+
+    assert result["modelPath"] == "case.pes"
+    assert result["preview"]["format"] == "native"
+    assert [operation["kind"] for operation in result["operations"]] == [
+        "disconnect", "connect",
+    ]
+    assert result["watch"] == ["vsc.effective.re", "vsc.effective.im", "vsc.effective.abs"]
+
+
 def test_component_insertion_is_a_single_source_range_edit():
     text = ('# keep the model header\nbase: {s_base: 2e6}\n'
             'buses:\n  pcc:\n    c_pu: 0.02 # preserve\n'
