@@ -271,19 +271,36 @@ def _converter(u, base, where: str):
     topology_fields = getattr(topology, "config_fields", frozenset())
     unused = [
         item.name for item in fields(u.bridge)
-        if item.name not in {"model", "type", "on_resistance", "parallel_capacitance", *topology_fields}
+        if item.name not in {
+            "model", "type", "switch_resistance", "diode_resistance",
+            "parallel_capacitance", *topology_fields,
+        }
         and getattr(u.bridge, item.name) != item.default
     ]
     if unused:
         raise ConfigError(
             f"{where}.bridge: fields {unused} do not apply to {u.bridge.type!r}"
         )
-    for field in ("on_resistance", "parallel_capacitance"):
+    for field in ("switch_resistance", "diode_resistance", "parallel_capacitance"):
         value = getattr(u.bridge, field)
         if not math.isfinite(value) or value < 0.0:
             raise ConfigError(f"{where}.bridge.{field} must be finite and >= 0")
-    if u.bridge.parallel_capacitance > 0.0 and u.bridge.on_resistance == 0.0:
-        raise ConfigError(f"{where}.bridge.parallel_capacitance requires positive on_resistance")
+    if (u.bridge.model != "switching"
+            and u.bridge.switch_resistance != u.bridge.diode_resistance):
+        raise ConfigError(
+            f"{where}.bridge: unequal switch and diode resistance requires "
+            "bridge.model: switching"
+        )
+    if not topology.controlled and u.bridge.switch_resistance != 0.0:
+        raise ConfigError(
+            f"{where}.bridge.switch_resistance does not apply to a diode bridge"
+        )
+    if u.bridge.parallel_capacitance > 0.0 and (
+            u.bridge.diode_resistance == 0.0
+            or (topology.controlled and u.bridge.switch_resistance == 0.0)):
+        raise ConfigError(
+            f"{where}.bridge.parallel_capacitance requires positive conducting-device resistance"
+        )
     _dclink(u.dclink, f"{where}.dclink")
     continuous = u.ctrl is None or continuous_control(u)
     if u.ctrl is not None:

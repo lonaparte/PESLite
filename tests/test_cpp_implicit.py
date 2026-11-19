@@ -139,7 +139,8 @@ def test_native_adaptive_commutation_requires_a_finite_observation_step(tmp_path
 def test_native_fixed_explicit_reuses_the_stiff_mode_fallback(tmp_path):
     params = peslite.load(EXAMPLES / "boost-example.pes").replace(**{
         "units.converter.bridge.model": "switching",
-        "units.converter.bridge.on_resistance": 1e-6,
+        "units.converter.bridge.switch_resistance": 1e-6,
+        "units.converter.bridge.diode_resistance": 1e-6,
         "units.converter.ctrl": {
             "type": "open_loop",
             "period": 50e-6,

@@ -80,7 +80,8 @@ units:                     # converters, one entry each
     #   type: three_phase_bridge   # inferred from the unit/control; scalar: half_bridge | full_bridge
     #   upper_controlled: 1        # half bridge: device placement; full bridge: both 0 = diode
     #   lower_controlled: 1        # rectifier (no ctrl/pwm); half/full bridge only
-    #   on_resistance: 0           # conducting-device resistance [ohm]; positive for nonzero capacitance
+    #   switch_resistance: 0       # controlled-channel resistance [ohm]
+    #   diode_resistance: 0        # diode resistance [ohm]
     #   parallel_capacitance: 0    # capacitance across the power ports [F]
     #   reverse_port: 0            # half-bridge scalar-port orientation
     #   external_port: midpoint # half bridge: midpoint | lower_rail

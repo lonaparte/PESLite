@@ -1312,7 +1312,7 @@ class Circuit:
         self._direct_dynamic = dynamic
         self._direct_mode_key = (
             net._dynamic_structure_key(topology) if dynamic else
-            topology.mode.key[:2] if numeric or net._switches else None
+            topology.mode.structure_key if numeric or net._switches else None
         )
         self._numeric_stages = numeric
         self._stage_signature = signature
@@ -1633,7 +1633,7 @@ class Circuit:
         """Bind or regenerate the equations selected by the current structural mode."""
         def mode_key(selected: Topology):
             return (self.netlist._dynamic_structure_key(selected)
-                    if self._direct_dynamic else selected.mode.key[:2])
+                    if self._direct_dynamic else selected.mode.structure_key)
 
         if self._numeric_stages:
             selected = self.netlist.topology() if topology is None else topology
@@ -2714,7 +2714,8 @@ class _ModeDecomposition:
             field, index = self.variables[variable]
             values = closed if field == "closed" else conducting
             values[index] = not values[index]
-        return Mode(closed, conducting, self.reference.ratios if ratios is None else ratios)
+        return Mode(closed, conducting, self.reference.ratios if ratios is None else ratios,
+                    self.reference.gated)
 
     def topology(self, net: Netlist, changed: frozenset[int]) -> Topology:
         """Return the physically resolved topology for one selection of local families."""
@@ -2834,7 +2835,7 @@ def circuit_mode_key(circuits: Sequence[Circuit]):
     return tuple(
         (id(circuit.netlist), (
             circuit._bound_device_topology() or circuit.netlist.topology()
-        ).mode.key[:2])
+        ).mode.structure_key)
         for circuit in circuits
     )
 
@@ -3306,17 +3307,19 @@ def _mode_decomposition(
     if not variables:
         return None
     net = circuit.netlist
+    if net._gate_resistance_sensitive:
+        return None
     actual = tuple(
         np.asarray(ratio, dtype=float)
         for ratio in (net._ratio_override if net._ratio_override is not None
                       else tuple(transformer.ratio() for transformer in net._transformers))
     )
     ratio_key = tuple((ratio.shape, ratio.tobytes()) for ratio in actual)
-    key = variables, reference.closed, reference.conducting, ratio_key
+    key = variables, reference.structure_key, ratio_key
     cache = circuit._mode_decompositions
     if key in cache:
         return cache[key]
-    base = Mode(reference.closed, reference.conducting, actual)
+    base = Mode(reference.closed, reference.conducting, actual, reference.gated)
 
     def combinations(cluster: Sequence[int]):
         for bits in range(1, 1 << len(cluster)):

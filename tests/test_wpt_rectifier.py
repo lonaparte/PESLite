@@ -35,7 +35,7 @@ def _rectifier(v2, capacitance=0.0):
               "model": "switching"}
     if capacitance:
         bridge["parallel_capacitance"] = capacitance
-        bridge["on_resistance"] = 10.0
+        bridge["diode_resistance"] = 10.0
     return {"type": "dc_converter",
             "dclink": {"vdc_ref": v2, "source": {"type": "voltage", "v": v2}},
             "bridge": bridge}
@@ -141,7 +141,9 @@ def _compare(tree, reference, out_dir, capacitance=0.0):
     states, i_dc_ref, log = rectify(
         reference, lambda tt: V1 * math.sin(2 * math.pi * F * tt), tree["units"]["charger"][
             "secondary"]["dclink"]["source"]["v"], t_end, t, parallel_capacitance=capacitance,
-        on_resistance=tree["units"]["charger"]["secondary"]["bridge"].get("on_resistance", 0.0))
+        on_resistance=tree["units"]["charger"]["secondary"]["bridge"].get(
+            "diode_resistance", 0.0
+        ))
     offset = 2 * len(reference.front)
     coil_errors = []
     for j, column in enumerate(_coil_columns(tree["units"]["charger"]["link"])):

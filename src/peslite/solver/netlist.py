@@ -987,11 +987,12 @@ class Diode(Element):
     ``R_off`` (voltage nonpositive). ``conducting`` and ``residual`` are its discrete equation state.
 
     ``gate()``, if given, makes it a semiconductor device position (a controlled switch with this
-    antiparallel diode): while the gate is on it conducts in both directions with ``R_on`` and is not
-    commutated; when it turns off the diode takes over from its own (blocking) conduction state."""
+    antiparallel diode): while the gate is on it conducts in both directions with ``gated_R_on`` and
+    is not commutated; when it turns off the diode takes over with ``R_on``."""
 
     def __init__(self, a: Port, b: Port, R_on: float = 0.0, R_off: float = math.inf,
-                 name: str = "", gate: Optional[Callable[[], bool]] = None) -> None:
+                 name: str = "", gate: Optional[Callable[[], bool]] = None,
+                 *, gated_R_on: Optional[float] = None) -> None:
         if _port(a, b)[0] != 1:
             raise ValueError("a diode connects dimension-1 nodes")
         if not (0.0 <= R_on <= R_off) or R_on == math.inf:
@@ -999,6 +1000,11 @@ class Diode(Element):
         self.ports, self.name = ((a, b),), name
         self.R_on = self._coefficient("R_on", R_on)
         self.R_off = self._coefficient("R_off", R_off)
+        if gated_R_on is not None and not (0.0 <= gated_R_on <= R_off):
+            raise ValueError("gated device resistance must satisfy 0 <= gated_R_on <= R_off")
+        self.R_gated = self._coefficient(
+            "R_gated", R_on if gated_R_on is None else gated_R_on
+        )
         self.gate = gate
         self.conducting = False
         self.residual = 0.0
@@ -1008,13 +1014,18 @@ class Diode(Element):
 class Mode:
     """Switch positions, diode conduction and transformer ratios; ``key`` identifies the mode."""
 
-    __slots__ = ("closed", "conducting", "ratios", "key")
+    __slots__ = ("closed", "conducting", "ratios", "gated", "structure_key", "key")
 
     def __init__(self, closed: Sequence[bool], conducting: Sequence[bool],
-                 ratios: Sequence[NDArray[np.float64]]) -> None:
+                 ratios: Sequence[NDArray[np.float64]], gated: Sequence[bool] = ()) -> None:
         self.closed, self.conducting, self.ratios = tuple(closed), tuple(conducting), tuple(ratios)
-        self.key = (self.closed, self.conducting,
-                    b"".join(r.tobytes() for r in self.ratios) if self.ratios else b"")
+        self.gated = tuple(gated)
+        self.structure_key = (
+            (self.closed, self.conducting, self.gated)
+            if self.gated else (self.closed, self.conducting)
+        )
+        ratio_key = b"".join(r.tobytes() for r in self.ratios) if self.ratios else b""
+        self.key = (*self.structure_key, ratio_key)
 
 
 @dataclass(frozen=True)
@@ -2430,7 +2441,7 @@ class Topology:
         ratios = b"".join(
             ratio.tobytes() for ratio, used in zip(mode.ratios, relevant) if used
         )
-        return mode.closed, mode.conducting, ratios
+        return (*mode.structure_key, ratios)
 
     def selected_outputs(self, selected: Sequence[int]) -> NDArray[np.float64]:
         """Cached ratio-independent rows of the network output map."""
@@ -2528,6 +2539,8 @@ class Topology:
 def _roles(net: "Netlist", mode: Mode) -> tuple[list[Optional[str]], dict[int, NDArray[np.float64]]]:
     closed = {id(s): c for s, c in zip(net._switches, mode.closed)}
     conducting = {id(d): c for d, c in zip(net._diodes, mode.conducting)}
+    gated = ({id(d): mode.gated[index] for index, d in enumerate(net._diodes)}
+             if mode.gated else {})
     roles: list[Optional[str]] = []
     resistance: dict[int, NDArray[np.float64]] = {}
     for k, br in enumerate(net._branches):
@@ -2537,7 +2550,7 @@ def _roles(net: "Netlist", mode: Mode) -> tuple[list[Optional[str]], dict[int, N
             resistance[k] = el.R
         elif isinstance(el, (Switch, Diode)):
             on = closed[id(el)] if isinstance(el, Switch) else conducting[id(el)]
-            r = el.R_on if on else el.R_off
+            r = (el.R_gated if gated.get(id(el), False) else el.R_on) if on else el.R_off
             role = "short" if r == 0.0 else None if r == math.inf else "res"
             if role == "res":
                 resistance[k] = np.diag(np.asarray([r] * br.dim, dtype=object))
@@ -2748,6 +2761,7 @@ class Netlist:
         self._transformers: list[Transformer] = []
         self._gates: list[tuple[int, Callable[[], bool]]] = []  # (diode, gate) of device positions
         self._gated_state: tuple[bool, ...] = ()
+        self._gate_resistance_sensitive = False
         self.states = np.zeros(0, dtype=np.intp)
         self._ordered = True  # the states are y[0:n_x] in order
         self.n_e = self.n_bd = self.n_x = self.n_u = 0
@@ -2850,6 +2864,9 @@ class Netlist:
                 if el.gate is not None:
                     self._gates.append((len(self._diodes), el.gate))
                 self._diodes.append(el)
+                self._gate_resistance_sensitive |= (
+                    el.gate is not None and el.R_gated != el.R_on
+                )
                 self._diode_branches = None
                 self._diode_output_bases = None
             elif isinstance(el, Transformer):
@@ -2927,7 +2944,7 @@ class Netlist:
                 )):
             return ()
         topology = self.topology() if topology is None else topology
-        structure = topology.mode.key[:2]
+        structure = topology.mode.structure_key
         pending = tuple(
             (diode_index, diode)
             for diode_index, diode in enumerate(self._diodes)
@@ -2998,7 +3015,7 @@ class Netlist:
         if not groups:
             return (), None
         gated = self._gated_state or (False,) * len(self._diodes)
-        key = topology.mode.key[:2], gated, groups
+        key = topology.mode.structure_key, gated, groups
         if key in self._state_diode_guards:
             return groups, self._state_diode_guards[key]
 
@@ -3117,7 +3134,8 @@ class Netlist:
             conducting[index] = True
             try:
                 self._compiled(Mode(
-                    topology.mode.closed, conducting, topology.mode.ratios
+                    topology.mode.closed, conducting, topology.mode.ratios,
+                    topology.mode.gated,
                 ))
             except _Degenerate:
                 continue
@@ -3161,8 +3179,10 @@ class Netlist:
         if (last is not None and last.closed == closed and last.conducting == conducting
                 and len(last.ratios) == len(ratios)
                 and all(a is b or np.array_equal(a, b) for a, b in zip(last.ratios, ratios))):
-            return last
-        self._mode = Mode(closed, conducting, ratios)
+            if not self._gate_resistance_sensitive or last.gated == self._gated_state:
+                return last
+        electrical_gated = self._gated_state if self._gate_resistance_sensitive else ()
+        self._mode = Mode(closed, conducting, ratios, electrical_gated)
         return self._mode
 
     def _gated(self) -> list[bool]:
@@ -3231,7 +3251,7 @@ class Netlist:
                     raise
                 conducting = list(pattern)
                 conducting[selected] = not conducting[selected]
-                mode = Mode(mode.closed, conducting, mode.ratios)
+                mode = Mode(mode.closed, conducting, mode.ratios, mode.gated)
         raise ConductionError("no nonsingular diode conduction pattern exists")
 
     def freeze_topology(self) -> None:
@@ -3242,7 +3262,7 @@ class Netlist:
         """
         if self._frozen_mode is None:
             requested = self.mode()
-            if (requested.closed, requested.conducting) in self._structures:
+            if requested.structure_key in self._structures:
                 self._frozen_mode = requested
             else:
                 topology = self.topology()
@@ -3258,7 +3278,7 @@ class Netlist:
         mode = self._frozen_mode
         if mode is None or self._frozen_topology is not None:
             return None, None
-        base = self._structures.get((mode.closed, mode.conducting))
+        base = self._structures.get(mode.structure_key)
         return base, None if base is None else base.ratio_range_spectral_bound(mode.ratios)
 
     def spectral_bound(self) -> Optional[tuple[object, float]]:
@@ -3295,7 +3315,7 @@ class Netlist:
     def _compiled(self, mode: Mode) -> Topology:
         top = self._cache.get(mode.key)
         if top is None:
-            structure = mode.key[:2]
+            structure = mode.structure_key
             base = self._structures.get(structure)
             if base is None:
                 failure = self._invalid_structures.get(structure)
@@ -3723,7 +3743,7 @@ class Netlist:
                 )
                 present[pattern.slot_pos] = True
                 pattern._symbolic_sparsity = symbolic = np.packbits(present).tobytes()
-            key = top.mode.key[:2], symbolic
+            key = top.mode.structure_key, symbolic
             top._dynamic_structure_key = key
         return key
 
@@ -4066,7 +4086,7 @@ class Netlist:
             self.power(el, port)
             for el in selected
             for port, k in enumerate(self._ports[id(el)])
-            if roles[k] == "res"
+            if isinstance(el, (Switch, Diode)) or roles[k] == "res"
         ) + sum(
             float(el.value(self._last.t)) for el in selected if isinstance(el, Dissipation)
         )
@@ -4222,7 +4242,7 @@ class Netlist:
             self._scalar_port_power(out, element, port)
             for element in elements
             for port, branch in enumerate(self._ports[id(element)])
-            if roles[branch] == "res"
+            if isinstance(element, (Switch, Diode)) or roles[branch] == "res"
         ) + sum(
             element.value(t) for element in elements if isinstance(element, Dissipation)
         )
@@ -4476,7 +4496,7 @@ class Netlist:
     def scalar_margin_key(self, top: Topology) -> tuple:
         """Structural equation and gate state that select one diode guard."""
         gated = self._gated_state or (False,) * len(self._diodes)
-        return top.mode.key[:2], gated
+        return top.mode.structure_key, gated
 
     def scalar_margin_evaluator(self, top: Topology) -> Callable[[Sequence[float]], float]:
         """Compile the current mode's diode guard from an already evaluated output vector."""

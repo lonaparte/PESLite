@@ -101,6 +101,8 @@ Aliases such as `<unit>.i_c` and `<unit>.u_dc` may resolve to the underlying phy
 - switches are `0` or `1`;
 - a time or result that did not occur is `null`;
 - alarms, energy problems and port-Hamiltonian defaults are lists;
+- `initial_state_adjustments` lists explicit initial values changed by startup or physical
+  consistency handling;
 - solver counts and timing values are numeric;
 - per-unit quantities retain `_pu` in their names.
 

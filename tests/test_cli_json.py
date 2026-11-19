@@ -136,6 +136,28 @@ def test_expected_trip_is_a_successful_run_with_diagnostics(capsys, tmp_path):
     assert any(item["code"] == "unit_warning" for item in payload["diagnostics"])
 
 
+def test_adjusted_initial_state_uses_the_common_diagnostic_channel(capsys, tmp_path):
+    code, payload = _command(
+        capsys, "run", "boost-example", "--switching",
+        "--set", "simulation.initial.states.converter.branch_f.i=4.225",
+        "--set", "simulation.t_end=1e-5",
+        "--set", "simulation.solver.dt=5e-8",
+        "--set", "simulation.output.period=1e-6",
+        "--set", "simulation.output.signals=0",
+        "--out", str(tmp_path / "initial"),
+    )
+
+    assert code == 0
+    adjustments = payload["diagnostics"]
+    diagnostic = next(item for item in adjustments
+                      if item["code"] == "initial_state_adjustment")
+    assert "converter.branch_f.i" in diagnostic["message"]
+    summary = json.loads((tmp_path / "initial" / "summary.json").read_text(encoding="utf-8"))
+    assert summary["initial_state_adjustments"] == [{
+        "name": "converter.branch_f.i", "requested": 4.225, "actual": 0.0,
+    }]
+
+
 def test_json_configuration_error_has_a_stable_envelope(capsys):
     code, payload = _command(
         capsys, "validate", "gfl-example", "--set", "simulation.t_end=invalid",

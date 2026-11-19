@@ -315,7 +315,7 @@ def test_scc_and_phase_shift_reuse_the_capacitive_bridge_equations(tmp_path):
     tree["simulation"]["output"]["states"] = True
     for side in ("primary", "secondary"):
         tree["units"]["charger"][side]["bridge"].update(
-            parallel_capacitance=20e-9, on_resistance=1.0)
+            parallel_capacitance=20e-9, switch_resistance=1.0, diode_resistance=1.0)
     results = []
     for dt in (5e-9, 2.5e-9):
         tree["simulation"]["solver"]["dt"] = dt

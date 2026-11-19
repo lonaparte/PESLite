@@ -292,6 +292,10 @@ def _bindings(simulation, config, model, *, events=None):
               f"imperix.units.{name}")
         if cfg.pwm.sync != "asynchronous":
             raise ValueError(f"{name}: angle-locked simulation carriers have no hardware adapter")
+        if cfg.pwm.alignment != "center" and cfg.pwm.update == "double":
+            raise ValueError(
+                f"{name}: Imperix sawtooth carriers support only single-rate PWM updates"
+            )
         stride = unit.ctrl.graph.period_stride(configured.ctrl.period, period)
         if (configured.ctrl.period < period * (1.0 - 1e-6)
                 or abs(stride * period - configured.ctrl.period) > 1e-6 * configured.ctrl.period):
@@ -505,6 +509,11 @@ def _source(generators, adc, clocks, period, phase, runtime, *, sampling_period=
                     f"        {ready} = tick + static_cast<unsigned long long>(std::ceil(1.0 / ({frequency}) / {_number(period)})) + 1;",
                     "}"]
         mode = "PWMH_ACTIVE" if gen.topology.unilateral else "COMPLEMENTARY"
+        carrier = {
+            "center": "TRIANGLE",
+            "trailing": "SAWTOOTH",
+            "leading": "INVSAWTOOTH",
+        }[gen.cfg.pwm.alignment]
         duties, activate, deactivate_all = [], [], []
         carrier_phase = _number(gen.cfg.pwm.carrier_phase % 1.0)
         for index, output in enumerate(binding["pwm"]):
@@ -512,7 +521,7 @@ def _source(generators, adc, clocks, period, phase, runtime, *, sampling_period=
             devices.add(device)
             address = f"PWM_CHANNEL_{channel}, "
             init += [f"CbPwm_ConfigureClock({address}CLOCK_{binding['clock']}, {device});",
-                     f"CbPwm_ConfigureCarrier({address}TRIANGLE, {device});",
+                     f"CbPwm_ConfigureCarrier({address}{carrier}, {device});",
                      f"CbPwm_ConfigureUpdateRate({address}{gen.cfg.pwm.update.upper()}_RATE, {device});",
                      f"CbPwm_ConfigureOutputMode({address}{mode}, {device});",
                      *([f"CbPwm_ConfigureDeadTime({address}{_number(binding['dead_time'])}, {device});"]

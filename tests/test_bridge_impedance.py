@@ -15,7 +15,8 @@ from test_converter_stages import _bridge_configuration
 def _model(topology, mode="switching", *, capacitance=1e-4, resistance=0.5):
     cfg = _bridge_configuration(mode)
     cfg.bridge.parallel_capacitance = capacitance
-    cfg.bridge.on_resistance = resistance
+    cfg.bridge.switch_resistance = resistance
+    cfg.bridge.diode_resistance = resistance
     bridge = make_bridge(cfg, topology=topology)
     bridge.enabled = True
     bridge.dc_port.voltage = 48.0
@@ -182,7 +183,7 @@ def test_three_phase_device_equations_solve_the_dc_network_directly(mode, resist
     )
     model = Model(subsystems, connections, zoh)
     model.sync(0.0, model.get_initial_values())
-    expected = 48.0 / (1.0 + resistance * (2.0 / 3.0) / bridge.device_on_resistance)
+    expected = 48.0 / (1.0 + resistance * (2.0 / 3.0) / bridge.device_diode_resistance)
     assert link.output.u_dc == pytest.approx(expected, rel=1e-8)
     assert not model.algebraic_loops
 
@@ -223,7 +224,10 @@ def test_floating_three_phase_netlist_matches_an_independent_nodal_solution():
                         break
                     bridge.commutate(0.0)
                     state = model.get_initial_values()
-                device = currents(expected).reshape(3, 2).sum(axis=1) / bridge.device_on_resistance
+                device = (
+                    currents(expected).reshape(3, 2).sum(axis=1)
+                    / bridge.device_diode_resistance
+                )
                 expected_current = sum(
                     factor.conjugate() * current
                     for factor, current in zip(bridge.topology.voltage_factors, device)
@@ -244,5 +248,5 @@ def test_resistance_without_capacitance_uses_the_same_conduction_path(topology):
 
 @pytest.mark.parametrize("topology", [HalfBridge(), FullBridge(), ThreePhaseBridge()])
 def test_nonzero_capacitance_requires_explicit_positive_device_resistance(topology):
-    with pytest.raises(ConfigError, match="positive on_resistance"):
+    with pytest.raises(ConfigError, match="positive conducting-device resistance"):
         _model(topology, resistance=0.0)

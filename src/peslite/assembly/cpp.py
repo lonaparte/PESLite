@@ -3467,6 +3467,7 @@ class _ModelGenerator:
         try:
             resolved_topology = self._equation_topology(circuit, Mode(
                 topology.mode.closed, topology.mode.conducting, zero_ratios,
+                topology.mode.gated,
             ))
             return resolved_topology, tuple(ratios)
         except (_Degenerate, ValueError, np.linalg.LinAlgError):
@@ -3495,6 +3496,7 @@ class _ModelGenerator:
                 samples[transformer_index] = sample
             resolved_topology = self._equation_topology(circuit, Mode(
                 topology.mode.closed, topology.mode.conducting, tuple(samples),
+                topology.mode.gated,
             ))
             return resolved_topology, tuple(resolved)
 
@@ -3944,7 +3946,8 @@ class _ModelGenerator:
             encoded = sum(int(value) << index for index, value in enumerate(selected))
             if encoded in descriptor["modes"]:
                 continue
-            mode = Mode(mode_closed, mode_conducting, samples)
+            mode = Mode(mode_closed, mode_conducting, samples,
+                        mode_gated if net._gate_resistance_sensitive else ())
             control, terms = _TRACE_CONTROL.set(None), _SCALAR_TERMS.set(None)
             try:
                 topology = net.resolved_topology(mode, mode_gated)
@@ -4070,30 +4073,6 @@ class _ModelGenerator:
         return result
 
     @staticmethod
-    @contextmanager
-    def _effective_gate_topology(circuit: Any):
-        """Select controlled devices and their parallel diodes through one topology state."""
-        net = circuit.netlist
-        gates = net._gates
-        raw_conduction = tuple(
-            (index, net._diodes[index].conducting) for index, _gate in gates
-        )
-        gated_state = net._gated_state
-        try:
-            for index, gate in gates:
-                diode = net._diodes[index]
-                diode.conducting = _Expression.of(diode.conducting) | _Expression.of(gate())
-            net._gates = []
-            net._mode = None
-            yield
-        finally:
-            net._gates = gates
-            net._gated_state = gated_state
-            net._mode = None
-            for index, conducting in raw_conduction:
-                net._diodes[index].conducting = conducting
-
-    @staticmethod
     def _equation_topology(circuit, mode):
         if mode.key not in circuit._cpp_topologies:
             matrices = {}
@@ -4132,6 +4111,8 @@ class _ModelGenerator:
     def _runtime_mode_decomposition(self, circuit: Any):
         """Return exact local families for all run-time structural mode variables."""
         net = circuit.netlist
+        if net._gate_resistance_sensitive:
+            return None
         variables: list[tuple[str, int]] = []
         flags: list[_Expression] = []
         closed: list[bool] = []
@@ -4359,8 +4340,7 @@ class _ModelGenerator:
             if values is None:
                 values = self._trace_switched_netlist(circuit, t, states, True)
             if values is None:
-                with self._effective_gate_topology(circuit):
-                    values = self._trace_dynamic_netlist(circuit, t, states)
+                values = self._trace_dynamic_netlist(circuit, t, states)
             case_derivatives, case_outputs = values
             derivatives = [total + weight * value
                            for total, value in zip(derivatives, case_derivatives)]
@@ -4421,8 +4401,7 @@ class _ModelGenerator:
             derivatives = circuit.scalar_derivatives(t, states)
             all_outputs = circuit.scalar_outputs(t, states)
         else:
-            with self._effective_gate_topology(circuit):
-                derivatives, all_outputs = self._trace_dynamic_netlist(circuit, t, states)
+            derivatives, all_outputs = self._trace_dynamic_netlist(circuit, t, states)
         return derivatives, all_outputs
 
     def _trace_circuit_solve(self, circuit: Any, t: Any):
@@ -4511,7 +4490,9 @@ class _ModelGenerator:
                 details = _SCALAR_TERMS.get()[3].get(("mixture", id(circuit)))
                 if details is None:
                     power = (circuit.netlist.scalar_power(outputs, elements) if supplied else
-                             self._mode_dissipated_power(circuit, outputs, elements))
+                             circuit.netlist.scalar_dissipated_power(
+                                 outputs, elements, t=_Expression("t", "real")
+                             ))
                 else:
                     power = _Expression("0.0", "real")
                     selectors = tuple(select for _cases, select in circuit._mixtures)
@@ -4520,8 +4501,8 @@ class _ModelGenerator:
                             for case, select in zip(cases, selectors):
                                 select(case)
                             value = (circuit.netlist.scalar_power(case_outputs, elements)
-                                     if supplied else self._mode_dissipated_power(
-                                         circuit, case_outputs, elements
+                                     if supplied else circuit.netlist.scalar_dissipated_power(
+                                         case_outputs, elements, t=_Expression("t", "real")
                                      ))
                             power = power + weight * value
                     finally:
@@ -4530,66 +4511,6 @@ class _ModelGenerator:
                 return -power if supplied else power
 
         return self._trace(run).code
-
-    def _mode_dissipated_power(self, circuit: Any, outputs: Sequence[Any],
-                               elements: Sequence[Any]) -> Any:
-        """Select mode-dependent resistive roles within their verified local clusters."""
-        net = circuit.netlist
-        selected = self._runtime_mode_decomposition(circuit)
-        if selected is None:
-            return net.scalar_dissipated_power(
-                outputs, elements, t=_Expression("t", "real")
-            )
-        decomposition, flags = selected
-        base = decomposition.topologies[0]
-        roles = {
-            changed: decomposition.topology(net, changed).roles
-            for changed in decomposition.modes
-        }
-        owner_of = {
-            variable: number
-            for number, cluster in enumerate(decomposition.clusters)
-            for variable in cluster
-        }
-
-        def select(owners: Sequence[int], value: Callable[[frozenset[int]], Any]) -> Any:
-            variables = tuple(variable for owner in owners
-                              for variable in decomposition.clusters[owner])
-            def build(position: int, changed: frozenset[int]) -> Any:
-                if position == len(variables):
-                    return value(changed)
-                variable = variables[position]
-                return self._merge_trace(
-                    flags[variable],
-                    build(position + 1, changed | {variable}),
-                    build(position + 1, changed),
-                )
-            return build(0, frozenset())
-
-        power: Any = 0.0
-        for element in elements:
-            if isinstance(element, Dissipation):
-                power += element.value(_Expression("t", "real"))
-                continue
-            for port, branch in enumerate(net._ports[id(element)]):
-                owners = sorted({
-                    owner_of[next(iter(changed))]
-                    for changed, mode_roles in roles.items()
-                    if changed and mode_roles[branch] != base.roles[branch]
-                })
-                loss = net._scalar_port_power(outputs, element, port)
-                if not owners:
-                    if base.roles[branch] == "res":
-                        power += loss
-                    continue
-                power += select(
-                    owners,
-                    lambda changed, branch=branch, loss=loss: (
-                        loss if decomposition.topology(net, changed).roles[branch] == "res"
-                        else _Expression.of(0.0)
-                    ),
-                )
-        return power
 
     def trace_netlist_outputs(self, owner: Any, method: Any, circuit: Any,
                               fields: tuple[str, ...]) -> list[str]:
@@ -6009,14 +5930,9 @@ class _CarrierModulatorGenerator:
             encoded = "q"
             extra = f", std::vector<std::pair<double, {q_kind}>>& edges_out"
             index_reset, finish = "", ""
-        result = f'''void {method}_{generator.tag}(double t, double span, double frequency,
-        double phase, {q_kind}& held{extra}) {{
-    if (!(frequency > 0.0)) throw std::runtime_error("PWM frequency is not positive");
-    {switches}.clear();
-    {index_reset}
-    std::array<double, {generator.bridge.modulation_width}> modulation{{}};
-    std::array<double, {generator.bridge.modulation_width}> q{{}};
-    for (int k = 0; k < {generator.bridge.modulation_width}; ++k)
+        alignment = generator.bridge.modulator.alignment
+        if alignment == "center":
+            geometry = f'''    for (int k = 0; k < {generator.bridge.modulation_width}; ++k)
         modulation[k] = std::clamp(2.0 * {generator.m('active')}[k] - 1.0, -1.0, 1.0);
     double position = carrier_position(t, frequency, phase);
     const double carrier0 = carrier_value(position);
@@ -6039,7 +5955,46 @@ class _CarrierModulatorGenerator:
         }}
         covered += length;
     }}
-    std::sort(edges.begin(), edges.end());
+'''
+        else:
+            trailing = alignment == "trailing"
+            gate = ("position < duty" if trailing else "position >= 1.0 - duty")
+            transitions = (
+                "{{cycle, 1.0}, {cycle + duty, 0.0}}" if trailing else
+                "{{cycle + 1.0 - duty, 1.0}, {cycle + 1.0, 0.0}}"
+            )
+            geometry = f'''    for (int k = 0; k < {generator.bridge.modulation_width}; ++k)
+        modulation[k] = std::clamp({generator.m('active')}[k], 0.0, 1.0);
+    const double position = carrier_position(t, frequency, phase);
+    for (int k = 0; k < {generator.bridge.modulation_width}; ++k) {{
+        const double duty = modulation[k];
+        q[k] = duty > 0.0 && {gate};
+    }}
+    held = {encoded};
+    std::vector<std::tuple<double, int, double>> edges;
+    const auto first = static_cast<long long>(std::floor(t * frequency + phase));
+    const auto last = static_cast<long long>(std::ceil((t + span) * frequency + phase));
+    for (auto cycle = first; cycle <= last; ++cycle) {{
+        for (int k = 0; k < {generator.bridge.modulation_width}; ++k) {{
+            const double duty = modulation[k];
+            if (duty <= 0.0 || duty >= 1.0) continue;
+            const double changes[2][2] = {transitions};
+            for (const auto& change : changes) {{
+                const double at = (change[0] - phase) / frequency - t;
+                if (at > 0.0 && at < span)
+                    edges.emplace_back(at, k, change[1]);
+            }}
+        }}
+    }}
+'''
+        result = f'''void {method}_{generator.tag}(double t, double span, double frequency,
+        double phase, {q_kind}& held{extra}) {{
+    if (!(frequency > 0.0)) throw std::runtime_error("PWM frequency is not positive");
+    {switches}.clear();
+    {index_reset}
+    std::array<double, {generator.bridge.modulation_width}> modulation{{}};
+    std::array<double, {generator.bridge.modulation_width}> q{{}};
+{geometry}    std::sort(edges.begin(), edges.end());
     double previous = 0.0;
     for (const auto& edge : edges) {{
         const double at = std::get<0>(edge);

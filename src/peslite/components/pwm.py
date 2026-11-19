@@ -18,6 +18,9 @@ from ..control.profiles import PHASE_SHIFT_MODES, control_type
 from ..solver.model import ConfigError, _integer, _real
 from ..solver.timing import TIME_EPS, PeriodicClock
 
+PWM_ALIGNMENTS = ("center", "trailing", "leading")
+DEFAULT_PWM_ALIGNMENT = "center"
+
 __all__ = ["PWM", "PhaseClock", "PulseSequence", "SwitchingSequence",
            "Modulator", "CarrierComparison",
            "SynchronousCarrier", "ZOH", "PhaseShiftModulator",
@@ -756,10 +759,11 @@ class CarrierComparison(Modulator):
     """
 
     supported_models = frozenset(("switching",))
+    config_fields = frozenset(("carrier_phase", "sync", "alignment"))
 
     @classmethod
     def from_config(cls, pwm, f0, references, carried):
-        result = cls(pwm.f_sw, pwm.carrier_phase)
+        result = cls(pwm.f_sw, pwm.carrier_phase, alignment=pwm.alignment)
         result.carried = carried
         return result
 
@@ -767,10 +771,14 @@ class CarrierComparison(Modulator):
         return PhaseClock(0.0, 2.0 * math.pi * self.phase, 2.0 * math.pi * self.f_sw)
 
 
-    def __init__(self, f_sw: float, phase: float = 0.0, min_interval: float = 1e-12) -> None:
+    def __init__(self, f_sw: float, phase: float = 0.0, min_interval: float = 1e-12,
+                 *, alignment: str = DEFAULT_PWM_ALIGNMENT) -> None:
+        if alignment not in PWM_ALIGNMENTS:
+            raise ValueError("carrier alignment must be center, trailing or leading")
         self.f_sw = _real(f_sw)
         self.phase = _real(phase)
         self.min_interval = min_interval
+        self.alignment = alignment
 
     @staticmethod
     def state_fractions(duties):
@@ -786,6 +794,9 @@ class CarrierComparison(Modulator):
 
     def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence:
+        if self.alignment != "center":
+            duties = np.clip(np.asarray(d_abc, dtype=float), 0.0, 1.0).tolist()
+            return self._edge_sequence(t, T_s, duties)
         m = np.clip(2.0 * np.asarray(d_abc, dtype=float) - 1.0, -1.0, 1.0).tolist()
         width = len(m)
         # initial switching state at t
@@ -805,6 +816,35 @@ class CarrierComparison(Modulator):
         events.sort(key=lambda e: e[0])
         return _switching_sequence(T_s, self.min_interval, q, events)
 
+    def _edge_sequence(self, t: float, span: float, duties) -> SwitchingSequence:
+        """Locate sawtooth PWM edges over one register interval."""
+        frequency, phase = self.f_sw, self.phase
+        position = carrier_position(t, frequency, phase)
+        trailing = self.alignment == "trailing"
+        word = [
+            1.0 if duty > 0.0 and (
+                position < duty if trailing else position >= 1.0 - duty
+            ) else 0.0
+            for duty in duties
+        ]
+        first = math.floor(t * frequency + phase)
+        last = math.ceil((t + span) * frequency + phase)
+        changes = []
+        for cycle in range(first, last + 1):
+            for index, duty in enumerate(duties):
+                if not 0.0 < duty < 1.0:
+                    continue
+                transitions = (
+                    ((cycle, 1.0), (cycle + duty, 0.0)) if trailing else
+                    ((cycle + 1.0 - duty, 1.0), (cycle + 1.0, 0.0))
+                )
+                for edge, value in transitions:
+                    offset = (edge - phase) / frequency - t
+                    if 0.0 < offset < span:
+                        changes.append((offset, (index,), (value,)))
+        changes.sort(key=lambda event: event[0])
+        return _switching_sequence(span, self.min_interval, word, changes)
+
 
 class SynchronousCarrier(Modulator):
     """Carrier comparison with the carrier locked to the controller angle.
@@ -814,10 +854,11 @@ class SynchronousCarrier(Modulator):
     """
 
     supported_models = frozenset(("switching",))
+    config_fields = frozenset(("carrier_phase", "sync", "alignment"))
 
     @classmethod
     def from_config(cls, pwm, f0, references, carried):
-        result = cls(round(pwm.f_sw / f0), pwm.carrier_phase)
+        result = cls(round(pwm.f_sw / f0), pwm.carrier_phase, alignment=pwm.alignment)
         result.carried = carried
         return result
 
@@ -835,10 +876,14 @@ class SynchronousCarrier(Modulator):
                 self.pulse_ratio * omega)
         return PhaseClock(t, angle, rate)
 
-    def __init__(self, pulse_ratio: int, phase: float = 0.0, min_interval: float = 1e-12) -> None:
+    def __init__(self, pulse_ratio: int, phase: float = 0.0, min_interval: float = 1e-12,
+                 *, alignment: str = DEFAULT_PWM_ALIGNMENT) -> None:
+        if alignment not in PWM_ALIGNMENTS:
+            raise ValueError("carrier alignment must be center, trailing or leading")
         self.pulse_ratio = _integer(pulse_ratio)
         self.phase = _real(phase)
         self.min_interval = min_interval
+        self.alignment = alignment
         self._angle = self._frequency = 0.0
         self._time = None
         self._restored = set()
@@ -853,8 +898,10 @@ class SynchronousCarrier(Modulator):
         self._frequency, self._time = frequency, t
         self._restored.clear()
         position = self._angle / (2.0 * math.pi)
-        return CarrierComparison(frequency, position - t * frequency, self.min_interval)(
-            t, T_s, d_abc)
+        return CarrierComparison(
+            frequency, position - t * frequency, self.min_interval,
+            alignment=self.alignment,
+        )(t, T_s, d_abc)
 
     def get_state(self):
         return {"angle": float(self._angle), "frequency": float(self._frequency)}

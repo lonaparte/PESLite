@@ -959,8 +959,8 @@ class Simulation:
         """Return the state-table column names after ``t``, i.e. the valid ``initial.states`` keys."""
         return list(self._states.columns)
 
-    def _initial_values(self, t0: float) -> dict:
-        """Resolve explicit initial states and automatic bus presets without loading them."""
+    def _resolved_initial(self, t0: float) -> tuple[dict[str, Any], tuple[str, ...]]:
+        """Resolve initial states and return the canonical names explicitly requested."""
         system = self.system
         aliases = dict(getattr(system, "state_aliases", {}))
         presets_of = getattr(system, "state_presets", None)
@@ -968,6 +968,10 @@ class Simulation:
         template = self._states.read()
         try:
             given = expand_aliases(self.p.simulation.initial.states, aliases)
+            explicit = tuple(dict.fromkeys(
+                name if name in template else name.rpartition(".")[0]
+                for name in given
+            ))
             if callable(presets):
                 for bus in getattr(system, "buses", {}):
                     key = f"{bus}.u_C"
@@ -983,12 +987,17 @@ class Simulation:
             if aliases:
                 msg += f". Aliases: {', '.join(f'{a} -> {c}' for a, c in aliases.items())}"
             raise ConfigError(msg) from None
-        return values
+        return values, explicit
+
+    def _initial_values(self, t0: float) -> dict:
+        """Resolve explicit initial states and automatic bus presets without loading them."""
+        return self._resolved_initial(t0)[0]
 
     def _apply_initial(self, t0: float) -> np.ndarray:
         """Load ``initial.states`` into the parts; return the solver vector."""
         system = self.system
-        values = self._initial_values(t0)
+        values, explicit = self._resolved_initial(t0)
+        self._initial_requested = {name: values[name] for name in explicit}
         # 1. power stage (unset states stay zero), events up to t0, then the solver vector
         timing = {prefix for name, unit in system.units.items()
                   for prefix in (f"{name}.ctrl", f"{name}.{unit.bridge.state_prefix}", f"{name}.meas")}
@@ -1343,6 +1352,23 @@ class Simulation:
 
         # ---------------------------------------------------------------- the event grid
         self._begin_event_owners(t_start, plant)
+        initial_state_adjustments = []
+        if self._initial_requested:
+            actual = self._states.read()
+            for name, requested in self._initial_requested.items():
+                started = actual[name]
+                if isinstance(requested, bool):
+                    changed = started != requested
+                else:
+                    changed = abs(started - requested) > 1e-10 * max(
+                        1.0, abs(requested), abs(started)
+                    )
+                if changed:
+                    initial_state_adjustments.append({
+                        "name": name,
+                        "requested": _json_safe(requested),
+                        "actual": _json_safe(started),
+                    })
         plant.settle = settle_now
         if progress_bar is not None:
             # Controller observations become valid at their first scheduled event. The 0% bar
@@ -1473,6 +1499,8 @@ class Simulation:
         if stop_reason and termination == "completed":
             termination = "stopped"
         summary["status"] = termination
+        if initial_state_adjustments:
+            summary["initial_state_adjustments"] = initial_state_adjustments
         if stop_reason:
             summary["stop_reason"] = stop_reason
         if self.ph_report is not None:
@@ -1873,6 +1901,14 @@ def _json_safe(value):
 
 def _summary_diagnostics(p: Params, summary: Mapping[str, Any]) -> list[dict[str, str]]:
     diagnostics = []
+    diagnostics.extend({
+        "severity": "warning",
+        "code": "initial_state_adjustment",
+        "message": (
+            f"initial state {item['name']!r} requested {item['requested']!r} "
+            f"but started at {item['actual']!r}"
+        ),
+    } for item in summary.get("initial_state_adjustments", ()))
     for unit_name, _cfg in _unit_items(p.units):
         trip_cause = summary.get(f"{unit_name}.trip_cause")
         alarms = summary.get(f"{unit_name}.alarms") or []

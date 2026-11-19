@@ -462,7 +462,8 @@ def test_switching_boost_uses_the_existing_implicit_solver_for_its_stiff_startup
     for circuit_model in ("device", "statewise", "nodal"):
         params = base.replace(**{
             "units.converter.bridge.model": "switching",
-            "units.converter.bridge.on_resistance": 1e-6,
+            "units.converter.bridge.switch_resistance": 1e-6,
+            "units.converter.bridge.diode_resistance": 1e-6,
             "units.converter.ctrl": {
                 "type": "open_loop",
                 "period": 50e-6,

@@ -366,8 +366,7 @@ class Unit(ABC):
     def states_loaded(self) -> None:
         """Apply restored lifecycle and bridge state to the physical port."""
         self.breaker = self._initially_connected and not self.tripped
-        current = self.branch_f.state.i if self.branch_f is not None else None
-        self._restore_bridge_state(current)
+        self._restore_bridge_state()
 
     def begin(self, t: float, plant: Plant, continued: bool, window_given: bool) -> None:
         """Track the initial plant state and restore bridge and ADC timing."""
@@ -562,7 +561,7 @@ class Unit(ABC):
         self._set_gates(False)
         self.dclink.open_breaker()
 
-    def _restore_bridge_state(self, given_current: complex | float | None) -> None:
+    def _restore_bridge_state(self) -> None:
         """Reconcile restored trip, controller and bridge state through one lifecycle path."""
         if self.tripped:
             self._controller_command(False, 0.0, 0.0, reset=False)
@@ -571,12 +570,6 @@ class Unit(ABC):
                 (self.ctrl is None or self.ctrl.startup.active) and self.breaker and not self.tripped
             )
         self._set_gates(self.bridge.on)
-        if given_current is not None and self.blocked and given_current != 0:
-            warnings.warn(
-                f"simulation.initial.states: unit {self.name!r} starts with its PWM blocked, "
-                f"so {self.name}.branch_f.i starts at zero, not at the value given",
-                stacklevel=5,
-            )
 
     def _start_continuous_bridge(self, t: float) -> None:
         """Apply continuous startup state to the common bridge/gate boundary."""
@@ -887,7 +880,7 @@ class DCConverter(Unit):
             self.conduction = _parameterized(lambda c: HalfBridgeDiodeConduction(
                 c.pwm.switching_period,
                 c.filter.l_f,
-                c.filter.r_f + c.bridge.on_resistance,
+                c.filter.r_f + c.bridge.diode_resistance,
                 topology,
             ), cfg)
             self.conduction.local_step_state = self.branch_f

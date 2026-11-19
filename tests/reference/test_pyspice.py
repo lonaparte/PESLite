@@ -106,8 +106,11 @@ class DCCase:
             "switching_frequency": (
                 "units.converter.pwm.f_sw", "Bgate frequency", self.switching_frequency,
             ),
-            "on_resistance": (
-                "units.converter.bridge.on_resistance", "SwitchModel.ron", self.on_resistance,
+            "switch_resistance": (
+                "units.converter.bridge.switch_resistance", "SwitchModel.ron", self.on_resistance,
+            ),
+            "diode_resistance": (
+                "units.converter.bridge.diode_resistance", "SwitchModel.ron", self.on_resistance,
             ),
             "upper_controlled": (
                 "units.converter.bridge.upper_controlled",
@@ -134,7 +137,8 @@ class DCCase:
             "model": "switching",
             "upper_controlled": self.upper_controlled,
             "lower_controlled": self.lower_controlled,
-            "on_resistance": self.on_resistance,
+            "switch_resistance": self.on_resistance,
+            "diode_resistance": self.on_resistance,
         }
         buses = {}
         elements = {}

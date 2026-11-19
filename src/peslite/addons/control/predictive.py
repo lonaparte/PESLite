@@ -531,7 +531,7 @@ class PredictiveCurrentControl(_PredictiveCurrentControl):
         return self._rl_plant(
             unit,
             unit.filter.l_f,
-            unit.filter.r_f + bridge.on_resistance,
+            unit.filter.r_f + bridge.switch_resistance,
             np.ones((1, 1)),
             blocked_min=0.0,
         )
@@ -587,7 +587,7 @@ class ThreePhasePredictiveCurrentControl(_PredictiveCurrentControl):
         plant = self._rl_plant(
             unit,
             unit.ac_filter.l_f,
-            unit.ac_filter.r_f + unit.bridge.on_resistance,
+            unit.ac_filter.r_f + unit.bridge.switch_resistance,
             np.array([
                 [value.real for value in vectors],
                 [value.imag for value in vectors],

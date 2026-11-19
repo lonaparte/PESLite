@@ -186,7 +186,9 @@ class _BridgeModel(NetworkComponent):
     set_dc_current = set_ac_voltage = NetworkComponent.set_outputs
 
     def __init__(self, topology=None, *, parallel_capacitance: float = 0.0,
-                 on_resistance: float = 0.0, switching: bool = False) -> None:
+                 switch_resistance: float = 0.0,
+                 diode_resistance: float = 0.0,
+                 switching: bool = False) -> None:
         self.topology = topology if topology is not None else ThreePhaseBridge()
         self.state = Empty()
         zero = self.topology.zero
@@ -215,17 +217,27 @@ class _BridgeModel(NetworkComponent):
         initialize = getattr(self.topology, "initialize_model", None)
         if initialize is not None:
             initialize(self, parallel_capacitance)
-        if (not math.isfinite(parallel_capacitance) or parallel_capacitance < 0.0
-                or not math.isfinite(on_resistance) or on_resistance < 0.0):
-            raise ConfigError("bridge capacitance and on_resistance must be finite and >= 0")
+        values = (parallel_capacitance, switch_resistance, diode_resistance)
+        if any(not math.isfinite(value) or value < 0.0 for value in values):
+            raise ConfigError("bridge capacitance and device resistance must be finite and >= 0")
         self.parallel_capacitance = _real(parallel_capacitance)
-        self.device_on_resistance = _real(on_resistance)
+        self.device_switch_resistance = _real(switch_resistance)
+        self.device_diode_resistance = _real(diode_resistance)
+        self._device_resistance_sensitive = (
+            self.topology.controlled
+            and self.device_switch_resistance != self.device_diode_resistance
+        )
         if parallel_capacitance > 0.0:
-            if on_resistance <= 0.0:
-                raise ConfigError("bridge.parallel_capacitance requires positive on_resistance")
-            self._capacitive_devices(parallel_capacitance, on_resistance, switching)
-        elif on_resistance > 0.0:
-            self.resistance = self.topology.series_devices * _real(on_resistance)
+            if (self.device_diode_resistance <= 0.0
+                    or (self.topology.controlled and self.device_switch_resistance <= 0.0)):
+                raise ConfigError(
+                    "bridge.parallel_capacitance requires positive conducting-device resistance"
+                )
+            self._capacitive_devices(parallel_capacitance, switching)
+        elif self._device_resistance_sensitive:
+            self.dirac = False
+        elif self.device_diode_resistance > 0.0:
+            self.resistance = self.topology.series_devices * self.device_diode_resistance
             self.dirac = False
             self.output_stages = tuple(
                 replace(stage, inputs=tuple(dict.fromkeys((*stage.inputs, "i_c"))))
@@ -276,7 +288,8 @@ class _BridgeModel(NetworkComponent):
                 self, "i_device", nb.node(self.power_port), exclude=(capacitor,)
             )
             return None
-        if not topology.controlled or not (topology.upper_controlled and topology.lower_controlled):
+        if (self._device_resistance_sensitive or not topology.controlled
+                or not (topology.upper_controlled and topology.lower_controlled)):
             return self._netlist_legs(nb)
 
         three_phase = isinstance(topology.zero, complex)
@@ -297,7 +310,8 @@ class _BridgeModel(NetworkComponent):
         from ..solver import netlist as nl
 
         topology = self.topology
-        on = self.device_on_resistance
+        diode_resistance = self.device_diode_resistance
+        switch_resistance = self.device_switch_resistance
         gate = self._leg_gates if self.state_names else _LegGates(self)
         upper = topology.upper_controlled and topology.controlled
         lower = topology.lower_controlled and topology.controlled
@@ -308,14 +322,16 @@ class _BridgeModel(NetworkComponent):
                 nl.Diode(
                     midpoint,
                     high,
-                    on,
+                    diode_resistance,
                     gate=(lambda: self.enabled and gate(index)) if upper else None,
+                    gated_R_on=switch_resistance if upper else None,
                 ),
                 nl.Diode(
                     low,
                     midpoint,
-                    on,
+                    diode_resistance,
                     gate=(lambda: self.enabled and not gate(index)) if lower else None,
+                    gated_R_on=switch_resistance if lower else None,
                 ),
             )
             nb.add(*pair)
@@ -417,7 +433,7 @@ class _BridgeModel(NetworkComponent):
                 ))
         return tuple(events)
 
-    def _capacitive_devices(self, capacitance, resistance, switching) -> None:
+    def _capacitive_devices(self, capacitance, switching) -> None:
         """Compose finite device conductances with the existing capacitor and algebraic solver."""
         self._switching_poles = switching
         self._leg_gates = _LegGates(self)
@@ -543,11 +559,15 @@ class _SampledModel(_BridgeModel, PWM):
                  pattern_sync: str = "interval",
                  dead_time: float = 0.0,
                  dead_time_compensation: bool = False,
-                 parallel_capacitance: float = 0.0, on_resistance: float = 0.0) -> None:
+                 parallel_capacitance: float = 0.0,
+                 switch_resistance: float = 0.0,
+                 diode_resistance: float = 0.0) -> None:
         self.pulse_update = None
         self.has_switching_events = not isinstance(modulator, ZOH)
         _BridgeModel.__init__(self, topology, parallel_capacitance=parallel_capacitance,
-                              on_resistance=on_resistance, switching=self.has_switching_events)
+                              switch_resistance=switch_resistance,
+                              diode_resistance=diode_resistance,
+                              switching=self.has_switching_events)
         ratio_bounds = getattr(topology, "ratio_bounds", None)
         self.ratio_bounds = None if ratio_bounds is None else ratio_bounds()
         registers = getattr(modulator, "registers", None)
@@ -682,7 +702,8 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None, *,
     topology = topology if topology is not None else make_topology(cfg.bridge)
     pwm = cfg.pwm
     impedance = {"parallel_capacitance": cfg.bridge.parallel_capacitance,
-                 "on_resistance": cfg.bridge.on_resistance}
+                 "switch_resistance": cfg.bridge.switch_resistance,
+                 "diode_resistance": cfg.bridge.diode_resistance}
     if not topology.controlled:
         if modulator is not None:
             raise ValueError("a diode full-bridge rectifier does not use a PWM modulator")
@@ -702,8 +723,7 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None, *,
             modulator if modulator is not None else make_unit_modulator(cfg),
             topology,
             pattern_sync="interval",
-            parallel_capacitance=cfg.bridge.parallel_capacitance,
-            on_resistance=cfg.bridge.on_resistance,
+            **impedance,
         )
     model_type = SwitchingModel if cfg.bridge.model == "switching" else PWMAveragingModel
     control_offset = control_clock_offset(cfg.ctrl, pwm)

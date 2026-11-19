@@ -28,6 +28,7 @@ from types import UnionType
 from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
 
 from ..components.network import ELEMENT_TYPES, element_buses
+from ..components.pwm import DEFAULT_PWM_ALIGNMENT, PWM_ALIGNMENTS
 from ..control.controller import continuous_control
 from ..control.loops import LOOP_TYPES, loop_key_type, loop_type
 from ..control.profiles import ReferenceParams, control_type
@@ -374,6 +375,8 @@ class PWMParams:
     ``pattern_sync``: ``"interval"`` applies newly loaded waveform commands
     at the load; ``"pulse"`` lets a pulse in progress finish and starts the new
     pattern at its next pulse.
+    ``alignment`` selects a centered triangular carrier or a trailing/leading-edge
+    sawtooth carrier without changing the compare-register load clock.
     ``dead_time`` delays complementary-device turn-on; ``dead_time_compensation`` adds
     current-polarity duty-ratio feedforward before the physical dead time.
     """
@@ -382,6 +385,7 @@ class PWMParams:
     modulation_limit: float = 1.0
     update: str = "single"  # "single" | "double"
     carrier_phase: float = field(default=0.0, metadata={"modulator": True})
+    alignment: str = field(default=DEFAULT_PWM_ALIGNMENT, metadata={"modulator": True})
     method: str = "spwm"  # "spwm" | "svpwm"
     sync: str = field(default="asynchronous", metadata={"modulator": True})
     pattern_sync: str = "interval"
@@ -389,7 +393,8 @@ class PWMParams:
     dead_time_compensation: bool = False
 
     _choices = {"update": ("single", "double"), "method": ("spwm", "svpwm"),
-                "sync": ("asynchronous", "synchronous"), "pattern_sync": ("interval", "pulse")}
+                "sync": ("asynchronous", "synchronous"), "pattern_sync": ("interval", "pulse"),
+                "alignment": PWM_ALIGNMENTS}
 
     @property
     def switching_period(self) -> float:
@@ -530,7 +535,8 @@ class BridgeParams:
     lower_controlled: bool = True
     reverse_port: bool = False
     external_port: str = "midpoint"
-    on_resistance: float = 0.0  # ohm, per conducting switch or diode
+    switch_resistance: float = 0.0  # ohm, per conducting controlled channel
+    diode_resistance: float = 0.0  # ohm, per conducting diode
     parallel_capacitance: float = 0.0  # F, across the power port (per phase for three phases)
 
     _choices = {

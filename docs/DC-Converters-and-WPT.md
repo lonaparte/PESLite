@@ -88,7 +88,7 @@ bridge: {type: full_bridge, upper_controlled: 0, lower_controlled: 0}
 
 Omit `ctrl`, `pwm` and protection. Set `meas.period` explicitly when the default output period is
 unsuitable. All bridge-model selections retain the natural diode commutation law. Nonzero
-`parallel_capacitance` requires positive `on_resistance`.
+`parallel_capacitance` requires positive resistance for every applicable conducting path.
 
 ## Phase-shift modulation
 
