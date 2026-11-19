@@ -51,5 +51,6 @@ markers = [
     "serial: resource-intensive tests that require a non-parallel pytest run",
     "motulator: cross-checks PESLite against the pinned motulator reference simulator",
     "pyspice: optional DC-converter and WPT cross-checks against PySpice and ngspice",
+    "openpels: cross-checks against pinned native-ngspice cases from OpenPELS",
     "onnx: optional black-box compatibility tests against ONNX Runtime",
 ]

@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 import peslite
+from reference_metrics import check_comparison
 from peslite.assembly.params import from_dict
 
 pytest.importorskip(
@@ -490,24 +491,7 @@ def _errors(actual_t, pairs, reference_t):
 
 
 def _check_errors(errors, limit, timings, record_property):
-    for signal, values in errors.items():
-        record_property(f"{signal}_mean_normalized_difference", values["mean"])
-        record_property(f"{signal}_maximum_normalized_difference", values["maximum"])
-    mean = float(np.mean([values["mean"] for values in errors.values()]))
-    maximum = max(values["maximum"] for values in errors.values())
-    record_property("mean_normalized_difference", mean)
-    record_property("maximum_normalized_difference", maximum)
-    record_property("peslite_simulation_seconds", timings["peslite"])
-    record_property("motulator_simulation_seconds", timings["motulator"])
-    record_property(
-        "simulation_time_difference_seconds",
-        timings["peslite"] - timings["motulator"],
-    )
-    record_property(
-        "peslite_to_motulator_simulation_time_ratio",
-        timings["peslite"] / timings["motulator"],
-    )
-    assert maximum <= limit, errors
+    check_comparison(errors, limit, timings, "motulator", record_property)
 
 
 def compare_single(case: ControlCase, out_dir):

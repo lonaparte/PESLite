@@ -261,12 +261,14 @@ class FixedStepSolver:
             tuple, tuple[tuple[int, ...], ...] | None
         ] = OrderedDict()
         self._block_eigenvalues: OrderedDict[tuple, NDArray[np.complex128]] = OrderedDict()
+        self._stable_bound_key: tuple[object, object, float] | None = None
         self.n_rhs = 0
 
     def parameters_changed(self) -> None:
         """Discard the lazy stiff-mode factors after a parameter event."""
         self._stability_results.clear()
         self._mode_eigenvalues.clear()
+        self._stable_bound_key = None
         if self._implicit is not None:
             self._implicit.parameters_changed()
 
@@ -368,11 +370,20 @@ class FixedStepSolver:
         check = getattr(self.model, "solver_check", None)
         if check is None:
             return False
+        bound_key = (
+            self.model.plan_revision,
+            self.model.equation_revision,
+            step,
+        ) if (hasattr(self.model, "plan_revision")
+              and hasattr(self.model, "equation_revision")) else None
+        if bound_key is not None and self._stable_bound_key == bound_key:
+            return False
         radius = _STABILITY_HALF_DISK.get(self.method, 0.0)
         bounds = check.spectral_bounds()
         if bounds and radius and all(
             bound is not None and step * bound.maximum <= radius for bound in bounds
         ):
+            self._stable_bound_key = bound_key
             return False
         modes = check.exact_modes()
         if not bounds:

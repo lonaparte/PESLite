@@ -24,28 +24,13 @@ import numpy as np
 
 from ..solver.energy import Port, StoragePort
 from ..solver.model import Bag, Empty, LocatedZero, OutputMethod, _real, commutation_tolerance
-from .network import NetworkComponent
+from .network import NetworkComponent, inductance_modes, two_winding_modes
 from .pwm import PhaseClock
 
 __all__ = ["CompensatedLink", "SwitchedCompensatedLink", "SwitchControlledCapacitor",
            "make_wpt_link"]
 
 SIDES = ("primary", "secondary")
-
-
-def _two_coil_modes(primary: float, secondary: float, mutual: float):
-    """Closed-form orthogonal diagonalization of a two-winding inductance matrix."""
-    angle = 0.5 * np.arctan2(2.0 * mutual, primary - secondary)
-    cosine, sine = np.cos(angle), np.sin(angle)
-    mean = 0.5 * (primary + secondary)
-    radius = np.sqrt((0.5 * (primary - secondary)) ** 2 + mutual ** 2)
-    first_sign = np.where(abs(sine) >= abs(cosine), np.where(sine > 0.0, -1.0, 1.0), 1.0)
-    second_sign = np.where(abs(sine) > abs(cosine), np.where(sine < 0.0, -1.0, 1.0), 1.0)
-    inductance = (_real(mean - radius), _real(mean + radius))
-    # rows: coils (primary, secondary); columns: modes
-    shapes = ((_real(-sine * first_sign), _real(cosine * second_sign)),
-              (_real(cosine * first_sign), _real(sine * second_sign)))
-    return inductance, shapes
 
 
 class _Side:
@@ -77,11 +62,10 @@ class CompensatedLink(NetworkComponent):
         self.coil_sides = tuple(coil_sides)
         self.sides = sides
         if n == 2:
-            self._inductance, shapes = _two_coil_modes(
+            self._inductance, shapes = two_winding_modes(
                 inductance[0][0], inductance[1][1], inductance[0][1])
         else:
-            matrix = np.asarray(inductance, dtype=float)
-            values, vectors = np.linalg.eigh(0.5 * (matrix + matrix.T))
+            _matrix, values, vectors = inductance_modes(inductance, n)
             self._inductance = tuple(float(v) for v in values)
             shapes = tuple(tuple(float(vectors[j, m]) for m in range(n)) for j in range(n))
         self._shapes = shapes                      # coil current j = sum_m shapes[j][m] mode_m

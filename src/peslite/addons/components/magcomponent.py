@@ -11,8 +11,8 @@ from typing import Any, ClassVar, Mapping
 
 import numpy as np
 
-from ...components.network import (GROUND, Element, NetworkComponent, register_component_type,
-                                   resolve_endpoints)
+from ...components.network import (GROUND, Element, LinearEnergyLaw, NetworkComponent,
+                                   inductance_modes, register_component_type, resolve_endpoints)
 from ...solver import Bag, ConfigError, OutputMethod, Port, StoragePort
 
 __all__ = [
@@ -323,24 +323,6 @@ class MagneticParams:
         return _winding_buses(self.windings)
 
 
-def _inductance_decomposition(
-    inductance: Any, count: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    try:
-        matrix = np.asarray(inductance, dtype=float)
-    except (TypeError, ValueError):
-        raise ConfigError("inductance must be a numeric square matrix") from None
-    if matrix.shape != (count, count) or not np.isfinite(matrix).all():
-        raise ConfigError(f"inductance must be a finite {count} x {count} matrix")
-    if not np.allclose(matrix, matrix.T, rtol=1e-12, atol=0.0):
-        raise ConfigError("inductance must be symmetric")
-    modes, shapes = np.linalg.eigh(matrix)
-    if modes.min() <= 0.0:
-        raise ConfigError("inductance must be positive definite")
-    matrix.setflags(write=False)
-    return matrix, modes, shapes
-
-
 class MagComponent(NetworkComponent):
     """Common magnetic component contract and cross-domain coupling signals."""
 
@@ -418,11 +400,11 @@ class CoupledCoilsModel(MagComponent):
         names = _validate_winding_names(winding_names)
         if len(resistance) != len(names) or len(terminals) != len(names):
             raise ConfigError("every winding must define resistance and terminals")
-        matrix, modes, shapes = _inductance_decomposition(inductance, len(names))
+        self.law = LinearEnergyLaw(names, inductance)
 
         self.names = names
-        self.inductance = matrix
-        self._shapes = shapes
+        self.inductance = self.law.inductance
+        self._shapes = self.law.shapes
         self.state_names = tuple(f"i_mode_{index + 1}" for index in range(len(names)))
         self.state = type("_MagneticState", (Bag,), {"__slots__": self.state_names})(
             **dict.fromkeys(self.state_names, 0.0)
@@ -445,7 +427,7 @@ class CoupledCoilsModel(MagComponent):
             ),
         )
         self.storage = tuple(StoragePort(name, float(mode), kind="inductor")
-                             for name, mode in zip(self.state_names, modes))
+                             for name, mode in zip(self.state_names, self.law.modes))
 
         ground = Port(self, GROUND, grounded=True) if any(any(pair) for pair in terminals) else None
         ports = []
@@ -609,7 +591,7 @@ class CoupledCoils(_MagneticElement):
 
         def __post_init__(self) -> None:
             super().__post_init__()
-            matrix, _modes, _shapes = _inductance_decomposition(
+            matrix, _modes, _shapes = inductance_modes(
                 self.inductance, len(self.windings)
             )
             object.__setattr__(self, "inductance", matrix.tolist())

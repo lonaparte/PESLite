@@ -18,6 +18,7 @@ import io
 import json
 import keyword
 import math
+import subprocess
 import sys
 import sysconfig
 import time
@@ -1308,6 +1309,16 @@ class Simulation:
             accepted_history if accepted_history.signals else None,
         )
         phs_check_step = p.simulation.solver.phs_check_step
+        limit_observers = tuple(
+            (unit_name, observe_limits)
+            for unit_name, ctrl in continuous_controls
+            if (observe_limits := getattr(ctrl, "observe_limits", None)) is not None
+        )
+        periodic_output = bool(
+            output.states or output.signals or output.energy
+            or (observe is not None and observe_output)
+            or energy_on or limit_observers
+        )
         snapshot_index = 0
         continuous_record_index = 0
         worst = {"tellegen": 0.0, "balance": 0.0}
@@ -1328,7 +1339,6 @@ class Simulation:
             available = True
             try:
                 with np.errstate(over="raise"):
-                    sync_if_needed(t_now)
                     state = self._states.read() if notifying else None
                     states = (flatten(state) if state is not None else self._states.read_flat()
                               if rec.keep_states or final else None)
@@ -1343,6 +1353,7 @@ class Simulation:
 
             @_SnapshotRead
             def read_logs():
+                sync_if_needed(t_now)
                 for unit_name, ctrl in continuous_controls:
                     rec.ctrl_sample(unit_name, t_now, lambda ctrl=ctrl: ctrl.continuous_log(t_now),
                                     record=record and continuous_record_index % record_every == 0)
@@ -1350,6 +1361,7 @@ class Simulation:
 
             @_SnapshotRead
             def read_signals():
+                sync_if_needed(t_now)
                 return getattr(system, "signals", lambda _t: {})(t_now)
 
             @_SnapshotRead
@@ -1362,6 +1374,7 @@ class Simulation:
                                              ctrl_names=ctrl_names)
 
             def record_energy():
+                sync_if_needed(t_now)
                 rep = energy_balance(t_now, plant.state)
                 if rec.keep_energy:
                     rec.energy_row(t_now, rep.columns())
@@ -1370,11 +1383,13 @@ class Simulation:
                 worst["balance"] = max(worst["balance"], rep.max_residual / scale)
 
             if record and available:
-                for unit_name, ctrl in continuous_controls:
-                    observe_limits = getattr(ctrl, "observe_limits", None)
-                    if observe_limits is not None:
-                        _optional_output(t_now, f"controller limits {unit_name!r}", observe_limits, t_now)
-                read_logs()
+                if limit_observers:
+                    sync_if_needed(t_now)
+                    for unit_name, observe_limits in limit_observers:
+                        _optional_output(t_now, f"controller limits {unit_name!r}",
+                                         observe_limits, t_now)
+                if continuous_controls:
+                    read_logs()
                 if rec.keep_signals:
                     _optional_output(t_now, "plant signals",
                                      lambda: rec.plant_snapshot(t_now, read_signals()))
@@ -1501,6 +1516,21 @@ class Simulation:
                         "actual": _json_safe(started),
                     })
         plant.settle = settle_now
+        boundary: tuple[float, float] | None = None
+
+        def next_model_boundary() -> tuple[float, float]:
+            """Return the next circuit and model boundaries until either is consumed."""
+            nonlocal boundary
+            if boundary is None:
+                circuit_stop = actions[0][0] if actions else math.inf
+                for next_time in circuit_clocks:
+                    circuit_stop = min(circuit_stop, next_time())
+                physical_stop = circuit_stop
+                for unit in clocked_units:
+                    physical_stop = min(physical_stop, unit.next_time())
+                boundary = circuit_stop, physical_stop
+            return boundary
+
         if progress_bar is not None:
             # Controller observations become valid at their first scheduled event. The 0% bar
             # therefore reports progress only instead of manufacturing pre-sample watch values.
@@ -1518,13 +1548,8 @@ class Simulation:
                     stopped = True
                     break
             plant.inputs_changed = False
-            t_log = n_log * log_period
-            circuit_stop = actions[0][0] if actions else math.inf
-            for next_time in circuit_clocks:
-                circuit_stop = min(circuit_stop, next_time())
-            physical_stop = circuit_stop
-            for unit in clocked_units:
-                physical_stop = min(physical_stop, unit.next_time())
+            t_log = n_log * log_period if periodic_output else math.inf
+            circuit_stop, physical_stop = next_model_boundary()
             t_stop = min(t_final, t_log, physical_stop)
             native_stop = t_stop
             if observations and observations[0] < t_stop - TIME_EPS:
@@ -1546,6 +1571,7 @@ class Simulation:
                 continue
             protection_changed = False
             if physical_stop <= t_stop + TIME_EPS:  # otherwise only the output snapshot is due
+                boundary = None
                 # A window integrates where the circuit changes or where its own unit samples;
                 # trips and other plant changes integrate through settle_now.
                 circuit = circuit_stop <= t_stop + TIME_EPS
@@ -2485,12 +2511,16 @@ def _export_main(argv=None) -> int | _CommandOutcome:
     ap.add_argument("parameters", nargs="*", metavar="PARAM",
                     help="variable parameter path, common or all")
     ap.add_argument("--out", default=None, help="export directory")
+    ap.add_argument("--run", action="store_true",
+                    help="compile and run the exported C++ simulator")
     ap.add_argument("--imperix", action="store_true", help="export an Imperix ELF")
     ap.add_argument("--imperix-config", metavar="FILE", help="ADC/PWM bindings; default: PESFILE.imperix.json")
     ap.add_argument("--imperix-sdk", metavar="DIRECTORY", help="installed official Imperix SDK")
     ap.add_argument("--imperix-source-only", action="store_true", help="generate sources without building an ELF")
     ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
     args = _parse_command_args(ap, argv)
+    if args.imperix and args.run:
+        ap.error("--run is available only for C++ export")
     if not args.imperix and (args.imperix_config or args.imperix_sdk or args.imperix_source_only):
         ap.error("Imperix options require --imperix")
     try:
@@ -2515,17 +2545,62 @@ def _export_main(argv=None) -> int | _CommandOutcome:
     diagnostics = [{"severity": item.get("severity", "warning"),
                     "code": item.get("code", "export_warning"), "message": item["message"]}
                    for item in result.diagnostics]
+    run = None
+    run_code, run_error = 0, None
+    if args.run:
+        from ..assembly.cpp import compile_source
+
+        run_out = _RESULTS / f"{config.stem}{suffix}"
+        try:
+            build = compile_source(result.files[0])
+            completed = subprocess.run(
+                [str(build.executable), str(run_out)], check=False
+            )
+            if completed.returncode:
+                raise RuntimeError(
+                    f"exported simulator exited with code {completed.returncode}"
+                )
+            summary_path = run_out / "summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+            if args.json:
+                raise _CommandFailure(4, "export_run_error", str(exc), config=config) from None
+            ap.error(str(exc))
+        run_code, error_code = _run_exit(summary)
+        diagnostics.extend(_summary_diagnostics(p, summary))
+        run_error = (None if run_code == 0 else
+                     {"code": error_code, "message": summary.get("stop_reason"), "path": None})
+        run = {
+            "directory": _absolute(run_out),
+            "summary": _absolute(summary_path),
+            "files": [_absolute(path) for path in sorted(run_out.iterdir()) if path.is_file()],
+            "build_cache_hit": build.cache_hit,
+        }
     if args.json:
         output = {"directory": _absolute(out), "summary": None,
                   "files": [_absolute(path) for path in result.files]}
-        return _CommandOutcome(0, _payload(
-            "export", config=config, output=output, diagnostics=diagnostics,
-            export={"format": export_format},
+        simulation = (None if run is None else {
+            "status": summary.get("status", "completed"),
+            "t_start": summary.get("t_start"),
+            "t_end": p.simulation.t_end,
+            "t_stop": summary.get("t_stop"),
+            "wall_time": summary.get("wall_time"),
+            "rhs_evaluations": summary.get("n_rhs"),
+            "tripped": bool(summary.get("tripped")),
+        })
+        return _CommandOutcome(run_code, _payload(
+            "export", config=config, status="ok" if run_code == 0 else "error",
+            code=run_code, output=output, simulation=simulation,
+            diagnostics=diagnostics, error=run_error,
+            export={"format": export_format, "run": run},
         ))
     for diagnostic in diagnostics:
         print("warning:", diagnostic["message"], file=sys.stderr)
     print("wrote", ", ".join(str(path) for path in result.files))
-    return 0
+    if run is not None:
+        source = "cached" if build.cache_hit else "compiled"
+        print(f"ran {source} simulator; output: {run_out}")
+    return run_code
 
 
 def _debug_main(argv=None) -> int | _CommandOutcome:

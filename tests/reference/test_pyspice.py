@@ -18,6 +18,7 @@ import pytest
 
 import peslite
 from peslite.assembly.params import from_dict
+from reference_metrics import check_comparison, normalized_errors
 
 
 pytest.importorskip("PySpice", reason="install the PySpice reference dependency")
@@ -534,18 +535,6 @@ def _interpolate(t, values, at):
     return np.interp(at, t, values)
 
 
-def _normalized_errors(actual, expected):
-    errors = {}
-    for name, values in actual.items():
-        scale = max(1.0, float(np.max(np.abs(expected[name]))))
-        difference = np.abs(values - expected[name]) / scale
-        errors[name] = {
-            "mean": float(np.mean(difference)),
-            "maximum": float(np.max(difference)),
-        }
-    return errors
-
-
 def compare_dc(case: DCCase, out_dir):
     """Measure direct differences between equivalent PESLite and PySpice models."""
     peslite_simulation = peslite.Simulation(case.peslite_params())
@@ -579,7 +568,7 @@ def compare_dc(case: DCCase, out_dir):
         name: _interpolate(reference_t, values, peslite_time)
         for name, values in pyspice.items()
     }
-    errors = _normalized_errors(actual, paired)
+    errors = normalized_errors(actual, paired)
     settled = peslite_time >= case.duration - case.period
     actual_current = actual["inductor_current"][settled]
     pyspice_current = paired["inductor_current"][settled]
@@ -633,29 +622,12 @@ def compare_wpt(case: WPTCase, out_dir):
         name: _interpolate(reference_t, values, actual_t)
         for name, values in pyspice.items()
     }
-    errors = _normalized_errors(actual, paired)
+    errors = normalized_errors(actual, paired)
     return errors, {"peslite": peslite_seconds, "pyspice": pyspice_seconds}
 
 
 def _check_errors(errors, limit, timings, record_property):
-    for signal, values in errors.items():
-        record_property(f"{signal}_mean_normalized_difference", values["mean"])
-        record_property(f"{signal}_maximum_normalized_difference", values["maximum"])
-    mean = float(np.mean([values["mean"] for values in errors.values()]))
-    maximum = max(values["maximum"] for values in errors.values())
-    record_property("mean_normalized_difference", mean)
-    record_property("maximum_normalized_difference", maximum)
-    record_property("peslite_simulation_seconds", timings["peslite"])
-    record_property("pyspice_simulation_seconds", timings["pyspice"])
-    record_property(
-        "simulation_time_difference_seconds",
-        timings["peslite"] - timings["pyspice"],
-    )
-    record_property(
-        "peslite_to_pyspice_simulation_time_ratio",
-        timings["peslite"] / timings["pyspice"],
-    )
-    assert maximum <= limit, errors
+    check_comparison(errors, limit, timings, "pyspice", record_property)
 
 
 @pytest.mark.parametrize("case", DC_CASES, ids=lambda case: case.name)

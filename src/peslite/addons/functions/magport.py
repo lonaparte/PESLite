@@ -38,7 +38,10 @@ def _write(file: str | Path, data: _MagPortData) -> Path:
         entries["inductance"] = data.inductance
     else:
         entries["flux_linkage"] = data.flux_linkage
-        entries["current"] = data.current
+        if data.stored_energy is not None:
+            entries["stored_energy"] = data.stored_energy
+        else:
+            entries["current"] = data.current
     if data.magnetic is not None:
         entries["magnetic"] = np.asarray(json.dumps(
             asdict(data.magnetic), allow_nan=False, sort_keys=True, separators=(",", ":")
@@ -66,6 +69,7 @@ def write_magport(
     inductance: Any | None = None,
     flux_linkage: Any | None = None,
     current: Any | None = None,
+    stored_energy: Any | None = None,
     physical: Mapping[str, Any] | None = None,
     magnetic: MagneticDescription | Mapping[str, Any] | None = None,
     field_points: Any | None = None,
@@ -73,8 +77,15 @@ def write_magport(
 ) -> Path:
     """Write a linear or sampled nonlinear constitutive law in the magport format."""
     return _write(file, _data(
-        winding_names, inductance, flux_linkage, current,
-        physical, magnetic, field_points, field_basis,
+        winding_names,
+        inductance=inductance,
+        flux_linkage=flux_linkage,
+        current=current,
+        stored_energy=stored_energy,
+        physical=physical,
+        magnetic=magnetic,
+        field_points=field_points,
+        field_basis=field_basis,
     ))
 
 

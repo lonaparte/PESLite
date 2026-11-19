@@ -72,7 +72,7 @@ jobs:
 
 
   reference-test:
-    name: Compare with motulator
+    name: Compare with external simulators
     runs-on: ubuntu-24.04
 
     steps:
@@ -88,15 +88,28 @@ jobs:
 
       - name: Install reference dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install --yes ngspice
           python -m pip install --upgrade pip
           python -m pip install -e ".[test]"
           python -m pip install "motulator==0.21.0"
+
+      - name: Checkout pinned OpenPELS sources
+        uses: actions/checkout@v6
+        with:
+          repository: IEEE-PELS/OpenPELS
+          ref: afc618f1d803c57baf1b9f75876a5267743692ab
+          path: external/OpenPELS
+          persist-credentials: false
 
       - name: Run reference comparisons
         run: >-
           python -m pytest -x --run-long
           tests/reference/test_motulator.py
           tests/reference/test_motulator_dead_time.py
+          tests/reference/test_openpels.py
+        env:
+          OPENPELS_ROOT: ${{ github.workspace }}/external/OpenPELS
 
 
   onnx-test:

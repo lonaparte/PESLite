@@ -135,8 +135,8 @@ simulation.
 
 ### `magport` files
 
-A `magport` file may contain either a constant inductance matrix or a sampled nonlinear
-flux-linkage-to-current map:
+A `magport` file may contain a constant inductance matrix, a sampled current map or a sampled
+magnetic-energy potential:
 
 ```yaml
 elements:
@@ -155,13 +155,14 @@ Relative paths start beside the simulation file. Winding names and their order m
 | `winding_names` | yes | ordered winding names |
 | `inductance` | one law | self- and mutual-inductance matrix in H |
 | `flux_linkage` and `current` | one law | sampled nonlinear map shaped `(samples, windings)` |
+| `flux_linkage` and `stored_energy` | one law | conservative energy map on a complete Cartesian flux grid |
 | `physical` | no | JSON-compatible source metadata |
 | `magnetic` | no | physical branches, continuity nodes and winding coupling |
 | `field_points` and `field_basis` | no | spatial coordinates and a linear current-to-field map |
 
-Exactly one constitutive law is stored. For several windings, nonlinear interpolation is defined
-only inside the convex hull of the sampled flux-linkage vectors, so the samples must cover the
-complete operating range.
+Exactly one constitutive law is stored. A multiwinding current map is a general constitutive map
+without automatic stored-energy accounting. A stored-energy map derives all winding currents from
+one scalar potential. Sampled maps must cover the complete operating range.
 
 Create a `magport` file with `write_magport`:
 
@@ -179,9 +180,10 @@ write_magport(
 )
 ```
 
-Replace `inductance=` with matching `flux_linkage=` and `current=` arrays for a sampled nonlinear
-law. The optional `magnetic` value records the same branch, node and winding-coupling structure used
-by `magcircuit`, but does not replace the stored constitutive law.
+Replace `inductance=` with matching `flux_linkage=` and `current=` arrays for a general nonlinear
+law, or with `flux_linkage=` and `stored_energy=` for a conservative law. The optional `magnetic`
+value records the same branch, node and winding-coupling structure used by `magcircuit`, but does
+not replace the stored constitutive law.
 
 ### Field reconstruction
 

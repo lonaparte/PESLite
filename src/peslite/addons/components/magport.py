@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 from dataclasses import dataclass, field
@@ -15,17 +16,17 @@ from .magcomponent import (
     MagneticDescription,
     MagneticParams,
     _MagneticElement,
-    _inductance_decomposition,
     _magnetic_description,
     _validate_winding_names,
 )
-from ...components.network import register_component_type
+from ...components.network import inductance_modes, register_component_type
 from ...solver import Bag, ConfigError, OutputMethod, Port, directional_derivative
 
 __all__ = [
     "MagneticLaw",
     "MagPort",
     "MagPortModel",
+    "TabulatedEnergyLaw",
     "TabulatedMagneticLaw",
 ]
 
@@ -34,10 +35,11 @@ _FORMAT = "peslite-magport"
 _VERSION = 2
 _REQUIRED = frozenset({"format", "version", "winding_names"})
 _LINEAR = frozenset({"inductance"})
-_NONLINEAR = frozenset({"flux_linkage", "current"})
+_CURRENT_MAP = frozenset({"flux_linkage", "current"})
+_ENERGY_MAP = frozenset({"flux_linkage", "stored_energy"})
 _OPTIONAL = frozenset({
     "physical", "magnetic", "field_points", "field_basis"
-}) | _LINEAR | _NONLINEAR
+}) | _LINEAR | _CURRENT_MAP | _ENERGY_MAP
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,7 @@ class _MagPortData:
     inductance: np.ndarray | None
     flux_linkage: np.ndarray | None
     current: np.ndarray | None
+    stored_energy: np.ndarray | None
     physical: dict[str, Any]
     magnetic: MagneticDescription | None
     field_points: np.ndarray | None
@@ -86,11 +89,53 @@ def _current_map(
     return flux, currents
 
 
+def _energy_map(
+    winding_names: Sequence[str], flux_linkage: Any, stored_energy: Any
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate samples of one scalar magnetic-energy potential on a Cartesian grid."""
+    count = len(tuple(winding_names))
+    try:
+        flux = np.asarray(flux_linkage, dtype=float)
+        energy = np.asarray(stored_energy, dtype=float)
+    except (TypeError, ValueError):
+        raise ConfigError("flux_linkage and stored_energy samples must be numeric") from None
+    if count == 1 and flux.ndim == 1:
+        flux = flux[:, None]
+    if flux.ndim != 2 or flux.shape[1] != count:
+        raise ConfigError(f"flux_linkage samples must have shape (samples, {count})")
+    if energy.shape != (len(flux),):
+        raise ConfigError(f"stored_energy samples must have shape ({len(flux)},)")
+    if not np.isfinite(flux).all() or not np.isfinite(energy).all():
+        raise ConfigError("flux_linkage and stored_energy samples must be finite")
+    axes = tuple(np.unique(flux[:, index]) for index in range(count))
+    if any(len(axis) < 2 for axis in axes) or math.prod(map(len, axes)) != len(flux):
+        raise ConfigError("stored_energy samples must cover a complete Cartesian flux grid")
+    positions = tuple({float(value): index for index, value in enumerate(axis)} for axis in axes)
+    grid = np.full(tuple(map(len, axes)), np.nan)
+    for point, value in zip(flux, energy):
+        index = tuple(positions[axis][float(coordinate)]
+                      for axis, coordinate in enumerate(point))
+        if math.isfinite(grid[index]):
+            raise ConfigError("stored_energy flux grid contains a duplicate point")
+        grid[index] = value
+    if not np.isfinite(grid).all():
+        raise ConfigError("stored_energy samples must cover a complete Cartesian flux grid")
+    ordered_flux = np.asarray(tuple(np.ndindex(grid.shape)), dtype=int)
+    ordered_flux = np.column_stack([
+        axes[axis][ordered_flux[:, axis]] for axis in range(count)
+    ])
+    ordered_energy = grid.ravel().copy()
+    ordered_flux.setflags(write=False)
+    ordered_energy.setflags(write=False)
+    return ordered_flux, ordered_energy
+
+
 def _data(
     winding_names: Sequence[str],
     inductance: Any | None = None,
     flux_linkage: Any | None = None,
     current: Any | None = None,
+    stored_energy: Any | None = None,
     physical: Mapping[str, Any] | None = None,
     magnetic: MagneticDescription | Mapping[str, Any] | None = None,
     field_points: Any | None = None,
@@ -98,18 +143,28 @@ def _data(
 ) -> _MagPortData:
     names = _validate_winding_names(winding_names)
     linear = inductance is not None
-    nonlinear = flux_linkage is not None or current is not None
-    if linear == nonlinear:
+    current_map = current is not None
+    energy_map = stored_energy is not None
+    if sum((linear, current_map, energy_map)) != 1:
         raise ConfigError(
-            "provide either inductance or both flux_linkage and current samples"
+            "provide exactly one of inductance, current samples or stored_energy samples"
         )
     if linear:
-        matrix, _modes, _shapes = _inductance_decomposition(inductance, len(names))
-        flux_samples = current_samples = None
-    else:
-        if flux_linkage is None or current is None:
+        if flux_linkage is not None:
+            raise ConfigError("flux_linkage belongs to a sampled constitutive law")
+        matrix, _modes, _shapes = inductance_modes(inductance, len(names))
+        flux_samples = current_samples = energy_samples = None
+    elif current_map:
+        if flux_linkage is None:
             raise ConfigError("flux_linkage and current samples must be provided together")
         flux_samples, current_samples = _current_map(names, flux_linkage, current)
+        energy_samples = None
+        matrix = None
+    else:
+        if flux_linkage is None:
+            raise ConfigError("flux_linkage and stored_energy samples must be provided together")
+        flux_samples, energy_samples = _energy_map(names, flux_linkage, stored_energy)
+        current_samples = None
         matrix = None
 
     try:
@@ -143,7 +198,8 @@ def _data(
     if description is not None:
         description.matrices(names)
     return _MagPortData(
-        names, matrix, flux_samples, current_samples, source, description, points, basis
+        names, matrix, flux_samples, current_samples, energy_samples,
+        source, description, points, basis
     )
 
 
@@ -183,11 +239,11 @@ def _load(file: str | Path) -> _MagPortData:
                 raise ConfigError(f"unknown magport format {format_name!r}")
             if type(version) not in (int, np.int32, np.int64) or int(version) != _VERSION:
                 raise ConfigError(f"unsupported magport version {version!r}")
-            constitutive = keys & (_LINEAR | _NONLINEAR)
-            if constitutive not in (_LINEAR, _NONLINEAR):
+            constitutive = keys & (_LINEAR | _CURRENT_MAP | _ENERGY_MAP)
+            if constitutive not in (_LINEAR, _CURRENT_MAP, _ENERGY_MAP):
                 raise ConfigError(
-                    "magport file must contain either inductance or both "
-                    "flux_linkage and current"
+                    "magport file must contain inductance, a flux_linkage/current map, "
+                    "or a flux_linkage/stored_energy map"
                 )
             names = tuple(str(name) for name in _vector_strings(
                 archive["winding_names"], "winding_names"
@@ -217,6 +273,8 @@ def _load(file: str | Path) -> _MagPortData:
                 flux_linkage=(archive["flux_linkage"].copy()
                               if "flux_linkage" in keys else None),
                 current=(archive["current"].copy() if "current" in keys else None),
+                stored_energy=(archive["stored_energy"].copy()
+                               if "stored_energy" in keys else None),
                 physical=physical,
                 magnetic=magnetic,
                 field_points=(archive["field_points"].copy()
@@ -246,6 +304,99 @@ class MagneticLaw(Protocol):
     def currents(
         self, t: float, flux_linkage: np.ndarray, state: Mapping[str, float]
     ) -> Sequence[float]: ...
+
+
+class TabulatedEnergyLaw:
+    """Conservative current map derived from one sampled scalar magnetic-energy potential."""
+
+    initial_state: Mapping[str, float] = {}
+
+    def __init__(
+        self, winding_names: Sequence[str], flux_linkage: Any, stored_energy: Any
+    ) -> None:
+        self.winding_names = _validate_winding_names(winding_names)
+        self.flux_linkage, self.energy = _energy_map(
+            self.winding_names, flux_linkage, stored_energy
+        )
+        count = len(self.winding_names)
+        self._axes = tuple(np.unique(self.flux_linkage[:, index]) for index in range(count))
+        self._grid = self.energy.reshape(tuple(map(len, self._axes)))
+        if count == 1:
+            from scipy.interpolate import PchipInterpolator
+
+            self._interpolator = PchipInterpolator(
+                self._axes[0], self.energy, extrapolate=False
+            )
+            self._gradient = self._interpolator.derivative()
+        else:
+            self._interpolator = self._gradient = None
+
+    def _evaluate(self, flux_linkage: np.ndarray) -> tuple[float, np.ndarray]:
+        point = np.asarray(flux_linkage, dtype=float)
+        count = len(self.winding_names)
+        if point.shape != (count,) or not np.isfinite(point).all():
+            raise ConfigError(f"flux linkage must contain {count} finite values")
+        if count == 1:
+            energy = float(self._interpolator(point[0]))
+            current = float(self._gradient(point[0]))
+            if not math.isfinite(energy) or not math.isfinite(current):
+                raise ConfigError(
+                    f"flux linkage {point.tolist()} lies outside the sampled magnetic energy map"
+                )
+            return energy, np.asarray((current,))
+
+        lower = []
+        fraction = []
+        width = []
+        for value, axis in zip(point, self._axes):
+            if value < axis[0] or value > axis[-1]:
+                raise ConfigError(
+                    f"flux linkage {point.tolist()} lies outside the sampled magnetic energy map"
+                )
+            index = min(max(int(np.searchsorted(axis, value, side="right")) - 1, 0),
+                        len(axis) - 2)
+            step = float(axis[index + 1] - axis[index])
+            lower.append(index)
+            width.append(step)
+            fraction.append(float((value - axis[index]) / step))
+
+        energy = 0.0
+        current = np.zeros(count)
+        for corner in itertools.product((0, 1), repeat=count):
+            index = tuple(lower[axis] + corner[axis] for axis in range(count))
+            value = float(self._grid[index])
+            factors = tuple(
+                fraction[axis] if corner[axis] else 1.0 - fraction[axis]
+                for axis in range(count)
+            )
+            energy += value * math.prod(factors)
+            for axis in range(count):
+                derivative = (1.0 if corner[axis] else -1.0) / width[axis]
+                current[axis] += value * derivative * math.prod(
+                    factors[other] for other in range(count) if other != axis
+                )
+        return energy, current
+
+    def currents(
+        self, _t: float, flux_linkage: np.ndarray, _state: Mapping[str, float]
+    ) -> np.ndarray:
+        return self._evaluate(flux_linkage)[1]
+
+    def stored_energy(
+        self, _t: float, flux_linkage: np.ndarray, _state: Mapping[str, float]
+    ) -> float:
+        return self._evaluate(flux_linkage)[0]
+
+    @staticmethod
+    def stored_energy_rate(
+        _t: float,
+        _flux_linkage: np.ndarray,
+        currents: np.ndarray,
+        _state: Mapping[str, float],
+        flux_rate: np.ndarray,
+        _state_rate: Mapping[str, float],
+    ) -> float:
+        return float(currents @ flux_rate)
 
 
 class TabulatedMagneticLaw:
@@ -689,5 +840,7 @@ class MagPort(_MagneticElement):
         if data.inductance is not None:
             self._assemble(name, cfg, data.winding_names, data.inductance, buses, magnetic)
             return
-        law = TabulatedMagneticLaw(data.winding_names, data.flux_linkage, data.current)
+        law = (TabulatedEnergyLaw(data.winding_names, data.flux_linkage, data.stored_energy)
+               if data.stored_energy is not None else
+               TabulatedMagneticLaw(data.winding_names, data.flux_linkage, data.current))
         _attach_magnetic_law(self, name, cfg, buses, law, magnetic)

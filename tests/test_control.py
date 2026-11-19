@@ -579,7 +579,7 @@ def test_unknown_auxiliary_output_source_is_rejected(gfl):
 
 
 def test_control_imports_only_itself_and_the_solver_kernel():
-    allowed = {"control", "solver"}
+    allowed = {"control", "defaults", "solver"}
     for path in CONTROL.glob("*.py"):
         imported = set()
         rel = path.relative_to(CONTROL.parent).with_suffix("")

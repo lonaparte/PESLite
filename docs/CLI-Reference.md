@@ -214,10 +214,11 @@ peslite export case.pes
 peslite export case.pes simulation.t_end units.vsc.ctrl.references.p_ref_pu
 peslite export case.pes common --out export/my-simulator
 peslite export case.pes all
+peslite export case.pes --run
 ```
 
 Items after the simulation file are variable parameter paths, `common` or `all`. See
-[C++ Export](Cpp-Export.md) for compilation, runtime options and backend limits.
+[C++ Export](Cpp-Export.md) for compilation, cached execution, runtime options and backend limits.
 
 Use `--imperix` for [Imperix ELF export (Experimental)](Imperix-Export.md):
 

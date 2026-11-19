@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from types import SimpleNamespace
-from typing import Any, Callable, ClassVar, Mapping, Optional
+from typing import Any, Callable, ClassVar, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -19,11 +19,87 @@ from ..solver.model import Bag, ConfigError, Empty, OutputMethod, _complex, _rea
 __all__ = [
     "Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode", "register_component_type",
     "element_buses", "resolve_endpoints", "GROUND", "Load", "Resistor", "VoltageSource",
+    "LinearEnergyLaw", "inductance_modes", "two_winding_modes",
 ]
 
 
 GROUND = "ground"
 
+
+def two_winding_modes(primary: Any, secondary: Any, mutual: Any):
+    """Diagonalize two coupled windings while retaining symbolic scalar arithmetic."""
+    if all(isinstance(value, (int, float, np.number))
+           for value in (primary, secondary, mutual)):
+        values = tuple(float(value) for value in (primary, secondary, mutual))
+        if (not all(map(np.isfinite, values)) or values[0] <= 0.0 or values[1] <= 0.0
+                or values[0] * values[1] <= values[2] ** 2):
+            raise ConfigError("inductance must be positive definite")
+    angle = 0.5 * np.arctan2(2.0 * mutual, primary - secondary)
+    cosine, sine = np.cos(angle), np.sin(angle)
+    mean = 0.5 * (primary + secondary)
+    radius = np.sqrt((0.5 * (primary - secondary)) ** 2 + mutual ** 2)
+    first_sign = np.where(abs(sine) >= abs(cosine), np.where(sine > 0.0, -1.0, 1.0), 1.0)
+    second_sign = np.where(abs(sine) > abs(cosine), np.where(sine < 0.0, -1.0, 1.0), 1.0)
+    modes = (_real(mean - radius), _real(mean + radius))
+    shapes = ((_real(-sine * first_sign), _real(cosine * second_sign)),
+              (_real(cosine * first_sign), _real(sine * second_sign)))
+    return modes, shapes
+
+
+def inductance_modes(inductance: Any, count: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Validate and diagonally decompose one numeric coupled-inductance matrix."""
+    try:
+        matrix = np.asarray(inductance, dtype=float)
+    except (TypeError, ValueError):
+        raise ConfigError("inductance must be a numeric square matrix") from None
+    if matrix.shape != (count, count) or not np.isfinite(matrix).all():
+        raise ConfigError(f"inductance must be a finite {count} x {count} matrix")
+    if not np.allclose(matrix, matrix.T, rtol=1e-12, atol=0.0):
+        raise ConfigError("inductance must be symmetric")
+    modes, shapes = np.linalg.eigh(matrix)
+    if modes.min() <= 0.0:
+        raise ConfigError("inductance must be positive definite")
+    matrix.setflags(write=False)
+    return matrix, modes, shapes
+
+
+class LinearEnergyLaw:
+    """Analytic quadratic energy law for a linear coupled-inductance matrix."""
+
+    initial_state: Mapping[str, float] = {}
+
+    def __init__(self, winding_names: Sequence[str], inductance: Any) -> None:
+        self.winding_names = tuple(winding_names)
+        self.inductance, self.modes, self.shapes = inductance_modes(
+            inductance, len(self.winding_names)
+        )
+
+    def currents(
+        self, _t: float, flux_linkage: np.ndarray, _state: Mapping[str, float]
+    ) -> np.ndarray:
+        flux = np.asarray(flux_linkage, dtype=float)
+        if flux.shape != (len(self.winding_names),) or not np.isfinite(flux).all():
+            raise ConfigError(
+                f"flux linkage must contain {len(self.winding_names)} finite values"
+            )
+        return self.shapes @ ((self.shapes.T @ flux) / self.modes)
+
+    def stored_energy(
+        self, t: float, flux_linkage: np.ndarray, state: Mapping[str, float]
+    ) -> float:
+        return float(0.5 * np.asarray(flux_linkage, dtype=float)
+                     @ self.currents(t, flux_linkage, state))
+
+    @staticmethod
+    def stored_energy_rate(
+        _t: float,
+        _flux_linkage: np.ndarray,
+        currents: np.ndarray,
+        _state: Mapping[str, float],
+        flux_rate: np.ndarray,
+        _state_rate: Mapping[str, float],
+    ) -> float:
+        return float(currents @ flux_rate)
 
 @dataclass(frozen=True)
 class ElectricalEndpoint:

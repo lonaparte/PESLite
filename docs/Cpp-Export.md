@@ -4,6 +4,17 @@ PESLite can turn a resolved simulation into a standalone, parameter-specialized 
 generated simulator performs the numerical run itself; it is not a recording or wrapper around
 Python.
 
+Export, compile and run a case with:
+
+```bash
+peslite export case.pes --run
+```
+
+The command retains `export/case/peslite.cpp` and writes simulation results to `output/case/`.
+The first run compiles the generated program. Later runs reuse it when the generated source,
+compiler, compiler options and platform are unchanged. Normal `--set` overrides are resolved
+before generation, so a change that affects the specialized program selects another cache entry.
+
 ## Export
 
 Use `peslite export` with a simulation file or bundled example:

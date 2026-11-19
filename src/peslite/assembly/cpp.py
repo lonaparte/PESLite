@@ -8,12 +8,20 @@ standard library and never calls Python.
 from __future__ import annotations
 
 import copy
+import hashlib
 import inspect
 import itertools
 import json
 import math
 import numbers
+import os
+import platform
 import re
+import shlex
+import shutil
+import subprocess
+import tempfile
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields, is_dataclass, replace
@@ -10015,3 +10023,92 @@ def _export_cpp(simulation: Any, out_dir: Path, name: str,
     source = out_dir / "peslite.cpp"
     source.write_text(code, encoding="utf-8")
     return ExportResult("cpp", out_dir, (source,), tuple(diagnostics + generator.diagnostics))
+
+
+_COMPILE_FLAGS = ("-O3", "-DNDEBUG", "-std=c++17")
+
+
+@dataclass(frozen=True)
+class _CppBuild:
+    executable: Path
+    cache_hit: bool
+
+
+def _compiler(command: str | None = None) -> tuple[str, ...]:
+    words = tuple(shlex.split(command or os.environ.get("CXX", "c++")))
+    if not words:
+        raise ValueError("CXX must name a C++ compiler")
+    resolved = shutil.which(words[0])
+    if resolved is None:
+        raise OSError(f"C++ compiler {words[0]!r} was not found")
+    return (str(Path(resolved).resolve()), *words[1:])
+
+
+def _compiler_identity(command: tuple[str, ...]) -> bytes:
+    result = subprocess.run(
+        [*command, "--version"], check=True, capture_output=True, text=False, timeout=15
+    )
+    return (b"\0".join((os.fsencode(command[0]), *map(os.fsencode, command[1:])))
+            + b"\0" + result.stdout)
+
+
+@contextmanager
+def _build_lock(path: Path, timeout: float = 120.0):
+    started = time.monotonic()
+    while True:
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if time.monotonic() - started >= timeout:
+                raise TimeoutError(f"timed out waiting for C++ build lock {path}") from None
+            time.sleep(0.05)
+        else:
+            os.close(descriptor)
+            break
+    try:
+        yield
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def compile_source(
+    source: str | Path,
+    *,
+    cache_dir: str | Path | None = None,
+    compiler: str | None = None,
+) -> _CppBuild:
+    """Compile exported C++ through a cache keyed by source and toolchain identity."""
+    source = Path(source)
+    command = _compiler(compiler)
+    base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    root = Path(cache_dir) if cache_dir is not None else base / "peslite" / "cpp"
+    root.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    digest.update(source.read_bytes())
+    digest.update(b"\0compiler\0")
+    digest.update(_compiler_identity(command))
+    digest.update(b"\0flags\0")
+    digest.update(b"\0".join(map(os.fsencode, _COMPILE_FLAGS)))
+    digest.update(b"\0platform\0")
+    digest.update(f"{platform.system()}-{platform.machine()}".encode())
+    executable = root / digest.hexdigest()
+    if executable.is_file():
+        return _CppBuild(executable, True)
+    with _build_lock(root / f"{executable.name}.lock"):
+        if executable.is_file():
+            return _CppBuild(executable, True)
+        with tempfile.TemporaryDirectory(prefix=f".{executable.name}-", dir=root) as directory:
+            candidate = Path(directory) / "peslite"
+            result = subprocess.run(
+                [*command, *_COMPILE_FLAGS, str(source), "-o", str(candidate)],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode:
+                detail = result.stderr.strip() or result.stdout.strip()
+                raise RuntimeError(
+                    f"C++ compilation failed with exit code {result.returncode}: {detail}"
+                )
+            candidate.chmod(0o755)
+            os.replace(candidate, executable)
+    return _CppBuild(executable, False)

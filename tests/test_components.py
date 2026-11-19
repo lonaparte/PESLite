@@ -216,7 +216,7 @@ def test_duty_register_states_are_owned_by_pwm():
 
 
 def test_components_import_only_control_solver_and_themselves():
-    allowed = {"components", "control", "solver"}
+    allowed = {"components", "control", "defaults", "solver"}
     for path in COMPONENTS.glob("*.py"):
         imported = set()
         rel = path.relative_to(COMPONENTS.parent).with_suffix("")
