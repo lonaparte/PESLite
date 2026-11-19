@@ -33,6 +33,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
 
+from ..defaults import DEFAULT_OUTPUT_PRECISION, DEFAULT_OUTPUT_WRITE_LENGTH
 from ..assembly.events import Scenario, switching_schedule
 from ..assembly.conduction import DiodeConduction
 from ..assembly.exporter import _signal_names
@@ -433,8 +434,9 @@ class SimulationResult:
 class _CSVTable:
     """A fixed-width numeric table flushed to CSV every ``batch_rows`` rows."""
 
-    def __init__(self, path: Path, batch_rows: int = 1000,
-                 columns: Iterable[str] | None = None, precision: int = 5) -> None:
+    def __init__(self, path: Path, batch_rows: int = DEFAULT_OUTPUT_WRITE_LENGTH,
+                 columns: Iterable[str] | None = None,
+                 precision: int = DEFAULT_OUTPUT_PRECISION) -> None:
         self.path = path
         self.batch_rows = batch_rows
         self.precision = precision
@@ -568,7 +570,7 @@ class Recorder:
                  ctrl_names: Mapping[str, Iterable[str]] | None = None,
                  keep_states: bool = True,
                  keep_signals: bool = False, keep_energy: bool = True,
-                 batch_rows: int = 1000, name: str = "simulation",
+                 batch_rows: int = DEFAULT_OUTPUT_WRITE_LENGTH, name: str = "simulation",
                  state_columns: Iterable[str] = ()) -> None:
         self.params = params
         self.out_dir = out_dir

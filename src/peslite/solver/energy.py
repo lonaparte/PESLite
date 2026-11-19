@@ -11,6 +11,8 @@ from typing import Any, ClassVar, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
+from ..defaults import DEFAULT_PH_REPORT_RTOL
+
 __all__ = ["StoragePort", "Port", "Energetic", "EnergySpec", "EnergyReport", "SubsystemEnergy", "PHReport", "SubsystemStatus", "CutStatus", "signal",
            "re_product", "spec_of", "balance", "ph_report"]
 
@@ -707,7 +709,8 @@ def _state_labels(model: Any, sub: Any) -> list[str]:
     return [f"{name}.{st}" for st in sub.state_names]
 
 
-def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e-8, seed: int = 0,
+def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None,
+              rtol: float = DEFAULT_PH_REPORT_RTOL, seed: int = 0,
               groups: Optional[dict[str, Any]] = None, hold: Optional[dict[str, float]] = None) -> PHReport:
     """Build the :class:`PHReport` of a model and, if given, of its multirate groups.
 

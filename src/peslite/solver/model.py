@@ -28,6 +28,8 @@ from typing import Any, Callable, ClassVar, Iterable, Mapping, Protocol, Sequenc
 import numpy as np
 from numpy.typing import NDArray
 
+from ..defaults import (DEFAULT_ALGEBRAIC_ATOL, DEFAULT_ALGEBRAIC_MAX_ITERATIONS,
+                        DEFAULT_ALGEBRAIC_RTOL, DEFAULT_PH_REPORT_RTOL)
 from . import energy as _energy
 from .differentiation import directional_derivative
 from .timing import TIME_EPS, PeriodicClock
@@ -1049,7 +1051,9 @@ class _AlgebraicLoop:
 
     def __init__(self, operations: tuple, tears: tuple, owners: tuple,
                  labels: tuple[str, ...],
-                 max_sweeps: int = 16, rtol: float = 1e-8, atol: float = 1e-10) -> None:
+                 max_sweeps: int = DEFAULT_ALGEBRAIC_MAX_ITERATIONS,
+                 rtol: float = DEFAULT_ALGEBRAIC_RTOL,
+                 atol: float = DEFAULT_ALGEBRAIC_ATOL) -> None:
         self.tears = tears
         torn = {id(item) for item in tears}
         self.operations = tuple(operation for operation in operations
@@ -2245,7 +2249,8 @@ class Model:
         return _energy.powers(self, t, y)
 
     def ph_report(self, zoh: Mapping[str, Any] | None = None, groups: Mapping[str, Any] | None = None,
-                  rtol: float = 1e-8, hold: Mapping[str, float] | None = None) -> "_energy.PHReport":
+                  rtol: float = DEFAULT_PH_REPORT_RTOL,
+                  hold: Mapping[str, float] | None = None) -> "_energy.PHReport":
         """Return the port-Hamiltonian report of the model (:class:`peslite.solver.energy.PHReport`).
 
         ``groups``: result of :meth:`groups`; ``hold``: ``{"step": dt, "window": W}`` hold times in s.

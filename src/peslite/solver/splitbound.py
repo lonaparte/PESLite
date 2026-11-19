@@ -11,7 +11,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from ..defaults import DEFAULT_LINEARIZATION_RELATIVE_STEP
+from ..defaults import DEFAULT_LINEARIZATION_RELATIVE_STEP, DEFAULT_SPLIT_LINEARIZATION_ROWS
 from .linearization import (LoopMap, coordinate_width as _width, coordinate_difference,
                             linearize_loop)
 from .multirate import rated_effort
@@ -117,7 +117,8 @@ def _convolve(a: np.ndarray, b: np.ndarray, n: int) -> np.ndarray:
 
 
 def split_error_bound(solver: Any, loop: LoopMap, t: np.ndarray, states: dict[str, np.ndarray],
-                      rows: int = 3, labels: Sequence[str] | None = None,
+                      rows: int = DEFAULT_SPLIT_LINEARIZATION_ROWS,
+                      labels: Sequence[str] | None = None,
                       prefix: str = "",
                       relative_step: float = DEFAULT_LINEARIZATION_RELATIVE_STEP) -> dict[str, Any]:
     """Estimate the split error of a finished multirate run.

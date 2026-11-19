@@ -20,9 +20,8 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
-from ..defaults import (DEFAULT_CONTROL_ALGEBRAIC_ATOL,
-                        DEFAULT_CONTROL_ALGEBRAIC_MAX_ITERATIONS,
-                        DEFAULT_CONTROL_ALGEBRAIC_RTOL)
+from ..defaults import (DEFAULT_ALGEBRAIC_ATOL, DEFAULT_ALGEBRAIC_MAX_ITERATIONS,
+                        DEFAULT_ALGEBRAIC_RTOL)
 from ..solver.model import (Bag, ConfigError, _complex, _component_plan, _dependency_plan,
                             _real, gather, scatter)
 from ..solver.energy import Port
@@ -450,9 +449,9 @@ class ControlGraph:
 
     def __init__(self, cfg, startup, connections, outputs, *, interface=CONTROL_INTERFACE,
                  continuous: bool | None = None,
-                 cycle_iterations: int = DEFAULT_CONTROL_ALGEBRAIC_MAX_ITERATIONS,
-                 cycle_atol: float = DEFAULT_CONTROL_ALGEBRAIC_ATOL,
-                 cycle_rtol: float = DEFAULT_CONTROL_ALGEBRAIC_RTOL):
+                 cycle_iterations: int = DEFAULT_ALGEBRAIC_MAX_ITERATIONS,
+                 cycle_atol: float = DEFAULT_ALGEBRAIC_ATOL,
+                 cycle_rtol: float = DEFAULT_ALGEBRAIC_RTOL):
         self.cfg, self.startup = cfg, startup
         self._cycle_iterations = cycle_iterations
         self._cycle_atol = cycle_atol

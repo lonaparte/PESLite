@@ -29,7 +29,11 @@ from typing import Any, Callable, Optional, Union, get_args, get_origin, get_typ
 
 from ..components.network import ELEMENT_TYPES, element_buses
 from ..components.pwm import PWM_ALIGNMENTS
-from ..defaults import DEFAULT_PWM_ALIGNMENT, DEFAULT_SOLVER_ATOL, DEFAULT_SOLVER_RTOL
+from ..defaults import (DEFAULT_MULTIRATE_SWEEPS, DEFAULT_OUTPUT_PRECISION,
+                        DEFAULT_OUTPUT_WRITE_LENGTH, DEFAULT_PWM_ALIGNMENT,
+                        DEFAULT_PWM_CARRIER_PHASE, DEFAULT_SOLVER_ATOL,
+                        DEFAULT_SOLVER_MAX_STEP, DEFAULT_SOLVER_RTOL,
+                        DEFAULT_SOLVER_WARM_START, DEFAULT_SPLIT_LINEARIZATION_ROWS)
 from ..control.controller import ControlInterface, continuous_control
 from ..control.loops import LOOP_TYPES, SignalType, loop_key_type, loop_type
 from ..control.profiles import (ControlTypeSpec, ReferenceParams, control_profile,
@@ -386,7 +390,7 @@ class PWMParams:
     f_sw: float  # carrier frequency, Hz
     modulation_limit: float = 1.0
     update: str = "single"  # "single" | "double"
-    carrier_phase: float = field(default=0.0, metadata={"modulator": True})
+    carrier_phase: float = field(default=DEFAULT_PWM_CARRIER_PHASE, metadata={"modulator": True})
     alignment: str = field(default=DEFAULT_PWM_ALIGNMENT, metadata={"modulator": True})
     method: str = "spwm"  # "spwm" | "svpwm"
     sync: str = field(default="asynchronous", metadata={"modulator": True})
@@ -910,12 +914,12 @@ class SolverParams:
     dt: float = 1e-6  # s; fixed: maximum system step
     rtol: float = DEFAULT_SOLVER_RTOL  # adaptive error; fixed implicit Newton convergence
     atol: float = DEFAULT_SOLVER_ATOL  # adaptive error; fixed implicit Newton convergence
-    max_step: float = math.inf
-    warm_start: bool = True  # adaptive: reuse the last step size across intervals
+    max_step: float = DEFAULT_SOLVER_MAX_STEP
+    warm_start: bool = DEFAULT_SOLVER_WARM_START  # adaptive: reuse the last step size across intervals
     subsystems: dict = field(default_factory=dict)  # fixed only: {name: step relative to dt | {step, method}}
-    sweeps: int = 2  # coupling sweeps for sub-stepped subsystems (>= 1)
-    linearisations: int = 3  # linearisation points for the split error bound (0: none)
-    write_length: int = 1000  # streamed CSV rows per write batch (>= 1)
+    sweeps: int = DEFAULT_MULTIRATE_SWEEPS  # coupling sweeps for sub-stepped subsystems (>= 1)
+    linearisations: int = DEFAULT_SPLIT_LINEARIZATION_ROWS  # split-error linearisation points
+    write_length: int = DEFAULT_OUTPUT_WRITE_LENGTH  # streamed CSV rows per write batch (>= 1)
     phs_check_step: int = 1000  # snapshots between port-Hamiltonian energy audits (>= 1)
     _choices = {"circuit_model": CIRCUIT_MODELS, "type": ("fixed", "adaptive")}
 
@@ -947,7 +951,7 @@ class OutputParams:
 
     period: float = 5e-4  # plant snapshot interval, s
     record_every: int = 1  # keep every n-th controller sample
-    precision: int = 5  # significant digits in CSV history rows
+    precision: int = DEFAULT_OUTPUT_PRECISION  # significant digits in CSV history rows
     states: bool = True  # states.csv
     signals: bool = False  # plant.csv and ctrl.<unit>.csv
     energy: bool = False  # energy.csv

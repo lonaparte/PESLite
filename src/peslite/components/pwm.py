@@ -14,7 +14,8 @@ from typing import Any, Callable, Iterator, Mapping, Protocol, NamedTuple, runti
 import numpy as np
 from numpy.typing import NDArray
 
-from ..defaults import DEFAULT_PWM_ALIGNMENT
+from ..defaults import (DEFAULT_PWM_ALIGNMENT, DEFAULT_PWM_CARRIER_PHASE,
+                        DEFAULT_PWM_MIN_INTERVAL)
 from ..control.profiles import PHASE_SHIFT_MODES, control_profile
 from ..solver.model import ConfigError, _integer, _real
 from ..solver.timing import TIME_EPS, PeriodicClock
@@ -724,7 +725,7 @@ def _value(u: float) -> float:
     return -1.0 + 4.0 * u if u < 0.5 else 3.0 - 4.0 * u
 
 
-def carrier(t: float, f_sw: float, phase: float = 0.0) -> float:
+def carrier(t: float, f_sw: float, phase: float = DEFAULT_PWM_CARRIER_PHASE) -> float:
     """Return the triangular carrier value in [-1, 1]; ``phase`` in carrier periods.
 
     With ``phase = 0`` the carrier is at -1 and rising at ``t = 0``.
@@ -771,7 +772,8 @@ class CarrierComparison(Modulator):
         return PhaseClock(0.0, 2.0 * math.pi * self.phase, 2.0 * math.pi * self.f_sw)
 
 
-    def __init__(self, f_sw: float, phase: float = 0.0, min_interval: float = 1e-12,
+    def __init__(self, f_sw: float, phase: float = DEFAULT_PWM_CARRIER_PHASE,
+                 min_interval: float = DEFAULT_PWM_MIN_INTERVAL,
                  *, alignment: str = DEFAULT_PWM_ALIGNMENT) -> None:
         if alignment not in PWM_ALIGNMENTS:
             raise ValueError("carrier alignment must be center, trailing or leading")
@@ -876,7 +878,8 @@ class SynchronousCarrier(Modulator):
                 self.pulse_ratio * omega)
         return PhaseClock(t, angle, rate)
 
-    def __init__(self, pulse_ratio: int, phase: float = 0.0, min_interval: float = 1e-12,
+    def __init__(self, pulse_ratio: int, phase: float = DEFAULT_PWM_CARRIER_PHASE,
+                 min_interval: float = DEFAULT_PWM_MIN_INTERVAL,
                  *, alignment: str = DEFAULT_PWM_ALIGNMENT) -> None:
         if alignment not in PWM_ALIGNMENTS:
             raise ValueError("carrier alignment must be center, trailing or leading")
@@ -1012,7 +1015,7 @@ class PhaseShiftModulator:
                      else self._registers(registers)[2])
         return PhaseClock(0.0, 0.0, 2.0 * math.pi * frequency)
 
-    def __init__(self, frequency: float, min_interval: float = 1e-12,
+    def __init__(self, frequency: float, min_interval: float = DEFAULT_PWM_MIN_INTERVAL,
                  carried: tuple[str, ...] = ()) -> None:
         frequency = _real(frequency)
         if not math.isfinite(frequency) or frequency <= 0.0:

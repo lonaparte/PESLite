@@ -23,7 +23,8 @@ from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
-from ..defaults import DEFAULT_SOLVER_ATOL, DEFAULT_SOLVER_RTOL
+from ..defaults import (DEFAULT_SOLVER_ATOL, DEFAULT_SOLVER_MAX_STEP, DEFAULT_SOLVER_RTOL,
+                        DEFAULT_SOLVER_WARM_START)
 from .model import SpectralBound, _component_plan, commutation_tolerance
 from .netlist import FORMS as CIRCUIT_MODELS
 
@@ -211,7 +212,8 @@ def stage_state(y: NDArray[np.float64], h: float, row: tuple[float, ...], ks: li
 
 def integrator(method: str, dt: float, rtol: float = DEFAULT_SOLVER_RTOL,
                atol: float = DEFAULT_SOLVER_ATOL,
-               max_step: float = math.inf, warm_start: bool = True, *,
+               max_step: float = DEFAULT_SOLVER_MAX_STEP,
+               warm_start: bool = DEFAULT_SOLVER_WARM_START, *,
                model=None, solver_type: str | None = None) -> Solver:
     """Return the single-rate integrator of ``method``: fixed-step with maximum step ``dt`` (s),
     the built-in ``"DP45"`` or a SciPy method.
@@ -621,8 +623,8 @@ class AdaptiveSolver:
         method: str = "RK45",
         rtol: float = DEFAULT_SOLVER_RTOL,
         atol: float = DEFAULT_SOLVER_ATOL,
-        max_step: float = math.inf,
-        warm_start: bool = True,
+        max_step: float = DEFAULT_SOLVER_MAX_STEP,
+        warm_start: bool = DEFAULT_SOLVER_WARM_START,
         jac: Callable | None = None,
         *, model=None,
     ) -> None:
@@ -771,7 +773,8 @@ class DormandPrince45:
     _e = (71 / 57600, 0.0, -71 / 16695, 71 / 1920, -17253 / 339200, 22 / 525, -1 / 40)
 
     def __init__(self, rtol: float = DEFAULT_SOLVER_RTOL,
-                 atol: float = DEFAULT_SOLVER_ATOL, max_step: float = math.inf,
+                 atol: float = DEFAULT_SOLVER_ATOL,
+                 max_step: float = DEFAULT_SOLVER_MAX_STEP,
                  h_init: float | None = None, safety: float = 0.9) -> None:
         self.rtol, self.atol, self.max_step, self.safety = rtol, atol, max_step, safety
         self._h = h_init
@@ -935,8 +938,9 @@ class AutoSolver:
     """
 
     def __init__(self, rtol: float = DEFAULT_SOLVER_RTOL,
-                 atol: float = DEFAULT_SOLVER_ATOL, max_step: float = math.inf,
-                 warm_start: bool = True, *, model=None) -> None:
+                 atol: float = DEFAULT_SOLVER_ATOL,
+                 max_step: float = DEFAULT_SOLVER_MAX_STEP,
+                 warm_start: bool = DEFAULT_SOLVER_WARM_START, *, model=None) -> None:
         self._dp = DormandPrince45(rtol, atol, max_step)
         self._warm_start, self._model = warm_start, model
         self.stiff = False

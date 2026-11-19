@@ -14,7 +14,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ...defaults import DEFAULT_LINEARIZATION_RELATIVE_STEP
+from ...defaults import (DEFAULT_LINEARIZATION_RELATIVE_STEP,
+                         DEFAULT_STABILITY_MULTIPLIER_TOLERANCE,
+                         DEFAULT_STABILITY_PERIODIC_TOLERANCE)
 from ...solver.linearization import (active_coordinates, coordinate_difference, coordinate_width,
                                      linearize_loop)
 from ...solver.simulation import SystemLoop
@@ -78,10 +80,12 @@ class SmallSignalResult:
         return "\n".join(lines)
 
 
-def small_signal(sim: Simulation, *, period: float | None = None,
-                 relative_step: float = DEFAULT_LINEARIZATION_RELATIVE_STEP,
-                 periodic_tolerance: float = 1e-3,
-                 multiplier_tolerance: float = 1e-5) -> SmallSignalResult:
+def small_signal(
+    sim: Simulation, *, period: float | None = None,
+    relative_step: float = DEFAULT_LINEARIZATION_RELATIVE_STEP,
+    periodic_tolerance: float = DEFAULT_STABILITY_PERIODIC_TOLERANCE,
+    multiplier_tolerance: float = DEFAULT_STABILITY_MULTIPLIER_TOLERANCE,
+) -> SmallSignalResult:
     """Linearize the completed run's final state through the shared one-period simulation.
 
     The default period repeats declared control/PWM and source schedules in stationary
@@ -247,7 +251,8 @@ def small_signal_report(sim: Simulation, *, times: Iterable[float] = (),
                         interval: float | None = None, period: float | None = None,
                         watch: Iterable[str] = (),
                         relative_step: float = DEFAULT_LINEARIZATION_RELATIVE_STEP,
-                        periodic_tolerance: float = 1e-3, multiplier_tolerance: float = 1e-5,
+                        periodic_tolerance: float = DEFAULT_STABILITY_PERIODIC_TOLERANCE,
+                        multiplier_tolerance: float = DEFAULT_STABILITY_MULTIPLIER_TOLERANCE,
                         change_tolerance: float = 1e-6,
                         out_dir: str | Path | None = "output/run", name: str = "simulation",
                         info: Mapping[str, object] | None = None, timeout: float | None = None,
