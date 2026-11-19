@@ -16,11 +16,18 @@ from numpy.typing import NDArray
 
 from ..defaults import (DEFAULT_PWM_ALIGNMENT, DEFAULT_PWM_CARRIER_PHASE,
                         DEFAULT_PWM_MIN_INTERVAL)
-from ..control.profiles import PHASE_SHIFT_MODES, control_profile
 from ..solver.model import ConfigError, _integer, _real
 from ..solver.timing import TIME_EPS, PeriodicClock
 
 PWM_ALIGNMENTS = ("center", "trailing", "leading")
+
+# Each phase-shift mode defines its pulses as (centre offset in rad, signed bridge level).
+PHASE_SHIFT_MODES = {
+    0: ((0.0, 1), (math.pi, -1)),
+    1: ((0.0, 1),),
+    3: (),
+    4: ((math.pi, -1),),
+}
 
 __all__ = ["PWM", "PhaseClock", "PulseSequence", "SwitchingSequence",
            "Modulator", "CarrierComparison",
@@ -1102,10 +1109,10 @@ def modulator_type(pwm, model, kind=None):
     return SynchronousCarrier if pwm.sync == "synchronous" else CarrierComparison
 
 
-def validate_modulator(unit, topology, where, *, dead_time_active=True):
+def validate_modulator(unit, topology, where, *, kind=None, dead_time_active=True):
     if unit.pwm is None:
         return
-    cls = modulator_type(unit.pwm, unit.bridge.model, control_profile(unit.ctrl).modulator)
+    cls = modulator_type(unit.pwm, unit.bridge.model, kind)
     if unit.bridge.model not in cls.supported_models:
         raise ConfigError(f"{where}.bridge.model: {cls.__name__} requires resolved switching edges")
     legs = getattr(cls, "switching_legs", None)
@@ -1129,9 +1136,3 @@ def make_modulator(pwm: Any, f0: float, bridge: Any, kind: str | None = None,
                    references: Any = None, carried: tuple[str, ...] = ()) -> Modulator:
     cls = modulator_type(pwm, bridge.model, kind)
     return cls.from_config(pwm, f0, references, tuple(carried))
-
-
-def make_unit_modulator(cfg):
-    spec = control_profile(cfg.ctrl)
-    return make_modulator(cfg.pwm, cfg.base.f0, cfg.bridge, spec.modulator, cfg.ctrl.references,
-                          spec.interface.auxiliary_outputs(cfg.ctrl.outputs))

@@ -11,9 +11,9 @@ import yaml
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, _unit_items, read_tree
-from peslite.assembly.simulation_file import parse_native_text
+from peslite.assembly.syntax import parse_native_text
 from peslite.components.pwm import modulator_type
-from peslite.control.profiles import control_type
+from peslite.assembly.control import control_type
 
 
 SHORT = ["--set", "simulation.t_end=0.004",

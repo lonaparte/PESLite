@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from peslite.assembly.simulation_file import (
+from peslite.assembly.syntax import (
     SimulationFileError, parse_native_text, parse_simulation_text,
 )
 from peslite.assembly.params import read_initial
@@ -68,7 +68,7 @@ def test_native_text_requires_one_unambiguous_circuit_view():
         parse_native_text("@circuit wrong\nbase: {s_base: 1}\n", "case.pes")
 
 
-def test_parameter_only_yaml_is_loaded_by_the_registered_format_addon():
+def test_parameter_only_yaml_is_loaded_by_the_registered_compatibility_function():
     parameters, interface = parse_simulation_text(
         "base: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n", Path("legacy.pes")
     )

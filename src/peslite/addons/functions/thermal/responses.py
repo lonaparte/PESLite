@@ -6,7 +6,7 @@ from typing import Sequence
 
 import numpy as np
 
-from ...components.thermal.network import FosterImpedance, _finite
+from ...components.thermalnetwork import FosterImpedance, _finite
 
 __all__ = ["foster_step_response"]
 

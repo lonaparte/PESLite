@@ -1,4 +1,4 @@
-"""Deterministic time tables used by controller reference inputs."""
+"""Deterministic scalar signals on the simulation time axis."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..solver.model import ConfigError
-from ..solver.timing import TIME_EPS
+from .model import ConfigError
+from .timing import TIME_EPS
 
 
 def _finite_sequence(values: Any, name: str) -> tuple[float, ...]:
@@ -234,27 +234,6 @@ class TableSignal:
             result = result * x + coefficient
         return result
 
-
-@dataclass(frozen=True)
-class ReferenceBinding:
-    """One controller-reference binding with its ordinary SI/pu conversion."""
-
-    name: str
-    signal: TableSignal
-    input_name: str
-    scale: float = 1.0
-    integer: bool = False
-
-    def __call__(self, t: float) -> float | int:
-        return self._cast(self.scale * self.signal(t))
-
-    def bounds(self, start: float, stop: float) -> tuple[float | int, float | int]:
-        """Return this converted reference's range over one simulation window."""
-        low, high = sorted(self.scale * value for value in self.signal.bounds(start, stop))
-        return self._cast(low), self._cast(high)
-
-    def _cast(self, value: float) -> float | int:
-        return int(round(value)) if self.integer else value
 
 
 __all__ = ["TableSignal"]

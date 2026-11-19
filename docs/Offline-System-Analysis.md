@@ -75,27 +75,28 @@ the source topology. All physical source quantities are SI values.
 
 ### Control-edge injection
 
-Virtual injection nodes add a typed signal at an existing `ControlGraph` edge. They are stateless
-and use the edge's existing unit and compatibility checks. Insert one between the original producer
-and consumer rather than reaching into a controller implementation:
+Use a `.pesdbg` plan to cut an existing `ControlGraph` edge and connect a test source. The ordinary
+graph assembly checks the source type, target type and connection ownership before simulation:
 
-```yaml
-units:
-  converter:
-    ctrl:
-      type: open_loop
-      loops:
-        DutyModulation: {}
-        VirtualDutyInjection: {amplitude: 0.02, frequency: 100.0}
-      references: {duty: 0.4}
-      connections:
-        VirtualDutyInjection.signal: references.duty
-        DutyModulation.duty: VirtualDutyInjection.injected
+```text
+model: ../buck-open-loop-example.pes
+
+@debug
+- converter.references.duty -> converter.DutyModulation.duty
++ Test.out -> converter.DutyModulation.duty
+
+@sources
+Test: {type: sine, amplitude: 0.02, frequency: 100.0, offset: 0.4}
+
+@probe
+before: converter.references.duty
+after: converter.Test.out
+effective: converter.DutyModulation.duty
 ```
 
-The addon supplies injection nodes for scalar, dq, duty, power, frequency and angle signals. Their
-recorded `before`, `after` and `injection` channels are measured at the graph edge. Unsupported unit
-or frame conversions are rejected rather than inferred.
+The disconnected producer remains available to probes, while the test source drives the consumer.
+The same mechanism applies to scalar and complex control signals; unsupported type conversions are
+rejected rather than inferred. See the bundled `buck-control-injection-example.pesdbg`.
 
 ## Recording and signal alignment
 
@@ -220,7 +221,7 @@ JSON output.
 
 ## Feedback return ratio and margins
 
-A control-edge injection exposes the values immediately before and after the additive cut. For
+A control-edge injection exposes the values immediately before and after the feedback cut. For
 ordinary negative feedback, the return ratio is `L = -before / after`, with a configurable sign for
 other summing conventions. Dividing the return signal by the added perturbation instead measures a
 closed-loop sensitivity, not the return ratio.
@@ -230,9 +231,9 @@ from peslite.addons.functions import measure_return_ratio, loop_gain_sweep
 
 point = measure_return_ratio(
     result,
-    injection="converter.VirtualDutyInjection",
+    before="converter.before",
+    after="converter.after",
     frequency=100.0,
-    component="d",
     window=(0.05, 0.1),
 )
 margin_report = loop_gain_sweep({20.0: point20, 40.0: point40, 80.0: point80})
@@ -252,13 +253,13 @@ explicitly. Use an excitation small enough for local behavior but large enough f
 Switching sidebands, a time-varying plant and coupled ports can require additional frequencies and
 independent directions.
 
-The native C++ and Imperix exporters do not promise support for Python analysis injection types;
-the workflows on this page use the Python backend and its ordinary result files.
+Debug overlays and offline analysis run through the Python workflow and its ordinary result files;
+they do not alter exported C++ or Imperix programs.
 
 ## Verification
 
 ```bash
 python -m pytest tests/test_identification.py tests/test_frequency_measurements.py
 python -m pytest tests/test_port_injection.py tests/test_port_measurement.py \
-    tests/test_virtual_injection.py
+    tests/test_loop_gain.py tests/test_debug.py
 ```

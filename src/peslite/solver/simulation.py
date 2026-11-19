@@ -36,15 +36,15 @@ import numpy as np
 
 from ..defaults import DEFAULT_OUTPUT_PRECISION, DEFAULT_OUTPUT_WRITE_LENGTH
 from ..assembly.events import Scenario, switching_schedule
-from ..assembly.conduction import DiodeConduction
 from ..assembly.exporter import _signal_names
 from ..assembly.params import (Params, _connection_variable, _parameterized, _unit_at, _unit_items,
-                               _unit_leaves, _load_case, connection_defaults, dump, dumps, to_dict)
+                               _unit_leaves, _load_case, connection_defaults, dump, dumps, to_dict,
+                               unit_type)
 from ..assembly.system import System, _start_connections
-from ..assembly.types import unit_type
 from ..assembly.unit import Plant, Unit
 from .timing import TIME_EPS
 from ..control.blocks import abc2complex, complex2abc
+from .commutation import Commutation
 from .integrators import Solver, _accepted_steps
 from .linearization import coordinate_width
 from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
@@ -385,7 +385,7 @@ class _StepLimits:
         return float(maximum)
 
 
-def _compile_interval_integrator(solver, rhs, conduction, settle, project, step_limits=None):
+def _compile_interval_integrator(solver, rhs, commutation, settle, project, step_limits=None):
     """Compile the assembled interval stages so structural choices leave the run loop.
 
     Conduction participation, solver settlement and state bounds cannot change during a run.
@@ -397,10 +397,10 @@ def _compile_interval_integrator(solver, rhs, conduction, settle, project, step_
         body = ["maximum_step = step_limits(t_a, y)"]
     else:
         body = []
-    if conduction:
-        env["conduction"] = conduction
-        advance = ("conduction.advance(t_a, t_b, y, max_step=maximum_step)"
-                   if step_limits else "conduction.advance(t_a, t_b, y)")
+    if commutation:
+        env["commutation"] = commutation
+        advance = ("commutation.advance(t_a, t_b, y, max_step=maximum_step)"
+                   if step_limits else "commutation.advance(t_a, t_b, y)")
     elif step_limits:
         advance = "solver.advance(rhs, t_a, t_b, y, max_step=maximum_step).y"
     else:
@@ -1233,15 +1233,15 @@ class Simulation:
         wall0 = time.perf_counter()
 
         units = list(system.units.values())
-        diode_conduction = DiodeConduction(mdl, solver)
+        commutation = Commutation(mdl, solver)
         if t_end <= t_start + TIME_EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         t_final = t_end
         progress_every = (t_final - t_start) / 100.0 if progress.enable else 0.0
         plant = Plant(mdl, self._apply_initial(t_start), project=project,
-                      synchronize=diode_conduction.synchronize if diode_conduction.commutating else None,
+                      synchronize=commutation.synchronize if commutation.commutating else None,
                       reconcile=getattr(system, "reconcile_circuits", None))
-        if diode_conduction.commutating:
+        if commutation.commutating:
             plant.outputs(t_start)
         if project is not None:
             plant.state = project(plant.state)
@@ -1425,7 +1425,7 @@ class Simulation:
         if validate_local_step is not None:
             validate_local_step(step_limits.owners)
         integrate = _compile_interval_integrator(
-            solver, mdl.rhs, diode_conduction, settle, project,
+            solver, mdl.rhs, commutation, settle, project,
             step_limits if step_limits else None,
         )
 

@@ -41,7 +41,7 @@ peslite case.pes
 | `wpt-ss-example` | SS WPT with local primary-side power feedback controlling modulation amplitude, including a 1200 to 1800 W reference step. |
 | `wpt-lcc-example` | LCC-LCC WPT with local secondary-side power feedback controlling phase, including a -500 to -800 W reference step. |
 | `wpt-load-example` | Independent series load with explicitly routed load-power feedback, a 5 to 8 ohm load step and per-side RMS overcurrent protection. |
-| `wpt-phase-shift-example` | Phase-shift WPT with power-controlled pulse width, a repeating bridge-mode sequence and a diode full-bridge secondary. |
+| `wpt-phase-shift-example` | Phase-shift WPT with power-controlled pulse width and a diode full-bridge secondary. |
 | `wpt-scc-example` | Square-wave WPT with primary power feedback commanding an SCC conduction angle. |
 
 The files are also available in the repository's
@@ -55,6 +55,8 @@ frequency-response measurement and a quantitative check. Run it with:
 ```bash
 peslite debug gfl-example --plan examples/debug/gfl-debug-example.pesdbg
 ```
+
+`buck-control-injection-example.pesdbg` applies the same mechanism to a scalar duty command.
 
 ## Compare bridge models
 

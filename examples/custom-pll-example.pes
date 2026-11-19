@@ -1,4 +1,4 @@
-# PESLite 0.5.2
+# PESLite 0.6.0
 # Grid-following converter using the automatically discovered voltage-adaptive PLL add-on.
 @circuit
 grid -- pcc -- vsc

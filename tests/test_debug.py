@@ -1,15 +1,18 @@
 """File-backed control-graph debugging through the ordinary PESLite runtime."""
 
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import peslite
 import pytest
 
 from conftest import EXAMPLES
 from peslite.addons.functions.debug import (
-    DebugOperation, DebugPlan, execute_debug, parse_debug_text, prepare_debug,
+    DebugOperation, DebugPlan, _analyses, execute_debug, parse_debug_text, prepare_debug,
+    read_debug_plan,
 )
 from peslite.solver.model import ConfigError
 
@@ -53,6 +56,19 @@ def test_plan_round_trip_and_strict_sections():
         parse_debug_text("model: case.pes\n@probe\na: A.out\n@probe\nb: B.out\n")
     with pytest.raises(ConfigError, match="state_policy"):
         parse_debug_text("model: case.pes\nstate_policy: discard\n")
+
+
+@pytest.mark.parametrize(
+    "name", ("gfl-debug-example.pesdbg", "buck-control-injection-example.pesdbg"),
+)
+def test_bundled_debug_plans_use_the_generic_overlay(name):
+    path = EXAMPLES / "debug" / name
+    plan = read_debug_plan(path)
+    model = (path.parent / plan.model).resolve()
+
+    prepared = prepare_debug(peslite.load(model), plan, directory=path.parent)
+
+    assert prepared.watch
 
 
 def test_plan_normalization_keeps_only_the_latest_value_and_round_trips_matrices():
@@ -103,6 +119,25 @@ def test_invalid_overlay_is_rejected_before_simulation():
     ), sources={"Test": 0.1})
     with pytest.raises(ConfigError, match="already connected"):
         prepare_debug(_short_params(), plan, directory=MODEL.parent)
+
+
+def test_loop_gain_analysis_applies_the_feedback_sign_at_a_generic_cut():
+    time = np.arange(0.0, 1.0, 0.001)
+    after = np.cos(math.tau * 20.0 * time)
+    before = -3.0 * after
+    plan = DebugPlan(analyses={
+        "return_ratio": {
+            "type": "loop_gain", "input": "after", "output": "before",
+            "frequency": 20.0,
+        },
+    })
+
+    report = _analyses(plan, None, {
+        "t": time.tolist(), "before": before.tolist(), "after": after.tolist(),
+    })
+    point = report["return_ratio"]["result"]["return_ratio"]["value"][0]
+
+    assert point == {"real": pytest.approx(3.0), "imag": pytest.approx(0.0)}
 
 
 def test_tracking_policy_uses_the_loop_tracking_law():

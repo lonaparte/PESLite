@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 from typing import Iterable
 
-from ...control.signals import TableSignal
+from ...solver.signals import TableSignal
 
 
 _FUNCTIONS = {

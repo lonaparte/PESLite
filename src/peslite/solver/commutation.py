@@ -1,4 +1,4 @@
-"""Ideal-diode conduction and discrete commutation around an otherwise generic ODE solver."""
+"""Locate and apply discrete commutations around an otherwise generic ODE solver."""
 
 from __future__ import annotations
 
@@ -10,18 +10,17 @@ from numpy.typing import NDArray
 
 from ..defaults import (DEFAULT_COMMUTATION_LOCATOR_ITERATIONS,
                         DEFAULT_COMMUTATION_MAX_TRANSITIONS)
-from .params import ConfigError
-from ..solver.integrators import (_accepted_checkpoint, _accepted_checkpoint_at,
-                                  _accepted, _accepted_restore)
-from ..solver.model import commutation_tolerance
+from .integrators import (_accepted_checkpoint, _accepted_checkpoint_at,
+                          _accepted, _accepted_restore)
+from .model import ConfigError, commutation_tolerance
 
-__all__ = ["DiodeConduction", "CommutationError"]
+__all__ = ["Commutation", "CommutationError"]
 
 class CommutationError(RuntimeError):
     """Commutating subsystems kept switching without time advancing (a Zeno condition)."""
 
 
-class DiodeConduction:
+class Commutation:
     """Apply ideal-diode blocking and exact discrete commutations for one assembled model.
 
     A plant participates in one of three ways:

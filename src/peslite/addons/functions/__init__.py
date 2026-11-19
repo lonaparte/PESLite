@@ -2,6 +2,8 @@
 
 from importlib import import_module
 
+from ...assembly.syntax import register_simulation_reader
+
 
 class FunctionUnavailableError(ImportError):
     """A cataloged function's implementation provider is not installed."""
@@ -22,6 +24,7 @@ _EXPORTS = {
     "reference_csv": ("reference_signals", "reference_csv"),
     "reference_expression": ("reference_signals", "reference_expression"),
     "reference_table": ("reference_signals", "reference_table"),
+    "read_legacy_yaml": ("legacy_yaml", "read_legacy_yaml"),
     "legacy_yaml_preview": ("peslite.gui.legacy_yaml", "preview"),
     "legacy_yaml_patch": ("peslite.gui.legacy_yaml", "validated_patch"),
     "legacy_yaml_add_component": ("peslite.gui.legacy_yaml", "validated_add_component"),
@@ -82,3 +85,20 @@ def _resolve(name):
 def __getattr__(name):
     """Load a public function from its implementation module when requested."""
     return _resolve(name)
+
+
+_SIMULATION_READERS = ("read_legacy_yaml",)
+
+
+@register_simulation_reader
+def _read_compatible_simulation(text, path):
+    """Try installed syntax-compatibility functions without loading them at startup."""
+    for name in _SIMULATION_READERS:
+        try:
+            reader = _resolve(name)
+        except FunctionUnavailableError:
+            continue
+        parameters = reader(text, path)
+        if parameters is not None:
+            return parameters
+    return None

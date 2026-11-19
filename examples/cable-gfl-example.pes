@@ -1,4 +1,4 @@
-# PESLite 0.5.2
+# PESLite 0.6.0
 # A grid-following converter connected to a stiff grid through a segmented lumped cable.
 @circuit
 grid -- grid_bus -- pcc -- vsc

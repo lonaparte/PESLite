@@ -1,4 +1,4 @@
-# PESLite 0.5.2
+# PESLite 0.6.0
 # Grid-following converter on a Thevenin grid: an annotated simulation file.
 # A simulation file combines interface views with YAML parameter domains: the model (base, buses,
 # branches, sources, units, elements), what happens during the run (events), how it is simulated

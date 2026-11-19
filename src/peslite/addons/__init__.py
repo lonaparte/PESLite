@@ -6,7 +6,7 @@ from importlib import import_module, invalidate_caches
 from pathlib import Path
 from typing import Any
 
-from . import components, control, formats
+from . import components, control
 from ._discovery import discover_modules
 from . import functions
 
@@ -14,9 +14,8 @@ from . import functions
 # directory search or add-on dispatch remains in the simulation hot path.
 control.discover()
 components.discover()
-formats.discover()
 
-__all__ = ["control", "components", "formats", "functions"]
+__all__ = ["control", "components", "functions"]
 
 
 def _merge_path(package, directory: Path) -> bool:
@@ -33,7 +32,7 @@ def _discover_for(simulation_file: str | Path) -> tuple[Any, ...]:
     """Merge and discover ``PESaddons`` beside one simulation file.
 
     The installed add-on packages remain the first search locations.  A sibling ``PESaddons``
-    contributes the same ``control``, ``components``, ``formats`` and ``functions`` package paths
+    contributes the same ``control``, ``components`` and ``functions`` package paths
     without changing the process-wide ``sys.path``. Registration modules run before the simulation
     file is parsed; functions remain lazy and are imported only when requested.
     """
@@ -43,7 +42,7 @@ def _discover_for(simulation_file: str | Path) -> tuple[Any, ...]:
 
     _merge_path(import_module(__name__), root)
     locations = []
-    for package, name in ((control, "control"), (components, "components"), (formats, "formats")):
+    for package, name in ((control, "control"), (components, "components")):
         directory = root / name
         if _merge_path(package, directory):
             locations.append((package, directory))

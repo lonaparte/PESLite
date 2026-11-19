@@ -1,9 +1,4 @@
-"""Feedback return-ratio and classical crossover margins from real simulation data.
-
-A virtual injection block records the signal on each side of the injection
-point. A closed feedback connection has a return ratio given by the quotient
-of the return and forward signals at that cut, not by return/disturbance.
-"""
+"""Feedback return-ratio and classical crossover margins from recorded signals."""
 
 from __future__ import annotations
 
@@ -20,27 +15,33 @@ from .port_measurement import measure_recorded_transfer
 __all__ = ["measure_return_ratio", "loop_gain_sweep", "LoopGainResult"]
 
 
-def measure_return_ratio(result, *, injection: str, frequency: float,
-                         component: str = "d", feedback_sign: float = -1.0,
+def _signed_return_ratio(observed: FrequencyMeasurement, feedback_sign: float,
+                         before: str, after: str) -> FrequencyMeasurement:
+    """Apply one feedback convention to a measured cut transfer."""
+    if isinstance(feedback_sign, bool) or feedback_sign not in (-1.0, 1.0):
+        raise ValueError("feedback_sign must be +1 or -1")
+    value = observed.gain * feedback_sign if observed.gain is not None else None
+    return replace(observed, gain=value, conditions={
+        **observed.conditions,
+        "feedback_sign": feedback_sign,
+        "before": before,
+        "after": after,
+        "definition": "feedback_sign * before / after",
+    })
+
+
+def measure_return_ratio(result, *, before: str, after: str, frequency: float,
+                         feedback_sign: float = -1.0,
                          window=None, **quality_options) -> FrequencyMeasurement:
-    """Read before/after observations from a typed virtual feedback injection.
+    """Measure a return ratio from signals recorded on both sides of a feedback cut.
 
     ``feedback_sign=-1`` is for ordinary negative feedback: L = -before/after.
     Do not divide the return by the *added disturbance*: that is a closed-loop
     sensitivity, not the return ratio. The user must verify the edge's sign.
     """
-    if component not in ("d", "q"):
-        raise ValueError("component must be 'd' or 'q'")
-    if isinstance(feedback_sign, bool) or feedback_sign not in (-1.0, 1.0):
-        raise ValueError("feedback_sign must be +1 or -1")
-    before = f"{injection}.before_{component}"
-    after = f"{injection}.after_{component}"
     observed = measure_recorded_transfer(result, after, before, frequency=frequency,
                                          window=window, **quality_options)
-    value = observed.gain * feedback_sign if observed.gain is not None else None
-    return replace(observed, gain=value, conditions={**observed.conditions,
-                     "feedback_sign": feedback_sign, "virtual_cut": injection,
-                     "definition": "feedback_sign * before / after"})
+    return _signed_return_ratio(observed, feedback_sign, before, after)
 
 
 def _crossings(logf, samples, level, accepted):

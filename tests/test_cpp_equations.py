@@ -10,7 +10,8 @@ from peslite.assembly.cpp import (_ALGEBRAIC_SOLVER, _ControlGenerator, _ModelGe
                                   _RuntimeParameters, _number, _uses_implementation)
 from peslite.components import Bag
 from peslite.components.converter import DCCapacitor, DCLink, DCVoltageSource
-from peslite.components.network import ACVoltageSource, RLBranch
+from peslite.components.passive import RLBranch
+from peslite.components.source import ACVoltageSource
 from peslite.solver.model import Empty, Model
 from peslite.control import Loop
 from peslite.control.blocks import PI

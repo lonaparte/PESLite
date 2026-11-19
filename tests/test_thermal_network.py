@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from peslite.addons.components.thermal import (
-    ElectroThermal, ElectroThermalModel,
+from peslite.addons.components.thermalcomponent import ElectroThermal, ElectroThermalModel
+from peslite.addons.components.thermalnetwork import (
     FosterImpedance, LumpedThermalNetwork, ThermalLink,
 )
 from peslite.addons.functions.thermal import (

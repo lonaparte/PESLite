@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from peslite.addons.components.thermal import (
+from peslite.addons.components.thermalcomponent import (
     ThermalComponent, ThermalResistor, ThermalResistorModel,
 )
 from peslite.solver.model import Model

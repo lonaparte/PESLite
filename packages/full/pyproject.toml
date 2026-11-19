@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "peslite-full"
-version = "0.5.2"
+version = "0.6.0"
 description = "Complete PESLite installation with advanced magnetic modeling, GUI and ONNX support."
 readme = "README.md"
 requires-python = ">=3.10.1"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 dependencies = [
-    "peslite-gui==0.5.2",
+    "peslite-gui==0.6.0",
     "onnx>=1.17.0",
     "onnxruntime>=1.18.0",
 ]

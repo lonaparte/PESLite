@@ -35,10 +35,12 @@ import numpy as np
 
 from ..defaults import (DEFAULT_COMMUTATION_LOCATOR_ITERATIONS,
                         DEFAULT_COMMUTATION_MAX_TRANSITIONS)
-from ..components.network import ACVoltageSource, NetworkComponent, RLBranch
+from ..components.network import NetworkComponent
+from ..components.passive import RLBranch
+from ..components.source import ACVoltageSource
 from ..components.pwm import (_EPS, _SNAP, CarrierComparison, SynchronousCarrier, PhaseClock,
                                PhaseShiftModulator, ZOH)
-from ..control.profiles import PHASE_SHIFT_MODES
+from ..components.pwm import PHASE_SHIFT_MODES
 from ..control.blocks import OutputLimit
 from ..control.controller import GraphController, VSCController
 from ..solver.energy import Port, re_product
@@ -46,20 +48,20 @@ from ..solver.history import DelayedSignal
 from ..solver.integrators import DormandPrince45, FixedStepSolver, TABLEAUS, _STABILITY_HALF_DISK
 from ..solver.implicit import (ImplicitSolver, _JACOBIAN_STEP, _MAX_SPLITS, _TABLEAUX,
                                _NEWTON_ITERATIONS, _NEWTON_SCALE, _THETA_MAX)
-from ..solver.model import _dependency_plan, commutation_tolerance
+from ..solver.model import _dependency_plan, _record_fields, commutation_tolerance
 from ..solver.netlist import (Dissipation, Element as NetlistElement, Mode, Netlist, Topology,
                               _Degenerate, _FLOAT_RTOL, _MARGIN_RTOL, _MAX_PATTERNS,
                               _Symbolic, _constant, _symbolic_solve, _symbolic_source)
 from ..solver.timing import TIME_EPS
-from .conduction import DiodeConduction
+from ..solver.commutation import Commutation
 from .circuit import _BoundValue, _NETWORK_DECLARATION, _mode_decomposition, compile_network
 from .protection import ProtectionStats
 from .params import (BaseValues, ConfigError, SourceParams, UnitParams, _PARAMETER_RECORDER, _event_assignments,
-                     _native_text, _written_out, connection_defaults, dumps, parameter_leaves)
-from .simulation_file import PARAMETER_DOMAINS
+                     _native_text, _written_out, connection_defaults, dumps, parameter_leaves,
+                     unit_type)
+from .syntax import PARAMETER_DOMAINS
 from .exporter import ExportResult, _exporter, _signal_names
 from .system import _source_scenario
-from .types import unit_type
 from .unit import Plant
 
 __all__ = []
@@ -370,7 +372,7 @@ private:
 
 
 _CONDUCTION_KERNEL = r'''
-    class DiodeConduction {
+    class Commutation {
         Simulator& sim;
         static constexpr std::size_t commutation_count = @@COMMUTATIONS@@;
         using Guards = std::array<bool, @@CURRENTS@@>;
@@ -403,7 +405,7 @@ _CONDUCTION_KERNEL = r'''
         }
 
     public:
-        explicit DiodeConduction(Simulator& owner) : sim(owner) {}
+        explicit Commutation(Simulator& owner) : sim(owner) {}
 
         void synchronize(double t) {
             if constexpr (commutation_count == 0) return;
@@ -558,19 +560,6 @@ def _uses_implementation(obj: Any, implementation: type, *operations: str) -> bo
                     pending.append(field)
             codes.extend(value for value in code.co_consts if inspect.iscode(value))
     return True
-
-
-def _fields(record: Any) -> tuple[str, ...]:
-    """Record fields in their declared order, including dynamic controller-state records."""
-    names: list[str] = []
-    for cls in reversed(type(record).__mro__):
-        slots = getattr(cls, "__slots__", ())
-        if isinstance(slots, str):
-            slots = (slots,)
-        names.extend(name for name in slots if name not in names)
-    dynamic = vars(record) if hasattr(record, "__dict__") else {}
-    names.extend(name for name in dynamic if name not in names)
-    return tuple(names)
 
 
 def _sequence_like(record: Any, values: Iterable[Any]) -> Any:
@@ -2013,7 +2002,7 @@ class _RuntimeParameters:
         elif inspect.isroutine(value) or isinstance(value, type):
             return False
         else:
-            values = (getattr(value, field) for field in _fields(value))
+            values = (getattr(value, field) for field in _record_fields(value))
         result = any(self.contains_parameters(item) for item in values)
         self._contains_parameters[id(value)] = result
         return result
@@ -2048,7 +2037,7 @@ class _RuntimeParameters:
         seen.add(id(original))
         changes = self.object_updates.setdefault(id(original), {})
         constructor_parameters = inspect.signature(type(original).__init__).parameters
-        for name in _fields(original):
+        for name in _record_fields(original):
             if not hasattr(initialized, name):
                 continue
             left, right = getattr(original, name), getattr(initialized, name)
@@ -2091,11 +2080,11 @@ class _RuntimeParameters:
         clone = _ControlGenerator._copy_block(original)
         self.object_copies[id(original)] = clone
         updates = self.object_updates[id(original)]
-        for name in _fields(original):
+        for name in _record_fields(original):
             if name not in {"state", "input", "output"}:
                 value = updates.get(name, getattr(original, name))
                 object.__setattr__(clone, name, self.object(value))
-        for name in _fields(original):
+        for name in _record_fields(original):
             value = getattr(original, name)
             if getattr(value, "__self__", None) is original:
                 object.__setattr__(clone, name, value.__func__.__get__(clone, type(clone)))
@@ -2486,7 +2475,7 @@ class _ModelGenerator:
             for role in ("state", "input", "output"):
                 record = getattr(sub, role)
                 mapped = self.record_fields.setdefault(id(record), {})
-                for field in _fields(record):
+                for field in _record_fields(record):
                     mapped.setdefault(field, f"{tag}_{role}_{_identifier(field)}")
                     value = getattr(record, field)
                     self.record_types[id(record), field] = (
@@ -2704,7 +2693,7 @@ class _ModelGenerator:
         for role in ("state", "input", "output"):
             original = getattr(owner, role)
             record = copy.copy(original)
-            for field in _fields(original):
+            for field in _record_fields(original):
                 setattr(record, field, _Expression(self.value(original, field),
                                                    self.record_types[id(original), field]))
             setattr(clone, role, record)
@@ -2773,7 +2762,7 @@ class _ModelGenerator:
 
         for original in {id(owner): owner, **{id(part): part for part, _attribute in bindings.values()}}.values():
             target = copies[id(original)]
-            for name in _fields(original):
+            for name in _record_fields(original):
                 value = getattr(target, name)
                 setattr(target, name, rebind(getattr(original, name), value))
         for (part_id, attribute), (member, kind, _part, _attribute) in self.equation_members.items():
@@ -2782,7 +2771,7 @@ class _ModelGenerator:
         if bindings:
             tracked = [(copies[part_id], attribute)
                        for part_id, attribute in self.equation_members if part_id in copies]
-            tracked += [(record, field) for record in records.values() for field in _fields(record)]
+            tracked += [(record, field) for record in records.values() for field in _record_fields(record)]
             cache_objects = {id(value) for value in (*copies.values(), *records.values(), *references.values())}
             for part_id, name, method, returns_none in self._equation_method_plan(owner, bindings):
                 target = copies[part_id]
@@ -2793,7 +2782,7 @@ class _ModelGenerator:
                     snapshot = copy.copy(receiver)
                     mutable = {attribute for part, attribute in _tracked if part is receiver}
                     def restore_transients():
-                        for field in _fields(snapshot):
+                        for field in _record_fields(snapshot):
                             if field not in mutable:
                                 setattr(receiver, field, getattr(snapshot, field))
                     def run():
@@ -2970,7 +2959,7 @@ class _ModelGenerator:
     def trace_outputs(self, method: Any,
                       attributes: dict[str, _Expression] | None = None) -> list[str]:
         owner = method.__self__
-        fields = _fields(owner.output)
+        fields = _record_fields(owner.output)
 
         def run():
             bound = {}
@@ -3055,7 +3044,7 @@ class _ModelGenerator:
             subsystem_name = self.subsystem_name[id(subsystem)]
             for role in ("input", "output"):
                 record = getattr(subsystem, role)
-                for field in _fields(record):
+                for field in _record_fields(record):
                     values[self.record_fields[id(record)][field]] = partial(
                         self.solver_observation, record, field, subsystem_name, role
                     )
@@ -3211,7 +3200,7 @@ class _ModelGenerator:
                 for sub in subsystems:
                     for role in ("state", "input", "output"):
                         record = getattr(sub, role)
-                        for field in _fields(record):
+                        for field in _record_fields(record):
                             value = getattr(record, field)
                             saved.append((record, field, value))
                             setattr(record, field, _Expression(
@@ -3248,7 +3237,7 @@ class _ModelGenerator:
         declared: set[str] = set()
         for sub in self.model.subsystems:
             for record in (sub.state, sub.input, sub.output):
-                for field in _fields(record):
+                for field in _record_fields(record):
                     name = self.value(record, field)
                     if name in declared:
                         continue
@@ -3434,7 +3423,7 @@ class _ModelGenerator:
                 return value
 
             for component in circuit.components:
-                for field in _fields(component):
+                for field in _record_fields(component):
                     before = getattr(component, field)
                     after = remap_netlist(before)
                     if after is not before:
@@ -3463,14 +3452,14 @@ class _ModelGenerator:
         if id(circuit.output) not in self.record_fields:
             restored.extend(
                 (circuit.output, field, getattr(circuit.output, field))
-                for field in _fields(circuit.output)
+                for field in _record_fields(circuit.output)
             )
         seen = set()
         for record in records:
             if id(record) in seen:
                 continue
             seen.add(id(record))
-            for field in _fields(record):
+            for field in _record_fields(record):
                 key = id(record), field
                 if key not in self.record_types:
                     continue
@@ -3560,7 +3549,7 @@ class _ModelGenerator:
         for owner in circuit.components:
             restored = []
             clone = self.runtime.object(owner)
-            attributes = {name: getattr(clone, name) for name in _fields(owner)
+            attributes = {name: getattr(clone, name) for name in _record_fields(owner)
                           if name not in {"state", "input", "output", "ports", "port_by_field"}
                           and not isinstance(getattr(clone, name), Port)
                           and not inspect.isroutine(getattr(clone, name))
@@ -4665,7 +4654,7 @@ class _ModelGenerator:
 
     def trace_circuit_outputs(self, circuit: Any, fields=None) -> list[str]:
         """Lower selected public outputs from the circuit's netlist equations."""
-        fields = _fields(circuit.output) if fields is None else fields
+        fields = _record_fields(circuit.output) if fields is None else fields
 
         def run():
             with self._netlist_symbols(circuit):
@@ -5218,7 +5207,7 @@ class _ModelGenerator:
         public = {self.value(getattr(owner, role), field):
                   f"{self.subsystem_name[id(owner)]}.{role}.{field}"
                   for owner in loop.owners for role in ("state", "input", "output")
-                  for field in _fields(getattr(owner, role))}
+                  for field in _record_fields(getattr(owner, role))}
         affected = {}
         for target, (rhs, fragments) in conditional_by_target.items():
             if target not in component_of:
@@ -6701,7 +6690,7 @@ class _ControlGenerator:
         cloned = object.__new__(type(block))
         if hasattr(block, "__dict__"):
             vars(cloned).update(vars(block))
-        for name in _fields(block):
+        for name in _record_fields(block):
             if hasattr(block, name) and not hasattr(cloned, name):
                 setattr(cloned, name, getattr(block, name))
         return cloned
@@ -8922,7 +8911,7 @@ class _CppGenerator:
             if projection_lines else ""
         )
         projection_call = "project_state();" if projection_lines else ""
-        diode_conduction = DiodeConduction(self.model, self.simulation.solver)
+        diode_conduction = Commutation(self.model, self.simulation.solver)
         if (diode_conduction.located and self.p.simulation.solver.type != "fixed"
                 and not math.isfinite(self.p.simulation.solver.max_step)):
             raise ConfigError(
@@ -9449,7 +9438,7 @@ class _CppGenerator:
                 kernel = kernel.replace("@@" + key + "@@", value)
             solver_code += "\n" + "\n".join(callbacks) + "\n" + kernel
             advance_method = "diode_conduction.advance"
-            diode_declaration = "DiodeConduction diode_conduction(*this);"
+            diode_declaration = "Commutation diode_conduction(*this);"
             if commutation_margins:
                 conduction_sync = "diode_conduction.synchronize(t);"
         adaptive_members = (f'''std::size_t n_rejected = 0;
@@ -9703,7 +9692,7 @@ public:
         {' '.join(discrete_initialization)}
         {chr(10).join(connection_initialization)}
         {'reconcile_circuits<false>(' + _number(self.p.simulation.initial.t) + ');' if boundary_method else ''}
-        {'DiodeConduction initial_conduction(*this); initial_conduction.synchronize(' + _number(self.p.simulation.initial.t) + ');' if conduction_sync else ''}
+        {'Commutation initial_conduction(*this); initial_conduction.synchronize(' + _number(self.p.simulation.initial.t) + ');' if conduction_sync else ''}
         {projection_call}
         {chr(10).join(initial_tracking)}
         {chr(10).join(adc_initialization)}

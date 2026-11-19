@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "peslite-gui"
-version = "0.5.2"
+version = "0.6.0"
 description = "Graphical user interface for PESLite."
 readme = "README.md"
 requires-python = ">=3.10.1"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
-dependencies = ["peslite==0.5.2"]
+dependencies = ["peslite==0.6.0"]
 
 [project.scripts]
 peslite-gui = "peslite.gui.web_service:main"

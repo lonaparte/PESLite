@@ -2,7 +2,7 @@
 
 import pytest
 from conftest import EXAMPLES
-from peslite.assembly.simulation_file import parse_native_text
+from peslite.assembly.syntax import parse_native_text
 from peslite.solver import simulation
 from peslite.solver.simulation import _config_path
 

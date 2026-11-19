@@ -18,8 +18,7 @@ from typing import Any
 
 import numpy as np
 
-from ..assembly.params import Params, _unit_items, flat_paths, to_dict
-from ..assembly.types import unit_type
+from ..assembly.params import Params, _unit_items, flat_paths, to_dict, unit_type
 from ..components.network import GROUND, element_buses
 from ..control.blocks import complex2abc
 

@@ -35,7 +35,8 @@ from peslite.addons.components.magcomponent import (
     MagneticDescription,
     MagneticParams,
 )
-from peslite.components.network import ELEMENT_TYPES, LinearEnergyLaw
+from peslite.addons.components.magcomponent import LinearEnergyLaw
+from peslite.components.network import ELEMENT_TYPES
 from peslite.solver import ConfigError
 from peslite.solver.energy import spec_of
 

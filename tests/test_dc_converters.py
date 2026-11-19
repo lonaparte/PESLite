@@ -10,7 +10,7 @@ from conftest import EXAMPLES
 from peslite.assembly.circuit import Circuit
 from peslite.assembly.params import ConfigError, from_dict, to_dict
 from peslite.components import HalfBridge, HalfBridgeDiodeConduction, PWMAveragingModel
-from peslite.assembly.conduction import DiodeConduction
+from peslite.solver.commutation import Commutation
 from peslite.control import (BridgeControlOutput, DCVoltageControl, GraphController,
                              InductorCurrentControl, Startup)
 from peslite.solver.netlist import CurrentState, Dissipation, Inductor, VoltageSource
@@ -665,7 +665,7 @@ def test_ratio_one_solver_schedule_still_honours_the_dcm_local_step():
     assert type(simulation.solver) is peslite.FixedStepSolver
     simulation.unit().conduction.solver_maximum_step = lambda: 5.0e-6
 
-    stage = DiodeConduction(simulation.system.model, simulation.solver)
+    stage = Commutation(simulation.system.model, simulation.solver)
     initial = simulation.system.model.get_initial_values()
     before = simulation.solver.n_rhs
     stage.advance(

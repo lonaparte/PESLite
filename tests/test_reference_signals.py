@@ -9,7 +9,8 @@ import peslite
 from peslite.addons.functions import reference_csv, reference_expression, reference_table
 from peslite.assembly.cpp import _validate_native_control_graph
 from peslite.assembly.params import from_dict, read_initial, read_tree, to_dict
-from peslite.control import ControlMeasurement, TableSignal
+from peslite.control import ControlMeasurement
+from peslite.solver import TableSignal
 from peslite.control.controller import ConverterMeasurement
 from peslite.solver import ConfigError
 from peslite.solver.timing import TIME_EPS
@@ -451,7 +452,11 @@ def test_integer_references_require_held_integer_tables(examples):
     tree = read_tree(examples / "wpt-phase-shift-example.pes")
     tree["events"] = {}
     tree["signals"] = {
-        "modes": {"time": [0.0, 0.001], "value": [0, 1]},
+        "modes": {
+            "time": [0.0, 0.001, 0.002, 0.003],
+            "value": [1, 0, 4, 1],
+            "repeat": True,
+        },
     }
     references = tree["units"]["charger"]["primary"]["ctrl"]["references"]
     references["mode"] = "signals.modes"
@@ -461,7 +466,9 @@ def test_integer_references_require_held_integer_tables(examples):
 
     tree["signals"]["modes"]["interpolation"] = "zero_order_hold"
     binding = from_dict(tree).unit("charger.primary").ctrl._reference_bindings["mode"]
-    assert binding(0.001) == 1
+    assert binding(0.001) == 0
+    assert binding(0.002) == 4
+    assert binding(0.004) == 0
     assert isinstance(binding(0.001), int)
 
     tree["signals"]["modes"]["extrapolation"] = "linear"

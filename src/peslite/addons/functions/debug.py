@@ -16,14 +16,12 @@ import numpy as np
 import yaml
 
 from ... import __version__
-from ...assembly.params import Params, _unit_items, flat_paths, to_dict
-from ...assembly.simulation_file import parse_parameter_mapping
-from ...assembly.types import unit_type
-from ...control.controller import (ControlGraphOverlay, continuous_control,
-                                   resolved_control_interface)
+from ...assembly.params import Params, _unit_items, flat_paths, to_dict, unit_type
+from ...assembly.syntax import parse_parameter_mapping
+from ...control.controller import ControlGraphOverlay, continuous_control
 from ...control.loops import LOOP_TYPES
-from ...control.profiles import control_profile
-from ...control.signals import TableSignal
+from ...assembly.control import control_profile, resolved_control_interface
+from ...solver.signals import TableSignal
 from ...solver.model import ConfigError
 from ...solver.simulation import Simulation, validate_model
 
@@ -414,7 +412,7 @@ def prepare_debug(p: Params, plan: DebugPlan, *, directory: str | Path = ".") ->
         profile = control_profile(unit.ctrl)
         is_continuous = continuous_control(unit)
         defaults, outputs = profile.wiring(unit, continuous=is_continuous)
-        interface = resolved_control_interface(unit.ctrl, is_continuous)
+        interface = resolved_control_interface(profile, is_continuous)
         classes = {loop_name: LOOP_TYPES[loop.type]
                    for loop_name, loop in unit.ctrl.loops.items()}
         source_types = dict(interface.inputs)
@@ -620,8 +618,15 @@ def _analyses(plan: DebugPlan, simulation: Simulation,
         if kind in {"frequency_response", "impedance", "loop_gain"}:
             from . import frequency_response, loop_gain_sweep
             context = f"debug analysis {name!r}"
-            excitation = _signal(series, _required(config, "input", context))
-            response = _signal(series, _required(config, "output", context))
+            input_name = _required(config, "input", context)
+            output_name = _required(config, "output", context)
+            excitation = _signal(series, input_name)
+            response = _signal(series, output_name)
+            feedback_sign = config.pop("feedback_sign", None)
+            if kind == "loop_gain":
+                feedback_sign = -1.0 if feedback_sign is None else feedback_sign
+            elif feedback_sign is not None:
+                raise ConfigError(f"{context}: feedback_sign is only valid for loop_gain")
             frequencies = config.pop("frequencies", None)
             if frequencies is None:
                 frequencies = (_required(config, "frequency", context),)
@@ -643,7 +648,15 @@ def _analyses(plan: DebugPlan, simulation: Simulation,
                         time, excitation, response, frequency=frequency, **config,
                     ) for frequency in selected
                 }
-            except TypeError as exc:
+                if kind == "loop_gain":
+                    from .loop_gain import _signed_return_ratio
+                    measurements = {
+                        frequency: _signed_return_ratio(
+                            measurement, feedback_sign, output_name, input_name,
+                        )
+                        for frequency, measurement in measurements.items()
+                    }
+            except (TypeError, ValueError) as exc:
                 raise ConfigError(f"{context}: {exc}") from None
             if kind == "loop_gain":
                 result = loop_gain_sweep(measurements).to_dict()

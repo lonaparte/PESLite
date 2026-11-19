@@ -18,7 +18,7 @@ copied into the components' ``input`` before solving. Zero-order-hold inputs kee
 components' ``input``; the Circuit also receives each such label, so a held change refreshes it.
 
 Mode changes (breakers, gates, transformer ratios, diodes, set events) are boundaries of the
-commutation protocol of :class:`~peslite.assembly.conduction.DiodeConduction`: the Circuit's margin is
+commutation protocol of :class:`~peslite.solver.commutation.Commutation`: the Circuit's margin is
 negative while the states are inconsistent with the present mode, and ``commutate`` projects them
 (charge and flux conservation) and records the impulsive loss and supply for the energy audit. A component
 may keep a commutation of its own beside it (a gate clock) and mirror the netlist's diode conduction into
@@ -47,9 +47,9 @@ from ..components.network import Port
 from ..solver.energy import Energetic, spec_of
 from ..solver.model import (
     Bag, ConfigError, Empty, OutputMethod, SolverCheck, SolverRegion, SpectralBound,
-    _InlineProgram, _compile_straight_line,
+    _InlineProgram, _compile_straight_line, _public_fields,
 )
-from ..solver.netlist import (QUANTITIES, CoupledInductors, CurrentSource, Diode, Element, Mode,
+from ..solver.netlist import (QUANTITIES, CurrentSource, Diode, Element, Mode,
                               Netlist, Node, Topology, VoltageSource, _DENSE_GROUP, _Degenerate,
                               _Evaluation, _linear_expression, _numeric_values, _roles, _UnionFind)
 
@@ -72,10 +72,6 @@ def _kind(port: Port) -> tuple[int, float]:
 def _ports(sub: Any) -> list[Port]:
     return [port for port in getattr(sub, "ports", ())
             if isinstance(port, Port) and port.physical and port.component is sub]
-
-
-def _fields(record: Any) -> tuple[str, ...]:
-    return tuple(f for f in dir(record) if not f.startswith("_") and not callable(getattr(record, f)))
 
 
 def _state_dimension(component: Any, name: str) -> int:
@@ -216,7 +212,7 @@ class NetlistBuilder:
             raise TypeError("a netlist function value must be callable")
         record = None
         if self.owner is not None:
-            known = set(_fields(self.owner.input))
+            known = set(_public_fields(self.owner.input))
             unknown = set(inputs) - known
             if unknown:
                 raise ValueError(f"unknown netlist function input fields {sorted(unknown)}")
@@ -2079,8 +2075,8 @@ def _component_output_stages(component: Any) -> Optional[tuple[OutputMethod, ...
     if stages is None and (component.outputs_need_inputs or component.output is not component.state):
         stages = (OutputMethod(
             "set_outputs",
-            _fields(component.input) if component.outputs_need_inputs else (),
-            _fields(component.output),
+            _public_fields(component.input) if component.outputs_need_inputs else (),
+            _public_fields(component.output),
         ),)
     return None if stages is None else tuple(stages)
 
@@ -2303,7 +2299,7 @@ def bind_device(name: str, component: Any, declaration: NetworkPlan,
     circuit.standalone_ports = tuple(
         port for port in _ports(component) if port.standalone is not None
     )
-    for field in _fields(component.input):
+    for field in _public_fields(component.input):
         key = circuit.key(f"{name}.{field}", getattr(component.input, field), output=False)
         circuit.copies.append((component, field, key))
         circuit.value_inputs[id(component.input), field] = key
@@ -3178,7 +3174,9 @@ class _ModeStructure:
 
     def _element_branches(self, net: Netlist, index: int) -> list[int]:
         element = self.branches[index].element
-        return list(net._ports[id(element)]) if isinstance(element, CoupledInductors) else [index]
+        if len(element.ports) > 1 and hasattr(element, "state"):
+            return list(net._ports[id(element)])
+        return [index]
 
     def equation_owners(self, net: Netlist) -> list[list[int]]:
         """Return the clusters that can change each derivative and output row."""

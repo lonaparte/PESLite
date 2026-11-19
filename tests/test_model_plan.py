@@ -19,6 +19,29 @@ def _successors(dependencies):
     return successors
 
 
+def test_record_fields_have_one_ordered_contract_for_fixed_and_dynamic_records():
+    class Base(Bag):
+        __slots__ = ("base",)
+
+    class Record(Base):
+        __slots__ = ("value",)
+
+    record = Record(value=2.0)
+    record.base = 1.0
+    assert kernel._record_fields(record) == ("base", "value")
+    assert kernel._public_fields(record) == ("base", "value")
+
+    class Dynamic:
+        def method(self):
+            return None
+
+    dynamic = Dynamic()
+    dynamic.first = 1.0
+    dynamic._cache = 2.0
+    assert kernel._record_fields(dynamic) == ("first", "_cache")
+    assert kernel._public_fields(dynamic) == ("first",)
+
+
 def test_residual_components_exclude_blocked_downstream_nodes_from_the_loop():
     dependencies = [set(), {0}, {1, 3}, {2}, {3}, {4}, set(), {7}]
     successors = _successors(dependencies)

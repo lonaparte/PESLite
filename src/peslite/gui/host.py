@@ -34,7 +34,7 @@ def _debug_model(workspace: Workspace, path: Path, plan: Any) -> tuple[Path, str
 
 def _native_preview(text: str, path: Path) -> dict[str, Any]:
     """Return diagnostics from the numerical parser; the browser renders the interface."""
-    from ..assembly.simulation_file import SimulationFileError, parse_native_text
+    from ..assembly.syntax import SimulationFileError, parse_native_text
     diagnostics = []
     try:
         parse_native_text(text, path)
@@ -196,7 +196,7 @@ class Host:
             text = params.get("text")
             if not isinstance(text, str):
                 raise WorkspaceError("preview requires source text")
-            from ..assembly.simulation_file import is_native_source
+            from ..assembly.syntax import is_native_source
             if is_native_source(text):
                 if method != "preview":
                     raise WorkspaceError("new-syntax schematics must be edited in source text")

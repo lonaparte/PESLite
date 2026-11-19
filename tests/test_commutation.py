@@ -5,7 +5,7 @@ import math
 import numpy as np
 import pytest
 
-from peslite.assembly.conduction import CommutationError, DiodeConduction
+from peslite.solver.commutation import CommutationError, Commutation
 from peslite.solver.model import Bag, Model
 
 
@@ -50,7 +50,7 @@ class _Ramp:
 def _handler(part, dt=0.1):
     from peslite.solver.integrators import FixedStepSolver
     model = Model({"ramp": part}, {})
-    return model, DiodeConduction(model, FixedStepSolver(dt, "RK4"))
+    return model, Commutation(model, FixedStepSolver(dt, "RK4"))
 
 
 def test_margin_commutation_is_located_and_its_state_written_back():
@@ -161,7 +161,7 @@ def test_located_and_scheduled_events_on_distinct_owners_share_the_boundary():
     clock = _Ramp(scheduled=[1.0])
     clock.flag = 1
     model = Model({"crossing": crossing, "clock": clock}, {})
-    handler = DiodeConduction(model, FixedStepSolver(0.25, "RK4"))
+    handler = Commutation(model, FixedStepSolver(0.25, "RK4"))
     handler.advance(0.0, 1.5, np.zeros(2))
     assert crossing.at == pytest.approx([1.0], abs=1e-14)
     assert clock.at == pytest.approx([1.0], abs=1e-14)
@@ -175,7 +175,7 @@ def test_bounded_current_and_margin_event_use_the_same_advance():
     branch.port1.voltage = -1.0
     ramp = _Ramp()
     model = Model({"branch": branch, "ramp": ramp}, {})
-    handler = DiodeConduction(model, FixedStepSolver(0.1, "RK4"))
+    handler = Commutation(model, FixedStepSolver(0.1, "RK4"))
     state = handler.advance(0.0, 2.0, model.get_initial_values())
     assert state[model.state_slice(branch, "i")][0] == 0.0
     assert state[model.state_slice(ramp, "x")][0] == pytest.approx(1.0, abs=1e-12)
@@ -194,6 +194,6 @@ def test_current_zero_locator_preserves_plain_float_solver_times():
     branch = RLBranch(1.0, 0.0, i0=0.5, phases=1, unilateral=True)
     branch.port1.voltage = -1.0
     model = Model({"branch": branch}, {})
-    handler = DiodeConduction(model, CheckingSolver(1.0, "RK4"))
+    handler = Commutation(model, CheckingSolver(1.0, "RK4"))
     state = handler.advance(0.0, 1.0, model.get_initial_values())
     assert state[0] == 0.0

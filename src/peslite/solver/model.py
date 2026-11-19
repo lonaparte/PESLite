@@ -123,6 +123,33 @@ class Empty(Bag):
     __slots__ = ()
 
 
+def _record_fields(record: Any) -> tuple[str, ...]:
+    """Return stored fields in declaration order for any PESLite record.
+
+    Fixed records declare ``__slots__`` (or named-tuple ``_fields``), while extension records may
+    add instance attributes dynamically. This is the single field-discovery contract used by the
+    model, circuit compiler and native exporter.
+    """
+    names: list[str] = []
+    for cls in reversed(type(record).__mro__):
+        declared = getattr(cls, "__slots__", ())
+        if isinstance(declared, str):
+            declared = (declared,)
+        names.extend(name for name in declared if name not in names)
+    names.extend(name for name in getattr(type(record), "_fields", ()) if name not in names)
+    dynamic = vars(record) if hasattr(record, "__dict__") else {}
+    names.extend(name for name in dynamic if name not in names)
+    return tuple(names)
+
+
+def _public_fields(record: Any) -> tuple[str, ...]:
+    """Return the public, non-callable fields exposed by a model record."""
+    return tuple(
+        name for name in _record_fields(record)
+        if not name.startswith("_") and not callable(getattr(record, name))
+    )
+
+
 @dataclass(frozen=True)
 class OutputMethod:
     """One output method of a subsystem and its direct input dependencies.
@@ -1782,7 +1809,7 @@ class Model:
             if produced.intersection(stage.outputs):
                 raise ValueError(f"{where}: an output has more than one producer")
             produced.update(stage.outputs)
-        outputs = {f for f in dir(sub.output) if not f.startswith("_") and not callable(getattr(sub.output, f))}
+        outputs = set(_public_fields(sub.output))
         missing = outputs - produced
         if missing:
             raise ValueError(f"{name}.output_stages: outputs without a producer: {sorted(missing)}")

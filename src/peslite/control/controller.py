@@ -31,19 +31,12 @@ from .loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, HERTZ, I, I_AB, LOOP_T
                     SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ,
                     Loop, SignalType, SyncLaw, loop_type)
 from .modulation import CONFIGURED, OutputStage
-from .profiles import (DutyReferenceParams, PhaseShiftReferenceParams, ReferenceParams,
-                       ResonantReferenceParams,
-                       ScalarCurrentReferenceParams, ScalarVoltageReferenceParams, control_profile,
-                       register_control_type, validate_duty_references,
-                       validate_phase_shift_references,
-                       validate_resonant_references,
-                       validate_scalar_voltage_references)
 
 __all__ = ["Measurement", "ConverterMeasurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
            "ControlInterface", "CONTROL_INTERFACE", "SAMPLED_VSC_INTERFACE",
-           "ControlGraph", "ControlGraphOverlay", "default_wiring",
+           "ControlGraph", "ControlGraphOverlay",
            "VSCController", "BridgeControlOutput", "GraphController",
-           "resolved_control_interface", "make_controller"]
+           "GraphController"]
 
 
 # ------------------------------------------------------------------ the interface
@@ -409,7 +402,7 @@ def continuous_control(unit: Any) -> bool:
     ctrl = getattr(unit, "ctrl", None)
     if ctrl is None:
         return True
-    profile = control_profile(ctrl)
+    profile = ctrl._profile
     if profile.wiring is None:
         return False
     connections, outputs = profile.wiring(unit, continuous=True)
@@ -449,6 +442,7 @@ class ControlGraph:
 
     def __init__(self, cfg, startup, connections, outputs, *, interface=CONTROL_INTERFACE,
                  continuous: bool | None = None,
+                 reference_validator=None,
                  cycle_iterations: int = DEFAULT_ALGEBRAIC_MAX_ITERATIONS,
                  cycle_atol: float = DEFAULT_ALGEBRAIC_ATOL,
                  cycle_rtol: float = DEFAULT_ALGEBRAIC_RTOL):
@@ -477,7 +471,7 @@ class ControlGraph:
         refs = cfg.ctrl.references
         self.reference_bindings = dict(_reference_bindings(cfg.ctrl))
         self._overlay_bindings = {}
-        self._reference_validator = control_profile(cfg.ctrl).reference_validator
+        self._reference_validator = reference_validator
         self.references = _reference_values(
             refs, attributes=bool(self.reference_bindings and self._reference_validator),
         )
@@ -1249,7 +1243,6 @@ class ControlGraph:
             for name, node in self.nodes.items()
             for field, value in node.observe().items()
         }
-
     def summary(self):
         """Return the nonempty summaries supplied by active loops."""
         result = {}
@@ -1355,95 +1348,6 @@ class ControlGraph:
     def _state_port(self, key):
         name, port = key.split(".", 1)
         return key + "_pu" if self.nodes[name].outputs[port].unit.startswith("pu_") else key
-
-
-# ------------------------------------------------------------------ the default wiring
-
-def _role_finder(cfg, label: str):
-    """Return a resolver which enforces one configured loop per semantic role."""
-    roles = {
-        name: getattr(LOOP_TYPES.get(params.type), "role", None)
-        for name, params in cfg.ctrl.loops.items()
-    }
-
-    def find(role):
-        found = [name for name, value in roles.items() if value == role]
-        if len(found) > 1:
-            raise ConfigError(
-                f"ctrl.loops: ambiguous {label} role {found}; use explicit "
-                "ctrl.connections and ctrl.outputs"
-            )
-        return found[0] if found else None
-
-    return find
-
-def default_wiring(cfg, family, *, continuous=False):
-    """Return the default ``(connections, outputs)`` for family ``"gfl"`` or ``"gfm"``.
-
-    Each loop is wired by its role (:attr:`peslite.control.loops.Loop.role`), so a registered loop
-    type takes the place of the built-in one of its role.
-    """
-    loops = cfg.ctrl.loops
-    roles = {name: getattr(LOOP_TYPES.get(p.type), "role", None) for name, p in loops.items()}
-    find = _role_finder(cfg, family)
-    pll, sync = find("pll"), find("sync")
-    angle = pll if family == "gfl" else sync
-    frame = f"{angle}.frame" if angle else "references.theta"
-    theta = f"{angle}.theta" if angle else "references.theta"
-    omega = f"{angle}.omega" if angle else "references.omega"
-    dc, cc = find("dc_voltage"), find("current")
-    modulation = find("modulation")
-    va, vi, damping = find("admittance"), find("impedance"), find("damping")
-    extra = f"{damping}.extra" if damping else "references.zero_v_pu"
-    command = vi if family == "gfm" and vi else cc
-    ports_of = {
-        "pll": {"v": "meas.u_g"},
-        "dc_voltage": {"voltage": "meas.u_dc", "reference": "references.vdc_ref_pu"},
-        "current": {"v": "meas.u_g", "i": "meas.i_c", "frame": frame, "omega": omega,
-                    "extra": extra,
-                    "id_ref": (f"{va}.id_ref" if va else f"{dc}.current_reference"
-                               if dc else "references.id_ref_pu"),
-                    "iq_ref": f"{va}.iq_ref" if va else "references.iq_ref_pu"},
-        "sync": {"v": "meas.u_g", "i": "meas.i_c",
-                 "u_dc": "meas.u_dc", "p_ref": "references.p_ref_pu", "q_ref": "references.q_ref_pu",
-                 "v_ref": "references.v_ref_pu"},
-        "impedance": {"v_ref": f"{sync}.v_ref", "frame": frame, "omega": omega, "i": "meas.i_c",
-                      "extra": extra},
-        "admittance": {"v_ref": f"{sync}.v_ref", "frame": frame, "omega": omega, "v": "meas.u_g"},
-        "damping": {"i": "meas.i_c", "frame": frame},
-        "modulation": {
-            "u_dq": f"{command}.u_dq",
-            "theta": theta,
-            "u_dc": "meas.u_dc",
-            "v": "meas.u_g",
-            "i": "meas.i_c",
-            "frame": frame,
-            "omega": omega,
-            "id_ref": (f"{va}.id_ref" if va else f"{dc}.current_reference"
-                       if dc else "references.id_ref_pu"),
-            "iq_ref": f"{va}.iq_ref" if va else "references.iq_ref_pu",
-            "extra": extra,
-        },
-    }
-    wires = {f"{name}.{port}": source for name, role in roles.items()
-             for port, source in ports_of.get(role, {}).items()
-             if port in LOOP_TYPES[loops[name].type].inputs}
-    if continuous:
-        if command is None:
-            return wires, {}
-        return wires, {"u_dq": f"{command}.u_dq", "theta": theta, "omega": omega}
-    if modulation is None:
-        raise ConfigError(f"ctrl.loops: sampled {family} control needs a modulation loop")
-    outputs = {
-        "d_a": f"{modulation}.d_a",
-        "d_b": f"{modulation}.d_b",
-        "d_c": f"{modulation}.d_c",
-        "theta": theta,
-        "omega": omega,
-    }
-    if "enable" in LOOP_TYPES[loops[modulation].type].outputs:
-        outputs["enable"] = f"{modulation}.enable"
-    return wires, outputs
 
 
 # ------------------------------------------------------------------ the controller
@@ -1644,12 +1548,15 @@ class VSCController(_GraphRuntime):
         # A continuous controller already participates in construction-time energy probes, before
         # VSC.start() applies its scenario. Keep its ideal source off until that command arrives.
         self.startup = ContinuousStartup(run=False) if self.continuous else Startup(cfg.ctrl.period)
-        profile = control_profile(cfg.ctrl)
+        profile = cfg.ctrl._profile
         wires, outputs = profile.wiring(cfg, continuous=self.continuous)
-        interface = resolved_control_interface(cfg.ctrl, self.continuous)
+        resolver = getattr(profile.controller_factory, "resolve_interface", None)
+        interface = (profile.interface if resolver is None
+                     else resolver(profile, self.continuous))
         self.graph = graph = ControlGraph(
             cfg, self.startup, wires, outputs, interface=interface,
             continuous=self.continuous,
+            reference_validator=profile.reference_validator,
         )
         self._carried_outputs = tuple(
             port for port in interface.auxiliary_outputs(graph.outputs) if port != "enable"
@@ -2113,89 +2020,6 @@ PHASE_SHIFT_CONVERTER_INTERFACE = ControlInterface(
 )
 
 
-def _converter_log_sources(outputs: tuple[str, ...] = ("duty",),
-                           **specific: str) -> Mapping[str, str]:
-    """Build the common scalar-converter log boundary in display order."""
-    return MappingProxyType({
-        "current": "meas.current",
-        "voltage": "meas.voltage",
-        "power": "meas.power",
-        **specific,
-        **{name: name for name in outputs},
-        "in_service": "startup.active",
-    })
-
-
-_DC_LOG_SOURCES = _converter_log_sources(
-    voltage_reference="references.voltage",
-    input_voltage="meas.vin",
-)
-
-
-_RESONANT_LOG_SOURCES = _converter_log_sources(
-    input_voltage="meas.vin",
-    modulation="references.modulation",
-    frequency="references.frequency",
-    phase="references.phase",
-    power_reference="references.power",
-)
-
-
-_PHASE_SHIFT_LOG_SOURCES = _converter_log_sources(
-    ("width", "phase", "frequency", "mode"),
-    input_voltage="meas.vin",
-    width_reference="references.width",
-    phase_reference="references.phase",
-    power_reference="references.power",
-)
-
-
-def _modulation_wiring(cfg, *, continuous=False):
-    """Wire the modulation-role loop: each of its inputs named like a reference of the control
-    type reads that reference, and each controller output reads the loop output of its name."""
-    find = _role_finder(cfg, cfg.ctrl.type)
-    modulation = find("modulation")
-    if modulation is None:
-        return {}, {}
-    interface = control_profile(cfg.ctrl).interface
-    loop = LOOP_TYPES[cfg.ctrl.loops[modulation].type]
-    connections = {f"{modulation}.{port}": f"references.{port}" for port in loop.inputs
-                   if f"references.{port}" in interface.inputs}
-    outputs = {port: f"{modulation}.{port}" for port in interface.outputs if port in loop.outputs}
-    return connections, outputs
-
-
-def _dc_converter_wiring(cfg, *, continuous=False):
-    find = _role_finder(cfg, cfg.ctrl.type)
-    voltage, current = find("dc_voltage"), find("current")
-    wires = {}
-    if voltage is not None:
-        wires.update({
-            f"{voltage}.reference": "references.voltage",
-            f"{voltage}.voltage": "meas.voltage",
-        })
-    if current is not None:
-        interface = control_profile(cfg.ctrl).interface
-        reference = (f"{voltage}.current_reference" if voltage is not None
-                     else "references.current" if "references.current" in interface.inputs
-                     else None)
-        sources = {
-            "reference": reference,
-            "current": "meas.current",
-            "voltage": "meas.voltage",
-            "vin": "meas.vin",
-            "feedforward": "meas.duty_feedforward",
-        }
-        loop = LOOP_TYPES[cfg.ctrl.loops[current].type]
-        wires.update({f"{current}.{port}": sources[port] for port in loop.inputs
-                      if port in sources and sources[port] is not None})
-        outputs = {port: f"{current}.{port}" for port in interface.outputs
-                   if port in loop.outputs}
-    else:
-        outputs = {}
-    return wires, outputs
-
-
 @dataclass
 class ConverterMeasurement:
     """SI sample at a scalar converter's public control boundary."""
@@ -2235,15 +2059,16 @@ class GraphController(_GraphRuntime):
             ContinuousStartup(run=False) if self.continuous
             else Startup(cfg.ctrl.period, run=False)
         )
-        profile = control_profile(cfg.ctrl)
+        profile = cfg.ctrl._profile
         connections, outputs = profile.wiring(cfg, continuous=self.continuous)
         self.graph = ControlGraph(
             cfg,
             self.startup,
             connections,
             outputs,
-            interface=resolved_control_interface(cfg.ctrl, self.continuous),
+            interface=self.resolve_interface(profile, self.continuous),
             continuous=self.continuous,
+            reference_validator=profile.reference_validator,
         )
         self.outputs_need_inputs = any(
             isinstance(source, str) and source.startswith("meas.")
@@ -2403,93 +2228,3 @@ class GraphController(_GraphRuntime):
             **self.graph.summary(),
             "alarms": [],
         }
-
-
-def resolved_control_interface(control, continuous: bool) -> ControlInterface:
-    """Resolve a graph boundary through its selected controller implementation."""
-    profile = control_profile(control)
-    resolver = getattr(profile.controller_factory, "resolve_interface", None)
-    return profile.interface if resolver is None else resolver(profile, continuous)
-
-
-def make_controller(cfg, **kwargs):
-    """Build the controller resolved for one Unit's control graph."""
-    factory = control_profile(cfg.ctrl).controller_factory
-    if factory is None:
-        raise ConfigError("the control graph has no controller factory for this Unit type")
-    return factory(cfg, **kwargs)
-
-
-for _control_name in ("gfl", "gfm"):
-    register_control_type(
-        _control_name,
-        references=ReferenceParams,
-        unit_types=frozenset(("vsc",)),
-        interface=CONTROL_INTERFACE,
-        wiring=lambda cfg, continuous=False, family=_control_name: default_wiring(
-            cfg, family, continuous=continuous,
-        ),
-        grid_following=_control_name == "gfl",
-        default_bridge="three_phase_bridge",
-        controller_factory=VSCController,
-        default_loops={"modulation": "ThreePhaseModulation"},
-    )
-register_control_type(
-    "dc",
-    references=ScalarVoltageReferenceParams,
-    unit_types=frozenset(("dc_converter",)),
-    interface=DC_CONVERTER_INTERFACE,
-    wiring=_dc_converter_wiring,
-    log_sources=_DC_LOG_SOURCES,
-    default_bridge="half_bridge",
-    controller_factory=GraphController,
-    reference_validator=validate_scalar_voltage_references,
-)
-register_control_type(
-    "current",
-    references=ScalarCurrentReferenceParams,
-    unit_types=frozenset(("dc_converter",)),
-    interface=CURRENT_CONVERTER_INTERFACE,
-    wiring=_dc_converter_wiring,
-    log_sources=_converter_log_sources(
-        input_voltage="meas.vin",
-        current_reference="references.current",
-    ),
-    default_bridge="half_bridge",
-    controller_factory=GraphController,
-)
-register_control_type(
-    "open_loop",
-    references=DutyReferenceParams,
-    unit_types=frozenset(("dc_converter",)),
-    interface=OPEN_LOOP_CONVERTER_INTERFACE,
-    wiring=_modulation_wiring,
-    log_sources=_converter_log_sources(input_voltage="meas.vin",
-                                       duty_reference="references.duty"),
-    default_bridge="half_bridge",
-    controller_factory=GraphController,
-    reference_validator=validate_duty_references,
-)
-register_control_type(
-    "phase_shift",
-    references=PhaseShiftReferenceParams,
-    unit_types=frozenset(("dc_converter",)),
-    interface=PHASE_SHIFT_CONVERTER_INTERFACE,
-    wiring=_modulation_wiring,
-    log_sources=_PHASE_SHIFT_LOG_SOURCES,
-    default_bridge="full_bridge",
-    controller_factory=GraphController,
-    reference_validator=validate_phase_shift_references,
-    modulator="phase_shift",
-)
-register_control_type(
-    "resonant",
-    references=ResonantReferenceParams,
-    unit_types=frozenset(("dc_converter",)),
-    interface=RESONANT_CONVERTER_INTERFACE,
-    wiring=_modulation_wiring,
-    log_sources=_RESONANT_LOG_SOURCES,
-    default_bridge="full_bridge",
-    controller_factory=GraphController,
-    reference_validator=validate_resonant_references,
-)

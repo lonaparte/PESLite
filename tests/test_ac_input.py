@@ -6,7 +6,7 @@ import pytest
 
 import peslite
 from peslite.assembly.params import ConfigError, from_dict
-from peslite.components.network import ACVoltageSource
+from peslite.components.source import ACVoltageSource
 
 
 def _rectifier_tree(source_bus="rectifier.power"):

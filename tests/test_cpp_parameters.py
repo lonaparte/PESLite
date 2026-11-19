@@ -312,7 +312,7 @@ def test_initial_connection_does_not_replace_a_scheduled_command(at, tmp_path):
 def test_connection_config_template_keeps_json_values_typed_without_yaml(monkeypatch):
     import builtins
     from peslite.assembly.cpp import _RuntimeParameters
-    from peslite.assembly.simulation_file import parse_native_text
+    from peslite.assembly.syntax import parse_native_text
 
     runtime = _RuntimeParameters(_case("buck", "pwm_averaging"), ("units.converter.connected",))
     original_import = builtins.__import__

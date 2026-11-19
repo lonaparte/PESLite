@@ -136,7 +136,7 @@ def test_real_circuit_shunt_injection_recovers_resistor_impedance(tmp_path):
 
 def test_recorded_nested_unit_controller_signals_keep_their_own_sample_clock():
     t = np.arange(0, 0.1, 0.001)
-    name = "charger.primary.VirtualDutyInjection.before_d"
+    name = "charger.primary.feedback_before"
     samples = np.cos(math.tau * 20 * t)
     result = _fake_result(t, ctrl={"charger.primary.t": t, name: samples})
     observed_t, values = recorded_signal(result, name)

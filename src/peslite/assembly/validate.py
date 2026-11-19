@@ -17,7 +17,7 @@ from ..components.converter import make_topology
 from ..components.pwm import validate_modulator
 from ..components.network import GROUND, element_buses
 from ..control.controller import continuous_control
-from ..control.profiles import control_profile
+from .control import control_profile
 from ..solver.integrators import (ADAPTIVE_METHODS, EXPLICIT_FIXED_METHODS, FIXED_METHODS,
                                   IMPLICIT_ADAPTIVE_METHODS, IMPLICIT_FIXED_METHODS)
 from ..solver.model import ConfigError
@@ -26,7 +26,7 @@ from ..solver.timing import (TIME_EPS, PeriodicClock, control_actuation_clock,
                              control_clock_offset, control_computation as _computation,
                              control_period as _period)
 from .events import NAMED, SWITCHABLE, SWITCHING
-from .types import unit_type
+from .params import unit_type
 
 if TYPE_CHECKING:
     from .params import Params
@@ -314,7 +314,10 @@ def _converter(u, base, where: str):
         dead_time_active = pwm_timed and not topology.unilateral
         _pwm(u.pwm, base, f"{where}.pwm", carrier_unused=not pwm_timed,
              dead_time_active=dead_time_active)
-        validate_modulator(u, topology, where, dead_time_active=dead_time_active)
+        validate_modulator(
+            u, topology, where, kind=profile.modulator,
+            dead_time_active=dead_time_active,
+        )
         _timing(u.ctrl, u.pwm, f"{where}.ctrl", continuous, pwm_timed=pwm_timed)
         _control(u.ctrl, u.pwm, f"{where}.ctrl", continuous)
     protection = u.protection
@@ -372,111 +375,6 @@ def _dc_converter(u, base, where: str, *, nested: bool = False) -> None:
             and u.pwm.sync != "asynchronous"):
         raise ConfigError(f"{where}.pwm.sync: scalar converters require asynchronous PWM")
 
-
-def _wpt(u, base, where: str, *, nested: bool = False) -> None:
-    """Check a WPT composite and its shared compensated magnetic link."""
-    for side in unit_type(u.type).children:
-        child = getattr(u, side)
-        child_where = f"{where}.{side}"
-        spec = unit_type(child.type, f"{child_where}.type")
-        if spec.phases != 1 or spec.composite:
-            raise ConfigError(
-                f"{child_where}: a WPT child needs a scalar, non-composite unit"
-            )
-        spec.validator(child, base, child_where, nested=True)
-    link = u.link
-    _switch_controlled_capacitors(u, where)
-    if link.type == "ss_multi":
-        _multi_link(link, f"{where}.link")
-        return
-    positive = ["primary_inductance", "secondary_inductance"]
-    nonnegative = ["primary_resistance", "secondary_resistance"]
-    for side in unit_type(u.type).children:
-        if hasattr(link, f"{side}_compensation_inductance"):
-            positive += [f"{side}_series_capacitance", f"{side}_compensation_inductance",
-                         f"{side}_parallel_capacitance"]
-            nonnegative += [f"{side}_compensation_resistance", f"{side}_parallel_resistance"]
-        else:
-            positive.append(f"{side}_capacitance")
-    for name in positive:
-        value = getattr(link, name)
-        if not math.isfinite(value) or value <= 0.0:
-            raise ConfigError(f"{where}.link.{name} must be finite and positive")
-    for name in nonnegative:
-        value = getattr(link, name)
-        if not math.isfinite(value) or value < 0.0:
-            raise ConfigError(f"{where}.link.{name} must be finite and nonnegative")
-    if not math.isfinite(link.mutual_inductance):
-        raise ConfigError(f"{where}.link.mutual_inductance must be finite")
-    determinant = (
-        link.primary_inductance * link.secondary_inductance
-        - link.mutual_inductance * link.mutual_inductance
-    )
-    if determinant <= 0.0:
-        raise ConfigError(
-            f"{where}.link: the coupled-inductor matrix must be positive definite "
-            "(mutual_inductance^2 < primary_inductance * secondary_inductance)"
-        )
-
-
-def _switch_controlled_capacitors(u, where: str) -> None:
-    """Check the switch-controlled capacitors of a WPT link and their same-side converters."""
-    for side in unit_type(u.type).children:
-        child = getattr(u, side)
-        ctrl = child.ctrl
-        clocked = ctrl is not None and child.bridge.pwm_timed and child.pwm is not None
-        commanded = ctrl is not None and "scc_angle" in ctrl.outputs
-        scc = getattr(u.link, f"{side}_scc", None)
-        at = f"{where}.link.{side}_scc"
-        if scc is None:
-            if commanded:
-                raise ConfigError(f"{where}.{side}.ctrl.outputs.scc_angle: the link has no "
-                                  f"{side}_scc with command: 1")
-            continue
-        if not math.isfinite(scc.capacitance) or scc.capacitance <= 0.0:
-            raise ConfigError(f"{at}.capacitance must be finite and positive")
-        if not math.isfinite(scc.angle) or not 0.0 <= scc.angle <= math.pi:
-            raise ConfigError(f"{at}.angle must be in [0, pi]")
-        if not math.isfinite(scc.sync_angle):
-            raise ConfigError(f"{at}.sync_angle must be finite")
-        if scc.sync == "bridge" and not clocked:
-            raise ConfigError(f"{at}.sync: 'bridge' needs a clocked bridge on the {side} side")
-        if scc.command and not (clocked and commanded):
-            raise ConfigError(f"{at}.command needs a clocked controller output scc_angle "
-                              f"on the {side} side (ctrl.outputs.scc_angle)")
-        if commanded and not scc.command:
-            raise ConfigError(f"{where}.{side}.ctrl.outputs.scc_angle: {at}.command is off")
-        if scc.command and scc.angle != 0.0:
-            raise ConfigError(f"{at}.angle is not used with command: the angle is the "
-                              "controller output scc_angle (0 before its first write)")
-
-
-def _multi_link(link, where: str) -> None:
-    """Check the coil matrix and per-module values of a multi-module series-series link."""
-    names = ("primary_capacitance", "secondary_capacitance",
-             "primary_resistance", "secondary_resistance")
-    try:
-        matrix = np.asarray(link.inductance, dtype=float)
-        vectors = {name: np.asarray(getattr(link, name), dtype=float) for name in names}
-    except (TypeError, ValueError):
-        raise ConfigError(f"{where}: inductance must be a numeric matrix and the per-module "
-                          "values numeric lists") from None
-    modules = vectors["primary_capacitance"].size
-    if modules < 1 or any(vector.shape != (modules,) for vector in vectors.values()):
-        raise ConfigError(f"{where}: {', '.join(names)} must be lists of one value per module")
-    if matrix.shape != (2 * modules, 2 * modules):
-        raise ConfigError(f"{where}.inductance must be a {2 * modules} x {2 * modules} matrix "
-                          f"for {modules} module(s)")
-    if not np.all(np.isfinite(matrix)) or not np.allclose(matrix, matrix.T, rtol=1e-12, atol=0.0):
-        raise ConfigError(f"{where}.inductance must be finite and symmetric")
-    if np.linalg.eigvalsh(matrix).min() <= 0.0:
-        raise ConfigError(f"{where}.inductance must be positive definite")
-    for name in names:
-        vector = vectors[name]
-        positive = name.endswith("capacitance")
-        if not np.all(np.isfinite(vector)) or np.any(vector <= 0.0 if positive else vector < 0.0):
-            raise ConfigError(f"{where}.{name} must be finite and "
-                              f"{'positive' if positive else 'nonnegative'}")
 
 
 def _network(p: Params) -> None:

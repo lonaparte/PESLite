@@ -20,16 +20,17 @@ import numpy as np
 from ..components.adc import ADC, ADCSample, MeasurementPorts, _PortMeasurement
 from ..components.converter import (HalfBridgeDiodeConduction, make_bridge, make_dclink,
                                     make_topology)
-from ..components.network import RLBranch, Port
+from ..components.network import Port
+from ..components.passive import RLBranch
 from ..components.pwm import Modulator
 from ..control.blocks import phases
 from ..control.controller import (Controller, ConverterMeasurement,
-                                  Measurement, continuous_control, make_controller)
+                                  Measurement, continuous_control)
 from ..solver.timing import TIME_EPS, PeriodicClock, control_clock_offset, resolve_clock_offset
 from .events import Scenario
-from .params import SimulationParams, UnitParams, _parameterized
+from .control import make_control_modulator, make_controller
+from .params import SimulationParams, UnitParams, _parameterized, unit_type
 from .protection import Protection, ProtectionSample
-from .types import unit_type
 
 __all__ = ["Plant", "Unit", "VSC", "DCConverter"]
 
@@ -698,7 +699,11 @@ class VSC(Unit):
         try:
             self.bridge = _parameterized(
                 lambda c: make_bridge(
-                    c, modulator, continuous=continuous_control(c),
+                    c,
+                    modulator if modulator is not None else (
+                        None if continuous_control(c) else make_control_modulator(c)
+                    ),
+                    continuous=continuous_control(c),
                 ),
                 cfg,
             )
@@ -848,7 +853,11 @@ class DCConverter(Unit):
         topology = make_topology(cfg.bridge)
         self.bridge = _parameterized(
             lambda c: make_bridge(
-                c, modulator, topology=topology,
+                c,
+                modulator if modulator is not None else (
+                    None if continuous_control(c) else make_control_modulator(c)
+                ),
+                topology=topology,
                 continuous=continuous_control(c),
             ),
             cfg,

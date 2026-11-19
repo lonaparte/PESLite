@@ -12,7 +12,7 @@ import pytest
 
 import peslite
 from peslite.assembly import imperix
-from peslite.assembly.imperix_build import build_project
+from peslite.assembly.imperix import build_project
 from peslite.components.converter import make_topology
 from peslite.control.blocks import phases
 from peslite.control.controller import Measurement, VSCController
@@ -1533,4 +1533,4 @@ def test_host_or_invalid_elf_cannot_be_published(change, message, tmp_path):
     path = tmp_path / "bad.elf"
     path.write_bytes(data)
     with pytest.raises(RuntimeError, match=message):
-        imperix.imperix_build._elf(path, 40)
+        imperix._elf(path, 40)

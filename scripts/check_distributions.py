@@ -54,13 +54,13 @@ def main(directory: str = "dist") -> int:
     required = {
         "peslite-core": (
             "peslite/addons/functions/__init__.py",
-            "peslite/addons/formats/__init__.py",
             "share/peslite/examples/templates/template.pes",
         ),
         "peslite": (
             "peslite/addons/components/magcomponent.py",
-            "peslite/addons/components/thermal/__init__.py",
-            "peslite/addons/formats/legacy_yaml.py",
+            "peslite/addons/components/thermalcomponent.py",
+            "peslite/addons/components/thermalnetwork.py",
+            "peslite/addons/functions/legacy_yaml.py",
             "peslite/addons/functions/thermal/__init__.py",
             "peslite/addons/functions/stability.py",
             "share/peslite/examples/gfl-example.pes",

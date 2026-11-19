@@ -10,15 +10,15 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Mapping, Optional
 
-from ..components.network import (ACVoltageSource, Bus, ELEMENT_TYPES, GROUND, RCNode, RLBranch,
-                                  Port, resolve_endpoints)
+from ..components.network import ELEMENT_TYPES, GROUND, Port, resolve_endpoints
+from ..components.passive import Bus, RCNode, RLBranch
+from ..components.source import ACVoltageSource
 from ..components.adc import _PortMeasurement
-from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather, scatter
 from .events import SWITCHABLE, Scenario, SourceScenario
-from .params import Change, Params, _parameterized, _split_path, _unit_leaves, _unit_path
-from .types import unit_type
+from .params import (Change, Params, _parameterized, _split_path, _unit_leaves, _unit_path,
+                     unit_type)
 from .unit import DCConverter, Unit, VSC
 
 __all__ = ["System"]
@@ -190,19 +190,6 @@ def _validate_electrical_domains(
             )
 
 
-class _WPTSignals:
-    """Expose shared link quantities without making the composite a scheduled unit."""
-
-    def __init__(self, name: str, link: Any) -> None:
-        self.name = name
-        self.link = link
-        self._outputs = tuple(type(link.output).__slots__)
-
-    def signals(self) -> dict[str, float]:
-        out = self.link.output
-        return {f"{self.name}.link.{name}": getattr(out, name) for name in self._outputs}
-
-
 def _source_scenario(p: Params, path: str, select: Callable[[Params], Any]) -> SourceScenario:
     """Construct a source timeline using one parameter path and selector."""
     paths = {f"{path}.{field}" for field in ("v", "f", "angle")}
@@ -340,33 +327,6 @@ def _assemble_dc_converter(name: str, cfg: Any, system: "System",
         default_port=unit_type(cfg.type).default_port,
         unit_port_bindings=bindings,
     )
-
-
-def _assemble_wpt(name: str, cfg: Any, system: "System",
-                  parts: Mapping[str, Any]) -> _UnitAssembly:
-    if _part(parts, name) is not None:
-        raise ConfigError(
-            f"parts.{name}: a composite WPT unit is assembled from its primary and secondary parts"
-        )
-    link = _parameterized(make_wpt_link, cfg.link)
-    assembly = _UnitAssembly(
-        subsystems={f"{name}.link": link},
-        signal_sources=(_WPTSignals(name, link),),
-        default_port=unit_type(cfg.type).default_port,
-    )
-    for side in unit_type(cfg.type).children:
-        child = _assemble_unit(f"{name}.{side}", getattr(cfg, side), system, parts)
-        physical_port = getattr(link, f"{side}_port")
-        child.attach(physical_port, f"units.{name}.{side}", "power")
-        for scc in link.switched:
-            if scc.side == side:
-                scc.bind_bridge(child.units[child.port("power").owner].bridge)
-        assembly.ports[side] = child.port()
-        assembly.include(child)
-    default = assembly.port()
-    assembly.unit_port_bindings[f"{name}.link"] = (default,)
-    return assembly
-
 
 def _assemble_unit(name: str, cfg: Any, system: "System",
                    parts: Mapping[str, Any]) -> _UnitAssembly:

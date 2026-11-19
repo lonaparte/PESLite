@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 from conftest import EXAMPLES
-from peslite.assembly.simulation_file import parse_native_text
+from peslite.assembly.syntax import parse_native_text
 from peslite.addons.functions import legacy_yaml_patch, legacy_yaml_preview
 from peslite.gui.workspace import patched_text, WorkspaceError
 
@@ -73,8 +73,10 @@ def test_invalid_yaml_is_diagnostic_and_rejected_without_writes():
 def test_legacy_adapter_is_a_lazy_function_addon():
     from peslite.addons import functions
 
+    assert 'read_legacy_yaml' in functions.__all__
     assert 'legacy_yaml_preview' in functions.__all__
     assert 'legacy_yaml_patch' in functions.__all__
+    assert functions._EXPORTS['read_legacy_yaml'] == ('legacy_yaml', 'read_legacy_yaml')
     assert functions._EXPORTS['legacy_yaml_preview'] == ('peslite.gui.legacy_yaml', 'preview')
 
 

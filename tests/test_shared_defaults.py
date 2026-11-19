@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from peslite.addons.functions.stability import small_signal, small_signal_report
-from peslite.assembly.conduction import DiodeConduction
+from peslite.solver.commutation import Commutation
 from peslite.assembly.cpp import _CppGenerator
 from peslite.assembly.params import OutputParams, PWMParams, SolverParams
 from peslite.components.pwm import (CarrierComparison, PhaseShiftModulator,
@@ -99,7 +99,7 @@ def test_shared_solver_defaults_are_selected_by_each_parameter_interface():
 def test_shared_execution_defaults_are_selected_by_their_owners():
     control = _defaults(ControlGraph)
     algebraic = _defaults(_AlgebraicLoop)
-    conduction = _defaults(DiodeConduction)
+    conduction = _defaults(Commutation)
     cpp = _defaults(_CppGenerator.source)
 
     assert control["cycle_iterations"] == DEFAULT_ALGEBRAIC_MAX_ITERATIONS
@@ -117,7 +117,7 @@ def test_shared_execution_defaults_are_selected_by_their_owners():
     assert runtime_loop.max_sweeps == DEFAULT_ALGEBRAIC_MAX_ITERATIONS
     assert runtime_loop.atol == DEFAULT_ALGEBRAIC_ATOL
     assert runtime_loop.rtol == DEFAULT_ALGEBRAIC_RTOL
-    runtime_conduction = DiodeConduction(SimpleNamespace(subsystems=()))
+    runtime_conduction = Commutation(SimpleNamespace(subsystems=()))
     assert runtime_conduction.max_transitions == DEFAULT_COMMUTATION_MAX_TRANSITIONS
     assert runtime_conduction.locator_iterations == DEFAULT_COMMUTATION_LOCATOR_ITERATIONS
 

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from peslite.addons.components.thermal import (
+from peslite.addons.components.thermalnetwork import (
     LumpedThermalNetwork, SharedThermalModel, SharedThermalNetwork, ThermalLink,
 )
 from peslite.addons.components.thermalport import (

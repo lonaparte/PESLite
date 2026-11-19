@@ -1,4 +1,4 @@
-# PESLite 0.5.2
+# PESLite 0.6.0
 # Open-loop Buck with a repeating duty-ratio table evaluated at controller interrupts.
 
 @circuit

@@ -1,4 +1,4 @@
-"""Physical series-voltage and shunt-current injection on the native circuit netlist.
+"""Physical series-voltage and shunt-current perturbations on the native circuit netlist.
 
 Positive series voltage raises the downstream bus relative to its upstream
 inlet. Positive shunt current flows *into* the measured bus from ground; its

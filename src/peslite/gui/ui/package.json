@@ -1,7 +1,7 @@
 {
   "name": "@peslite/workspace-ui",
   "private": true,
-  "version": "0.5.2",
+  "version": "0.6.0",
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit && vite build",

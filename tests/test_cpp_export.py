@@ -894,7 +894,7 @@ def test_generated_cpp_matches_python_for_adaptive_dcm(mode, tmp_path):
         params, tmp_path / f"adaptive-{mode}", compiler
     )
 
-    assert source.read_text(encoding="utf-8").count("class DiodeConduction") == 1
+    assert source.read_text(encoding="utf-8").count("class Commutation") == 1
     expected = _final_csv(python_out / "states.csv")
     actual = _final_csv(cpp_out / "states.csv")
     scale = max(1.0, max(abs(value) for value in expected.values()))
@@ -966,7 +966,7 @@ def test_generated_cpp_matches_composite_wpt_with_independent_clocks(mode, tmp_p
         params, tmp_path / f"wpt-{mode}", compiler
     )
 
-    assert "class DiodeConduction" not in source.read_text(encoding="utf-8")
+    assert "class Commutation" not in source.read_text(encoding="utf-8")
     expected = _final_csv(python_out / "states.csv")
     actual = _final_csv(cpp_out / "states.csv")
     assert actual.keys() == expected.keys()

@@ -1,24 +1,250 @@
-"""Electrothermal add-ons composed with PESLite's existing electrical Model.
-
-Thermal state is an ordinary restartable subsystem; no second electrical circuit,
-RHS integrator or global thermal configuration is introduced.
-"""
+"""Temperature-dependent physical components."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Mapping
+from typing import Any, ClassVar, Mapping, Protocol, Sequence
 
 import numpy as np
 
-from ....components.network import Element, register_component_type
-from ....solver import Bag, ConfigError, Empty
-from ...functions.thermal import SemiconductorLossModel, SwitchingEvent
-from ...functions.thermal.losses import _lookup
-from .network import FosterImpedance, LumpedThermalNetwork, _positive, _record
+from ...components.network import Element, NetworkComponent, register_component_type
+from ...solver import Bag, ConfigError, Empty, OutputMethod, Port
+from ..functions.thermal import SemiconductorLossModel, SwitchingEvent
+from ..functions.thermal.losses import _lookup
+from .thermalnetwork import FosterImpedance, LumpedThermalNetwork, _positive, _record
 
-__all__ = ["ElectroThermalModel", "ElectroThermal"]
+__all__ = [
+    "ThermalComponent", "ThermalParams", "ThermalPropertyLaw",
+    "ThermalResistor", "ThermalResistorModel",
+    "ElectroThermal", "ElectroThermalModel",
+]
+
+
+class ThermalPropertyLaw(Protocol):
+    """Return named physical properties at one component temperature."""
+
+    property_names: tuple[str, ...]
+
+    def properties(self, temperature_K: float) -> Sequence[float]: ...
+
+
+@dataclass(frozen=True, kw_only=True)
+class ThermalParams:
+    """Common temperature connection for thermal component adapters."""
+
+    temperature_source: str = field(metadata={"runtime": False})
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.temperature_source, str) or not self.temperature_source:
+            raise ConfigError("temperature_source must name a physical output")
+
+
+class ThermalComponent(NetworkComponent):
+    """Physical component whose constitutive properties depend on temperature.
+
+    Concrete components retain the ordinary network-component interface. The thermal addon only
+    adds a named property law, a temperature input and a realized-loss output.
+    """
+
+    def __init__(self, thermal_law: ThermalPropertyLaw) -> None:
+        names = tuple(getattr(thermal_law, "property_names", ()))
+        if (
+            not names
+            or any(not isinstance(name, str) or not name.isidentifier() for name in names)
+            or len(set(names)) != len(names)
+            or not callable(getattr(thermal_law, "properties", None))
+        ):
+            raise TypeError(
+                "a thermal property law needs unique property_names and properties(temperature_K)"
+            )
+        self.thermal_law = thermal_law
+        self.thermal_property_names = names
+
+    def temperature_K(self) -> float:
+        """Return the connected physical temperature."""
+        try:
+            temperature = float(self.input.temperature_K)
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("a thermal component needs a numeric temperature_K input") from None
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("thermal component temperature_K must be finite and positive")
+        return temperature
+
+    def _thermal_property_values(self) -> tuple[float, ...]:
+        """Evaluate and validate the current constitutive-property vector."""
+        try:
+            values = tuple(self.thermal_law.properties(self.temperature_K()))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"cannot evaluate thermal component properties: {exc}") from None
+        if len(values) != len(self.thermal_property_names):
+            raise ValueError("thermal property values must match property_names")
+        try:
+            values = tuple(float(value) for value in values)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("thermal component properties must be numeric") from None
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("thermal component properties must be finite")
+        return values
+
+    def thermal_properties(self) -> Mapping[str, float]:
+        """Return the component's current constitutive properties by name."""
+        return dict(zip(self.thermal_property_names, self._thermal_property_values()))
+
+    def dissipated_power(self) -> float:
+        """Return the realized loss published by the concrete component."""
+        try:
+            loss = float(self.output.loss_W)
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("a thermal component must publish numeric loss_W") from None
+        if not math.isfinite(loss) or loss < 0.0:
+            raise ValueError("thermal component loss_W must be finite and nonnegative")
+        return loss
+
+    @staticmethod
+    def supplied_power() -> float:
+        return 0.0
+
+
+class _Input(Bag):
+    __slots__ = ("voltage", "temperature_K")
+
+
+class _Output(Bag):
+    __slots__ = ("current", "loss_W", "resistance_Ohm")
+
+
+@dataclass(frozen=True)
+class _LinearResistance:
+    property_names = ("resistance_Ohm",)
+
+    reference_Ohm: float
+    coefficient_per_K: float
+    reference_K: float
+
+    def properties(self, temperature_K: float) -> tuple[float]:
+        return (self.reference_Ohm * (
+            1.0 + self.coefficient_per_K * (temperature_K - self.reference_K)
+        ),)
+
+
+class ThermalResistorModel(ThermalComponent):
+    """Memoryless scalar resistor with temperature supplied as a separate signal."""
+
+    state_names: ClassVar[tuple[str, ...]] = ()
+    outputs_need_inputs: ClassVar[bool] = True
+    storage: ClassVar[tuple] = ()
+    output_stages: ClassVar[tuple[OutputMethod, ...]] = (
+        OutputMethod(
+            "set_outputs",
+            inputs=("voltage", "temperature_K"),
+            outputs=("current", "loss_W", "resistance_Ohm"),
+        ),
+    )
+
+    def __init__(self, r_reference_Ohm: float, alpha_per_K: float,
+                 reference_K: float, phases: int = 1, *,
+                 thermal_law: ThermalPropertyLaw | None = None) -> None:
+        if phases not in (1, 3):
+            raise ValueError("phases must be 1 or 3")
+        super().__init__(thermal_law or _LinearResistance(
+            r_reference_Ohm, alpha_per_K, reference_K
+        ))
+        if self.thermal_property_names != ("resistance_Ohm",):
+            raise ValueError("a thermal resistor law must provide resistance_Ohm")
+        self.power_scale = 1.5 if phases == 3 else 1.0
+        zero = 0j if phases == 3 else 0.0
+        self.state = Empty()
+        self.input = _Input(voltage=zero, temperature_K=reference_K)
+        self.output = _Output(
+            current=zero,
+            loss_W=0.0,
+            resistance_Ohm=r_reference_Ohm,
+        )
+        self.port = Port(
+            self,
+            "power",
+            scale=self.power_scale,
+            effort="input.voltage",
+            flow="output.current",
+        )
+        self.ports = (self.port,)
+
+    def resistance(self) -> float:
+        value = self._thermal_property_values()[0]
+        if value <= 0.0:
+            raise ValueError("thermal resistance must remain positive and finite")
+        return value
+
+    def set_outputs(self, _t: float) -> None:
+        resistance = self.resistance()
+        current = self.input.voltage / resistance
+        self.output.resistance_Ohm = resistance
+        self.output.current = current
+        self.output.loss_W = self.power_scale * resistance * abs(current) ** 2
+
+    @staticmethod
+    def rhs(_t: float) -> tuple:
+        return ()
+
+@register_component_type
+class ThermalResistor(Element):
+    """Bind an electrical resistor to an electrothermal output.
+
+    Use an ``elements`` entry of type ``thermal_resistor``.
+    The temperature path is a scalar physical output, e.g. ``chip.temperature_K``.
+    """
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params(ThermalParams):
+        bus: str
+        r_reference_Ohm: float
+        alpha_per_K: float = 0.0
+        reference_K: float = 298.15
+        type: str = "thermal_resistor"
+
+        def __post_init__(self):
+            super().__post_init__()
+            for label in ("r_reference_Ohm", "reference_K"):
+                value = getattr(self, label)
+                if isinstance(value, bool) or not math.isfinite(value) or value <= 0.0:
+                    raise ConfigError(f"{label} must be finite and positive")
+            if not math.isfinite(self.alpha_per_K):
+                raise ConfigError("alpha_per_K must be finite")
+
+    type = "thermal_resistor"
+
+    def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
+        self.name, self.cfg = name, cfg
+        self.model = ThermalResistorModel(
+            cfg.r_reference_Ohm,
+            cfg.alpha_per_K,
+            cfg.reference_K,
+            buses[cfg.bus].phases,
+        )
+
+    def subsystems(self) -> dict[str, ThermalResistorModel]:
+        return {self.name: self.model}
+
+    def connections(self) -> dict:
+        return {(self.model, "temperature_K"): self.cfg.temperature_source}
+
+    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
+        return ((self.cfg.bus, self.model.port),)
+
+    def signals(self) -> dict[str, complex | float]:
+        return {f"{self.name}.i": self.model.output.current,
+                f"{self.name}.loss_W": self.model.output.loss_W,
+                f"{self.name}.r_Ohm": self.model.output.resistance_Ohm}
+
+    def retune(self, cfg: Any) -> bool:
+        if cfg.bus != self.cfg.bus or cfg.temperature_source != self.cfg.temperature_source:
+            raise ConfigError("thermal resistor wiring cannot change during a run")
+        self.cfg = cfg
+        self.model.thermal_law = _LinearResistance(
+            cfg.r_reference_Ohm, cfg.alpha_per_K, cfg.reference_K
+        )
+        return False
 
 
 class _ThermalInput(Bag):

@@ -283,10 +283,10 @@ def test_a_solver_without_step_observation_still_needs_a_finite_check_interval()
     tree["simulation"]["solver"] = {"type": "adaptive", "method": "DOP853", "linearisations": 0}
     tree["simulation"]["output"]["signals"] = False
     simulation = peslite.Simulation(from_dict(tree))
-    from peslite.assembly.conduction import DiodeConduction
+    from peslite.solver.commutation import Commutation
 
     with pytest.raises(ConfigError, match="max_step must be finite"):
-        DiodeConduction(simulation.system.model, Unobserved())
+        Commutation(simulation.system.model, Unobserved())
 
 
 def test_continuation_from_saved_states_reproduces_the_run(tmp_path):

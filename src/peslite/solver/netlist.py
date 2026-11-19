@@ -44,7 +44,7 @@ from scipy.linalg import lapack
 from scipy.sparse import csgraph
 from scipy.sparse.linalg import splu
 
-__all__ = ["Node", "Element", "Resistor", "Inductor", "CoupledInductors", "Capacitor", "VoltageSource",
+__all__ = ["Node", "Element", "Resistor", "Inductor", "Capacitor", "VoltageSource",
            "CurrentSource", "CurrentState", "Dissipation", "Transformer", "Switch", "Diode", "Netlist", "Mode", "Topology", "StateSpace",
            "Grouping", "ConductionError", "FORMS", "QUANTITIES", "device_rhs", "device_outputs",
            "device_dissipated_power", "device_supplied_power",
@@ -802,31 +802,37 @@ class Resistor(Element):
 
 
 class Inductor(Element):
-    """``v = L di/dt``; the current is the state at the ``d`` indices ``state``."""
+    """``v = L di/dt`` for one branch or a matrix-coupled group of branches.
 
-    def __init__(self, a: Port, b: Port, L: ArrayLike, state: ArrayLike, name: str = "") -> None:
-        d, _ = _port(a, b)
-        self.ports, self.name = ((a, b),), name
-        self.L = _definite(self._coefficient("L", L, d, "inductance"), "inductance")
-        self.state = _indices(state, d, "an inductor")
+    The ordinary form is ``Inductor(a, b, L, state)``. A component that already owns several
+    electrical branches may use ``Inductor(L=L, state=state, branches=branches)``; all branches
+    must have the same port dimension and scale.
+    """
 
-
-class CoupledInductors(Element):
-    """``v_k = sum_j L_kj di_j/dt`` over ``branches`` ``[(a_k, b_k), ...]``. ``L`` is (k d) x (k d), or
-    k x k applied to every component; ``state``: the k d current indices, branch by branch."""
-
-    def __init__(self, branches: Sequence[tuple[Port, Port]], L: ArrayLike, state: ArrayLike,
-                 name: str = "") -> None:
-        self.ports, self.name = tuple((a, b) for a, b in branches), name
-        kinds = {_port(a, b) for a, b in self.ports}
-        if len(kinds) != 1:
-            raise ValueError("coupled inductors need at least one branch, all of one dimension and scale")
-        d, k = kinds.pop()[0], len(self.ports)
-        m = _coefficient_array(L)
-        if m.shape == (k, k) and d > 1:
-            m = np.kron(m, np.eye(d))
-        self.L = _definite(self._coefficient("L", m, k * d, "coupled inductance"), "coupled inductance")
-        self.state = _indices(state, k * d, "coupled inductors")
+    def __init__(self, a: Port = None, b: Port = None, L: ArrayLike = None,
+                 state: ArrayLike = None, name: str = "", *,
+                 branches: Sequence[tuple[Port, Port]] | None = None) -> None:
+        if branches is None:
+            d, _ = _port(a, b)
+            self.ports = ((a, b),)
+        else:
+            if a is not None or b is not None:
+                raise TypeError("specify either one inductor branch or branches, not both")
+            self.ports = tuple((positive, negative) for positive, negative in branches)
+            kinds = {_port(positive, negative) for positive, negative in self.ports}
+            if len(kinds) != 1:
+                raise ValueError(
+                    "inductor branches need at least one branch, all of one dimension and scale"
+                )
+            d = kinds.pop()[0]
+        self.name = name
+        count = len(self.ports)
+        matrix = _coefficient_array(L)
+        if count > 1 and matrix.shape == (count, count) and d > 1:
+            matrix = np.kron(matrix, np.eye(d))
+        size = count * d
+        self.L = _definite(self._coefficient("L", matrix, size, "inductance"), "inductance")
+        self.state = _indices(state, size, "an inductor")
 
 
 class Capacitor(Element):
@@ -2557,7 +2563,7 @@ def _roles(net: "Netlist", mode: Mode) -> tuple[list[Optional[str]], dict[int, N
         elif isinstance(el, Transformer):
             role = "p" if br.port == 0 else "s"
         else:
-            role = {Inductor: "ind", CoupledInductors: "ind", Capacitor: "cap", VoltageSource: "vsrc",
+            role = {Inductor: "ind", Capacitor: "cap", VoltageSource: "vsrc",
                     CurrentSource: "isrc", CurrentState: "state_current"}[type(el)]
         roles.append(role)
     return roles, resistance

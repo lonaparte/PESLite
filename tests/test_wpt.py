@@ -10,7 +10,7 @@ import peslite
 from conftest import EXAMPLES
 from peslite.assembly import Event, register_event_type
 from peslite.assembly.params import ConfigError, _unit_leaves, from_dict, read_tree, to_dict
-from peslite.components import CompensatedLink
+from peslite.addons.components.magcomponent import CompensatedLink
 from peslite.control import GraphController, ResonantModulation
 
 
@@ -18,7 +18,7 @@ def test_link_templates_share_only_layout_and_release_their_instances():
     import dataclasses
     import gc
     import weakref
-    from peslite.components.wpt import make_wpt_link
+    from peslite.addons.components.magcomponent import make_wpt_link
 
     cfg = _short().unit("charger").link
     first = make_wpt_link(cfg)

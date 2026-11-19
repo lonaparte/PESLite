@@ -5,7 +5,7 @@ import math
 import pytest
 
 from peslite.addons.functions import reference_chirp, reference_multitone, reference_prbs
-from peslite.control.signals import TableSignal
+from peslite.solver.signals import TableSignal
 
 
 def test_prbs_seed_is_repeatable_and_maximal_length():

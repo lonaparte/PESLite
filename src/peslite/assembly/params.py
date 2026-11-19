@@ -36,16 +36,67 @@ from ..defaults import (DEFAULT_MULTIRATE_SWEEPS, DEFAULT_OUTPUT_PRECISION,
                         DEFAULT_SOLVER_WARM_START, DEFAULT_SPLIT_LINEARIZATION_ROWS)
 from ..control.controller import ControlInterface, continuous_control
 from ..control.loops import LOOP_TYPES, SignalType, loop_key_type, loop_type
-from ..control.profiles import (ControlTypeSpec, ReferenceParams, control_profile,
-                                control_profiles, control_type, explicit_wiring)
-from ..control.signals import ReferenceBinding, TableSignal
+from .control import (ControlTypeSpec, ReferenceBinding, ReferenceParams,
+                      control_profile, control_profiles, control_type, explicit_wiring)
+from ..solver.signals import TableSignal
 from ..solver.integrators import CIRCUIT_MODELS, canonical_method
 from ..solver.model import ConfigError
 from ..solver.timing import control_computation, control_period
 from .events import EVENT_TYPES, NAMED, SWITCHABLE, events_for
-from .simulation_file import (PARAMETER_DOMAINS, SimulationFileError,
-                              parse_parameter_mapping, read_simulation_file)
-from .types import unit_type
+from .syntax import (PARAMETER_DOMAINS, SimulationFileError,
+                     parse_parameter_mapping, read_simulation_file)
+
+
+@dataclass(frozen=True, kw_only=True)
+class UnitTypeSpec:
+    """All behavior selected by one ``units.<name>.type`` value."""
+
+    name: str
+    params: type | None = None
+    default_bridge: str | Callable[[Any], str] | None = None
+    children: tuple[str, ...] = ()
+    default_port: str | None = None
+    ports: tuple[str, ...] = ()
+    phases: int
+    bridge_types: frozenset[str] = frozenset()
+    measurement_channels: frozenset[str] = frozenset()
+    current_channel: str | None = None
+    protection_criteria: frozenset[str] = frozenset()
+    defaults_grid_frequency: bool = False
+    controller_factory: Callable[..., Any] | None = None
+    validator: Callable[..., None]
+    assembler: Callable[..., Any]
+
+    @property
+    def composite(self) -> bool:
+        return bool(self.children)
+
+    def bridge_for(self, control: Any) -> str:
+        return self.default_bridge(control) if callable(self.default_bridge) else self.default_bridge
+
+
+UNIT_TYPES: dict[str, UnitTypeSpec] = {}
+
+
+def register_unit_type(name: str, **values: Any) -> UnitTypeSpec:
+    """Register one complete unit profile; profiles cannot be patched later."""
+    if name in UNIT_TYPES:
+        raise ValueError(f"unit type {name!r} is already registered")
+    try:
+        spec = UnitTypeSpec(name=name, **values)
+    except TypeError as exc:
+        raise TypeError(f"invalid unit type {name!r}: {exc}") from None
+    UNIT_TYPES[name] = spec
+    return spec
+
+
+def unit_type(name: str, where: str = "unit.type") -> UnitTypeSpec:
+    try:
+        return UNIT_TYPES[name]
+    except KeyError:
+        raise ConfigError(
+            f"{where}: unknown unit type {name!r}; known: {sorted(UNIT_TYPES)}"
+        ) from None
 
 __all__ = [
     "ConfigError", "load", "dump", "dumps", "read_tree", "read_initial", "from_dict", "to_dict",
@@ -54,8 +105,7 @@ __all__ = [
     "FilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams",
     "MeasurementParams", "ReferenceParams", "ControlParams", "OvercurrentParams", "VoltageLimitParams",
     "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
-    "BridgeParams", "SSLinkParams", "LCCLinkParams", "LCCSLinkParams", "MultiSSLinkParams",
-    "SCCParams",
+    "BridgeParams",
     "UnitParams",
     "RUNTIME", "Change", "runtime_changeable", "event_changes",
     "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "ProgressParams",
@@ -688,7 +738,7 @@ class UnitParams:
     @functools.cached_property
     def dc_base(self) -> DCBase:
         if unit_type(self.type).composite:
-            raise AttributeError("a composite WPT unit has no single DC base")
+            raise AttributeError("a composite unit has no single DC base")
         return self.base.dc(self.dclink.vdc_ref)
 
 
@@ -761,140 +811,10 @@ class _DCConverterUnitFields:
     """Fields unique to a scalar converter unit.
 
     A series ``filter`` exposes the bridge through the common named ``bus``. A composite may omit
-    both and attach the bridge to a scoped internal bus, as WPT does.
+    both and attach the bridge to one of its scoped internal buses.
     """
 
     filter: Optional[FilterParams] = None
-
-
-@dataclass(frozen=True)
-class SCCParams:
-    """Capacitor shunted by a source-to-source MOSFET pair, with explicit gate drive.
-
-    ``common`` drives both gates together; ``alternating`` uses overlapping pulses displaced
-    by pi. ``angle`` is their nominal conduction/overlap angle. Device channels and body diodes
-    determine the actual branch conduction; zero-voltage turn-on is not imposed artificially.
-    """
-
-    capacitance: float
-    angle: float = 0.0
-    drive: str = "common"
-    sync: str = "current"
-    sync_angle: float = 0.0
-    command: bool = False
-
-    _choices = {"drive": ("common", "alternating"), "sync": ("current", "bridge")}
-
-
-@dataclass(frozen=True, kw_only=True)
-class SSLinkParams:
-    """Series-series compensated two-winding inductive link in SI units."""
-
-    type: str = "ss"
-    primary_inductance: float
-    secondary_inductance: float
-    mutual_inductance: float
-    primary_capacitance: float
-    secondary_capacitance: float
-    primary_resistance: float = 0.0
-    secondary_resistance: float = 0.0
-    primary_scc: Optional[SCCParams] = None
-    secondary_scc: Optional[SCCParams] = None
-
-    _choices = {"type": ("ss",)}
-
-
-@dataclass(frozen=True, kw_only=True)
-class LCCLinkParams:
-    """Symmetric-form LCC-LCC compensated two-winding inductive link in SI units.
-
-    Each port has a series compensation inductor, a shunt compensation capacitor and a
-    series coil capacitor.  The two coil inductances are coupled by ``mutual_inductance``.
-    """
-
-    type: str = "lcc"
-    primary_inductance: float
-    secondary_inductance: float
-    mutual_inductance: float
-    primary_series_capacitance: float
-    secondary_series_capacitance: float
-    primary_compensation_inductance: float
-    secondary_compensation_inductance: float
-    primary_parallel_capacitance: float
-    secondary_parallel_capacitance: float
-    primary_resistance: float = 0.0
-    secondary_resistance: float = 0.0
-    primary_compensation_resistance: float = 0.0
-    secondary_compensation_resistance: float = 0.0
-    primary_parallel_resistance: float = 0.0  # ESR in series with the shunt capacitor
-    secondary_parallel_resistance: float = 0.0
-    primary_scc: Optional[SCCParams] = None
-    secondary_scc: Optional[SCCParams] = None
-
-    _choices = {"type": ("lcc",)}
-
-
-@dataclass(frozen=True, kw_only=True)
-class LCCSLinkParams:
-    """LCC-compensated primary and series-compensated secondary of a two-winding link (SI).
-
-    The primary port has a series compensation inductor, a shunt capacitor (optional ESR) and a
-    series coil capacitor; the secondary coil has a series capacitor only.
-    """
-
-    type: str = "lcc_s"
-    primary_inductance: float
-    secondary_inductance: float
-    mutual_inductance: float
-    primary_series_capacitance: float
-    primary_compensation_inductance: float
-    primary_parallel_capacitance: float
-    secondary_capacitance: float
-    primary_resistance: float = 0.0
-    secondary_resistance: float = 0.0
-    primary_compensation_resistance: float = 0.0
-    primary_parallel_resistance: float = 0.0
-    primary_scc: Optional[SCCParams] = None
-    secondary_scc: Optional[SCCParams] = None
-
-    _choices = {"type": ("lcc_s",)}
-
-
-@dataclass(frozen=True, kw_only=True)
-class MultiSSLinkParams:
-    """N series-series modules with inter- and cross-coupling, in SI units.
-
-    ``inductance`` is the symmetric 2N x 2N inductance matrix of the coils in the order
-    Tx1..TxN, Rx1..RxN. Every Tx coil (with its series capacitor and resistance) connects in
-    parallel to the primary port, every Rx coil to the secondary port.
-    """
-
-    type: str = "ss_multi"
-    inductance: list
-    primary_capacitance: list
-    secondary_capacitance: list
-    primary_resistance: Optional[list] = None  # default: zero per module
-    secondary_resistance: Optional[list] = None
-
-    _choices = {"type": ("ss_multi",)}
-
-    def __post_init__(self) -> None:
-        modules = len(self.primary_capacitance) if isinstance(
-            self.primary_capacitance, (list, tuple)) else 0
-        for name in ("primary_resistance", "secondary_resistance"):
-            if getattr(self, name) is None:
-                object.__setattr__(self, name, [0.0] * modules)
-
-
-@dataclass(frozen=True)
-class _WPTUnitFields:
-    """Fields unique to a composite wireless-power-transfer unit."""
-
-    primary: Any = field(metadata={"unit": True})
-    secondary: Any = field(metadata={"unit": True})
-    link: Any = field(metadata={"types": {"ss": SSLinkParams, "lcc": LCCLinkParams,
-                                          "lcc_s": LCCSLinkParams,
-                                          "ss_multi": MultiSSLinkParams}})
 
 
 # ------------------------------------------------------------------ the run
@@ -1456,7 +1376,7 @@ def _build_control_params(data: Any, path: str, base: BaseValues,
     return replace(
         _build(ControlParams, values, path, base, scales),
         _reference_bindings=bindings,
-        _profile=spec if kind is None else None,
+        _profile=spec,
     )
 
 

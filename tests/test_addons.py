@@ -13,8 +13,8 @@ from peslite.addons.components.cable import (BergeronCableModel, Cable,
                                              LumpedCableModel)
 from peslite.assembly.params import from_dict, runtime_changeable
 from peslite.addons.control.voltage_adaptive_pll import VoltageAdaptivePLL
-from peslite.addons.control.predictive import (PredictiveCurrentControl,
-                                               ThreePhasePredictiveCurrentControl)
+from peslite.addons.control.mpc import (PredictiveCurrentControl,
+                                        ThreePhasePredictiveCurrentControl)
 from peslite.components.network import ELEMENT_TYPES
 from peslite.control import LOOP_TYPES, Loop
 from peslite.solver import ConfigError
@@ -87,7 +87,7 @@ class AddonElement:
 
 def test_functions_have_one_lazy_public_namespace():
     functions = peslite.addons.functions
-    assert peslite.addons.__all__ == ["control", "components", "formats", "functions"]
+    assert peslite.addons.__all__ == ["control", "components", "functions"]
     assert not hasattr(peslite.addons, "plot_csv")
     assert set(functions.__all__) == set(functions._EXPORTS)
     assert len(set(functions._EXPORTS.values())) == len(functions._EXPORTS)

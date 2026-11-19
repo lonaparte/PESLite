@@ -15,10 +15,10 @@ interface must use the matching PESLite version.
 
 ```text
 src/peslite/
-├── components/   network, converter, WPT link, ADC and PWM hardware
+├── components/   network, passive elements, sources, converter, ADC and PWM hardware
 ├── control/      control loops, graphs, startup and modulation
-├── assembly/     parameters, events, protection, units, systems and exporters
-├── solver/       connected model kernel, energy model, integrators and simulation run
+├── assembly/     input syntax, typed parameters, events, units, systems and exporters
+├── solver/       connected model kernel, energy model, integrators, commutation and simulation run
 └── addons/       control, component and function addons
     ├── control/      automatically discovered control-loop modules
     ├── components/   automatically discovered circuit-element modules
@@ -38,12 +38,12 @@ without adding run-loop work; see [Project Workspace](Project-Workspace.md).
 
 ## Components
 
-`components/network.py` contains grid sources, R-L branches, bus R-C nodes and registered element
-types. `components/converter.py` provides the common lossless bridge boundary, bridge topologies,
-simulation models and DC-link models. `components/wpt.py` provides compensated WPT links and
-switch-controlled capacitors. The standard `magcomponent` addon uses the same component and
-circuit-netlist contracts without adding magnetic code to the core runtime. `components/adc.py`
-and `components/pwm.py` implement sampled converter peripherals.
+`components/network.py` defines the common connection, registration and netlist-translation
+interface. Core physical implementations are grouped in `components/passive.py`,
+`components/source.py` and `components/converter.py`. The standard `magcomponent` addon provides
+magnetic components and compensated WPT links through the same contracts, without adding magnetic
+models to the core package. `components/adc.py` and `components/pwm.py` implement sampled converter
+peripherals.
 
 Physical component state and parameters are SI quantities. Components declare ports, state,
 derivatives and energy/storage relationships without knowing the global system order.

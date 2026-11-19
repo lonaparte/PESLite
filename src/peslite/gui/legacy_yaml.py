@@ -177,7 +177,7 @@ def preview(text: str, path: str | Path) -> dict[str, Any]:
     path = Path(path)
     try:
         locations = _positions(text)
-        from ..assembly.simulation_file import parse_parameter_mapping
+        from ..assembly.syntax import parse_parameter_mapping
         config = parse_parameter_mapping(text, path)
         # Do not call load(path): load preparers may execute project-local addons.
         from ..assembly.params import _ASSET_DIRECTORY, from_dict
@@ -322,7 +322,7 @@ def validated_rewire(text: str, path: str | Path, key: str,
     """
     if not isinstance(target, str) or not target:
         raise WorkspaceError("a destination bus is required")
-    from ..assembly.simulation_file import parse_parameter_mapping
+    from ..assembly.syntax import parse_parameter_mapping
     config = parse_parameter_mapping(text)
     if target not in (config.get("buses") or {}):
         raise WorkspaceError(f"unknown destination bus: {target}")

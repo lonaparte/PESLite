@@ -19,7 +19,8 @@ from .magcomponent import (
     _magnetic_description,
     _validate_winding_names,
 )
-from ...components.network import inductance_modes, register_component_type
+from .magcomponent import inductance_modes
+from ...components.network import register_component_type
 from ...solver import Bag, ConfigError, OutputMethod, Port, directional_derivative
 
 __all__ = [

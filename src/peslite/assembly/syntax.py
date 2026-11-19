@@ -1,4 +1,4 @@
-"""Read simulation parameters and preserve native interface source text."""
+"""Parse native PESLite text and dispatch registered alternate input syntaxes."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ _READERS: list[Callable[[str, Path], Mapping[str, Any] | None]] = []
 
 
 class SimulationFileError(ValueError):
-    """Invalid native syntax or an unavailable source-format addon."""
+    """Invalid native syntax or an unavailable compatibility function."""
 
     def __init__(self, message: str, *, path: str | Path | None = None,
                  line: int = 0, column: int = 0) -> None:
@@ -248,7 +248,7 @@ def parse_native_text(text: str, path: str | Path = "<string>") -> tuple[dict[st
 
 
 def parse_simulation_text(text: str, path: str | Path = "<string>") -> tuple[dict[str, Any], str]:
-    """Parse native syntax, or delegate a parameter-only buffer to a format addon."""
+    """Parse native syntax, or delegate a parameter-only buffer to a compatibility function."""
     source = Path(path)
     if is_native_source(text):
         return parse_native_text(text, source)
@@ -271,7 +271,7 @@ def parse_simulation_text(text: str, path: str | Path = "<string>") -> tuple[dic
         raise errors[0]
     raise SimulationFileError(
         "native simulation files require an @circuit view; "
-        "this source needs a compatible format addon", path=path,
+        "this source needs a compatible syntax function", path=path,
     )
 
 

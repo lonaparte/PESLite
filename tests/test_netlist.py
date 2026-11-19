@@ -12,7 +12,7 @@ import peslite
 from conftest import EXAMPLES, QUIET
 from peslite.assembly.circuit import (Circuit, NetworkView, _live_statements, _ModeStructure,
                                       bind_device, compile_network)
-from peslite.components.network import ACVoltageSource
+from peslite.components.source import ACVoltageSource
 from peslite.solver import FixedStepSolver
 from peslite.solver import netlist as nl
 from peslite.solver.netlist import (Capacitor, CurrentSource, Diode, Inductor, Netlist, Node,
