@@ -14,8 +14,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ...solver.linearization import (DEFAULT_STEP, active_coordinates, coordinate_difference,
-                                     coordinate_width, linearize_loop)
+from ...defaults import DEFAULT_LINEARIZATION_RELATIVE_STEP
+from ...solver.linearization import (active_coordinates, coordinate_difference, coordinate_width,
+                                     linearize_loop)
 from ...solver.simulation import SystemLoop
 from ...solver.timing import TIME_EPS
 
@@ -78,7 +79,8 @@ class SmallSignalResult:
 
 
 def small_signal(sim: Simulation, *, period: float | None = None,
-                 relative_step: float = DEFAULT_STEP, periodic_tolerance: float = 1e-3,
+                 relative_step: float = DEFAULT_LINEARIZATION_RELATIVE_STEP,
+                 periodic_tolerance: float = 1e-3,
                  multiplier_tolerance: float = 1e-5) -> SmallSignalResult:
     """Linearize the completed run's final state through the shared one-period simulation.
 
@@ -243,7 +245,8 @@ def _report_value(value):
 
 def small_signal_report(sim: Simulation, *, times: Iterable[float] = (),
                         interval: float | None = None, period: float | None = None,
-                        watch: Iterable[str] = (), relative_step: float = DEFAULT_STEP,
+                        watch: Iterable[str] = (),
+                        relative_step: float = DEFAULT_LINEARIZATION_RELATIVE_STEP,
                         periodic_tolerance: float = 1e-3, multiplier_tolerance: float = 1e-5,
                         change_tolerance: float = 1e-6,
                         out_dir: str | Path | None = "output/run", name: str = "simulation",

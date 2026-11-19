@@ -8,10 +8,10 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
+from ..defaults import DEFAULT_LINEARIZATION_RELATIVE_STEP
+
 __all__ = ["LoopMap", "LoopLinearization", "coordinate_width", "active_coordinates", "coordinate_difference",
            "linearize_loop"]
-
-DEFAULT_STEP = 1e-4
 
 
 @runtime_checkable
@@ -78,7 +78,7 @@ class LoopLinearization:
 
 
 def linearize_loop(loop: LoopMap, row: dict[str, float], t0: float, cols: list,
-                   *, relative_step: float = DEFAULT_STEP,
+                   *, relative_step: float = DEFAULT_LINEARIZATION_RELATIVE_STEP,
                    baseline: dict[str, float] | None = None) -> LoopLinearization:
     """Central differences of the complete map, including one reusable baseline evaluation.
 

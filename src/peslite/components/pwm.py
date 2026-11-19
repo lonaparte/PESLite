@@ -14,12 +14,12 @@ from typing import Any, Callable, Iterator, Mapping, Protocol, NamedTuple, runti
 import numpy as np
 from numpy.typing import NDArray
 
+from ..defaults import DEFAULT_PWM_ALIGNMENT
 from ..control.profiles import PHASE_SHIFT_MODES, control_profile
 from ..solver.model import ConfigError, _integer, _real
 from ..solver.timing import TIME_EPS, PeriodicClock
 
 PWM_ALIGNMENTS = ("center", "trailing", "leading")
-DEFAULT_PWM_ALIGNMENT = "center"
 
 __all__ = ["PWM", "PhaseClock", "PulseSequence", "SwitchingSequence",
            "Modulator", "CarrierComparison",

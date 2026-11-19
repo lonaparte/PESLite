@@ -28,7 +28,8 @@ from types import MappingProxyType, UnionType
 from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
 
 from ..components.network import ELEMENT_TYPES, element_buses
-from ..components.pwm import DEFAULT_PWM_ALIGNMENT, PWM_ALIGNMENTS
+from ..components.pwm import PWM_ALIGNMENTS
+from ..defaults import DEFAULT_PWM_ALIGNMENT, DEFAULT_SOLVER_ATOL, DEFAULT_SOLVER_RTOL
 from ..control.controller import ControlInterface, continuous_control
 from ..control.loops import LOOP_TYPES, SignalType, loop_key_type, loop_type
 from ..control.profiles import (ControlTypeSpec, ReferenceParams, control_profile,
@@ -907,8 +908,8 @@ class SolverParams:
     method: str = "RK4"  # fixed: euler|heun|RK4|trapezoidal|radau
     #                      adaptive: RK23|RK45|DOP853|radau|BDF|LSODA|DP45|auto
     dt: float = 1e-6  # s; fixed: maximum system step
-    rtol: float = 1e-6  # adaptive error; fixed implicit Newton convergence
-    atol: float = 1e-9  # adaptive error; fixed implicit Newton convergence
+    rtol: float = DEFAULT_SOLVER_RTOL  # adaptive error; fixed implicit Newton convergence
+    atol: float = DEFAULT_SOLVER_ATOL  # adaptive error; fixed implicit Newton convergence
     max_step: float = math.inf
     warm_start: bool = True  # adaptive: reuse the last step size across intervals
     subsystems: dict = field(default_factory=dict)  # fixed only: {name: step relative to dt | {step, method}}

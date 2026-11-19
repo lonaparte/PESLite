@@ -8,16 +8,14 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from ..defaults import (DEFAULT_COMMUTATION_LOCATOR_ITERATIONS,
+                        DEFAULT_COMMUTATION_MAX_TRANSITIONS)
 from .params import ConfigError
 from ..solver.integrators import (_accepted_checkpoint, _accepted_checkpoint_at,
                                   _accepted_restore)
 from ..solver.model import commutation_tolerance
 
 __all__ = ["DiodeConduction", "CommutationError"]
-
-_MAX_COMMUTATIONS = 64  # commutations allowed at one instant before the model is rejected
-_LOCATOR_ITERATIONS = 80
-
 
 class CommutationError(RuntimeError):
     """Commutating subsystems kept switching without time advancing (a Zeno condition)."""
@@ -46,9 +44,13 @@ class DiodeConduction:
     steps; a user solver without that interface needs a finite local check interval.
     """
 
-    def __init__(self, model: Any, solver: Any = None) -> None:
+    def __init__(self, model: Any, solver: Any = None, *,
+                 max_transitions: int = DEFAULT_COMMUTATION_MAX_TRANSITIONS,
+                 locator_iterations: int = DEFAULT_COMMUTATION_LOCATOR_ITERATIONS) -> None:
         self.model = model
         self.solver = solver
+        self.max_transitions = max_transitions
+        self.locator_iterations = locator_iterations
         self.current_states = tuple(
             (subsystem, model.state_slice(subsystem, state).start)
             for subsystem in model.subsystems
@@ -180,7 +182,7 @@ class DiodeConduction:
                 if lower_margin is None:
                     lower_margin = self._margin(lower, origin_state, guarded, located)
                 bisect_next = False
-                for _ in range(_LOCATOR_ITERATIONS):
+                for _ in range(self.locator_iterations):
                     tolerance = commutation_tolerance(upper)
                     width = upper - lower
                     if width <= tolerance:
@@ -232,7 +234,7 @@ class DiodeConduction:
             if target == t1:
                 return state
             stalled = stalled + 1 if target - t <= commutation_tolerance(t) else 0
-            if stalled >= _MAX_COMMUTATIONS:
+            if stalled >= self.max_transitions:
                 raise CommutationError(f"t = {t:.12g} s: conduction events cannot advance time")
             t = target
         return state
@@ -316,7 +318,7 @@ class DiodeConduction:
             return state
         due = t + commutation_tolerance(t)
         commutated = False
-        for _ in range(_MAX_COMMUTATIONS):
+        for _ in range(self.max_transitions):
             self.model.sync(t, state)
             pending = {sub for sub in self.commutating if sub.commutation_margin() < 0.0}
             pending.update(sub for sub in self._scheduled
@@ -342,7 +344,7 @@ class DiodeConduction:
                 commutated = True
         names = sorted(self.model.name_of(sub) for sub in pending)
         raise CommutationError(
-            f"t = {t:.12g} s: {names} commutated {_MAX_COMMUTATIONS} times without time "
+            f"t = {t:.12g} s: {names} commutated {self.max_transitions} times without time "
             "advancing; the configured circuit has no consistent conduction state here"
         )
 

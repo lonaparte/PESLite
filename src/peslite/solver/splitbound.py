@@ -11,8 +11,9 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from .linearization import (DEFAULT_STEP as _FD, LoopMap, coordinate_width as _width,
-                            coordinate_difference, linearize_loop)
+from ..defaults import DEFAULT_LINEARIZATION_RELATIVE_STEP
+from .linearization import (LoopMap, coordinate_width as _width, coordinate_difference,
+                            linearize_loop)
 from .multirate import rated_effort
 
 __all__ = ["LoopMap", "split_error_bound"]
@@ -39,16 +40,17 @@ def _frame_index(cols: list, prefix: str) -> dict[str, list[int]]:
 
 
 def _period_map(loop: LoopMap, row: dict[str, float], t0: float, cols: list,
-                held: list[tuple[str, float]]) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+                held: list[tuple[str, float]],
+                relative_step: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """``Phi``, ``B_b``, ``B_c`` at ``row`` by finite differences, plus the evaluation count."""
     t1 = t0 + loop.period
-    linear = linearize_loop(loop, row, t0, cols)
+    linear = linearize_loop(loop, row, t0, cols, relative_step=relative_step)
     phi, base, evaluations = linear.phi, linear.final, linear.evaluations
     n = len(base)
     b_b = np.zeros((n, len(held)))
     b_c = np.zeros((n, len(held)))
     for k, (label, scale) in enumerate(held):
-        h = _FD * (scale or 1.0)
+        h = relative_step * (scale or 1.0)
         b_b[:, k] = coordinate_difference(
             loop.to_frame(loop.advance(row, t0, (label, h, "b")), t1, cols), base, cols) / h
         b_c[:, k] = coordinate_difference(
@@ -116,7 +118,8 @@ def _convolve(a: np.ndarray, b: np.ndarray, n: int) -> np.ndarray:
 
 def split_error_bound(solver: Any, loop: LoopMap, t: np.ndarray, states: dict[str, np.ndarray],
                       rows: int = 3, labels: Sequence[str] | None = None,
-                      prefix: str = "") -> dict[str, Any]:
+                      prefix: str = "",
+                      relative_step: float = DEFAULT_LINEARIZATION_RELATIVE_STEP) -> dict[str, Any]:
     """Estimate the split error of a finished multirate run.
 
     ``solver``: the :class:`~peslite.solver.multirate.MultirateSolver` that ran; ``loop``: the
@@ -213,7 +216,9 @@ def split_error_bound(solver: Any, loop: LoopMap, t: np.ndarray, states: dict[st
     truncated = False
     for i_row in picks:
         row = {k: float(states[k][i_row]) for k in names}
-        phi, b_b, b_c, n_eval = _period_map(loop, row, float(t_rows[i_row]), cols, held)
+        phi, b_b, b_c, n_eval = _period_map(
+            loop, row, float(t_rows[i_row]), cols, held, relative_step,
+        )
         evaluations += n_eval
         rb, rc, cut_off = _response(phi, b_b, b_c, outputs, inputs, n_periods, T_s)
         truncated |= cut_off

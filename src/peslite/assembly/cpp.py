@@ -25,6 +25,8 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from ..defaults import (DEFAULT_COMMUTATION_LOCATOR_ITERATIONS,
+                        DEFAULT_COMMUTATION_MAX_TRANSITIONS)
 from ..components.network import ACVoltageSource, RLBranch
 from ..components.pwm import (_EPS, _SNAP, CarrierComparison, SynchronousCarrier, PhaseClock,
                                PhaseShiftModulator, ZOH)
@@ -40,7 +42,7 @@ from ..solver.netlist import (Dissipation, Element as NetlistElement, Mode, Netl
                               _Degenerate, _FLOAT_RTOL, _MARGIN_RTOL, _MAX_PATTERNS,
                               _Symbolic, _constant, _symbolic_solve, _symbolic_source)
 from ..solver.timing import TIME_EPS
-from .conduction import DiodeConduction, _LOCATOR_ITERATIONS, _MAX_COMMUTATIONS
+from .conduction import DiodeConduction
 from .circuit import _BoundValue, _NETWORK_DECLARATION, _mode_decomposition, compile_network
 from .protection import ProtectionStats
 from .params import (BaseValues, ConfigError, SourceParams, UnitParams, _PARAMETER_RECORDER, _event_assignments,
@@ -8602,7 +8604,13 @@ class _CppGenerator:
         lines.append(f"    return std::array<double, {len(all_values)}>{{{{{', '.join(all_values)}}}}};")
         return lines, columns
 
-    def source(self, model: _ModelGenerator) -> str:
+    def source(
+        self,
+        model: _ModelGenerator,
+        *,
+        max_commutation_transitions: int = DEFAULT_COMMUTATION_MAX_TRANSITIONS,
+        commutation_locator_iterations: int = DEFAULT_COMMUTATION_LOCATOR_ITERATIONS,
+    ) -> str:
         """Return the complete generated translation unit."""
         self.diagnostics = model.diagnostics
         sampled = {name: _make_unit_generator(name, unit, model)
@@ -9144,8 +9152,8 @@ class _CppGenerator:
                     for k, (_sub, index) in enumerate(diode_current_states)),
                 "GUARDS": ", ".join(f"sim.diode_blocks_reverse_current_{k}() && initial[{index}] > 0.0"
                                     for k, (_sub, index) in enumerate(diode_current_states)),
-                "MAX_COMMUTATIONS": str(_MAX_COMMUTATIONS),
-                "LOCATOR_ITERATIONS": str(_LOCATOR_ITERATIONS),
+                "MAX_COMMUTATIONS": str(max_commutation_transitions),
+                "LOCATOR_ITERATIONS": str(commutation_locator_iterations),
                 "PROBE": "sim.commutation_probe()" if commutation_margins else "std::numeric_limits<double>::infinity()",
                 "PROJECT": "sim.project_state();" if projection_lines else "",
             }

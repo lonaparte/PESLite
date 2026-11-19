@@ -20,6 +20,9 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
+from ..defaults import (DEFAULT_CONTROL_ALGEBRAIC_ATOL,
+                        DEFAULT_CONTROL_ALGEBRAIC_MAX_ITERATIONS,
+                        DEFAULT_CONTROL_ALGEBRAIC_RTOL)
 from ..solver.model import (Bag, ConfigError, _complex, _component_plan, _dependency_plan,
                             _real, gather, scatter)
 from ..solver.energy import Port
@@ -445,13 +448,15 @@ class ControlGraph:
     their new parameters and continue from their named states.
     """
 
-    _cycle_iterations = 16
-    _cycle_atol = 1e-10
-    _cycle_rtol = 1e-8
-
     def __init__(self, cfg, startup, connections, outputs, *, interface=CONTROL_INTERFACE,
-                 continuous: bool | None = None):
+                 continuous: bool | None = None,
+                 cycle_iterations: int = DEFAULT_CONTROL_ALGEBRAIC_MAX_ITERATIONS,
+                 cycle_atol: float = DEFAULT_CONTROL_ALGEBRAIC_ATOL,
+                 cycle_rtol: float = DEFAULT_CONTROL_ALGEBRAIC_RTOL):
         self.cfg, self.startup = cfg, startup
+        self._cycle_iterations = cycle_iterations
+        self._cycle_atol = cycle_atol
+        self._cycle_rtol = cycle_rtol
         self.interface = interface
         self._pending: list[Any] = []
         self.on_retune = None

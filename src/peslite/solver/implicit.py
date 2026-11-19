@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
+from ..defaults import DEFAULT_SOLVER_ATOL, DEFAULT_SOLVER_RTOL
 from .integrators import IMPLICIT_FIXED_METHODS, RHS, SolverStep, _accepted, subintervals
 
 __all__ = ["ImplicitSolver", "LinearSystem", "Structure", "linear_system",
@@ -491,7 +492,8 @@ class ImplicitSolver:
     ``linear``: the :class:`LinearSystem` of the circuit model (a dense one by default).
     """
 
-    def __init__(self, dt: float, method: str = "trapezoidal", rtol: float = 1e-6, atol: float = 1e-9,
+    def __init__(self, dt: float, method: str = "trapezoidal",
+                 rtol: float = DEFAULT_SOLVER_RTOL, atol: float = DEFAULT_SOLVER_ATOL,
                  linear: Optional[LinearSystem] = None) -> None:
         if method not in _TABLEAUX:
             raise ValueError(f"unknown implicit method {method!r}")

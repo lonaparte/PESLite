@@ -14,6 +14,7 @@ from typing import Any, Mapping, Optional
 import numpy as np
 from numpy.typing import NDArray
 
+from ..defaults import DEFAULT_SOLVER_ATOL, DEFAULT_SOLVER_RTOL
 from .energy import re_product
 from .integrators import (EXPLICIT_FIXED_METHODS, RHS, TABLEAUS, SolverStep, _accepted,
                           _accepted_steps, combine, canonical_method, integrator, stage_state,
@@ -129,7 +130,8 @@ class MultirateSolver:
     """
 
     def __init__(self, model: Any, steps: Mapping[str, Any], dt: float, method: str = "RK4",
-                 sweeps: int = 2, rtol: float = 1e-6, atol: float = 1e-9,
+                 sweeps: int = 2, rtol: float = DEFAULT_SOLVER_RTOL,
+                 atol: float = DEFAULT_SOLVER_ATOL,
                  ratings: Any = None) -> None:
         method = canonical_method(method, "fixed")
         if method not in TABLEAUS:
