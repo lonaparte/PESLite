@@ -162,7 +162,7 @@ def test_registered_carrier_keeps_its_own_topology_capabilities(monkeypatch):
 def test_control_profiles_declare_one_static_interface_contract():
     from peslite.control.profiles import control_type
 
-    for name in ("gfl", "gfm", "custom", "dc", "resonant"):
+    for name in ("gfl", "gfm", "dc", "resonant"):
         assert isinstance(control_type(name).interface, ControlInterface)
 
 

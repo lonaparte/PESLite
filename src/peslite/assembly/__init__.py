@@ -21,7 +21,8 @@ from .params import _DCConverterUnitFields, _VSCUnitFields, _WPTUnitFields
 from .system import _assemble_dc_converter, _assemble_vsc, _assemble_wpt
 from .types import register_unit_type
 from .validate import _dc_converter, _unit, _wpt
-from ..control.profiles import control_type
+from ..control.controller import GraphController, VSCController
+from ..control.profiles import control_profile
 from . import circuit as _circuit
 from ..solver.netlist import _install_device_runtime
 
@@ -41,13 +42,14 @@ register_unit_type(
         "overcurrent", "rms_current", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof",
     )),
     defaults_grid_frequency=True,
+    controller_factory=VSCController,
     validator=_unit,
     assembler=_assemble_vsc,
 )
 register_unit_type(
     "dc_converter",
     params=_DCConverterUnitFields,
-    default_bridge=lambda control: control_type(control.type).default_bridge,
+    default_bridge=lambda control: control_profile(control).default_bridge,
     default_port="dc",
     ports=("dc", "power"),
     phases=1,
@@ -57,6 +59,7 @@ register_unit_type(
     protection_criteria=frozenset((
         "overcurrent", "rms_current", "undervoltage", "overvoltage", "dc_voltage",
     )),
+    controller_factory=GraphController,
     validator=_dc_converter,
     assembler=_assemble_dc_converter,
 )

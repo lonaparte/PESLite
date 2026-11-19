@@ -19,10 +19,10 @@ from ... import __version__
 from ...assembly.params import Params, _unit_items, flat_paths, to_dict
 from ...assembly.simulation_file import parse_parameter_mapping
 from ...assembly.types import unit_type
-from ...control.controller import (SAMPLED_VSC_INTERFACE, ControlGraphOverlay,
-                                   continuous_control)
+from ...control.controller import (ControlGraphOverlay, continuous_control,
+                                   resolved_control_interface)
 from ...control.loops import LOOP_TYPES
-from ...control.profiles import control_type
+from ...control.profiles import control_profile
 from ...control.signals import TableSignal
 from ...solver.model import ConfigError
 from ...solver.simulation import Simulation, validate_model
@@ -411,11 +411,10 @@ def prepare_debug(p: Params, plan: DebugPlan, *, directory: str | Path = ".") ->
 
     descriptions = {}
     for name, unit in units.items():
-        profile = control_type(unit.ctrl.type)
+        profile = control_profile(unit.ctrl)
         is_continuous = continuous_control(unit)
         defaults, outputs = profile.wiring(unit, continuous=is_continuous)
-        interface = (profile.interface if is_continuous or unit.type != "vsc"
-                     else SAMPLED_VSC_INTERFACE)
+        interface = resolved_control_interface(unit.ctrl, is_continuous)
         classes = {loop_name: LOOP_TYPES[loop.type]
                    for loop_name, loop in unit.ctrl.loops.items()}
         source_types = dict(interface.inputs)

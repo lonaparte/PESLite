@@ -365,7 +365,6 @@ def test_custom_tracking_callback_is_lowered_without_a_sync_law_adapter(voltage,
         "sources.grid.v_pu": voltage,
         "units.vsc.protection.overcurrent.enable": 0,
         "units.vsc.ctrl": {
-            "type": "custom",
             "loops": {_TrackingOscillator.__name__: {}},
             "connections": {f"{_TrackingOscillator.__name__}.voltage": "meas.u_g"},
             "outputs": {"theta": f"{_TrackingOscillator.__name__}.theta",

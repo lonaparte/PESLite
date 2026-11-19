@@ -1985,6 +1985,9 @@ class _RuntimeParameters:
                             vars(clone).pop(key, None)
             for item in fields(value):
                 if item.init:
+                    if item.metadata.get("internal"):
+                        object.__setattr__(clone, item.name, getattr(value, item.name))
+                        continue
                     child = path if item.name == "_unit_fields" else (
                         f"{path}.{item.name}" if path else item.name)
                     object.__setattr__(clone, item.name, self.copy(getattr(value, item.name), child))

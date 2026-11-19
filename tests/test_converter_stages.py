@@ -55,7 +55,7 @@ def _bridge_configuration(model):
             switch_resistance=0.0,
             diode_resistance=0.0,
         ),
-        ctrl=SimpleNamespace(type="custom", period=1e-4, offset=None, computation=0.0, outputs={},
+        ctrl=SimpleNamespace(type="open_loop", period=1e-4, offset=None, computation=0.0, outputs={},
                              references=None),
         pwm=SimpleNamespace(
             load_period=1e-4,

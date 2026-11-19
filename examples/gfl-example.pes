@@ -88,7 +88,7 @@ units:                     # converters, one entry each
     #                              # CLI: --averaging | --pwm-averaging | --switching
 
     ctrl:
-      type: gfl            # default wiring: gfl | gfm | custom (explicit connections and outputs)
+      type: gfl            # default wiring: gfl | gfm; omit for an explicit control graph
       # period: 50.0e-6    # sampled modes: control interrupt (ignored by averaging)
       # offset: 0.0        # sampled modes: control-clock position, s (default: PWM load clock)
       # computation: 1.0e-6  # sampled modes: sample-to-PWM-load eligibility (ignored by averaging)

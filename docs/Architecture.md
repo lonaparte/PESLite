@@ -125,14 +125,13 @@ a second flattened parameter mapping or a group table. The solver therefore sees
 converter units without WPT-specific scheduling.
 
 Parameter ownership is explicit: all converter units share common fields; `unit.type` adds
-electrical fields, `bridge.type` topology fields, `ctrl.type` reference/default-wiring fields, and
-each `ctrl.loops` key its class parameters. See
+electrical fields, `bridge.type` topology fields, an optional `ctrl.type` supplies reference and
+default-wiring fields, and each `ctrl.loops` key its class parameters. See
 [Simulation Files](Simulation-Files.md#si-and-per-unit-values).
 
-Every `ctrl` section is represented by the same `ControlParams` type. Its discriminator narrows the
-valid fields inside that object; it never switches to another public parameter container. The unit
-discriminator does not select or interpret controller-specific fields. For example, a DC converter
-declares both `type: dc_converter` in its unit scope and `type: dc` in its `ctrl` scope.
+Every `ctrl` section is represented by the same `ControlParams` type. A specified control type adds
+defaults before the declared connections are merged; omitting it leaves the graph explicit. Both
+paths use the same typed graph validation and execution-plan construction.
 
 ## Model kernel
 

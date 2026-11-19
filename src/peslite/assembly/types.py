@@ -24,6 +24,7 @@ class UnitTypeSpec:
     current_channel: str | None = None
     protection_criteria: frozenset[str] = frozenset()
     defaults_grid_frequency: bool = False
+    controller_factory: Callable[..., Any] | None = None
     validator: Callable[..., None]
     assembler: Callable[..., Any]
 

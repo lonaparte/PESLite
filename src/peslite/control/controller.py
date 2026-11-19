@@ -31,7 +31,7 @@ from .loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, HERTZ, I, I_AB, LOOP_T
 from .modulation import CONFIGURED, OutputStage
 from .profiles import (DutyReferenceParams, PhaseShiftReferenceParams, ReferenceParams,
                        ResonantReferenceParams,
-                       ScalarCurrentReferenceParams, ScalarVoltageReferenceParams, control_type,
+                       ScalarCurrentReferenceParams, ScalarVoltageReferenceParams, control_profile,
                        register_control_type, validate_duty_references,
                        validate_phase_shift_references,
                        validate_resonant_references,
@@ -41,7 +41,7 @@ __all__ = ["Measurement", "ConverterMeasurement", "ControlMeasurement", "Control
            "ControlInterface", "CONTROL_INTERFACE", "SAMPLED_VSC_INTERFACE",
            "ControlGraph", "ControlGraphOverlay", "default_wiring",
            "VSCController", "BridgeControlOutput", "GraphController",
-           "make_controller"]
+           "resolved_control_interface", "make_controller"]
 
 
 # ------------------------------------------------------------------ the interface
@@ -407,7 +407,7 @@ def continuous_control(unit: Any) -> bool:
     ctrl = getattr(unit, "ctrl", None)
     if ctrl is None:
         return True
-    profile = control_type(ctrl.type)
+    profile = control_profile(ctrl)
     if profile.wiring is None:
         return False
     connections, outputs = profile.wiring(unit, continuous=True)
@@ -473,7 +473,7 @@ class ControlGraph:
         refs = cfg.ctrl.references
         self.reference_bindings = dict(_reference_bindings(cfg.ctrl))
         self._overlay_bindings = {}
-        self._reference_validator = control_type(cfg.ctrl.type).reference_validator
+        self._reference_validator = control_profile(cfg.ctrl).reference_validator
         self.references = _reference_values(
             refs, attributes=bool(self.reference_bindings and self._reference_validator),
         )
@@ -1374,13 +1374,11 @@ def _role_finder(cfg, label: str):
     return find
 
 def default_wiring(cfg, family, *, continuous=False):
-    """Return the default ``(connections, outputs)`` for family ``"gfl"``, ``"gfm"`` or ``"custom"``.
+    """Return the default ``(connections, outputs)`` for family ``"gfl"`` or ``"gfm"``.
 
     Each loop is wired by its role (:attr:`peslite.control.loops.Loop.role`), so a registered loop
     type takes the place of the built-in one of its role.
     """
-    if family == "custom":
-        return {}, {}
     loops = cfg.ctrl.loops
     roles = {name: getattr(LOOP_TYPES.get(p.type), "role", None) for name, p in loops.items()}
     find = _role_finder(cfg, family)
@@ -1630,15 +1628,21 @@ class VSCController(_GraphRuntime):
     bridge's modulation space vector directly.
     """
 
+    @staticmethod
+    def resolve_interface(profile, continuous: bool) -> ControlInterface:
+        boundary = CONTROL_INTERFACE if continuous else SAMPLED_VSC_INTERFACE
+        return replace(profile.interface, outputs=boundary.outputs,
+                       optional_outputs=boundary.optional_outputs)
+
     def __init__(self, cfg, pwm_method=None, *, limiter=CONFIGURED):
         self.p = cfg
         self.continuous = continuous_control(cfg)
         # A continuous controller already participates in construction-time energy probes, before
         # VSC.start() applies its scenario. Keep its ideal source off until that command arrives.
         self.startup = ContinuousStartup(run=False) if self.continuous else Startup(cfg.ctrl.period)
-        profile = control_type(cfg.ctrl.type)
+        profile = control_profile(cfg.ctrl)
         wires, outputs = profile.wiring(cfg, continuous=self.continuous)
-        interface = profile.interface if self.continuous else SAMPLED_VSC_INTERFACE
+        interface = resolved_control_interface(cfg.ctrl, self.continuous)
         self.graph = graph = ControlGraph(
             cfg, self.startup, wires, outputs, interface=interface,
             continuous=self.continuous,
@@ -1693,12 +1697,12 @@ class VSCController(_GraphRuntime):
                             else self._frame_key if self._frame_key in graph.values
                             else graph.outputs["theta"])
         self._is_gfl = profile.grid_following
-        if self._is_gfl:
+        if self._is_gfl is True:
             mode_log_sources = {"id_ref_pu": (
                 graph.connections[f"{self._log_cc}.id_ref"]
                 if self._log_cc is not None else "references.id_ref_pu"
             )}
-        else:
+        elif self._is_gfl is False:
             mode_log_sources = (
                 {"p_pu": f"{self._sync}.p", "q_pu": f"{self._sync}.q",
                  "p_ref_pu": "references.p_ref_pu",
@@ -1707,6 +1711,8 @@ class VSCController(_GraphRuntime):
                 {"p_ref_pu": "references.p_ref_pu",
                  "v_ref_pu": "references.v_ref_pu"}
             )
+        else:
+            mode_log_sources = {}
         self._mode_log_sources = MappingProxyType(mode_log_sources)
         self._terminal_limit = None
         self._terminal_limit_scale = None
@@ -1832,8 +1838,10 @@ class VSCController(_GraphRuntime):
             names += ["vd_raw_pu", "vq_raw_pu", "id_raw_pu", "iq_raw_pu"]
         if not self.continuous and "u_dc" in self.p.meas.average:
             names.append("vdc_raw_pu")
-        names += (["id_ref_pu", "freq_dev", "angle_rel"] if self._is_gfl else
-                  ["p_pu", "q_pu", "p_ref_pu", "v_ref_pu", "freq_dev", "angle_rel"])
+        if self._is_gfl is True:
+            names += ["id_ref_pu", "freq_dev", "angle_rel"]
+        elif self._is_gfl is False:
+            names += ["p_pu", "q_pu", "p_ref_pu", "v_ref_pu", "freq_dev", "angle_rel"]
         names += self.graph.observation_names
         names += self.graph.probe_names
         return tuple(names)
@@ -1849,9 +1857,11 @@ class VSCController(_GraphRuntime):
             name: graph._read(*graph._resolve(source), meas)
             for name, source in self._mode_log_sources.items()
         }
-        if self._is_gfl:
+        if self._is_gfl is None:
+            return values
+        if self._is_gfl is True:
             values.setdefault("id_ref_pu", 0.0)
-        else:
+        elif self._is_gfl is False:
             values.setdefault("p_pu", 0.0)
             values.setdefault("q_pu", 0.0)
             values.setdefault("v_ref_pu", graph.references["v_ref_pu"])
@@ -2143,7 +2153,7 @@ def _modulation_wiring(cfg, *, continuous=False):
     modulation = find("modulation")
     if modulation is None:
         return {}, {}
-    interface = control_type(cfg.ctrl.type).interface
+    interface = control_profile(cfg.ctrl).interface
     loop = LOOP_TYPES[cfg.ctrl.loops[modulation].type]
     connections = {f"{modulation}.{port}": f"references.{port}" for port in loop.inputs
                    if f"references.{port}" in interface.inputs}
@@ -2161,7 +2171,7 @@ def _dc_converter_wiring(cfg, *, continuous=False):
             f"{voltage}.voltage": "meas.voltage",
         })
     if current is not None:
-        interface = control_type(cfg.ctrl.type).interface
+        interface = control_profile(cfg.ctrl).interface
         reference = (f"{voltage}.current_reference" if voltage is not None
                      else "references.current" if "references.current" in interface.inputs
                      else None)
@@ -2206,6 +2216,13 @@ class GraphController(_GraphRuntime):
     ordinary graph loops; no application-specific controller bypasses the graph.
     """
 
+    @staticmethod
+    def resolve_interface(profile, continuous: bool) -> ControlInterface:
+        boundary = (PHASE_SHIFT_CONVERTER_INTERFACE
+                    if profile.modulator == "phase_shift" else DC_CONVERTER_INTERFACE)
+        return replace(profile.interface, outputs=boundary.outputs,
+                       optional_outputs=boundary.optional_outputs)
+
     def __init__(self, cfg, topology) -> None:
         self.p = cfg
         self.topology = topology
@@ -2214,14 +2231,14 @@ class GraphController(_GraphRuntime):
             ContinuousStartup(run=False) if self.continuous
             else Startup(cfg.ctrl.period, run=False)
         )
-        profile = control_type(cfg.ctrl.type)
+        profile = control_profile(cfg.ctrl)
         connections, outputs = profile.wiring(cfg, continuous=self.continuous)
         self.graph = ControlGraph(
             cfg,
             self.startup,
             connections,
             outputs,
-            interface=profile.interface,
+            interface=resolved_control_interface(cfg.ctrl, self.continuous),
             continuous=self.continuous,
         )
         self.outputs_need_inputs = any(
@@ -2384,15 +2401,22 @@ class GraphController(_GraphRuntime):
         }
 
 
+def resolved_control_interface(control, continuous: bool) -> ControlInterface:
+    """Resolve a graph boundary through its selected controller implementation."""
+    profile = control_profile(control)
+    resolver = getattr(profile.controller_factory, "resolve_interface", None)
+    return profile.interface if resolver is None else resolver(profile, continuous)
+
+
 def make_controller(cfg, **kwargs):
-    """Build the controller registered for ``cfg.ctrl.type``."""
-    factory = control_type(cfg.ctrl.type).controller_factory
+    """Build the controller resolved for one Unit's control graph."""
+    factory = control_profile(cfg.ctrl).controller_factory
     if factory is None:
-        raise ConfigError(f"ctrl.type: {cfg.ctrl.type!r} has no controller factory")
+        raise ConfigError("the control graph has no controller factory for this Unit type")
     return factory(cfg, **kwargs)
 
 
-for _control_name in ("gfl", "gfm", "custom"):
+for _control_name in ("gfl", "gfm"):
     register_control_type(
         _control_name,
         references=ReferenceParams,
@@ -2404,9 +2428,7 @@ for _control_name in ("gfl", "gfm", "custom"):
         grid_following=_control_name == "gfl",
         default_bridge="three_phase_bridge",
         controller_factory=VSCController,
-        default_loops={} if _control_name == "custom" else {
-            "modulation": "ThreePhaseModulation"
-        },
+        default_loops={"modulation": "ThreePhaseModulation"},
     )
 register_control_type(
     "dc",

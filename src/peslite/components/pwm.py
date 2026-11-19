@@ -14,7 +14,7 @@ from typing import Any, Callable, Iterator, Mapping, Protocol, NamedTuple, runti
 import numpy as np
 from numpy.typing import NDArray
 
-from ..control.profiles import PHASE_SHIFT_MODES, control_type
+from ..control.profiles import PHASE_SHIFT_MODES, control_profile
 from ..solver.model import ConfigError, _integer, _real
 from ..solver.timing import TIME_EPS, PeriodicClock
 
@@ -1102,7 +1102,7 @@ def modulator_type(pwm, model, kind=None):
 def validate_modulator(unit, topology, where, *, dead_time_active=True):
     if unit.pwm is None:
         return
-    cls = modulator_type(unit.pwm, unit.bridge.model, control_type(unit.ctrl.type).modulator)
+    cls = modulator_type(unit.pwm, unit.bridge.model, control_profile(unit.ctrl).modulator)
     if unit.bridge.model not in cls.supported_models:
         raise ConfigError(f"{where}.bridge.model: {cls.__name__} requires resolved switching edges")
     legs = getattr(cls, "switching_legs", None)
@@ -1129,6 +1129,6 @@ def make_modulator(pwm: Any, f0: float, bridge: Any, kind: str | None = None,
 
 
 def make_unit_modulator(cfg):
-    spec = control_type(cfg.ctrl.type)
+    spec = control_profile(cfg.ctrl)
     return make_modulator(cfg.pwm, cfg.base.f0, cfg.bridge, spec.modulator, cfg.ctrl.references,
                           spec.interface.auxiliary_outputs(cfg.ctrl.outputs))

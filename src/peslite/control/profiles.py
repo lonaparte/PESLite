@@ -78,7 +78,7 @@ class PhaseShiftReferenceParams:
 
 @dataclass(frozen=True)
 class ControlTypeSpec:
-    """Behavior selected by one ``ctrl.type`` value.
+    """Defaults selected by one ``ctrl.type`` value, or an assembled explicit boundary.
 
     ``options`` is the optional dataclass schema for ``ctrl.options``. A standalone controller
     sets ``requires_loops=False`` and may validate cross-field relationships with ``validator``.
@@ -93,7 +93,7 @@ class ControlTypeSpec:
     interface: ControlInterface | None = None
     wiring: Callable[..., Any] | None = None
     log_sources: Mapping[str, str] | None = None
-    grid_following: bool = False
+    grid_following: Optional[bool] = None
     default_bridge: str | None = None
     controller_factory: Callable[..., Any] | None = None
     reference_validator: Callable[[Any, str], None] | None = None
@@ -171,3 +171,23 @@ def control_type(name: str, where: str = "ctrl.type") -> ControlTypeSpec:
         raise ConfigError(
             f"{where}: unknown control type {name!r}; known: {sorted(CONTROL_TYPES)}"
         ) from None
+
+
+def control_profile(control: Any) -> ControlTypeSpec:
+    """Return the profile resolved while building one controller configuration."""
+    if getattr(control, "type", None) is not None:
+        return control_type(control.type)
+    profile = getattr(control, "_profile", None)
+    if profile is None:
+        raise ConfigError("an explicit control graph has not been assembled")
+    return profile
+
+
+def control_profiles(unit_type: str) -> tuple[ControlTypeSpec, ...]:
+    """Return registered default profiles applicable to one Unit type."""
+    return tuple(profile for profile in CONTROL_TYPES.values() if unit_type in profile.unit_types)
+
+
+def explicit_wiring(_cfg: Any, *, continuous: bool = False) -> tuple[dict, dict]:
+    """Supply no defaults; explicit graph declarations pass through the normal merge path."""
+    return {}, {}

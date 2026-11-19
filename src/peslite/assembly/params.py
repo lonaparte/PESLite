@@ -22,16 +22,17 @@ import math
 from collections.abc import Mapping as _Mapping
 from copy import deepcopy
 from contextvars import ContextVar
-from dataclasses import dataclass, field, fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass, make_dataclass, replace
 from pathlib import Path
-from types import UnionType
+from types import MappingProxyType, UnionType
 from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
 
 from ..components.network import ELEMENT_TYPES, element_buses
 from ..components.pwm import DEFAULT_PWM_ALIGNMENT, PWM_ALIGNMENTS
-from ..control.controller import continuous_control
-from ..control.loops import LOOP_TYPES, loop_key_type, loop_type
-from ..control.profiles import ReferenceParams, control_type
+from ..control.controller import ControlInterface, continuous_control
+from ..control.loops import LOOP_TYPES, SignalType, loop_key_type, loop_type
+from ..control.profiles import (ControlTypeSpec, ReferenceParams, control_profile,
+                                control_profiles, control_type, explicit_wiring)
 from ..control.signals import ReferenceBinding, TableSignal
 from ..solver.integrators import CIRCUIT_MODELS, canonical_method
 from ..solver.model import ConfigError
@@ -93,7 +94,7 @@ def parameter_leaves(value, prefix="", defaulted=frozenset()):
                  for item in fields(value) if item.init and not item.name.startswith("_"))
     elif is_dataclass(value):
         items = ((item.name, getattr(value, item.name), item.metadata)
-                 for item in fields(value) if item.init)
+                 for item in fields(value) if item.init and not item.metadata.get("internal"))
     elif isinstance(value, dict):
         items = ((key, item, {}) for key, item in value.items())
     else:
@@ -440,13 +441,14 @@ class ControlParams:
     to 1 us: the time from the ADC sample until the new command may be loaded. An ideal averaging
     bridge uses these fields only when its active graph contains sampled-only loops.
 
-    ``type`` selects the reference-field schema and default wiring. ``connections`` and ``outputs``
-    override that wiring. A ``loops`` key names a registered loop class. The optional
+    Optional ``type`` selects a reference schema and supplies default wiring. ``connections`` and
+    ``outputs`` override those defaults; without a type they form the graph directly. A ``loops``
+    key names a registered loop class. The optional
     ``ClassName[label]`` form distinguishes repeated uses of the same class. Standalone
     control types may omit loops and declare a typed ``options`` section in their registry entry.
     """
 
-    type: str
+    type: Optional[str] = None
     period: Optional[float] = None  # s; default: one carrier period
     offset: Optional[float] = None  # s; default: the PWM load-clock offset
     computation: Optional[float] = None  # s; sampled default 1 us
@@ -460,6 +462,8 @@ class ControlParams:
     )
     _control_overlay: Any = field(default=None, repr=False, compare=False,
                                   metadata={"internal": True})
+    _profile: Any = field(default=None, repr=False, compare=False,
+                          metadata={"internal": True})
 
 
 @dataclass(frozen=True)
@@ -655,7 +659,7 @@ class UnitParams:
             loops = dict(ctrl.loops)
             if loops and not continuous:
                 roles = {LOOP_TYPES[loop.type].role for loop in loops.values()}
-                for role, name in control_type(ctrl.type).default_loops.items():
+                for role, name in control_profile(ctrl).default_loops.items():
                     if role not in roles:
                         loops[name] = loop_key_type(name).Params(period=ctrl.period)
                         derived.add(f"ctrl.loops.{name}")
@@ -1139,6 +1143,8 @@ def to_dict(p: Any, derived: bool = False) -> dict:
         d = {f.name: to_dict(getattr(p, f.name), derived) for f in fields(p)
              if f.init and not f.metadata.get("internal")}
         if isinstance(p, ControlParams):
+            if p.type is None:
+                d.pop("type", None)
             for name, loop in p.loops.items():
                 direct = loop_key_type(name)
                 if direct is not None and direct.type == loop.type:
@@ -1227,18 +1233,168 @@ _TYPED = {
 }
 
 
+_UNKNOWN_SIGNAL = SignalType("unknown")
+
+
+@functools.cache
+def _explicit_reference_schema(items: tuple[tuple[str, SignalType], ...]) -> type:
+    """Create the ordinary typed parameter schema implied by explicit reference connections."""
+    invalid = [name for name, _signal in items if not name.isidentifier()]
+    if invalid:
+        raise ConfigError(f"ctrl.references: unusable names {invalid}")
+    schema = make_dataclass(
+        "ExplicitReferenceParams",
+        [(name, int if signal.frame == "mode" else float) for name, signal in items],
+        frozen=True,
+    )
+    schema._quantities = {
+        name: signal.unit[3:] for name, signal in items
+        if name.endswith("_pu") and signal.unit.startswith("pu_")
+    }
+    return schema
+
+
+def _merged_control_ports(profiles: tuple[ControlTypeSpec, ...], boundary: str,
+                          owner: str | None = None) -> dict[str, SignalType]:
+    """Merge compatible registered boundary declarations for an explicit graph."""
+    merged: dict[str, SignalType] = {}
+    for profile in profiles:
+        interface = profile.interface
+        if interface is None:
+            continue
+        ports = getattr(interface, boundary)
+        for name, signal in ports.items():
+            if owner is not None and not name.startswith(owner + "."):
+                continue
+            previous = merged.get(name)
+            if previous is not None and previous != signal:
+                raise ConfigError(
+                    f"registered control profiles disagree on {name!r}: {previous} and {signal}"
+                )
+            merged[name] = signal
+    return merged
+
+
+def _reference_signal(existing: SignalType | None, incoming: SignalType, where: str) -> SignalType:
+    """Combine the types inferred for one reference or report the real wiring ambiguity."""
+    if existing is None or existing == _UNKNOWN_SIGNAL:
+        return incoming
+    if incoming == _UNKNOWN_SIGNAL or existing == incoming:
+        return existing
+    if not existing.compatible(incoming):
+        raise ConfigError(f"{where}: incompatible uses require both {existing} and {incoming}")
+    generic = {"current", "voltage"}
+    return incoming if existing.unit in generic and incoming.unit not in generic else existing
+
+
+def _explicit_profile(data: dict, path: str, unit_kind: str,
+                      loops: dict[str, Any]) -> ControlTypeSpec:
+    """Derive one typed boundary from an explicit graph without inventing controller families."""
+    profiles = control_profiles(unit_kind)
+    factory = unit_type(unit_kind).controller_factory
+    if factory is None:
+        raise ConfigError(
+            f"{path}: unit type {unit_kind!r} does not define a controller runtime"
+        )
+
+    connections = data.get("connections", {})
+    outputs = data.get("outputs", {})
+    references = data.get("references", {})
+    for name, value in (("connections", connections), ("outputs", outputs),
+                        ("references", references)):
+        if not isinstance(value, dict):
+            raise ConfigError(f"{path}.{name}: expected a mapping, got {type(value).__name__}")
+
+    classes = {name: loop_type(loop.type) for name, loop in loops.items()}
+    targets = {f"{name}.{port}": signal
+               for name, cls in classes.items() for port, signal in cls.inputs.items()}
+    loop_outputs = {f"{name}.{port}": signal
+                    for name, cls in classes.items() for port, signal in cls.outputs.items()}
+    measurements = _merged_control_ports(profiles, "inputs", "meas")
+    command_types = _merged_control_ports(profiles, "outputs")
+    reference_types: dict[str, SignalType] = {
+        str(name): _UNKNOWN_SIGNAL for name in references
+    }
+    used_measurements: dict[str, SignalType] = {}
+
+    for target, source in connections.items():
+        if not isinstance(source, str):
+            continue
+        expected = targets.get(target, _UNKNOWN_SIGNAL)
+        if source.startswith("references."):
+            name = source[11:]
+            reference_types[name] = _reference_signal(
+                reference_types.get(name), expected, f"{path}.references.{name}"
+            )
+        elif source.startswith("meas.") and source in measurements:
+            used_measurements[source] = measurements[source]
+
+    output_types: dict[str, SignalType] = {}
+    for port, source in outputs.items():
+        expected = command_types.get(port, _UNKNOWN_SIGNAL)
+        actual = loop_outputs.get(source, measurements.get(source, _UNKNOWN_SIGNAL))
+        if isinstance(source, str) and source.startswith("references."):
+            name = source[11:]
+            reference_types[name] = _reference_signal(
+                reference_types.get(name), expected, f"{path}.references.{name}"
+            )
+            actual = reference_types[name]
+        output_types[str(port)] = expected if expected != _UNKNOWN_SIGNAL else actual
+
+    reference_inputs = {
+        f"references.{name}": signal for name, signal in reference_types.items()
+    }
+    interface = ControlInterface(
+        inputs=MappingProxyType({**used_measurements, **reference_inputs}),
+        outputs=MappingProxyType(output_types),
+        optional_outputs=frozenset(set(output_types) - set(command_types)),
+    )
+    output_names = set(outputs)
+    matching = []
+    for profile in profiles:
+        candidate = profile.interface
+        if candidate is None:
+            continue
+        required = set(candidate.outputs) - set(candidate.optional_outputs)
+        if required <= output_names:
+            matching.append(profile)
+    bridge_choices = {
+        profile.default_bridge for profile in (matching or profiles)
+        if profile.default_bridge is not None
+    }
+    modulator_choices = {profile.modulator for profile in matching}
+    modulator = next(iter(modulator_choices)) if len(modulator_choices) == 1 else None
+    reference_schema = _explicit_reference_schema(tuple(sorted(reference_types.items())))
+    return ControlTypeSpec(
+        name="explicit",
+        references=reference_schema,
+        unit_types=frozenset((unit_kind,)),
+        interface=interface,
+        wiring=explicit_wiring,
+        log_sources=MappingProxyType({}),
+        default_bridge=(next(iter(bridge_choices)) if len(bridge_choices) == 1 else None),
+        controller_factory=factory,
+        modulator=modulator,
+    )
+
+
 def _build_control_params(data: Any, path: str, base: BaseValues,
                           scales: dict[str, float], unit_type: str) -> ControlParams:
-    """Build common controller parameters with registered reference and option schemas."""
+    """Build one controller, resolving defaults and explicit graphs to the same profile."""
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: expected a mapping, got {type(data).__name__}")
     kind = data.get("type")
-    spec = control_type(kind, f"{path}.type")
-    if unit_type not in spec.unit_types:
+    values = dict(data)
+    loops = _build_named(
+        "loop", values.get("loops", {}), f"{path}.loops", base, scales, values,
+    )
+    values["loops"] = loops
+    spec = (_explicit_profile(values, path, unit_type, loops) if kind is None
+            else control_type(kind, f"{path}.type"))
+    if kind is not None and unit_type not in spec.unit_types:
         raise ConfigError(
             f"{path}.type: unit type {unit_type!r} cannot use control type {kind!r}"
         )
-    values = dict(data)
     references = values.get("references", {})
     if not isinstance(references, dict):
         raise ConfigError(f"{path}.references: expected a mapping, got {type(references).__name__}")
@@ -1290,9 +1446,13 @@ def _build_control_params(data: Any, path: str, base: BaseValues,
             spec.options, values.get("options", {}), f"{path}.options", base, scales,
         )
     elif values.get("options") is not None:
-        raise ConfigError(f"{path}.options: control type {kind!r} does not accept options")
-    return replace(_build(ControlParams, values, path, base, scales),
-                   _reference_bindings=bindings)
+        scope = "an explicit control graph" if kind is None else f"control type {kind!r}"
+        raise ConfigError(f"{path}.options: {scope} does not accept options")
+    return replace(
+        _build(ControlParams, values, path, base, scales),
+        _reference_bindings=bindings,
+        _profile=spec if kind is None else None,
+    )
 
 
 def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
@@ -1347,7 +1507,13 @@ def _build_unit_params(data: Any, path: str, base: BaseValues) -> UnitParams:
             data.get("ctrl"), f"{path}.ctrl", unit_base, unit_scales, kind
         )
         bridge = common["bridge"]
-        common["bridge"] = replace(bridge, type=bridge.type or spec.bridge_for(control))
+        selected_bridge = bridge.type or spec.bridge_for(control)
+        if selected_bridge is None:
+            raise ConfigError(
+                f"{path}.bridge.type: required because the explicit control graph does not "
+                "select one unique bridge topology"
+            )
+        common["bridge"] = replace(bridge, type=selected_bridge)
         common["ctrl"] = control
     return UnitParams(
         type=kind,
@@ -1458,6 +1624,8 @@ def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dic
             raise ConfigError(f"{path}: {name!r} is not a usable name (non-empty, no '.')")
         where = f"{path}.{name}"
         if isinstance(item_cls, type) and is_dataclass(item_cls) and isinstance(item, item_cls):
+            out[name] = item
+        elif item_cls == "loop" and is_dataclass(item):
             out[name] = item
         elif item_cls == "unit":
             out[name] = _build_unit_params(item, where, base)

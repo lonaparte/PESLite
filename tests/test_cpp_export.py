@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -499,13 +500,13 @@ def test_native_continuous_control_feedback_checks_convergence(tmp_path):
     tree = read_tree(EXAMPLES / "gfl-example.pes")
     tree["units"]["vsc"]["bridge"] = {"model": "averaging"}
     tree["units"]["vsc"]["ctrl"] = {
-        "type": "custom",
         "loops": {"_AffineFeedback[a]": {"gain": 0.25, "bias": 1.0},
                   "_AffineFeedback[b]": {"gain": 0.5, "bias": 2.0}},
         "connections": {"_AffineFeedback[a].x": "_AffineFeedback[b].y",
                         "_AffineFeedback[b].x": "_AffineFeedback[a].y"},
         "outputs": {"u_dq": "_AffineFeedback[a].y", "theta": "references.theta",
                     "omega": "references.omega"},
+        "references": {"theta": 0.0, "omega": 2.0 * math.pi * 50.0},
     }
     tree["simulation"].update(t_end=1e-4, energy_check="off")
     tree["simulation"]["solver"].update(type="fixed", method="rk4", dt=1e-6,

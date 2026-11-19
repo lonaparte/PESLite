@@ -1,6 +1,7 @@
 """The refactored controller, its loop registry and dependency boundary."""
 
 import ast
+import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -285,7 +286,6 @@ def test_repeated_loop_class_uses_qualified_names_without_type_fields():
     unit = tree["units"]["vsc"]
     unit["bridge"] = {"model": "averaging"}
     unit["ctrl"] = {
-        "type": "custom",
         "loops": {
             "_AffineFeedback[a]": {"gain": 0.25, "bias": 1.0},
             "_AffineFeedback[b]": {"gain": 0.5, "bias": 2.0},
@@ -299,6 +299,7 @@ def test_repeated_loop_class_uses_qualified_names_without_type_fields():
             "theta": "references.theta",
             "omega": "references.omega",
         },
+        "references": {"theta": 0.0, "omega": 2.0 * math.pi * 50.0},
     }
 
     params = from_dict(tree)

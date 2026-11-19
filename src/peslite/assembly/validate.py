@@ -17,7 +17,7 @@ from ..components.converter import make_topology
 from ..components.pwm import validate_modulator
 from ..components.network import GROUND, element_buses
 from ..control.controller import continuous_control
-from ..control.profiles import control_type
+from ..control.profiles import control_profile
 from ..solver.integrators import (ADAPTIVE_METHODS, EXPLICIT_FIXED_METHODS, FIXED_METHODS,
                                   IMPLICIT_ADAPTIVE_METHODS, IMPLICIT_FIXED_METHODS)
 from ..solver.model import ConfigError
@@ -144,7 +144,7 @@ def _timing(c, pwm, where: str, continuous: bool = False, *,
 
 def _control(c, pwm, where: str, continuous: bool = False) -> None:
     """Check shared controller fields and the registered controller configuration."""
-    profile = control_type(c.type, f"{where}.type")
+    profile = control_profile(c)
     if profile.requires_loops and not c.loops:
         raise ConfigError(f"{where}.loops must contain at least one loop")
     T_c = None if continuous else _period(c, pwm)
@@ -304,7 +304,7 @@ def _converter(u, base, where: str):
     _dclink(u.dclink, f"{where}.dclink")
     continuous = u.ctrl is None or continuous_control(u)
     if u.ctrl is not None:
-        profile = control_type(u.ctrl.type, f"{where}.ctrl.type")
+        profile = control_profile(u.ctrl)
         if profile.supported_models is not None and u.bridge.model not in profile.supported_models:
             raise ConfigError(
                 f"{where}.bridge.model: control type {u.ctrl.type!r} supports only "
@@ -685,7 +685,7 @@ def _reference_signals(p: Params) -> None:
         control = unit.ctrl
         if control is None or not control._reference_bindings:
             continue
-        profile = control_type(control.type)
+        profile = control_profile(control)
         for target, binding in control._reference_bindings.items():
             where = f"units.{name}.ctrl.references.{binding.input_name}"
             try:
