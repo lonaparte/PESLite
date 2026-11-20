@@ -25,7 +25,6 @@ from ..defaults import (DEFAULT_ALGEBRAIC_ATOL, DEFAULT_ALGEBRAIC_MAX_ITERATIONS
 from ..solver.model import (Bag, ConfigError, _complex, _component_plan, _dependency_plan,
                             _real, gather, scatter)
 from ..solver.energy import Port
-from ..solver.timing import control_clock_offset
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,
                     SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ,
@@ -461,9 +460,7 @@ class ControlGraph:
         self.continuous = (cfg.bridge.model == "averaging"
                            if continuous is None else bool(continuous))
         self._T = None if self.continuous else _real(cfg.ctrl.period)
-        self._t0 = control_clock_offset(
-            cfg.ctrl, cfg.pwm, pwm_timed=cfg.bridge.pwm_timed,
-        )
+        self._t0 = _real(0.0 if cfg.ctrl.offset is None else cfg.ctrl.offset)
         self.values: dict[str, Any] = {}
         self._out_specs: dict[str, tuple] = {}
         self._limits: dict[str, tuple[str, OutputLimit]] = {}

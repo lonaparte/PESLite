@@ -20,7 +20,7 @@ from peslite.addons.components.magport import (
     MagPortModel,
     TabulatedEnergyLaw,
     TabulatedMagneticLaw,
-    _load,
+    load_magport_data,
 )
 from peslite.addons.functions import (
     export_magnetic_circuit,
@@ -71,7 +71,7 @@ def test_external_magnetic_model_round_trip_and_strict_schema(tmp_path):
         field_basis=basis,
     )
 
-    loaded = _load(path)
+    loaded = load_magport_data(path)
     assert loaded.winding_names == ("primary", "secondary")
     np.testing.assert_array_equal(loaded.inductance, [[4e-3, 1e-3], [1e-3, 3e-3]])
     np.testing.assert_array_equal(loaded.field_points, points)
@@ -91,7 +91,7 @@ def test_external_magnetic_model_round_trip_and_strict_schema(tmp_path):
         unexpected=np.array(1.0),
     )
     with pytest.raises(ConfigError, match="unknown entries.*unexpected"):
-        _load(invalid)
+        load_magport_data(invalid)
 
 
 def test_simulation_file_resolves_external_magnetic_model_relative_to_itself(tmp_path):
@@ -138,7 +138,7 @@ def test_linear_reluctance_network_reduces_to_reciprocal_inductance(tmp_path):
         reluctance=reluctance,
         coupling=coupling,
     )
-    loaded = _load(path)
+    loaded = load_magport_data(path)
     np.testing.assert_allclose(loaded.inductance, expected, rtol=1e-14, atol=0.0)
     network = dict(loaded.physical)["reluctance_network"]
     assert network["coupling"] == coupling.tolist()
@@ -273,7 +273,7 @@ def test_multiwinding_energy_samples_define_one_conservative_current_map(tmp_pat
         flux_linkage=flux,
         stored_energy=energy,
     )
-    data = _load(file)
+    data = load_magport_data(file)
     assert data.current is None
     np.testing.assert_array_equal(data.stored_energy, energy)
 
@@ -527,7 +527,7 @@ def test_nonlinear_magport_file_and_magcircuit_branch_law(tmp_path):
         flux_linkage=flux,
         current=current,
     )
-    data = _load(file)
+    data = load_magport_data(file)
     assert data.inductance is None
     np.testing.assert_array_equal(data.flux_linkage[:, 0], flux)
     np.testing.assert_array_equal(data.current[:, 0], current)

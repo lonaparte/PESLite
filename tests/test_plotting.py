@@ -11,7 +11,7 @@ from peslite.addons.functions import plot_csv, plot_result
 from peslite.addons.functions import plotting
 from peslite.addons.functions.plotting import _time_scale
 from peslite.solver import simulation
-from peslite.solver.simulation import main
+from peslite.cli import main
 
 
 pytest.importorskip("matplotlib")

@@ -10,7 +10,7 @@ from typing import Mapping
 import numpy as np
 
 from .frequency import FrequencyMeasurement, _complex, _write
-from .port_measurement import measure_recorded_transfer
+from .identification import measure_recorded_transfer
 
 __all__ = ["measure_return_ratio", "loop_gain_sweep", "LoopGainResult"]
 

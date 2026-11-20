@@ -24,16 +24,21 @@ from ...components.network import register_component_type
 from ...solver import Bag, ConfigError, OutputMethod, Port, directional_derivative
 
 __all__ = [
+    "MAGPORT_FORMAT",
+    "MAGPORT_VERSION",
     "MagneticLaw",
     "MagPort",
+    "MagPortData",
     "MagPortModel",
     "TabulatedEnergyLaw",
     "TabulatedMagneticLaw",
+    "load_magport_data",
+    "magport_data",
 ]
 
 
-_FORMAT = "peslite-magport"
-_VERSION = 2
+MAGPORT_FORMAT = "peslite-magport"
+MAGPORT_VERSION = 2
 _REQUIRED = frozenset({"format", "version", "winding_names"})
 _LINEAR = frozenset({"inductance"})
 _CURRENT_MAP = frozenset({"flux_linkage", "current"})
@@ -44,7 +49,7 @@ _OPTIONAL = frozenset({
 
 
 @dataclass(frozen=True)
-class _MagPortData:
+class MagPortData:
     winding_names: tuple[str, ...]
     inductance: np.ndarray | None
     flux_linkage: np.ndarray | None
@@ -131,7 +136,7 @@ def _energy_map(
     return ordered_flux, ordered_energy
 
 
-def _data(
+def magport_data(
     winding_names: Sequence[str],
     inductance: Any | None = None,
     flux_linkage: Any | None = None,
@@ -141,7 +146,7 @@ def _data(
     magnetic: MagneticDescription | Mapping[str, Any] | None = None,
     field_points: Any | None = None,
     field_basis: Any | None = None,
-) -> _MagPortData:
+) -> MagPortData:
     names = _validate_winding_names(winding_names)
     linear = inductance is not None
     current_map = current is not None
@@ -198,7 +203,7 @@ def _data(
     description = _magnetic_description(magnetic)
     if description is not None:
         description.matrices(names)
-    return _MagPortData(
+    return MagPortData(
         names, matrix, flux_samples, current_samples, energy_samples,
         source, description, points, basis
     )
@@ -218,7 +223,7 @@ def _vector_strings(value: np.ndarray, name: str) -> np.ndarray:
     return array.astype(str)
 
 
-def _load(file: str | Path) -> _MagPortData:
+def load_magport_data(file: str | Path) -> MagPortData:
     path = Path(file).expanduser().resolve()
     if not path.is_file():
         raise ConfigError(f"magport file does not exist: {path}")
@@ -236,9 +241,10 @@ def _load(file: str | Path) -> _MagPortData:
                 raise ConfigError("; ".join(details))
             format_name = _scalar(archive["format"], "format")
             version = _scalar(archive["version"], "version")
-            if format_name != _FORMAT:
+            if format_name != MAGPORT_FORMAT:
                 raise ConfigError(f"unknown magport format {format_name!r}")
-            if type(version) not in (int, np.int32, np.int64) or int(version) != _VERSION:
+            if (type(version) not in (int, np.int32, np.int64)
+                    or int(version) != MAGPORT_VERSION):
                 raise ConfigError(f"unsupported magport version {version!r}")
             constitutive = keys & (_LINEAR | _CURRENT_MAP | _ENERGY_MAP)
             if constitutive not in (_LINEAR, _CURRENT_MAP, _ENERGY_MAP):
@@ -267,7 +273,7 @@ def _load(file: str | Path) -> _MagPortData:
                     magnetic = json.loads(text)
                 except json.JSONDecodeError as exc:
                     raise ConfigError(f"magnetic contains invalid JSON: {exc.msg}") from None
-            return _data(
+            return magport_data(
                 names,
                 inductance=(archive["inductance"].copy()
                             if "inductance" in keys else None),
@@ -834,7 +840,7 @@ class MagPort(_MagneticElement):
         if law is not None:
             _attach_magnetic_law(self, name, cfg, buses, law, magnetic)
             return
-        data = _load(cfg.file)
+        data = load_magport_data(cfg.file)
         if cfg.magnetic is not None and data.magnetic is not None:
             raise ConfigError("magnetic may be provided by the configuration or file, not both")
         magnetic = cfg.magnetic or data.magnetic

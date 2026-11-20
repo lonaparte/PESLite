@@ -3,8 +3,8 @@
 import pytest
 from conftest import EXAMPLES
 from peslite.assembly.syntax import parse_native_text
-from peslite.solver import simulation
-from peslite.solver.simulation import _config_path
+from peslite import cli
+from peslite.cli import _config_path
 
 pytestmark = pytest.mark.static
 
@@ -46,7 +46,7 @@ def test_installed_package_finds_examples_in_its_data_directory(tmp_path, monkey
         def locate_file(_entry):
             return installed
 
-    fake_module = tmp_path / "package" / "peslite" / "solver" / "simulation.py"
-    monkeypatch.setattr(simulation, "__file__", str(fake_module))
-    monkeypatch.setattr(simulation, "distribution", lambda _name: Distribution())
-    assert simulation._example_configs_dir() == examples
+    fake_module = tmp_path / "package" / "peslite" / "cli.py"
+    monkeypatch.setattr(cli, "__file__", str(fake_module))
+    monkeypatch.setattr(cli, "distribution", lambda _name: Distribution())
+    assert cli._example_configs_dir() == examples

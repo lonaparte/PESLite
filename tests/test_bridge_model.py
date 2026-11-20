@@ -293,7 +293,7 @@ def test_set_wins_over_averaging_flag():
 
 
 def test_pwm_averaging_flag_results_use_their_own_folder(tmp_path, monkeypatch):
-    monkeypatch.setattr(peslite.solver.simulation, "_RESULTS", tmp_path)
+    monkeypatch.setattr(peslite.cli, "_RESULTS", tmp_path)
     with redirect_stdout(io.StringIO()):
         assert peslite.main(["gfl-example", *SHORT]) == 0
         assert peslite.main(["gfl-example", "--switching", *SHORT]) == 0

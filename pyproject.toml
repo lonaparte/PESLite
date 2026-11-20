@@ -27,7 +27,7 @@ test = [
 onnx-test = ["onnx>=1.17.0", "onnxruntime>=1.18.0"]
 
 [project.scripts]
-peslite = "peslite.solver.simulation:main"
+peslite = "peslite.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/lonaparte/PESLite"

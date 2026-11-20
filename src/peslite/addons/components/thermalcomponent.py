@@ -10,8 +10,7 @@ import numpy as np
 
 from ...components.network import Element, NetworkComponent, register_component_type
 from ...solver import Bag, ConfigError, Empty, OutputMethod, Port
-from ..functions.thermal import SemiconductorLossModel, SwitchingEvent
-from ..functions.thermal.losses import _lookup
+from ..functions.thermal import SemiconductorLossModel, SwitchingEvent, _lookup
 from .thermalnetwork import FosterImpedance, LumpedThermalNetwork, _positive, _record
 
 __all__ = [

@@ -8,7 +8,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from ...solver import ConfigError
-from ..components.magcircuit import _linear_circuit, _matrix
+from ..components.magcircuit import reduce_linear_circuit
 from .magport import write_magport
 
 __all__ = ["export_magnetic_circuit", "reluctance_inductance"]
@@ -18,10 +18,7 @@ def reluctance_inductance(
     reluctance: Any, coupling: Any, incidence: Any | None = None
 ) -> np.ndarray:
     """Return the exact winding inductance of a linear magnetic circuit."""
-    inductance, _response, _matrix_value = _linear_circuit(
-        reluctance, coupling, incidence
-    )
-    return inductance
+    return reduce_linear_circuit(reluctance, coupling, incidence).inductance
 
 
 def export_magnetic_circuit(
@@ -35,10 +32,11 @@ def export_magnetic_circuit(
     field_per_flux: Any | None = None,
 ) -> Path:
     """Write the exact linear reduction of one magnetic circuit through magport."""
-    inductance, response, matrix = _linear_circuit(
-        reluctance, coupling, incidence
-    )
-    turns = _matrix(coupling, "coupling")
+    reduction = reduce_linear_circuit(reluctance, coupling, incidence)
+    inductance = reduction.inductance
+    response = reduction.response
+    matrix = reduction.reluctance
+    turns = reduction.coupling
     names = tuple(winding_names)
     if turns.shape[1] != len(names):
         raise ConfigError(
@@ -66,7 +64,7 @@ def export_magnetic_circuit(
             "reluctance": matrix.tolist(),
             "coupling": turns.tolist(),
             "incidence": (
-                None if incidence is None else _matrix(incidence, "incidence").tolist()
+                None if incidence is None else np.asarray(incidence, dtype=float).tolist()
             ),
         }
     }

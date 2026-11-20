@@ -59,7 +59,7 @@ class _Loop:
 
 @pytest.fixture
 def _use_fake_period_map(monkeypatch):
-    monkeypatch.setattr(operating_module, "SystemLoop", _Loop)
+    monkeypatch.setattr(operating_module, "SimulationTransition", _Loop)
 
 
 def test_detects_dc_periodic_and_unconverged_states(_use_fake_period_map):

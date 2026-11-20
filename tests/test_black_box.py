@@ -15,7 +15,7 @@ from peslite.components import register_component_type
 from peslite.components.network import Element
 from peslite.solver import Bag, Model, StateRegistry
 from peslite.solver.energy import Port
-from peslite.solver.simulation import SystemLoop
+from peslite.solver.simulation import SimulationTransition
 
 
 @register_component_type
@@ -397,7 +397,7 @@ def test_discrete_black_box_updates_on_the_shared_simulation_event_grid(tmp_path
     result = simulation.run(out_dir=tmp_path)
 
     assert simulation.system.model.state_labels() == ["block.lag.z"]
-    assert SystemLoop(simulation).periods == [1.0e-3]
+    assert SimulationTransition(simulation).periods == [1.0e-3]
     assert "block.hidden" not in simulation._states.discrete_names
     assert result.states["block.hidden"][-1] == pytest.approx(3.0)
     assert simulation.system.named_elements["block"].counter.output.y == pytest.approx(3.0)

@@ -406,7 +406,9 @@ def _bindings(simulation, config, model, *, events=None):
         if unit.cfg.pwm.pattern_sync == "pulse":
             raise TypeError(f"{name}: the Imperix hardware PWM adapter does not implement "
                             "complete-pulse updates")
-        if unit.cfg.ctrl.offset is not None or unit.cfg.meas.offset is not None:
+        explicit_control_offset = (unit.cfg.ctrl.offset is not None
+                                   and "ctrl.offset" not in unit.cfg.derived_defaults)
+        if explicit_control_offset or unit.cfg.meas.offset is not None:
             raise ValueError(f"{name}: hardware timing comes from imperix.sampling_phase on the CLK0 "
                              "grid; configured clock offsets (ctrl.offset, meas.offset) have no "
                              "hardware adapter")

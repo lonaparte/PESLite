@@ -12,7 +12,7 @@ from peslite.assembly.params import from_dict, to_dict
 from peslite.control import DUTY_RATIO, ControlGraph, Loop, register_loop_type
 from peslite.solver.linearization import linearize_loop
 from peslite.solver.model import StateRegistry
-from peslite.solver.simulation import SystemLoop
+from peslite.solver.simulation import SimulationTransition
 from peslite.solver.splitbound import _period_map
 from test_small_signal import _AffineMap
 
@@ -33,7 +33,8 @@ def _simulation(**changes):
 
 
 def _compare(sim, exhaustive_loop, *, period=None):
-    loop = SystemLoop(sim, period=period, frame_frequency=0.0, repeat_forcing=True)
+    loop = SimulationTransition(sim, period=period, frame_frequency=0.0,
+                                repeat_forcing=True)
     row = sim.result.final_states()
     start = row.pop("t")
     cols = loop.coordinates(list(row))

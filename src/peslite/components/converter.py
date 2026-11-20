@@ -16,8 +16,7 @@ from ..control.blocks import A120, phases, smoothstep
 from ..solver.energy import Port, StoragePort
 from ..solver.model import (Bag, ConfigError, Empty, LocatedZero, OutputMethod, _real,
                             _record_fields)
-from ..solver.timing import (TIME_EPS, control_actuation_clock,
-                             control_clock_offset)
+from ..solver.timing import TIME_EPS, PeriodicClock
 from .network import NetworkComponent
 from .passive import RCNode
 from .pwm import CarrierComparison, Modulator, PWM, ZOH, make_modulator
@@ -725,8 +724,11 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None, *,
             if modulator is not None:
                 raise ValueError("a continuously controlled averaging bridge does not use a modulator")
             return AveragingModel(topology, **impedance)
-        control_offset = control_clock_offset(cfg.ctrl, pwm, pwm_timed=False)
-        actuation = control_actuation_clock(cfg.ctrl, pwm, pwm_timed=False)
+        control_offset = cfg.ctrl.offset
+        actuation = PeriodicClock(
+            cfg.ctrl.period,
+            (control_offset + cfg.ctrl.computation) % cfg.ctrl.period,
+        )
         return _SampledAveragingModel(
             cfg.ctrl.period, actuation.period, control_offset, actuation.offset,
             cfg.ctrl.computation, cfg.ctrl.period,
@@ -738,7 +740,7 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None, *,
             **impedance,
         )
     model_type = SwitchingModel if cfg.bridge.model == "switching" else PWMAveragingModel
-    control_offset = control_clock_offset(cfg.ctrl, pwm)
+    control_offset = cfg.ctrl.offset
     return model_type(
         cfg.ctrl.period, pwm.load_period, control_offset, pwm.grid_offset, cfg.ctrl.computation,
         pwm.switching_period,

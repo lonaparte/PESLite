@@ -25,7 +25,7 @@ from ...control.blocks import abc2complex
 from ...control.loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, I, I_AB, SI_CURRENT,
                               SI_VOLTAGE, V, V_AB, Loop, register_loop_type)
 from ...solver.model import ConfigError
-from ...solver.timing import TIME_EPS, control_actuation_clock, control_clock_offset
+from ...solver.timing import TIME_EPS, PeriodicClock
 
 __all__ = ["LinearModel", "QuadraticProblem", "SolverResult", "MPCResult",
            "CCSMPC", "FCSMPC", "solve_active_set", "solve_slsqp",
@@ -1828,13 +1828,17 @@ class _PredictiveCurrentControl(Loop):
                 f"{type(self).__name__} commands cannot use duty-ratio dead-time compensation"
             )
         self.T = cfg.period
-        actuation = control_actuation_clock(unit.ctrl, unit.pwm, pwm_timed=pwm_timed)
+        actuation = (PeriodicClock(unit.pwm.load_period, unit.pwm.grid_offset)
+                     if pwm_timed else PeriodicClock(
+                         unit.ctrl.period,
+                         (unit.ctrl.offset + unit.ctrl.computation) % unit.ctrl.period,
+                     ))
         ratio = self.T / actuation.period
         if not math.isclose(ratio, round(ratio), rel_tol=1e-9) or ratio < 1:
             raise ConfigError(
                 f"{type(self).__name__}.period must be a whole multiple of the actuation period"
             )
-        t0 = control_clock_offset(unit.ctrl, unit.pwm, pwm_timed=pwm_timed)
+        t0 = unit.ctrl.offset
         index = actuation.index_at_or_after(t0 + unit.ctrl.computation)
         if unit.ctrl.computation > 0:
             index = max(index, actuation.index_after(t0))

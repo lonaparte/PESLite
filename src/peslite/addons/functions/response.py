@@ -1,4 +1,4 @@
-"""Step-response and tracking metrics from recorded transient waveforms."""
+"""Time-domain performance metrics from recorded transient waveforms."""
 
 from __future__ import annotations
 

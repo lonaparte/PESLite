@@ -9,7 +9,7 @@ import pytest
 import peslite
 from peslite.assembly.params import from_dict
 from peslite.solver import simulation as simulation_module
-from peslite.solver.simulation import _export_main
+from peslite.cli import _export_main
 
 
 pytestmark = [pytest.mark.long, pytest.mark.serial]

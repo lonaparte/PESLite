@@ -65,7 +65,7 @@ class SimulationProcess:
         if not path.is_file():
             raise WorkspaceError("select an existing .pes or .pesdbg file")
         model = path
-        command = [self.python, "-m", "peslite.solver.simulation"]
+        command = [self.python, "-m", "peslite.cli"]
         if path.suffix == ".pesdbg":
             from ..addons.functions.debug import read_debug_plan
             plan = read_debug_plan(path)

@@ -26,7 +26,7 @@ from ..components.pwm import Modulator
 from ..control.blocks import phases
 from ..control.controller import (Controller, ConverterMeasurement,
                                   Measurement, continuous_control)
-from ..solver.timing import TIME_EPS, PeriodicClock, control_clock_offset, resolve_clock_offset
+from ..solver.timing import TIME_EPS, PeriodicClock, resolve_clock_offset
 from .events import Scenario
 from .control import make_control_modulator, make_controller
 from .params import SimulationParams, UnitParams, _parameterized, unit_type
@@ -132,10 +132,7 @@ class Unit(ABC):
             if not self.continuous:
                 return PeriodicClock(
                     cfg.ctrl.period,
-                    control_clock_offset(
-                        cfg.ctrl, cfg.pwm,
-                        pwm_timed=cfg.bridge.pwm_timed,
-                    ),
+                    cfg.ctrl.offset,
                 )
             meas = cfg.meas
             return PeriodicClock(

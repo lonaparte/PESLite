@@ -1,8 +1,8 @@
-"""Multirate fixed-step solver, and :func:`make_solver`, which builds the solver of the settings.
+"""Multirate fixed-step integration.
 
 Named subsystems step at ``dt/N`` or advance over windows of ``M*dt``. Windowed subsystems advance on
 window-averaged inputs while the rest sees their extrapolated states; with every step equal to
-``dt``, :func:`make_solver` returns the single-rate integrator itself.
+``dt``, the solver is equivalent to a single-rate integrator.
 """
 
 from __future__ import annotations
@@ -16,45 +16,14 @@ from numpy.typing import NDArray
 
 from ..defaults import DEFAULT_MULTIRATE_SWEEPS, DEFAULT_SOLVER_ATOL, DEFAULT_SOLVER_RTOL
 from .energy import re_product
-from .integrators import (EXPLICIT_FIXED_METHODS, RHS, TABLEAUS, SolverStep, _accepted,
+from .integrators import (RHS, TABLEAUS, SolverStep, _accepted,
                           _accepted_steps, combine, canonical_method, integrator, stage_state,
                           subintervals)
 from .model import ConfigError
 
-__all__ = ["MultirateSolver", "HeldStorage", "make_solver", "parse_step"]
+__all__ = ["MultirateSolver", "HeldStorage", "own_schedule", "parse_step", "rated_effort"]
 
 _EPS = 1e-12
-
-
-def make_solver(cfg: Any, model: Optional[Any] = None, ratings: Any = None):
-    """Build the solver of the ``simulation.solver`` settings: single-rate, or multirate when
-    ``cfg.subsystems`` names subsystems of ``model`` on their own step.
-
-    ``ratings``: mapping storage scale -> (rated effort, rated flow), or a callable
-    ``(subsystem_name, storage) -> (effort, flow)``.
-    """
-    solver_type = cfg.type
-    method = cfg.method
-    if solver_type == "fixed" and cfg.subsystems:
-        if model is None:
-            raise ConfigError("simulation.solver.subsystems needs the model whose subsystems it names")
-        try:
-            parsed = {name: parse_step(value) for name, value in cfg.subsystems.items()}
-            if any(own_schedule(ratio, own, method) for ratio, own in parsed.values()):
-                if method not in EXPLICIT_FIXED_METHODS:
-                    raise ConfigError(
-                        "simulation.solver.subsystems needs an explicit system method, got "
-                        f"{method!r}"
-                    )
-                return MultirateSolver(model, cfg.subsystems, cfg.dt, method, cfg.sweeps, cfg.rtol, cfg.atol,
-                                       ratings)
-            unknown = [name for name in parsed if not model.select(name)]  # every step is dt: single-rate
-            if unknown:
-                raise KeyError(f"unknown subsystem(s) or namespace(s) {unknown}; this model has {model.names}")
-        except (KeyError, ValueError) as exc:
-            raise ConfigError(f"simulation.solver.subsystems: {exc.args[0]}") from None
-    return integrator(method, cfg.dt, cfg.rtol, cfg.atol, cfg.max_step, cfg.warm_start,
-                      model=model, solver_type=solver_type)
 
 
 def own_schedule(ratio: float, method: Optional[str], system_method: str) -> bool:

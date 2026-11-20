@@ -1,4 +1,4 @@
-"""Opt-in online stability analysis using the complete simulation loop map."""
+"""Online small-signal stability analysis using the complete simulation loop map."""
 
 from __future__ import annotations
 
@@ -17,9 +17,8 @@ import numpy as np
 from ...defaults import (DEFAULT_LINEARIZATION_RELATIVE_STEP,
                          DEFAULT_STABILITY_MULTIPLIER_TOLERANCE,
                          DEFAULT_STABILITY_PERIODIC_TOLERANCE)
-from ...solver.linearization import (active_coordinates, coordinate_difference, coordinate_width,
-                                     linearize_loop)
-from ...solver.simulation import SystemLoop
+from ...solver.linearization import active_coordinates, compare_loop_states, linearize_loop
+from ...solver.simulation import SimulationTransition
 from ...solver.timing import TIME_EPS
 
 if TYPE_CHECKING:
@@ -94,7 +93,7 @@ def small_signal(
     approximately periodic; this function does not trim it or replace the configured bridge.
 
     Complete named-state restart must be supported. No CSV history or new recording is needed.
-    The existing SystemLoop uses unsplit reference integration for a multirate configuration.
+    The simulation transition uses unsplit reference integration for a multirate configuration.
     """
     _validate_options(relative_step, periodic_tolerance, multiplier_tolerance, period)
     if sim.result is None:
@@ -108,7 +107,7 @@ def small_signal(
         raise ValueError("small_signal cannot analyze a tripped final operating state")
     row = sim.result.final_states()
     t0 = float(row.pop("t"))
-    loop = SystemLoop(sim, period=period, frame_frequency=0.0, repeat_forcing=True)
+    loop = SimulationTransition(sim, period=period, frame_frequency=0.0, repeat_forcing=True)
     if loop.period is None:
         raise ValueError("no common loop period was found; supply a valid period explicitly")
     if any(t0 < change.t <= t0 + loop.period + TIME_EPS for change in sim.p.changes):
@@ -140,40 +139,19 @@ def _analyze(loop, row, t0, relative_step, periodic_tolerance, multiplier_tolera
         raise ValueError("the loop has no differentiable state coordinates")
     coordinate_names = tuple(name for kind, group, _scale in cols if kind not in ("frozen", "mode")
                              for name in group)
-    check_row = loop.periodic_state(row)
-    check_cols = loop.coordinates(list(check_row), linearization=False)
-    check_active = active_coordinates(check_cols)
-    check_names = tuple(name for _kind, group, _scale in check_cols for name in group)
-    initial = loop.to_frame(check_row, t0, check_cols)
     baseline_evaluations = int(baseline is None)
     baseline = loop.advance(dict(row), t0) if baseline is None else baseline
-    final = loop.to_frame(loop.periodic_state(baseline), t0 + loop.period, check_cols)
-    if not np.all(np.isfinite(initial)) or not np.all(np.isfinite(final)):
-        raise ValueError("small_signal requires finite initial and final states")
-    floors = np.concatenate([np.full(coordinate_width(kind), scale)
-                             for kind, _names, scale in check_cols])
-    scales = np.maximum(floors, np.maximum(np.abs(initial), np.abs(final)))
-    j = 0
-    evolved_modes = []
-    for kind, names, scale in check_cols:
-        if kind == "angle":
-            scales[j] = scale
-        elif kind in ("frozen", "mode") and initial[j] != final[j]:
-            evolved_modes.append(names[0])
-        j += coordinate_width(kind)
-    residual = (np.abs(coordinate_difference(final, initial, check_cols))[list(check_active)]
-                / scales[list(check_active)])
-    worst = int(np.argmax(residual))
-    error = float(residual[worst])
-    periodic = repeating and not evolved_modes and error <= periodic_tolerance
+    comparison = compare_loop_states(loop, row, baseline, t0, t0 + loop.period)
+    error = comparison.error
+    periodic = repeating and not comparison.changed_modes and error <= periodic_tolerance
     if not periodic:
         if not repeating:
             reason = "the analysis period contains a non-repeating simulation-file event"
-        elif evolved_modes:
-            reason = f"the analysis period changes the discrete state {evolved_modes[0]!r}"
+        elif comparison.changed_modes:
+            reason = f"the analysis period changes the discrete state {comparison.changed_modes[0]!r}"
         else:
             reason = (f"the final state is not periodic over {loop.period:.8g} s "
-                      f"({check_names[check_active[worst]]}: scaled residual {error:.3g} "
+                      f"({comparison.worst_coordinate}: scaled residual {error:.3g} "
                       f"> {periodic_tolerance:.3g}); settle the run or supply the correct period")
         if require_periodic:
             raise ValueError(reason)
@@ -191,11 +169,11 @@ def _analyze(loop, row, t0, relative_step, periodic_tolerance, multiplier_tolera
     order = np.argsort(-np.abs(multipliers), kind="stable")
     diagnostics = ["Frequencies use the principal logarithm and are ambiguous modulo 1 / period."]
     # A single norm convention is used at both window boundaries; it is not an energy norm.
-    scales_by_name = dict(zip(check_names, scales))
+    scales_by_name = dict(zip(comparison.coordinates, comparison.scales))
     scale = np.array([scales_by_name[name] for name in coordinate_names])
     amplification = float(np.linalg.norm(phi * scale[None, :] / scale[:, None], ord=2))
     if getattr(loop, "split_reference", False):
-        diagnostics.append("The map uses SystemLoop's unsplit reference integration.")
+        diagnostics.append("The transition uses unsplit reference integration.")
     return SmallSignalResult(t0, loop.period, phi, coordinate_names, multipliers[order], error,
                              linear.evaluations + baseline_evaluations, time.perf_counter() - started,
                              multiplier_tolerance, tuple(diagnostics), periodic, amplification)
@@ -234,7 +212,7 @@ class SmallSignalReport:
 class _ReportPoint:
     at: float
     row: dict
-    loop: SystemLoop
+    loop: SimulationTransition
 
 
 def _report_value(value):
@@ -353,7 +331,8 @@ def small_signal_report(sim: Simulation, *, times: Iterable[float] = (),
             entry.update({"analysis.stability": "unavailable", "analysis.reason": "tripped operating state"})
             return None if final else next_endpoint()
         try:
-            loop = SystemLoop(sim, period=period, frame_frequency=0.0, repeat_forcing=True)
+            loop = SimulationTransition(sim, period=period, frame_frequency=0.0,
+                                        repeat_forcing=True)
             if loop.period is None:
                 raise ValueError("no common analysis period; supply period explicitly")
         except ValueError as exc:

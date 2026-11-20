@@ -13,7 +13,8 @@ from ...components.network import register_component_type
 from ...solver import ConfigError, directional_derivative
 from .magport import _attach_magnetic_law
 
-__all__ = ["MagCircuit", "MagCircuitLaw"]
+__all__ = ["LinearCircuitReduction", "MagCircuit", "MagCircuitLaw",
+           "reduce_linear_circuit"]
 
 _NEWTON_ITERATIONS = 50
 _NEWTON_TOLERANCE = 1.0e-9
@@ -61,9 +62,20 @@ def _flux_basis(incidence: Any | None, branches: int) -> np.ndarray:
     return basis
 
 
-def _linear_circuit(
+@dataclass(frozen=True)
+class LinearCircuitReduction:
+    """Linear winding law and validated matrices from one magnetic circuit."""
+
+    inductance: np.ndarray
+    response: np.ndarray
+    reluctance: np.ndarray
+    coupling: np.ndarray
+
+
+def reduce_linear_circuit(
     reluctance: Any, coupling: Any, incidence: Any | None = None
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> LinearCircuitReduction:
+    """Reduce a linear magnetic circuit to its winding law."""
     turns = _matrix(coupling, "coupling")
     if not turns.shape[0] or not turns.shape[1]:
         raise ConfigError("coupling must have at least one branch and winding")
@@ -75,7 +87,7 @@ def _linear_circuit(
     inductance = 0.5 * (inductance + inductance.T)
     if np.linalg.eigvalsh(inductance).min() <= 0.0:
         raise ConfigError("magnetic circuit does not produce a positive-definite winding law")
-    return inductance, response, matrix
+    return LinearCircuitReduction(inductance, response, matrix, turns)
 
 
 class MagCircuitLaw:
@@ -463,12 +475,12 @@ class MagCircuit(_MagneticElement):
             branch.constitutive_data() for branch in magnetic.branches.values()
         )
         if all(reluctance is not None for reluctance, _flux, _mmf in constitutive):
-            inductance, _response, _matrix = _linear_circuit(
+            reduction = reduce_linear_circuit(
                 [reluctance for reluctance, _flux, _mmf in constitutive],
                 coupling,
                 incidence,
             )
-            self._assemble(name, cfg, names, inductance, buses, magnetic)
+            self._assemble(name, cfg, names, reduction.inductance, buses, magnetic)
             return
         mmf, differential, stored_energy = _branch_law(constitutive)
         law = MagCircuitLaw(

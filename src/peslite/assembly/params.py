@@ -29,7 +29,8 @@ from typing import Any, Callable, Optional, Union, get_args, get_origin, get_typ
 
 from ..components.network import ELEMENT_TYPES, element_buses
 from ..components.pwm import PWM_ALIGNMENTS
-from ..defaults import (DEFAULT_MULTIRATE_SWEEPS, DEFAULT_OUTPUT_PRECISION,
+from ..defaults import (DEFAULT_CONTROL_COMPUTATION, DEFAULT_MULTIRATE_SWEEPS,
+                        DEFAULT_OUTPUT_PRECISION,
                         DEFAULT_OUTPUT_WRITE_LENGTH, DEFAULT_PWM_ALIGNMENT,
                         DEFAULT_PWM_CARRIER_PHASE, DEFAULT_SOLVER_ATOL,
                         DEFAULT_SOLVER_MAX_STEP, DEFAULT_SOLVER_RTOL,
@@ -41,7 +42,6 @@ from .control import (ControlTypeSpec, ReferenceBinding, ReferenceParams,
 from ..solver.signals import TableSignal
 from ..solver.integrators import CIRCUIT_MODELS, canonical_method
 from ..solver.model import ConfigError
-from ..solver.timing import control_computation, control_period
 from .events import EVENT_TYPES, NAMED, SWITCHABLE, events_for
 from .syntax import (PARAMETER_DOMAINS, SimulationFileError,
                      parse_parameter_mapping, read_simulation_file)
@@ -521,6 +521,25 @@ class ControlParams:
                           metadata={"internal": True})
 
 
+def _control_period(control: ControlParams, pwm: PWMParams) -> float:
+    """Resolve the sampled-control period from its configuration."""
+    return pwm.switching_period if control.period is None else control.period
+
+
+def _control_computation(control: ControlParams) -> float:
+    """Resolve the sampled-control computation delay from its configuration."""
+    return (DEFAULT_CONTROL_COMPUTATION
+            if control.computation is None else control.computation)
+
+
+def _control_offset(control: ControlParams, pwm: PWMParams, *, pwm_timed: bool) -> float:
+    """Resolve the sampled-control interrupt offset from its configuration."""
+    if control.offset is not None:
+        return control.offset
+    default = pwm.grid_offset if pwm_timed else 0.0
+    return default % _control_period(control, pwm)
+
+
 @dataclass(frozen=True)
 class OvercurrentParams:
     enable: bool = False
@@ -701,11 +720,19 @@ class UnitParams:
             assert self.pwm is not None and self.bridge is not None
             continuous = continuous_control(self)
             if not continuous and ctrl.period is None:
-                ctrl = replace(ctrl, period=control_period(ctrl, self.pwm))
+                ctrl = replace(ctrl, period=_control_period(ctrl, self.pwm))
                 derived.add("ctrl.period")
             if not continuous and ctrl.computation is None:
-                ctrl = replace(ctrl, computation=control_computation(ctrl))
+                ctrl = replace(ctrl, computation=_control_computation(ctrl))
                 derived.add("ctrl.computation")
+            if not continuous and ctrl.offset is None:
+                ctrl = replace(
+                    ctrl,
+                    offset=_control_offset(
+                        ctrl, self.pwm, pwm_timed=self.bridge.pwm_timed,
+                    ),
+                )
+                derived.add("ctrl.offset")
             if (unit_type(self.type).defaults_grid_frequency
                     and hasattr(ctrl.references, "omega") and ctrl.references.omega is None):
                 references = replace(ctrl.references, omega=system_base.w0)

@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ...solver.linearization import active_coordinates, coordinate_difference, coordinate_width
-from ...solver.simulation import SystemLoop
+from ...solver.linearization import compare_loop_states
+from ...solver.simulation import SimulationTransition
 from ...solver.timing import TIME_EPS
 
 if TYPE_CHECKING:
@@ -49,38 +49,13 @@ class OperatingPointResult:
         }
 
 
-def _period_error(loop: SystemLoop, initial: dict, final: dict,
+def _period_error(loop: SimulationTransition, initial: dict, final: dict,
                   start: float, end: float) -> tuple[float, str | None]:
-    """Use the same logical state, coordinate scales and angular residual as stability analysis."""
-    first = loop.periodic_state(initial)
-    last = loop.periodic_state(final)
-    cols = loop.coordinates(list(first), linearization=False)
-    a = loop.to_frame(first, start, cols)
-    b = loop.to_frame(last, end, cols)
-    if a.shape != b.shape or not np.all(np.isfinite(a)) or not np.all(np.isfinite(b)):
-        raise ValueError("operating-point states must be finite and have matching coordinates")
-    scales = (np.concatenate([np.full(coordinate_width(kind), floor)
-                              for kind, _names, floor in cols])
-              if cols else np.empty(0))
-    scales = np.maximum(scales, np.maximum(np.abs(a), np.abs(b)))
-    names = []
-    discrete = []
-    index = 0
-    for kind, group, floor in cols:
-        names.extend(group)
-        if kind == "angle":
-            scales[index] = floor
-        elif kind in ("frozen", "mode") and a[index] != b[index]:
-            discrete.append(group[0])
-        index += coordinate_width(kind)
-    active = active_coordinates(cols)
-    if discrete:
-        return math.inf, f"discrete state {discrete[0]!r} changes within the check window"
-    if not active:
-        return 0.0, None
-    residual = np.abs(coordinate_difference(b, a, cols))[list(active)] / scales[list(active)]
-    worst = int(np.argmax(residual))
-    return float(residual[worst]), names[active[worst]]
+    comparison = compare_loop_states(loop, initial, final, start, end)
+    if comparison.changed_modes:
+        name = comparison.changed_modes[0]
+        return math.inf, f"discrete state {name!r} changes within the check window"
+    return comparison.error, comparison.worst_coordinate
 
 
 def detect_operating_point(sim: Simulation, *, period: float | None = None,
@@ -119,12 +94,13 @@ def detect_operating_point(sim: Simulation, *, period: float | None = None,
         return fail("startup ramp has not completed")
 
     try:
-        loop = SystemLoop(sim, period=period, frame_frequency=0.0, repeat_forcing=True)
+        loop = SimulationTransition(sim, period=period, frame_frequency=0.0, repeat_forcing=True)
         if loop.period is None and not loop.periods:
             sample = float(sim.p.simulation.output.period)
             if not math.isfinite(sample) or sample <= TIME_EPS:
                 return fail("no valid autonomous-state comparison interval")
-            loop = SystemLoop(sim, period=sample, frame_frequency=0.0, repeat_forcing=True)
+            loop = SimulationTransition(sim, period=sample, frame_frequency=0.0,
+                                        repeat_forcing=True)
         if loop.period is None:
             return fail("no common loop period; supply a valid period explicitly")
         span = loop.period

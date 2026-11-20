@@ -309,7 +309,7 @@ def _source_signal(config: Any, *, directory: Path, start: float, stop: float,
             lo if t < delay else hi if ((t - delay) % cycle) < w * cycle else lo
         )
     else:
-        from .identification import (
+        from .reference_signals import (
             reference_chirp, reference_multitone, reference_prbs,
         )
         from .reference_signals import reference_csv, reference_table

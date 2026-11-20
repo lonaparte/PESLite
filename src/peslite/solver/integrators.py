@@ -25,12 +25,12 @@ from numpy.typing import NDArray
 
 from ..defaults import (DEFAULT_SOLVER_ATOL, DEFAULT_SOLVER_MAX_STEP, DEFAULT_SOLVER_RTOL,
                         DEFAULT_SOLVER_WARM_START)
-from .model import SpectralBound, _component_plan, commutation_tolerance
+from .model import ConfigError, SpectralBound, _component_plan, commutation_tolerance
 from .netlist import FORMS as CIRCUIT_MODELS
 
 __all__ = ["RHS", "SolverStep", "Solver", "FIXED_METHODS", "ADAPTIVE_METHODS", "EXPLICIT_FIXED_METHODS",
            "IMPLICIT_FIXED_METHODS", "IMPLICIT_ADAPTIVE_METHODS", "CIRCUIT_MODELS", "TABLEAUS", "combine",
-           "canonical_method", "integrator", "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "AutoSolver",
+           "canonical_method", "integrator", "make_solver", "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "AutoSolver",
            "subintervals"]
 
 
@@ -232,6 +232,43 @@ def integrator(method: str, dt: float, rtol: float = DEFAULT_SOLVER_RTOL,
 
         return ImplicitSolver(dt, method, rtol, atol, linear_system(model))
     return AdaptiveSolver(method, rtol, atol, max_step, warm_start, model=model)
+
+
+def make_solver(cfg: Any, model: Any = None, ratings: Any = None):
+    """Return the single-rate or multirate integrator selected by solver settings."""
+    solver_type = cfg.type
+    method = cfg.method
+    if solver_type == "fixed" and cfg.subsystems:
+        from .multirate import MultirateSolver, own_schedule, parse_step
+
+        if model is None:
+            raise ConfigError(
+                "simulation.solver.subsystems needs the model whose subsystems it names"
+            )
+        try:
+            parsed = {name: parse_step(value) for name, value in cfg.subsystems.items()}
+            if any(own_schedule(ratio, own, method) for ratio, own in parsed.values()):
+                if method not in EXPLICIT_FIXED_METHODS:
+                    raise ConfigError(
+                        "simulation.solver.subsystems needs an explicit system method, got "
+                        f"{method!r}"
+                    )
+                return MultirateSolver(
+                    model, cfg.subsystems, cfg.dt, method, cfg.sweeps,
+                    cfg.rtol, cfg.atol, ratings,
+                )
+            unknown = [name for name in parsed if not model.select(name)]
+            if unknown:
+                raise KeyError(
+                    f"unknown subsystem(s) or namespace(s) {unknown}; "
+                    f"this model has {model.names}"
+                )
+        except (KeyError, ValueError) as exc:
+            raise ConfigError(f"simulation.solver.subsystems: {exc.args[0]}") from None
+    return integrator(
+        method, cfg.dt, cfg.rtol, cfg.atol, cfg.max_step, cfg.warm_start,
+        model=model, solver_type=solver_type,
+    )
 
 
 def subintervals(span: float, step: float) -> int:

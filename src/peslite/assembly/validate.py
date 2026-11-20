@@ -22,16 +22,25 @@ from ..solver.integrators import (ADAPTIVE_METHODS, EXPLICIT_FIXED_METHODS, FIXE
                                   IMPLICIT_ADAPTIVE_METHODS, IMPLICIT_FIXED_METHODS)
 from ..solver.model import ConfigError
 from ..solver.multirate import own_schedule, parse_step
-from ..solver.timing import (TIME_EPS, PeriodicClock, control_actuation_clock,
-                             control_clock_offset, control_computation as _computation,
-                             control_period as _period)
+from ..solver.timing import TIME_EPS, PeriodicClock
 from .events import NAMED, SWITCHABLE, SWITCHING
-from .params import unit_type
+from .params import (_control_computation, _control_offset, _control_period,
+                     unit_type)
 
 if TYPE_CHECKING:
     from .params import Params
 
 __all__ = ["validate"]
+
+
+def _actuation_clock(control, pwm, *, pwm_timed: bool) -> PeriodicClock:
+    """Resolve the command-application grid while validating raw parameters."""
+    if pwm_timed:
+        return PeriodicClock(pwm.load_period, pwm.grid_offset)
+    period = _control_period(control, pwm)
+    offset = (_control_offset(control, pwm, pwm_timed=False)
+              + _control_computation(control)) % period
+    return PeriodicClock(period, offset)
 
 
 def _whole(r: float) -> bool:
@@ -125,10 +134,10 @@ def _timing(c, pwm, where: str, continuous: bool = False, *,
         if c.offset is not None and (not math.isfinite(c.offset) or c.offset < 0.0):
             raise ConfigError(f"{where}.offset must be finite and nonnegative, got {c.offset}")
         return
-    T_c = _period(c, pwm)
+    T_c = _control_period(c, pwm)
     if not math.isfinite(T_c) or T_c <= 0.0:
         raise ConfigError(f"{where}.period must be finite and positive, got {T_c}")
-    offset = control_clock_offset(c, pwm, pwm_timed=pwm_timed)
+    offset = _control_offset(c, pwm, pwm_timed=pwm_timed)
     if not math.isfinite(offset) or not 0.0 <= offset < T_c:
         raise ConfigError(f"{where}.offset must be in [0, ctrl.period), got {offset}")
     half = pwm.switching_period / 2.0
@@ -136,7 +145,7 @@ def _timing(c, pwm, where: str, continuous: bool = False, *,
         raise ConfigError(f"{where}.period = {T_c:.6g} s is not a multiple of half the carrier period "
                           f"({half:.6g} s at pwm.f_sw = {pwm.f_sw:g} Hz): the carrier triggers the "
                           f"interrupt at its valleys and peaks")
-    tau = _computation(c)
+    tau = _control_computation(c)
     if not math.isfinite(tau) or tau < 0.0 or tau >= T_c:
         raise ConfigError(f"{where}.computation = {tau} s must be at least 0 and shorter than the "
                           f"control period {T_c:.6g} s")
@@ -147,7 +156,7 @@ def _control(c, pwm, where: str, continuous: bool = False) -> None:
     profile = control_profile(c)
     if profile.requires_loops and not c.loops:
         raise ConfigError(f"{where}.loops must contain at least one loop")
-    T_c = None if continuous else _period(c, pwm)
+    T_c = None if continuous else _control_period(c, pwm)
     for name, cfg in c.loops.items():
         if name in {"meas", "references", "held", "command", "prot", "startup"}:
             raise ConfigError(f"{where}.loops.{name}: reserved loop name")
@@ -528,17 +537,18 @@ def _initial(p: Params) -> None:
         m = u.meas
         if continuous_control(u) or not u.bridge.controlled:
             continue
-        T_c = _period(u.ctrl, u.pwm)
+        T_c = _control_period(u.ctrl, u.pwm)
         given = p.simulation.initial.states
         bridge_prefix = f"{name}.{'pwm' if u.bridge.model != 'averaging' else 'command'}."
         continued = any(key.startswith((f"{name}.ctrl.", bridge_prefix)) for key in given)
         if not continued and not any(key.startswith(f"{name}.meas.") for key in given):
             continue
         pwm_timed = u.bridge.pwm_timed
-        offset = control_clock_offset(u.ctrl, u.pwm, pwm_timed=pwm_timed)
+        offset = _control_offset(u.ctrl, u.pwm, pwm_timed=pwm_timed)
         interrupts = PeriodicClock(T_c, offset)
-        loads = control_actuation_clock(u.ctrl, u.pwm, pwm_timed=pwm_timed)
-        k, j, tau = interrupts.index_after(t0), loads.index_after(t0), _computation(u.ctrl)
+        loads = _actuation_clock(u.ctrl, u.pwm, pwm_timed=pwm_timed)
+        k, j, tau = (interrupts.index_after(t0), loads.index_after(t0),
+                     _control_computation(u.ctrl))
         # A pending command overwritten during computation is not part of the saved state.
         if continued and (interrupts.at(k - 1) + tau > loads.at(j) + TIME_EPS
                           and interrupts.at(k - 2) + tau > loads.at(j - 1) + TIME_EPS):
@@ -614,7 +624,7 @@ def validate(p: Params) -> Params:
     for name, unit in _unit_items(p.units):
         continuous = unit.ctrl is None or continuous_control(unit)
         period = ((unit.meas.period or p.simulation.output.period) if unit.ctrl is None
-                  else None if continuous else _period(unit.ctrl, unit.pwm))
+                  else None if continuous else _control_period(unit.ctrl, unit.pwm))
         if period is not None and (not math.isfinite(period) or period <= 0):
             raise ConfigError(f"units.{name}.meas: sampling period must be finite and positive")
         _measurement(unit.meas, period, f"units.{name}.meas",

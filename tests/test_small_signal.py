@@ -19,7 +19,8 @@ from peslite.components.adc import ADC, MeasurementPorts
 from peslite.solver.linearization import (LoopMap, active_coordinates, coordinate_difference,
                                          linearize_loop)
 from peslite.solver.model import Empty, Model, StateRegistry
-from peslite.solver.simulation import SystemLoop, macro_period
+from peslite.solver.simulation import SimulationTransition
+from peslite.solver.timing import common_period
 from peslite.solver.splitbound import LoopMap as SplitLoopMap, _period_map
 
 pytestmark = pytest.mark.long
@@ -424,8 +425,8 @@ def test_normal_run_does_not_construct_a_map_or_compute_modes(monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("ordinary simulations must not invoke stability analysis")
 
-    monkeypatch.setattr("peslite.solver.simulation.SystemLoop", forbidden)
-    monkeypatch.setattr("peslite.addons.functions.stability.linearize_loop", forbidden)
+    monkeypatch.setattr("peslite.solver.simulation.SimulationTransition", forbidden)
+    monkeypatch.setattr("peslite.addons.functions.online_stability.linearize_loop", forbidden)
     sim = peslite.Simulation(_params())
     sim.run(out_dir=None)
     assert sim.result.summary["t_stop"] == sim.p.simulation.t_end
@@ -433,14 +434,16 @@ def test_normal_run_does_not_construct_a_map_or_compute_modes(monkeypatch):
 
 def test_loop_scales_plant_coordinates_by_rating_with_a_single_rate_solver(gfl):
     sim = peslite.Simulation(gfl())
-    cols = SystemLoop(sim, period=0.02, frame_frequency=0.0).coordinates(list(sim._states.read_flat()))
+    cols = SimulationTransition(sim, period=0.02, frame_frequency=0.0).coordinates(
+        list(sim._states.read_flat())
+    )
     assert {group[0]: scale for _kind, group, scale in cols}["pcc.u_C.re"] == pytest.approx(
         sim.p.base.v_phase_peak)
 
 
 def test_loop_preserves_output_grid_when_disabling_histories(gfl):
     sim = peslite.Simulation(gfl())
-    loop = SystemLoop(sim, period=0.02, frame_frequency=0.0)
+    loop = SimulationTransition(sim, period=0.02, frame_frequency=0.0)
     assert loop._p.simulation.output.period == sim.p.simulation.output.period
     assert not loop._p.simulation.output.states
     assert not loop._p.simulation.output.signals
@@ -454,7 +457,7 @@ def test_loop_reads_controller_angle_coordinates_from_state_owner_metadata(gfl, 
     if model == "switching":
         assert {"vsc.ctrl.held.SRFPLL.theta", "vsc.ctrl.held.SRFPLL.frame"} <= angles
         assert "vsc.ctrl.command.theta" not in sim.state_names()
-    loop = SystemLoop(sim, period=0.02, frame_frequency=0.0)
+    loop = SimulationTransition(sim, period=0.02, frame_frequency=0.0)
     assert loop._angles == set(angles)
 
 
@@ -496,11 +499,12 @@ def test_analysis_rejects_invalid_options(name, value):
 
 def test_declared_schedules_and_waveforms_determine_the_period(gfl):
     sim = peslite.Simulation(gfl())
-    loop = SystemLoop(sim, frame_frequency=0.0, repeat_forcing=True)
+    loop = SimulationTransition(sim, frame_frequency=0.0, repeat_forcing=True)
     assert loop.period == pytest.approx(1.0 / sim.p.sources["grid"].f)
     with pytest.raises(ValueError, match="repeat"):
-        SystemLoop(sim, period=sim.unit().bridge.period, frame_frequency=0.0, repeat_forcing=True)
-    assert macro_period([1.0, math.sqrt(2.0)]) is None
+        SimulationTransition(sim, period=sim.unit().bridge.period,
+                             frame_frequency=0.0, repeat_forcing=True)
+    assert common_period([1.0, math.sqrt(2.0)]) is None
     assert active_coordinates(loop.coordinates(sim.state_names()))
 
 
@@ -512,13 +516,13 @@ def test_period_must_be_supplied_for_an_autonomous_continuous_model():
 
 def test_split_error_map_does_not_expand_to_a_slow_waveform_beat_period(gfl):
     sim = peslite.Simulation(gfl(**{"sources.grid.f": 49.8}))
-    assert SystemLoop(sim).period == pytest.approx(sim.unit().bridge.period)
+    assert SimulationTransition(sim).period == pytest.approx(sim.unit().bridge.period)
 
 
 def test_resonant_forcing_is_declared_by_the_loop_not_by_device_name():
     params = peslite.load(EXAMPLES / "wpt-example.pes")
     sim = peslite.Simulation(params)
-    loop = SystemLoop(sim, frame_frequency=0.0, repeat_forcing=True)
+    loop = SimulationTransition(sim, frame_frequency=0.0, repeat_forcing=True)
     forcing = 1.0 / params.unit("charger.primary").ctrl.references.frequency
     assert forcing in loop.periods
     assert loop.period is not None
@@ -533,6 +537,6 @@ def test_other_addons_and_normal_runs_do_not_import_stability_analysis():
 import sys
 import peslite
 from peslite.addons.functions import plot_result
-assert 'peslite.addons.functions.stability' not in sys.modules
+assert 'peslite.addons.functions.online_stability' not in sys.modules
 assert not hasattr(peslite.Simulation, 'small_signal')
 """], env=env, check=True, capture_output=True, text=True)

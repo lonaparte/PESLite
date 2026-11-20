@@ -10,7 +10,8 @@ import numpy as np
 
 from ..defaults import DEFAULT_LINEARIZATION_RELATIVE_STEP
 
-__all__ = ["LoopMap", "LoopLinearization", "coordinate_width", "active_coordinates", "coordinate_difference",
+__all__ = ["LoopMap", "LoopComparison", "LoopLinearization", "coordinate_width",
+           "active_coordinates", "coordinate_difference", "compare_loop_states",
            "linearize_loop"]
 
 
@@ -27,7 +28,8 @@ class LoopMap(Protocol):
 
     period: float
 
-    def coordinates(self, names: list[str]) -> list[tuple[str, list[str], float]]: ...
+    def coordinates(self, names: list[str], *, linearization: bool = True
+                    ) -> list[tuple[str, list[str], float]]: ...
 
     def to_frame(self, row: dict[str, float], t: float, cols: list) -> np.ndarray: ...
 
@@ -36,6 +38,8 @@ class LoopMap(Protocol):
 
     def advance(self, row: dict[str, float], t: float,
                 view: tuple[str, float, str] | None = None) -> dict[str, float]: ...
+
+    def periodic_state(self, row: dict[str, float]) -> dict[str, float]: ...
 
 
 def coordinate_width(kind: str) -> int:
@@ -63,6 +67,53 @@ def coordinate_difference(a: np.ndarray, b: np.ndarray, cols: list) -> np.ndarra
             delta[j] = math.remainder(float(delta[j]), math.tau)
         j += coordinate_width(kind)
     return delta
+
+
+@dataclass(frozen=True)
+class LoopComparison:
+    """Scaled recurrence comparison in a loop map's physical coordinates."""
+
+    error: float
+    worst_coordinate: str | None
+    changed_modes: tuple[str, ...]
+    initial: np.ndarray
+    final: np.ndarray
+    scales: np.ndarray
+    coordinates: tuple[str, ...]
+
+
+def compare_loop_states(loop: LoopMap, initial: dict[str, float], final: dict[str, float],
+                        start: float, end: float) -> LoopComparison:
+    """Compare two logical loop states with shared frame, scale and mode semantics."""
+    first = loop.periodic_state(initial)
+    last = loop.periodic_state(final)
+    cols = loop.coordinates(list(first), linearization=False)
+    a = loop.to_frame(first, start, cols)
+    b = loop.to_frame(last, end, cols)
+    if a.shape != b.shape or not np.all(np.isfinite(a)) or not np.all(np.isfinite(b)):
+        raise ValueError("loop states must be finite and have matching coordinates")
+    scales = (np.concatenate([np.full(coordinate_width(kind), floor)
+                              for kind, _names, floor in cols])
+              if cols else np.empty(0))
+    scales = np.maximum(scales, np.maximum(np.abs(a), np.abs(b)))
+    names: list[str] = []
+    changed_modes: list[str] = []
+    index = 0
+    for kind, group, floor in cols:
+        names.extend(group)
+        if kind == "angle":
+            scales[index] = floor
+        elif kind in ("frozen", "mode") and a[index] != b[index]:
+            changed_modes.append(group[0])
+        index += coordinate_width(kind)
+    active = active_coordinates(cols)
+    if not active:
+        return LoopComparison(0.0, None, tuple(changed_modes), a, b, scales, tuple(names))
+    selected = list(active)
+    residual = np.abs(coordinate_difference(b, a, cols))[selected] / scales[selected]
+    worst = int(np.argmax(residual))
+    return LoopComparison(float(residual[worst]), names[active[worst]], tuple(changed_modes),
+                          a, b, scales, tuple(names))
 
 
 @dataclass(frozen=True)

@@ -18,7 +18,7 @@ from .assembly import (DCConverter, Params, Protection, ProtectionSample,
                        SourceScenario, System, Unit, VSC,
                        dump, dumps, load, register_event_type)
 from .assembly.control import make_controller
-from .solver.simulation import Simulation, SimulationResult, main, validate_model
+from .solver.simulation import Simulation, SimulationResult, validate_model
 from .assembly.exporter import ExportResult, export
 from . import addons
 from .assembly.params import _register_load_preparer
@@ -26,6 +26,13 @@ from .assembly.params import _register_load_preparer
 _register_load_preparer(addons._discover_for)
 
 __version__ = "0.6.0"
+
+
+def main(argv=None):
+    """Run the command-line interface without loading it during normal imports."""
+    from .cli import main as cli_main
+
+    return cli_main(argv)
 
 __all__ = [
     "solver", "control", "components", "assembly", "addons",

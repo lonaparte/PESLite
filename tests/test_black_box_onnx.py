@@ -11,7 +11,7 @@ from onnx import TensorProto, helper
 import peslite
 from peslite import BlackBoxSubsystem
 from peslite.solver import Model
-from peslite.solver.simulation import SystemLoop
+from peslite.solver.simulation import SimulationTransition
 
 
 pytestmark = [pytest.mark.long, pytest.mark.onnx]
@@ -209,7 +209,7 @@ def test_configured_recurrent_onnx_model_uses_registered_sampled_state(tmp_path)
     result = simulation.run(out_dir=tmp_path / "run")
     block = simulation.system.named_elements["onnx_model"].model
 
-    assert SystemLoop(simulation).periods == [1.0e-3]
+    assert SimulationTransition(simulation).periods == [1.0e-3]
     assert "onnx_model.state_0" not in simulation._states.discrete_names
     assert block.get_state() == pytest.approx({
         "state_0": 0.5,

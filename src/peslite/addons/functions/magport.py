@@ -12,11 +12,11 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from ..components.magport import (
-    _FORMAT,
-    _VERSION,
-    _MagPortData,
-    _data,
-    _load,
+    MAGPORT_FORMAT,
+    MAGPORT_VERSION,
+    MagPortData,
+    load_magport_data,
+    magport_data,
 )
 from ..components.magcomponent import MagneticDescription
 from ...solver import ConfigError
@@ -24,12 +24,12 @@ from ...solver import ConfigError
 __all__ = ["MagneticFieldResult", "write_magport", "magnetic_field"]
 
 
-def _write(file: str | Path, data: _MagPortData) -> Path:
+def _write(file: str | Path, data: MagPortData) -> Path:
     path = Path(file).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     entries = {
-        "format": np.asarray(_FORMAT),
-        "version": np.asarray(_VERSION),
+        "format": np.asarray(MAGPORT_FORMAT),
+        "version": np.asarray(MAGPORT_VERSION),
         "winding_names": np.asarray(data.winding_names),
         "physical": np.asarray(json.dumps(data.physical, allow_nan=False, sort_keys=True,
                                            separators=(",", ":"))),
@@ -76,7 +76,7 @@ def write_magport(
     field_basis: Any | None = None,
 ) -> Path:
     """Write a linear or sampled nonlinear constitutive law in the magport format."""
-    return _write(file, _data(
+    return _write(file, magport_data(
         winding_names,
         inductance=inductance,
         flux_linkage=flux_linkage,
@@ -98,7 +98,7 @@ class MagneticFieldResult:
     flux_density: np.ndarray
 
 
-def _field_basis(data: _MagPortData, points: Any | None) -> tuple[np.ndarray, np.ndarray]:
+def _field_basis(data: MagPortData, points: Any | None) -> tuple[np.ndarray, np.ndarray]:
     if data.field_points is None:
         raise ConfigError("magport file does not contain a spatial field map")
     if points is None:
@@ -127,7 +127,7 @@ def _field_basis(data: _MagPortData, points: Any | None) -> tuple[np.ndarray, np
 def magnetic_field(result: Any, model_file: str | Path, *, element: str,
                    points: Any | None = None) -> MagneticFieldResult:
     """Reconstruct ``B(x, y, z, t)`` from recorded winding currents and a field map."""
-    data = _load(model_file)
+    data = load_magport_data(model_file)
     locations, basis = _field_basis(data, points)
     columns = result.columns()
     paths = tuple(f"{element}.i_{name}" for name in data.winding_names)

@@ -89,7 +89,7 @@ class Runs {
       throw new Error('Project-local PESaddons execute Python code; explicit trust is required');
     }
     this.output = ''; this.code = null; this.file = filename;
-    const child = spawn(python(), ['-m', 'peslite.solver.simulation', uri.fsPath], {
+    const child = spawn(python(), ['-m', 'peslite.cli', uri.fsPath], {
       cwd: folder.uri.fsPath, env: process.env, windowsHide: true,
     });
     this.process = child;

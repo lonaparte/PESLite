@@ -15,7 +15,7 @@ from conftest import EXAMPLES
 from peslite.addons.functions import energy_closure, small_signal_report
 from peslite.solver.linearization import linearize_loop
 from peslite.solver.model import Empty, Model
-from peslite.solver.simulation import SystemLoop
+from peslite.solver.simulation import SimulationTransition
 
 pytestmark = pytest.mark.long
 
@@ -70,13 +70,13 @@ def _values(report, name):
 
 def test_constant_report_has_one_row_and_reuses_main_run_endpoints(monkeypatch):
     calls = []
-    advance = SystemLoop.advance
+    advance = SimulationTransition.advance
 
     def count(self, row, t, view=None):
         calls.append(t)
         return advance(self, row, t, view)
 
-    monkeypatch.setattr(SystemLoop, "advance", count)
+    monkeypatch.setattr(SimulationTransition, "advance", count)
     sim = _linear_sim()
     report = small_signal_report(sim, interval=0.0005, period=0.0001,
                                  watch=["plant.signal", "plant.x"], out_dir=None)
@@ -90,7 +90,7 @@ def test_constant_report_has_one_row_and_reuses_main_run_endpoints(monkeypatch):
 
 
 def test_transient_skips_perturbations_until_a_periodic_state_is_established(monkeypatch):
-    module = importlib.import_module("peslite.addons.functions.stability")
+    module = importlib.import_module("peslite.addons.functions.online_stability")
 
     def forbidden(*args, **kwargs):
         raise AssertionError("non-periodic operating states must not be linearized")
@@ -109,7 +109,7 @@ def test_transient_skips_perturbations_until_a_periodic_state_is_established(mon
 
 
 def test_report_starts_analysis_at_the_first_selected_periodic_operating_state(monkeypatch):
-    module = importlib.import_module("peslite.addons.functions.stability")
+    module = importlib.import_module("peslite.addons.functions.online_stability")
     linearize = module.linearize_loop
     calls = []
 
@@ -399,7 +399,7 @@ def test_real_converter_reuses_baselines_and_does_not_mutate_the_main_simulation
 
 
 def test_unreused_baselines_give_the_same_report_but_cost_one_advance_per_check(monkeypatch):
-    module = importlib.import_module("peslite.addons.functions.stability")
+    module = importlib.import_module("peslite.addons.functions.online_stability")
     sim = _linear_sim()
     reused = small_signal_report(sim, period=0.0001, interval=0.0005, out_dir=None)
     analyze = module._analyze
@@ -764,7 +764,7 @@ def test_report_enables_control_logs_when_explicitly_watched():
 
 
 def test_completed_analysis_windows_release_their_restart_rows_during_the_run(monkeypatch):
-    module = importlib.import_module("peslite.addons.functions.stability")
+    module = importlib.import_module("peslite.addons.functions.online_stability")
     original_point, original_analyze = module._ReportPoint, module._analyze
     live = peak = 0
     during_run = []

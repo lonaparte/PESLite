@@ -16,7 +16,7 @@ from peslite.assembly.imperix import build_project
 from peslite.components.converter import make_topology
 from peslite.control.blocks import phases
 from peslite.control.controller import Measurement, VSCController
-from peslite.solver.simulation import main
+from peslite.cli import main
 from conftest import EXAMPLES
 from test_cpp_export import _compiler, _run_generated
 
