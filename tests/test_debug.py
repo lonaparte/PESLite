@@ -180,14 +180,65 @@ def test_debug_run_records_control_signals_states_and_only_two_artifacts(tmp_pat
     assert report["status"] == "passed"
     assert report["checks"]["bounded"]["passed"] is True
     assert report["metrics"]["bounded"]["metric"] == "max"
+    assert report["error"] is None
     assert report["evidence"]["sample_count"] == len(report["data"]["t"])
     assert {"original.re", "injected.re", "effective.re", "integral.re"} <= report["data"].keys()
+    assert report["plan"]["probes"]["effective"] == "vsc.ThreePhaseModulation.u_dq"
+    assert report["simulation"]["summary"]["status"] == "completed"
     assert report["plan"]["effective_configuration"]["simulation"]["t_end"] == 0.0005
     assert {path.name for path in run.iterdir()} == {"debug.pesdbg", "report.json"}
     assert "~ units.vsc.ctrl.loops.CurrentLoop.bandwidth = 210.0" in (
         run / "debug.pesdbg"
     ).read_text(encoding="utf-8")
     assert json.loads((run / "report.json").read_text(encoding="utf-8"))["status"] == "passed"
+
+
+def test_debug_configuration_failure_writes_the_same_structured_report(tmp_path):
+    plan = DebugPlan(operations=(
+        DebugOperation("connect", source="Test.out",
+                       target="vsc.ThreePhaseModulation.u_dq"),
+    ), sources={"Test": 0.1})
+
+    run, report = execute_debug(MODEL, _short_params(), "", plan, output=tmp_path)
+
+    assert report["status"] == "error"
+    assert report["error"]["stage"] == "configuration"
+    assert report["diagnostics"] == [{
+        "severity": "error", "code": "debug_configuration_error",
+        "stage": "configuration",
+        "message": "debug target 'vsc.ThreePhaseModulation.u_dq' is already connected; "
+                   "disconnect it first",
+    }]
+    assert report["evidence"] == {"sample_count": 0, "signals": [], "analyses": []}
+    assert {path.name for path in run.iterdir()} == {"debug.pesdbg", "report.json"}
+    saved = json.loads((run / "report.json").read_text(encoding="utf-8"))
+    assert saved["error"] == report["error"]
+
+
+def test_debug_cli_failure_returns_the_saved_report(tmp_path, monkeypatch, capsys):
+    from peslite import cli
+
+    monkeypatch.setattr(cli, "_RESULTS", tmp_path / "output")
+    plan_path = tmp_path / "invalid.pesdbg"
+    plan_path.write_text(DebugPlan(
+        model=str(MODEL.resolve()),
+        operations=(DebugOperation(
+            "connect", source="Test.out", target="vsc.ThreePhaseModulation.u_dq",
+        ),),
+        sources={"Test": 0.1},
+    ).to_text(), encoding="utf-8")
+
+    code = peslite.main([
+        "debug", str(MODEL), "--plan", str(plan_path),
+        "--set", "simulation.t_end=0.0005", "--json",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == payload["exit_code"] == 2
+    assert payload["error"]["code"] == "debug_configuration_error"
+    report_path = Path(payload["output"]["summary"])
+    assert payload["error"]["path"] == str(report_path)
+    assert json.loads(report_path.read_text(encoding="utf-8"))["status"] == "error"
 
 
 def test_debug_cli_json_and_history_use_the_same_run(tmp_path, monkeypatch, capsys):
@@ -218,3 +269,51 @@ def test_debug_cli_json_and_history_use_the_same_run(tmp_path, monkeypatch, caps
     history = json.loads(capsys.readouterr().out)
     assert len(history["runs"]) == 2
     assert str(report) in {entry["report"] for entry in history["runs"]}
+
+    first = history["runs"][0]["id"]
+    assert peslite.main(["debug", "rm", str(MODEL), first, "--json"]) == 0
+    removed = json.loads(capsys.readouterr().out)
+    assert [entry["id"] for entry in removed["removed"]] == [first]
+    assert not Path(removed["removed"][0]["directory"]).exists()
+
+    assert peslite.main(["debug", "rm", str(MODEL), "--all", "--json"]) == 0
+    removed = json.loads(capsys.readouterr().out)
+    assert len(removed["removed"]) == 1
+    debug_root = tmp_path / "output" / MODEL.stem / "debug"
+    assert debug_root.is_dir() and not any(debug_root.iterdir())
+
+
+def test_debug_rm_removes_the_whole_run_directory_only(tmp_path, monkeypatch, capsys):
+    from peslite import cli
+
+    monkeypatch.setattr(cli, "_RESULTS", tmp_path / "output")
+    case = cli._RESULTS / MODEL.stem
+    run = case / "debug" / "261120T1030-000"
+    run.mkdir(parents=True)
+    (run / "debug.pesdbg").write_text("", encoding="utf-8")
+    (run / "report.json").write_text("{}", encoding="utf-8")
+    (run / "evidence.csv").write_text("t,value\n", encoding="utf-8")
+    ordinary = case / "summary.json"
+    ordinary.write_text("{}", encoding="utf-8")
+
+    assert peslite.main([
+        "debug", "rm", str(MODEL), run.name, "--json",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["removed"][0]["id"] == run.name
+    assert not run.exists()
+    assert run.parent.is_dir()
+    assert ordinary.is_file()
+
+
+def test_debug_rm_rejects_unknown_runs(tmp_path, monkeypatch, capsys):
+    from peslite import cli
+
+    monkeypatch.setattr(cli, "_RESULTS", tmp_path / "output")
+    code = peslite.main(["debug", "rm", str(MODEL), "unknown", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 2
+    assert payload["error"]["code"] == "configuration_error"
+    assert "unknown debug run IDs" in payload["error"]["message"]

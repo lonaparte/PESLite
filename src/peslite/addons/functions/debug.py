@@ -33,6 +33,7 @@ _PATH = r"[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)+"
 _PATH_NAME = re.compile(rf"^{_PATH}$")
 _WIRE = re.compile(rf"^([+-])\s*({_PATH})\s*->\s*({_PATH})\s*$")
 _SET = re.compile(rf"^~\s*({_PATH})\s*=\s*(.+)$")
+_RUN_ID = re.compile(r"^\d{6}T\d{4}-\d{3}$")
 _OPERATORS = {
     "<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge,
     "==": operator.eq, "!=": operator.ne,
@@ -721,7 +722,27 @@ def debug_root(config: str | Path, output: str | Path = "output") -> Path:
 
 def debug_history(config: str | Path, output: str | Path = "output") -> list[Path]:
     root = debug_root(config, output)
-    return sorted((path for path in root.iterdir() if path.is_dir()), reverse=True) if root.is_dir() else []
+    return sorted((path for path in root.iterdir()
+                   if path.is_dir() and _RUN_ID.fullmatch(path.name)), reverse=True
+                  ) if root.is_dir() else []
+
+
+def remove_debug_history(config: str | Path, runs: tuple[str, ...] = (), *,
+                         output: str | Path = "output", all_runs: bool = False) -> list[Path]:
+    """Remove selected debug-run directories from one case's current output root."""
+    import shutil
+
+    history = {path.name: path for path in debug_history(config, output)}
+    selected = tuple(history) if all_runs else runs
+    missing = [run for run in selected if run not in history]
+    if missing:
+        raise ConfigError(f"unknown debug run IDs: {missing}")
+    paths = [history[run] for run in selected]
+    if any(path.is_symlink() for path in paths):
+        raise ConfigError("debug history contains a symbolic-link run directory")
+    for path in paths:
+        shutil.rmtree(path)
+    return paths
 
 
 def _canonical_plan(plan: DebugPlan, config: Path, directory: Path) -> DebugPlan:
@@ -770,66 +791,79 @@ def execute_debug(config: str | Path, p: Params, interface_text: str, plan: Debu
                   timeout: float | None = None, max_rhs: int | None = None) -> tuple[Path, dict]:
     """Run one debug overlay and write its canonical plan and structured evidence."""
     config = Path(config).resolve()
-    canonical = _canonical_plan(plan, config, Path(plan_directory).resolve())
-    prepared = prepare_debug(p, canonical, directory=config.parent)
-    canonical = replace(canonical, operations=prepared.operations)
-    simulation = validate_model(prepared.params, interface_text=interface_text)
-    state_probes = _resolve_state_probes(simulation, prepared.state_probes)
     series = {"t": []}
-    for alias, names in prepared.probes.items():
-        for full in names:
-            marker = f".{alias}"
-            suffix = full[full.rfind(marker) + len(marker):]
-            public = alias + suffix
-            series[public] = []
-    for alias, names in state_probes.items():
-        suffixes = (".re", ".im", ".abs") if len(names) == 2 else ("",)
-        for suffix in suffixes:
-            series[alias + suffix] = []
+    root = debug_root(config, output)
+    run_dir = root / _run_id(root)
+    run_dir.mkdir(parents=True, exist_ok=False)
+    report = {
+        "schema": "peslite.debug/v1", "version": __version__,
+        "model": {"path": str(config), "sha256": None},
+        "plan": {**_json_safe(plan), "parameter_overrides": {},
+                 "effective_configuration": None},
+        "limits": {"timeout": timeout, "max_rhs": max_rhs},
+        "status": "running", "simulation": {}, "data": {}, "analyses": {},
+        "metrics": {}, "checks": {},
+        "evidence": {"sample_count": 0, "signals": [],
+                     "analyses": list(plan.analyses)},
+        "diagnostics": [], "error": None,
+    }
+    stage = "configuration"
+    try:
+        report["model"]["sha256"] = hashlib.sha256(config.read_bytes()).hexdigest()
+        canonical = _canonical_plan(plan, config, Path(plan_directory).resolve())
+        (run_dir / "debug.pesdbg").write_text(canonical.to_text(), encoding="utf-8")
+        prepared = prepare_debug(p, canonical, directory=config.parent)
+        canonical = replace(canonical, operations=prepared.operations)
+        (run_dir / "debug.pesdbg").write_text(canonical.to_text(), encoding="utf-8")
+        report["plan"] = {
+            **_json_safe(canonical),
+            "parameter_overrides": prepared.parameter_overrides,
+            "effective_configuration": to_dict(prepared.params, derived=True),
+        }
 
-    def observe(t, states, read_values, *, final, stop_reason):
-        values = read_values()
-        if series["t"] and math.isclose(series["t"][-1], t, rel_tol=0.0, abs_tol=1e-15):
-            index = -1
-        else:
-            series["t"].append(float(t))
-            for name in series:
-                if name != "t":
-                    series[name].append(math.nan)
-            index = -1
+        stage = "assembly"
+        simulation = validate_model(prepared.params, interface_text=interface_text)
+        state_probes = _resolve_state_probes(simulation, prepared.state_probes)
         for alias, names in prepared.probes.items():
             for full in names:
                 marker = f".{alias}"
                 suffix = full[full.rfind(marker) + len(marker):]
-                public = alias + suffix
-                if full in values:
-                    series[public][index] = float(values[full])
+                series[alias + suffix] = []
         for alias, names in state_probes.items():
-            if states is None:
-                continue
-            if len(names) == 1:
-                series[alias][index] = float(states[names[0]])
-                continue
-            real, imaginary = (float(states[name]) for name in names)
-            series[f"{alias}.re"][index] = real
-            series[f"{alias}.im"][index] = imaginary
-            series[f"{alias}.abs"][index] = math.hypot(real, imaginary)
+            suffixes = (".re", ".im", ".abs") if len(names) == 2 else ("",)
+            for suffix in suffixes:
+                series[alias + suffix] = []
 
-    root = debug_root(config, output)
-    run_dir = root / _run_id(root)
-    run_dir.mkdir(parents=True, exist_ok=False)
-    (run_dir / "debug.pesdbg").write_text(canonical.to_text(), encoding="utf-8")
-    report = {
-        "schema": "peslite.debug/v1", "version": __version__,
-        "model": {"path": str(config),
-                  "sha256": hashlib.sha256(config.read_bytes()).hexdigest()},
-        "plan": {"state_policy": canonical.state_policy,
-                 "parameter_overrides": prepared.parameter_overrides,
-                 "effective_configuration": to_dict(prepared.params, derived=True)},
-        "status": "running", "simulation": {}, "data": {}, "analyses": {},
-        "metrics": {}, "checks": {}, "evidence": {}, "diagnostics": [],
-    }
-    try:
+        def observe(t, states, read_values, *, final, stop_reason):
+            values = read_values()
+            if series["t"] and math.isclose(
+                    series["t"][-1], t, rel_tol=0.0, abs_tol=1e-15):
+                index = -1
+            else:
+                series["t"].append(float(t))
+                for name in series:
+                    if name != "t":
+                        series[name].append(math.nan)
+                index = -1
+            for alias, names in prepared.probes.items():
+                for full in names:
+                    marker = f".{alias}"
+                    suffix = full[full.rfind(marker) + len(marker):]
+                    public = alias + suffix
+                    if full in values:
+                        series[public][index] = float(values[full])
+            for alias, names in state_probes.items():
+                if states is None:
+                    continue
+                if len(names) == 1:
+                    series[alias][index] = float(states[names[0]])
+                    continue
+                real, imaginary = (float(states[name]) for name in names)
+                series[f"{alias}.re"][index] = real
+                series[f"{alias}.im"][index] = imaginary
+                series[f"{alias}.abs"][index] = math.hypot(real, imaginary)
+
+        stage = "simulation"
         result = simulation.run(
             out_dir=None, observe=observe, times=None, observe_values=prepared.watch,
             name=config.stem, timeout=timeout, max_rhs=max_rhs,
@@ -840,6 +874,7 @@ def execute_debug(config: str | Path, p: Params, interface_text: str, plan: Debu
             "t_stop": result.summary.get("t_stop"), "wall_time": result.wall_time,
             "rhs_evaluations": result.n_rhs, "tripped": result.tripped,
             "stop_reason": result.summary.get("stop_reason") or None,
+            "summary": result.summary,
         }
         report["data"] = series
         report["evidence"] = {
@@ -847,7 +882,9 @@ def execute_debug(config: str | Path, p: Params, interface_text: str, plan: Debu
             "signals": sorted(name for name in series if name != "t"),
             "analyses": list(canonical.analyses),
         }
+        stage = "analysis"
         report["analyses"] = _analyses(canonical, simulation, series)
+        stage = "checks"
         checks, passed = _checks(canonical, series)
         report["checks"] = checks
         report["metrics"] = {
@@ -859,18 +896,25 @@ def execute_debug(config: str | Path, p: Params, interface_text: str, plan: Debu
         report["status"] = "stopped" if stopped else "passed" if passed else "failed"
     except Exception as exc:
         report["status"] = "error"
-        report["diagnostics"].append({"severity": "error", "message": str(exc)})
+        report["error"] = {"stage": stage, "type": type(exc).__name__, "message": str(exc)}
+        report["diagnostics"].append({
+            "severity": "error", "code": f"debug_{stage}_error",
+            "stage": stage, "message": str(exc),
+        })
+    finally:
+        report["data"] = series
+        report["evidence"].update({
+            "sample_count": len(series["t"]),
+            "signals": sorted(name for name in series if name != "t"),
+        })
         (run_dir / "report.json").write_text(
             json.dumps(_json_safe(report), indent=2, allow_nan=False) + "\n", encoding="utf-8",
         )
-        raise
-    (run_dir / "report.json").write_text(
-        json.dumps(_json_safe(report), indent=2, allow_nan=False) + "\n", encoding="utf-8",
-    )
     return run_dir, report
 
 
 __all__ = [
     "DebugOperation", "DebugPlan", "PreparedDebug", "debug_history", "debug_root",
     "execute_debug", "parse_debug_text", "parse_operation", "prepare_debug", "read_debug_plan",
+    "remove_debug_history",
 ]

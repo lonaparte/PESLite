@@ -1,10 +1,11 @@
 # CLI Reference
 
-PESLite installs one `peslite` command with six operations:
+PESLite installs one `peslite` command with seven operations:
 
 ```bash
 peslite create case.pes
 peslite run case.pes
+peslite ls
 peslite validate case.pes
 peslite inspect case.pes
 peslite export case.pes
@@ -58,6 +59,14 @@ peslite ./cases/my-converter.pes
 The `.pes` suffix may be omitted. PESLite checks the supplied path before checking bundled examples.
 The default result directory is
 `output/<name>/`.
+
+List simulation results directly below the current working directory's `output/`:
+
+```bash
+peslite ls
+```
+
+Only directories containing a `summary.json` are listed.
 
 ## Override parameters
 
@@ -169,6 +178,7 @@ peslite create case.pes --json
 peslite validate case.pes --json
 peslite inspect case.pes --json
 peslite run case.pes --out output/case --json
+peslite ls --json
 peslite export case.pes common --json
 peslite debug case.pes --plan control.pesdbg --json
 ```
@@ -190,10 +200,13 @@ assembly errors, `4` for simulation failures, `5` for a run limit, `6` for faile
 ```bash
 peslite debug case.pes --plan control.pesdbg
 peslite debug ls case.pes
+peslite debug rm case.pes 261120T1030-000
+peslite debug rm case.pes --all
 ```
 
 Debug runs use the normal model, control graph and solver with a file-backed overlay. See
 [Debugging](Debugging.md) for connection edits, sources, probes, analyses, checks and run history.
+The run ID passed to `rm` is printed by `debug ls`; the command removes that complete run directory.
 
 ## Run limits
 

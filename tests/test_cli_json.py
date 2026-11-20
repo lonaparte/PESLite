@@ -15,6 +15,31 @@ def _command(capsys, *args):
     return code, json.loads(captured.out)
 
 
+def test_ls_reports_only_simulation_results_in_the_current_output(tmp_path, monkeypatch,
+                                                                  capsys):
+    from peslite import cli
+
+    output = tmp_path / "output"
+    monkeypatch.setattr(cli, "_RESULTS", output)
+    completed = output / "gfl-example"
+    completed.mkdir(parents=True)
+    (completed / "summary.json").write_text(json.dumps({
+        "status": "completed", "t_stop": 0.5, "wall_time": 1.25,
+    }), encoding="utf-8")
+    (output / "not-a-result").mkdir()
+
+    code, payload = _command(capsys, "ls")
+
+    assert code == 0 and payload["command"] == "ls"
+    assert payload["output"]["directory"] == str(output.resolve())
+    assert payload["results"] == [{
+        "name": "gfl-example",
+        "directory": str(completed.resolve()),
+        "summary": str((completed / "summary.json").resolve()),
+        "status": "completed", "t_stop": 0.5, "wall_time": 1.25, "error": None,
+    }]
+
+
 def test_validate_assembles_without_running_or_writing(capsys, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     code, payload = _command(capsys, "validate", "gfl-example")

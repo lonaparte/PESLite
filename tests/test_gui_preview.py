@@ -1,4 +1,4 @@
-"""Real-browser smoke test for the standalone GUI preview."""
+"""Real-browser smoke test for the supported PESLite GUI."""
 
 import os
 import shutil
@@ -65,7 +65,7 @@ def _run(command: list[str], *, cwd: Path, environment: dict[str, str],
     return result
 
 
-def test_offline_preview_and_file_workbench_render_in_headless_chromium(tmp_path):
+def test_file_workbench_renders_in_headless_chromium(tmp_path):
     browser = _browser()
     npm = shutil.which("npm")
     if npm is None:
@@ -81,26 +81,41 @@ def test_offline_preview_and_file_workbench_render_in_headless_chromium(tmp_path
         _run([npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
              cwd=preview, environment=environment, timeout=120)
         _run([npm, "run", "build"], cwd=preview, environment=environment, timeout=120)
-        page = _run([
-            browser,
-            "--headless",
-            "--no-sandbox",
-            "--disable-gpu",
-            "--disable-dev-shm-usage",
-            "--no-first-run",
-            f"--user-data-dir={tmp_path / 'preview-profile'}",
-            "--virtual-time-budget=1000",
-            "--dump-dom",
-            (preview / "demo.html").as_uri(),
-        ], cwd=preview, environment=environment, timeout=30)
+        renderer_page = tmp_path / "renderer-smoke.html"
+        renderer_page.write_text(f"""<!doctype html>
+<html><body><main id="preview"></main>
+<script src="{(preview / 'dist/pes-preview.iife.js').as_uri()}"></script>
+<script>
+const view = PESLitePreview.createPESPreview(document.getElementById('preview'));
+view.update(`@circuit
+Grid -- PCC -- VSC
+PCC -- Load1
+PCC -- Load2
+&Loads: Load1, Load2
 
-        assert "PESLite standalone preview" in page.stdout
-        assert page.stdout.count('class="pp-node"') == 5
-        assert 'aria-label="Event timeline"' in page.stdout
-        assert 'role="slider"' in page.stdout
-        assert "connect VSC" in page.stdout
-        assert "workbench.css" in (preview / "demo.html").read_text(encoding="utf-8")
-        assert '<ul class="pp-diagnostics"' not in page.stdout
+@VSC
+PLL.theta -> Current.theta
+Current -> PWM
+
+VSC: vsc, gfl
+  PLL: SRFPLL
+  Current: CurrentLoop
+  PWM: ThreePhaseModulation
+
+events:
+  connect_vsc: {{type: connect, target: VSC, t: 0.2}}
+`);
+</script></body></html>
+""", encoding="utf-8")
+        rendered = _run([
+            browser, "--headless", "--no-sandbox", "--disable-gpu",
+            "--disable-dev-shm-usage", "--no-first-run",
+            f"--user-data-dir={tmp_path / 'renderer-profile'}",
+            "--virtual-time-budget=1000", "--dump-dom", renderer_page.as_uri(),
+        ], cwd=preview, environment=environment, timeout=30)
+        assert rendered.stdout.count('class="pp-node"') == 5
+        assert 'aria-label="Event timeline"' in rendered.stdout
+        assert "connect VSC" in rendered.stdout
 
         ui = workspace / "ui"
         _run([npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund"],

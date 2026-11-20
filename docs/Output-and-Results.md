@@ -12,6 +12,8 @@ to the name so comparison runs do not overwrite one another. Set an explicit des
 peslite case.pes --out output/my-run
 ```
 
+`peslite ls` lists the result directories under the current working directory's `output/`.
+
 Files are written directly to their final paths. PESLite does not build a complete in-memory
 history and then export it afterward.
 

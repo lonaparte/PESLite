@@ -1,14 +1,11 @@
-"""Temporary layout storage and the local GUI preview host."""
+"""Temporary layout storage shared by the supported GUI hosts."""
 
 import io
 import json
-import threading
-import urllib.request
 
 import pytest
 
 from peslite.gui.preview_cache import PreviewLayoutCache, empty_layout, normalize_layout
-from peslite.gui.preview_host import Workspace, make_server
 from peslite.gui.service import FrontendService
 from peslite.gui.host import Host
 
@@ -16,14 +13,6 @@ pytestmark = pytest.mark.ui
 
 LAYOUT = {"format": "peslite.preview-layout", "version": 1,
           "views": {"circuit": {"VSC": {"dx": 48, "dy": -24}}}}
-
-
-def _request(url, method="GET", value=None):
-    data = None if value is None else json.dumps(value).encode()
-    request = urllib.request.Request(url, method=method, data=data,
-                                     headers={"Content-Type": "application/json"} if data else {})
-    with urllib.request.urlopen(request, timeout=5) as response:
-        return json.loads(response.read())
 
 
 def test_layout_cache_validates_keys_and_removes_its_file():
@@ -42,28 +31,6 @@ def test_layout_cache_validates_keys_and_removes_its_file():
     finally:
         cache.close()
     assert path is not None and not path.exists()
-
-
-def test_preview_host_reads_files_and_clears_layout_cache_on_close(tmp_path):
-    case = tmp_path / "case.pes"
-    case.write_text("@circuit\nA -- B\n", encoding="utf-8")
-    workspace = Workspace(tmp_path, open_file=case)
-    server = make_server(workspace, port=0)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    url = f"http://127.0.0.1:{server.server_address[1]}"
-    try:
-        assert _request(f"{url}/api/workspace")["open"] == "case.pes"
-        assert _request(f"{url}/api/file?path=case.pes")["source"].startswith("@circuit")
-        _request(f"{url}/api/layout?path=case.pes", "PUT", LAYOUT)
-        cache_file = workspace.cache.path
-        assert cache_file is not None and cache_file.is_file()
-        assert _request(f"{url}/api/session/close", "POST") == {"cleared": True}
-        assert not cache_file.exists()
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
 
 
 def test_gui_service_uses_the_same_session_cache(tmp_path):

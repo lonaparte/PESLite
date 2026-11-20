@@ -11,14 +11,21 @@ peslite debug case.pes --plan control.pesdbg
 peslite debug case.pes --probe command=vsc.CurrentLoop.u_dq
 ```
 
-Each run creates `output/<case>/debug/YYMMDDTHHMM-NNN/` containing only the effective
-`debug.pesdbg` and `report.json`. With no `--plan`, PESLite inherits the latest run for that case;
-use `--fresh` to start with an empty overlay, `--from RUN` to select an earlier run, or list the
-history with:
+Each run creates `output/<case>/debug/YYMMDDTHHMM-NNN/` containing the effective
+`debug.pesdbg`, `report.json` and any additional evidence from that run. With no `--plan`, PESLite
+inherits the latest run for that case; use `--fresh` to start with an empty overlay, pass an ID
+printed by `debug ls` to `--from`, or list the history with:
 
 ```bash
 peslite debug ls case.pes
+peslite debug rm case.pes 261120T1030-000
+peslite debug rm case.pes --all
 ```
+
+`debug ls` prints the run IDs accepted by `debug rm`; for example, `261120T1030-000` names the
+directory `output/<case>/debug/261120T1030-000/`. `rm` removes that complete directory, while
+`--all` removes every run directory for the case. Both commands are limited to `debug/` under the
+current working directory, retain the `debug/` directory itself and do not remove ordinary results.
 
 ## Plan syntax
 
@@ -86,5 +93,6 @@ the file invokes the same `peslite debug` command and produces the same history 
 
 `report.json` records the PESLite version, model hash, effective configuration, termination status,
 probe samples, analyses, metrics, checks, evidence and diagnostics. A passed check set exits with
-code `0`; a failed check set exits with code `6`. Successful execution confirms the requested
-computation, not the physical validity of the model.
+code `0`; a failed check set exits with code `6`. Configuration, assembly, simulation, analysis and
+check failures use the same report structure and identify their stage. Successful execution confirms
+the requested computation, not the physical validity of the model.

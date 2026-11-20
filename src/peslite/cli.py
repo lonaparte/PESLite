@@ -196,6 +196,56 @@ def _run_outcome(config: Path, out: Path, result: SimulationResult) -> _CommandO
     ))
 
 
+def _result_history(output: Path) -> list[dict[str, Any]]:
+    """Describe simulation results immediately below the current output directory."""
+    records = []
+    if not output.is_dir():
+        return records
+    for directory in sorted(path for path in output.iterdir() if path.is_dir()):
+        summary_path = directory / "summary.json"
+        if not summary_path.is_file():
+            continue
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if not isinstance(summary, dict):
+                raise ValueError("the summary root is not an object")
+            status = summary.get("status")
+            t_stop = summary.get("t_stop")
+            wall_time = summary.get("wall_time")
+            error = None
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            status, t_stop, wall_time, error = "invalid", None, None, str(exc)
+        records.append({
+            "name": directory.name,
+            "directory": _absolute(directory),
+            "summary": _absolute(summary_path),
+            "status": status,
+            "t_stop": t_stop,
+            "wall_time": wall_time,
+            "error": error,
+        })
+    return records
+
+
+def _ls_main(argv=None) -> int | _CommandOutcome:
+    """List simulation results in the current working directory."""
+    ap = _command_parser(prog="peslite ls", description=_ls_main.__doc__)
+    ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
+    args = ap.parse_args(argv)
+    records = _result_history(_RESULTS)
+    if args.json:
+        return _CommandOutcome(0, _payload(
+            "ls", output={"directory": _absolute(_RESULTS), "summary": None, "files": []},
+            results=records,
+        ))
+    if records:
+        for record in records:
+            print(f"{record['name']}  {record['status'] or 'unknown'}  {record['directory']}")
+    else:
+        print(f"No simulation results in {_RESULTS}.")
+    return 0
+
+
 _BRIDGE_PRESETS = {"switching": ("fixed", "RK4"), "pwm_averaging": ("fixed", "RK4"),
                    "averaging": ("adaptive", "DP45")}
 
@@ -289,7 +339,7 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
     """Run a simulation file and save its states, summary and configured signals."""
     ap = _command_parser(
         prog=prog, description=_run_main.__doc__,
-        epilog="commands: run, create, validate, inspect, export, debug; a simulation file without a command implies run",
+        epilog="commands: run, ls, create, validate, inspect, export, debug; a simulation file without a command implies run",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_configuration_arguments(ap, optional=True)
@@ -688,6 +738,7 @@ def _debug_main(argv=None) -> int | _CommandOutcome:
     try:
         from .addons.functions.debug import (
             DebugPlan, debug_history, debug_root, execute_debug, parse_operation, read_debug_plan,
+            remove_debug_history,
         )
     except ModuleNotFoundError as exc:
         if exc.name == "peslite.addons.functions.debug":
@@ -695,17 +746,44 @@ def _debug_main(argv=None) -> int | _CommandOutcome:
         raise
 
     values = list(argv or ())
-    listing = bool(values and values[0] == "ls")
-    if listing:
-        values.pop(0)
-        ap = _command_parser(prog="peslite debug ls", description="List debug runs for a case.")
+    history_command = values.pop(0) if values and values[0] in {"ls", "rm"} else None
+    if history_command is not None:
+        ap = _command_parser(prog=f"peslite debug {history_command}",
+                             description=f"{'List' if history_command == 'ls' else 'Remove'} "
+                                         "debug runs for a case in the current output directory.")
         ap.add_argument("config", help="simulation file path or bundled example name")
+        if history_command == "rm":
+            ap.add_argument("runs", nargs="*", metavar="RUN_ID", help="run ID printed by debug ls")
+            ap.add_argument("--all", action="store_true", help="remove every run for this case")
         ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
         args = ap.parse_args(values)
+        if history_command == "rm" and not args.all and not args.runs:
+            ap.error("name at least one RUN or use --all")
+        if history_command == "rm" and args.all and args.runs:
+            ap.error("RUN and --all cannot be combined")
         try:
             config = _config_path(args.config)
         except FileNotFoundError as exc:
             ap.error(str(exc))
+        if history_command == "rm":
+            try:
+                removed = remove_debug_history(
+                    config, tuple(args.runs), output=_RESULTS, all_runs=args.all,
+                )
+            except ConfigError as exc:
+                if args.json:
+                    raise _CommandFailure(
+                        2, "configuration_error", str(exc), config=config,
+                    ) from None
+                raise
+            records = [{"id": path.name, "directory": _absolute(path)} for path in removed]
+            if args.json:
+                return _CommandOutcome(0, _payload("debug", config=config, removed=records))
+            if records:
+                print("\n".join(f"Removed {item['id']}  {item['directory']}" for item in records))
+            else:
+                print(f"No debug runs for {config.stem}.")
+            return 0
         runs = debug_history(config, _RESULTS)
         records = [{"id": path.name, "directory": _absolute(path),
                     "plan": _absolute(path / "debug.pesdbg"),
@@ -725,7 +803,7 @@ def _debug_main(argv=None) -> int | _CommandOutcome:
                     help="quoted +/− connection or ~ parameter operation")
     origin = ap.add_mutually_exclusive_group()
     origin.add_argument("--plan", metavar="FILE", help="read this .pesdbg plan")
-    origin.add_argument("--from", dest="from_run", metavar="RUN",
+    origin.add_argument("--from", dest="from_run", metavar="RUN_ID",
                         help="inherit one run ID or .pesdbg path")
     origin.add_argument("--fresh", action="store_true", help="do not inherit the latest run")
     ap.add_argument("--state-policy", choices=("continue", "freeze", "tracking"),
@@ -802,14 +880,32 @@ def _debug_main(argv=None) -> int | _CommandOutcome:
             raise _CommandFailure(4, "debug_error", str(exc), config=config) from None
         raise
     status = report["status"]
-    code = 0 if status == "passed" else 6 if status == "failed" else 4
+    error = report.get("error")
+    code = (0 if status == "passed" else 6 if status == "failed" else
+            2 if error and error["stage"] in {"configuration", "assembly"} else 4)
     if args.json:
+        failure = None
+        if error:
+            failure = {
+                "code": f"debug_{error['stage']}_error", "message": error["message"],
+                "path": _absolute(run_dir / "report.json"),
+            }
+        elif status == "failed":
+            failure = {"code": "debug_checks_failed",
+                       "message": "one or more debug checks failed",
+                       "path": _absolute(run_dir / "report.json")}
+        elif status == "stopped":
+            failure = {"code": "debug_stopped",
+                       "message": report["simulation"].get("stop_reason"),
+                       "path": _absolute(run_dir / "report.json")}
         return _CommandOutcome(code, _payload(
             "debug", config=config, status="ok" if code == 0 else "error", code=code,
             output={"directory": _absolute(run_dir),
                     "summary": _absolute(run_dir / "report.json"),
                     "files": [_absolute(run_dir / "debug.pesdbg"),
                               _absolute(run_dir / "report.json")]},
+            simulation=report["simulation"] or None,
+            diagnostics=report["diagnostics"], error=failure,
             debug={"status": status, "checks": report["checks"]},
         ))
     print(f"Debug {status}: {run_dir}")
@@ -867,14 +963,16 @@ def _json_command(command: str, invoke: Callable[[], int | _CommandOutcome]) -> 
 
 
 def main(argv=None) -> int:
-    """Create, run, validate, inspect, export or debug a PESLite simulation."""
+    """Create, run, list, validate, inspect, export or debug a PESLite simulation."""
     values = list(sys.argv[1:] if argv is None else argv)
-    commands = {"run", "create", "validate", "inspect", "export", "debug"}
+    commands = {"run", "ls", "create", "validate", "inspect", "export", "debug"}
     explicit_command = bool(values and values[0] in commands)
     command = values.pop(0) if explicit_command else "run"
     json_output = "--json" in values
     if command == "run":
         invoke = lambda: _run_main(values, prog="peslite run" if explicit_command else "peslite")
+    elif command == "ls":
+        invoke = lambda: _ls_main(values)
     elif command == "validate":
         invoke = lambda: _validate_main(values)
     elif command == "inspect":
