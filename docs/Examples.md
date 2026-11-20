@@ -23,8 +23,7 @@ peslite case.pes
 | `buck-open-loop-example` | An open-loop synchronous Buck whose duty-ratio reference changes through an ordinary event. |
 | `boost-example` | A closed-loop 24 V to 48 V Boost application using the same DCConverter with the lower device controlled, the upper diode active and the external scalar bus as its input port. |
 | `buck-boost-example` | A closed-loop single-inductor Buck-Boost built from one DCConverter, with the half bridge's lower rail connected to the negative output bus. |
-| `cable-gfl-example` | A grid-following converter connected to the grid through the distributed R-L/G-C model registered under `addons/components`. |
-| `custom-pll-example` | Grid-following control assembled from built-in current/DC-voltage loops and an automatically discovered voltage-adaptive PLL under `addons/control`. |
+| `cable-gfl-example` | A grid-following converter connected through the cable add-on's segmented lumped R-L/G-C model. |
 | `gfl-example` | One grid-following converter with PLL, dc-voltage control, current control and unit protection. This is the most extensively annotated configuration. |
 | `gfm-psc-example` | Grid-forming power-synchronization control with virtual impedance and active damping. |
 | `gfm-vsg-example` | Grid-forming virtual synchronous generator control. |
@@ -41,12 +40,22 @@ peslite case.pes
 | `wpt-ss-example` | SS WPT with local primary-side power feedback controlling modulation amplitude, including a 1200 to 1800 W reference step. |
 | `wpt-lcc-example` | LCC-LCC WPT with local secondary-side power feedback controlling phase, including a -500 to -800 W reference step. |
 | `wpt-load-example` | Independent series load with explicitly routed load-power feedback, a 5 to 8 ohm load step and per-side RMS overcurrent protection. |
-| `wpt-phase-shift-example` | Phase-shift WPT with power-controlled pulse width, a repeating bridge-mode sequence and a diode full-bridge secondary. |
+| `wpt-phase-shift-example` | Phase-shift WPT with power-controlled pulse width and a diode full-bridge secondary. |
 | `wpt-scc-example` | Square-wave WPT with primary power feedback commanding an SCC conduction angle. |
 
 The files are also available in the repository's
-[`examples/`](https://github.com/lonaparte/PESLite/tree/main/examples) directory. The root
-directory contains only simulation files, not Python example programs.
+[`examples/`](https://github.com/lonaparte/PESLite/tree/main/examples) directory. Its root contains
+plain-text simulation files, while related plain-text resources use named subdirectories; it does
+not contain Python example programs.
+
+`gfl-debug-example.pesdbg` demonstrates a control-loop bypass, an injected source, probes, a
+frequency-response measurement and a quantitative check. Run it with:
+
+```bash
+peslite debug gfl-example --plan examples/debug/gfl-debug-example.pesdbg
+```
+
+`buck-control-injection-example.pesdbg` applies the same mechanism to a scalar duty command.
 
 ## Compare bridge models
 

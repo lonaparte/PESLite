@@ -10,14 +10,15 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Mapping, Optional
 
-from ..components.network import ACVoltageSource, Bus, ELEMENT_TYPES, RCNode, RLBranch, Port
+from ..components.network import ELEMENT_TYPES, GROUND, Port, resolve_endpoints
+from ..components.passive import Bus, RCNode, RLBranch
+from ..components.source import ACVoltageSource
 from ..components.adc import _PortMeasurement
-from ..components.wpt import make_wpt_link
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather, scatter
 from .events import SWITCHABLE, Scenario, SourceScenario
-from .params import Change, Params, _parameterized, _split_path, _unit_leaves, _unit_path
-from .types import unit_type
+from .params import (Change, Params, _parameterized, _split_path, _unit_leaves, _unit_path,
+                     unit_type)
 from .unit import DCConverter, Unit, VSC
 
 __all__ = ["System"]
@@ -144,7 +145,9 @@ def _validate_electrical_domains(
         return resolved
 
     for group in passive_groups:
-        buses = tuple(dict.fromkeys(node(name) for name, _terminal in group))
+        buses = tuple(dict.fromkeys(
+            node(name) for name, _terminal in group if name != GROUND
+        ))
         if buses:
             first = buses[0]
             for other in buses[1:]:
@@ -159,7 +162,7 @@ def _validate_electrical_domains(
         seen_ports.add(id(port))
         constraints.append((node(port.bus), port.electrical_domain, f"unit port {name}"))
     for bus, port in physical_bindings:
-        if port.electrical_domain is not None:
+        if bus != GROUND and port.electrical_domain is not None:
             label = f"{type(port.component).__name__}.{port.name}"
             constraints.append((node(bus), port.electrical_domain, label))
 
@@ -185,19 +188,6 @@ def _validate_electrical_domains(
                 "electrical-domain conflict: connected network contains "
                 f"AC constraint {domains['ac']!r} and DC constraint {domains['dc']!r}"
             )
-
-
-class _WPTSignals:
-    """Expose shared link quantities without making the composite a scheduled unit."""
-
-    def __init__(self, name: str, link: Any) -> None:
-        self.name = name
-        self.link = link
-        self._outputs = tuple(type(link.output).__slots__)
-
-    def signals(self) -> dict[str, float]:
-        out = self.link.output
-        return {f"{self.name}.link.{name}": getattr(out, name) for name in self._outputs}
 
 
 def _source_scenario(p: Params, path: str, select: Callable[[Params], Any]) -> SourceScenario:
@@ -338,33 +328,6 @@ def _assemble_dc_converter(name: str, cfg: Any, system: "System",
         unit_port_bindings=bindings,
     )
 
-
-def _assemble_wpt(name: str, cfg: Any, system: "System",
-                  parts: Mapping[str, Any]) -> _UnitAssembly:
-    if _part(parts, name) is not None:
-        raise ConfigError(
-            f"parts.{name}: a composite WPT unit is assembled from its primary and secondary parts"
-        )
-    link = _parameterized(make_wpt_link, cfg.link)
-    assembly = _UnitAssembly(
-        subsystems={f"{name}.link": link},
-        signal_sources=(_WPTSignals(name, link),),
-        default_port=unit_type(cfg.type).default_port,
-    )
-    for side in unit_type(cfg.type).children:
-        child = _assemble_unit(f"{name}.{side}", getattr(cfg, side), system, parts)
-        physical_port = getattr(link, f"{side}_port")
-        child.attach(physical_port, f"units.{name}.{side}", "power")
-        for scc in link.switched:
-            if scc.side == side:
-                scc.bind_bridge(child.units[child.port("power").owner].bridge)
-        assembly.ports[side] = child.port()
-        assembly.include(child)
-    default = assembly.port()
-    assembly.unit_port_bindings[f"{name}.link"] = (default,)
-    return assembly
-
-
 def _assemble_unit(name: str, cfg: Any, system: "System",
                    parts: Mapping[str, Any]) -> _UnitAssembly:
     assembly = unit_type(cfg.type, f"units.{name}.type").assembler(name, cfg, system, parts)
@@ -456,14 +419,18 @@ class System:
             )
             for name, cfg in p.sources.items()
         }
-        for name, cfg in p.branches.items():
-            if network_buses[cfg.bus1].phases != network_buses[cfg.bus2].phases:
-                raise ConfigError(f"branches.{name}: both buses must have the same phase count")
+        branch_endpoints = {
+            name: resolve_endpoints(
+                {"bus1": cfg.bus1, "bus2": cfg.bus2}, network_buses,
+                f"branches.{name}", same_phases=True,
+            )
+            for name, cfg in p.branches.items()
+        }
         self.branches = {name: _parameterized(lambda values: RLBranch(
                              values[0].l,
                              values[0].r,
                              phases=values[1],
-                         ), (cfg, network_buses[cfg.bus1].phases))
+                         ), (cfg, next(iter(branch_endpoints[name].values())).phases))
                          for name, cfg in p.branches.items()}
         self.named_elements = {name: _parameterized(
                                   lambda values, name=name: ELEMENT_TYPES[values[0].type](
@@ -505,6 +472,8 @@ class System:
             assembled.endpoints, passive_groups, physical_bindings, resolve_bus
         )
 
+        bound_endpoints: dict[int, str] = {}
+
         def attach_bindings(element: Any, bindings: tuple[tuple[str, Port], ...]) -> None:
             for bus_name, port in bindings:
                 if not isinstance(port, Port):
@@ -512,10 +481,25 @@ class System:
                         f"{type(element).__name__}.port_bindings() returned "
                         f"{type(port).__name__}, not Port"
                     )
-                bus_ports.setdefault(resolve_bus(bus_name), []).append(port)
+                endpoint = GROUND if bus_name == GROUND else resolve_bus(bus_name)
+                previous = bound_endpoints.setdefault(id(port), endpoint)
+                if previous != endpoint:
+                    raise ConfigError(
+                        f"{type(element).__name__}.{port.name} is connected to both "
+                        f"{previous!r} and {endpoint!r}"
+                    )
+                if endpoint == GROUND:
+                    port.standalone = None
+                    port.grounded = True
+                else:
+                    if port.grounded:
+                        raise ConfigError(
+                            f"{type(element).__name__}.{port.name} is internally grounded and "
+                            f"cannot also connect to {endpoint!r}"
+                        )
+                    bus_ports.setdefault(endpoint, []).append(port)
 
-        for bus_name, port in assembled.attached_ports:
-            bus_ports.setdefault(bus_name, []).append(port)
+        attach_bindings(assembled, assembled.attached_ports)
         configured_elements = {id(element) for element in self.named_elements.values()}
 
         def attach_order(entry: tuple) -> int:

@@ -15,23 +15,32 @@ from typing import TYPE_CHECKING, Optional
 
 from ..components.converter import make_topology
 from ..components.pwm import validate_modulator
-from ..components.network import element_buses
+from ..components.network import GROUND, element_buses
 from ..control.controller import continuous_control
-from ..control.profiles import control_type
+from .control import control_profile
 from ..solver.integrators import (ADAPTIVE_METHODS, EXPLICIT_FIXED_METHODS, FIXED_METHODS,
                                   IMPLICIT_ADAPTIVE_METHODS, IMPLICIT_FIXED_METHODS)
 from ..solver.model import ConfigError
 from ..solver.multirate import own_schedule, parse_step
-from ..solver.timing import (TIME_EPS, PeriodicClock, control_actuation_clock,
-                             control_clock_offset, control_computation as _computation,
-                             control_period as _period)
+from ..solver.timing import TIME_EPS, PeriodicClock
 from .events import NAMED, SWITCHABLE, SWITCHING
-from .types import unit_type
+from .params import (_control_computation, _control_offset, _control_period,
+                     unit_type)
 
 if TYPE_CHECKING:
     from .params import Params
 
 __all__ = ["validate"]
+
+
+def _actuation_clock(control, pwm, *, pwm_timed: bool) -> PeriodicClock:
+    """Resolve the command-application grid while validating raw parameters."""
+    if pwm_timed:
+        return PeriodicClock(pwm.load_period, pwm.grid_offset)
+    period = _control_period(control, pwm)
+    offset = (_control_offset(control, pwm, pwm_timed=False)
+              + _control_computation(control)) % period
+    return PeriodicClock(period, offset)
 
 
 def _whole(r: float) -> bool:
@@ -125,10 +134,10 @@ def _timing(c, pwm, where: str, continuous: bool = False, *,
         if c.offset is not None and (not math.isfinite(c.offset) or c.offset < 0.0):
             raise ConfigError(f"{where}.offset must be finite and nonnegative, got {c.offset}")
         return
-    T_c = _period(c, pwm)
+    T_c = _control_period(c, pwm)
     if not math.isfinite(T_c) or T_c <= 0.0:
         raise ConfigError(f"{where}.period must be finite and positive, got {T_c}")
-    offset = control_clock_offset(c, pwm, pwm_timed=pwm_timed)
+    offset = _control_offset(c, pwm, pwm_timed=pwm_timed)
     if not math.isfinite(offset) or not 0.0 <= offset < T_c:
         raise ConfigError(f"{where}.offset must be in [0, ctrl.period), got {offset}")
     half = pwm.switching_period / 2.0
@@ -136,7 +145,7 @@ def _timing(c, pwm, where: str, continuous: bool = False, *,
         raise ConfigError(f"{where}.period = {T_c:.6g} s is not a multiple of half the carrier period "
                           f"({half:.6g} s at pwm.f_sw = {pwm.f_sw:g} Hz): the carrier triggers the "
                           f"interrupt at its valleys and peaks")
-    tau = _computation(c)
+    tau = _control_computation(c)
     if not math.isfinite(tau) or tau < 0.0 or tau >= T_c:
         raise ConfigError(f"{where}.computation = {tau} s must be at least 0 and shorter than the "
                           f"control period {T_c:.6g} s")
@@ -144,10 +153,10 @@ def _timing(c, pwm, where: str, continuous: bool = False, *,
 
 def _control(c, pwm, where: str, continuous: bool = False) -> None:
     """Check shared controller fields and the registered controller configuration."""
-    profile = control_type(c.type, f"{where}.type")
+    profile = control_profile(c)
     if profile.requires_loops and not c.loops:
         raise ConfigError(f"{where}.loops must contain at least one loop")
-    T_c = None if continuous else _period(c, pwm)
+    T_c = None if continuous else _control_period(c, pwm)
     for name, cfg in c.loops.items():
         if name in {"meas", "references", "held", "command", "prot", "startup"}:
             raise ConfigError(f"{where}.loops.{name}: reserved loop name")
@@ -271,23 +280,40 @@ def _converter(u, base, where: str):
     topology_fields = getattr(topology, "config_fields", frozenset())
     unused = [
         item.name for item in fields(u.bridge)
-        if item.name not in {"model", "type", "on_resistance", "parallel_capacitance", *topology_fields}
+        if item.name not in {
+            "model", "type", "switch_resistance", "diode_resistance",
+            "parallel_capacitance", *topology_fields,
+        }
         and getattr(u.bridge, item.name) != item.default
     ]
     if unused:
         raise ConfigError(
             f"{where}.bridge: fields {unused} do not apply to {u.bridge.type!r}"
         )
-    for field in ("on_resistance", "parallel_capacitance"):
+    for field in ("switch_resistance", "diode_resistance", "parallel_capacitance"):
         value = getattr(u.bridge, field)
         if not math.isfinite(value) or value < 0.0:
             raise ConfigError(f"{where}.bridge.{field} must be finite and >= 0")
-    if u.bridge.parallel_capacitance > 0.0 and u.bridge.on_resistance == 0.0:
-        raise ConfigError(f"{where}.bridge.parallel_capacitance requires positive on_resistance")
+    if (u.bridge.model != "switching"
+            and u.bridge.switch_resistance != u.bridge.diode_resistance):
+        raise ConfigError(
+            f"{where}.bridge: unequal switch and diode resistance requires "
+            "bridge.model: switching"
+        )
+    if not topology.controlled and u.bridge.switch_resistance != 0.0:
+        raise ConfigError(
+            f"{where}.bridge.switch_resistance does not apply to a diode bridge"
+        )
+    if u.bridge.parallel_capacitance > 0.0 and (
+            u.bridge.diode_resistance == 0.0
+            or (topology.controlled and u.bridge.switch_resistance == 0.0)):
+        raise ConfigError(
+            f"{where}.bridge.parallel_capacitance requires positive conducting-device resistance"
+        )
     _dclink(u.dclink, f"{where}.dclink")
     continuous = u.ctrl is None or continuous_control(u)
     if u.ctrl is not None:
-        profile = control_type(u.ctrl.type, f"{where}.ctrl.type")
+        profile = control_profile(u.ctrl)
         if profile.supported_models is not None and u.bridge.model not in profile.supported_models:
             raise ConfigError(
                 f"{where}.bridge.model: control type {u.ctrl.type!r} supports only "
@@ -297,7 +323,10 @@ def _converter(u, base, where: str):
         dead_time_active = pwm_timed and not topology.unilateral
         _pwm(u.pwm, base, f"{where}.pwm", carrier_unused=not pwm_timed,
              dead_time_active=dead_time_active)
-        validate_modulator(u, topology, where, dead_time_active=dead_time_active)
+        validate_modulator(
+            u, topology, where, kind=profile.modulator,
+            dead_time_active=dead_time_active,
+        )
         _timing(u.ctrl, u.pwm, f"{where}.ctrl", continuous, pwm_timed=pwm_timed)
         _control(u.ctrl, u.pwm, f"{where}.ctrl", continuous)
     protection = u.protection
@@ -356,111 +385,6 @@ def _dc_converter(u, base, where: str, *, nested: bool = False) -> None:
         raise ConfigError(f"{where}.pwm.sync: scalar converters require asynchronous PWM")
 
 
-def _wpt(u, base, where: str, *, nested: bool = False) -> None:
-    """Check a WPT composite and its shared compensated magnetic link."""
-    for side in unit_type(u.type).children:
-        child = getattr(u, side)
-        child_where = f"{where}.{side}"
-        spec = unit_type(child.type, f"{child_where}.type")
-        if spec.phases != 1 or spec.composite:
-            raise ConfigError(
-                f"{child_where}: a WPT child needs a scalar, non-composite unit"
-            )
-        spec.validator(child, base, child_where, nested=True)
-    link = u.link
-    _switch_controlled_capacitors(u, where)
-    if link.type == "ss_multi":
-        _multi_link(link, f"{where}.link")
-        return
-    positive = ["primary_inductance", "secondary_inductance"]
-    nonnegative = ["primary_resistance", "secondary_resistance"]
-    for side in unit_type(u.type).children:
-        if hasattr(link, f"{side}_compensation_inductance"):
-            positive += [f"{side}_series_capacitance", f"{side}_compensation_inductance",
-                         f"{side}_parallel_capacitance"]
-            nonnegative += [f"{side}_compensation_resistance", f"{side}_parallel_resistance"]
-        else:
-            positive.append(f"{side}_capacitance")
-    for name in positive:
-        value = getattr(link, name)
-        if not math.isfinite(value) or value <= 0.0:
-            raise ConfigError(f"{where}.link.{name} must be finite and positive")
-    for name in nonnegative:
-        value = getattr(link, name)
-        if not math.isfinite(value) or value < 0.0:
-            raise ConfigError(f"{where}.link.{name} must be finite and nonnegative")
-    if not math.isfinite(link.mutual_inductance):
-        raise ConfigError(f"{where}.link.mutual_inductance must be finite")
-    determinant = (
-        link.primary_inductance * link.secondary_inductance
-        - link.mutual_inductance * link.mutual_inductance
-    )
-    if determinant <= 0.0:
-        raise ConfigError(
-            f"{where}.link: the coupled-inductor matrix must be positive definite "
-            "(mutual_inductance^2 < primary_inductance * secondary_inductance)"
-        )
-
-
-def _switch_controlled_capacitors(u, where: str) -> None:
-    """Check the switch-controlled capacitors of a WPT link and their same-side converters."""
-    for side in unit_type(u.type).children:
-        child = getattr(u, side)
-        ctrl = child.ctrl
-        clocked = ctrl is not None and child.bridge.pwm_timed and child.pwm is not None
-        commanded = ctrl is not None and "scc_angle" in ctrl.outputs
-        scc = getattr(u.link, f"{side}_scc", None)
-        at = f"{where}.link.{side}_scc"
-        if scc is None:
-            if commanded:
-                raise ConfigError(f"{where}.{side}.ctrl.outputs.scc_angle: the link has no "
-                                  f"{side}_scc with command: 1")
-            continue
-        if not math.isfinite(scc.capacitance) or scc.capacitance <= 0.0:
-            raise ConfigError(f"{at}.capacitance must be finite and positive")
-        if not math.isfinite(scc.angle) or not 0.0 <= scc.angle <= math.pi:
-            raise ConfigError(f"{at}.angle must be in [0, pi]")
-        if not math.isfinite(scc.sync_angle):
-            raise ConfigError(f"{at}.sync_angle must be finite")
-        if scc.sync == "bridge" and not clocked:
-            raise ConfigError(f"{at}.sync: 'bridge' needs a clocked bridge on the {side} side")
-        if scc.command and not (clocked and commanded):
-            raise ConfigError(f"{at}.command needs a clocked controller output scc_angle "
-                              f"on the {side} side (ctrl.outputs.scc_angle)")
-        if commanded and not scc.command:
-            raise ConfigError(f"{where}.{side}.ctrl.outputs.scc_angle: {at}.command is off")
-        if scc.command and scc.angle != 0.0:
-            raise ConfigError(f"{at}.angle is not used with command: the angle is the "
-                              "controller output scc_angle (0 before its first write)")
-
-
-def _multi_link(link, where: str) -> None:
-    """Check the coil matrix and per-module values of a multi-module series-series link."""
-    names = ("primary_capacitance", "secondary_capacitance",
-             "primary_resistance", "secondary_resistance")
-    try:
-        matrix = np.asarray(link.inductance, dtype=float)
-        vectors = {name: np.asarray(getattr(link, name), dtype=float) for name in names}
-    except (TypeError, ValueError):
-        raise ConfigError(f"{where}: inductance must be a numeric matrix and the per-module "
-                          "values numeric lists") from None
-    modules = vectors["primary_capacitance"].size
-    if modules < 1 or any(vector.shape != (modules,) for vector in vectors.values()):
-        raise ConfigError(f"{where}: {', '.join(names)} must be lists of one value per module")
-    if matrix.shape != (2 * modules, 2 * modules):
-        raise ConfigError(f"{where}.inductance must be a {2 * modules} x {2 * modules} matrix "
-                          f"for {modules} module(s)")
-    if not np.all(np.isfinite(matrix)) or not np.allclose(matrix, matrix.T, rtol=1e-12, atol=0.0):
-        raise ConfigError(f"{where}.inductance must be finite and symmetric")
-    if np.linalg.eigvalsh(matrix).min() <= 0.0:
-        raise ConfigError(f"{where}.inductance must be positive definite")
-    for name in names:
-        vector = vectors[name]
-        positive = name.endswith("capacitance")
-        if not np.all(np.isfinite(vector)) or np.any(vector <= 0.0 if positive else vector < 0.0):
-            raise ConfigError(f"{where}.{name} must be finite and "
-                              f"{'positive' if positive else 'nonnegative'}")
-
 
 def _network(p: Params) -> None:
     """Check element identities, network values and bus references."""
@@ -470,6 +394,8 @@ def _network(p: Params) -> None:
         name: unit for name, unit in _unit_items(p.units)
         if unit.bus is not None
     }
+    if GROUND in p.buses:
+        raise ConfigError(f"buses.{GROUND}: {GROUND!r} is the reserved electrical reference")
     for name, bus in p.buses.items():
         if bus.c is not None and bus.c <= 0.0:
             raise ConfigError(f"buses.{name}.c must be > 0 when specified")
@@ -483,7 +409,9 @@ def _network(p: Params) -> None:
         if bus not in p.buses:
             raise ConfigError(f"{where}: unknown bus {bus!r}; known: {sorted(p.buses)}")
 
-    def _element_bus(where: str, bus: str) -> None:
+    def _element_bus(where: str, bus: str, *, allow_ground: bool = False) -> None:
+        if allow_ground and bus == GROUND:
+            return
         name = _unit_path(p.units, bus)
         if name is not None:
             spec = unit_type(p.unit(name).type)
@@ -491,8 +419,8 @@ def _network(p: Params) -> None:
                 return
         _bus_of(where, bus)
     for name, br in p.branches.items():
-        _element_bus(f"branches.{name}.bus1", br.bus1)
-        _element_bus(f"branches.{name}.bus2", br.bus2)
+        _element_bus(f"branches.{name}.bus1", br.bus1, allow_ground=True)
+        _element_bus(f"branches.{name}.bus2", br.bus2, allow_ground=True)
         if br.bus1 == br.bus2:
             raise ConfigError(f"branches.{name}: both ends are {br.bus1!r}")
         if br.l <= 0.0:
@@ -517,8 +445,11 @@ def _network(p: Params) -> None:
                 f"units.{name}.bus: unit type {u.type!r} needs a {phase_name}-phase bus"
             )
     for name, element in p.elements.items():
-        for key, bus in element_buses(element).items():
-            _element_bus(f"elements.{name}.{key}", bus)
+        endpoints = element_buses(element)
+        if endpoints and all(bus == GROUND for bus in endpoints.values()):
+            raise ConfigError(f"elements.{name}: an electrical component cannot connect only to ground")
+        for key, bus in endpoints.items():
+            _element_bus(f"elements.{name}.{key}", bus, allow_ground=True)
         for key, value in vars(element).items():
             if isinstance(value, float) and not math.isfinite(value):
                 raise ConfigError(f"elements.{name}.{key} must be finite")
@@ -606,17 +537,18 @@ def _initial(p: Params) -> None:
         m = u.meas
         if continuous_control(u) or not u.bridge.controlled:
             continue
-        T_c = _period(u.ctrl, u.pwm)
+        T_c = _control_period(u.ctrl, u.pwm)
         given = p.simulation.initial.states
         bridge_prefix = f"{name}.{'pwm' if u.bridge.model != 'averaging' else 'command'}."
         continued = any(key.startswith((f"{name}.ctrl.", bridge_prefix)) for key in given)
         if not continued and not any(key.startswith(f"{name}.meas.") for key in given):
             continue
         pwm_timed = u.bridge.pwm_timed
-        offset = control_clock_offset(u.ctrl, u.pwm, pwm_timed=pwm_timed)
+        offset = _control_offset(u.ctrl, u.pwm, pwm_timed=pwm_timed)
         interrupts = PeriodicClock(T_c, offset)
-        loads = control_actuation_clock(u.ctrl, u.pwm, pwm_timed=pwm_timed)
-        k, j, tau = interrupts.index_after(t0), loads.index_after(t0), _computation(u.ctrl)
+        loads = _actuation_clock(u.ctrl, u.pwm, pwm_timed=pwm_timed)
+        k, j, tau = (interrupts.index_after(t0), loads.index_after(t0),
+                     _control_computation(u.ctrl))
         # A pending command overwritten during computation is not part of the saved state.
         if continued and (interrupts.at(k - 1) + tau > loads.at(j) + TIME_EPS
                           and interrupts.at(k - 2) + tau > loads.at(j - 1) + TIME_EPS):
@@ -661,7 +593,7 @@ def _reference_signals(p: Params) -> None:
         control = unit.ctrl
         if control is None or not control._reference_bindings:
             continue
-        profile = control_type(control.type)
+        profile = control_profile(control)
         for target, binding in control._reference_bindings.items():
             where = f"units.{name}.ctrl.references.{binding.input_name}"
             try:
@@ -692,7 +624,7 @@ def validate(p: Params) -> Params:
     for name, unit in _unit_items(p.units):
         continuous = unit.ctrl is None or continuous_control(unit)
         period = ((unit.meas.period or p.simulation.output.period) if unit.ctrl is None
-                  else None if continuous else _period(unit.ctrl, unit.pwm))
+                  else None if continuous else _control_period(unit.ctrl, unit.pwm))
         if period is not None and (not math.isfinite(period) or period <= 0):
             raise ConfigError(f"units.{name}.meas: sampling period must be finite and positive")
         _measurement(unit.meas, period, f"units.{name}.meas",

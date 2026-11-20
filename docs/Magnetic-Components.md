@@ -1,13 +1,10 @@
 # Magnetic Components
 
-PESLite connects magnetic devices to the electrical circuit through ordinary component ports.
-`MagComponent` is the abstract component boundary for project-defined magnetic devices: it adds an
-optional physical magnetic description to the normal electrical component contract without
-prescribing a device type. Its electrical behavior may be supplied by a netlist, a constitutive law
-or imported data.
-
-The standard PESLite installation includes the `magcomponent` addon. `peslite-full` additionally
-includes the `magport` and `magcircuit` addons.
+The `magcomponent` addon connects magnetic devices to the electrical circuit through ordinary
+component ports. `MagComponent` is the abstract component boundary for project-defined magnetic
+devices: it adds an optional physical magnetic description to the normal electrical component
+contract without prescribing a device type. Its electrical behavior may be supplied by a netlist,
+a constitutive law or imported data.
 
 ## MagComponent interface
 
@@ -135,8 +132,8 @@ simulation.
 
 ### `magport` files
 
-A `magport` file may contain either a constant inductance matrix or a sampled nonlinear
-flux-linkage-to-current map:
+A `magport` file may contain a constant inductance matrix, a sampled current map or a sampled
+magnetic-energy potential:
 
 ```yaml
 elements:
@@ -155,18 +152,19 @@ Relative paths start beside the simulation file. Winding names and their order m
 | `winding_names` | yes | ordered winding names |
 | `inductance` | one law | self- and mutual-inductance matrix in H |
 | `flux_linkage` and `current` | one law | sampled nonlinear map shaped `(samples, windings)` |
+| `flux_linkage` and `stored_energy` | one law | conservative energy map on a complete Cartesian flux grid |
 | `physical` | no | JSON-compatible source metadata |
 | `magnetic` | no | physical branches, continuity nodes and winding coupling |
 | `field_points` and `field_basis` | no | spatial coordinates and a linear current-to-field map |
 
-Exactly one constitutive law is stored. For several windings, nonlinear interpolation is defined
-only inside the convex hull of the sampled flux-linkage vectors, so the samples must cover the
-complete operating range.
+Exactly one constitutive law is stored. A multiwinding current map is a general constitutive map
+without automatic stored-energy accounting. A stored-energy map derives all winding currents from
+one scalar potential. Sampled maps must cover the complete operating range.
 
 Create a `magport` file with `write_magport`:
 
 ```python
-from peslite.addons.functions import write_magport
+from peslite.addons.functions.magport import write_magport
 
 write_magport(
     "models/magnetic-device.npz",
@@ -179,16 +177,17 @@ write_magport(
 )
 ```
 
-Replace `inductance=` with matching `flux_linkage=` and `current=` arrays for a sampled nonlinear
-law. The optional `magnetic` value records the same branch, node and winding-coupling structure used
-by `magcircuit`, but does not replace the stored constitutive law.
+Replace `inductance=` with matching `flux_linkage=` and `current=` arrays for a general nonlinear
+law, or with `flux_linkage=` and `stored_energy=` for a conservative law. The optional `magnetic`
+value records the same branch, node and winding-coupling structure used by `magcircuit`, but does
+not replace the stored constitutive law.
 
 ### Field reconstruction
 
 When a `magport` file contains field data, reconstruct the field after simulation:
 
 ```python
-from peslite.addons.functions import magnetic_field
+from peslite.addons.functions.magport import magnetic_field
 
 field = magnetic_field(
     result,
@@ -207,7 +206,7 @@ Reduce an externally prepared linear magnetic circuit to a reusable `magport` fi
 `export_magnetic_circuit`:
 
 ```python
-from peslite.addons.functions import export_magnetic_circuit
+from peslite.addons.functions.magcircuit import export_magnetic_circuit
 
 export_magnetic_circuit(
     "models/magnetic-device.npz",

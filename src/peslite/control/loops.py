@@ -390,14 +390,29 @@ class SRFPLL(Loop):
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
-        kp_pu: float
-        ki_pu: float
+        kp_pu: Optional[float] = None
+        ki_pu: Optional[float] = None
+        bandwidth: Optional[float] = None
         normalisation: str = field(default="rated", metadata={"runtime": False})
         period: Optional[float] = None
         type: str = "srf_pll"
 
         _choices = {"normalisation": ("rated", "amplitude")}
         _quantities = {"kp_pu": "1/voltage", "ki_pu": "1/voltage"}
+
+        def __post_init__(self):
+            gains = self.kp_pu is not None or self.ki_pu is not None
+            if (self.kp_pu is None) != (self.ki_pu is None):
+                raise ConfigError("SRFPLL requires both kp_pu and ki_pu")
+            if gains == (self.bandwidth is not None):
+                raise ConfigError("SRFPLL requires either bandwidth or kp_pu and ki_pu")
+            values = (("kp_pu", self.kp_pu), ("ki_pu", self.ki_pu),
+                      ("bandwidth", self.bandwidth))
+            for name, value in values:
+                if value is not None and (
+                    isinstance(value, bool) or not math.isfinite(value) or value <= 0.0
+                ):
+                    raise ConfigError(f"SRFPLL {name} must be finite and positive")
 
     type = "srf_pll"
     role = "pll"
@@ -408,7 +423,12 @@ class SRFPLL(Loop):
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
-        self.kp, self.ki, self.w0, self.T = cfg.kp_pu, cfg.ki_pu, unit.base.w0, cfg.period
+        if cfg.bandwidth is None:
+            self.kp, self.ki = cfg.kp_pu, cfg.ki_pu
+        else:
+            alpha = 2.0 * math.pi * cfg.bandwidth
+            self.kp, self.ki = 2.0 * alpha, alpha * alpha
+        self.w0, self.T = unit.base.w0, cfg.period
         self.pi = PI(self.kp, self.ki, self.block_period)
         self.theta, self.omega = 0.0, self.w0
         self.u_g = 1.0 if cfg.normalisation == "amplitude" else None

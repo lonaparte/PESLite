@@ -142,27 +142,30 @@ def test_registered_carrier_keeps_its_own_topology_capabilities(monkeypatch):
     from dataclasses import replace
     import peslite
     from conftest import EXAMPLES
+    from peslite.assembly.control import make_control_modulator
     from peslite.components.converter import HalfBridge, make_bridge
     from peslite.components.pwm import CarrierComparison, MODULATOR_TYPES, validate_modulator
-    from peslite.control.profiles import CONTROL_TYPES
+    from peslite.assembly.control import CONTROL_TYPES
 
     class CustomCarrier(CarrierComparison):
         pass
 
-    unit = peslite.load(EXAMPLES / "buck-example.pes",
-                        **{"units.converter.bridge.model": "switching"}).units["converter"]
+    params = peslite.load(EXAMPLES / "buck-example.pes",
+                          **{"units.converter.bridge.model": "switching"})
     monkeypatch.setitem(MODULATOR_TYPES, "test_carrier", CustomCarrier)
-    monkeypatch.setitem(CONTROL_TYPES, "dc", replace(CONTROL_TYPES["dc"], modulator="test_carrier"))
-    validate_modulator(unit, HalfBridge(), "units.converter")
-    bridge = make_bridge(unit)
+    profile = replace(CONTROL_TYPES["dc"], modulator="test_carrier")
+    unit = params.units["converter"]
+    unit = replace(unit, ctrl=replace(unit.ctrl, _profile=profile)).resolved(params.base)
+    validate_modulator(unit, HalfBridge(), "units.converter", kind=unit.ctrl._profile.modulator)
+    bridge = make_bridge(unit, make_control_modulator(unit))
     assert isinstance(bridge.modulator, CustomCarrier)
     assert len(bridge.register_names) == 1
 
 
 def test_control_profiles_declare_one_static_interface_contract():
-    from peslite.control.profiles import control_type
+    from peslite.assembly.control import control_type
 
-    for name in ("gfl", "gfm", "custom", "dc", "resonant"):
+    for name in ("gfl", "gfm", "dc", "resonant"):
         assert isinstance(control_type(name).interface, ControlInterface)
 
 

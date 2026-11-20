@@ -28,6 +28,8 @@ from typing import Any, Callable, ClassVar, Iterable, Mapping, Protocol, Sequenc
 import numpy as np
 from numpy.typing import NDArray
 
+from ..defaults import (DEFAULT_ALGEBRAIC_ATOL, DEFAULT_ALGEBRAIC_MAX_ITERATIONS,
+                        DEFAULT_ALGEBRAIC_RTOL, DEFAULT_PH_REPORT_RTOL)
 from . import energy as _energy
 from .differentiation import directional_derivative
 from .timing import TIME_EPS, PeriodicClock
@@ -119,6 +121,33 @@ class Empty(Bag):
     """Record with no fields."""
 
     __slots__ = ()
+
+
+def _record_fields(record: Any) -> tuple[str, ...]:
+    """Return stored fields in declaration order for any PESLite record.
+
+    Fixed records declare ``__slots__`` (or named-tuple ``_fields``), while extension records may
+    add instance attributes dynamically. This is the single field-discovery contract used by the
+    model, circuit compiler and native exporter.
+    """
+    names: list[str] = []
+    for cls in reversed(type(record).__mro__):
+        declared = getattr(cls, "__slots__", ())
+        if isinstance(declared, str):
+            declared = (declared,)
+        names.extend(name for name in declared if name not in names)
+    names.extend(name for name in getattr(type(record), "_fields", ()) if name not in names)
+    dynamic = vars(record) if hasattr(record, "__dict__") else {}
+    names.extend(name for name in dynamic if name not in names)
+    return tuple(names)
+
+
+def _public_fields(record: Any) -> tuple[str, ...]:
+    """Return the public, non-callable fields exposed by a model record."""
+    return tuple(
+        name for name in _record_fields(record)
+        if not name.startswith("_") and not callable(getattr(record, name))
+    )
 
 
 @dataclass(frozen=True)
@@ -1049,7 +1078,9 @@ class _AlgebraicLoop:
 
     def __init__(self, operations: tuple, tears: tuple, owners: tuple,
                  labels: tuple[str, ...],
-                 max_sweeps: int = 16, rtol: float = 1e-8, atol: float = 1e-10) -> None:
+                 max_sweeps: int = DEFAULT_ALGEBRAIC_MAX_ITERATIONS,
+                 rtol: float = DEFAULT_ALGEBRAIC_RTOL,
+                 atol: float = DEFAULT_ALGEBRAIC_ATOL) -> None:
         self.tears = tears
         torn = {id(item) for item in tears}
         self.operations = tuple(operation for operation in operations
@@ -1778,7 +1809,7 @@ class Model:
             if produced.intersection(stage.outputs):
                 raise ValueError(f"{where}: an output has more than one producer")
             produced.update(stage.outputs)
-        outputs = {f for f in dir(sub.output) if not f.startswith("_") and not callable(getattr(sub.output, f))}
+        outputs = set(_public_fields(sub.output))
         missing = outputs - produced
         if missing:
             raise ValueError(f"{name}.output_stages: outputs without a producer: {sorted(missing)}")
@@ -2245,7 +2276,8 @@ class Model:
         return _energy.powers(self, t, y)
 
     def ph_report(self, zoh: Mapping[str, Any] | None = None, groups: Mapping[str, Any] | None = None,
-                  rtol: float = 1e-8, hold: Mapping[str, float] | None = None) -> "_energy.PHReport":
+                  rtol: float = DEFAULT_PH_REPORT_RTOL,
+                  hold: Mapping[str, float] | None = None) -> "_energy.PHReport":
         """Return the port-Hamiltonian report of the model (:class:`peslite.solver.energy.PHReport`).
 
         ``groups``: result of :meth:`groups`; ``hold``: ``{"step": dt, "window": W}`` hold times in s.

@@ -1,4 +1,4 @@
-# PESLite 0.5.2
+# PESLite 0.6.0
 # Grid-following converter; electrical values with a _pu suffix use per-unit values.
 @circuit
 grid -- pcc -- converter

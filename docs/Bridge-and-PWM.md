@@ -7,8 +7,9 @@ Converter Units share the same bridge-model, control-period, PWM-register and AD
 ```yaml
 bridge:
   type: three_phase_bridge
-  model: pwm_averaging
-  on_resistance: 0.0
+  model: switching
+  switch_resistance: 0.0
+  diode_resistance: 0.0
   parallel_capacitance: 0.0
 ```
 
@@ -19,7 +20,8 @@ bridge:
 | `upper_controlled`, `lower_controlled` | switches | 1 | controlled rows of a half bridge or full bridge |
 | `reverse_port` | switch | 0 | half-bridge power-port direction |
 | `external_port` | `midpoint`, `lower_rail` | `midpoint` | exposed half-bridge port |
-| `on_resistance` | ohm per conducting device | 0 | device voltage drop and loss |
+| `switch_resistance` | ohm per conducting device | 0 | controlled-channel voltage drop and loss |
+| `diode_resistance` | ohm per conducting device | 0 | diode voltage drop and loss |
 | `parallel_capacitance` | F | 0 | capacitance across the bridge power port |
 
 ### Model comparison
@@ -36,13 +38,15 @@ Each converter Unit selects its model independently.
 
 | Configuration | Result |
 |---|---|
-| both values zero | ideal bridge; no additional state |
-| nonzero `on_resistance` | finite conducting-path voltage drop and loss |
+| both resistance values zero | ideal bridge; no additional state |
+| nonzero switch or diode resistance | finite voltage drop and loss in that conduction path |
 | nonzero `parallel_capacitance` | adds continuous state `bridge.u_C` |
-| nonzero `parallel_capacitance` with zero resistance | rejected |
+| nonzero `parallel_capacitance` with any zero conducting-path resistance | rejected |
 
 A half-bridge or three-phase conducting leg uses one device resistance; a full-bridge current path
-uses two. Use `switching` to resolve individual capacitor charging and commutation pulses.
+uses two. Unequal switch and diode resistance requires `switching`; averaged models accept one
+common value by setting both fields equally. Use `switching` to resolve individual capacitor
+charging and commutation pulses.
 
 ## Control and PWM period
 
@@ -54,6 +58,7 @@ ctrl:
 pwm:
   f_sw: 20000.0
   update: single
+  alignment: center
   sync: asynchronous
   pattern_sync: interval
   dead_time: 0.0
@@ -72,6 +77,7 @@ meas:
 | `pwm.f_sw` | required for sampled control | positive Hz | carrier and default control frequency |
 | `pwm.update` | `single` | `single` or `double` | active-register load rate |
 | `pwm.carrier_phase` | 0 | carrier periods | asynchronous carrier position at `t = 0` |
+| `pwm.alignment` | `center` | `center`, `trailing` or `leading` | centered or edge-aligned switching pulses |
 | `pwm.sync` | `asynchronous` | `asynchronous` or `synchronous` | carrier clock source |
 | `pwm.pattern_sync` | `interval` | `interval` or `pulse` | waveform replacement rule |
 | `pwm.dead_time` | 0 | seconds, less than half a switching period | complementary-device turn-on delay |
@@ -159,6 +165,8 @@ Only the newest completed value is retained in the shadow register.
 
 Three-phase PWM uses `pwm.method: spwm` or `svpwm`; `pwm.modulation_limit` defaults to 1.
 Synchronous PWM requires an integer ratio `pwm.f_sw / base.f0`.
+`trailing` turns a pulse off after its duty fraction; `leading` turns it on after the
+complementary fraction. Alignment changes exact switching edges, so averaged models ignore it.
 
 | `pwm.pattern_sync` | Update rule |
 |---|---|

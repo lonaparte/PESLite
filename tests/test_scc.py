@@ -13,7 +13,7 @@ import pytest
 
 import peslite
 from peslite.assembly.params import ConfigError, from_dict, read_initial
-from peslite.components.wpt import SwitchControlledCapacitor
+from peslite.addons.components.magcomponent import SwitchControlledCapacitor
 from phase_shift_reference import level
 from test_phase_shift import _phase_shift, _ps_tree, _square_wave_breaks
 from test_wpt_rectifier import F, L1, L2, LCC, LCC_VALUES, SS, V1, C_60K, _rectifier
@@ -315,7 +315,7 @@ def test_scc_and_phase_shift_reuse_the_capacitive_bridge_equations(tmp_path):
     tree["simulation"]["output"]["states"] = True
     for side in ("primary", "secondary"):
         tree["units"]["charger"][side]["bridge"].update(
-            parallel_capacitance=20e-9, on_resistance=1.0)
+            parallel_capacitance=20e-9, switch_resistance=1.0, diode_resistance=1.0)
     results = []
     for dt in (5e-9, 2.5e-9):
         tree["simulation"]["solver"]["dt"] = dt
@@ -347,9 +347,9 @@ class _Clock:
 
 def _capacitor(current, *, angle=1.2, drive="alternating", voltage=0.0):
     """Use the existing capacitor and real commutation dispatcher for device tests."""
-    from peslite.components.network import RCNode
+    from peslite.components.passive import RCNode
     from peslite.solver.model import Model
-    from peslite.assembly.conduction import DiodeConduction
+    from peslite.solver.commutation import Commutation
     from peslite.solver.integrators import FixedStepSolver
 
     switch = SwitchControlledCapacitor("primary", 0, 60e-9, angle, drive, "bridge")
@@ -377,7 +377,7 @@ def _capacitor(current, *, angle=1.2, drive="alternating", voltage=0.0):
 
     capacitor = Capacitor(60e-9, 0.0, u0=voltage, phases=1)
     model = Model({"capacitor": capacitor}, {})
-    handler = DiodeConduction(model, FixedStepSolver(2e-9, "RK4"))
+    handler = Commutation(model, FixedStepSolver(2e-9, "RK4"))
     return switch, capacitor, model, handler
 
 

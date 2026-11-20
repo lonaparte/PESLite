@@ -10,6 +10,7 @@ import pytest
 
 import peslite
 from peslite.assembly.exporter import _signal_names
+from peslite.assembly.params import from_dict
 from peslite.control.blocks import complex2abc
 from peslite.solver.model import ConfigError
 from peslite.solver.simulation import _CSVTable, _PlantRows, _plant_output_row
@@ -48,6 +49,25 @@ def test_compiled_output_rows_keep_the_fixed_public_schema():
 
 def _run(params, out):
     return peslite.Simulation(params).run(out_dir=out)
+
+
+def test_disabled_output_period_does_not_partition_the_physical_run():
+    params = from_dict({
+        "base": {"s_base": 1.0},
+        "buses": {"node": {"phases": 1, "c": 1e-3}},
+        "elements": {"load": {"type": "resistor", "bus": "node", "r": 2.0}},
+        "simulation": {
+            "t_end": 1e-4,
+            "initial": {"states": {"node.u_C": 1.0}},
+            "energy_check": "off",
+            "solver": {"type": "fixed", "method": "rk4", "dt": 7e-6},
+            "output": {"states": False, "signals": False, "energy": False},
+        },
+    })
+    dense = peslite.Simulation(params.replace(**{"simulation.output.period": 1e-7})).run()
+    sparse = peslite.Simulation(params.replace(**{"simulation.output.period": 1e-4})).run()
+    assert dense.n_rhs == sparse.n_rhs
+    assert dense.final_states() == sparse.final_states()
 
 
 def test_csv_rows_select_significant_digit_precision(tmp_path):

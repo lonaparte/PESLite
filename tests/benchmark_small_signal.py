@@ -28,9 +28,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from peslite import Simulation, load  # noqa: E402
-from peslite.addons.functions import small_signal  # noqa: E402
+from peslite.addons.functions.online_analysis import small_signal  # noqa: E402
 from peslite.solver.linearization import linearize_loop  # noqa: E402
-from peslite.solver.simulation import SystemLoop, parse_override  # noqa: E402
+from peslite.solver.simulation import SimulationTransition  # noqa: E402
+from peslite.cli import parse_override  # noqa: E402
 
 
 def profile_analysis(sim, **options):
@@ -47,7 +48,7 @@ def profile_analysis(sim, **options):
     advance = entry(Simulation.run)
     linear = entry(linearize_loop)
     matrix = linear.totaltime - sum(call.totaltime for call in linear.calls
-                                   if call.code is SystemLoop.advance.__code__)
+                                   if call.code is SimulationTransition.advance.__code__)
     eigenvalues = entry(np.linalg.eigvals).totaltime
     remaining = total - rebuild.totaltime - advance.totaltime - matrix - eigenvalues
     sample = {

@@ -1,4 +1,4 @@
-# PESLite 0.5.2
+# PESLite 0.6.0
 # CIGRE MV 14-node feeder with pi-line shunts, distributed loads and a 5 MVA GFM converter.
 @circuit
 grid -- bus1 -- bus2 -- bus3 -- bus4 -- bus5 -- bus6

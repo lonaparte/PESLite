@@ -11,8 +11,8 @@ import warnings
 import pytest
 
 import peslite
+import peslite.cli as cli_module
 from conftest import EXAMPLES, ROOT
-from peslite.solver import simulation as simulation_module
 
 
 @pytest.mark.parametrize("name,relative,class_name", [
@@ -59,7 +59,7 @@ def test_create_preserves_an_existing_file(name, relative, tmp_path, monkeypatch
 def test_create_opens_only_when_requested(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     opened = []
-    monkeypatch.setattr(simulation_module, "_open_file", opened.append)
+    monkeypatch.setattr(cli_module, "_open_file", opened.append)
     assert peslite.main(["create", "closed.pes"]) == 0
     assert opened == []
     assert peslite.main(["create", "opened.pes", "--open"]) == 0
@@ -72,7 +72,7 @@ def test_create_keeps_the_file_when_opening_fails(tmp_path, monkeypatch, capsys)
     def fail(_path):
         raise OSError("no associated application")
 
-    monkeypatch.setattr(simulation_module, "_open_file", fail)
+    monkeypatch.setattr(cli_module, "_open_file", fail)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         assert peslite.main(["create", "case.pes", "--open", "--json"]) == 0
@@ -96,9 +96,9 @@ def test_open_file_prefers_visual_then_editor(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setenv("VISUAL", "code --wait")
     monkeypatch.setenv("EDITOR", "nano")
-    simulation_module._open_file(target)
+    cli_module._open_file(target)
     monkeypatch.delenv("VISUAL")
-    simulation_module._open_file(target)
+    cli_module._open_file(target)
     assert calls == [
         (["code", "--wait", str(target)], {}),
         (["nano", str(target)], {}),
@@ -117,7 +117,7 @@ def test_open_file_uses_xdg_open_without_an_editor(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.delenv("VISUAL", raising=False)
     monkeypatch.delenv("EDITOR", raising=False)
-    simulation_module._open_file(target)
+    cli_module._open_file(target)
     assert calls[0][0] == ["xdg-open", str(target)]
     assert calls[0][1]["timeout"] == 10
 

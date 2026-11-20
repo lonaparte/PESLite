@@ -6,7 +6,8 @@ import type {
 import { closePreviewSession, request, subscribe, inVSCode } from './transport';
 import type { Operation } from './transport';
 import type {
-  CsvResponse, Field, PreviewResponse, RunStatus, SourceEdit, TextFile, TreeEntry,
+  CsvResponse, DebugOperation, DebugPreview, Field, PreviewResponse, RunStatus,
+  SourceEdit, TextFile, TreeEntry,
 } from './transport';
 import { SourceEditor } from './SourceEditor';
 import { Waveform } from './Waveform';
@@ -51,8 +52,9 @@ function FileTree({ directory, current, onOpen, stamp }: {
   </div>;
 }
 
-function GraphPane({ text, path, response, layout, onLayout, onSelect, onSource }: {
+function GraphPane({ text, path, response, operations, layout, onLayout, onSelect, onSource }: {
   text: string; path: string; response: PreviewResponse | null;
+  operations?: DebugOperation[];
   layout: PreviewLayout; onLayout: (layout: PreviewLayout) => void;
   onSelect: (node: GraphNode | GraphEdge, view: string, kind: 'node' | 'edge') => void;
   onSource: (location: SourceLocation) => void;
@@ -81,7 +83,8 @@ function GraphPane({ text, path, response, layout, onLayout, onSelect, onSource 
         diagnostics: response.diagnostics,
       });
     } else {
-      const model = parsePES(text);
+      const parsed = parsePES(text);
+      const model = operations?.length ? debugModel(parsed, operations) : parsed;
       const host = response.source === text ? response.diagnostics : [];
       const lines = new Set(model.diagnostics.map(item => item.range.start.line));
       preview.current.updateModel({
@@ -89,8 +92,46 @@ function GraphPane({ text, path, response, layout, onLayout, onSelect, onSource 
         diagnostics: [...model.diagnostics, ...host.filter(item => !lines.has(item.range.start.line))],
       });
     }
-  }, [text, path, response]);
+  }, [text, path, response, operations]);
   return <div className="graph-container" ref={container} />;
+}
+
+function debugModel(model: PESModel, operations: DebugOperation[]): PESModel {
+  const views = model.views.map(view => ({ ...view, nodes: [...view.nodes],
+    edges: view.edges.map(edge => ({ ...edge })) }));
+  const controlViews = views.filter(view => view.name !== 'circuit');
+  const endpoint = (written: string, preferred?: string) => {
+    const explicit = controlViews.filter(view => written.startsWith(view.name + '.'))
+      .sort((a, b) => b.name.length - a.name.length)[0];
+    const view = explicit || controlViews.find(item => item.name === preferred)
+      || (controlViews.length === 1 ? controlViews[0] : undefined);
+    if (!view) return null;
+    const local = explicit ? written.slice(view.name.length + 1) : written;
+    const [node, ...port] = local.split('.');
+    return { view, node, port: port.join('.') || undefined };
+  };
+  operations.forEach((operation, index) => {
+    if (operation.kind === 'set') return;
+    const target = endpoint(operation.target);
+    const source = endpoint(operation.source, target?.view.name);
+    if (!source || !target || source.view !== target.view) return;
+    const view = target.view;
+    if (operation.kind === 'disconnect') {
+      const edge = view.edges.find(item => item.from === source.node && item.to === target.node
+        && item.fromPort === source.port && item.toPort === target.port);
+      if (edge) edge.debug = 'disconnect';
+      return;
+    }
+    if (!view.nodes.some(node => node.id === source.node)) {
+      view.nodes.push({ id: source.node, name: source.node, type: 'Debug source', firstLine: 1,
+        source: { start: { line: 1, column: 1 }, end: { line: 1, column: 1 } },
+        ports: source.port ? [source.port] : [] });
+    }
+    view.edges.push({ id: `debug:${index}`, from: source.node, to: target.node,
+      fromPort: source.port, toPort: target.port, directed: true, debug: 'connect', line: 1,
+      source: { start: { line: 1, column: 1 }, end: { line: 1, column: 1 } } });
+  });
+  return { ...model, views };
 }
 
 type Selection = { name: string; id: string; view: string; kind: 'node' | 'edge' };
@@ -104,6 +145,7 @@ export function App() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [summary, setSummary] = useState<{ summary: unknown; simulationFile: string | null } | null>(null);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
+  const [debugPreview, setDebugPreview] = useState<DebugPreview | null>(null);
   const [layout, setLayout] = useState<PreviewLayout>(emptyLayout());
   const [selected, setSelected] = useState<Selection | null>(null);
   const [fields, setFields] = useState<Record<string, string>>({});
@@ -122,8 +164,10 @@ export function App() {
   currentText.current = text;
   const kind = path.toLowerCase().endsWith('.csv') ? 'csv'
     : path.toLowerCase().endsWith('summary.json') ? 'summary'
-    : path.toLowerCase().endsWith('.pes') ? 'pes' : 'text';
+    : path.toLowerCase().endsWith('.pes') ? 'pes'
+    : path.toLowerCase().endsWith('.pesdbg') ? 'debug' : 'text';
   const isPes = !!path && kind === 'pes';
+  const isDebug = !!path && kind === 'debug';
 
   const open = useCallback(async (name: string) => {
     try {
@@ -131,6 +175,7 @@ export function App() {
       const selectedPath = name || (await request<{ path: string }>('workspace.active')).path;
       if (!selectedPath) return;
       setPath(selectedPath); setSelected(null); setFields({}); setPreview(null);
+      setDebugPreview(null);
       setShowOutput(false); setComparison(null);
       if (selectedPath.endsWith('.csv')) {
         setCsv(await request<CsvResponse>('csv.read', {
@@ -182,6 +227,23 @@ export function App() {
     }, 260);
     return () => { active = false; clearTimeout(timer); };
   }, [isPes, file?.path, text, trustAddons]);
+
+  useEffect(() => {
+    if (!isDebug || !file) { setDebugPreview(null); return; }
+    let active = true;
+    const timer = setTimeout(() => {
+      request<DebugPreview>('debug.inspect', { path, text, trustAddons })
+        .then(result => {
+          if (!active) return;
+          setDebugPreview(result);
+          return request<{ layout: PreviewLayout }>('preview.layout.load', {
+            path: result.modelPath,
+          }).then(saved => { if (active) setLayout(saved.layout); });
+        })
+        .catch(problem => { if (active) setError(message(problem)); });
+    }, 260);
+    return () => { active = false; clearTimeout(timer); };
+  }, [isDebug, file?.path, text, trustAddons]);
 
   useEffect(() => {
     const poll = () => request<RunStatus>('run.status').then(setRun).catch(() => {});
@@ -368,7 +430,7 @@ export function App() {
   }
 
   async function execute() {
-    if (!isPes) return;
+    if (!isPes && !isDebug) return;
     if (dirty || (file && text !== file.text)) {
       setError('Save your .pes source before running the CLI.'); return;
     }
@@ -384,9 +446,9 @@ export function App() {
     }
   }
 
-  async function reveal(location: SourceLocation) {
+  async function reveal(location: SourceLocation, sourcePath = path) {
     if (inVSCode) {
-      try { await request('editor.reveal', { path, line: location.line, column: location.column }); }
+      try { await request('editor.reveal', { path: sourcePath, line: location.line, column: location.column }); }
       catch (problem) { setError(message(problem)); }
     } else { setJumpLine(location.line); setTab('split'); }
   }
@@ -435,7 +497,7 @@ export function App() {
     <header className="top-bar">
       <div className="identity"><span className="logo">P</span><strong>PESLite</strong><span>Workspace</span></div>
       <div className="header-actions">
-        {isPes && <><button title="Load project-local Python addons only after explicit trust"
+        {(isPes || isDebug) && <><button title="Load project-local Python addons only after explicit trust"
           onClick={() => { if (window.confirm('Allow this workspace to execute local PESaddons Python code during preview and simulation?')) setTrustAddons(true); }}
           disabled={trustAddons}>{trustAddons ? 'Addons trusted' : 'Trust addons'}</button>
           <button onClick={execute} disabled={!!run?.running}>▶ Run</button>
@@ -459,28 +521,34 @@ export function App() {
       <main className="content">
         <div className="document-bar">
           <strong>{path || (inVSCode ? 'Select a .pes document in the editor' : 'Select a file')}</strong>
-          {isPes && !inVSCode && <div className="tabs">{(['diagram', 'source', 'split'] as const)
+          {(isPes || isDebug) && !inVSCode && <div className="tabs">{(['diagram', 'source', 'split'] as const)
             .map(value => <button key={value} className={tab === value ? 'active' : ''}
               onClick={() => setTab(value)}>{value}</button>)}</div>}
         </div>
         {error && <div className="error-bar" role="alert">{error}
           <button onClick={() => setError('')}>Dismiss</button></div>}
-        {isPes && file && <>
+        {(isPes || isDebug) && file && <>
           {preview?.format === 'legacy' && <div className="schematic-actions">
             <button onClick={() => void addSchematicComponent()}>Add component</button>
             <span>Validated source-range edits only; unsafe changes are rejected.</span>
           </div>}
           <div className={'editor-layout ' + (inVSCode ? 'only-diagram' : tab)}>
-            {(inVSCode || tab !== 'source') && <GraphPane path={path} text={text}
-              response={preview} layout={layout} onLayout={value => {
+            {(inVSCode || tab !== 'source') && <GraphPane
+              path={debugPreview?.modelPath || path}
+              text={debugPreview?.modelText || text}
+              response={debugPreview?.preview || preview}
+              operations={debugPreview?.operations}
+              layout={layout} onLayout={value => {
                 setLayout(value);
-                request('preview.layout.save', { path, layout: value })
+                request('preview.layout.save', {
+                  path: debugPreview?.modelPath || path, layout: value,
+                })
                   .catch(problem => setError(message(problem)));
               }} onSelect={(entity, view, selectedKind) => setSelected({
                 name: selectedKind === 'node' ? (entity as GraphNode).name : entity.id,
                 id: entity.id, view, kind: selectedKind,
               })}
-              onSource={location => void reveal(location)} />}
+              onSource={location => void reveal(location, debugPreview?.modelPath || path)} />}
             {!inVSCode && tab !== 'diagram' && <section className="source-pane">
               <h3>Source{dirty && <span className="dirty"> · unsaved</span>}</h3>
               <SourceEditor key={path} text={text} onChange={value => {
@@ -488,6 +556,10 @@ export function App() {
               }} jumpLine={jumpLine} />
             </section>}
           </div>
+          {isDebug && debugPreview && <section className="inspector">
+            <div className="section-header"><h3>Debug overlay · {debugPreview.modelPath}</h3></div>
+            <p className="hint">{debugPreview.operations.length} operations · {debugPreview.sources.length} sources · {Object.keys(debugPreview.probes).length} probes · {debugPreview.analyses.length} analyses · {debugPreview.checks.length} checks</p>
+          </section>}
           {selected && <section className="inspector">
             <div className="section-header"><h3>{selected.name} · {selected.kind === 'edge' ? 'connection' : 'parameters'}</h3>
               <div className="inspector-buttons">

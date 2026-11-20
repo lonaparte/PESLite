@@ -25,6 +25,8 @@ BELOW = {
 }
 TOP = {"solver/simulation.py"}
 INTEGRATIONS = {"gui"}
+ROOT_MODULES = {"__init__.py", "__main__.py", "cli.py", "defaults.py"}
+SHARED = {"defaults"}
 
 
 def _imports(path):
@@ -41,9 +43,9 @@ def _imports(path):
     return out
 
 
-def test_the_package_has_five_code_parts():
+def test_the_package_has_five_code_parts_and_shared_defaults():
     entries = {p.name for p in PACKAGE.iterdir() if p.name != "__pycache__"}
-    assert entries == {"__init__.py", "gui", *PARTS}
+    assert entries == {"gui", *ROOT_MODULES, *PARTS}
 
 
 def test_the_root_examples_directory_contains_only_pes_case_files():
@@ -55,9 +57,9 @@ def test_the_root_examples_directory_contains_only_pes_case_files():
 def test_each_part_imports_only_the_parts_below_it():
     for path in sorted(PACKAGE.rglob("*.py")):
         rel = path.relative_to(PACKAGE)
-        if rel.as_posix() in ("__init__.py", *TOP) or rel.parts[0] in INTEGRATIONS:
+        if rel.as_posix() in (*ROOT_MODULES, *TOP) or rel.parts[0] in INTEGRATIONS:
             continue
-        wrong = _imports(path) - BELOW[rel.parts[0]]
+        wrong = _imports(path) - BELOW[rel.parts[0]] - SHARED
         assert not wrong, f"{rel} imports {sorted(wrong)}"
 
 

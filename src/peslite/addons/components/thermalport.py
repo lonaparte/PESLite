@@ -12,7 +12,7 @@ import numpy as np
 
 from ...components.network import Element, register_component_type
 from ...solver import Bag, ConfigError
-from .thermal.network import _finite, _record
+from .thermal import _finite, _record
 
 __all__ = ["ThermalLaw", "ThermalPort", "ThermalPortModel", "load_thermalport"]
 

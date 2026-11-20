@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 import sys
+import tomllib
 from email.parser import Parser
 from pathlib import Path
 from zipfile import ZipFile
 
-MANIFEST = Path(__file__).resolve().parents[1] / "packages/distributions.json"
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST = ROOT / "packages/distributions.json"
+ADDON_MANIFEST = ROOT / "src/peslite/addons/addons.toml"
+ADDON_DIRECTORIES = {"component": "components", "control": "control", "function": "functions"}
 EXPECTED = set(json.loads(MANIFEST.read_text(encoding="utf-8"))["distributions"])
 
 
@@ -53,17 +57,12 @@ def main(directory: str = "dist") -> int:
 
     required = {
         "peslite-core": (
-            "peslite/addons/functions/__init__.py",
-            "peslite/addons/formats/__init__.py",
+            "peslite/addons/addons.toml",
             "share/peslite/examples/templates/template.pes",
         ),
         "peslite": (
-            "peslite/addons/components/magcomponent.py",
-            "peslite/addons/components/thermal/__init__.py",
-            "peslite/addons/formats/legacy_yaml.py",
-            "peslite/addons/functions/thermal/__init__.py",
-            "peslite/addons/functions/stability.py",
             "share/peslite/examples/gfl-example.pes",
+            "share/peslite/examples/debug/gfl-debug-example.pesdbg",
         ),
         "peslite-gui": (
             "peslite/gui/legacy_yaml.py",
@@ -78,14 +77,18 @@ def main(directory: str = "dist") -> int:
             "peslite/gui/preview/workbench.js",
             "peslite/gui/web_dist/index.html",
         ),
-        "peslite-full": (
-            "peslite/addons/components/magport.py",
-            "peslite/addons/components/thermalport.py",
-            "peslite/addons/components/magcircuit.py",
-            "peslite/addons/functions/magport.py",
-            "peslite/addons/functions/magcircuit.py",
-        ),
+        "peslite-full": (),
     }
+    with ADDON_MANIFEST.open("rb") as stream:
+        addons = tomllib.load(stream)
+    for name, addon in addons.items():
+        distribution = "peslite" if addon["installation"] == "standard" else "peslite-full"
+        modules = tuple(
+            f"peslite/addons/{directory}/{name}.py"
+            for category, directory in ADDON_DIRECTORIES.items()
+            if addon[category]
+        )
+        required[distribution] += modules
     for distribution, paths in required.items():
         for path in paths:
             if path not in wheels[distribution]:

@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "peslite-core"
-version = "0.5.2"
+version = "0.6.0"
 description = "Core runtime for the PESLite power electronics simulator."
 readme = "README.md"
-requires-python = ">=3.10.1"
+requires-python = ">=3.11.0"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 dependencies = [
@@ -20,14 +20,13 @@ dependencies = [
 test = [
     "pytest>=7.0.0",
     "matplotlib>=3.7.0",
-    "tomli>=2.0.0; python_version < '3.11'",
 ]
 
 [dependency-groups]
 onnx-test = ["onnx>=1.17.0", "onnxruntime>=1.18.0"]
 
 [project.scripts]
-peslite = "peslite.solver.simulation:main"
+peslite = "peslite.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/lonaparte/PESLite"
@@ -41,6 +40,9 @@ where = ["src"]
 [tool.setuptools.data-files]
 "share/peslite/examples/templates" = ["examples/templates/*.pes", "examples/templates/*.py"]
 
+[tool.setuptools.package-data]
+"peslite.addons" = ["addons.toml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
@@ -51,5 +53,6 @@ markers = [
     "serial: resource-intensive tests that require a non-parallel pytest run",
     "motulator: cross-checks PESLite against the pinned motulator reference simulator",
     "pyspice: optional DC-converter and WPT cross-checks against PySpice and ngspice",
+    "openpels: cross-checks against pinned native-ngspice cases from OpenPELS",
     "onnx: optional black-box compatibility tests against ONNX Runtime",
 ]

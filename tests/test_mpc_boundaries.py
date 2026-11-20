@@ -7,7 +7,7 @@ import peslite
 from conftest import EXAMPLES
 from peslite.control import ConverterMeasurement
 from peslite.addons.control.mpc import MPCResult
-from peslite.addons.control.predictive import PredictiveCurrentControl
+from peslite.addons.control.mpc import PredictiveCurrentControl
 from peslite.solver.model import ConfigError, StateRegistry
 
 
@@ -202,7 +202,8 @@ def test_fcs_state_restore_validates_the_complete_physical_action(mpc_params):
 
 def test_bridge_energy_storage_is_not_silently_omitted_from_the_predictor(mpc_params):
     params = mpc_params.replace(**{
-        "units.converter.bridge.on_resistance": 0.01,
+        "units.converter.bridge.switch_resistance": 0.01,
+        "units.converter.bridge.diode_resistance": 0.01,
         "units.converter.bridge.parallel_capacitance": 1e-6,
     })
 

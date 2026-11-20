@@ -38,6 +38,7 @@ nav:
       - C++ Export: Cpp-Export.md
       - Imperix Export: Imperix-Export.md
       - Extending PESLite: Extending-PESLite.md
+      - Debugging: Debugging.md
       - Model Predictive Control: Model-Predictive-Control.md
       - Online System Analysis: Online-System-Analysis.md
       - Offline System Analysis: Offline-System-Analysis.md
@@ -46,6 +47,7 @@ nav:
       - Plotting: Plotting.md
   - Reference:
       - CLI Reference: CLI-Reference.md
+      - List of Addons: List-of-Addons.md
       - Examples: Examples.md
       - FAQ: FAQ.md
 

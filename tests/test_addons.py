@@ -1,19 +1,15 @@
-"""Add-on discovery plus a custom PLL assembled and run with built-in controller loops."""
+"""Addon manifest, assembly and registration boundaries."""
 
 import importlib
-import inspect
 from pathlib import Path
 
-import numpy as np
 import peslite
 import pytest
 from peslite.addons import components as addon_components
 from peslite.addons import control as addon_control
-from peslite.addons.components.cable import CableModel
-from peslite.assembly.params import runtime_changeable
-from peslite.addons.control.voltage_adaptive_pll import VoltageAdaptivePLL
-from peslite.addons.control.predictive import (PredictiveCurrentControl,
-                                               ThreePhasePredictiveCurrentControl)
+from peslite.assembly import addons as addon_assembly
+from peslite.addons.control.mpc import (PredictiveCurrentControl,
+                                        ThreePhasePredictiveCurrentControl)
 from peslite.components.network import ELEMENT_TYPES
 from peslite.control import LOOP_TYPES, Loop
 
@@ -27,7 +23,7 @@ def test_control_addon_path_registers_loops(tmp_path, monkeypatch):
     )
     (path / "test_controller_addon.py").write_text(
         """from dataclasses import dataclass
-from peslite.addons.control import Loop, register_loop_type
+from peslite.control import Loop, register_loop_type
 
 @register_loop_type
 class AddonLoop(Loop):
@@ -43,7 +39,7 @@ class AddonLoop(Loop):
     monkeypatch.setattr(addon_control, "__path__", [str(path)])
     importlib.invalidate_caches()
 
-    imported = addon_control.discover()
+    imported = addon_assembly._import_modules(addon_control.__name__, addon_control.__path__)
 
     assert [module.__name__ for module in imported] == [
         "peslite.addons.control.test_controller_addon"
@@ -56,7 +52,7 @@ def test_component_addon_path_registers_elements(tmp_path, monkeypatch):
     path.mkdir()
     (path / "test_component_addon.py").write_text(
         """from dataclasses import dataclass
-from peslite.addons.components import register_component_type
+from peslite.components import register_component_type
 from peslite.solver import netlist as nl
 
 @register_component_type
@@ -74,7 +70,9 @@ class AddonElement:
     monkeypatch.setattr(addon_components, "__path__", [str(path)])
     importlib.invalidate_caches()
 
-    imported = addon_components.discover()
+    imported = addon_assembly._import_modules(
+        addon_components.__name__, addon_components.__path__
+    )
 
     assert [module.__name__ for module in imported] == [
         "peslite.addons.components.test_component_addon"
@@ -82,41 +80,56 @@ class AddonElement:
     assert ELEMENT_TYPES["addon_test_element"].params.__module__ == imported[0].__name__
 
 
-def test_functions_have_one_lazy_public_namespace():
-    functions = peslite.addons.functions
-    assert peslite.addons.__all__ == ["control", "components", "formats", "functions"]
+def test_function_addons_use_their_explicit_modules():
+    functions = importlib.import_module("peslite.addons.functions")
     assert not hasattr(peslite.addons, "plot_csv")
-    assert set(functions.__all__) == set(functions._EXPORTS)
-    assert len(set(functions._EXPORTS.values())) == len(functions._EXPORTS)
+    assert not hasattr(functions, "__all__")
+    plotting = importlib.import_module("peslite.addons.functions.plotting")
+    assert callable(plotting.plot_csv)
 
-    local = {}
-    for name, (module_name, attribute) in functions._EXPORTS.items():
-        value = getattr(functions, name)
-        qualified = (module_name if "." in module_name
-                     else f"{functions.__name__}.{module_name}")
-        assert callable(value)
-        assert value is getattr(importlib.import_module(qualified), attribute)
-        if "." not in module_name:
-            local.setdefault(module_name, set()).add(attribute)
 
-    directory = Path(functions.__file__).parent
-    for path in directory.glob("*.py"):
-        if path.stem.startswith("_"):
-            continue
-        module = importlib.import_module(f"{functions.__name__}.{path.stem}")
-        public_functions = {
-            name for name in module.__all__
-            if inspect.isfunction(getattr(module, name, None))
-            and getattr(module, name).__module__ == module.__name__
+def test_simulation_readers_are_declared_and_loaded_through_addon_assembly():
+    declared = [name for name, spec in addon_assembly.ADDONS.items()
+                if spec.simulation_reader]
+    readers = addon_assembly.simulation_readers()
+
+    assert declared == ["legacy_yaml"]
+    assert [reader.__module__ for reader in readers] == [
+        "peslite.addons.functions.legacy_yaml"
+    ]
+
+
+def test_every_installed_addon_module_is_declared_once():
+    root = Path(addon_assembly.__file__).parents[1] / "addons"
+    declared = {category: {} for category in ("control", "components", "functions")}
+    for name, spec in addon_assembly.ADDONS.items():
+        for field, category in (("control", "control"), ("component", "components"),
+                                ("function", "functions")):
+            module = spec.module(field)
+            if module is not None:
+                assert module == name
+                assert module not in declared[category]
+                declared[category][module] = name
+    for category, modules in declared.items():
+        files = {
+            path.stem for path in (root / category).glob("*.py")
+            if path.stem != "__init__" and not path.stem.startswith("_")
         }
-        assert public_functions == local.get(path.stem, set())
+        assert files == set(modules)
+        source_directories = {
+            path.name for path in (root / category).iterdir()
+            if path.is_dir() and path.name != "__pycache__"
+        }
+        assert not source_directories
 
 
-def test_missing_function_provider_has_one_facade_error(monkeypatch):
-    functions = peslite.addons.functions
-    monkeypatch.setitem(functions._EXPORTS, "missing_function", ("missing_provider", "run"))
-    with pytest.raises(functions.FunctionUnavailableError, match="missing_function"):
-        functions._resolve("missing_function")
+def test_missing_addon_module_has_one_assembly_error(monkeypatch):
+    def missing(name):
+        raise ModuleNotFoundError(name=name)
+
+    monkeypatch.setattr(addon_assembly, "import_module", missing)
+    with pytest.raises(addon_assembly.AddonUnavailableError, match="plotting"):
+        addon_assembly.import_addon("plotting", "function")
 
 
 def test_mpc_is_a_control_addon():
@@ -129,47 +142,13 @@ def test_mpc_is_a_control_addon():
     assert "PredictiveCurrentControl" not in peslite.control.__all__
 
 
-def test_addon_entry_points_match_builtin_public_apis():
-    assert set(peslite.control.__all__) < set(addon_control.__all__)
-    assert set(peslite.components.__all__) < set(addon_components.__all__)
-    assert addon_control.LOOP_TYPES is LOOP_TYPES
-    assert not {"Element", "NetworkComponent", "ELEMENT_TYPES"} & set(
-        addon_components.__all__
-    )
-
-
-def test_cable_model_has_two_inward_ports_and_closes_its_power_balance():
-    cable = CableModel(
-        length_km=2.0,
-        r_per_km=0.08,
-        l_per_km=0.6e-3,
-        g_per_km=2.0e-7,
-        c_per_km=0.3e-6,
-        sections=2,
-        voltage0=0j,
-    )
-    cable.port1.voltage = 8000.0 + 200.0j
-    cable.port2.voltage = 7600.0 - 100.0j
-    cable.state.iL1 = 20.0 + 3.0j
-    cable.state.iL2 = 18.0 + 2.0j
-    cable.state.iL3 = 16.0 + 1.0j
-    cable.state.uC1 = 7900.0 + 100.0j
-    cable.state.uC2 = 7750.0
-    cable.set_outputs(0.0)
-    derivatives = cable.rhs(0.0)
-
-    stored_rate = 0.0
-    for storage, derivative in zip(cable.storage, derivatives):
-        value = getattr(cable.state, storage.state)
-        stored_rate += storage.scale * storage.value * (value * derivative.conjugate()).real
-    power_in = cable.port1.power() + cable.port2.power()
-
-    assert cable.port1.component is cable and cable.port2.component is cable
-    assert cable.output.i1 == cable.state.iL1
-    assert cable.output.i2 == -cable.state.iL3
-    assert sum(cable.series_r) == pytest.approx(0.16)
-    assert sum(cable.series_l) == pytest.approx(1.2e-3)
-    assert power_in == pytest.approx(stored_rate + cable.dissipated_power())
+def test_addon_namespaces_do_not_duplicate_builtin_public_apis():
+    assert not hasattr(addon_control, "__all__")
+    assert not hasattr(addon_components, "__all__")
+    assert not hasattr(addon_control, "LOOP_TYPES")
+    assert not hasattr(addon_components, "register_component_type")
+    assert not hasattr(addon_control, "discover")
+    assert not hasattr(addon_components, "discover")
 
 
 def test_pesaddons_beside_simulation_file_merges_project_paths(examples, tmp_path):
@@ -183,8 +162,8 @@ def test_pesaddons_beside_simulation_file_merges_project_paths(examples, tmp_pat
     (control / "project_local_pll.py").write_text(
         """import cmath
 from dataclasses import dataclass
-from peslite.addons.control import (ANGLE, FREQUENCY, V_AB, Integrator, Loop,
-                                    register_loop_type)
+from peslite.control import (ANGLE, FREQUENCY, V_AB, Integrator, Loop,
+                             register_loop_type)
 
 @register_loop_type
 class ProjectLocalPLL(Loop):
@@ -222,7 +201,7 @@ class ProjectLocalPLL(Loop):
     )
     (components / "project_local_element.py").write_text(
         """from dataclasses import dataclass
-from peslite.addons.components import register_component_type
+from peslite.components import register_component_type
 from peslite.solver import netlist as nl
 
 @register_component_type
@@ -267,87 +246,3 @@ class ProjectLocalElement:
     assert str(control.resolve()) in addon_control.__path__
     assert str(components.resolve()) in addon_components.__path__
     assert str(functions.resolve()) in peslite.addons.functions.__path__
-
-
-@pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
-def test_custom_pll_assembles_with_builtin_loops_and_runs(examples, tmp_path, model):
-    params = peslite.load(
-        examples / "custom-pll-example.pes",
-        **{
-            "simulation.t_end": 0.004,
-            "simulation.solver.linearisations": 0,
-            "units.vsc.bridge.model": model,
-        },
-    )
-    simulation = peslite.Simulation(params)
-    nodes = simulation.unit().ctrl.graph.nodes
-
-    expected = {"VoltageAdaptivePLL", "CurrentLoop", "DCVoltageControl"}
-    if model != "averaging":
-        expected.add("ThreePhaseModulation")
-    assert set(nodes) == expected
-    assert isinstance(nodes["VoltageAdaptivePLL"], VoltageAdaptivePLL)
-    assert type(nodes["VoltageAdaptivePLL"]).sample is Loop.sample
-    assert type(nodes["VoltageAdaptivePLL"]).flow_path is Loop.flow_path
-    assert set(nodes["VoltageAdaptivePLL"]._state_blocks) == {"theta", "omega_g", "u_g_pu"}
-    assert nodes["CurrentLoop"].type == "dq_current_pi"
-    assert nodes["DCVoltageControl"].type == "dc_voltage_control"
-
-    result = simulation.run(out_dir=tmp_path / model)
-    theta = result.states["vsc.ctrl.VoltageAdaptivePLL.theta"]
-    assert np.isfinite(theta).all()
-    assert theta[-1] > 1.0
-    assert not result.tripped
-
-
-@pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
-def test_custom_cable_gfl_case_runs_in_every_bridge_mode(examples, tmp_path, model):
-    solver = ("adaptive", "DP45") if model == "averaging" else ("fixed", "rk4")
-    params = peslite.load(
-        examples / "cable-gfl-example.pes",
-        **{
-            "simulation.t_end": 0.004,
-            "simulation.solver.type": solver[0],
-            "simulation.solver.method": solver[1],
-            "simulation.solver.linearisations": 0,
-            "simulation.energy_check": "strict",
-            "simulation.output.signals": 1,
-            "units.vsc.bridge.model": model,
-        },
-    )
-    simulation = peslite.Simulation(params)
-    result = simulation.run(out_dir=tmp_path / model)
-
-    assert not runtime_changeable("elements.cable1.sections", params)
-    assert simulation.ph_report.verdict == "port-hamiltonian"
-    assert not result.tripped
-    assert np.isfinite(result.states["cable1.iL1.re"]).all()
-    assert np.isfinite(result.states["cable1.uC2.im"]).all()
-    assert {"cable1.i1_a", "cable1.i2_a"} <= result.plant.keys()
-
-
-def test_custom_cable_parameters_can_change_at_an_event(examples, tmp_path):
-    params = peslite.load(
-        examples / "cable-gfl-example.pes",
-        **{
-            "simulation.t_end": 0.001,
-            "simulation.solver.type": "adaptive",
-            "simulation.solver.method": "DP45",
-            "simulation.solver.linearisations": 0,
-            "simulation.output.signals": 0,
-            "units.vsc.bridge.model": "averaging",
-        },
-    )
-    initial = params.replace(**{"elements.cable1.r_per_km": 0.2})
-    event = params.replace(**{
-        "events.cable_r": {
-            "type": "set",
-            "t": 0.0,
-            "set": {"elements.cable1.r_per_km": 0.2},
-        }
-    })
-    finals = [
-        peslite.Simulation(case).run(out_dir=tmp_path / str(index)).final_states()
-        for index, case in enumerate((initial, event))
-    ]
-    assert finals[1] == pytest.approx(finals[0], rel=1e-9)

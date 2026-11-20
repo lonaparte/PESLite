@@ -30,7 +30,7 @@ units:
 | `bus`, `filter` | together for an external connection | omitted | external port and series R-L filter |
 | `s_base` | no | `base.s_base` | Unit rating in VA |
 | `dclink` | yes | — | rated DC voltage and source |
-| `bridge.type` | no | selected by `ctrl.type` | `half_bridge` or `full_bridge` |
+| `bridge.type` | no | control-profile default | `half_bridge` or `full_bridge`; required when an explicit graph has no unique default |
 | `pwm`, `ctrl`, `meas`, `protection` | by application | — | common converter configuration |
 
 An external bus must use `phases: 1`. The bridge, PWM periods, ADC and protection settings are
@@ -75,6 +75,9 @@ instantaneous energy balance.
 | `resonant` | amplitude, frequency and phase modulation graph |
 | `phase_shift` | square-wave full-bridge modulation |
 
+Omit `ctrl.type` to assemble the declared loops, connections and outputs without profile defaults.
+The ordinary graph checks then report any missing, ambiguous or incompatible connection.
+
 Built-in measurement channels are `current`, `voltage`, `vin` and requested port `power`.
 Available protection criteria are overcurrent, RMS current, terminal voltage and DC-link voltage.
 `PredictiveCurrentControl` can replace the PI current loop; see
@@ -88,7 +91,7 @@ bridge: {type: full_bridge, upper_controlled: 0, lower_controlled: 0}
 
 Omit `ctrl`, `pwm` and protection. Set `meas.period` explicitly when the default output period is
 unsuitable. All bridge-model selections retain the natural diode commutation law. Nonzero
-`parallel_capacitance` requires positive `on_resistance`.
+`parallel_capacitance` requires positive resistance for every applicable conducting path.
 
 ## Phase-shift modulation
 

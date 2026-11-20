@@ -18,8 +18,8 @@ from typing import Any
 
 import numpy as np
 
-from ..assembly.params import Params, _unit_items, flat_paths, to_dict
-from ..assembly.types import unit_type
+from ..assembly.params import Params, _unit_items, flat_paths, to_dict, unit_type
+from ..components.network import GROUND, element_buses
 from ..control.blocks import complex2abc
 
 SCHEMA_VERSION = 1
@@ -196,6 +196,11 @@ class Topology:
         """The component a ``bus`` reference attaches to: a public bus or a unit's scoped bus."""
         if not bus:
             return None
+        if bus == GROUND:
+            if GROUND not in self.entities:
+                entity = Entity(GROUND, "", GROUND, "component")
+                self._component(entity, "Ground", "peslite.Ground", "ground", "ground", {})
+            return GROUND
         if bus in self.params.buses:
             return f"bus-{slug(bus)}"
         owner = next((path for path in self._unit_paths if bus.startswith(path + ".")), None)
@@ -205,9 +210,9 @@ class Topology:
         point = self._attach_point(bus)
         if point is None:
             return
-        connection_id = f"{entity.id}-terminal"
+        connection_id = f"{entity.id}-{slug(label)}"
         self._connect(connection_id, label, point, entity.id, entity.section, entity.name)
-        self.terminals[entity.name] = connection_id
+        self.terminals.setdefault(entity.name, connection_id)
 
     def _build(self, units: tuple[tuple[str, Any], ...]) -> None:
         p, tree = self.params, self._tree
@@ -243,7 +248,8 @@ class Topology:
         for name, cfg in p.branches.items():
             entity = Entity(name, "branches", f"branch-{slug(name)}", "connection")
             self.entities.setdefault(entity.name, entity)
-            self._connect(entity.id, name, f"bus-{slug(cfg.bus1)}", f"bus-{slug(cfg.bus2)}",
+            self._connect(entity.id, name, self._attach_point(cfg.bus1),
+                          self._attach_point(cfg.bus2),
                           "branches", name,
                           [_parameter(f"branches.{name}.r", "Resistance", cfg.r, "branches",
                                       unit="ohm"),
@@ -251,8 +257,9 @@ class Topology:
                                       unit="H")],
                           ("right", "left"))
         for name, cfg in tree["elements"].items():
-            points = [self._attach_point(cfg.get(key)) for key in ("bus1", "bus2")]
-            if all(points):  # a two-terminal network element is drawn as a connection
+            endpoints = element_buses(p.elements[name])
+            points = [self._attach_point(endpoint) for endpoint in endpoints.values()]
+            if len(points) == 2 and all(points):  # a two-terminal element is a connection
                 entity = Entity(name, "elements", f"element-{slug(name)}", "connection")
                 self.entities.setdefault(entity.name, entity)
                 self._connect(entity.id, name, points[0], points[1], "elements", name,
@@ -266,7 +273,8 @@ class Topology:
                     else "load" if any(word in element_type for word in ("load", "resistor"))
                     else "motor" if "motor" in element_type else "generic")
             self._component(entity, name, f"peslite.{element_type or 'element'}", kind, kind, cfg)
-            self._attach(entity, cfg.get("bus"), "Terminal")
+            for field_name, endpoint in endpoints.items():
+                self._attach(entity, endpoint, field_name)
 
     def owner(self, signal: str) -> Entity | None:
         """The entity whose name is the longest dotted prefix of a state or signal name."""

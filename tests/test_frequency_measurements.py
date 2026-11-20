@@ -6,7 +6,9 @@ import math
 import numpy as np
 import pytest
 
-from peslite.addons.functions import frequency_response, frequency_sweep, impedance_matrix
+from peslite.addons.functions.offline_analysis import (
+    frequency_response, frequency_sweep, impedance_matrix,
+)
 
 
 def _sinusoid(f=40.0, duration=1.0, step=0.0005, gain=0.2 + 0.3j):

@@ -22,7 +22,7 @@ from typing import Any
 import yaml
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
-TEXT_SUFFIXES = frozenset({".pes", ".yaml", ".yml", ".json"})
+TEXT_SUFFIXES = frozenset({".pes", ".pesdbg", ".yaml", ".yml", ".json"})
 READ_SUFFIXES = TEXT_SUFFIXES | {".csv"}
 MAX_FILE_SIZE = 4 * 1024 * 1024
 MAX_ROWS = 4000

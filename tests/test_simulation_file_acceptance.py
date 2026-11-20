@@ -15,7 +15,7 @@ from packaging.version import Version
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, dumps, from_dict, read_tree, to_dict
-from peslite.assembly.simulation_file import parse_native_text
+from peslite.assembly.syntax import parse_native_text
 from peslite.control import LOOP_TYPES
 
 

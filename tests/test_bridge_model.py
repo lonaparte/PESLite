@@ -11,9 +11,9 @@ import yaml
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, _unit_items, read_tree
-from peslite.assembly.simulation_file import parse_native_text
+from peslite.assembly.syntax import parse_native_text
 from peslite.components.pwm import modulator_type
-from peslite.control.profiles import control_type
+from peslite.assembly.control import control_type
 
 
 SHORT = ["--set", "simulation.t_end=0.004",
@@ -293,7 +293,7 @@ def test_set_wins_over_averaging_flag():
 
 
 def test_pwm_averaging_flag_results_use_their_own_folder(tmp_path, monkeypatch):
-    monkeypatch.setattr(peslite.solver.simulation, "_RESULTS", tmp_path)
+    monkeypatch.setattr(peslite.cli, "_RESULTS", tmp_path)
     with redirect_stdout(io.StringIO()):
         assert peslite.main(["gfl-example", *SHORT]) == 0
         assert peslite.main(["gfl-example", "--switching", *SHORT]) == 0

@@ -379,7 +379,8 @@ def test_an_oversampled_continuation_starts_at_an_interrupt(gfl):
     gfl(**late, **{
         "units.vsc.bridge.model": "switching",
         "units.vsc.bridge.parallel_capacitance": 1e-8,
-        "units.vsc.bridge.on_resistance": 1e-3,
+        "units.vsc.bridge.switch_resistance": 1e-3,
+        "units.vsc.bridge.diode_resistance": 1e-3,
         "simulation.initial.states": {"vsc.bridge.u_C.re": 0.0},
         "simulation.initial.t": 9.5e-5,
     })

@@ -13,26 +13,27 @@ from scipy.linalg import expm
 from scipy.optimize import brentq
 
 import peslite
-from peslite.addons.components import register_component_type
+from peslite.components import register_component_type
 from peslite.addons.components.magcircuit import MagCircuitLaw
 from peslite.addons.components.magport import (
     MagPort,
     MagPortModel,
+    TabulatedEnergyLaw,
     TabulatedMagneticLaw,
-    _load,
+    load_magport_data,
 )
-from peslite.addons.functions import (
-    export_magnetic_circuit,
-    magnetic_field,
-    reluctance_inductance,
-    write_magport,
+from peslite.addons.functions.magcircuit import (
+    export_magnetic_circuit, reluctance_inductance,
 )
+from peslite.addons.functions.magport import magnetic_field, write_magport
 from peslite.assembly.params import from_dict
 from peslite.addons.components.magcomponent import (
+    CoupledCoilsModel,
     MagneticBranchDescription,
     MagneticDescription,
     MagneticParams,
 )
+from peslite.addons.components.magcomponent import LinearEnergyLaw
 from peslite.components.network import ELEMENT_TYPES
 from peslite.solver import ConfigError
 from peslite.solver.energy import spec_of
@@ -68,7 +69,7 @@ def test_external_magnetic_model_round_trip_and_strict_schema(tmp_path):
         field_basis=basis,
     )
 
-    loaded = _load(path)
+    loaded = load_magport_data(path)
     assert loaded.winding_names == ("primary", "secondary")
     np.testing.assert_array_equal(loaded.inductance, [[4e-3, 1e-3], [1e-3, 3e-3]])
     np.testing.assert_array_equal(loaded.field_points, points)
@@ -88,7 +89,7 @@ def test_external_magnetic_model_round_trip_and_strict_schema(tmp_path):
         unexpected=np.array(1.0),
     )
     with pytest.raises(ConfigError, match="unknown entries.*unexpected"):
-        _load(invalid)
+        load_magport_data(invalid)
 
 
 def test_simulation_file_resolves_external_magnetic_model_relative_to_itself(tmp_path):
@@ -135,7 +136,7 @@ def test_linear_reluctance_network_reduces_to_reciprocal_inductance(tmp_path):
         reluctance=reluctance,
         coupling=coupling,
     )
-    loaded = _load(path)
+    loaded = load_magport_data(path)
     np.testing.assert_allclose(loaded.inductance, expected, rtol=1e-14, atol=0.0)
     network = dict(loaded.physical)["reluctance_network"]
     assert network["coupling"] == coupling.tolist()
@@ -227,6 +228,91 @@ def test_magport_owns_nonlinear_and_internal_magnetic_states_without_black_box()
     )
     with pytest.raises(ConfigError, match="outside the sampled magnetic current map"):
         multiple.currents(0.0, np.array([0.75, 0.75]), {})
+
+
+def test_multiwinding_energy_samples_define_one_conservative_current_map(tmp_path):
+    axes = (np.array([-1.0, 0.0, 1.0]), np.array([-2.0, 0.0, 2.0]))
+    flux = np.asarray([(x, y) for x in axes[0] for y in axes[1]])
+    # This bilinear potential is represented exactly by multilinear interpolation.
+    energy = 2.0 * flux[:, 0] + 3.0 * flux[:, 1] + 0.4 * flux[:, 0] * flux[:, 1]
+    law = TabulatedEnergyLaw(("primary", "secondary"), flux, energy)
+    point = np.array([0.25, -0.5])
+    direction = np.array([0.7, -0.2])
+    currents = law.currents(0.0, point, {})
+    np.testing.assert_allclose(currents, [2.0 + 0.4 * point[1], 3.0 + 0.4 * point[0]])
+    step = 1e-7
+    numerical_rate = (
+        law.stored_energy(0.0, point + step * direction, {})
+        - law.stored_energy(0.0, point - step * direction, {})
+    ) / (2.0 * step)
+    assert numerical_rate == pytest.approx(currents @ direction, rel=1e-7)
+    assert law.stored_energy_rate(0.0, point, currents, {}, direction, {}) == pytest.approx(
+        numerical_rate, rel=1e-7
+    )
+
+    model = MagPortModel(
+        law,
+        resistance=(0.0, 0.0),
+        terminals=((False, True), (False, True)),
+    )
+    model.state.lambda_primary, model.state.lambda_secondary = point
+    model.set_outputs(0.0)
+    np.testing.assert_allclose(
+        [model.output.i_positive_primary, model.output.i_positive_secondary], currents
+    )
+    specification = spec_of(model)
+    assert specification.stored_energy is not None
+    assert specification.stored_energy_rate is not None
+    assert model.stored_energy(0.0) == pytest.approx(law.stored_energy(0.0, point, {}))
+
+    file = write_magport(
+        tmp_path / "energy-map.npz",
+        winding_names=("primary", "secondary"),
+        flux_linkage=flux,
+        stored_energy=energy,
+    )
+    data = load_magport_data(file)
+    assert data.current is None
+    np.testing.assert_array_equal(data.stored_energy, energy)
+
+
+def test_linear_inductance_uses_the_same_energy_law_contract():
+    inductance = np.array([[4.0, 1.0], [1.0, 3.0]])
+    law = LinearEnergyLaw(("primary", "secondary"), inductance)
+    flux = np.array([0.7, -0.2])
+    flux_rate = np.array([0.3, 0.4])
+    current = np.linalg.solve(inductance, flux)
+
+    np.testing.assert_allclose(law.currents(0.0, flux, {}), current)
+    assert law.stored_energy(0.0, flux, {}) == pytest.approx(0.5 * flux @ current)
+    assert law.stored_energy_rate(
+        0.0, flux, current, {}, flux_rate, {}
+    ) == pytest.approx(current @ flux_rate)
+
+    model = CoupledCoilsModel(
+        law.winding_names,
+        inductance,
+        resistance=(0.0, 0.0),
+        terminals=((False, True), (False, True)),
+    )
+    modal_current = np.array([0.2, -0.35])
+    for name, value in zip(model.state_names, modal_current):
+        setattr(model.state, name, value)
+    winding_current = law.shapes @ modal_current
+    np.testing.assert_allclose(model._winding_currents(), winding_current)
+    linkage = inductance @ winding_current
+    assert law.stored_energy(0.0, linkage, {}) == pytest.approx(
+        0.5 * np.dot(law.modes, modal_current * modal_current)
+    )
+
+
+def test_multiwinding_energy_samples_require_a_complete_cartesian_grid():
+    with pytest.raises(ConfigError, match="complete Cartesian flux grid"):
+        TabulatedEnergyLaw(
+            ("primary", "secondary"),
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            [0.0, 0.5, 0.5],
+        )
 
 
 def test_magport_matches_magnetic_loss_and_temperature_coupling_signals():
@@ -362,7 +448,7 @@ def _linear_equivalence_case(inductance):
 def test_base_inductance_magport_and_magcircuit_are_numerically_equivalent(tmp_path):
     """The optimized and magnetic formulations must agree for the same complete linear model."""
     inductance = np.array([[8.0e-3, -1.5e-3], [-1.5e-3, 6.0e-3]])
-    _modes, shapes = np.linalg.eigh(inductance)
+    shapes = LinearEnergyLaw(("primary", "secondary"), inductance).shapes
     modal_initial = np.array([0.35, -0.2])
     physical_initial = shapes @ modal_initial
 
@@ -439,7 +525,7 @@ def test_nonlinear_magport_file_and_magcircuit_branch_law(tmp_path):
         flux_linkage=flux,
         current=current,
     )
-    data = _load(file)
+    data = load_magport_data(file)
     assert data.inductance is None
     np.testing.assert_array_equal(data.flux_linkage[:, 0], flux)
     np.testing.assert_array_equal(data.current[:, 0], current)

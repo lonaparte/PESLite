@@ -47,6 +47,9 @@ The preview provides:
 - zoom, pan and fit controls;
 - an event timeline that shows connect and disconnect states at the selected time.
 
+A `.pesdbg` file opens the referenced model with its added and removed control connections overlaid;
+editing and running it use the same source and report format as [`peslite debug`](Debugging.md).
+
 Simulation-file and view notation is defined in
 [Simulation Files](Simulation-Files.md#interface-views).
 

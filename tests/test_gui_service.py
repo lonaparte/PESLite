@@ -41,6 +41,27 @@ def test_topology_references_only_existing_components(case):
     peslite.load(EXAMPLES / f"{case}.pes", **values)
 
 
+def test_topology_renders_one_shared_explicit_ground(tmp_path):
+    path = tmp_path / "ground.pes"
+    path.write_text("@circuit\nsource -- node -- shunt -- ground\n", encoding="utf-8")
+    params = peslite.assembly.params.from_dict({
+        "base": {"s_base": 1000.0, "v_ll_rms": 100.0, "f0": 50.0},
+        "buses": {"node": {"phases": 1}},
+        "branches": {
+            "shunt": {"bus1": "node", "bus2": "ground", "l": 1.0e-3},
+        },
+        "sources": {"source": {"bus": "node", "l": 1.0e-3, "r": 0.1}},
+        "simulation": {"t_end": 1.0e-3},
+    })
+
+    topology = Topology.build("ground", path, params)
+    components = [component for component in topology.components if component["id"] == "ground"]
+    shunt = next(connection for connection in topology.connections if connection["id"] == "branch-shunt")
+
+    assert len(components) == 1
+    assert {shunt["source"], shunt["target"]} == {"bus-node", "ground"}
+
+
 def test_protocol_loads_simulates_and_streams(tmp_path):
     overrides = {"simulation.t_end": 0.004, "simulation.energy_check": "off"}
     messages = _serve(

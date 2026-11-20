@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -499,13 +500,13 @@ def test_native_continuous_control_feedback_checks_convergence(tmp_path):
     tree = read_tree(EXAMPLES / "gfl-example.pes")
     tree["units"]["vsc"]["bridge"] = {"model": "averaging"}
     tree["units"]["vsc"]["ctrl"] = {
-        "type": "custom",
         "loops": {"_AffineFeedback[a]": {"gain": 0.25, "bias": 1.0},
                   "_AffineFeedback[b]": {"gain": 0.5, "bias": 2.0}},
         "connections": {"_AffineFeedback[a].x": "_AffineFeedback[b].y",
                         "_AffineFeedback[b].x": "_AffineFeedback[a].y"},
         "outputs": {"u_dq": "_AffineFeedback[a].y", "theta": "references.theta",
                     "omega": "references.omega"},
+        "references": {"theta": 0.0, "omega": 2.0 * math.pi * 50.0},
     }
     tree["simulation"].update(t_end=1e-4, energy_check="off")
     tree["simulation"]["solver"].update(type="fixed", method="rk4", dt=1e-6,
@@ -889,11 +890,10 @@ def test_generated_cpp_matches_python_for_adaptive_dcm(mode, tmp_path):
         "simulation.output.energy": False,
         "simulation.energy_check": "off",
     })
-    source, cpp_out, python_out = _run_generated(
+    _source, cpp_out, python_out = _run_generated(
         params, tmp_path / f"adaptive-{mode}", compiler
     )
 
-    assert source.read_text(encoding="utf-8").count("class DiodeConduction") == 1
     expected = _final_csv(python_out / "states.csv")
     actual = _final_csv(cpp_out / "states.csv")
     scale = max(1.0, max(abs(value) for value in expected.values()))
@@ -965,7 +965,7 @@ def test_generated_cpp_matches_composite_wpt_with_independent_clocks(mode, tmp_p
         params, tmp_path / f"wpt-{mode}", compiler
     )
 
-    assert "class DiodeConduction" not in source.read_text(encoding="utf-8")
+    assert "class Commutation" not in source.read_text(encoding="utf-8")
     expected = _final_csv(python_out / "states.csv")
     actual = _final_csv(cpp_out / "states.csv")
     assert actual.keys() == expected.keys()
@@ -1136,6 +1136,51 @@ def test_generated_cpp_runs_custom_cable_equations_with_a_range_bound(tmp_path):
     actual_plant = _final_csv(cpp_out / "plant.csv")
     assert actual_plant.keys() == expected_plant.keys()
     assert {"cable1.i1_a", "cable1.i2_a"} <= actual_plant.keys()
+
+
+def test_generated_cpp_bergeron_history_matches_python(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = peslite.load(EXAMPLES / "cable-gfl-example.pes", **{
+        "elements.cable1.model": "bergeron",
+        "elements.cable1.g_per_km": 0.0,
+        "elements.cable1.r_per_km": 0.0,
+        "units.vsc.bridge.model": "averaging",
+        "simulation.t_end": 2.0e-4,
+        "simulation.solver.type": "fixed",
+        "simulation.solver.method": "rk4",
+        "simulation.solver.dt": 5.0e-6,
+        "simulation.solver.linearisations": 0,
+        "simulation.energy_check": "warn",
+        "simulation.output.period": 25.0e-6,
+        "simulation.output.signals": 1,
+        "simulation.output.energy": 1,
+    })
+    source, cpp_out, python_out = _run_generated(
+        params, tmp_path / "bergeron", compiler,
+    )
+
+    generated = source.read_text(encoding="utf-8")
+    assert "class DelayHistory" in generated
+    assert "accepted_history_0.value(" in generated
+    expected = _final_csv(python_out / "states.csv")
+    actual = _final_csv(cpp_out / "states.csv")
+    assert actual.keys() == expected.keys()
+    np.testing.assert_allclose(
+        list(actual.values()), list(expected.values()), rtol=2e-8, atol=2e-9,
+    )
+    expected_plant = _final_csv(python_out / "plant.csv")
+    actual_plant = _final_csv(cpp_out / "plant.csv")
+    for name in ("cable1.i1_a", "cable1.i2_a"):
+        assert actual_plant[name] == pytest.approx(expected_plant[name], rel=2e-8, abs=2e-9)
+    expected_energy = _final_csv(python_out / "energy.csv")
+    actual_energy = _final_csv(cpp_out / "energy.csv")
+    assert actual_energy.keys() == expected_energy.keys()
+    for name in ("energy_J", "power_dissipated_W", "cable1.energy_J"):
+        assert actual_energy[name] == pytest.approx(
+            expected_energy[name], rel=2e-8, abs=2e-9,
+        )
 
 
 def test_generated_cpp_runs_black_box_outputs_and_peslite_state_equations(tmp_path):

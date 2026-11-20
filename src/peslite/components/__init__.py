@@ -1,15 +1,14 @@
-"""The components of a converter system: the power circuit and the converter's hardware.
+"""Power-circuit components and converter hardware.
 
-The power circuit (:mod:`.network`, including registered ``elements``, and :mod:`.converter`) is
-continuous-time, in SI, connected through :class:`peslite.solver.model.Model`. Sampled bridge
-models use the ADC (:mod:`.adc`) and own their PWM timing/register implementation from
-:mod:`.pwm`; the ideal averaging bridge accepts either continuous equations or sampled held
-commands from the same control graph.
+``network`` defines the common declaration and connection interface; ``passive``, ``source`` and
+``converter`` provide physical implementations. Sampled bridges use ``adc`` and ``pwm`` through
+the same assembled model.
 """
 
 from ..solver import Bag, ConfigError, Empty, Port, StoragePort
-from .network import (ACVoltageSource, Bus, Load, Resistor, RCNode, RLBranch,
-                      VoltageSource, register_component_type)
+from .network import GROUND, register_component_type, resolve_endpoints
+from .passive import Bus, Capacitor, Load, Resistor, RCNode, RLBranch
+from .source import ACVoltageSource, VoltageSource
 from .converter import (AveragingModel, PWMAveragingModel, SwitchingModel,
                         ThreePhaseBridge,
                         DCCapacitor, DCCurrentSource, DCLink,
@@ -19,13 +18,13 @@ from .converter import (AveragingModel, PWMAveragingModel, SwitchingModel,
 from .adc import ADC, ADCSample, MeasurementPorts
 from .pwm import (ZOH, CarrierComparison, PWM, PhaseShiftModulator, SwitchingSequence,
                   SynchronousCarrier, make_modulator)
-from .wpt import (CompensatedLink, SwitchControlledCapacitor, SwitchedCompensatedLink,
-                  make_wpt_link)
 from .onnx import ONNXModel, ONNXStateParams
+from .cable import BergeronCableModel, Cable, LumpedCableModel
 
-__all__ = ["Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode",
+__all__ = ["Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode", "Capacitor",
            "Bag", "Empty", "ConfigError", "StoragePort",
-           "register_component_type", "Load", "Resistor", "VoltageSource",
+           "register_component_type", "resolve_endpoints", "GROUND",
+           "Load", "Resistor", "VoltageSource",
            "ThreePhaseBridge", "SwitchingModel",
            "PWMAveragingModel", "make_bridge", "DCLink",
            "DCCapacitor", "DCCurrentSource", "DCVoltageSource",
@@ -33,5 +32,4 @@ __all__ = ["Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode",
            "MeasurementPorts", "AveragingModel", "HalfBridge",
            "FullBridge", "HalfBridgeDiodeConduction", "PWM", "SwitchingSequence",
            "CarrierComparison", "SynchronousCarrier", "ZOH", "PhaseShiftModulator", "make_modulator",
-           "CompensatedLink", "SwitchedCompensatedLink", "SwitchControlledCapacitor", "make_wpt_link",
-           "ONNXModel", "ONNXStateParams"]
+           "ONNXModel", "ONNXStateParams", "BergeronCableModel", "Cable", "LumpedCableModel"]

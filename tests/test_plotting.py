@@ -6,12 +6,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from peslite.addons import functions
-from peslite.addons.functions import plot_csv, plot_result
-from peslite.addons.functions import plotting
+import peslite.addons.functions.plotting as plotting
+from peslite.assembly import addons as addon_assembly
+from peslite.addons.functions.plotting import plot_csv, plot_result
 from peslite.addons.functions.plotting import _time_scale
 from peslite.solver import simulation
-from peslite.solver.simulation import main
+from peslite.cli import main
 
 
 pytest.importorskip("matplotlib")
@@ -95,11 +95,10 @@ def test_cli_runs_then_plots_named_waveforms(examples, tmp_path, monkeypatch):
 
 
 def test_cli_resolves_the_plot_addon_before_simulation(monkeypatch, capsys):
-    def unavailable(_name):
-        raise ModuleNotFoundError("plot addon unavailable", name="peslite.addons.functions.plotting")
+    def unavailable(_name, _category):
+        raise addon_assembly.AddonUnavailableError("plot addon unavailable")
 
-    monkeypatch.delattr(functions, "plot_result", raising=False)
-    monkeypatch.setattr(functions, "_resolve", unavailable)
+    monkeypatch.setattr(addon_assembly, "import_addon", unavailable)
     monkeypatch.setattr(
         simulation,
         "Simulation",

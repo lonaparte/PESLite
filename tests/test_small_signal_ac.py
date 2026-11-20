@@ -17,11 +17,11 @@ import pytest
 from scipy.optimize import linear_sum_assignment
 
 from conftest import EXAMPLES
-from peslite.addons.functions import small_signal, small_signal_report
+from peslite.addons.functions.online_analysis import small_signal, small_signal_report
 from peslite.assembly.params import from_dict, to_dict
 from peslite.solver.linearization import (active_coordinates, coordinate_difference, coordinate_width,
                                          linearize_loop)
-from peslite.solver.simulation import SystemLoop
+from peslite.solver.simulation import SimulationTransition
 
 pytestmark = pytest.mark.long
 
@@ -122,7 +122,7 @@ def test_complete_ac_map_retains_control_and_pwm_memory(ac_point, record_propert
 
 def test_ac_pruning_preserves_the_entire_exhaustive_matrix(ac_point, exhaustive_loop, record_property):
     sim, analysis = ac_point
-    loop = SystemLoop(sim, frame_frequency=0.0, repeat_forcing=True)
+    loop = SimulationTransition(sim, frame_frequency=0.0, repeat_forcing=True)
     row = sim.result.final_states()
     start = row.pop("t")
     full = linearize_loop(exhaustive_loop(loop), row, start, loop.coordinates(list(row)))
@@ -160,7 +160,7 @@ def test_ac_clock_variants_match_exhaustive_local_maps(ac_points, changes, offse
     sim = _restart(original, offset, **changes)
     sim.run(out_dir=None)
     assert not sim.result.tripped and not sim.result.summary.get("stop_reason")
-    loop = SystemLoop(sim, frame_frequency=0.0, repeat_forcing=True)
+    loop = SimulationTransition(sim, frame_frequency=0.0, repeat_forcing=True)
     row = sim.result.final_states()
     start = row.pop("t")
     cols = loop.coordinates(list(row))
@@ -180,7 +180,7 @@ def test_coupled_converters_with_different_clock_phases_match_exhaustive_maps(ac
     })
     sim.run(out_dir=None)
     assert not sim.result.tripped and not sim.result.summary.get("stop_reason")
-    loop = SystemLoop(sim, frame_frequency=0.0, repeat_forcing=True)
+    loop = SimulationTransition(sim, frame_frequency=0.0, repeat_forcing=True)
     row = sim.result.final_states()
     start = row.pop("t")
     cols = loop.coordinates(list(row))
@@ -195,7 +195,7 @@ def test_ac_period_restart_matches_the_main_time_domain_simulation(ac_point):
     sim, analysis = ac_point
     row = sim.result.final_states()
     start = row.pop("t")
-    loop = SystemLoop(sim, frame_frequency=0.0, repeat_forcing=True)
+    loop = SimulationTransition(sim, frame_frequency=0.0, repeat_forcing=True)
     first = loop.advance(row, start)
     second = loop.advance(row, start)
     assert first == second
@@ -208,7 +208,7 @@ def test_ac_period_restart_matches_the_main_time_domain_simulation(ac_point):
 
 def test_ac_modal_prediction_matches_an_independent_perturbation_direction(ac_point, record_property):
     sim, analysis = ac_point
-    loop = SystemLoop(sim, frame_frequency=0.0, repeat_forcing=True)
+    loop = SimulationTransition(sim, frame_frequency=0.0, repeat_forcing=True)
     row = sim.result.final_states()
     start = row.pop("t")
     cols = loop.coordinates(list(row))

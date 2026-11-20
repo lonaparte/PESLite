@@ -2,33 +2,12 @@
   "file-groups": {
     "all": [
       "src/peslite/**/*.py",
+      "src/peslite/addons/addons.toml",
       "src/peslite/gui/preview/*",
       "src/peslite/gui/preview/tests/*",
       "src/peslite/gui/ui/**/*",
       "src/peslite/gui/vscode/**/*",
       "src/peslite/gui/web_dist/*"
-    ],
-    "addons": [
-      "src/peslite/addons/components/**/*.py",
-      "src/peslite/addons/control/**/*.py",
-      "src/peslite/addons/formats/**/*.py",
-      "src/peslite/addons/functions/**/*.py",
-      "!src/peslite/addons/components/magport.py",
-      "!src/peslite/addons/components/magcircuit.py",
-      "!src/peslite/addons/functions/magport.py",
-      "!src/peslite/addons/functions/magcircuit.py",
-      "!src/peslite/addons/components/__init__.py",
-      "!src/peslite/addons/control/__init__.py",
-      "!src/peslite/addons/formats/__init__.py",
-      "!src/peslite/addons/functions/__init__.py",
-      "!src/peslite/addons/components/thermalport.py"
-    ],
-    "full-addons": [
-      "src/peslite/addons/components/magport.py",
-      "src/peslite/addons/components/magcircuit.py",
-      "src/peslite/addons/functions/magport.py",
-      "src/peslite/addons/functions/magcircuit.py",
-      "src/peslite/addons/components/thermalport.py"
     ],
     "gui": [
       "src/peslite/gui/**/*.py",
@@ -52,7 +31,8 @@
         "addons"
       ],
       "files": [
-        "examples/*.pes"
+        "examples/*.pes",
+        "examples/debug/*.pesdbg"
       ]
     },
     "peslite-gui": {

@@ -312,7 +312,7 @@ def test_initial_connection_does_not_replace_a_scheduled_command(at, tmp_path):
 def test_connection_config_template_keeps_json_values_typed_without_yaml(monkeypatch):
     import builtins
     from peslite.assembly.cpp import _RuntimeParameters
-    from peslite.assembly.simulation_file import parse_native_text
+    from peslite.assembly.syntax import parse_native_text
 
     runtime = _RuntimeParameters(_case("buck", "pwm_averaging"), ("units.converter.connected",))
     original_import = builtins.__import__
@@ -365,7 +365,6 @@ def test_custom_tracking_callback_is_lowered_without_a_sync_law_adapter(voltage,
         "sources.grid.v_pu": voltage,
         "units.vsc.protection.overcurrent.enable": 0,
         "units.vsc.ctrl": {
-            "type": "custom",
             "loops": {_TrackingOscillator.__name__: {}},
             "connections": {f"{_TrackingOscillator.__name__}.voltage": "meas.u_g"},
             "outputs": {"theta": f"{_TrackingOscillator.__name__}.theta",
@@ -549,14 +548,16 @@ def test_finite_bridge_parameters_use_the_shared_native_equations(name, mode, se
     for unit in names:
         changes.update({
             f"units.{unit}.bridge.parallel_capacitance": 1e-5,
-            f"units.{unit}.bridge.on_resistance": 1.0,
+            f"units.{unit}.bridge.switch_resistance": 1.0,
+            f"units.{unit}.bridge.diode_resistance": 1.0,
             f"units.{unit}.protection.overcurrent.enable": False,
         })
     p = p.replace(**changes)
     binary = _compile(p, tmp_path / "model", (selection,))
     unit = names[0]
     runtime = ({f"units.{unit}.bridge.parallel_capacitance": 1.2e-5,
-                f"units.{unit}.bridge.on_resistance": 1.1}
+                f"units.{unit}.bridge.switch_resistance": 1.1,
+                f"units.{unit}.bridge.diode_resistance": 1.1}
                if selection == "all" else {})
     _compare_run(p, binary, runtime, tmp_path / "run")
 
@@ -570,7 +571,8 @@ def test_fixed_finite_bridge_uses_the_compiled_structural_modes(tmp_path):
         "simulation.output.energy": False,
         "simulation.energy_check": "off",
         "units.vsc.bridge.parallel_capacitance": 1e-5,
-        "units.vsc.bridge.on_resistance": 1.0,
+        "units.vsc.bridge.switch_resistance": 1.0,
+        "units.vsc.bridge.diode_resistance": 1.0,
         "units.vsc.protection.overcurrent.enable": False,
     })
     binary = _compile(p, tmp_path / "model", ())
@@ -770,3 +772,16 @@ def test_retained_clock_cannot_silently_reuse_a_restored_switching_sequence(tmp_
     assert rejected.returncode == 1
     assert not output.exists()
     _compare_run(p, binary, {}, tmp_path / "unchanged")
+
+
+@pytest.mark.parametrize("alignment", ["trailing", "leading"])
+def test_edge_aligned_pwm_matches_the_native_backend(alignment, tmp_path):
+    p = _case("buck", "switching").replace(**{
+        "units.converter.pwm.alignment": alignment,
+        "simulation.t_end": 2e-5,
+        "simulation.output.period": 5e-7,
+        "simulation.solver.dt": 2.5e-7,
+    })
+    binary = _compile(p, tmp_path / "model", variables=())
+
+    _compare_run(p, binary, {}, tmp_path / "run", rtol=1e-8, atol=1e-8)

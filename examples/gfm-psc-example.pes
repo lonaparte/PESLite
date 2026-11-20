@@ -1,4 +1,4 @@
-# PESLite 0.5.2
+# PESLite 0.6.0
 # Grid-forming converter: power-synchronization control (PSC) with active damping.
 @circuit
 grid -- pcc -- vsc

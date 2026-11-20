@@ -18,7 +18,7 @@ from peslite.addons.components.magcomponent import (
     WindingParams,
 )
 from peslite.addons.components.magport import MagPort, MagPortModel
-from peslite.addons.functions import write_magport
+from peslite.addons.functions.magport import write_magport
 
 
 def _windings(n, *, r=0.0):
@@ -266,7 +266,7 @@ def test_distinct_winding_terminals_match_full_matrix_circuit(tmp_path):
     result = simulation.run(out_dir=tmp_path)
     currents = np.array([result.columns()[f"coils.i_w{k}"][-1] for k in range(2)])
     effective_resistance = np.diag(np.array(series_resistance) + positive_loads + np.array(negative_loads))
-    starting_currents = np.linalg.eigh(inductance)[1] @ initial_modes
+    starting_currents = np.asarray(component.law.shapes) @ initial_modes
     expected = expm(-np.linalg.solve(inductance, effective_resistance) * result.t[-1]) @ starting_currents
     np.testing.assert_allclose(currents, expected, rtol=2e-5, atol=1e-8)
     for k in range(2):

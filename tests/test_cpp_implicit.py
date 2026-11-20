@@ -109,11 +109,15 @@ def test_native_implicit_switching_commutations(case, form, method, tmp_path):
     assert max(map(abs, selected)) > 0.1
 
 
-def test_native_export_traces_registered_addon_control_equations(tmp_path):
-    params = peslite.load(EXAMPLES / "custom-pll-example.pes", **{
+def test_native_export_traces_amplitude_normalised_pll(tmp_path):
+    params = peslite.load(EXAMPLES / "gfl-example.pes", **{
         "simulation.t_end": 2e-4,
         "simulation.progress.enable": False,
         "simulation.energy_check": "off",
+        "units.vsc.ctrl.loops.SRFPLL": {
+            "bandwidth": 20.0,
+            "normalisation": "amplitude",
+        },
     })
     _compare_native(params, tmp_path, rtol=1e-10, atol=1e-11)
 
@@ -139,7 +143,8 @@ def test_native_adaptive_commutation_requires_a_finite_observation_step(tmp_path
 def test_native_fixed_explicit_reuses_the_stiff_mode_fallback(tmp_path):
     params = peslite.load(EXAMPLES / "boost-example.pes").replace(**{
         "units.converter.bridge.model": "switching",
-        "units.converter.bridge.on_resistance": 1e-6,
+        "units.converter.bridge.switch_resistance": 1e-6,
+        "units.converter.bridge.diode_resistance": 1e-6,
         "units.converter.ctrl": {
             "type": "open_loop",
             "period": 50e-6,

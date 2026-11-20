@@ -12,7 +12,7 @@ import peslite
 from conftest import EXAMPLES, QUIET
 from peslite.assembly.circuit import (Circuit, NetworkView, _live_statements, _ModeStructure,
                                       bind_device, compile_network)
-from peslite.components.network import ACVoltageSource
+from peslite.components.source import ACVoltageSource
 from peslite.solver import FixedStepSolver
 from peslite.solver import netlist as nl
 from peslite.solver.netlist import (Capacitor, CurrentSource, Diode, Inductor, Netlist, Node,
@@ -840,7 +840,8 @@ def test_switching_bridge_with_device_capacitance_is_native(circuit_model, tmp_p
         "simulation.solver.linearisations": 0,
         "units.vsc.bridge.model": "switching",
         "units.vsc.bridge.parallel_capacitance": 1e-7,
-        "units.vsc.bridge.on_resistance": 0.01,
+        "units.vsc.bridge.switch_resistance": 0.01,
+        "units.vsc.bridge.diode_resistance": 0.01,
     }
     reference = peslite.Simulation(peslite.load(
         EXAMPLES / "gfl-example.pes", **changes
@@ -870,7 +871,8 @@ def test_averaged_bridge_mixture_publishes_the_same_outputs(circuit_model, tmp_p
         "simulation.solver.linearisations": 0,
         "units.vsc.bridge.model": "averaging",
         "units.vsc.bridge.parallel_capacitance": 1e-7,
-        "units.vsc.bridge.on_resistance": 0.01,
+        "units.vsc.bridge.switch_resistance": 0.01,
+        "units.vsc.bridge.diode_resistance": 0.01,
     }
 
     def run(form):

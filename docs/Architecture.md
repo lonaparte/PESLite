@@ -15,14 +15,14 @@ interface must use the matching PESLite version.
 
 ```text
 src/peslite/
-├── components/   network, converter, WPT link, ADC and PWM hardware
+├── components/   network, passive elements, sources, converter, ADC and PWM hardware
 ├── control/      control loops, graphs, startup and modulation
-├── assembly/     parameters, events, protection, units, systems and exporters
-├── solver/       connected model kernel, energy model, integrators and simulation run
+├── assembly/     input syntax, typed parameters, events, addon loading, units, systems and exporters
+├── solver/       connected model kernel, energy model, integrators, commutation and simulation run
 └── addons/       control, component and function addons
-    ├── control/      automatically discovered control-loop modules
-    ├── components/   automatically discovered circuit-element modules
-    └── functions/    optional functions
+    ├── control/      declared control-loop implementations
+    ├── components/   declared circuit-element implementations
+    └── functions/    declared optional functions
 ```
 
 Dependencies point inward through small interfaces: components use the model kernel, controller
@@ -31,19 +31,21 @@ assembled system.
 
 Addons use the same registries and runtime contracts as core implementations. Registration is
 completed before simulation, while function providers are loaded only when requested; neither adds
-dispatch to the simulation hot path. See [Extending PESLite](Extending-PESLite.md).
+dispatch to the simulation hot path. `addons.toml` declares each addon's metadata and dependencies.
+See [List of Addons](List-of-Addons.md) and
+[Extending PESLite](Extending-PESLite.md).
 
 Loading a simulation file also merges a sibling `PESaddons/` tree into the matching package paths
 without adding run-loop work; see [Project Workspace](Project-Workspace.md).
 
 ## Components
 
-`components/network.py` contains grid sources, R-L branches, bus R-C nodes and registered element
-types. `components/converter.py` provides the common lossless bridge boundary, bridge topologies,
-simulation models and DC-link models. `components/wpt.py` provides compensated WPT links and
-switch-controlled capacitors. The standard `magcomponent` addon uses the same component and
-circuit-netlist contracts without adding magnetic code to the core runtime. `components/adc.py`
-and `components/pwm.py` implement sampled converter peripherals.
+`components/network.py` defines the common connection, registration and netlist-translation
+interface. Core physical implementations are grouped in `components/passive.py`,
+`components/source.py` and `components/converter.py`. The `magcomponent` addon provides
+magnetic components and compensated WPT links through the same contracts, without adding magnetic
+models to the core package. `components/adc.py` and `components/pwm.py` implement sampled converter
+peripherals.
 
 Physical component state and parameters are SI quantities. Components declare ports, state,
 derivatives and energy/storage relationships without knowing the global system order.
@@ -125,14 +127,13 @@ a second flattened parameter mapping or a group table. The solver therefore sees
 converter units without WPT-specific scheduling.
 
 Parameter ownership is explicit: all converter units share common fields; `unit.type` adds
-electrical fields, `bridge.type` topology fields, `ctrl.type` reference/default-wiring fields, and
-each `ctrl.loops` key its class parameters. See
+electrical fields, `bridge.type` topology fields, an optional `ctrl.type` supplies reference and
+default-wiring fields, and each `ctrl.loops` key its class parameters. See
 [Simulation Files](Simulation-Files.md#si-and-per-unit-values).
 
-Every `ctrl` section is represented by the same `ControlParams` type. Its discriminator narrows the
-valid fields inside that object; it never switches to another public parameter container. The unit
-discriminator does not select or interpret controller-specific fields. For example, a DC converter
-declares both `type: dc_converter` in its unit scope and `type: dc` in its `ctrl` scope.
+Every `ctrl` section is represented by the same `ControlParams` type. A specified control type adds
+defaults before the declared connections are merged; omitting it leaves the graph explicit. Both
+paths use the same typed graph validation and execution-plan construction.
 
 ## Model kernel
 

@@ -1,6 +1,6 @@
-# PESLite 0.5.2
+# PESLite 0.6.0
 # SS WPT with a square-wave primary and a diode full-bridge rectifier. Power feedback commands
-# pulse width, while pulse synchronisation lets an active pulse finish before a pattern update.
+# pulse width, while pulse synchronisation lets an active pulse finish before an update.
 
 @circuit
 primary -- charger -- secondary
@@ -33,8 +33,6 @@ units:
             minimum: 0.05
             maximum: 1.0
             power_filter: {enable: true, bandwidth: 1000.0}
-          ModeSequence:
-            modes: [1, 0, 4]
           PhaseShiftModulation: {}
         references:
           power: 1500.0
@@ -44,7 +42,7 @@ units:
           PowerControl.reference: references.power
           PowerControl.power: meas.power
           PowerControl.feedforward: references.width
-          PhaseShiftModulation.mode: ModeSequence.mode
+          PhaseShiftModulation.mode: references.mode
           PhaseShiftModulation.width: PowerControl.modulation
           PhaseShiftModulation.phase: references.phase
 

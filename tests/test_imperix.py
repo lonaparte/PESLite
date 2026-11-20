@@ -12,11 +12,11 @@ import pytest
 
 import peslite
 from peslite.assembly import imperix
-from peslite.assembly.imperix_build import build_project
+from peslite.assembly.imperix import build_project
 from peslite.components.converter import make_topology
 from peslite.control.blocks import phases
 from peslite.control.controller import Measurement, VSCController
-from peslite.solver.simulation import main
+from peslite.cli import main
 from conftest import EXAMPLES
 from test_cpp_export import _compiler, _run_generated
 
@@ -185,7 +185,7 @@ def _sdk_double(directory):
 #define NUMBER_OF_DEVICES(n) constexpr int device_count = n
 enum tUserSafe { SAFE, UNSAFE }; enum tErrorSource { TEST_FAULT };
 enum tClock { CLOCK_0, CLOCK_1, CLOCK_2, CLOCK_3 };
-enum tPwmCarrier { TRIANGLE }; enum tPwmRate { SINGLE_RATE, DOUBLE_RATE };
+enum tPwmCarrier { TRIANGLE, SAWTOOTH, INVSAWTOOTH }; enum tPwmRate { SINGLE_RATE, DOUBLE_RATE };
 enum tPwmOutMode { COMPLEMENTARY, PWMH_ACTIVE };
 inline double input[4][32]{}, sensitivity[4][32]{}, offset[4][32]{}, duty[4][32]{};
 inline unsigned adc_reads[4][32]{}, history_reads[4][32]{}, history_depth[4][32]{};
@@ -700,6 +700,37 @@ def test_incompatible_explicit_interrupt_is_rejected_before_writing_files(tmp_pa
     assert not (tmp_path / "out").exists()
 
 
+@pytest.mark.parametrize(("alignment", "carrier"), [
+    ("center", "TRIANGLE"),
+    ("trailing", "SAWTOOTH"),
+    ("leading", "INVSAWTOOTH"),
+])
+def test_pwm_alignment_maps_to_the_hardware_carrier(alignment, carrier, tmp_path):
+    base = _simulation()
+    params = base.p.replace(**{
+        "units.converter.pwm.alignment": alignment,
+        "units.converter.pwm.update": "single",
+    })
+    simulation = peslite.Simulation(params)
+
+    _export(simulation, tmp_path)
+
+    assert f"CbPwm_ConfigureCarrier(PWM_CHANNEL_0, {carrier}, 0);" in (
+        tmp_path / "user.cpp"
+    ).read_text(encoding="utf-8")
+
+
+def test_imperix_rejects_double_rate_sawtooth_pwm(tmp_path):
+    base = _simulation()
+    params = base.p.replace(**{
+        "units.converter.pwm.alignment": "trailing",
+        "units.converter.pwm.update": "double",
+    })
+
+    with pytest.raises(ValueError, match="sawtooth carriers support only single-rate"):
+        _export(peslite.Simulation(params), tmp_path)
+
+
 def test_native_history_limit_is_checked_before_writing_files(tmp_path):
     sim = peslite.Simulation(_simulation().p.replace(**{"units.converter.meas.average": ["voltage"]}))
     config = _mapping(sim)
@@ -735,7 +766,8 @@ def test_probe_names_cannot_shadow_other_exported_symbols(unit_name, channel, va
         "adc": {channel: (dict(channel=0, device=0, sign=1),)},
         "pwm": (), "dead_time": 0.0, "stride": 1,
     }, cfg=SimpleNamespace(ctrl=SimpleNamespace(period=50e-6),
-                           pwm=SimpleNamespace(f_sw=20000.0, carrier_phase=0.0)),
+                           pwm=SimpleNamespace(f_sw=20000.0, carrier_phase=0.0,
+                                               alignment="center")),
        topology=SimpleNamespace(unilateral=True), m=lambda field: "test_" + field)
     with pytest.raises(ValueError, match="exported names collide"):
         imperix._source([unit], {}, {}, 50e-6, 0.5, runtime)
@@ -1423,7 +1455,8 @@ def test_cli_help_describes_imperix_elf_export(capsys):
 def test_cli_sidecar_and_backend_option_routing(tmp_path, capsys):
     sim = _simulation()
     case = tmp_path / "case.pes"
-    peslite.dump(sim.p, case)
+    case.write_text((EXAMPLES / "buck-example.pes").read_text(encoding="utf-8"),
+                    encoding="utf-8")
     case.with_suffix(".imperix.json").write_text(json.dumps(_mapping(sim)), encoding="utf-8")
     assert main(["export", str(case), "--imperix", "--imperix-source-only",
                  "--out", str(tmp_path / "out")]) == 0
@@ -1501,4 +1534,4 @@ def test_host_or_invalid_elf_cannot_be_published(change, message, tmp_path):
     path = tmp_path / "bad.elf"
     path.write_bytes(data)
     with pytest.raises(RuntimeError, match=message):
-        imperix.imperix_build._elf(path, 40)
+        imperix._elf(path, 40)

@@ -46,6 +46,7 @@ meta: {}
 
 All top-level sections except `base` and `simulation` are optional. A model without a component
 section simply omits it.
+Shared default parameter values can be changed directly in `src/peslite/defaults.py`.
 
 ## Interface views
 

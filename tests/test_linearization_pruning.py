@@ -10,9 +10,10 @@ import pytest
 from conftest import EXAMPLES
 from peslite.assembly.params import from_dict, to_dict
 from peslite.control import DUTY_RATIO, ControlGraph, Loop, register_loop_type
+from peslite.defaults import DEFAULT_LINEARIZATION_RELATIVE_STEP
 from peslite.solver.linearization import linearize_loop
 from peslite.solver.model import StateRegistry
-from peslite.solver.simulation import SystemLoop
+from peslite.solver.simulation import SimulationTransition
 from peslite.solver.splitbound import _period_map
 from test_small_signal import _AffineMap
 
@@ -33,7 +34,8 @@ def _simulation(**changes):
 
 
 def _compare(sim, exhaustive_loop, *, period=None):
-    loop = SystemLoop(sim, period=period, frame_frequency=0.0, repeat_forcing=True)
+    loop = SimulationTransition(sim, period=period, frame_frequency=0.0,
+                                repeat_forcing=True)
     row = sim.result.final_states()
     start = row.pop("t")
     cols = loop.coordinates(list(row))
@@ -303,8 +305,13 @@ def test_proven_zero_columns_keep_rows_zero_modes_and_split_input_responses(exha
     assert optimized.active == (0, 1)
     assert optimized.evaluations == 3 and full.evaluations == 5
     assert 0.0 in np.linalg.eigvals(optimized.phi[:2, :2])
-    actual = _period_map(loop, row, 0.0, loop.cols, [("x", 1.0)])
-    expected = _period_map(exhaustive_loop(loop), row, 0.0, loop.cols, [("x", 1.0)])
+    actual = _period_map(
+        loop, row, 0.0, loop.cols, [("x", 1.0)], DEFAULT_LINEARIZATION_RELATIVE_STEP,
+    )
+    expected = _period_map(
+        exhaustive_loop(loop), row, 0.0, loop.cols, [("x", 1.0)],
+        DEFAULT_LINEARIZATION_RELATIVE_STEP,
+    )
     for a, b in zip(actual[:3], expected[:3]):
         np.testing.assert_array_equal(a, b)
     assert actual[3] == expected[3] - 2

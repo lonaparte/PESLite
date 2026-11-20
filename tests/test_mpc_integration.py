@@ -12,13 +12,13 @@ from scipy.integrate import quad
 
 import peslite
 from conftest import EXAMPLES
-from peslite.addons.control.voltage_adaptive_pll import VoltageAdaptivePLL
-from peslite.addons.functions import energy_closure, plot_result
-from peslite.addons.functions import small_signal
+from peslite.control.loops import SRFPLL
+from peslite.addons.functions.online_analysis import energy_closure, small_signal
+from peslite.addons.functions.plotting import plot_result
 from peslite.assembly.params import from_dict, read_initial
 from peslite.control import ConverterMeasurement, Measurement, register_loop_type
 from peslite.addons.control.mpc import MPCResult
-from peslite.addons.control.predictive import PredictiveCurrentControl
+from peslite.addons.control.mpc import PredictiveCurrentControl
 from test_dc_converters import _case as dc_case
 from test_cpp_export import _compiler, _final_csv, _run_generated
 
@@ -646,7 +646,7 @@ def test_mpc_composes_with_control_and_component_addons(examples, tmp_path):
             "type": "gfl",
             "references": {"id_ref_pu": 0.2},
             "loops": {
-                "VoltageAdaptivePLL": {"bandwidth": 20.0},
+                "SRFPLL": {"bandwidth": 20.0, "normalisation": "amplitude"},
                 _AC_MPC: {
                     "algorithm": "fcs",
                     "prediction_horizon": 2,
@@ -659,7 +659,7 @@ def test_mpc_composes_with_control_and_component_addons(examples, tmp_path):
     result = simulation.run(out_dir=tmp_path)
     nodes = simulation.unit("vsc").ctrl.graph.nodes
 
-    assert isinstance(nodes["VoltageAdaptivePLL"], VoltageAdaptivePLL)
+    assert isinstance(nodes["SRFPLL"], SRFPLL)
     assert nodes[_AC_MPC].fallback_count == 0
     assert np.isfinite(result.states["cable1.iL1.re"]).all()
     assert not result.tripped

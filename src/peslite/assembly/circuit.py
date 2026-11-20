@@ -18,7 +18,7 @@ copied into the components' ``input`` before solving. Zero-order-hold inputs kee
 components' ``input``; the Circuit also receives each such label, so a held change refreshes it.
 
 Mode changes (breakers, gates, transformer ratios, diodes, set events) are boundaries of the
-commutation protocol of :class:`~peslite.assembly.conduction.DiodeConduction`: the Circuit's margin is
+commutation protocol of :class:`~peslite.solver.commutation.Commutation`: the Circuit's margin is
 negative while the states are inconsistent with the present mode, and ``commutate`` projects them
 (charge and flux conservation) and records the impulsive loss and supply for the energy audit. A component
 may keep a commutation of its own beside it (a gate clock) and mirror the netlist's diode conduction into
@@ -47,9 +47,9 @@ from ..components.network import Port
 from ..solver.energy import Energetic, spec_of
 from ..solver.model import (
     Bag, ConfigError, Empty, OutputMethod, SolverCheck, SolverRegion, SpectralBound,
-    _InlineProgram, _compile_straight_line,
+    _InlineProgram, _compile_straight_line, _public_fields,
 )
-from ..solver.netlist import (QUANTITIES, CoupledInductors, CurrentSource, Diode, Element, Mode,
+from ..solver.netlist import (QUANTITIES, CurrentSource, Diode, Element, Mode,
                               Netlist, Node, Topology, VoltageSource, _DENSE_GROUP, _Degenerate,
                               _Evaluation, _linear_expression, _numeric_values, _roles, _UnionFind)
 
@@ -72,10 +72,6 @@ def _kind(port: Port) -> tuple[int, float]:
 def _ports(sub: Any) -> list[Port]:
     return [port for port in getattr(sub, "ports", ())
             if isinstance(port, Port) and port.physical and port.component is sub]
-
-
-def _fields(record: Any) -> tuple[str, ...]:
-    return tuple(f for f in dir(record) if not f.startswith("_") and not callable(getattr(record, f)))
 
 
 def _state_dimension(component: Any, name: str) -> int:
@@ -216,7 +212,7 @@ class NetlistBuilder:
             raise TypeError("a netlist function value must be callable")
         record = None
         if self.owner is not None:
-            known = set(_fields(self.owner.input))
+            known = set(_public_fields(self.owner.input))
             unknown = set(inputs) - known
             if unknown:
                 raise ValueError(f"unknown netlist function input fields {sorted(unknown)}")
@@ -1312,7 +1308,7 @@ class Circuit:
         self._direct_dynamic = dynamic
         self._direct_mode_key = (
             net._dynamic_structure_key(topology) if dynamic else
-            topology.mode.key[:2] if numeric or net._switches else None
+            topology.mode.structure_key if numeric or net._switches else None
         )
         self._numeric_stages = numeric
         self._stage_signature = signature
@@ -1633,7 +1629,7 @@ class Circuit:
         """Bind or regenerate the equations selected by the current structural mode."""
         def mode_key(selected: Topology):
             return (self.netlist._dynamic_structure_key(selected)
-                    if self._direct_dynamic else selected.mode.key[:2])
+                    if self._direct_dynamic else selected.mode.structure_key)
 
         if self._numeric_stages:
             selected = self.netlist.topology() if topology is None else topology
@@ -1912,14 +1908,12 @@ class Circuit:
 
 
 def _bind_energy(component: Any, circuit: Circuit) -> tuple[Optional[Callable], Optional[Callable]]:
-    """Bind one component's declared power laws to its owning circuit."""
+    """Return one component's circuit-owned power laws without replacing its methods."""
     loss = supply = None
     if id(component) in circuit._loss_elements:
         loss = lambda: circuit.dissipated_power_of(component)
-        component.dissipated_power = loss
     if id(component) in circuit._supply_elements:
         supply = lambda: circuit.supplied_power_of(component)
-        component.supplied_power = supply
     return loss, supply
 
 
@@ -2079,8 +2073,8 @@ def _component_output_stages(component: Any) -> Optional[tuple[OutputMethod, ...
     if stages is None and (component.outputs_need_inputs or component.output is not component.state):
         stages = (OutputMethod(
             "set_outputs",
-            _fields(component.input) if component.outputs_need_inputs else (),
-            _fields(component.output),
+            _public_fields(component.input) if component.outputs_need_inputs else (),
+            _public_fields(component.output),
         ),)
     return None if stages is None else tuple(stages)
 
@@ -2303,7 +2297,7 @@ def bind_device(name: str, component: Any, declaration: NetworkPlan,
     circuit.standalone_ports = tuple(
         port for port in _ports(component) if port.standalone is not None
     )
-    for field in _fields(component.input):
+    for field in _public_fields(component.input):
         key = circuit.key(f"{name}.{field}", getattr(component.input, field), output=False)
         circuit.copies.append((component, field, key))
         circuit.value_inputs[id(component.input), field] = key
@@ -2714,7 +2708,8 @@ class _ModeDecomposition:
             field, index = self.variables[variable]
             values = closed if field == "closed" else conducting
             values[index] = not values[index]
-        return Mode(closed, conducting, self.reference.ratios if ratios is None else ratios)
+        return Mode(closed, conducting, self.reference.ratios if ratios is None else ratios,
+                    self.reference.gated)
 
     def topology(self, net: Netlist, changed: frozenset[int]) -> Topology:
         """Return the physically resolved topology for one selection of local families."""
@@ -2834,7 +2829,7 @@ def circuit_mode_key(circuits: Sequence[Circuit]):
     return tuple(
         (id(circuit.netlist), (
             circuit._bound_device_topology() or circuit.netlist.topology()
-        ).mode.key[:2])
+        ).mode.structure_key)
         for circuit in circuits
     )
 
@@ -3177,7 +3172,9 @@ class _ModeStructure:
 
     def _element_branches(self, net: Netlist, index: int) -> list[int]:
         element = self.branches[index].element
-        return list(net._ports[id(element)]) if isinstance(element, CoupledInductors) else [index]
+        if len(element.ports) > 1 and hasattr(element, "state"):
+            return list(net._ports[id(element)])
+        return [index]
 
     def equation_owners(self, net: Netlist) -> list[list[int]]:
         """Return the clusters that can change each derivative and output row."""
@@ -3306,17 +3303,19 @@ def _mode_decomposition(
     if not variables:
         return None
     net = circuit.netlist
+    if net._gate_resistance_sensitive:
+        return None
     actual = tuple(
         np.asarray(ratio, dtype=float)
         for ratio in (net._ratio_override if net._ratio_override is not None
                       else tuple(transformer.ratio() for transformer in net._transformers))
     )
     ratio_key = tuple((ratio.shape, ratio.tobytes()) for ratio in actual)
-    key = variables, reference.closed, reference.conducting, ratio_key
+    key = variables, reference.structure_key, ratio_key
     cache = circuit._mode_decompositions
     if key in cache:
         return cache[key]
-    base = Mode(reference.closed, reference.conducting, actual)
+    base = Mode(reference.closed, reference.conducting, actual, reference.gated)
 
     def combinations(cluster: Sequence[int]):
         for bits in range(1, 1 << len(cluster)):

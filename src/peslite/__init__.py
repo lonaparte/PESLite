@@ -9,7 +9,7 @@ Plant quantities are in SI; controllers work in each unit's pu bases.
 from . import solver, control, components, assembly
 from .solver import (AdaptiveSolver, BlackBoxSubsystem, DormandPrince45, FixedStepSolver, Model,
                      MultirateSolver, make_solver)
-from .control import OutputStage, VSCController, make_controller, register_loop_type
+from .control import OutputStage, VSCController, register_loop_type
 from .components import (ADC, ADCSample, PWM, PWMAveragingModel, ZOH, AveragingModel, SwitchingModel,
                          ThreePhaseBridge, CarrierComparison, FullBridge, HalfBridge,
                          MeasurementPorts, make_bridge,
@@ -17,14 +17,19 @@ from .components import (ADC, ADCSample, PWM, PWMAveragingModel, ZOH, AveragingM
 from .assembly import (DCConverter, Params, Protection, ProtectionSample,
                        SourceScenario, System, Unit, VSC,
                        dump, dumps, load, register_event_type)
-from .solver.simulation import Simulation, SimulationResult, main, validate_model
+from .assembly.control import make_controller
+from .solver.simulation import Simulation, SimulationResult, validate_model
 from .assembly.exporter import ExportResult, export
 from . import addons
-from .assembly.params import _register_load_preparer
 
-_register_load_preparer(addons._discover_for)
+__version__ = "0.6.0"
 
-__version__ = "0.5.2"
+
+def main(argv=None):
+    """Run the command-line interface without loading it during normal imports."""
+    from .cli import main as cli_main
+
+    return cli_main(argv)
 
 __all__ = [
     "solver", "control", "components", "assembly", "addons",

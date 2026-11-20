@@ -1,8 +1,9 @@
 # Multiphysics Analysis
 
-Electrical, magnetic and thermal components are independent PESLite subsystems. Coupling does not
-make one physical domain an implementation of another: assembly only connects compatible public
-signals through the existing model connection graph.
+The `magcomponent` and `thermal` addons expose the magnetic and thermal sides of multiphysics
+analysis. Electrical, magnetic and thermal components remain independent PESLite subsystems.
+Coupling does not make one physical domain an implementation of another: assembly only connects
+compatible public signals through the existing model connection graph.
 
 ## Signal contract
 
@@ -43,7 +44,7 @@ signal contract remains unchanged.
 
 ## Electrical and thermal coupling
 
-`ThermalComponent` is the thermal addon's common contract for physical components whose
+`ThermalComponent` is the `thermal` addon's common contract for physical components whose
 constitutive properties depend on temperature. Concrete components keep ordinary electrical ports
 and solvers while a `ThermalPropertyLaw` supplies their current physical properties.
 

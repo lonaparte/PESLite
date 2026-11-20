@@ -12,7 +12,8 @@ from peslite.addons.components.thermal import (
 from peslite.addons.components.thermalport import (
     ThermalPort, ThermalPortModel,
 )
-from peslite.addons.functions import foster_step_response, load_thermalport
+from peslite.addons.components.thermalport import load_thermalport
+from peslite.addons.functions.thermal import foster_step_response
 from peslite.solver.model import Model
 
 

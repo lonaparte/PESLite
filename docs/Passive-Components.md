@@ -29,6 +29,7 @@ A branch is a switchable series R-L connection:
 ```yaml
 branches:
   line: {bus1: grid_bus, bus2: pcc, x_pu: 0.2, r_pu: 0.02}
+  shunt: {bus1: pcc, bus2: ground, l: 1e-3, r: 0.1}
 ```
 
 | Field | Required | Default | Meaning |
@@ -37,7 +38,8 @@ branches:
 | `l` or `x_pu` | yes | — | series inductance |
 | `r` or `r_pu` | no | 0 | series resistance |
 
-Branch current is positive from `bus1` to `bus2`. Both ports must use the same phase count.
+Branch current is positive from `bus1` to `bus2`. Both ports must use the same phase count;
+`ground` takes the representation of the other port.
 Use [Events Timeline](Events-Timeline.md) to connect or disconnect a branch.
 
 ## Passive elements
@@ -59,14 +61,46 @@ elements:
 system base. Capacitor terminals must be distinct, `c` must be positive and `r` non-negative. The
 capacitor exposes `<element>.u`; energy accounting includes its stored energy and series loss.
 
+## Cables
+
+The bundled cable component is a two-port element whose currents are positive into the cable:
+
+```yaml
+elements:
+  line:
+    type: cable
+    bus1: sending
+    bus2: receiving
+    length_km: 5.0
+    r_per_km: 0.05
+    l_per_km: 0.4e-3
+    c_per_km: 0.2e-6
+```
+
+`model: bergeron` is the default. It represents distributed L-C propagation with an exact travel
+delay and splits the total series resistance into quarter-half-quarter sections. Use
+`model: lumped` for the segmented R-L/G-C model; `sections` selects its number of shunt G-C cells
+and `g_per_km` its shunt conductance. All per-kilometre fields use SI units, and the Bergeron model
+requires `g_per_km: 0`.
+
 ## Connections
 
-Component ports accept a public bus name or Unit-port path. Examples:
+Component ports accept a public bus name, Unit-port path or the reserved `ground` reference.
+`ground` is always available and is not declared under `buses`:
 
 ```yaml
 branches:
   dc_line: {bus1: converter.power, bus2: output, l: 1e-3, r: 0.05}
+elements:
+  grounded_capacitor: {type: capacitor, bus1: output, bus2: ground, c: 1e-3}
 ```
+
+Single-terminal shunt components already include their ground terminal, so configurations such as
+`{type: load, bus: pcc, ...}` do not write it. A network with no implicit or explicit ground
+connection remains floating; a numerical reference chosen for its equations does not create a
+physical current path. `ground` denotes ideal zero voltage, not a neutral conductor or protective
+earth. The three-phase space-vector representation contains no zero-sequence quantity, so neutral
+impedance, ground current and common-mode networks require a multi-conductor model.
 
 The phase count is resolved during assembly. A connection between incompatible explicit AC and DC
 domains is rejected before simulation.

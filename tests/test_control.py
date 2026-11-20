@@ -1,6 +1,7 @@
 """The refactored controller, its loop registry and dependency boundary."""
 
 import ast
+import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -285,7 +286,6 @@ def test_repeated_loop_class_uses_qualified_names_without_type_fields():
     unit = tree["units"]["vsc"]
     unit["bridge"] = {"model": "averaging"}
     unit["ctrl"] = {
-        "type": "custom",
         "loops": {
             "_AffineFeedback[a]": {"gain": 0.25, "bias": 1.0},
             "_AffineFeedback[b]": {"gain": 0.5, "bias": 2.0},
@@ -299,6 +299,7 @@ def test_repeated_loop_class_uses_qualified_names_without_type_fields():
             "theta": "references.theta",
             "omega": "references.omega",
         },
+        "references": {"theta": 0.0, "omega": 2.0 * math.pi * 50.0},
     }
 
     params = from_dict(tree)
@@ -373,6 +374,28 @@ def test_adc_sample_and_controller_measurement_have_distinct_scopes():
 
     assert peslite.ADCSample is ADCSample
     assert Measurement.__module__ == "peslite.control.controller"
+
+
+@pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
+def test_srf_pll_bandwidth_and_amplitude_normalisation_share_the_builtin_loop(
+        gfl, tmp_path, model):
+    params = gfl(**{
+        "simulation.t_end": 0.004,
+        "simulation.solver.linearisations": 0,
+        "units.vsc.bridge.model": model,
+        "units.vsc.ctrl.loops.SRFPLL": {
+            "bandwidth": 20.0,
+            "normalisation": "amplitude",
+        },
+    })
+    simulation = peslite.Simulation(params)
+    pll = simulation.unit().ctrl.graph.nodes["SRFPLL"]
+
+    assert pll.cfg.normalisation == "amplitude"
+    assert set(pll.state_names) == {"theta", "integral_pu", "u_g_pu"}
+    result = simulation.run(out_dir=tmp_path / model)
+    assert np.isfinite(result.states["vsc.ctrl.SRFPLL.theta"]).all()
+    assert not result.tripped
 
 
 def test_control_graph_has_one_typed_boundary_for_inputs_and_outputs(gfl):
@@ -578,7 +601,7 @@ def test_unknown_auxiliary_output_source_is_rejected(gfl):
 
 
 def test_control_imports_only_itself_and_the_solver_kernel():
-    allowed = {"control", "solver"}
+    allowed = {"control", "defaults", "solver"}
     for path in CONTROL.glob("*.py"):
         imported = set()
         rel = path.relative_to(CONTROL.parent).with_suffix("")

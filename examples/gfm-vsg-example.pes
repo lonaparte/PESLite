@@ -1,4 +1,4 @@
-# PESLite 0.5.2
+# PESLite 0.6.0
 # Grid-forming converter: virtual synchronous generator (VSG) with a virtual impedance.
 @circuit
 grid -- pcc -- vsc

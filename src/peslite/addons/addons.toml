@@ -1,0 +1,118 @@
+[injection]
+version = "1.0.0"
+component = true
+control = false
+function = false
+installation = "standard"
+dependencies = []
+summary = "Series-voltage and shunt-current perturbation sources."
+
+[magcomponent]
+version = "1.0.0"
+component = true
+control = false
+function = false
+installation = "standard"
+dependencies = []
+summary = "Native magnetic-component and compensated-link interfaces."
+
+[magport]
+version = "1.0.0"
+component = true
+control = false
+function = true
+installation = "full"
+dependencies = ["magcomponent"]
+summary = "External magnetic constitutive data and field reconstruction."
+
+[magcircuit]
+version = "1.0.0"
+component = true
+control = false
+function = true
+installation = "full"
+dependencies = ["magcomponent", "magport"]
+summary = "Nonlinear magnetic-circuit laws and linear circuit reduction."
+
+[thermal]
+version = "1.0.0"
+component = true
+control = false
+function = true
+installation = "standard"
+dependencies = []
+summary = "Thermal networks, temperature-dependent components, losses and reports."
+
+[thermalport]
+version = "1.0.0"
+component = true
+control = false
+function = false
+installation = "full"
+dependencies = ["thermal"]
+summary = "External thermal-law adapter."
+
+[mpc]
+version = "1.0.0"
+component = false
+control = true
+function = false
+installation = "standard"
+dependencies = []
+summary = "Continuous-control-set and finite-control-set model predictive control."
+
+[debug]
+version = "1.0.0"
+component = false
+control = false
+function = true
+installation = "standard"
+dependencies = ["offline_analysis", "online_analysis", "reference_signals"]
+summary = "Structured simulation diagnostics and .pesdbg execution."
+
+[offline_analysis]
+version = "1.0.0"
+component = false
+control = false
+function = true
+installation = "standard"
+dependencies = ["injection"]
+summary = "Frequency response, recorded identification, port matrices and loop gain."
+
+[legacy_yaml]
+version = "1.0.0"
+component = false
+control = false
+function = true
+simulation_reader = true
+installation = "standard"
+dependencies = []
+summary = "Legacy YAML simulation-file compatibility."
+
+[online_analysis]
+version = "1.0.0"
+component = false
+control = false
+function = true
+installation = "standard"
+dependencies = []
+summary = "Online stability, operating-point, response and energy analysis."
+
+[plotting]
+version = "1.0.0"
+component = false
+control = false
+function = true
+installation = "standard"
+dependencies = []
+summary = "Waveform plotting from completed simulation results."
+
+[reference_signals]
+version = "1.0.0"
+component = false
+control = false
+function = true
+installation = "standard"
+dependencies = []
+summary = "Table, expression, PRBS, multitone and chirp reference signals."
+

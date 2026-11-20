@@ -1,6 +1,6 @@
 # Online System Analysis
 
-The online system analysis addon evaluates the operating state or recorded response of an ordinary
+The `online_analysis` addon evaluates the operating state or recorded response of an ordinary
 PESLite simulation. It does not replace the plant, insert a test source or use a separate
 reduced-order model. Sampled controllers, ADC and PWM state, computation delays, switching events
 and algebraic loops therefore remain part of the analyzed system.
@@ -16,6 +16,7 @@ For transfer identification from deliberately excited experiments, use
 | Analyze the final recurring operating state | `small_signal` | A completed restartable `Simulation` |
 | Check whether the final state is recurring | `detect_operating_point` | A completed restartable `Simulation` |
 | Measure step and tracking performance | `dynamic_performance` | Recorded time, response and reference arrays |
+| Audit stored, supplied and dissipated energy | `energy_closure` | A completed `SimulationResult` |
 
 The first three interfaces use the complete named restart state and the same `SystemLoop` period
 map. `dynamic_performance` reads an existing waveform and does not advance the simulation. None of
@@ -30,13 +31,13 @@ peslite buck-example --report
 ```
 
 The command writes `buck-example_report.json`; the name comes from the input file rather than the
-output directory or bridge preset. If the addon is unavailable, PESLite warns and completes the
-ordinary simulation. Plotting and reporting may be requested together.
+output directory or bridge preset. If the `online_analysis` addon is unavailable, PESLite warns
+and completes the ordinary simulation. Plotting and reporting may be requested together.
 
 The Python interface exposes the same workflow:
 
 ```python
-from peslite.addons.functions import small_signal_report
+from peslite.addons.functions.online_analysis import small_signal_report
 
 sim = peslite.Simulation(params)
 report = small_signal_report(
@@ -118,7 +119,7 @@ Before interpreting a modal result, check that the final state actually repeats:
 
 ```python
 import peslite
-from peslite.addons.functions import detect_operating_point
+from peslite.addons.functions.online_analysis import detect_operating_point
 
 sim = peslite.Simulation(peslite.load("buck-example"))
 sim.run(out_dir="output/buck")
@@ -143,7 +144,7 @@ recurrence; it does not by itself establish asymptotic stability.
 Analyze the final complete state after the operating point has settled:
 
 ```python
-from peslite.addons.functions import small_signal
+from peslite.addons.functions.online_analysis import small_signal
 
 analysis = small_signal(
     sim,
@@ -200,7 +201,7 @@ frequencies are not an unaliased reconstruction of faster modes. Zero multiplier
 Use an ordinary recorded response for step and tracking metrics:
 
 ```python
-from peslite.addons.functions import dynamic_performance
+from peslite.addons.functions.online_analysis import dynamic_performance
 
 metrics = dynamic_performance(
     sim.result.t,
@@ -229,6 +230,20 @@ pre-step value, and `step_time` must be a recorded sample.
 `settling_tolerance` defaults to 2% of the step; `absolute_tolerance` can impose a larger physical
 band. `tail_fraction` defaults to the final 10% of the post-step interval. Missing or invalid
 metrics are `None` with explicit flags rather than fabricated values.
+
+## Energy closure
+
+After a run with energy output enabled, compare stored-energy change and impulsive loss with
+accepted-step supplied and dissipated energy:
+
+```python
+from peslite.addons.functions.online_analysis import energy_closure
+
+closure = energy_closure(sim.result)
+```
+
+The result contains the component energies, closure residual and relative residual. CSV sampling
+and precision do not affect the calculation.
 
 ## Accuracy and limitations
 

@@ -23,12 +23,14 @@ from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
-from .model import SpectralBound, _component_plan, commutation_tolerance
+from ..defaults import (DEFAULT_SOLVER_ATOL, DEFAULT_SOLVER_MAX_STEP, DEFAULT_SOLVER_RTOL,
+                        DEFAULT_SOLVER_WARM_START)
+from .model import ConfigError, SpectralBound, _component_plan, commutation_tolerance
 from .netlist import FORMS as CIRCUIT_MODELS
 
 __all__ = ["RHS", "SolverStep", "Solver", "FIXED_METHODS", "ADAPTIVE_METHODS", "EXPLICIT_FIXED_METHODS",
            "IMPLICIT_FIXED_METHODS", "IMPLICIT_ADAPTIVE_METHODS", "CIRCUIT_MODELS", "TABLEAUS", "combine",
-           "canonical_method", "integrator", "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "AutoSolver",
+           "canonical_method", "integrator", "make_solver", "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "AutoSolver",
            "subintervals"]
 
 
@@ -208,8 +210,10 @@ def stage_state(y: NDArray[np.float64], h: float, row: tuple[float, ...], ks: li
     return y + acc
 
 
-def integrator(method: str, dt: float, rtol: float = 1e-6, atol: float = 1e-9,
-               max_step: float = math.inf, warm_start: bool = True, *,
+def integrator(method: str, dt: float, rtol: float = DEFAULT_SOLVER_RTOL,
+               atol: float = DEFAULT_SOLVER_ATOL,
+               max_step: float = DEFAULT_SOLVER_MAX_STEP,
+               warm_start: bool = DEFAULT_SOLVER_WARM_START, *,
                model=None, solver_type: str | None = None) -> Solver:
     """Return the single-rate integrator of ``method``: fixed-step with maximum step ``dt`` (s),
     the built-in ``"DP45"`` or a SciPy method.
@@ -230,6 +234,43 @@ def integrator(method: str, dt: float, rtol: float = 1e-6, atol: float = 1e-9,
     return AdaptiveSolver(method, rtol, atol, max_step, warm_start, model=model)
 
 
+def make_solver(cfg: Any, model: Any = None, ratings: Any = None):
+    """Return the single-rate or multirate integrator selected by solver settings."""
+    solver_type = cfg.type
+    method = cfg.method
+    if solver_type == "fixed" and cfg.subsystems:
+        from .multirate import MultirateSolver, own_schedule, parse_step
+
+        if model is None:
+            raise ConfigError(
+                "simulation.solver.subsystems needs the model whose subsystems it names"
+            )
+        try:
+            parsed = {name: parse_step(value) for name, value in cfg.subsystems.items()}
+            if any(own_schedule(ratio, own, method) for ratio, own in parsed.values()):
+                if method not in EXPLICIT_FIXED_METHODS:
+                    raise ConfigError(
+                        "simulation.solver.subsystems needs an explicit system method, got "
+                        f"{method!r}"
+                    )
+                return MultirateSolver(
+                    model, cfg.subsystems, cfg.dt, method, cfg.sweeps,
+                    cfg.rtol, cfg.atol, ratings,
+                )
+            unknown = [name for name in parsed if not model.select(name)]
+            if unknown:
+                raise KeyError(
+                    f"unknown subsystem(s) or namespace(s) {unknown}; "
+                    f"this model has {model.names}"
+                )
+        except (KeyError, ValueError) as exc:
+            raise ConfigError(f"simulation.solver.subsystems: {exc.args[0]}") from None
+    return integrator(
+        method, cfg.dt, cfg.rtol, cfg.atol, cfg.max_step, cfg.warm_start,
+        model=model, solver_type=solver_type,
+    )
+
+
 def subintervals(span: float, step: float) -> int:
     """Return equal pieces that cover ``span`` without exceeding ``step``."""
     return max(1, int(math.ceil(span / step - 1e-9)))
@@ -241,8 +282,9 @@ class FixedStepSolver:
     ``method``: ``"euler"``, ``"heun"`` or ``"RK4"``.
     """
 
-    def __init__(self, dt: float, method: str = "RK4", *, rtol: float = 1e-6,
-                 atol: float = 1e-9, model=None) -> None:
+    def __init__(self, dt: float, method: str = "RK4", *,
+                 rtol: float = DEFAULT_SOLVER_RTOL,
+                 atol: float = DEFAULT_SOLVER_ATOL, model=None) -> None:
         if method not in TABLEAUS:
             raise ValueError(f"unknown fixed-step method {method!r}")
         self.dt = float(dt)
@@ -256,12 +298,14 @@ class FixedStepSolver:
             tuple, tuple[tuple[int, ...], ...] | None
         ] = OrderedDict()
         self._block_eigenvalues: OrderedDict[tuple, NDArray[np.complex128]] = OrderedDict()
+        self._stable_bound_key: tuple[object, object, float] | None = None
         self.n_rhs = 0
 
     def parameters_changed(self) -> None:
         """Discard the lazy stiff-mode factors after a parameter event."""
         self._stability_results.clear()
         self._mode_eigenvalues.clear()
+        self._stable_bound_key = None
         if self._implicit is not None:
             self._implicit.parameters_changed()
 
@@ -363,11 +407,20 @@ class FixedStepSolver:
         check = getattr(self.model, "solver_check", None)
         if check is None:
             return False
+        bound_key = (
+            self.model.plan_revision,
+            self.model.equation_revision,
+            step,
+        ) if (hasattr(self.model, "plan_revision")
+              and hasattr(self.model, "equation_revision")) else None
+        if bound_key is not None and self._stable_bound_key == bound_key:
+            return False
         radius = _STABILITY_HALF_DISK.get(self.method, 0.0)
         bounds = check.spectral_bounds()
         if bounds and radius and all(
             bound is not None and step * bound.maximum <= radius for bound in bounds
         ):
+            self._stable_bound_key = bound_key
             return False
         modes = check.exact_modes()
         if not bounds:
@@ -616,10 +669,10 @@ class AdaptiveSolver:
     def __init__(
         self,
         method: str = "RK45",
-        rtol: float = 1e-6,
-        atol: float = 1e-9,
-        max_step: float = math.inf,
-        warm_start: bool = True,
+        rtol: float = DEFAULT_SOLVER_RTOL,
+        atol: float = DEFAULT_SOLVER_ATOL,
+        max_step: float = DEFAULT_SOLVER_MAX_STEP,
+        warm_start: bool = DEFAULT_SOLVER_WARM_START,
         jac: Callable | None = None,
         *, model=None,
     ) -> None:
@@ -767,7 +820,9 @@ class DormandPrince45:
     _b = (35 / 384, 0.0, 500 / 1113, 125 / 192, -2187 / 6784, 11 / 84, 0.0)
     _e = (71 / 57600, 0.0, -71 / 16695, 71 / 1920, -17253 / 339200, 22 / 525, -1 / 40)
 
-    def __init__(self, rtol: float = 1e-6, atol: float = 1e-9, max_step: float = math.inf,
+    def __init__(self, rtol: float = DEFAULT_SOLVER_RTOL,
+                 atol: float = DEFAULT_SOLVER_ATOL,
+                 max_step: float = DEFAULT_SOLVER_MAX_STEP,
                  h_init: float | None = None, safety: float = 0.9) -> None:
         self.rtol, self.atol, self.max_step, self.safety = rtol, atol, max_step, safety
         self._h = h_init
@@ -930,8 +985,10 @@ class AutoSolver:
     already computed by Radau; neither decision runs a second model or probes extra RHS values.
     """
 
-    def __init__(self, rtol: float = 1e-6, atol: float = 1e-9, max_step: float = math.inf,
-                 warm_start: bool = True, *, model=None) -> None:
+    def __init__(self, rtol: float = DEFAULT_SOLVER_RTOL,
+                 atol: float = DEFAULT_SOLVER_ATOL,
+                 max_step: float = DEFAULT_SOLVER_MAX_STEP,
+                 warm_start: bool = DEFAULT_SOLVER_WARM_START, *, model=None) -> None:
         self._dp = DormandPrince45(rtol, atol, max_step)
         self._warm_start, self._model = warm_start, model
         self.stiff = False

@@ -8,10 +8,10 @@ import pytest
 
 from peslite.addons.components.thermal import (
     ElectroThermal, ElectroThermalModel,
-    FosterImpedance, LumpedThermalNetwork, ThermalLink,
+    FosterImpedance, LossTable, LumpedThermalNetwork, SemiconductorLossModel,
+    SwitchingEvent, ThermalLink,
 )
 from peslite.addons.functions.thermal import (
-    LossTable, SemiconductorLossModel, SwitchingEvent,
     thermal_report, compare_thermal_reports,
 )
 from peslite.solver.model import ConfigError, Model

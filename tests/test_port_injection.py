@@ -7,7 +7,7 @@ import numpy as np
 import peslite
 import pytest
 
-from peslite.addons.components.port_injection import PortInjection
+from peslite.addons.components.injection import PortInjection
 from peslite.assembly.params import from_dict, read_tree
 from peslite.solver import ConfigError, netlist as nl
 

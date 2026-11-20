@@ -1,5 +1,4 @@
-"""The run of a simulation: the system and solver built from its parameters, the initial states, the
-event loop, and the command line (the ``peslite`` command).
+"""The run of a simulation: its assembled system, solver, states and event loop.
 
 Between events the solver integrates the model; the events are those of the file, sampled units'
 ADC samples, control interrupts, PWM loads, averaging-window openings and switching instants, and
@@ -11,49 +10,61 @@ snapshot.
 
 from __future__ import annotations
 
-import argparse
 import dataclasses
 import heapq
-import io
 import json
-import keyword
 import math
 import sys
-import sysconfig
 import time
 import warnings
 from collections import deque
 from collections.abc import Iterator
-from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
-from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
 
+from ..defaults import DEFAULT_OUTPUT_PRECISION, DEFAULT_OUTPUT_WRITE_LENGTH
 from ..assembly.events import Scenario, switching_schedule
-from ..assembly.conduction import DiodeConduction
 from ..assembly.exporter import _signal_names
 from ..assembly.params import (Params, _connection_variable, _parameterized, _unit_at, _unit_items,
-                               _unit_leaves, _load_case, connection_defaults, dump, dumps, to_dict)
+                               _unit_leaves, connection_defaults, dump, unit_type)
 from ..assembly.system import System, _start_connections
-from ..assembly.types import unit_type
 from ..assembly.unit import Plant, Unit
-from .timing import TIME_EPS
+from .timing import TIME_EPS, common_period
 from ..control.blocks import abc2complex, complex2abc
-from .integrators import Solver, _accepted_steps
+from .commutation import Commutation
+from .integrators import Solver, _accepted_steps, make_solver
 from .linearization import coordinate_width
 from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
-from .multirate import make_solver, rated_effort
+from .multirate import rated_effort
 from .splitbound import split_error_bound
 
-__all__ = ["Simulation", "SimulationResult", "Recorder", "main", "read_csv", "validate_model"]
+__all__ = ["Simulation", "SimulationResult", "Recorder", "json_value", "read_csv",
+           "validate_model"]
 
 
 _UNAVAILABLE = object()
 _RESTART_PRECISION = 17
+
+
+def json_value(value):
+    """Convert simulation data to strict JSON-compatible values."""
+    if isinstance(value, Mapping):
+        return {str(key): json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_value(item) for item in value]
+    if isinstance(value, Path):
+        return str(value.resolve())
+    if isinstance(value, np.generic):
+        return json_value(value.item())
+    if isinstance(value, complex):
+        return [json_value(value.real), json_value(value.imag)]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 class _ProgressBar:
@@ -279,19 +290,131 @@ class _AcceptedEnergy:
         }
 
 
-def _compile_interval_integrator(solver, rhs, conduction, settle, project):
+class _AcceptedHistory:
+    """Commit declared signal histories only at accepted physical states."""
+
+    def __init__(self, model, signals: tuple[Any, ...]) -> None:
+        self.model, self.signals = model, signals
+        self.last_t = -math.inf
+        self.history: list[tuple[float, tuple]] = []
+
+    def _state(self, history_size: int | None = None) -> tuple:
+        return (
+            self.last_t,
+            tuple(signal.history.checkpoint() for signal in self.signals),
+            len(self.history) if history_size is None else history_size,
+        )
+
+    def _remember(self) -> None:
+        same = self.history and abs(self.history[-1][0] - self.last_t) <= TIME_EPS
+        size = len(self.history) if same else len(self.history) + 1
+        entry = (self.last_t, self._state(size))
+        if same:
+            self.history[-1] = entry
+        else:
+            self.history.append(entry)
+
+    def begin_interval(self, t: float, y: np.ndarray) -> None:
+        """Refresh the wave accepted at a boundary after any event at that boundary."""
+        self.accept(t, y)
+        self.history[:] = self.history[-1:]
+
+    def accept(self, t: float, y: np.ndarray) -> None:
+        if t < self.last_t - TIME_EPS:
+            raise RuntimeError("accepted history steps must be chronological")
+        self.model.sync(t, y)
+        for signal in self.signals:
+            signal.history.accept(t, signal.value())
+        self.last_t = t
+        self._remember()
+
+    def checkpoint(self) -> tuple:
+        return self._state()
+
+    def checkpoint_at(self, t: float) -> tuple:
+        for when, checkpoint in reversed(self.history):
+            if abs(when - t) <= TIME_EPS:
+                return checkpoint
+        raise RuntimeError(f"accepted-history checkpoint missing at t = {t:.12g} s")
+
+    def restore(self, checkpoint: tuple) -> None:
+        self.last_t, histories, size = checkpoint
+        for signal, state in zip(self.signals, histories):
+            signal.history.restore(state)
+        del self.history[size:]
+
+
+class _AcceptedObservers:
+    """One accepted-step interface shared by independent observer lifecycles."""
+
+    def __init__(self, *observers: Any) -> None:
+        self.observers = tuple(observer for observer in observers if observer is not None)
+
+    @property
+    def last_t(self) -> float:
+        return min(observer.last_t for observer in self.observers)
+
+    def begin_interval(self, t: float, y: np.ndarray) -> None:
+        for observer in self.observers:
+            observer.begin_interval(t, y)
+
+    def accept(self, t: float, y: np.ndarray) -> None:
+        for observer in self.observers:
+            observer.accept(t, y)
+
+    def checkpoint(self) -> tuple:
+        return tuple(observer.checkpoint() for observer in self.observers)
+
+    def checkpoint_at(self, t: float) -> tuple:
+        return tuple(observer.checkpoint_at(t) for observer in self.observers)
+
+    def restore(self, checkpoint: tuple) -> None:
+        for observer, state in zip(self.observers, checkpoint):
+            observer.restore(state)
+
+
+class _StepLimits:
+    """Evaluate component-owned integration limits through one model-level interface."""
+
+    def __init__(self, model) -> None:
+        self.model = model
+        self.owners = tuple(
+            subsystem for subsystem in model.subsystems
+            if callable(getattr(subsystem, "solver_maximum_step", None))
+        )
+
+    def __bool__(self) -> bool:
+        return bool(self.owners)
+
+    def __call__(self, t: float, y: np.ndarray) -> float:
+        self.model.sync(t, y)
+        maximum = min(owner.solver_maximum_step() for owner in self.owners)
+        if not maximum > 0.0:
+            raise FloatingPointError("a component integration step is below time resolution")
+        return float(maximum)
+
+
+def _compile_interval_integrator(solver, rhs, commutation, settle, project, step_limits=None):
     """Compile the assembled interval stages so structural choices leave the run loop.
 
     Conduction participation, solver settlement and state bounds cannot change during a run.
     Only whether the current boundary is an event remains dynamic.
     """
     env = {"solver": solver, "rhs": rhs}
-    if conduction:
-        env["conduction"] = conduction
-        advance = "conduction.advance(t_a, t_b, y)"
+    if step_limits:
+        env["step_limits"] = step_limits
+        body = ["maximum_step = step_limits(t_a, y)"]
+    else:
+        body = []
+    if commutation:
+        env["commutation"] = commutation
+        advance = ("commutation.advance(t_a, t_b, y, max_step=maximum_step)"
+                   if step_limits else "commutation.advance(t_a, t_b, y)")
+    elif step_limits:
+        advance = "solver.advance(rhs, t_a, t_b, y, max_step=maximum_step).y"
     else:
         advance = "solver(rhs, t_a, t_b, y).y"
-    body = [f"y = {advance}"]
+    body.append(f"y = {advance}")
     if settle is not None:
         env["settle"] = settle
         body += ["if event:", "    y = settle(t_b, y)"]
@@ -421,7 +544,7 @@ class SimulationResult:
 
     def plot(self, columns: str | Iterable[str], **options: Any) -> Path:
         """Plot recorded columns from one result CSV through the optional plotting add-on."""
-        from ..addons.functions import plot_result
+        from ..addons.functions.plotting import plot_result
 
         path = plot_result(self, columns, **options)
         if path not in self.files:
@@ -433,8 +556,9 @@ class SimulationResult:
 class _CSVTable:
     """A fixed-width numeric table flushed to CSV every ``batch_rows`` rows."""
 
-    def __init__(self, path: Path, batch_rows: int = 1000,
-                 columns: Iterable[str] | None = None, precision: int = 5) -> None:
+    def __init__(self, path: Path, batch_rows: int = DEFAULT_OUTPUT_WRITE_LENGTH,
+                 columns: Iterable[str] | None = None,
+                 precision: int = DEFAULT_OUTPUT_PRECISION) -> None:
         self.path = path
         self.batch_rows = batch_rows
         self.precision = precision
@@ -568,7 +692,7 @@ class Recorder:
                  ctrl_names: Mapping[str, Iterable[str]] | None = None,
                  keep_states: bool = True,
                  keep_signals: bool = False, keep_energy: bool = True,
-                 batch_rows: int = 1000, name: str = "simulation",
+                 batch_rows: int = DEFAULT_OUTPUT_WRITE_LENGTH, name: str = "simulation",
                  state_columns: Iterable[str] = ()) -> None:
         self.params = params
         self.out_dir = out_dir
@@ -959,8 +1083,8 @@ class Simulation:
         """Return the state-table column names after ``t``, i.e. the valid ``initial.states`` keys."""
         return list(self._states.columns)
 
-    def _initial_values(self, t0: float) -> dict:
-        """Resolve explicit initial states and automatic bus presets without loading them."""
+    def _resolved_initial(self, t0: float) -> tuple[dict[str, Any], tuple[str, ...]]:
+        """Resolve initial states and return the canonical names explicitly requested."""
         system = self.system
         aliases = dict(getattr(system, "state_aliases", {}))
         presets_of = getattr(system, "state_presets", None)
@@ -968,6 +1092,10 @@ class Simulation:
         template = self._states.read()
         try:
             given = expand_aliases(self.p.simulation.initial.states, aliases)
+            explicit = tuple(dict.fromkeys(
+                name if name in template else name.rpartition(".")[0]
+                for name in given
+            ))
             if callable(presets):
                 for bus in getattr(system, "buses", {}):
                     key = f"{bus}.u_C"
@@ -983,12 +1111,17 @@ class Simulation:
             if aliases:
                 msg += f". Aliases: {', '.join(f'{a} -> {c}' for a, c in aliases.items())}"
             raise ConfigError(msg) from None
-        return values
+        return values, explicit
+
+    def _initial_values(self, t0: float) -> dict:
+        """Resolve explicit initial states and automatic bus presets without loading them."""
+        return self._resolved_initial(t0)[0]
 
     def _apply_initial(self, t0: float) -> np.ndarray:
         """Load ``initial.states`` into the parts; return the solver vector."""
         system = self.system
-        values = self._initial_values(t0)
+        values, explicit = self._resolved_initial(t0)
+        self._initial_requested = {name: values[name] for name in explicit}
         # 1. power stage (unset states stay zero), events up to t0, then the solver vector
         timing = {prefix for name, unit in system.units.items()
                   for prefix in (f"{name}.ctrl", f"{name}.{unit.bridge.state_prefix}", f"{name}.meas")}
@@ -1109,15 +1242,15 @@ class Simulation:
         wall0 = time.perf_counter()
 
         units = list(system.units.values())
-        diode_conduction = DiodeConduction(mdl, solver)
+        commutation = Commutation(mdl, solver)
         if t_end <= t_start + TIME_EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         t_final = t_end
         progress_every = (t_final - t_start) / 100.0 if progress.enable else 0.0
         plant = Plant(mdl, self._apply_initial(t_start), project=project,
-                      synchronize=diode_conduction.synchronize if diode_conduction.commutating else None,
+                      synchronize=commutation.synchronize if commutation.commutating else None,
                       reconcile=getattr(system, "reconcile_circuits", None))
-        if diode_conduction.commutating:
+        if commutation.commutating:
             plant.outputs(t_start)
         if project is not None:
             plant.state = project(plant.state)
@@ -1172,7 +1305,29 @@ class Simulation:
         accepted_energy = (
             _AcceptedEnergy(mdl, energy_balance) if energy_on and output.energy else None
         )
+        accepted_history = _AcceptedHistory(
+            mdl,
+            tuple(
+                signal
+                for subsystem in mdl.subsystems
+                for signal in getattr(subsystem, "accepted_histories", ())
+            ),
+        )
+        accepted_steps = _AcceptedObservers(
+            accepted_energy,
+            accepted_history if accepted_history.signals else None,
+        )
         phs_check_step = p.simulation.solver.phs_check_step
+        limit_observers = tuple(
+            (unit_name, observe_limits)
+            for unit_name, ctrl in continuous_controls
+            if (observe_limits := getattr(ctrl, "observe_limits", None)) is not None
+        )
+        periodic_output = bool(
+            output.states or output.signals or output.energy
+            or (observe is not None and observe_output)
+            or energy_on or limit_observers
+        )
         snapshot_index = 0
         continuous_record_index = 0
         worst = {"tellegen": 0.0, "balance": 0.0}
@@ -1193,7 +1348,6 @@ class Simulation:
             available = True
             try:
                 with np.errstate(over="raise"):
-                    sync_if_needed(t_now)
                     state = self._states.read() if notifying else None
                     states = (flatten(state) if state is not None else self._states.read_flat()
                               if rec.keep_states or final else None)
@@ -1208,6 +1362,7 @@ class Simulation:
 
             @_SnapshotRead
             def read_logs():
+                sync_if_needed(t_now)
                 for unit_name, ctrl in continuous_controls:
                     rec.ctrl_sample(unit_name, t_now, lambda ctrl=ctrl: ctrl.continuous_log(t_now),
                                     record=record and continuous_record_index % record_every == 0)
@@ -1215,6 +1370,7 @@ class Simulation:
 
             @_SnapshotRead
             def read_signals():
+                sync_if_needed(t_now)
                 return getattr(system, "signals", lambda _t: {})(t_now)
 
             @_SnapshotRead
@@ -1227,6 +1383,7 @@ class Simulation:
                                              ctrl_names=ctrl_names)
 
             def record_energy():
+                sync_if_needed(t_now)
                 rep = energy_balance(t_now, plant.state)
                 if rec.keep_energy:
                     rec.energy_row(t_now, rep.columns())
@@ -1235,11 +1392,13 @@ class Simulation:
                 worst["balance"] = max(worst["balance"], rep.max_residual / scale)
 
             if record and available:
-                for unit_name, ctrl in continuous_controls:
-                    observe_limits = getattr(ctrl, "observe_limits", None)
-                    if observe_limits is not None:
-                        _optional_output(t_now, f"controller limits {unit_name!r}", observe_limits, t_now)
-                read_logs()
+                if limit_observers:
+                    sync_if_needed(t_now)
+                    for unit_name, observe_limits in limit_observers:
+                        _optional_output(t_now, f"controller limits {unit_name!r}",
+                                         observe_limits, t_now)
+                if continuous_controls:
+                    read_logs()
                 if rec.keep_signals:
                     _optional_output(t_now, "plant signals",
                                      lambda: rec.plant_snapshot(t_now, read_signals()))
@@ -1270,30 +1429,37 @@ class Simulation:
                                   f"known: {sorted(values)}")
             return "".join(f"   {name} = {values[name]:.6g}" for name in watch)
 
+        step_limits = _StepLimits(mdl)
+        validate_local_step = getattr(solver, "validate_local_step", None)
+        if validate_local_step is not None:
+            validate_local_step(step_limits.owners)
         integrate = _compile_interval_integrator(
-            solver, mdl.rhs, diode_conduction, settle, project,
+            solver, mdl.rhs, commutation, settle, project,
+            step_limits if step_limits else None,
         )
 
         def advance(t_a: float, t_b: float, event: bool = False) -> bool:
             """Integrate over ``[t_a, t_b]``; ``event`` means the model changes at ``t_b``."""
             nonlocal t_local, stop_reason, termination, coarse_reported
             plant.invalidate()
-            energy_checkpoint = None
-            if accepted_energy is not None:
-                accepted_energy.begin_interval(t_a, plant.state)
-                energy_checkpoint = accepted_energy.checkpoint()
+            accepted_checkpoint = None
+            if accepted_steps.observers:
+                accepted_steps.begin_interval(t_a, plant.state)
+                accepted_checkpoint = accepted_steps.checkpoint()
             try:
-                if accepted_energy is None:  # no observer to install
+                if not accepted_steps.observers:
                     plant.state = integrate(t_a, t_b, plant.state, event)
                 else:
-                    with _accepted_steps(accepted_energy):
+                    with _accepted_steps(accepted_steps):
                         plant.state = integrate(t_a, t_b, plant.state, event)
-                if (accepted_energy is not None
-                        and accepted_energy.last_t < t_b - TIME_EPS):
-                    accepted_energy.accept(t_b, plant.state)
+                if (accepted_steps.observers
+                        and accepted_steps.last_t < t_b - TIME_EPS):
+                    accepted_steps.accept(t_b, plant.state)
             except (OverflowError, FloatingPointError):
-                if accepted_energy is not None:
-                    accepted_energy.restore(energy_checkpoint)
+                if accepted_steps.observers:
+                    accepted_steps.restore(accepted_checkpoint)
+                mdl.set_states(plant.state)
+                plant.invalidate()
                 termination = "diverged"
                 stop_reason = (f"diverged: the states overflowed between t = {t_a:.6g} s "
                                f"and {t_b:.6g} s")
@@ -1343,7 +1509,39 @@ class Simulation:
 
         # ---------------------------------------------------------------- the event grid
         self._begin_event_owners(t_start, plant)
+        initial_state_adjustments = []
+        if self._initial_requested:
+            actual = self._states.read()
+            for name, requested in self._initial_requested.items():
+                started = actual[name]
+                if isinstance(requested, bool):
+                    changed = started != requested
+                else:
+                    changed = abs(started - requested) > 1e-10 * max(
+                        1.0, abs(requested), abs(started)
+                    )
+                if changed:
+                    initial_state_adjustments.append({
+                        "name": name,
+                        "requested": json_value(requested),
+                        "actual": json_value(started),
+                    })
         plant.settle = settle_now
+        boundary: tuple[float, float] | None = None
+
+        def next_model_boundary() -> tuple[float, float]:
+            """Return the next circuit and model boundaries until either is consumed."""
+            nonlocal boundary
+            if boundary is None:
+                circuit_stop = actions[0][0] if actions else math.inf
+                for next_time in circuit_clocks:
+                    circuit_stop = min(circuit_stop, next_time())
+                physical_stop = circuit_stop
+                for unit in clocked_units:
+                    physical_stop = min(physical_stop, unit.next_time())
+                boundary = circuit_stop, physical_stop
+            return boundary
+
         if progress_bar is not None:
             # Controller observations become valid at their first scheduled event. The 0% bar
             # therefore reports progress only instead of manufacturing pre-sample watch values.
@@ -1361,13 +1559,8 @@ class Simulation:
                     stopped = True
                     break
             plant.inputs_changed = False
-            t_log = n_log * log_period
-            circuit_stop = actions[0][0] if actions else math.inf
-            for next_time in circuit_clocks:
-                circuit_stop = min(circuit_stop, next_time())
-            physical_stop = circuit_stop
-            for unit in clocked_units:
-                physical_stop = min(physical_stop, unit.next_time())
+            t_log = n_log * log_period if periodic_output else math.inf
+            circuit_stop, physical_stop = next_model_boundary()
             t_stop = min(t_final, t_log, physical_stop)
             native_stop = t_stop
             if observations and observations[0] < t_stop - TIME_EPS:
@@ -1389,6 +1582,7 @@ class Simulation:
                 continue
             protection_changed = False
             if physical_stop <= t_stop + TIME_EPS:  # otherwise only the output snapshot is due
+                boundary = None
                 # A window integrates where the circuit changes or where its own unit samples;
                 # trips and other plant changes integrate through settle_now.
                 circuit = circuit_stop <= t_stop + TIME_EPS
@@ -1473,6 +1667,8 @@ class Simulation:
         if stop_reason and termination == "completed":
             termination = "stopped"
         summary["status"] = termination
+        if initial_state_adjustments:
+            summary["initial_state_adjustments"] = initial_state_adjustments
         if stop_reason:
             summary["stop_reason"] = stop_reason
         if self.ph_report is not None:
@@ -1490,7 +1686,7 @@ class Simulation:
             summary.update({f"interface_{k}": v for k, v in interface.items()})
         if getattr(solver, "window_log", None) and p.simulation.solver.linearisations > 0:
             if self._rebuildable:
-                loop = SystemLoop(self)
+                loop = SimulationTransition(self)
                 if loop.period is None:  # no common control period
                     summary["split_bound"] = (f"the converters' periods {loop.periods} (control, PWM "
                                               f"loads, carriers and loops) have no common multiple within "
@@ -1532,33 +1728,14 @@ def validate_model(params: Params, *, interface_text: str = "") -> Simulation:
     return Simulation(params, interface_text=interface_text)
 
 
-_LOOPMAP_EPS = 1e-9
-
-def macro_period(periods: list[float], limit: int = 64) -> float | None:
-    """Return the smallest common multiple of ``periods`` (s), or ``None`` beyond ``limit`` longest periods."""
-    if not periods:
-        return None
-    longest = max(periods)
-    for n in range(1, limit + 1):
-        T = n * longest
-        if all(abs(T / p - round(T / p)) <= 1e-9 * max(1.0, T / p) for p in periods):
-            return T
-    return None
+_TRANSITION_EPS = 1e-9
 
 
-class SystemLoop:
-    """Complete closed-loop map rebuilt through the existing named-state restart path.
-
-    ``frame_frequency`` is in Hz (default: system base); zero keeps stationary coordinates.
-    ``repeat_forcing`` includes waveform periods, as required for a periodic stability result.
-    The default retains split-error analysis's local common-clock map. An explicit ``period``
-    must repeat the selected schedules. Histories are disabled without changing their time grid.
-    """
+class SimulationTransition:
+    """Restartable full-system state transition used by post-run analyses."""
 
     def __init__(self, sim: Any, *, period: float | None = None,
                  frame_frequency: float | None = None, repeat_forcing: bool = False) -> None:
-
-        self._cls = Simulation
         self._factories = dict(sim._factories)
         self.split_reference = bool(getattr(sim.solver, "groups", ()))
         frequency = (sim.p.base.f0 or 0.0) if frame_frequency is None else frame_frequency
@@ -1590,15 +1767,16 @@ class SystemLoop:
                 if relative > 0.0 and source.emf.e_peak != 0.0:
                     periods.add(1.0 / relative)
         if any(not math.isfinite(value) or value <= 0.0 for value in periods):
-            raise ValueError("loop periods must be finite and positive")
+            raise ValueError("transition periods must be finite and positive")
         self.periods = sorted(periods)
         if period is not None:
             if not math.isfinite(period) or period <= 0.0:
                 raise ValueError("period must be finite and positive")
-            if any(not math.isclose(period / value, round(period / value), rel_tol=1e-9, abs_tol=1e-9)
+            if any(not math.isclose(period / value, round(period / value),
+                                    rel_tol=1e-9, abs_tol=1e-9)
                    or period < value * (1.0 - 1e-9) for value in self.periods):
-                raise ValueError(f"period must repeat the loop schedules {self.periods}")
-        self.period = macro_period(self.periods) if period is None else float(period)
+                raise ValueError(f"period must repeat the system schedules {self.periods}")
+        self.period = common_period(self.periods) if period is None else float(period)
         flags = set(sim._states.boolean_names)
         self._flags = {name for name in flags
                        if name.rpartition(".")[2] in ("tripped", "fault")}
@@ -1606,836 +1784,139 @@ class SystemLoop:
         self._states = sim._states
         self._map_columns = set(sim._states.linearization_columns)
         self._plant_columns = set(sim._states.read_flat(["", *sim.units])) - control_columns
-        rated = rated_effort(sim.system.model, sim._ratings())  # the same scales for every solver
-        self._rated = ({lab: float(r) for lab, r in zip(sim.system.model.state_labels(), rated)}
+        rated = rated_effort(sim.system.model, sim._ratings())
+        self._rated = ({label: float(value)
+                        for label, value in zip(sim.system.model.state_labels(), rated)}
                        if rated is not None else {})
-        p = sim.p
-        sp = p.simulation
+        parameters = sim.p
+        simulation = parameters.simulation
         self._p = dataclasses.replace(
-            p,
+            parameters,
             simulation=dataclasses.replace(
-                sp, energy_check="off", stop_on_trip=False,
-                progress=dataclasses.replace(sp.progress, enable=False),
-                                           output=dataclasses.replace(sp.output, states=False,
-                                                                      energy=False, signals=False),
-                                           solver=dataclasses.replace(sp.solver, subsystems={},
-                                                                      linearisations=0)))
+                simulation, energy_check="off", stop_on_trip=False,
+                progress=dataclasses.replace(simulation.progress, enable=False),
+                output=dataclasses.replace(simulation.output, states=False,
+                                           energy=False, signals=False),
+                solver=dataclasses.replace(simulation.solver, subsystems={}, linearisations=0),
+            ),
+        )
 
-    # ------------------------------------------------------------ coordinates
     def overwritten_columns(self, t: float) -> frozenset[str]:
-        """Reuse owner proofs only while file events cannot change the execution schedule."""
+        """Return columns proved overwritten within an unchanged execution schedule."""
         if any(t < change.t <= t + self.period + TIME_EPS for change in self._p.changes):
             return frozenset()
         return self._states.overwritten_columns(self.period)
 
     def periodic_state(self, row: Mapping[str, float]) -> dict[str, float]:
-        """Logical snapshot for recurrence checks, retaining non-modal protection history."""
+        """Return the logical state used for recurrence checks."""
         return self._states.periodic_state(row)
 
     def coordinates(self, names: list[str], *, linearization: bool = True
                     ) -> list[tuple[str, list[str], float]]:
-        """Group state-table columns into map coordinates ``(kind, names, scale)``."""
-        cols: list[tuple[str, list[str], float]] = []
+        """Group named states into physical transition coordinates."""
+        columns: list[tuple[str, list[str], float]] = []
         used: set[str] = set()
         selected = self._map_columns if linearization else set(self._states.columns)
-        for c in names:
-            if c in used or c not in selected or c.startswith("solver."):
-                continue  # Select existing columns; solver bookkeeping is never a loop state.
-            if c in self._flags:
-                cols.append(("frozen", [c], 1.0))
-                used.add(c)
-            elif c in self._modes:
-                cols.append(("mode", [c], 1.0))
-                used.add(c)
-            elif c in self._angles:
-                cols.append(("angle", [c], 1.0))
-                used.add(c)
-            elif c.endswith(".re") and c[:-3] + ".im" in names:
-                base = c[:-3]
-                turns = c in self._plant_columns  # physical vectors rotate; control memory stays in its frame
-                scale = self._rated.get(base + ".re", 0.0) if turns else 0.0
-                cols.append(("vector" if turns else "fixed", [c, base + ".im"], scale if scale > 0 else 1.0))
-                used.update(cols[-1][1])
-            elif (self.w0 != 0.0 and c.endswith(".d_a")
-                  and c[:-4] + ".d_b" in names and c[:-4] + ".d_c" in names):
-                cols.append(("triple", [c[:-4] + f".d_{ph}" for ph in "abc"], 1.0))
-                used.update(cols[-1][1])
+        for name in names:
+            if name in used or name not in selected or name.startswith("solver."):
+                continue
+            if name in self._flags:
+                columns.append(("frozen", [name], 1.0))
+                used.add(name)
+            elif name in self._modes:
+                columns.append(("mode", [name], 1.0))
+                used.add(name)
+            elif name in self._angles:
+                columns.append(("angle", [name], 1.0))
+                used.add(name)
+            elif name.endswith(".re") and name[:-3] + ".im" in names:
+                base = name[:-3]
+                rotates = name in self._plant_columns
+                scale = self._rated.get(base + ".re", 0.0) if rotates else 0.0
+                columns.append(("vector" if rotates else "fixed",
+                                [name, base + ".im"], scale if scale > 0 else 1.0))
+                used.update(columns[-1][1])
+            elif (self.w0 != 0.0 and name.endswith(".d_a")
+                  and name[:-4] + ".d_b" in names and name[:-4] + ".d_c" in names):
+                columns.append(("triple", [name[:-4] + f".d_{phase}" for phase in "abc"], 1.0))
+                used.update(columns[-1][1])
             else:
-                scale = self._rated.get(c, 0.0) if c in self._plant_columns else 0.0
-                cols.append(("scalar", [c], scale if scale > 0 else 1.0))
-                used.add(c)
-        return cols
+                scale = self._rated.get(name, 0.0) if name in self._plant_columns else 0.0
+                columns.append(("scalar", [name], scale if scale > 0 else 1.0))
+                used.add(name)
+        return columns
 
     def to_frame(self, row: dict[str, float], t: float, cols: list) -> np.ndarray:
-        theta = self.w0 * t
-        rot = complex(math.cos(theta), -math.sin(theta))
+        rotation = complex(math.cos(self.w0 * t), -math.sin(self.w0 * t))
         out: list[float] = []
-        for kind, names, _s in cols:
+        for kind, names, _scale in cols:
             if kind == "vector":
-                z = complex(row[names[0]], row[names[1]]) * rot
-                out += [z.real, z.imag]
+                value = complex(row[names[0]], row[names[1]]) * rotation
+                out += [value.real, value.imag]
             elif kind == "fixed":
                 out += [row[names[0]], row[names[1]]]
             elif kind == "triple":
-                d = np.array([row[k] for k in names])
-                z = abc2complex(d) * rot
-                out += [z.real, z.imag, float(d.mean())]
+                values = np.array([row[name] for name in names])
+                value = abc2complex(values) * rotation
+                out += [value.real, value.imag, float(values.mean())]
             else:
                 out.append(row[names[0]])
         return np.array(out)
 
-    def from_frame(self, x: np.ndarray, t: float, cols: list, row: dict[str, float]) -> dict[str, float]:
-        theta = self.w0 * t
-        rot = complex(math.cos(theta), math.sin(theta))
+    def from_frame(self, values: np.ndarray, t: float, cols: list,
+                   row: dict[str, float]) -> dict[str, float]:
+        rotation = complex(math.cos(self.w0 * t), math.sin(self.w0 * t))
         out = dict(row)
-        i = 0
-        for kind, names, _s in cols:
+        index = 0
+        for kind, names, _scale in cols:
             if kind == "vector":
-                z = complex(x[i], x[i + 1]) * rot
-                out[names[0]], out[names[1]] = z.real, z.imag
+                value = complex(values[index], values[index + 1]) * rotation
+                out[names[0]], out[names[1]] = value.real, value.imag
             elif kind == "fixed":
-                out[names[0]], out[names[1]] = float(x[i]), float(x[i + 1])
+                out[names[0]], out[names[1]] = float(values[index]), float(values[index + 1])
             elif kind == "triple":
-                d = complex2abc(complex(x[i], x[i + 1]) * rot) + x[i + 2]
-                for k, name in enumerate(names):
-                    out[name] = float(d[k])
+                phases = complex2abc(complex(values[index], values[index + 1]) * rotation)
+                phases += values[index + 2]
+                for offset, name in enumerate(names):
+                    out[name] = float(phases[offset])
             elif kind in ("scalar", "angle"):
-                out[names[0]] = float(x[i])
-            i += coordinate_width(kind)
+                out[names[0]] = float(values[index])
+            index += coordinate_width(kind)
         return out
-
-    # --------------------------------------------------------- one period of it
     def advance(self, row: dict[str, float], t: float,
                 view: tuple[str, float, str] | None = None) -> dict[str, float]:
-        """Return the state row one period after ``t``.
-
-        view: optional ``(plant state label, offset, channel)``; the offset is seen by the
-        integration (``"b"``) or by the end-of-period sample (``"c"``).
-        """
+        """Return the named state after the configured transition period."""
         initial = dataclasses.replace(
             self._p.simulation.initial, t=t,
-            states={k: v for k, v in row.items() if not k.startswith("solver.")})
-        p = dataclasses.replace(self._p, simulation=dataclasses.replace(
-            self._p.simulation, t_end=t + self.period, initial=initial))
-        sim = self._cls(p, parts=self._factories)
-        model = sim.system.model
+            states={name: value for name, value in row.items()
+                    if not name.startswith("solver.")},
+        )
+        parameters = dataclasses.replace(
+            self._p,
+            simulation=dataclasses.replace(
+                self._p.simulation, t_end=t + self.period, initial=initial
+            ),
+        )
+        simulation = Simulation(parameters, parts=self._factories)
+        model = simulation.system.model
         if view is not None:
-            label, off, channel = view
-            vec = np.zeros(model.n_states)
-            vec[list(model.state_labels()).index(label)] = off
-            t_end = t + self.period
-            if channel == "b":  # what the integration sees
-                rhs0 = model.rhs
-                model.rhs = lambda tt, y: rhs0(tt, y + vec)  # type: ignore[method-assign]
-            else:  # what the end-of-period sample reads
-                sync0 = model.sync
-                model.sync = lambda tt, y: sync0(tt, y + vec if tt >= t_end - _LOOPMAP_EPS else y)  # type: ignore[method-assign]
-        res = sim.run(out_dir=None)
-        out = res.final_states()
-        if res.summary.get("stop_reason") or not math.isclose(
+            label, offset, channel = view
+            vector = np.zeros(model.n_states)
+            vector[list(model.state_labels()).index(label)] = offset
+            end = t + self.period
+            if channel == "b":
+                rhs = model.rhs
+                model.rhs = lambda time, state: rhs(time, state + vector)  # type: ignore[method-assign]
+            else:
+                sync = model.sync
+                model.sync = lambda time, state: sync(  # type: ignore[method-assign]
+                    time, state + vector if time >= end - _TRANSITION_EPS else state
+                )
+        result = simulation.run(out_dir=None)
+        out = result.final_states()
+        if result.summary.get("stop_reason") or not math.isclose(
                 out.pop("t"), t + self.period, rel_tol=0.0, abs_tol=TIME_EPS):
-            raise FloatingPointError("loop advance did not complete its analysis period")
+            raise FloatingPointError("state transition did not complete its analysis period")
         if view is not None and view[2] == "c":
             out[view[0]] -= view[1]
         return out
-
-
-# --------------------------------------------------------- command-line entry
-
-def _example_configs_dir() -> Path:
-    """Return the root examples directory, from a checkout or an installed wheel."""
-    source = Path(__file__).resolve().parents[3] / "examples"
-    if source.is_dir():
-        return source
-    # data-files live below the installation prefix, outside the import package. A ``--target``
-    # installation puts them below the metadata root; a normal environment uses sysconfig's data root.
-    for distribution_name in ("peslite", "peslite-core"):
-        try:
-            dist = distribution(distribution_name)
-        except PackageNotFoundError:
-            continue
-        roots = (Path(dist.locate_file("")).resolve(), Path(sysconfig.get_path("data")).resolve())
-        for root in roots:
-            candidate = root / "share" / "peslite" / "examples"
-            if candidate.is_dir():
-                return candidate
-    return source
-
-
-_EXAMPLE_CONFIGS = _example_configs_dir()
-_RESULTS = Path.cwd() / "output"
-_CONFIG_SUFFIXES = (".pes",)
-
-
-def _config_path(value: str | None) -> Path:
-    if value is None:
-        default = _EXAMPLE_CONFIGS / "gfl-example.pes"
-        if default.is_file():
-            return default.resolve()
-        configs = sorted(
-            p for p in _EXAMPLE_CONFIGS.iterdir()
-            if p.is_file() and p.suffix.lower() in _CONFIG_SUFFIXES
-        )
-        if not configs:
-            raise FileNotFoundError("no bundled example configurations available")
-        return configs[0]
-    path = Path(value).expanduser()
-    candidates = [path]
-    if not path.suffix:
-        candidates += [path.with_suffix(s) for s in _CONFIG_SUFFIXES]
-    example = _EXAMPLE_CONFIGS / path
-    candidates.append(example)
-    if not path.suffix:
-        candidates += [example.with_suffix(s) for s in _CONFIG_SUFFIXES]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    raise FileNotFoundError(f"configuration not found: {value}")
-
-def parse_override(text: str):
-    key, _, value = text.partition("=")
-    if not key or not _:
-        raise argparse.ArgumentTypeError("expected key.path=value")
-    for cast in (int, float):
-        try:
-            v = cast(value)
-            if cast is int and str(v) != value:
-                continue
-            return key, v
-        except ValueError:
-            pass
-    if value.lower() in ("true", "false"):
-        return key, value.lower() == "true"
-    if value.lower() in ("null", "none"):
-        return key, None
-    return key, value
-
-
-def _solver_choice_is_set(overrides: Mapping[str, Any]) -> bool:
-    """Whether ``--set`` selected a solver family or method for this run."""
-    return any(
-        path in ("simulation.solver.type", "simulation.solver.method")
-        for path in overrides
-    )
-
-
-@dataclass
-class _CommandOutcome:
-    code: int
-    payload: dict[str, Any]
-
-
-class _CommandFailure(Exception):
-    def __init__(self, code: int, error_code: str, message: str, path: str | None = None,
-                 config: str | Path | None = None) -> None:
-        super().__init__(message)
-        self.code, self.error_code, self.path, self.config = code, error_code, path, config
-
-
-def _absolute(path: str | Path) -> str:
-    return str(Path(path).resolve())
-
-
-def _payload(command: str, *, config: str | Path | None = None, status: str = "ok",
-             code: int = 0, output=None, simulation=None, diagnostics=(), error=None,
-             **extra) -> dict[str, Any]:
-    return {
-        "schema": "peslite.cli/v1",
-        "command": command,
-        "status": status,
-        "exit_code": code,
-        "config": _absolute(config) if config is not None else None,
-        "output": output,
-        "simulation": simulation,
-        "diagnostics": list(diagnostics),
-        "physical_validation": "not_performed",
-        "error": error,
-        **extra,
-    }
-
-
-def _json_safe(value):
-    """Convert command results to strict JSON without non-finite numeric extensions."""
-    if isinstance(value, Mapping):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, Path):
-        return _absolute(value)
-    if isinstance(value, np.generic):
-        return _json_safe(value.item())
-    if isinstance(value, complex):
-        return [_json_safe(value.real), _json_safe(value.imag)]
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value
-
-
-def _summary_diagnostics(p: Params, summary: Mapping[str, Any]) -> list[dict[str, str]]:
-    diagnostics = []
-    for unit_name, _cfg in _unit_items(p.units):
-        trip_cause = summary.get(f"{unit_name}.trip_cause")
-        alarms = summary.get(f"{unit_name}.alarms") or []
-        messages = ([f"tripped: {trip_cause}"] if trip_cause else []) + list(alarms)
-        diagnostics.extend({"severity": "warning", "code": "unit_warning",
-                            "message": f"{unit_name}: {message}"}
-                           for message in messages)
-    return diagnostics
-
-
-def _run_exit(summary: Mapping[str, Any]) -> tuple[int, str | None]:
-    reason = summary.get("stop_reason")
-    if summary.get("status") == "timed_out":
-        return 5, "timeout"
-    if reason and str(reason).startswith("RHS evaluation limit"):
-        return 5, "resource_limit"
-    if summary.get("status") == "diverged":
-        return 4, "simulation_diverged"
-    if reason:
-        return 4, "simulation_stopped"
-    return 0, None
-
-
-def _run_outcome(config: Path, out: Path, result: SimulationResult) -> _CommandOutcome:
-    summary = result.summary
-    simulation_status = summary.get("status", "completed")
-    reason = summary.get("stop_reason")
-    code, error_code = _run_exit(summary)
-    diagnostics = _summary_diagnostics(result.params, summary)
-    output = {
-        "directory": _absolute(out),
-        "summary": _absolute(out / "summary.json"),
-        "files": [_absolute(path) for path in result.files],
-    }
-    simulation = {
-        "status": simulation_status,
-        "t_start": summary.get("t_start"),
-        "t_end": result.params.simulation.t_end,
-        "t_stop": summary.get("t_stop"),
-        "wall_time": result.wall_time,
-        "rhs_evaluations": result.n_rhs,
-        "tripped": bool(summary.get("tripped")),
-    }
-    error = None if code == 0 else {"code": error_code, "message": reason, "path": None}
-    return _CommandOutcome(code, _payload(
-        "run", config=config, status="ok" if code == 0 else "error", code=code,
-        output=output, simulation=simulation, diagnostics=diagnostics, error=error,
-    ))
-
-
-_BRIDGE_PRESETS = {"switching": ("fixed", "RK4"), "pwm_averaging": ("fixed", "RK4"),
-                   "averaging": ("adaptive", "DP45")}
-
-
-def _command_parser(*args, **kwargs) -> argparse.ArgumentParser:
-    """Build a command parser with exact, stable option names."""
-    return argparse.ArgumentParser(*args, allow_abbrev=False, **kwargs)
-
-
-def _add_configuration_arguments(ap: argparse.ArgumentParser, *, optional: bool = False) -> None:
-    ap.add_argument("config", nargs="?" if optional else None,
-                    help="simulation file path or bundled example name"
-                         + ("; default: gfl-example" if optional else ""))
-    ap.add_argument("--set", action="append", default=[], type=parse_override, metavar="PATH=VALUE",
-                    help="override a dotted parameter path (repeatable)")
-    ap.add_argument("--initial", default=None, metavar="FILE",
-                    help="initial values: a states.csv row or a simulation file's simulation.initial block")
-    ap.add_argument("--initial-time", type=float, default=None, metavar="T",
-                    help="with a states.csv: start from the row at time T instead of the last row")
-    bridge = ap.add_mutually_exclusive_group()
-    bridge.add_argument("--switching", action="store_true",
-                        help="exact-switching bridge with fixed-step RK4; --set has priority")
-    bridge.add_argument("--pwm-averaging", action="store_true",
-                        help="PWM-period-averaged bridge with fixed-step RK4; --set has priority")
-    bridge.add_argument("--averaging", action="store_true",
-                        help="ideal averaged bridge with adaptive DP45; --set has priority")
-
-
-def _parse_command_args(ap: argparse.ArgumentParser, argv=None):
-    args = ap.parse_args(argv)
-    if args.initial_time is not None and args.initial is None:
-        ap.error("--initial-time selects a row of a states.csv: add --initial FILE")
-    return args
-
-
-def _load_command_params(args, extra_overrides: Mapping[str, Any] | None = None
-                         ) -> tuple[Path, Params, str | None, str]:
-    try:
-        config = _config_path(args.config)
-    except FileNotFoundError as exc:
-        if args.json:
-            raise _CommandFailure(2, "input_error", str(exc), config=args.config) from None
-        raise
-    set_overrides = dict(args.set)
-    overrides = {**set_overrides, **(extra_overrides or {})}
-    try:
-        p, interface_text = _load_case(
-            config, initial=args.initial, initial_time=args.initial_time, **overrides,
-        )
-    except ConfigError as exc:
-        if args.json:
-            raise _CommandFailure(2, "configuration_error", str(exc), config=config) from None
-        raise
-    model = next((flag for flag in _BRIDGE_PRESETS if getattr(args, flag)), None)
-    if model is None:
-        return config, p, None, interface_text
-    effective_models = []
-    for name, cfg in _unit_items(p.units):
-        path = f"units.{name}.bridge.model"
-        selected = cfg.bridge.model
-        if path not in set_overrides:
-            try:
-                p = p.replace(**{path: model})
-            except ConfigError as exc:
-                warnings.warn(
-                    f"--{model.replace('_', '-')} does not apply to units.{name}: "
-                    f"{exc}; keeping bridge.model = {selected!r}",
-                    stacklevel=3,
-                )
-            else:
-                selected = model
-        effective_models.append(selected)
-    solver_type, method = (_BRIDGE_PRESETS[model] if all(
-        selected == model for selected in effective_models
-    ) else _BRIDGE_PRESETS["switching"])
-    changes = {}
-    if not _solver_choice_is_set(set_overrides):
-        changes.update({
-            "simulation.solver.type": solver_type,
-            "simulation.solver.method": method,
-        })
-        if solver_type == "adaptive" and not any(
-                path == "simulation.solver.subsystems"
-                or path.startswith("simulation.solver.subsystems.")
-                for path in set_overrides):
-            changes["simulation.solver.subsystems"] = {}
-    return config, p.replace(**changes) if changes else p, model, interface_text
-
-
-def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
-    """Run a simulation file and save its states, summary and configured signals."""
-    ap = _command_parser(
-        prog=prog, description=_run_main.__doc__,
-        epilog="commands: run, create, validate, inspect, export; a simulation file without a command implies run",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    _add_configuration_arguments(ap, optional=True)
-    ap.add_argument("--out", default=None,
-                    help="output directory (default: output/<file name>, or "
-                         "a bridge-mode suffix with --switching/--pwm-averaging/--averaging)")
-    ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
-    ap.add_argument("--timeout", type=float, default=None, metavar="SECONDS",
-                    help="stop after this much wall time")
-    ap.add_argument("--max-rhs", type=int, default=None, metavar="COUNT",
-                    help="stop after this many solver RHS evaluations")
-    ap.add_argument("--progress", action=argparse.BooleanOptionalAction, default=None,
-                    help="show or hide the terminal progress bar")
-    ap.add_argument("--watch", action="append", default=None, metavar="NAME",
-                    help="append a state or plant/control value to the progress bar; repeatable, "
-                         "or use NAME,NAME")
-    ap.add_argument("--report", action="store_true",
-                    help="generate <simulation name>_report.json using the optional analysis addon")
-    plots = ap.add_argument_group("IEEE-style PDF plot (after simulation)")
-    plots.add_argument("--plot", nargs="+", default=None, metavar="NAME",
-                       help="plot these recorded columns against time; all must belong to one result CSV")
-    presentation = [  # their destinations are the keywords of SimulationResult.plot
-        plots.add_argument("--plot-output", dest="output", default=None, metavar="PDF",
-                           help="PDF path relative to the run directory (default: fig_<table>.pdf)"),
-        plots.add_argument("--plot-x", dest="x", default="t", metavar="NAME",
-                           help="horizontal-axis column (default: t)"),
-        plots.add_argument("--plot-time-unit", dest="time_unit", choices=("auto", "s", "ms", "us"), default="auto",
-                           help="time-axis unit (default: choose s, ms, or us from the range)"),
-        plots.add_argument("--plot-title", dest="title", default=None, metavar="TEXT"),
-        plots.add_argument("--plot-xlabel", dest="xlabel", default=None, metavar="TEXT"),
-        plots.add_argument("--plot-ylabel", dest="ylabel", default=None, metavar="TEXT"),
-        plots.add_argument("--plot-label", dest="labels", action="append", default=None, metavar="TEXT",
-                           help="legend label for each waveform, in --plot order; repeatable"),
-        plots.add_argument("--plot-color", dest="colors", action="append", default=None, metavar="COLOR",
-                           help="Matplotlib color for each waveform, in --plot order; repeatable"),
-        plots.add_argument("--plot-style", dest="linestyles", action="append", default=None, metavar="STYLE",
-                           help="line style for each waveform, in --plot order; repeatable"),
-        plots.add_argument("--plot-width", dest="width", choices=("single", "double"), default="single",
-                           help="IEEE single- or double-column width (default: single)"),
-        plots.add_argument("--plot-height", dest="height", type=float, default=None, metavar="INCHES"),
-        plots.add_argument("--plot-linewidth", dest="linewidth", type=float, default=1.5, metavar="POINTS"),
-        plots.add_argument("--plot-xlim", dest="xlim", type=float, nargs=2, default=None, metavar=("MIN", "MAX")),
-        plots.add_argument("--plot-ylim", dest="ylim", type=float, nargs=2, default=None, metavar=("MIN", "MAX")),
-        plots.add_argument("--plot-no-grid", dest="grid", action="store_false", help="disable the background grid"),
-        plots.add_argument("--plot-no-legend", dest="legend", action="store_false", help="disable the legend"),
-    ]
-    args = _parse_command_args(ap, argv)
-
-    plot_options = {action.dest: getattr(args, action.dest) for action in presentation}
-    if args.timeout is not None and (not math.isfinite(args.timeout) or args.timeout <= 0.0):
-        ap.error("--timeout must be finite and positive")
-    if args.max_rhs is not None and args.max_rhs <= 0:
-        ap.error("--max-rhs must be positive")
-    if args.json and (args.progress is not None or args.watch):
-        ap.error("--json cannot be combined with terminal progress options")
-    if args.plot is None and any(plot_options[action.dest] != action.default for action in presentation):
-        ap.error("plot presentation options require --plot NAME [NAME ...]")
-    overrides = {}
-    if args.json:
-        overrides["simulation.progress.enable"] = False
-    if args.progress is not None:
-        overrides["simulation.progress.enable"] = args.progress
-    if args.watch is not None:
-        overrides["simulation.progress.watch"] = [name for value in args.watch
-                                                   for name in value.split(",") if name]
-    try:
-        config, p, model, interface_text = _load_command_params(args, overrides)
-    except FileNotFoundError as exc:
-        ap.error(str(exc))
-    if (args.progress is None and not p.simulation.progress.enable
-            and bool(getattr(sys.stdout, "isatty", lambda: False)())):
-        p = p.replace(**{"simulation.progress.enable": True})
-    if args.watch and not p.simulation.progress.enable:
-        ap.error("--watch prints on the progress bar: add --progress")
-    if args.plot:
-        try:
-            from ..addons import functions
-            _plot_result = functions.plot_result
-        except (ImportError, RuntimeError) as exc:
-            ap.error(f"--plot: {exc}")
-    sim = _assemble_command(p, config, args.json, interface_text)
-    suffix = "-" + model.replace("_", "-") if model is not None else ""
-    out = Path(args.out) if args.out else _RESULTS / f"{config.stem}{suffix}"
-    reporter = None
-    if args.report:
-        try:
-            from ..addons import functions
-            reporter = functions.small_signal_report
-        except functions.FunctionUnavailableError:
-            pass
-        if not callable(reporter):
-            warnings.warn("--report: the online stability analysis addon is unavailable; "
-                          "continuing the simulation without a report", RuntimeWarning, stacklevel=2)
-            reporter = None
-    limits = {name: value for name, value in (("timeout", args.timeout), ("max_rhs", args.max_rhs))
-              if value is not None}
-    if reporter is not None:
-        reporter(sim, out_dir=out, name=config.stem, info={"config": str(config)}, **limits)
-        r = sim.result
-    else:
-        r = sim.run(out_dir=out, info={"config": str(config)}, name=config.stem, **limits)
-    s = r.summary
-    diagnostics = _summary_diagnostics(p, s)
-    if not args.json:
-        for diagnostic in diagnostics:
-            print(f"warning: {diagnostic['message']}", file=sys.stderr)
-    if args.plot:
-        output, plot_options["output"] = plot_options["output"], None
-        if output:
-            output = Path(output) if Path(output).is_absolute() else out / output
-            plot_options["output"] = output if output.suffix else output.with_suffix(".pdf")
-        try:
-            r.plot(args.plot, **plot_options)
-        except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:
-            ap.error(str(exc))
-    if args.json:
-        return _run_outcome(config, out, r)
-    t_stop = s.get("t_stop", 0)
-    status = s.get("status", "completed").replace("_", " ").title()
-    trip = ", tripped" if s.get("tripped") else ""
-    print(
-        f"{status}: t = {t_stop:.6g} s, wall = {r.wall_time:.1f} s, "
-        f"RHS = {r.n_rhs}{trip}, output = {out}"
-    )
-    return _run_exit(s)[0]
-
-
-def _assemble_command(p: Params, config: Path, json_output: bool,
-                      interface_text: str = "") -> Simulation:
-    try:
-        return validate_model(p, interface_text=interface_text)
-    except ConfigError as exc:
-        if json_output:
-            raise _CommandFailure(3, "assembly_error", str(exc), config=config) from None
-        raise
-
-
-def _open_file(path: Path) -> None:
-    """Open *path* with the operating system's associated application."""
-    import os
-    import shlex
-    import subprocess
-
-    if sys.platform == "win32":
-        os.startfile(path)  # type: ignore[attr-defined]
-        return
-    editor = (os.environ.get("VISUAL", "").strip()
-              or os.environ.get("EDITOR", "").strip())
-    if editor:
-        try:
-            command = shlex.split(editor)
-        except ValueError as exc:
-            raise OSError(f"invalid editor command: {exc}") from exc
-        options = {}
-    else:
-        command = ["open" if sys.platform == "darwin" else "xdg-open"]
-        options = {
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.PIPE,
-            "text": True,
-            "timeout": 10,
-        }
-    try:
-        result = subprocess.run([*command, str(path)], **options)
-    except subprocess.SubprocessError as exc:
-        raise OSError(str(exc)) from exc
-    if result.returncode:
-        detail = (result.stderr.strip() if result.stderr else
-                  f"exit code {result.returncode}")
-        raise OSError(f"{command[0]}: {detail}")
-
-
-def _create_main(argv=None) -> int | _CommandOutcome:
-    """Create a simulation file or project add-on from a bundled template."""
-    ap = _command_parser(prog="peslite create", description=_create_main.__doc__)
-    ap.add_argument("name", help="file name to create (.pes or .py)")
-    ap.add_argument("--open", action="store_true",
-                    help="open the created file with the configured editor or default application")
-    ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
-    args = ap.parse_args(argv)
-    name = Path(args.name)
-    if name.name != args.name or name.suffix not in {".pes", ".py"}:
-        ap.error("provide a file name ending in .pes or .py in the current directory")
-    target = Path.cwd() / name
-    templates = _EXAMPLE_CONFIGS / "templates"
-    template = templates / "template.pes"
-    replacements = ()
-    if name.suffix == ".py":
-        class_name = "".join(part[:1].upper() + part[1:] for part in name.stem.split("_"))
-        if (not name.stem.isascii() or not name.stem.isidentifier()
-                or keyword.iskeyword(name.stem) or not class_name.isidentifier()):
-            ap.error("Python file names must be ASCII Python identifiers")
-        kind = "component" if name.stem == "component" else "controller"
-        template = templates / f"{kind}.py"
-        target = Path.cwd() / "PESaddons" / ("components" if kind == "component" else "control") / name
-        replacements = ((f"Template{kind.title()}", class_name),
-                        (f"template_{kind}", name.stem.lower()))
-    try:
-        text = template.read_text(encoding="utf-8")
-        for original, replacement in replacements:
-            text = text.replace(original, replacement)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("x", encoding="utf-8") as stream:
-            stream.write(text)
-    except OSError as exc:
-        ap.error(str(exc))
-    if args.open:
-        try:
-            _open_file(target)
-        except OSError as exc:
-            warnings.warn(f"could not open {target}: {exc}", stacklevel=2)
-    if args.json:
-        return _CommandOutcome(0, _payload("create", output={
-            "directory": _absolute(target.parent), "summary": None, "files": [_absolute(target)],
-        }))
-    print("created", target)
-    return 0
-
-
-def _validate_main(argv=None) -> int | _CommandOutcome:
-    """Validate and assemble one configuration without running it."""
-    ap = _command_parser(prog="peslite validate", description=_validate_main.__doc__)
-    _add_configuration_arguments(ap)
-    ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
-    args = _parse_command_args(ap, argv)
-    try:
-        config, p, _model, interface_text = _load_command_params(args)
-    except FileNotFoundError as exc:
-        ap.error(str(exc))
-    simulation = _assemble_command(p, config, args.json, interface_text)
-    validation = {
-        "status": "valid",
-        "units": list(simulation.units),
-        "state_count": len(simulation.state_names()),
-        "solver": {"type": p.simulation.solver.type, "method": p.simulation.solver.method},
-    }
-    if args.json:
-        return _CommandOutcome(0, _payload("validate", config=config, validation=validation))
-    print(
-        f"Valid: {config}  units = {len(validation['units'])}, "
-        f"states = {validation['state_count']}, "
-        f"solver = {validation['solver']['type']}/{validation['solver']['method']}"
-    )
-    return 0
-
-
-def _inspect_main(argv=None) -> int | _CommandOutcome:
-    """Inspect parameters, states, electrical groups and the port-Hamiltonian structure without running."""
-    ap = _command_parser(prog="peslite inspect", description=_inspect_main.__doc__)
-    _add_configuration_arguments(ap)
-    ap.add_argument("--resolved", action="store_true", help="show the complete resolved configuration")
-    ap.add_argument("--states", action="store_true", help="show the generated state names")
-    ap.add_argument("--ph-report", action="store_true", help="show the port-Hamiltonian structure report")
-    ap.add_argument("--groups", action="store_true", help="show the automatic electrical partition")
-    ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
-    args = _parse_command_args(ap, argv)
-    try:
-        config, p, _model, interface_text = _load_command_params(args)
-    except FileNotFoundError as exc:
-        ap.error(str(exc))
-    selected = {"resolved": args.resolved, "states": args.states,
-                "ph_report": args.ph_report, "groups": args.groups}
-    if not any(selected.values()):
-        selected = dict.fromkeys(selected, True)
-    simulation = None
-    if selected["states"] or selected["ph_report"] or selected["groups"]:
-        assembly_p = p
-        if selected["ph_report"] and p.simulation.energy_check == "off":
-            assembly_p = p.replace(**{"simulation.energy_check": "warn"})
-        simulation = _assemble_command(assembly_p, config, args.json, interface_text)
-    values = {}
-    if selected["resolved"]:
-        values["resolved"] = to_dict(p)
-    if selected["states"]:
-        values["states"] = simulation.state_names()
-        values["state_count"] = len(values["states"])
-    if selected["ph_report"]:
-        values["ph_report"] = simulation.ph_report.to_dict()
-    if selected["groups"]:
-        values["groups"] = [circuit.grouping_report() for circuit in simulation.system.circuits]
-    if args.json:
-        return _CommandOutcome(0, _payload("inspect", config=config, **values))
-    views = {
-        "resolved": ("Resolved configuration", lambda: dumps(p, interface_text).rstrip()),
-        "states": ("States", lambda: "\n".join(values["states"])),
-        "ph_report": ("Port-Hamiltonian report", lambda: str(simulation.ph_report)),
-        "groups": ("Electrical groups", lambda: json.dumps(values["groups"], indent=2)),
-    }
-    sections = [(title, render()) for name, (title, render) in views.items() if selected[name]]
-    print(sections[0][1] if len(sections) == 1 else
-          "\n\n".join(title + ":\n" + body for title, body in sections))
-    return 0
-
-
-def _export_main(argv=None) -> int | _CommandOutcome:
-    """Export a standalone C++ simulator or an Imperix ELF executable."""
-    ap = _command_parser(prog="peslite export", description=_export_main.__doc__)
-    _add_configuration_arguments(ap)
-    ap.add_argument("parameters", nargs="*", metavar="PARAM",
-                    help="variable parameter path, common or all")
-    ap.add_argument("--out", default=None, help="export directory")
-    ap.add_argument("--imperix", action="store_true", help="export an Imperix ELF")
-    ap.add_argument("--imperix-config", metavar="FILE", help="ADC/PWM bindings; default: PESFILE.imperix.json")
-    ap.add_argument("--imperix-sdk", metavar="DIRECTORY", help="installed official Imperix SDK")
-    ap.add_argument("--imperix-source-only", action="store_true", help="generate sources without building an ELF")
-    ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
-    args = _parse_command_args(ap, argv)
-    if not args.imperix and (args.imperix_config or args.imperix_sdk or args.imperix_source_only):
-        ap.error("Imperix options require --imperix")
-    try:
-        config, p, model, interface_text = _load_command_params(args)
-    except FileNotFoundError as exc:
-        ap.error(str(exc))
-    simulation = _assemble_command(p, config, args.json, interface_text)
-    suffix = "-" + model.replace("_", "-") if model is not None else ""
-    out = Path(args.out) if args.out else Path("export") / f"{config.stem}{suffix}"
-    export_format = "imperix" if args.imperix else "cpp"
-    options = {}
-    if args.imperix:
-        options = dict(target_config=args.imperix_config or config.with_suffix(".imperix.json"),
-                       sdk=args.imperix_sdk, build=not args.imperix_source_only)
-    try:
-        result = simulation.export(export_format, out, name=f"{config.stem}{suffix}",
-                                   variables=args.parameters, **options)
-    except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        if args.json:
-            raise _CommandFailure(4, "export_error", str(exc), config=config) from None
-        ap.error(str(exc))
-    diagnostics = [{"severity": item.get("severity", "warning"),
-                    "code": item.get("code", "export_warning"), "message": item["message"]}
-                   for item in result.diagnostics]
-    if args.json:
-        output = {"directory": _absolute(out), "summary": None,
-                  "files": [_absolute(path) for path in result.files]}
-        return _CommandOutcome(0, _payload(
-            "export", config=config, output=output, diagnostics=diagnostics,
-            export={"format": export_format},
-        ))
-    for diagnostic in diagnostics:
-        print("warning:", diagnostic["message"], file=sys.stderr)
-    print("wrote", ", ".join(str(path) for path in result.files))
-    return 0
-
-
-def _warning_diagnostics(caught) -> list[dict[str, str]]:
-    return [{
-        "severity": "warning",
-        "code": "warning",
-        "message": str(item.message),
-    } for item in caught]
-
-
-def _error_outcome(command: str, code: int, error_code: str, message: str, *,
-                   config: str | Path | None = None, path: str | None = None) -> _CommandOutcome:
-    return _CommandOutcome(code, _payload(
-        command, config=config, status="error", code=code,
-        error={"code": error_code, "message": message, "path": path},
-    ))
-
-
-def _json_command(command: str, invoke: Callable[[], int | _CommandOutcome]) -> int:
-    stdout, stderr = io.StringIO(), io.StringIO()
-    with warnings.catch_warnings(record=True) as caught, redirect_stdout(stdout), redirect_stderr(stderr):
-        warnings.simplefilter("always")
-        try:
-            outcome = invoke()
-        except _CommandFailure as exc:
-            outcome = _error_outcome(command, exc.code, exc.error_code, str(exc),
-                                     config=exc.config, path=exc.path)
-        except SystemExit as exc:
-            code = int(exc.code or 0)
-            if code == 0:
-                outcome = _CommandOutcome(0, _payload(command))
-            else:
-                lines = [line.strip() for line in stderr.getvalue().splitlines() if line.strip()]
-                message = lines[-1].partition("error: ")[2] if lines else "invalid command"
-                outcome = _error_outcome(command, code, "command_error", message)
-        except (FileNotFoundError, OSError) as exc:
-            outcome = _error_outcome(command, 2, "input_error", str(exc))
-        except ConfigError as exc:
-            outcome = _error_outcome(command, 2, "configuration_error", str(exc))
-        except (RuntimeError, FloatingPointError, ValueError) as exc:
-            outcome = _error_outcome(command, 4, "simulation_error", str(exc))
-        except Exception as exc:
-            outcome = _error_outcome(command, 70, "internal_error", str(exc))
-    if not isinstance(outcome, _CommandOutcome):
-        outcome = _CommandOutcome(int(outcome), _payload(
-            command, status="ok" if outcome == 0 else "error", code=int(outcome)
-        ))
-    outcome.payload["diagnostics"].extend(_warning_diagnostics(caught))
-    print(json.dumps(_json_safe(outcome.payload), indent=2, allow_nan=False))
-    return outcome.code
-
-
-def main(argv=None) -> int:
-    """Create, run, validate, inspect or export a PESLite simulation."""
-    values = list(sys.argv[1:] if argv is None else argv)
-    commands = {"run", "create", "validate", "inspect", "export"}
-    explicit_command = bool(values and values[0] in commands)
-    command = values.pop(0) if explicit_command else "run"
-    json_output = "--json" in values
-    if command == "run":
-        invoke = lambda: _run_main(values, prog="peslite run" if explicit_command else "peslite")
-    elif command == "validate":
-        invoke = lambda: _validate_main(values)
-    elif command == "inspect":
-        invoke = lambda: _inspect_main(values)
-    elif command == "create":
-        invoke = lambda: _create_main(values)
-    else:
-        invoke = lambda: _export_main(values)
-    if json_output:
-        return _json_command(command, invoke)
-    try:
-        return int(invoke())
-    except (ConfigError, OSError) as exc:
-        print(f"peslite {command}: error: {exc}", file=sys.stderr)
-        return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

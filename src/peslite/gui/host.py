@@ -19,9 +19,22 @@ from .preview_cache import PreviewLayoutCache
 from .workspace import Workspace, WorkspaceError
 
 
+def _debug_model(workspace: Workspace, path: Path, plan: Any) -> tuple[Path, str]:
+    """Resolve a plan's model inside the selected workspace."""
+    if not plan.model:
+        raise WorkspaceError("the debug plan must name its simulation model")
+    model = Path(plan.model).expanduser()
+    if not model.is_absolute():
+        model = path.parent / model
+    model = model.resolve()
+    if not model.is_relative_to(workspace.root) or model.suffix != ".pes":
+        raise WorkspaceError("the debug model must be a .pes file inside the workspace")
+    return model, model.relative_to(workspace.root).as_posix()
+
+
 def _native_preview(text: str, path: Path) -> dict[str, Any]:
     """Return diagnostics from the numerical parser; the browser renders the interface."""
-    from ..assembly.simulation_file import SimulationFileError, parse_native_text
+    from ..assembly.syntax import SimulationFileError, parse_native_text
     diagnostics = []
     try:
         parse_native_text(text, path)
@@ -48,10 +61,20 @@ class SimulationProcess:
         self._lock = threading.RLock()
 
     def start(self, name: str, *, trust_addons: bool = False) -> dict:
-        path = self.workspace.path(name, suffixes={".pes"})
+        path = self.workspace.path(name, suffixes={".pes", ".pesdbg"})
         if not path.is_file():
-            raise WorkspaceError("select an existing .pes file")
-        if self.workspace.has_project_addons(name) and not trust_addons:
+            raise WorkspaceError("select an existing .pes or .pesdbg file")
+        model = path
+        command = [self.python, "-m", "peslite.cli"]
+        if path.suffix == ".pesdbg":
+            from ..addons.functions.debug import read_debug_plan
+            plan = read_debug_plan(path)
+            model, model_name = _debug_model(self.workspace, path, plan)
+            command.extend(("debug", str(model), "--plan", str(path)))
+        else:
+            model_name = name
+            command.append(str(path))
+        if self.workspace.has_project_addons(model_name) and not trust_addons:
             raise WorkspaceError("project-local PESaddons execute Python code; explicit trust is required")
         with self._lock:
             if self.process is not None and self.process.poll() is None:
@@ -60,7 +83,7 @@ class SimulationProcess:
             self.path = name
             # Use the normal CLI, its default output directory and addon discovery.
             self.process = subprocess.Popen(
-                [self.python, "-m", "peslite.solver.simulation", str(path)],
+                command,
                 cwd=self.workspace.root, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, errors="replace", bufsize=1,
@@ -126,6 +149,37 @@ class Host:
                                                if params.get("byteOffset") is not None else None))
         if method == "summary.read":
             return self.files.summary(name)
+        if method == "debug.inspect":
+            target = self.files.path(name, suffixes={".pesdbg"})
+            text = params.get("text")
+            if not isinstance(text, str):
+                raise WorkspaceError("debug inspection requires source text")
+            from ..addons.functions.debug import parse_debug_text, prepare_debug
+            plan = parse_debug_text(text, target)
+            model, model_name = _debug_model(self.files, target, plan)
+            if self.files.has_project_addons(model_name):
+                if params.get("trustAddons") is not True:
+                    raise WorkspaceError(
+                        "project-local PESaddons execute Python code; explicit trust is required"
+                    )
+                from ..assembly.addons import register_project
+                register_project(model)
+            from ..assembly.params import _load_case
+            configured, _interface = _load_case(model)
+            prepared = prepare_debug(configured, plan, directory=target.parent)
+            source = self.files.read(model_name)["text"]
+            return {
+                "modelPath": model_name, "modelText": source,
+                "preview": _native_preview(source, model),
+                "operations": [
+                    {"kind": item.kind, "source": item.source, "target": item.target,
+                     "path": item.path, "value": item.value}
+                    for item in plan.operations
+                ],
+                "sources": list(plan.sources), "probes": dict(plan.probes),
+                "analyses": list(plan.analyses), "checks": list(plan.checks),
+                "watch": list(prepared.watch),
+            }
         if method in {"preview.layout.load", "preview.layout.save"}:
             target = self.files.path(name, suffixes={".pes"})
             if not target.is_file():
@@ -142,21 +196,24 @@ class Host:
             text = params.get("text")
             if not isinstance(text, str):
                 raise WorkspaceError("preview requires source text")
-            from ..assembly.simulation_file import is_native_source
+            from ..assembly.syntax import is_native_source
             if is_native_source(text):
                 if method != "preview":
                     raise WorkspaceError("new-syntax schematics must be edited in source text")
                 return _native_preview(text, target)
             if params.get("trustAddons") is True and self.files.has_project_addons(name):
-                from ..addons import _discover_for
+                from ..assembly.addons import register_project
                 # A workspace may place PESaddons next to a nested model or at
                 # the workspace root. Both locations require the same approval.
                 if (self.files.root / "PESaddons").is_dir():
-                    _discover_for(self.files.root / "workspace.pes")
-                _discover_for(target)
-            from ..addons.functions import (
-                legacy_yaml_add_component, legacy_yaml_patch, legacy_yaml_preview,
-                legacy_yaml_remove_component, legacy_yaml_rewire,
+                    register_project(self.files.root / "workspace.pes")
+                register_project(target)
+            from .legacy_yaml import (
+                validated_add_component as legacy_yaml_add_component,
+                validated_patch as legacy_yaml_patch,
+                preview as legacy_yaml_preview,
+                validated_remove_component as legacy_yaml_remove_component,
+                validated_rewire as legacy_yaml_rewire,
             )
             if method == "parameter.patch":
                 return {"edit": legacy_yaml_patch(text, target, params["key"], params["value"])}

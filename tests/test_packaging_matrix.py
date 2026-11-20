@@ -5,17 +5,15 @@ import re
 from pathlib import Path
 
 import pytest
+import tomllib
 import yaml
 from scripts.distributions import selections
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - exercised by the Python 3.10 CI job
-    import tomli as tomllib
 
 pytestmark = pytest.mark.static
 
 ROOT = Path(__file__).resolve().parents[1]
+ADDON_MANIFEST = ROOT / "src/peslite/addons/addons.toml"
+ADDON_DIRECTORIES = {"component": "components", "control": "control", "function": "functions"}
 PROJECTS = {
     "peslite-core": ROOT / "pyproject.toml",
     "peslite": ROOT / "packages/peslite/pyproject.toml",
@@ -32,6 +30,11 @@ def _project(path):
 def _requirements(project):
     return {re.split(r"[<>=!~; ]", requirement, maxsplit=1)[0]
             for requirement in project.get("dependencies", ())}
+
+
+def _addons():
+    with ADDON_MANIFEST.open("rb") as stream:
+        return tomllib.load(stream)
 
 
 def test_distribution_names_versions_and_dependencies_form_the_install_matrix():
@@ -64,27 +67,20 @@ def test_code_distributions_own_disjoint_source_files():
     for index, left in enumerate(code):
         for right in code[index + 1:]:
             assert owned[left].isdisjoint(owned[right])
-    assert Path("src/peslite/addons/__init__.py") in owned["peslite-core"]
-    assert Path("src/peslite/addons/functions/__init__.py") in owned["peslite-core"]
-    assert Path("src/peslite/addons/components/magcomponent.py") in owned["peslite"]
-    assert Path("src/peslite/addons/components/magcomponent.py") not in owned["peslite-core"]
+    assert Path("src/peslite/addons/addons.toml") in owned["peslite-core"]
+    for name, addon in _addons().items():
+        owner = "peslite" if addon["installation"] == "standard" else "peslite-full"
+        for category, directory in ADDON_DIRECTORIES.items():
+            if not addon[category]:
+                continue
+            path = Path(f"src/peslite/addons/{directory}/{name}.py")
+            assert path in owned[owner]
+            assert all(path not in files for distribution, files in owned.items()
+                       if distribution != owner)
     assert Path("src/peslite/addons/components/coupled_coils.py") not in set().union(
         *owned.values()
     )
-    assert Path("src/peslite/addons/components/cable.py") in owned["peslite"]
-    assert Path("src/peslite/addons/components/magport.py") in owned["peslite-full"]
-    assert Path("src/peslite/addons/functions/magport.py") in owned["peslite-full"]
-    assert Path("src/peslite/addons/functions/magcircuit.py") in owned["peslite-full"]
-    assert Path("src/peslite/addons/components/magcircuit.py") in owned["peslite-full"]
-    assert Path("src/peslite/addons/formats/__init__.py") in owned["peslite-core"]
-    assert Path("src/peslite/addons/formats/legacy_yaml.py") in owned["peslite"]
-    assert Path("src/peslite/addons/functions/stability.py") in owned["peslite"]
-    assert Path("src/peslite/addons/functions/thermal/__init__.py") in owned["peslite"]
-    assert Path("src/peslite/addons/components/thermal/__init__.py") in owned["peslite"]
-    assert Path("src/peslite/addons/components/thermalport.py") in owned["peslite-full"]
-    assert Path("src/peslite/addons/control/mpc.py") in owned["peslite"]
-    assert Path("src/peslite/addons/control/predictive.py") in owned["peslite"]
-    assert Path("src/peslite/addons/control/_native_mpc.py") in owned["peslite"]
+    assert Path("src/peslite/components/cable.py") in owned["peslite-core"]
     assert Path("src/peslite/gui/legacy_yaml.py") in owned["peslite-gui"]
     assert Path("src/peslite/gui/service.py") in owned["peslite-gui"]
     assert Path("src/peslite/gui/preview/parser.ts") in owned["peslite-gui"]
@@ -111,7 +107,9 @@ def test_templates_and_cases_have_distinct_owners():
     with (ROOT / "packages/distributions.json").open(encoding="utf-8") as handle:
         distributions = json.load(handle)["distributions"]
     assert distributions["peslite-core"]["files"] == ["examples/templates/*"]
-    assert distributions["peslite"]["files"] == ["examples/*.pes"]
+    assert distributions["peslite"]["files"] == [
+        "examples/*.pes", "examples/debug/*.pesdbg",
+    ]
 
 
 def test_public_documentation_describes_the_distribution_matrix_and_gui():
@@ -120,6 +118,32 @@ def test_public_documentation_describes_the_distribution_matrix_and_gui():
         assert distribution in installation
     navigation = (ROOT / "mkdocs.yml").read_text(encoding="utf-8")
     assert "Graphical Interface: Graphical-Interface.md" in navigation
+
+
+def test_addon_documentation_tracks_the_manifest():
+    rows = {}
+    for line in (ROOT / "docs/List-of-Addons.md").read_text(encoding="utf-8").splitlines():
+        if not line.startswith("| `"):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        rows[cells[0].strip("`")] = {
+            "version": cells[1],
+            "categories": tuple(item.strip().strip("`") for item in cells[2].split(",")),
+            "installation": cells[3],
+            "dependencies": (() if cells[4] == "—" else
+                             tuple(item.strip().strip("`") for item in cells[4].split(","))),
+        }
+    addons = _addons()
+    assert set(rows) == set(addons)
+    assert rows == {
+        name: {
+            "version": addon["version"],
+            "categories": tuple(category for category in ADDON_DIRECTORIES if addon[category]),
+            "installation": addon["installation"],
+            "dependencies": tuple(addon["dependencies"]),
+        }
+        for name, addon in addons.items()
+    }
 
 
 def test_release_uses_one_approval_gate_for_the_distribution_matrix():

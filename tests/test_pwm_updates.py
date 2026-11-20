@@ -67,6 +67,44 @@ def test_constant_gate_commands_do_not_wait_for_nonexistent_edges():
     assert update.next == (0.0,)
 
 
+@pytest.mark.parametrize(("alignment", "durations", "levels"), [
+    ("center", (2.1e-6, 5.8e-6, 2.1e-6), (1.0, 0.0, 1.0)),
+    ("trailing", (4.2e-6, 5.8e-6), (1.0, 0.0)),
+    ("leading", (5.8e-6, 4.2e-6), (0.0, 1.0)),
+])
+def test_carrier_alignment_locates_exact_switching_edges(alignment, durations, levels):
+    sequence = CarrierComparison(100e3, alignment=alignment)(0.0, 10e-6, np.array([0.42]))
+
+    assert sequence.dt == pytest.approx(durations, abs=1e-13)
+    assert sequence.q_abc[:, 0] == pytest.approx(levels)
+
+
+@pytest.mark.parametrize("alignment", ["trailing", "leading"])
+def test_synchronous_carrier_uses_the_selected_alignment(alignment):
+    frequency = 100e3
+    sequence = SynchronousCarrier(1, alignment=alignment)(
+        0.0, 10e-6, np.array([0.42]), 0.0, 2.0 * math.pi * frequency,
+    )
+
+    on_time = sum(dt for dt, word in zip(sequence.dt, sequence.q_abc) if word[0] > 0.5)
+    assert on_time == pytest.approx(4.2e-6, abs=1e-13)
+
+
+def test_alignment_uses_the_existing_modulator_configuration_boundary():
+    params = peslite.load(EXAMPLES / "buck-open-loop-example.pes")
+    assert params.units["converter"].pwm.alignment == "center"
+    assert CarrierComparison(100e3).alignment == "center"
+    assert SynchronousCarrier(1).alignment == "center"
+    switching = params.replace(**{
+        "units.converter.bridge.model": "switching",
+        "units.converter.pwm.alignment": "trailing",
+    })
+
+    assert peslite.Simulation(switching).unit("converter").bridge.modulator.alignment == "trailing"
+    with pytest.warns(UserWarning, match="pwm.alignment is ignored by ZOH"):
+        params.replace(**{"units.converter.pwm.alignment": "leading"})
+
+
 @pytest.mark.parametrize(("current", "durations"), [
     (1.0, [0.5, 0.3, 0.2]),
     (-1.0, [0.4, 0.5, 0.1]),

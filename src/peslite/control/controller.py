@@ -20,28 +20,22 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
+from ..defaults import (DEFAULT_ALGEBRAIC_ATOL, DEFAULT_ALGEBRAIC_MAX_ITERATIONS,
+                        DEFAULT_ALGEBRAIC_RTOL)
 from ..solver.model import (Bag, ConfigError, _complex, _component_plan, _dependency_plan,
                             _real, gather, scatter)
 from ..solver.energy import Port
-from ..solver.timing import control_clock_offset
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,
                     SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ,
                     Loop, SignalType, SyncLaw, loop_type)
 from .modulation import CONFIGURED, OutputStage
-from .profiles import (DutyReferenceParams, PhaseShiftReferenceParams, ReferenceParams,
-                       ResonantReferenceParams,
-                       ScalarCurrentReferenceParams, ScalarVoltageReferenceParams, control_type,
-                       register_control_type, validate_duty_references,
-                       validate_phase_shift_references,
-                       validate_resonant_references,
-                       validate_scalar_voltage_references)
 
 __all__ = ["Measurement", "ConverterMeasurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
            "ControlInterface", "CONTROL_INTERFACE", "SAMPLED_VSC_INTERFACE",
-           "ControlGraph", "default_wiring",
+           "ControlGraph", "ControlGraphOverlay",
            "VSCController", "BridgeControlOutput", "GraphController",
-           "make_controller"]
+           "GraphController"]
 
 
 # ------------------------------------------------------------------ the interface
@@ -301,6 +295,32 @@ class ContinuousStartup:
 _HELD, _MEASURED, _CONSTANT, _REFERENCE = 0, 1, 2, 3
 
 
+@dataclass(frozen=True)
+class ControlGraphOverlay:
+    """Construction-time connection, source and observation changes to one control graph."""
+
+    connections: Mapping[str, str | None] = field(default_factory=dict)
+    sources: Mapping[str, tuple[SignalType, Any]] = field(default_factory=dict)
+    probes: Mapping[str, str] = field(default_factory=dict)
+    retained: frozenset[str] = frozenset()
+    policies: Mapping[str, str] = field(default_factory=dict)
+    initial_t: float = 0.0
+
+
+def _control_connections(defaults: Mapping[str, str], ctrl: Any) -> dict[str, str]:
+    """Apply normal and optional construction-time connection changes through one merge."""
+    result = {**defaults, **ctrl.connections}
+    overlay = getattr(ctrl, "_control_overlay", None)
+    if overlay is None:
+        return result
+    for target, source in overlay.connections.items():
+        if source is None:
+            result.pop(target, None)
+        else:
+            result[target] = source
+    return result
+
+
 def _reference_bindings(ctrl) -> Mapping:
     """Return optional time-varying bindings from a controller configuration."""
     return getattr(ctrl, "_reference_bindings", {})
@@ -381,11 +401,11 @@ def continuous_control(unit: Any) -> bool:
     ctrl = getattr(unit, "ctrl", None)
     if ctrl is None:
         return True
-    profile = control_type(ctrl.type)
+    profile = ctrl._profile
     if profile.wiring is None:
         return False
     connections, outputs = profile.wiring(unit, continuous=True)
-    connections = {**connections, **ctrl.connections}
+    connections = _control_connections(connections, ctrl)
     outputs = {**outputs, **ctrl.outputs}
     required = {
         name for name in profile.interface.outputs
@@ -394,7 +414,14 @@ def continuous_control(unit: Any) -> bool:
     if not required <= outputs.keys():
         return False
     classes = {name: loop_type(params.type) for name, params in ctrl.loops.items()}
-    active = _active_loop_names(classes, connections, outputs.values())
+    overlay = getattr(ctrl, "_control_overlay", None)
+    sources = list(outputs.values())
+    if overlay is not None:
+        sources.extend(overlay.probes.values())
+        sources.extend(overlay.retained)
+        if "tracking" in overlay.policies.values():
+            return False
+    active = _active_loop_names(classes, connections, sources)
     return all(classes[name].supports_continuous() for name in active)
 
 
@@ -412,33 +439,36 @@ class ControlGraph:
     their new parameters and continue from their named states.
     """
 
-    _cycle_iterations = 16
-    _cycle_atol = 1e-10
-    _cycle_rtol = 1e-8
-
     def __init__(self, cfg, startup, connections, outputs, *, interface=CONTROL_INTERFACE,
-                 continuous: bool | None = None):
+                 continuous: bool | None = None,
+                 reference_validator=None,
+                 cycle_iterations: int = DEFAULT_ALGEBRAIC_MAX_ITERATIONS,
+                 cycle_atol: float = DEFAULT_ALGEBRAIC_ATOL,
+                 cycle_rtol: float = DEFAULT_ALGEBRAIC_RTOL):
         self.cfg, self.startup = cfg, startup
+        self._cycle_iterations = cycle_iterations
+        self._cycle_atol = cycle_atol
+        self._cycle_rtol = cycle_rtol
         self.interface = interface
         self._pending: list[Any] = []
         self.on_retune = None
-        self.connections = {**connections, **cfg.ctrl.connections}
+        self.overlay = getattr(cfg.ctrl, "_control_overlay", None)
+        self.connections = _control_connections(connections, cfg.ctrl)
         self.outputs = {**outputs, **cfg.ctrl.outputs}
         self.nodes = {}
         self.periods = {}
         self.continuous = (cfg.bridge.model == "averaging"
                            if continuous is None else bool(continuous))
         self._T = None if self.continuous else _real(cfg.ctrl.period)
-        self._t0 = control_clock_offset(
-            cfg.ctrl, cfg.pwm, pwm_timed=cfg.bridge.pwm_timed,
-        )
+        self._t0 = _real(0.0 if cfg.ctrl.offset is None else cfg.ctrl.offset)
         self.values: dict[str, Any] = {}
         self._out_specs: dict[str, tuple] = {}
         self._limits: dict[str, tuple[str, OutputLimit]] = {}
         self.updated = set()
         refs = cfg.ctrl.references
         self.reference_bindings = dict(_reference_bindings(cfg.ctrl))
-        self._reference_validator = control_type(cfg.ctrl.type).reference_validator
+        self._overlay_bindings = {}
+        self._reference_validator = reference_validator
         self.references = _reference_values(
             refs, attributes=bool(self.reference_bindings and self._reference_validator),
         )
@@ -457,6 +487,14 @@ class ControlGraph:
                 raise ConfigError(f"ctrl.loops.{name}: no loop type {loop.type!r} is registered")
             classes[name] = cls
             types.update({f"{name}.{port}": spec for port, spec in cls.outputs.items()})
+        if self.overlay is not None:
+            for name, (spec, signal) in self.overlay.sources.items():
+                if name in types:
+                    raise ConfigError(f"control overlay source {name!r} conflicts with a controller port")
+                types[name] = spec
+                self.references[name] = signal(self.overlay.initial_t)
+                self._overlay_bindings[name] = signal
+        self._bindings = (*self.reference_bindings.items(), *self._overlay_bindings.items())
         targets = {
             f"{name}.{port}": spec
             for name, cls in classes.items()
@@ -503,6 +541,13 @@ class ControlGraph:
             if source not in types or not types[source].compatible(spec):
                 raise ConfigError(f"ctrl.outputs.{port}: missing or incompatible source {source!r}")
             pending_sources.append(source)
+        if self.overlay is not None:
+            for alias, source in self.overlay.probes.items():
+                source = self.connections.get(source, source)
+                if source not in types:
+                    raise ConfigError(f"control overlay probe {alias!r}: unknown source {source!r}")
+                pending_sources.append(source)
+            pending_sources.extend(self.overlay.retained)
         if interface.optional_outputs:
             retained = frozenset(port for port in interface.optional_outputs
                                  if port in self.outputs)
@@ -536,6 +581,35 @@ class ControlGraph:
                                           for port, spec in node.outputs.items())
             self.periods[name] = loop.period
             self._store(name, node.initial_outputs(), real=_real, complex=_complex)
+        policies = {} if self.overlay is None else dict(self.overlay.policies)
+        unknown_policies = set(policies) - set(self.nodes)
+        if unknown_policies:
+            raise ConfigError(
+                f"control overlay state policy: inactive or unknown loops {sorted(unknown_policies)}"
+            )
+        invalid_policies = {
+            name: policy for name, policy in policies.items()
+            if policy not in {"continue", "freeze", "tracking"}
+        }
+        if invalid_policies:
+            raise ConfigError(f"control overlay state policy: unsupported values {invalid_policies}")
+        if self.continuous and "tracking" in policies.values():
+            raise ConfigError("control overlay state policy 'tracking' requires sampled control")
+        unsupported_tracking = [
+            name for name, policy in policies.items()
+            if policy == "tracking" and not callable(getattr(self.nodes[name], "track", None))
+        ]
+        if unsupported_tracking:
+            raise ConfigError(
+                "control overlay state policy 'tracking' is unsupported by loops "
+                f"{unsupported_tracking}"
+            )
+        self._frozen = frozenset(
+            name for name, policy in policies.items() if policy == "freeze"
+        )
+        self._tracking = frozenset(
+            name for name, policy in policies.items() if policy == "tracking"
+        )
         self.observation_names = tuple(
             f"{name}.{field}"
             for name, node in self.nodes.items()
@@ -556,9 +630,12 @@ class ControlGraph:
             name: {port: self.values[key] for port, key, _complex in self._out_specs[name]}
             for name in self.nodes
         }
-        self._samples = {name: node.sample_into for name, node in self.nodes.items()}
+        self._samples = {name: self._sample_method(name, node)
+                         for name, node in self.nodes.items()}
         dependencies = {name: set() for name in self.nodes}
         for name, node in self.nodes.items():
+            if name in self._frozen:
+                continue
             for port, spec in node.inputs.items():
                 target = f"{name}.{port}"
                 source = self.connections[target]
@@ -608,6 +685,7 @@ class ControlGraph:
                 affected.update(group)
         self.dc_affected = frozenset(affected)
         self._rewire()
+        self._prepare_probes(types)
         if self.continuous:
             self._prepare_flow()
         self._every = (() if self.continuous else
@@ -616,8 +694,11 @@ class ControlGraph:
         self._every_interrupt = (None if self.continuous else
                                  frozenset(name for name, every in self._every)
                                  if all(every == 1 for _name, every in self._every) else None)
+        self._due = self.due if not self._frozen else self._due_without_frozen
         self._sample_runner = (
-            self._compile_sample_runner() if self._every_interrupt is not None else None
+            self._compile_sample_runner()
+            if self._every_interrupt is not None and not (self._frozen or self._tracking)
+            else None
         )
         angles = []
         for name, node in self.nodes.items():
@@ -635,6 +716,20 @@ class ControlGraph:
         """Interrupt count per loop update; configuration validation requires an integer ratio."""
         return np.maximum(1.0, np.rint(period / interrupt_period))
 
+    def _sample_method(self, name, node):
+        if name not in self._tracking:
+            return node.sample_into
+
+        def tracking_sample(t, inputs, outputs):
+            tracked = node.track(inputs)
+            if tracked is None:
+                raise FloatingPointError(
+                    f"control overlay tracking failed for loop {name!r} at t = {t}"
+                )
+            outputs.update(tracked)
+
+        return tracking_sample
+
     def limit_output(self, name, port, limit):
         """Attach a controller-owned limit to one sampled loop output."""
         if self.continuous:
@@ -643,7 +738,7 @@ class ControlGraph:
         if node is None or port not in node.outputs:
             raise ConfigError(f"controller limit: unknown output {name}.{port}")
         self._limits[name] = (port, limit)
-        sample = node.sample_into
+        sample = self._sample_method(name, node)
 
         def limited_sample(t, inputs, outputs):
             sample(t, inputs, outputs)
@@ -653,7 +748,7 @@ class ControlGraph:
 
     def clear_limit(self, name):
         if self._limits.pop(name, None) is not None:
-            self._samples[name] = self.nodes[name].sample_into
+            self._samples[name] = self._sample_method(name, self.nodes[name])
 
     def _rewire(self):
         """Resolve loop inputs and graph outputs against the current references."""
@@ -670,11 +765,45 @@ class ControlGraph:
                 )
             else:  # ControlInterface is a package-owned declaration, not user input.
                 raise RuntimeError(f"unknown controller input owner {owner!r}")
+        for name in self._overlay_bindings:
+            self._boundary_sources[name] = (_REFERENCE, name)
         self._wiring = {}
         for name, node in self.nodes.items():
             wiring = tuple((port,) + self._resolve(self.connections[f"{name}.{port}"]) for port in node.inputs)
             self._wiring[name] = wiring
         self._output_source = {port: self._resolve(source) for port, source in self.outputs.items()}
+
+    def _prepare_probes(self, types: Mapping[str, SignalType]) -> None:
+        """Resolve overlay probes once and expose a stable scalar log schema."""
+        self._probes = ()
+        self.probe_names = ()
+        if self.overlay is None:
+            return
+        probes = []
+        names = []
+        for alias, written in self.overlay.probes.items():
+            source = self.connections.get(written, written)
+            if source not in types:
+                raise ConfigError(f"control overlay probe {alias!r}: unknown source {source!r}")
+            complex_value = types[source].complex_value
+            probes.append((alias, self._resolve(source), complex_value))
+            names.extend((f"{alias}.re", f"{alias}.im", f"{alias}.abs")
+                         if complex_value else (alias,))
+        self._probes = tuple(probes)
+        self.probe_names = tuple(names)
+
+    def probe_values(self, meas) -> dict[str, float]:
+        """Read scalar overlay probes from the already evaluated graph."""
+        values = {}
+        for alias, source, complex_value in self._probes:
+            value = self._read(*source, meas)
+            if complex_value:
+                value = complex(value)
+                values.update({f"{alias}.re": value.real, f"{alias}.im": value.imag,
+                               f"{alias}.abs": abs(value)})
+            else:
+                values[alias] = float(value)
+        return values
 
     def _prepare_flow(self):
         """Build the fixed buffers and runner for continuous loop-flow evaluations."""
@@ -704,14 +833,19 @@ class ControlGraph:
             group: tuple(key for name in group for _port, key, _complex in self._out_specs[name])
             for group in self._continuous_cycles
         }
-        steps = {
-            name: (
-                name, node.flow_into, self._wiring[name], self._flow_inputs[name],
+        steps = {}
+        for name, node in self.nodes.items():
+            evaluate, wiring = node.flow_into, self._wiring[name]
+            if name in self._frozen:
+                def freeze(_t, _inputs, _outputs, derivatives):
+                    for state in derivatives:
+                        derivatives[state] = 0.0
+                evaluate, wiring = freeze, ()
+            steps[name] = (
+                name, evaluate, wiring, self._flow_inputs[name],
                 self._flow_outputs[name], self._flow_derivatives[name],
                 self._out_specs[name], self._flow_derivative_specs[name],
             )
-            for name, node in self.nodes.items()
-        }
         self._flow_plan = tuple(
             (group, self._flow_cycle_keys.get(group, ()), tuple(steps[name] for name in group))
             for group in self._continuous_plan
@@ -847,6 +981,10 @@ class ControlGraph:
                 self.references = _reference_values(
                     ctrl.references, attributes=bool(bindings and self._reference_validator),
                 )
+                for name, signal in self._overlay_bindings.items():
+                    self.references[name] = signal(self.overlay.initial_t)
+                self._bindings = (*self.reference_bindings.items(),
+                                  *self._overlay_bindings.items())
                 self._reference_time = None
                 self._rewire()
                 if self.continuous:
@@ -880,7 +1018,7 @@ class ControlGraph:
                 f"states than before ({exc}), so it cannot continue from them") from None
         fresh.retuned(old)
         self.nodes[name] = fresh
-        self._samples[name] = fresh.sample_into
+        self._samples[name] = self._sample_method(name, fresh)
         if self.continuous:
             self._prepare_flow()
         if self.on_retune is not None:
@@ -904,14 +1042,16 @@ class ControlGraph:
         """Evaluate every time-varying reference once at this graph boundary."""
         if self._reference_time == t:
             return
-        for name, signal in self.reference_bindings.items():
+        for name, signal in self._bindings:
             try:
                 value = signal(t)
             except (ArithmeticError, ValueError) as exc:
                 raise FloatingPointError(
                     f"controller reference {name!r} failed at t = {t}: {exc}"
                 ) from None
-            if not math.isfinite(value):
+            finite = (math.isfinite(value.real) and math.isfinite(value.imag)
+                      if isinstance(value, complex) else math.isfinite(value))
+            if not finite:
                 raise FloatingPointError(
                     f"controller reference {name!r} returned a non-finite value at t = {t}"
                 )
@@ -964,10 +1104,13 @@ class ControlGraph:
         k = int(round((t - self._t0) / self._T))
         return {name for name, every in self._every if k % every == 0}
 
+    def _due_without_frozen(self, t):
+        return self.due(t) - self._frozen
+
     # ------------------------------------------------------------ running
     def track(self, meas):
         """Pre-synchronise every loop that supports ``track(inputs)``."""
-        if self.reference_bindings:
+        if self._bindings:
             self._update_references(meas.t)
         done = set()
         for name in self.order:
@@ -990,7 +1133,7 @@ class ControlGraph:
         """
         if self._pending:
             self._apply_pending()
-        if self.reference_bindings:
+        if self._bindings:
             self._update_references(t)
         if self._sample_runner is not None:
             self._sample_runner(t, meas)
@@ -999,7 +1142,7 @@ class ControlGraph:
                 finalize(t, meas, updated)
             return updated
         self.updated = updated = set()
-        due = self.due(t)
+        due = self._due(t)
         if not due:
             return updated
         samples, wiring = self._samples, self._wiring
@@ -1035,7 +1178,7 @@ class ControlGraph:
         """
         if self._pending:
             self._apply_pending()
-        if self.reference_bindings:
+        if self._bindings:
             self._update_references(t)
         named = derivatives is None
         if derivatives is None:
@@ -1097,7 +1240,6 @@ class ControlGraph:
             for name, node in self.nodes.items()
             for field, value in node.observe().items()
         }
-
     def summary(self):
         """Return the nonempty summaries supplied by active loops."""
         result = {}
@@ -1203,97 +1345,6 @@ class ControlGraph:
     def _state_port(self, key):
         name, port = key.split(".", 1)
         return key + "_pu" if self.nodes[name].outputs[port].unit.startswith("pu_") else key
-
-
-# ------------------------------------------------------------------ the default wiring
-
-def _role_finder(cfg, label: str):
-    """Return a resolver which enforces one configured loop per semantic role."""
-    roles = {
-        name: getattr(LOOP_TYPES.get(params.type), "role", None)
-        for name, params in cfg.ctrl.loops.items()
-    }
-
-    def find(role):
-        found = [name for name, value in roles.items() if value == role]
-        if len(found) > 1:
-            raise ConfigError(
-                f"ctrl.loops: ambiguous {label} role {found}; use explicit "
-                "ctrl.connections and ctrl.outputs"
-            )
-        return found[0] if found else None
-
-    return find
-
-def default_wiring(cfg, family, *, continuous=False):
-    """Return the default ``(connections, outputs)`` for family ``"gfl"``, ``"gfm"`` or ``"custom"``.
-
-    Each loop is wired by its role (:attr:`peslite.control.loops.Loop.role`), so a registered loop
-    type takes the place of the built-in one of its role.
-    """
-    if family == "custom":
-        return {}, {}
-    loops = cfg.ctrl.loops
-    roles = {name: getattr(LOOP_TYPES.get(p.type), "role", None) for name, p in loops.items()}
-    find = _role_finder(cfg, family)
-    pll, sync = find("pll"), find("sync")
-    angle = pll if family == "gfl" else sync
-    frame = f"{angle}.frame" if angle else "references.theta"
-    theta = f"{angle}.theta" if angle else "references.theta"
-    omega = f"{angle}.omega" if angle else "references.omega"
-    dc, cc = find("dc_voltage"), find("current")
-    modulation = find("modulation")
-    va, vi, damping = find("admittance"), find("impedance"), find("damping")
-    extra = f"{damping}.extra" if damping else "references.zero_v_pu"
-    command = vi if family == "gfm" and vi else cc
-    ports_of = {
-        "pll": {"v": "meas.u_g"},
-        "dc_voltage": {"voltage": "meas.u_dc", "reference": "references.vdc_ref_pu"},
-        "current": {"v": "meas.u_g", "i": "meas.i_c", "frame": frame, "omega": omega,
-                    "extra": extra,
-                    "id_ref": (f"{va}.id_ref" if va else f"{dc}.current_reference"
-                               if dc else "references.id_ref_pu"),
-                    "iq_ref": f"{va}.iq_ref" if va else "references.iq_ref_pu"},
-        "sync": {"v": "meas.u_g", "i": "meas.i_c",
-                 "u_dc": "meas.u_dc", "p_ref": "references.p_ref_pu", "q_ref": "references.q_ref_pu",
-                 "v_ref": "references.v_ref_pu"},
-        "impedance": {"v_ref": f"{sync}.v_ref", "frame": frame, "omega": omega, "i": "meas.i_c",
-                      "extra": extra},
-        "admittance": {"v_ref": f"{sync}.v_ref", "frame": frame, "omega": omega, "v": "meas.u_g"},
-        "damping": {"i": "meas.i_c", "frame": frame},
-        "modulation": {
-            "u_dq": f"{command}.u_dq",
-            "theta": theta,
-            "u_dc": "meas.u_dc",
-            "v": "meas.u_g",
-            "i": "meas.i_c",
-            "frame": frame,
-            "omega": omega,
-            "id_ref": (f"{va}.id_ref" if va else f"{dc}.current_reference"
-                       if dc else "references.id_ref_pu"),
-            "iq_ref": f"{va}.iq_ref" if va else "references.iq_ref_pu",
-            "extra": extra,
-        },
-    }
-    wires = {f"{name}.{port}": source for name, role in roles.items()
-             for port, source in ports_of.get(role, {}).items()
-             if port in LOOP_TYPES[loops[name].type].inputs}
-    if continuous:
-        if command is None:
-            return wires, {}
-        return wires, {"u_dq": f"{command}.u_dq", "theta": theta, "omega": omega}
-    if modulation is None:
-        raise ConfigError(f"ctrl.loops: sampled {family} control needs a modulation loop")
-    outputs = {
-        "d_a": f"{modulation}.d_a",
-        "d_b": f"{modulation}.d_b",
-        "d_c": f"{modulation}.d_c",
-        "theta": theta,
-        "omega": omega,
-    }
-    if "enable" in LOOP_TYPES[loops[modulation].type].outputs:
-        outputs["enable"] = f"{modulation}.enable"
-    return wires, outputs
 
 
 # ------------------------------------------------------------------ the controller
@@ -1482,18 +1533,27 @@ class VSCController(_GraphRuntime):
     bridge's modulation space vector directly.
     """
 
+    @staticmethod
+    def resolve_interface(profile, continuous: bool) -> ControlInterface:
+        boundary = CONTROL_INTERFACE if continuous else SAMPLED_VSC_INTERFACE
+        return replace(profile.interface, outputs=boundary.outputs,
+                       optional_outputs=boundary.optional_outputs)
+
     def __init__(self, cfg, pwm_method=None, *, limiter=CONFIGURED):
         self.p = cfg
         self.continuous = continuous_control(cfg)
         # A continuous controller already participates in construction-time energy probes, before
         # VSC.start() applies its scenario. Keep its ideal source off until that command arrives.
         self.startup = ContinuousStartup(run=False) if self.continuous else Startup(cfg.ctrl.period)
-        profile = control_type(cfg.ctrl.type)
+        profile = cfg.ctrl._profile
         wires, outputs = profile.wiring(cfg, continuous=self.continuous)
-        interface = profile.interface if self.continuous else SAMPLED_VSC_INTERFACE
+        resolver = getattr(profile.controller_factory, "resolve_interface", None)
+        interface = (profile.interface if resolver is None
+                     else resolver(profile, self.continuous))
         self.graph = graph = ControlGraph(
             cfg, self.startup, wires, outputs, interface=interface,
             continuous=self.continuous,
+            reference_validator=profile.reference_validator,
         )
         self._carried_outputs = tuple(
             port for port in interface.auxiliary_outputs(graph.outputs) if port != "enable"
@@ -1545,12 +1605,12 @@ class VSCController(_GraphRuntime):
                             else self._frame_key if self._frame_key in graph.values
                             else graph.outputs["theta"])
         self._is_gfl = profile.grid_following
-        if self._is_gfl:
+        if self._is_gfl is True:
             mode_log_sources = {"id_ref_pu": (
                 graph.connections[f"{self._log_cc}.id_ref"]
                 if self._log_cc is not None else "references.id_ref_pu"
             )}
-        else:
+        elif self._is_gfl is False:
             mode_log_sources = (
                 {"p_pu": f"{self._sync}.p", "q_pu": f"{self._sync}.q",
                  "p_ref_pu": "references.p_ref_pu",
@@ -1559,6 +1619,8 @@ class VSCController(_GraphRuntime):
                 {"p_ref_pu": "references.p_ref_pu",
                  "v_ref_pu": "references.v_ref_pu"}
             )
+        else:
+            mode_log_sources = {}
         self._mode_log_sources = MappingProxyType(mode_log_sources)
         self._terminal_limit = None
         self._terminal_limit_scale = None
@@ -1684,9 +1746,12 @@ class VSCController(_GraphRuntime):
             names += ["vd_raw_pu", "vq_raw_pu", "id_raw_pu", "iq_raw_pu"]
         if not self.continuous and "u_dc" in self.p.meas.average:
             names.append("vdc_raw_pu")
-        names += (["id_ref_pu", "freq_dev", "angle_rel"] if self._is_gfl else
-                  ["p_pu", "q_pu", "p_ref_pu", "v_ref_pu", "freq_dev", "angle_rel"])
+        if self._is_gfl is True:
+            names += ["id_ref_pu", "freq_dev", "angle_rel"]
+        elif self._is_gfl is False:
+            names += ["p_pu", "q_pu", "p_ref_pu", "v_ref_pu", "freq_dev", "angle_rel"]
         names += self.graph.observation_names
+        names += self.graph.probe_names
         return tuple(names)
 
     def mode_log_sources(self) -> Mapping[str, str]:
@@ -1700,9 +1765,11 @@ class VSCController(_GraphRuntime):
             name: graph._read(*graph._resolve(source), meas)
             for name, source in self._mode_log_sources.items()
         }
-        if self._is_gfl:
+        if self._is_gfl is None:
+            return values
+        if self._is_gfl is True:
             values.setdefault("id_ref_pu", 0.0)
-        else:
+        elif self._is_gfl is False:
             values.setdefault("p_pu", 0.0)
             values.setdefault("q_pu", 0.0)
             values.setdefault("v_ref_pu", graph.references["v_ref_pu"])
@@ -1763,6 +1830,8 @@ class VSCController(_GraphRuntime):
                    **self._raw_log(meas, frame)}
             log.update(self._mode_log(t, control_meas))
             log.update(graph.observations())
+            if graph.probe_names:
+                log.update(graph.probe_values(control_meas))
             self.last_log = log
         commands = ({port: self.graph.output(port, control_meas) for port in self._carried_outputs}
                     if self._carried_outputs else None)
@@ -1835,6 +1904,8 @@ class VSCController(_GraphRuntime):
                "in_service": 1.0 if self.startup.active else 0.0}
         log.update(self._mode_log(t, meas))
         log.update(self.graph.observations())
+        if self.graph.probe_names:
+            log.update(self.graph.probe_values(meas))
         self.last_log = log
         return log
 
@@ -1946,89 +2017,6 @@ PHASE_SHIFT_CONVERTER_INTERFACE = ControlInterface(
 )
 
 
-def _converter_log_sources(outputs: tuple[str, ...] = ("duty",),
-                           **specific: str) -> Mapping[str, str]:
-    """Build the common scalar-converter log boundary in display order."""
-    return MappingProxyType({
-        "current": "meas.current",
-        "voltage": "meas.voltage",
-        "power": "meas.power",
-        **specific,
-        **{name: name for name in outputs},
-        "in_service": "startup.active",
-    })
-
-
-_DC_LOG_SOURCES = _converter_log_sources(
-    voltage_reference="references.voltage",
-    input_voltage="meas.vin",
-)
-
-
-_RESONANT_LOG_SOURCES = _converter_log_sources(
-    input_voltage="meas.vin",
-    modulation="references.modulation",
-    frequency="references.frequency",
-    phase="references.phase",
-    power_reference="references.power",
-)
-
-
-_PHASE_SHIFT_LOG_SOURCES = _converter_log_sources(
-    ("width", "phase", "frequency", "mode"),
-    input_voltage="meas.vin",
-    width_reference="references.width",
-    phase_reference="references.phase",
-    power_reference="references.power",
-)
-
-
-def _modulation_wiring(cfg, *, continuous=False):
-    """Wire the modulation-role loop: each of its inputs named like a reference of the control
-    type reads that reference, and each controller output reads the loop output of its name."""
-    find = _role_finder(cfg, cfg.ctrl.type)
-    modulation = find("modulation")
-    if modulation is None:
-        return {}, {}
-    interface = control_type(cfg.ctrl.type).interface
-    loop = LOOP_TYPES[cfg.ctrl.loops[modulation].type]
-    connections = {f"{modulation}.{port}": f"references.{port}" for port in loop.inputs
-                   if f"references.{port}" in interface.inputs}
-    outputs = {port: f"{modulation}.{port}" for port in interface.outputs if port in loop.outputs}
-    return connections, outputs
-
-
-def _dc_converter_wiring(cfg, *, continuous=False):
-    find = _role_finder(cfg, cfg.ctrl.type)
-    voltage, current = find("dc_voltage"), find("current")
-    wires = {}
-    if voltage is not None:
-        wires.update({
-            f"{voltage}.reference": "references.voltage",
-            f"{voltage}.voltage": "meas.voltage",
-        })
-    if current is not None:
-        interface = control_type(cfg.ctrl.type).interface
-        reference = (f"{voltage}.current_reference" if voltage is not None
-                     else "references.current" if "references.current" in interface.inputs
-                     else None)
-        sources = {
-            "reference": reference,
-            "current": "meas.current",
-            "voltage": "meas.voltage",
-            "vin": "meas.vin",
-            "feedforward": "meas.duty_feedforward",
-        }
-        loop = LOOP_TYPES[cfg.ctrl.loops[current].type]
-        wires.update({f"{current}.{port}": sources[port] for port in loop.inputs
-                      if port in sources and sources[port] is not None})
-        outputs = {port: f"{current}.{port}" for port in interface.outputs
-                   if port in loop.outputs}
-    else:
-        outputs = {}
-    return wires, outputs
-
-
 @dataclass
 class ConverterMeasurement:
     """SI sample at a scalar converter's public control boundary."""
@@ -2053,6 +2041,13 @@ class GraphController(_GraphRuntime):
     ordinary graph loops; no application-specific controller bypasses the graph.
     """
 
+    @staticmethod
+    def resolve_interface(profile, continuous: bool) -> ControlInterface:
+        boundary = (PHASE_SHIFT_CONVERTER_INTERFACE
+                    if profile.modulator == "phase_shift" else DC_CONVERTER_INTERFACE)
+        return replace(profile.interface, outputs=boundary.outputs,
+                       optional_outputs=boundary.optional_outputs)
+
     def __init__(self, cfg, topology) -> None:
         self.p = cfg
         self.topology = topology
@@ -2061,15 +2056,16 @@ class GraphController(_GraphRuntime):
             ContinuousStartup(run=False) if self.continuous
             else Startup(cfg.ctrl.period, run=False)
         )
-        profile = control_type(cfg.ctrl.type)
+        profile = cfg.ctrl._profile
         connections, outputs = profile.wiring(cfg, continuous=self.continuous)
         self.graph = ControlGraph(
             cfg,
             self.startup,
             connections,
             outputs,
-            interface=profile.interface,
+            interface=self.resolve_interface(profile, self.continuous),
             continuous=self.continuous,
+            reference_validator=profile.reference_validator,
         )
         self.outputs_need_inputs = any(
             isinstance(source, str) and source.startswith("meas.")
@@ -2096,6 +2092,7 @@ class GraphController(_GraphRuntime):
             **{f"{name}.{port}": f"{name}.{port}"
                for name, node in self.graph.nodes.items() for port in node.log_outputs},
             **{name: name for name in self.graph.observation_names},
+            **{name: name for name in self.graph.probe_names},
         })
         self._logs_loop_outputs = any(
             source in self.graph.values for source in self._log_sources.values()
@@ -2198,6 +2195,8 @@ class GraphController(_GraphRuntime):
         if self._logs_loop_outputs:
             values.update(self.graph.values)
         values.update(self.graph.observations())
+        if self.graph.probe_names:
+            values.update(self.graph.probe_values(measurement))
         self.last_log = {name: values[source] for name, source in self._log_sources.items()}
         return self.last_log
 
@@ -2226,88 +2225,3 @@ class GraphController(_GraphRuntime):
             **self.graph.summary(),
             "alarms": [],
         }
-
-
-def make_controller(cfg, **kwargs):
-    """Build the controller registered for ``cfg.ctrl.type``."""
-    factory = control_type(cfg.ctrl.type).controller_factory
-    if factory is None:
-        raise ConfigError(f"ctrl.type: {cfg.ctrl.type!r} has no controller factory")
-    return factory(cfg, **kwargs)
-
-
-for _control_name in ("gfl", "gfm", "custom"):
-    register_control_type(
-        _control_name,
-        references=ReferenceParams,
-        unit_types=frozenset(("vsc",)),
-        interface=CONTROL_INTERFACE,
-        wiring=lambda cfg, continuous=False, family=_control_name: default_wiring(
-            cfg, family, continuous=continuous,
-        ),
-        grid_following=_control_name == "gfl",
-        default_bridge="three_phase_bridge",
-        controller_factory=VSCController,
-        default_loops={} if _control_name == "custom" else {
-            "modulation": "ThreePhaseModulation"
-        },
-    )
-register_control_type(
-    "dc",
-    references=ScalarVoltageReferenceParams,
-    unit_types=frozenset(("dc_converter",)),
-    interface=DC_CONVERTER_INTERFACE,
-    wiring=_dc_converter_wiring,
-    log_sources=_DC_LOG_SOURCES,
-    default_bridge="half_bridge",
-    controller_factory=GraphController,
-    reference_validator=validate_scalar_voltage_references,
-)
-register_control_type(
-    "current",
-    references=ScalarCurrentReferenceParams,
-    unit_types=frozenset(("dc_converter",)),
-    interface=CURRENT_CONVERTER_INTERFACE,
-    wiring=_dc_converter_wiring,
-    log_sources=_converter_log_sources(
-        input_voltage="meas.vin",
-        current_reference="references.current",
-    ),
-    default_bridge="half_bridge",
-    controller_factory=GraphController,
-)
-register_control_type(
-    "open_loop",
-    references=DutyReferenceParams,
-    unit_types=frozenset(("dc_converter",)),
-    interface=OPEN_LOOP_CONVERTER_INTERFACE,
-    wiring=_modulation_wiring,
-    log_sources=_converter_log_sources(input_voltage="meas.vin",
-                                       duty_reference="references.duty"),
-    default_bridge="half_bridge",
-    controller_factory=GraphController,
-    reference_validator=validate_duty_references,
-)
-register_control_type(
-    "phase_shift",
-    references=PhaseShiftReferenceParams,
-    unit_types=frozenset(("dc_converter",)),
-    interface=PHASE_SHIFT_CONVERTER_INTERFACE,
-    wiring=_modulation_wiring,
-    log_sources=_PHASE_SHIFT_LOG_SOURCES,
-    default_bridge="full_bridge",
-    controller_factory=GraphController,
-    reference_validator=validate_phase_shift_references,
-    modulator="phase_shift",
-)
-register_control_type(
-    "resonant",
-    references=ResonantReferenceParams,
-    unit_types=frozenset(("dc_converter",)),
-    interface=RESONANT_CONVERTER_INTERFACE,
-    wiring=_modulation_wiring,
-    log_sources=_RESONANT_LOG_SOURCES,
-    default_bridge="full_bridge",
-    controller_factory=GraphController,
-    reference_validator=validate_resonant_references,
-)

@@ -14,8 +14,7 @@ new simulation file.
 
 All four distributions use the same `peslite` Python package and command. `peslite-core` provides
 the simulation runtime and extension interfaces, `peslite` adds the default addons,
-`peslite-gui` adds the graphical workbench, and `peslite-full` installs all addon support, including
-advanced magnetic modeling and ONNX integration.
+`peslite-gui` adds the graphical workbench, and `peslite-full` installs all optional features.
 
 Check the command-line interface:
 
@@ -23,7 +22,7 @@ Check the command-line interface:
 peslite --help
 ```
 
-PESLite requires Python 3.10.1 or newer.
+PESLite requires Python 3.11.0 or newer.
 
 ## Run the first case
 

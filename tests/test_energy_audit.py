@@ -3,7 +3,7 @@
 import pytest
 
 import peslite
-from peslite.addons.functions import energy_closure
+from peslite.addons.functions.online_analysis import energy_closure
 from conftest import EXAMPLES
 
 

@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from peslite.addons.functions import dynamic_performance
+from peslite.addons.functions.online_analysis import dynamic_performance
 
 
 def test_first_order_step_rise_settling_tracking_and_units():

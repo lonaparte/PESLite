@@ -1,10 +1,8 @@
 # Thermal Analysis
 
-The standard PESLite installation includes the `thermal` addon. `peslite-full` additionally
-includes the `thermalport` addon for external thermal models.
-
-Thermal states use the existing simulation model, solvers, result files and restart mechanism;
-there is no separate thermal solver or duplicated electrical network.
+The `thermal` addon supplies thermal components, networks, loss models and reports. Thermal states
+use the existing simulation model, solvers, result files and restart mechanism; there is no
+separate thermal solver or duplicated electrical network.
 
 ## Heat sources
 
@@ -77,7 +75,7 @@ watt (K/W).
   builds a junction-to-case-to-ambient ladder and can participate in shared cooling networks.
 - `FosterImpedance` represents parallel transient-impedance branches relative to fixed ambient. Its
   branches do not represent physical case or heat-sink nodes.
-- `thermalport` evaluates a stable continuous-time model imported from an external file.
+- the `thermalport` addon evaluates a stable continuous-time model imported from an external file.
 - `shared_thermal_network` assigns several named heat inputs to nodes in one thermal network.
 
 Thermal dynamics use the configured PESLite integrator. A first-order RC network follows

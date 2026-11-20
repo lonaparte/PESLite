@@ -6,20 +6,157 @@ and sampled protection use the C++ lowering already used by standalone simulatio
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 import math
+import os
 from fractions import Fraction
 from pathlib import Path
+import struct
+import subprocess
+import tempfile
 from types import SimpleNamespace
 
 from ..control.controller import VSCController
-from . import imperix_build
 from .cpp import (_CONTROL_MATH, _CPP_TYPES, _MOVING_WINDOW, _ControlGenerator, _Expression,
                   _ModelGenerator, _ProtectionGenerator,
                   _controller_implementation, _identifier, _literal, _number,
                   _parameter_generator, _prepare_export, _validate_native_control_graph)
 from .exporter import ExportResult, _exporter, _signal_names
 from .validate import _whole
+
+
+def _elf(path, machine):
+    """Validate an Imperix target executable and return its digest."""
+    data = path.read_bytes()
+    if len(data) < 52 or data[:4] != b"\x7fELF" or data[4] not in (1, 2) or data[5] not in (1, 2):
+        raise RuntimeError("SDK build did not produce an ELF executable")
+    order = "<" if data[5] == 1 else ">"
+    actual = struct.unpack_from(order + "H", data, 18)[0]
+    if machine not in (40, 183) or actual != machine:
+        raise RuntimeError(f"SDK ELF machine mismatch: expected ARM=40 or AArch64=183 ({machine}), got {actual}")
+    if data[4] != (1 if machine == 40 else 2):
+        raise RuntimeError("SDK ELF word size does not match the requested architecture")
+    kind = struct.unpack_from(order + "H", data, 16)[0]
+    if kind != 2:
+        raise RuntimeError("SDK artifact must be an ELF executable, not an object or host library")
+    offsets = (24, 28, 32, 42, 44, 46, 48) if data[4] == 1 else (24, 32, 40, 54, 56, 58, 60)
+    address = "I" if data[4] == 1 else "Q"
+    entry, phoff, shoff = [struct.unpack_from(order + address, data, at)[0] for at in offsets[:3]]
+    phsize, phnum, shsize, shnum = [struct.unpack_from(order + "H", data, at)[0] for at in offsets[3:]]
+    if (entry == 0 or phnum == 0 or shnum == 0
+            or phsize < (32 if data[4] == 1 else 56) or shsize < (40 if data[4] == 1 else 64)
+            or phoff + phsize * phnum > len(data) or shoff + shsize * shnum > len(data)):
+        raise RuntimeError("SDK ELF is missing its entry point, program or symbol/debug section table")
+    if not any(struct.unpack_from(order + "I", data, phoff + index * phsize)[0] == 1
+               for index in range(phnum)):
+        raise RuntimeError("SDK ELF has no loadable segment")
+    if not any(struct.unpack_from(order + "I", data, shoff + index * shsize + 4)[0] == 2
+               for index in range(shnum)):
+        raise RuntimeError("SDK ELF was stripped; Cockpit requires retained symbols")
+    names_index = struct.unpack_from(order + "H", data, 50 if data[4] == 1 else 62)[0]
+    if names_index >= shnum:
+        raise RuntimeError("SDK ELF has an invalid section-name table")
+    names_header = shoff + names_index * shsize
+    names_offset, names_size = struct.unpack_from(order + address * 2, data,
+                                                 names_header + (16 if data[4] == 1 else 24))
+    if names_offset + names_size > len(data):
+        raise RuntimeError("SDK ELF section names extend past the artifact")
+    names = data[names_offset:names_offset + names_size]
+    sections = []
+    for index in range(shnum):
+        offset = struct.unpack_from(order + "I", data, shoff + index * shsize)[0]
+        sections.append(names[offset:].split(b"\0", 1)[0])
+    if not any(name in sections for name in (b".debug_info", b".zdebug_info")):
+        raise RuntimeError("SDK ELF has no debug information; retain the SDK project's debug flags")
+    return hashlib.sha256(data).hexdigest()
+
+
+def build_project(directory):
+    """Build and validate one exported project with its configured official SDK command."""
+    directory = Path(directory).resolve()
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(status="building", artifact=None, sha256=None)
+    manifest.pop("error", None)
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    try:
+        profile = json.loads((directory / "imperix-build.json").read_text(encoding="utf-8"))
+        if not isinstance(profile, dict):
+            raise ValueError("imperix-build.json must contain a mapping")
+        unknown = profile.keys() - {"name", "sdk", "command", "elf_machine", "timeout"}
+        if unknown:
+            raise ValueError(f"unknown SDK build fields: {sorted(unknown)}")
+        sdk = profile.get("sdk") or os.environ.get("PESLITE_IMPERIX_SDK")
+        if not sdk or not Path(sdk).is_dir():
+            raise ValueError("an installed official Imperix SDK directory is required; "
+                             "set build.sdk, --imperix-sdk or PESLITE_IMPERIX_SDK; "
+                             "use --imperix-source-only to generate sources without building")
+        command = profile.get("command")
+        if not isinstance(command, list) or not command or not all(isinstance(arg, str) and arg for arg in command):
+            raise ValueError("build.command must be an argument list for the official SDK build")
+        if not any("{elf}" in arg for arg in command):
+            raise ValueError("build.command must write its fresh output to {elf}")
+        machine = profile.get("elf_machine")
+        if type(machine) is not int or machine not in (40, 183):
+            raise ValueError("build.elf_machine must match the installed SDK: ARM=40 or AArch64=183")
+        timeout = profile.get("timeout", 300.0)
+        if isinstance(timeout, bool) or not isinstance(timeout, (float, int)) or not 0 < timeout <= 3600:
+            raise ValueError("build.timeout must be in (0, 3600] seconds")
+        name = profile.get("name", "run")
+        if not isinstance(name, str) or not name or Path(name).name != name or name in (".", ".."):
+            raise ValueError("the export name must be a single filename stem")
+        with tempfile.TemporaryDirectory(prefix=".build-", dir=directory) as staging:
+            elf = Path(staging) / (name + ".elf")
+            values = dict(sdk=str(Path(sdk).resolve()), source=str(directory), elf=str(elf))
+            args = [arg.format_map(values) for arg in command]
+            (directory / "build-command.json").write_text(json.dumps(args, indent=2) + "\n", encoding="utf-8")
+            with (directory / "build.log").open("w", encoding="utf-8") as stream:
+                result = subprocess.run(args, cwd=directory, stdout=stream, stderr=subprocess.STDOUT,
+                                        timeout=timeout, check=False)
+            if result.returncode:
+                raise RuntimeError(f"official SDK build failed ({result.returncode}); inspect build.log")
+            if not elf.is_file():
+                raise RuntimeError("official SDK build returned success without producing a fresh ELF")
+            digest = _elf(elf, machine)
+            artifact = directory / (name + ".elf")
+            elf.replace(artifact)
+        manifest.update(status="built", artifact=artifact.name, sha256=digest,
+                        sources={key: hashlib.sha256((directory / key).read_bytes()).hexdigest()
+                                 for key in ("user.cpp", "user.h", "peslite_control.hpp")})
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        return artifact
+    except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError, struct.error) as error:
+        manifest.update(status="build_failed", artifact=None, error=str(error))
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        raise RuntimeError(f"Imperix: {error}") from error
+
+
+def _build_script() -> str:
+    """Render the same builder as a standard-library-only script for the SDK machine."""
+    imports = '''"""Build an exported PESLite Imperix project with its configured official SDK."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import struct
+import subprocess
+import tempfile
+'''
+    main = '''
+
+if __name__ == "__main__":
+    import sys
+    try:
+        print(build_project(Path(__file__).resolve().parent))
+    except RuntimeError as error:
+        print(error, file=sys.stderr)
+        sys.exit(1)
+'''
+    return imports + "\n\n" + inspect.getsource(_elf) + "\n\n" + inspect.getsource(build_project) + main
 
 
 def _keys(value, allowed, where):
@@ -125,7 +262,7 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
             ))
             voltage = "std::abs(meas_u_g)"
             frequency = f"({self.source(self.graph.outputs['omega'])} - {_number(self.cfg.base.w0)}) / (2.0 * pi)"
-            vdc_error = f"meas_u_dc - {self._reference('vdc_ref_pu')}"
+            vdc_error = f"meas_u_dc - {self._reference('vdc_ref_pu', 1.0)}"
         else:
             output = SimpleNamespace(**{port: _Expression(self.source(port), "real")
                                         for port in self.graph.interface.outputs})
@@ -269,7 +406,9 @@ def _bindings(simulation, config, model, *, events=None):
         if unit.cfg.pwm.pattern_sync == "pulse":
             raise TypeError(f"{name}: the Imperix hardware PWM adapter does not implement "
                             "complete-pulse updates")
-        if unit.cfg.ctrl.offset is not None or unit.cfg.meas.offset is not None:
+        explicit_control_offset = (unit.cfg.ctrl.offset is not None
+                                   and "ctrl.offset" not in unit.cfg.derived_defaults)
+        if explicit_control_offset or unit.cfg.meas.offset is not None:
             raise ValueError(f"{name}: hardware timing comes from imperix.sampling_phase on the CLK0 "
                              "grid; configured clock offsets (ctrl.offset, meas.offset) have no "
                              "hardware adapter")
@@ -292,6 +431,10 @@ def _bindings(simulation, config, model, *, events=None):
               f"imperix.units.{name}")
         if cfg.pwm.sync != "asynchronous":
             raise ValueError(f"{name}: angle-locked simulation carriers have no hardware adapter")
+        if cfg.pwm.alignment != "center" and cfg.pwm.update == "double":
+            raise ValueError(
+                f"{name}: Imperix sawtooth carriers support only single-rate PWM updates"
+            )
         stride = unit.ctrl.graph.period_stride(configured.ctrl.period, period)
         if (configured.ctrl.period < period * (1.0 - 1e-6)
                 or abs(stride * period - configured.ctrl.period) > 1e-6 * configured.ctrl.period):
@@ -505,6 +648,11 @@ def _source(generators, adc, clocks, period, phase, runtime, *, sampling_period=
                     f"        {ready} = tick + static_cast<unsigned long long>(std::ceil(1.0 / ({frequency}) / {_number(period)})) + 1;",
                     "}"]
         mode = "PWMH_ACTIVE" if gen.topology.unilateral else "COMPLEMENTARY"
+        carrier = {
+            "center": "TRIANGLE",
+            "trailing": "SAWTOOTH",
+            "leading": "INVSAWTOOTH",
+        }[gen.cfg.pwm.alignment]
         duties, activate, deactivate_all = [], [], []
         carrier_phase = _number(gen.cfg.pwm.carrier_phase % 1.0)
         for index, output in enumerate(binding["pwm"]):
@@ -512,7 +660,7 @@ def _source(generators, adc, clocks, period, phase, runtime, *, sampling_period=
             devices.add(device)
             address = f"PWM_CHANNEL_{channel}, "
             init += [f"CbPwm_ConfigureClock({address}CLOCK_{binding['clock']}, {device});",
-                     f"CbPwm_ConfigureCarrier({address}TRIANGLE, {device});",
+                     f"CbPwm_ConfigureCarrier({address}{carrier}, {device});",
                      f"CbPwm_ConfigureUpdateRate({address}{gen.cfg.pwm.update.upper()}_RATE, {device});",
                      f"CbPwm_ConfigureOutputMode({address}{mode}, {device});",
                      *([f"CbPwm_ConfigureDeadTime({address}{_number(binding['dead_time'])}, {device});"]
@@ -551,8 +699,8 @@ def _source(generators, adc, clocks, period, phase, runtime, *, sampling_period=
 def _export_imperix(simulation, out_dir, name, variables, reusable, *,
                     target_config=None, sdk=None, build=True):
     """Generate Imperix ELF sources and optionally build the executable with the configured SDK."""
-    from .conduction import DiodeConduction
-    if DiodeConduction(simulation.system.model).commutating:
+    from ..solver.commutation import Commutation
+    if Commutation(simulation.system.model).commutating:
         raise ValueError("Imperix hardware adapters do not implement plant commutations")
     if not name or name in (".", "..") or any(char in name for char in "/\\"):
         raise ValueError("Imperix export name must be a single filename stem")
@@ -647,7 +795,7 @@ def _export_imperix(simulation, out_dir, name, variables, reusable, *,
                   'tUserSafe UserInit();\ntUserSafe UserInterrupt();\nvoid UserError(tErrorSource);\n',
         "peslite_control.hpp": header,
         "imperix-build.json": json.dumps({**profile, "name": name}, indent=2) + "\n",
-        "build.py": Path(imperix_build.__file__).read_text(encoding="utf-8"),
+        "build.py": _build_script(),
         "manifest.json": json.dumps({"format": "imperix", "name": name, "status": "source_only",
                                      "hardware_tested": False, "period": period,
                                      "timing": timing,
@@ -666,6 +814,6 @@ def _export_imperix(simulation, out_dir, name, variables, reusable, *,
         (out_dir / filename).write_text(content, encoding="utf-8")
     paths = tuple(out_dir / filename for filename in files)
     if build:
-        artifact = imperix_build.build_project(out_dir)
+        artifact = build_project(out_dir)
         paths += (artifact, out_dir / "build-command.json", out_dir / "build.log")
     return ExportResult("imperix", out_dir, paths, diagnostics)

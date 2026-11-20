@@ -38,11 +38,11 @@ on the same reference replaces its table binding with the event's constant value
 
 ## Generated tables
 
-The built-in function addon creates the same serializable table mapping from arrays, CSV columns or
-a mathematical expression:
+The `reference_signals` addon creates the same serializable table mapping from arrays, CSV columns
+or a mathematical expression:
 
 ```python
-from peslite.addons.functions import reference_csv, reference_expression
+from peslite.addons.functions.reference_signals import reference_csv, reference_expression
 
 from_csv = reference_csv(
     "command.csv", time_column="time", value_column="power",
@@ -66,7 +66,9 @@ Use `reference_prbs` for a deterministic maximal-length pseudorandom binary sequ
 `TableSignal` data; no new simulation source type or random runtime state is introduced.
 
 ```python
-from peslite.addons.functions import reference_prbs, reference_multitone, reference_chirp
+from peslite.addons.functions.reference_signals import (
+    reference_chirp, reference_multitone, reference_prbs,
+)
 
 prbs = reference_prbs(
     start=0.0, stop=0.127, period=0.001, order=7, seed=29,

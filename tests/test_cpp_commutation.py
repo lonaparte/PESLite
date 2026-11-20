@@ -245,7 +245,7 @@ class _Stalled(_Reset):
 
 
 def test_native_commutation_reports_no_progress_instead_of_hanging(tmp_path):
-    from peslite.assembly.conduction import CommutationError
+    from peslite.solver.commutation import CommutationError
 
     tree = _ps_tree(_rectifier(400.), _rectifier(200.), .8)
     tree['simulation'].update(energy_check='off')

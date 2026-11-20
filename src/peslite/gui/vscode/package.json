@@ -2,7 +2,7 @@
   "name": "peslite-workspace",
   "displayName": "PESLite Workspace",
   "description": "Offline .pes schematic and result preview using a locally selected PESLite Python environment.",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "private": true,
   "publisher": "peslite",
   "license": "AGPL-3.0-only",

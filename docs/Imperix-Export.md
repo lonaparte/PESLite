@@ -184,7 +184,9 @@ a resolved `clocks` table containing each used clock's frequency and full-path b
 including defaults. Assignment happens only during export; no runtime clock allocator is added.
 
 `sampling_phase` is in `[0, 1)` relative to CLK0. PWM uses the configured carrier phase,
-frequency and single/double register-update selection. The hardware adapter uses
+frequency, alignment and single/double register-update selection. `center`, `trailing` and
+`leading` map to the SDK's triangle, sawtooth and inverted-sawtooth carriers; sawtooth carriers
+require single-rate updates. The hardware adapter uses
 `pattern_sync: interval`; complete-pulse software updates require a hardware adapter and are
 rejected rather than approximated. Only asynchronous carriers are supported;
 an angle-locked simulation carrier needs a separate hardware timing adapter. Here

@@ -20,16 +20,17 @@ import numpy as np
 from ..components.adc import ADC, ADCSample, MeasurementPorts, _PortMeasurement
 from ..components.converter import (HalfBridgeDiodeConduction, make_bridge, make_dclink,
                                     make_topology)
-from ..components.network import RLBranch, Port
+from ..components.network import Port
+from ..components.passive import RLBranch
 from ..components.pwm import Modulator
 from ..control.blocks import phases
 from ..control.controller import (Controller, ConverterMeasurement,
-                                  Measurement, continuous_control, make_controller)
-from ..solver.timing import TIME_EPS, PeriodicClock, control_clock_offset, resolve_clock_offset
+                                  Measurement, continuous_control)
+from ..solver.timing import TIME_EPS, PeriodicClock, resolve_clock_offset
 from .events import Scenario
-from .params import SimulationParams, UnitParams, _parameterized
+from .control import make_control_modulator, make_controller
+from .params import SimulationParams, UnitParams, _parameterized, unit_type
 from .protection import Protection, ProtectionSample
-from .types import unit_type
 
 __all__ = ["Plant", "Unit", "VSC", "DCConverter"]
 
@@ -131,10 +132,7 @@ class Unit(ABC):
             if not self.continuous:
                 return PeriodicClock(
                     cfg.ctrl.period,
-                    control_clock_offset(
-                        cfg.ctrl, cfg.pwm,
-                        pwm_timed=cfg.bridge.pwm_timed,
-                    ),
+                    cfg.ctrl.offset,
                 )
             meas = cfg.meas
             return PeriodicClock(
@@ -366,8 +364,7 @@ class Unit(ABC):
     def states_loaded(self) -> None:
         """Apply restored lifecycle and bridge state to the physical port."""
         self.breaker = self._initially_connected and not self.tripped
-        current = self.branch_f.state.i if self.branch_f is not None else None
-        self._restore_bridge_state(current)
+        self._restore_bridge_state()
 
     def begin(self, t: float, plant: Plant, continued: bool, window_given: bool) -> None:
         """Track the initial plant state and restore bridge and ADC timing."""
@@ -562,7 +559,7 @@ class Unit(ABC):
         self._set_gates(False)
         self.dclink.open_breaker()
 
-    def _restore_bridge_state(self, given_current: complex | float | None) -> None:
+    def _restore_bridge_state(self) -> None:
         """Reconcile restored trip, controller and bridge state through one lifecycle path."""
         if self.tripped:
             self._controller_command(False, 0.0, 0.0, reset=False)
@@ -571,12 +568,6 @@ class Unit(ABC):
                 (self.ctrl is None or self.ctrl.startup.active) and self.breaker and not self.tripped
             )
         self._set_gates(self.bridge.on)
-        if given_current is not None and self.blocked and given_current != 0:
-            warnings.warn(
-                f"simulation.initial.states: unit {self.name!r} starts with its PWM blocked, "
-                f"so {self.name}.branch_f.i starts at zero, not at the value given",
-                stacklevel=5,
-            )
 
     def _start_continuous_bridge(self, t: float) -> None:
         """Apply continuous startup state to the common bridge/gate boundary."""
@@ -705,7 +696,11 @@ class VSC(Unit):
         try:
             self.bridge = _parameterized(
                 lambda c: make_bridge(
-                    c, modulator, continuous=continuous_control(c),
+                    c,
+                    modulator if modulator is not None else (
+                        None if continuous_control(c) else make_control_modulator(c)
+                    ),
+                    continuous=continuous_control(c),
                 ),
                 cfg,
             )
@@ -855,7 +850,11 @@ class DCConverter(Unit):
         topology = make_topology(cfg.bridge)
         self.bridge = _parameterized(
             lambda c: make_bridge(
-                c, modulator, topology=topology,
+                c,
+                modulator if modulator is not None else (
+                    None if continuous_control(c) else make_control_modulator(c)
+                ),
+                topology=topology,
                 continuous=continuous_control(c),
             ),
             cfg,
@@ -887,7 +886,7 @@ class DCConverter(Unit):
             self.conduction = _parameterized(lambda c: HalfBridgeDiodeConduction(
                 c.pwm.switching_period,
                 c.filter.l_f,
-                c.filter.r_f + c.bridge.on_resistance,
+                c.filter.r_f + c.bridge.diode_resistance,
                 topology,
             ), cfg)
             self.conduction.local_step_state = self.branch_f

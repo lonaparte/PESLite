@@ -7,23 +7,16 @@ elsewhere can still be imported and registered explicitly before loading a simul
 names them.
 
 The root `examples/` directory contains simulation files and a `templates/` directory for
-`peslite create`. Bundled Python implementations live under `peslite.addons`, while test fixtures
+`peslite create`. Bundled addon implementations live under `peslite.addons`, while test fixtures
 exercise the same interfaces in the test suite.
 
 Project-local controllers, components and functions can live beside a simulation rather than in
 the installed package. Their exact search rules and their relationship to the output directory are
 defined once in [Project Workspace](Project-Workspace.md).
 
-The bundled `custom-pll-example` demonstrates this layout: its `.pes` file remains in `examples/`,
-while `peslite.addons.control.voltage_adaptive_pll` contains the executable custom loop. It
-uses a filtered measured-voltage magnitude and grid-frequency state, then joins the same GFL graph
-as the built-in current and DC-voltage loops.
-
-The bundled `cable-gfl-example` similarly keeps its case in `examples/`, while
-`peslite.addons.components.cable` declares a distributed R-L/G-C network through the same component
-interface. It is a two-port custom element rather than a renamed built-in branch: both port currents
-are positive into the cable, and its internal inductor currents and capacitor voltages are ordinary
-restartable PESLite states.
+The bundled `cable-gfl-example` uses the core cable component with either its delayed Bergeron or
+segmented lumped model. Project-local implementations use the same component interface and
+registration mechanism.
 
 ## Custom control loops
 
@@ -33,7 +26,7 @@ Register a control-loop class with `register_loop_type`:
 from dataclasses import dataclass
 from typing import Optional
 
-from peslite.addons.control import SyncLaw, register_loop_type
+from peslite.control import SyncLaw, register_loop_type
 
 @register_loop_type
 class LaggedSync(SyncLaw):
@@ -68,9 +61,9 @@ class LaggedSync(SyncLaw):
 The nested frozen `Params` dataclass defines the file schema and defaults. Loop `type` and `period`
 are structural; `set` events may write other fields except those declared with dataclass metadata
 `{"runtime": False}`. Use that metadata for additional fields that add or remove states, as the
-built-in loops do for `SRFPLL.normalisation` and the power-filter `enable`. A module stored under
-`peslite/addons/control/` is discovered automatically; the class name is then available directly
-under `units.<u>.ctrl.loops` exactly like a built-in loop:
+built-in loops do for `SRFPLL.normalisation` and the power-filter `enable`. A project module stored
+under `PESaddons/control/` is registered when its simulation file is loaded; the class name is then
+available directly under `units.<u>.ctrl.loops` exactly like a built-in loop:
 
 ```yaml
 loops:
@@ -88,7 +81,7 @@ implementations during construction. Typed ports still validate all connections 
 The essential pattern is:
 
 ```python
-from peslite.addons.control import Filter, Integrator, PI
+from peslite.control import Filter, Integrator, PI
 
 def __init__(self, cfg, unit, startup):
     super().__init__(cfg, unit, startup)
@@ -115,8 +108,8 @@ averaging. Construction therefore selects a sampled or continuous implementation
 itself has no mode branch. `Filter` follows the Transfer Fcn coefficient convention: numerator and
 denominator coefficients are in descending powers of `s`, and the transfer function must be
 proper. Its sampled implementation, and the sampled integral branch of `Integrator` and `PI`, use
-the trapezoidal (Tustin) method. The complete bundled example is
-`peslite.addons.control.voltage_adaptive_pll`.
+the trapezoidal (Tustin) method. The built-in `SRFPLL` uses the same block and state interfaces,
+including optional amplitude normalisation and bandwidth-based tuning.
 
 ## Custom circuit elements
 
@@ -128,7 +121,7 @@ circuit model.
 from dataclasses import dataclass
 from typing import ClassVar
 
-from peslite.addons.components import register_component_type
+from peslite.components import register_component_type
 from peslite.solver import netlist as nl
 
 @register_component_type
@@ -157,8 +150,8 @@ elements:
   load: {type: series_rl, bus: pcc, r: 1.0, l: 2e-3}
 ```
 
-Modules under `peslite/addons/components/` are discovered automatically. Built-in and add-on
-components use the same registry and assembly-time translation. A `bus` field creates one port;
+Project modules under `PESaddons/components/` are registered when their simulation file is loaded.
+Built-in and addon components use the same registry and assembly-time translation. A `bus` field creates one port;
 `bus1`, `bus2` and later numbered fields create multiple ports. Each port starts with zero voltage
 and current, with current positive into the component. `n.bus` or `n.busN` is its network node,
 `n.ground` is the reference node, and `n.internal()` inherits the component's electrical dimension.
@@ -187,12 +180,14 @@ Every entry returned by `signals()` follows the same output path. Complex values
 phase columns with `_a`, `_b` and `_c` suffixes, while scalar values retain their declared name;
 custom signal names do not require recorder-specific code.
 
-The cable add-on is a complete multi-port reference implementation:
+The cable add-on is a complete multi-port reference implementation. This selects its segmented
+lumped model so the internal continuous states remain visible:
 
 ```yaml
 elements:
   cable1:
     type: cable
+    model: lumped
     bus1: grid_bus
     bus2: pcc
     length_km: 5.0
@@ -204,7 +199,8 @@ elements:
 ```
 
 Its per-kilometre parameters are SI values. `sections` changes the spatial discretisation and
-therefore the state layout, so it is fixed when the simulation is assembled.
+therefore the state layout, so it is fixed when the simulation is assembled. See
+[Passive Components](Passive-Components.md#cables) for the cable models and fields.
 
 ## Custom events
 

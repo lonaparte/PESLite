@@ -11,6 +11,8 @@ from typing import Any, ClassVar, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
+from ..defaults import DEFAULT_PH_REPORT_RTOL
+
 __all__ = ["StoragePort", "Port", "Energetic", "EnergySpec", "EnergyReport", "SubsystemEnergy", "PHReport", "SubsystemStatus", "CutStatus", "signal",
            "re_product", "spec_of", "balance", "ph_report"]
 
@@ -158,8 +160,9 @@ class Energetic(Protocol):
     Members: ``storage``, ``ports``, ``dissipated_power()`` (W, >= 0) and ``supplied_power()``
     (W, zero if passive). Optional flags: ``dirac`` (lossless interconnection),
     ``observer`` (non-loading reader), ``has_source`` (internal source). Coupled or nonlinear
-    storage may additionally declare ``energy_states``, ``stored_energy(t)`` and
-    ``stored_energy_rate(t, derivatives)``.
+    storage may additionally declare ``stored_energy(t)`` and
+    ``stored_energy_rate(t, derivatives)``. ``energy_states`` names any continuous states whose
+    derivatives the rate law needs; accepted-step histories need no continuous-state names.
     """
 
     storage: ClassVar[tuple[StoragePort, ...]]
@@ -231,9 +234,9 @@ def spec_of(sub: Any) -> EnergySpec:
         energy_states = tuple(getattr(sub, "energy_states", ()))
         stored = getattr(sub, "stored_energy", None)
         rate = getattr(sub, "stored_energy_rate", None)
-        if bool(energy_states) != (callable(stored) and callable(rate)):
+        if callable(stored) != callable(rate):
             raise TypeError(
-                "functional storage requires energy_states, stored_energy(t) and "
+                "functional storage requires both stored_energy(t) and "
                 "stored_energy_rate(t, derivatives)"
             )
         if len(set(energy_states)) != len(energy_states):
@@ -246,9 +249,9 @@ def spec_of(sub: Any) -> EnergySpec:
             supplied=_power_law(sub, "supplied_power"),
             energy_states=energy_states,
             stored_energy=(_state_energy_law(sub, "stored_energy")
-                           if energy_states else None),
+                           if callable(stored) else None),
             stored_energy_rate=(_state_energy_law(sub, "stored_energy_rate")
-                                if energy_states else None),
+                                if callable(rate) else None),
             has_source=bool(getattr(sub, "has_source", False)),
         )
     return EnergySpec(
@@ -455,7 +458,7 @@ class _BalancePlan:
                     dx = float(dy[storage.index])
                     rate += storage.coefficient * x * dx
                 energy += 0.5 * storage.coefficient * (abs(x) ** 2)
-            if check.energy_states:
+            if spec.stored_energy is not None:
                 derivatives = {}
                 for state, index, complex_value in check.energy_states:
                     derivatives[state] = (
@@ -707,7 +710,8 @@ def _state_labels(model: Any, sub: Any) -> list[str]:
     return [f"{name}.{st}" for st in sub.state_names]
 
 
-def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e-8, seed: int = 0,
+def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None,
+              rtol: float = DEFAULT_PH_REPORT_RTOL, seed: int = 0,
               groups: Optional[dict[str, Any]] = None, hold: Optional[dict[str, float]] = None) -> PHReport:
     """Build the :class:`PHReport` of a model and, if given, of its multirate groups.
 
@@ -730,7 +734,7 @@ def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e
             kind, role = "dirac", "lossless"
             n_covered += n
         elif spec.kind == "declared":
-            kind = "storage" if spec.storage or spec.energy_states else "static"
+            kind = "storage" if spec.storage or spec.stored_energy is not None else "static"
             role = "source" if spec.has_source else "passive"
             n_covered += n
         else:

@@ -143,6 +143,49 @@ def test_rk4_step_check_reuses_a_spectral_bound_across_exact_mode_keys():
     assert not solver._stability_results
 
 
+def test_revision_cache_reuses_only_a_conclusive_range_bound():
+    class DynamicMode:
+        plan_revision = 0
+        equation_revision = 0
+        mode = 0
+        builds = 0
+        bound_calls = 0
+
+        def __init__(self):
+            self.solver_check = SolverCheck(self.exact_modes, self.bounds)
+
+        def bounds(self):
+            self.bound_calls += 1
+            return (None,)
+
+        def exact_modes(self):
+            def build():
+                self.builds += 1
+                return np.array([[-1.0 - self.mode]])
+            return ((self.mode, build),)
+
+    model = DynamicMode()
+    solver = FixedStepSolver(1e-3, "RK4", model=model)
+    state = np.array([1.0])
+    solver(lambda _t, y: -y, 0.0, 1e-3, state)
+    model.mode = 1
+    solver(lambda _t, y: -y, 1e-3, 2e-3, state)
+    assert model.builds == 2
+    assert model.bound_calls == 2
+
+    model.solver_check = SolverCheck(
+        model.exact_modes,
+        lambda: (SpectralBound("declared-range", 500.0),),
+    )
+    solver.parameters_changed()
+    solver(lambda _t, y: -y, 2e-3, 3e-3, state)
+    cached = solver._stable_bound_key
+    model.mode = 2
+    solver(lambda _t, y: -y, 3e-3, 4e-3, state)
+    assert solver._stable_bound_key == cached
+    assert model.builds == 2
+
+
 def test_stability_reuses_unchanged_strongly_connected_blocks(monkeypatch):
     first = np.array([
         [-2.0, 1.0, 0.0, 0.0],

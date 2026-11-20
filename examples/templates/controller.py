@@ -1,10 +1,10 @@
-# PESLite 0.5.2
+# PESLite 0.6.0
 """Voltage PI control-loop template using the shared sampled and continuous PI block."""
 
 from dataclasses import dataclass
 from typing import Optional
 
-from peslite.addons.control import Loop, PI, SignalType, register_loop_type
+from peslite.control import Loop, PI, SignalType, register_loop_type
 
 
 @register_loop_type

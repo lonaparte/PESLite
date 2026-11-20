@@ -8,9 +8,9 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.circuit import Circuit
-from peslite.assembly.params import ConfigError, from_dict
+from peslite.assembly.params import ConfigError, from_dict, to_dict
 from peslite.components import HalfBridge, HalfBridgeDiodeConduction, PWMAveragingModel
-from peslite.assembly.conduction import DiodeConduction
+from peslite.solver.commutation import Commutation
 from peslite.control import (BridgeControlOutput, DCVoltageControl, GraphController,
                              InductorCurrentControl, Startup)
 from peslite.solver.netlist import CurrentState, Dissipation, Inductor, VoltageSource
@@ -68,6 +68,39 @@ def _case(*, model="pwm_averaging", bridge_type="half_bridge",
             "output": {"period": 100.0e-6, "states": 1, "signals": 1, "energy": 0},
         },
     })
+
+
+def test_explicit_dc_graph_uses_the_same_assembly_and_runtime_as_a_default_profile():
+    profiled = _case(model="averaging", t_end=0.001)
+    tree = to_dict(profiled)
+    control = tree["units"]["converter"]["ctrl"]
+    control.pop("type")
+    control["connections"] = {
+        "DCVoltageControl.reference": "references.voltage",
+        "DCVoltageControl.voltage": "meas.voltage",
+        "InductorCurrentControl.reference": "DCVoltageControl.current_reference",
+        "InductorCurrentControl.current": "meas.current",
+        "InductorCurrentControl.feedforward": "meas.duty_feedforward",
+    }
+    control["outputs"] = {"duty": "InductorCurrentControl.duty"}
+    explicit = from_dict(tree)
+
+    profiled_unit = peslite.System(profiled).units["converter"]
+    explicit_unit = peslite.System(explicit).units["converter"]
+    assert type(explicit_unit.ctrl) is type(profiled_unit.ctrl)
+    assert explicit_unit.ctrl.graph.interface.outputs == profiled_unit.ctrl.graph.interface.outputs
+    assert explicit_unit.ctrl.graph.nodes.keys() == profiled_unit.ctrl.graph.nodes.keys()
+    assert explicit_unit.ctrl.graph.connections == profiled_unit.ctrl.graph.connections
+    assert explicit_unit.ctrl.graph.outputs == profiled_unit.ctrl.graph.outputs
+
+    profiled_result = peslite.Simulation(profiled).run()
+    explicit_result = peslite.Simulation(explicit).run()
+    np.testing.assert_allclose(
+        list(explicit_result.final_states().values()),
+        list(profiled_result.final_states().values()),
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
@@ -462,7 +495,8 @@ def test_switching_boost_uses_the_existing_implicit_solver_for_its_stiff_startup
     for circuit_model in ("device", "statewise", "nodal"):
         params = base.replace(**{
             "units.converter.bridge.model": "switching",
-            "units.converter.bridge.on_resistance": 1e-6,
+            "units.converter.bridge.switch_resistance": 1e-6,
+            "units.converter.bridge.diode_resistance": 1e-6,
             "units.converter.ctrl": {
                 "type": "open_loop",
                 "period": 50e-6,
@@ -629,12 +663,15 @@ def test_ratio_one_solver_schedule_still_honours_the_dcm_local_step():
     })
     simulation = peslite.Simulation(params)
     assert type(simulation.solver) is peslite.FixedStepSolver
-    simulation.unit().conduction.diode_maximum_step = lambda: 5.0e-6
+    simulation.unit().conduction.solver_maximum_step = lambda: 5.0e-6
 
-    stage = DiodeConduction(simulation.system.model, simulation.solver)
+    stage = Commutation(simulation.system.model, simulation.solver)
     initial = simulation.system.model.get_initial_values()
     before = simulation.solver.n_rhs
-    stage.advance(0.0, 50.0e-6, initial)
+    stage.advance(
+        0.0, 50.0e-6, initial,
+        max_step=simulation.unit().conduction.solver_maximum_step(),
+    )
 
     assert simulation.solver.n_rhs - before >= 40
 

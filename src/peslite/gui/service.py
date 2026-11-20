@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from ..assembly.params import load
-from ..solver.simulation import Simulation, _example_configs_dir, validate_model
+from ..cli import _example_configs_dir
+from ..solver.simulation import Simulation, validate_model
 from .descriptor import SignalRecorder, Topology, json_safe, small_signal_descriptor
 from .preview_cache import PreviewLayoutCache
 
@@ -273,7 +274,7 @@ class FrontendService:
 
     def run_small_signal(self, request_id: Any) -> None:
         """Linearize the final state of the latest run, running the case first when needed."""
-        from ..addons.functions import small_signal
+        from ..addons.functions.online_analysis import small_signal
 
         if self.simulation is None:
             self.run(request_id, stream=False)
