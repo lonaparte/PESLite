@@ -116,7 +116,11 @@ def test_every_installed_addon_module_is_declared_once():
             if path.stem != "__init__" and not path.stem.startswith("_")
         }
         assert files == set(modules)
-        assert not any(path.is_dir() for path in (root / category).iterdir())
+        source_directories = {
+            path.name for path in (root / category).iterdir()
+            if path.is_dir() and path.name != "__pycache__"
+        }
+        assert not source_directories
 
 
 def test_missing_addon_module_has_one_assembly_error(monkeypatch):
