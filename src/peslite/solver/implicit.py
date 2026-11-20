@@ -21,7 +21,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..defaults import DEFAULT_SOLVER_ATOL, DEFAULT_SOLVER_RTOL
-from .integrators import IMPLICIT_FIXED_METHODS, RHS, SolverStep, _accepted, subintervals
+from .integrators import IMPLICIT_FIXED_METHODS, RHS, SolverStep, _accepted, _fixed_step_layout
 
 __all__ = ["ImplicitSolver", "LinearSystem", "Structure", "linear_system",
            "ModeJacobian"]
@@ -515,14 +515,9 @@ class ImplicitSolver:
     def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
                 max_step: float = math.inf) -> SolverStep:
         """Integrate with an optional per-call maximum step without changing configuration."""
-        span = t1 - t0
-        if span <= 0.0:
+        n, h = _fixed_step_layout(t1 - t0, self.dt, max_step)
+        if n == 0:
             return SolverStep(t1, y0, 0)
-        step = min(self.dt, max_step)
-        if step <= 0.0:
-            raise ValueError("max_step must be positive")
-        n = subintervals(span, step)
-        h = span / n
         y = np.array(y0, dtype=float)
         lin = self.linear
         before = lin.n_rhs

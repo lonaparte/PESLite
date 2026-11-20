@@ -574,10 +574,11 @@ class Circuit:
         writes = [f"{ref(c.state)}.{n} = v[{i}] + 1j * v[{i + 1}]" if z else f"{ref(c.state)}.{n} = v[{i}]"
                   for c, n, z, i in layout]
         copies = [f"setattr({ref(c.input)}, {f!r}, input.{k})" for c, f, k in self.copies]
-        source = "\n".join(["def gather():", f"    return [{', '.join(values)}]",
-                            "def scatter(v):", *("    " + w for w in writes or ["pass"]),
-                            "def receive():", *("    " + c for c in copies or ["pass"])]) + "\n"
-        exec(compile(source, "<peslite circuit>", "exec"), env)
+        _compile_straight_line(env, "<peslite circuit>", (
+            ("gather()", [f"return [{', '.join(values)}]"]),
+            ("scatter(v)", writes),
+            ("receive()", copies),
+        ))
         self.gather, self.scatter, self.receive = env["gather"], env["scatter"], env["receive"]
         self.derivatives = [0.0] * self.n_states
         self.build()
@@ -819,8 +820,7 @@ class Circuit:
             self._append_publication_writes(key, expression, lines, env, "runtime", computed)
         lines.extend(f"output.{output} = input.{input_}" for input_, output in self.passthrough)
         env.update(input=self.input, output=self.output)
-        exec(compile("def publish(o):\n" + "\n".join("    " + line for line in lines or ["pass"]) + "\n",
-                     "<peslite circuit outputs>", "exec"), env)
+        _compile_straight_line(env, "<peslite circuit outputs>", (("publish(o)", lines),))
         self.publish = env["publish"]
 
     def _use_runtime_stages(self) -> None:
@@ -1963,8 +1963,9 @@ class NetworkView:
         entries = [(i, z) for c, _n, z, i in circuit.layout if c is self.component]
         items = "".join(f"d[{i}] + 1j * d[{i + 1}], " if z else f"d[{i}], " for i, z in entries)
         env: dict[str, Any] = {}
-        exec(compile(f"def rhs(self, t):\n    d = self._circuit.derivatives\n    return ({items})\n",
-                     "<peslite netlist view>", "exec"), env)
+        _compile_straight_line(env, "<peslite netlist view>", ((
+            "rhs(self, t)", ["d = self._circuit.derivatives", f"return ({items})"],
+        ),))
         results = tuple(
             f"self._circuit.derivatives[{i}] + 1j * self._circuit.derivatives[{i + 1}]"
             if complex_state else f"self._circuit.derivatives[{i}]"
@@ -1977,13 +1978,14 @@ class NetworkView:
             derived = tuple(stage.method for stage in self.output_stages or ())
             self._derived_output_methods = derived
             env = {}
-            body = "".join(
-                f"    self.output.{field} = self._circuit.output."
-                f"{circuit.published[id(self.component), field]}\n"
+            body = [
+                f"self.output.{field} = self._circuit.output."
+                f"{circuit.published[id(self.component), field]}"
                 for field in self.declared
-            )
-            exec(compile(f"def netlist_outputs(self, t):\n{body}",
-                         "<peslite netlist outputs>", "exec"), env)
+            ]
+            _compile_straight_line(env, "<peslite netlist outputs>", (
+                ("netlist_outputs(self, t)", body),
+            ))
             env["netlist_outputs"]._peslite_netlist_outputs = (circuit, self.declared)
             self.netlist_outputs = MethodType(env["netlist_outputs"], self)
             self.output_stages = (OutputMethod(
@@ -2175,19 +2177,16 @@ def _bind_standalone(component: Any, circuit: Circuit, outputs: Sequence[str]) -
                 values = ()
         body.extend(assignments)
         values = tuple(results) if results else values
-        source = [f"    {line}" for line in body]
+        source = list(body)
         if values:
             source.append(
-                "    return (" + ", ".join(values)
+                "return (" + ", ".join(values)
                 + ("," if len(values) == 1 else "") + ")"
             )
-        elif not source:
-            source.append("    pass")
         env = dict(namespace)
-        exec(compile(
-            f"def {name}(self, t):\n" + "\n".join(source) + "\n",
-            "<peslite standalone netlist>", "exec",
-        ), env)
+        _compile_straight_line(env, "<peslite standalone netlist>", (
+            (f"{name}(self, t)", source),
+        ))
         function = env[name]
         identifiers = set(_IDENTIFIERS.findall("\n".join((*body, *values))))
         function._peslite_inline_program = _InlineProgram(

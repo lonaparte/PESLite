@@ -309,13 +309,6 @@ class Cable(Element):
             )
         )
 
-    def subsystems(self) -> dict[str, NetworkComponent]:
-        return {self.name: self.model}
-
-    @staticmethod
-    def connections() -> dict:
-        return {}
-
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         return ((self.cfg.bus1, self.model.port1),
                 (self.cfg.bus2, self.model.port2))

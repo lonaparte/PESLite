@@ -558,10 +558,6 @@ class System:
                         )
                     port = ports[0]
                     observer = _PortMeasurement(port)
-                    observer.input.voltage = port.voltage
-                    observer.input.current = port.current
-                    observer.output.voltage = observer.input.voltage
-                    observer.output.current = observer.input.current
                     _merge_unique(subsystems, {f"measurements.{owner}": observer},
                                   "subsystem name")
                     port_measurements[bus] = observer

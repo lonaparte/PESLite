@@ -38,7 +38,8 @@ from ..control.blocks import abc2complex, complex2abc
 from .commutation import Commutation
 from .integrators import Solver, _accepted_steps, make_solver
 from .linearization import coordinate_width
-from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
+from .model import (ConfigError, StateRegistry, _compile_straight_line, expand_aliases, flatten,
+                    resolve)
 from .multirate import rated_effort
 from .splitbound import split_error_bound
 
@@ -422,10 +423,9 @@ def _compile_interval_integrator(solver, rhs, commutation, settle, project, step
         env["project"] = project
         body.append("y = project(y)")
     body.append("return y")
-    source = "def integrate(t_a, t_b, y, event):\n" + "\n".join(
-        "    " + line for line in body
-    )
-    exec(compile(source, "<peslite interval integrator>", "exec"), env)
+    _compile_straight_line(env, "<peslite interval integrator>", (
+        ("integrate(t_a, t_b, y, event)", body),
+    ))
     return np.errstate(over="raise")(env["integrate"])
 
 

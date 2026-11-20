@@ -307,15 +307,8 @@ class ONNXModel(Element):
             observer=True,
         )
 
-    def subsystems(self) -> dict[str, Any]:
-        return {self.name: self.model}
-
     def connections(self) -> dict:
         return {(self.model, name): source for name, source in self._sources.items()}
-
-    @staticmethod
-    def port_bindings() -> tuple:
-        return ()
 
     def signals(self) -> dict[str, Any]:
         return {

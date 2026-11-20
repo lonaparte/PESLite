@@ -477,17 +477,6 @@ class _BridgeModel(NetworkComponent):
             raise TypeError("the selected topology has no independent rail-current transfer ratios")
         configure(self)
 
-    def _bind_netlist_devices(self, netlist, devices) -> None:
-        self._netlist_devices = netlist, tuple(devices)
-
-    def _device_commutation_margin(self) -> float:
-        from ..solver.netlist import device_commutation_margin
-        return device_commutation_margin(self)
-
-    def _device_commutate(self, t: float) -> None:
-        from ..solver.netlist import device_commutate
-        device_commutate(self, t)
-
     def zoh_connections(self, label: str) -> dict:
         """An unclocked model has no held modulation input."""
         return {}

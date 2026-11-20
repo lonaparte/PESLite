@@ -22,8 +22,8 @@ from numpy.typing import NDArray
 
 from ..defaults import (DEFAULT_ALGEBRAIC_ATOL, DEFAULT_ALGEBRAIC_MAX_ITERATIONS,
                         DEFAULT_ALGEBRAIC_RTOL)
-from ..solver.model import (Bag, ConfigError, _complex, _component_plan, _dependency_plan,
-                            _real, gather, scatter)
+from ..solver.model import (Bag, ConfigError, _compile_straight_line, _complex,
+                            _component_plan, _dependency_plan, _real, gather, scatter)
 from ..solver.energy import Port
 from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,
@@ -34,8 +34,7 @@ from .modulation import CONFIGURED, OutputStage
 __all__ = ["Measurement", "ConverterMeasurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
            "ControlInterface", "CONTROL_INTERFACE", "SAMPLED_VSC_INTERFACE",
            "ControlGraph", "ControlGraphOverlay",
-           "VSCController", "BridgeControlOutput", "GraphController",
-           "GraphController"]
+           "VSCController", "BridgeControlOutput", "GraphController"]
 
 
 # ------------------------------------------------------------------ the interface
@@ -295,6 +294,20 @@ class ContinuousStartup:
 _HELD, _MEASURED, _CONSTANT, _REFERENCE = 0, 1, 2, 3
 
 
+def _compiled_input_source(kind: int, key: Any, environment: dict[str, Any],
+                           suffix: str) -> str:
+    """Encode one input source for either generated control runner."""
+    if kind == _HELD:
+        return f"_values[{key!r}]"
+    if kind == _MEASURED:
+        return f"meas.{key}"
+    if kind == _REFERENCE:
+        return f"_references[{key!r}]"
+    constant = f"_constant{suffix}_{len(environment)}"
+    environment[constant] = key
+    return constant
+
+
 @dataclass(frozen=True)
 class ControlGraphOverlay:
     """Construction-time connection, source and observation changes to one control graph."""
@@ -541,12 +554,14 @@ class ControlGraph:
             if source not in types or not types[source].compatible(spec):
                 raise ConfigError(f"ctrl.outputs.{port}: missing or incompatible source {source!r}")
             pending_sources.append(source)
+        probes = {}
         if self.overlay is not None:
             for alias, source in self.overlay.probes.items():
                 source = self.connections.get(source, source)
                 if source not in types:
                     raise ConfigError(f"control overlay probe {alias!r}: unknown source {source!r}")
-                pending_sources.append(source)
+                probes[alias] = source
+            pending_sources.extend(probes.values())
             pending_sources.extend(self.overlay.retained)
         if interface.optional_outputs:
             retained = frozenset(port for port in interface.optional_outputs
@@ -685,7 +700,7 @@ class ControlGraph:
                 affected.update(group)
         self.dc_affected = frozenset(affected)
         self._rewire()
-        self._prepare_probes(types)
+        self._prepare_probes(probes, types)
         if self.continuous:
             self._prepare_flow()
         self._every = (() if self.continuous else
@@ -773,18 +788,12 @@ class ControlGraph:
             self._wiring[name] = wiring
         self._output_source = {port: self._resolve(source) for port, source in self.outputs.items()}
 
-    def _prepare_probes(self, types: Mapping[str, SignalType]) -> None:
-        """Resolve overlay probes once and expose a stable scalar log schema."""
-        self._probes = ()
-        self.probe_names = ()
-        if self.overlay is None:
-            return
+    def _prepare_probes(self, sources: Mapping[str, str],
+                        types: Mapping[str, SignalType]) -> None:
+        """Bind the resolved overlay probes and expose a stable scalar log schema."""
         probes = []
         names = []
-        for alias, written in self.overlay.probes.items():
-            source = self.connections.get(written, written)
-            if source not in types:
-                raise ConfigError(f"control overlay probe {alias!r}: unknown source {source!r}")
+        for alias, source in sources.items():
             complex_value = types[source].complex_value
             probes.append((alias, self._resolve(source), complex_value))
             names.extend((f"{alias}.re", f"{alias}.im", f"{alias}.abs")
@@ -880,16 +889,7 @@ class ControlGraph:
             environment[f"_flow{suffix}"] = flow
             sources = {}
             for port, kind, key in wiring:
-                if kind == _HELD:
-                    value = f"_values[{key!r}]"
-                elif kind == _MEASURED:
-                    value = f"meas.{key}"
-                elif kind == _REFERENCE:
-                    value = f"_references[{key!r}]"
-                else:
-                    constant = f"_constant{suffix}_{len(environment)}"
-                    environment[constant] = key
-                    value = constant
+                value = _compiled_input_source(kind, key, environment, suffix)
                 sources[port] = value
                 if path_ports is not None:
                     continue
@@ -925,10 +925,9 @@ class ControlGraph:
                         f"derivatives[{self._flow_derivative_index[key]}] = "
                         f"{flow_values[local]}"
                     )
-        source = "def run(t, meas, derivatives):\n" + "\n".join(
-            "    " + line for line in (body or ["pass"])
-        ) + "\n"
-        exec(compile(source, "<peslite continuous control>", "exec"), environment)
+        _compile_straight_line(environment, "<peslite continuous control>", (
+            ("run(t, meas, derivatives)", body),
+        ))
         return environment["run"]
 
     def _compile_sample_runner(self):
@@ -945,24 +944,14 @@ class ControlGraph:
         for index, name in enumerate(self.order):
             inputs = f"_inputs[{name!r}]"
             for port, kind, key in self._wiring[name]:
-                if kind == _HELD:
-                    value = f"_values[{key!r}]"
-                elif kind == _MEASURED:
-                    value = f"meas.{key}"
-                elif kind == _REFERENCE:
-                    value = f"_references[{key!r}]"
-                else:
-                    constant = f"_constant{index}_{len(environment)}"
-                    environment[constant] = key
-                    value = constant
+                value = _compiled_input_source(kind, key, environment, str(index))
                 body.append(f"{inputs}[{port!r}] = {value}")
             outputs = f"_outputs[{name!r}]"
             body.append(f"_samples[{name!r}](t, {inputs}, {outputs})")
             body.append(f"_store({name!r}, {outputs})")
-        source = "def run(t, meas):\n" + "\n".join(
-            "    " + line for line in (body or ["pass"])
-        ) + "\n"
-        exec(compile(source, "<peslite sampled control>", "exec"), environment)
+        _compile_straight_line(environment, "<peslite sampled control>", (
+            ("run(t, meas)", body),
+        ))
         return environment["run"]
 
     def schedule(self, cfg):

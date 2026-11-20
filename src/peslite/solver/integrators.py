@@ -276,6 +276,17 @@ def subintervals(span: float, step: float) -> int:
     return max(1, int(math.ceil(span / step - 1e-9)))
 
 
+def _fixed_step_layout(span: float, dt: float, max_step: float) -> tuple[int, float]:
+    """Return the equal-step count and width for one fixed-step interval."""
+    if span <= 0.0:
+        return 0, 0.0
+    step = min(dt, max_step)
+    if step <= 0.0:
+        raise ValueError("max_step must be positive")
+    count = subintervals(span, step)
+    return count, span / count
+
+
 class FixedStepSolver:
     """Explicit RK with a maximum step ``dt`` (s); sub-steps are equal within an interval.
 
@@ -465,14 +476,9 @@ class FixedStepSolver:
     def advance(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64], *,
                 max_step: float = math.inf) -> SolverStep:
         """Integrate with an optional per-call maximum step without changing configuration."""
-        span = t1 - t0
-        if span <= 0.0:
+        n, h = _fixed_step_layout(t1 - t0, self.dt, max_step)
+        if n == 0:
             return SolverStep(t1, y0, 0)
-        step = min(self.dt, max_step)
-        if step <= 0.0:
-            raise ValueError("max_step must be positive")
-        n = subintervals(span, step)
-        h = span / n
         if self._stiff(h):
             return self._implicit_advance(f, t0, t1, y0, h)
         c, a, _b = TABLEAUS[self.method]
@@ -512,14 +518,9 @@ class FixedStepSolver:
         supplied when an RHS evaluation also refreshes everything read by the guard; interior
         observations then reuse the first RHS stage of the following step.
         """
-        span = t1 - t0
-        if span <= 0.0:
+        n, h = _fixed_step_layout(t1 - t0, self.dt, max_step)
+        if n == 0:
             return _GuardedStep.at(guard, t1, y0, self.n_rhs)
-        step = min(self.dt, max_step)
-        if step <= 0.0:
-            raise ValueError("max_step must be positive")
-        n = subintervals(span, step)
-        h = span / n
         if self._stiff(h):
             y, t = np.asarray(y0, dtype=float), t0
             watch = _GuardWatch(synchronized_guard if synchronized_guard is not None else guard,

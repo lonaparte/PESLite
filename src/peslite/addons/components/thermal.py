@@ -352,18 +352,11 @@ class SharedThermalNetwork(Element):
             initial_K=cfg.initial_K,
         )
 
-    def subsystems(self) -> dict[str, SharedThermalModel]:
-        return {self.name: self.model}
-
     def connections(self) -> dict:
         return {
             (self.model, f"heat_{name}_W"): source["path"]
             for name, source in self.cfg.sources.items()
         }
-
-    @staticmethod
-    def port_bindings() -> tuple:
-        return ()
 
     def signals(self) -> dict[str, float]:
         return {
@@ -737,9 +730,6 @@ class ThermalResistor(Element):
             buses[cfg.bus].phases,
         )
 
-    def subsystems(self) -> dict[str, ThermalResistorModel]:
-        return {self.name: self.model}
-
     def connections(self) -> dict:
         return {(self.model, "temperature_K"): self.cfg.temperature_source}
 
@@ -1076,9 +1066,6 @@ class ElectroThermal(Element):
                                   initial_temperature_K=cfg.initial_K,
                                   switching_devices=cfg.switching_devices)
 
-    def subsystems(self) -> dict[str, ElectroThermalModel]:
-        return {self.name: self.model}
-
     def connections(self) -> dict:
         source = (self.cfg.heat_source if self.cfg.heat_source is not None
                   else self.cfg.current_source)
@@ -1090,10 +1077,6 @@ class ElectroThermal(Element):
     def transition_bindings(self) -> tuple[tuple[str, ElectroThermalModel], ...]:
         return (() if self.cfg.switching_source is None else
                 ((self.cfg.switching_source, self.model),))
-
-    @staticmethod
-    def port_bindings() -> tuple:
-        return ()
 
     def signals(self) -> dict[str, float]:
         return {f"{self.name}.temperature_K": self.model.output.temperature_K,

@@ -1713,25 +1713,23 @@ class Model:
     def _build_state_layout(self) -> None:
         """Map every state field to a slice of the flat real vector."""
         ops: list[tuple[Any, str, int, bool]] = []
-        index = 0
-        for sub in self.subsystems:
-            for name in sub.state_names:
-                value = getattr(sub.state, name)
-                is_complex = isinstance(value, complex)
-                ops.append((sub.state, name, index, is_complex))
-                index += 2 if is_complex else 1
-        self._state_ops = tuple(ops)
-        self.n_states = index
-        # per-subsystem packing of the rhs return values
         rhs_layout = []
+        self._state_slices: dict[tuple[int, str], slice] = {}
+        index = 0
         for sub in self.subsystems:
             entries = []
             for name in sub.state_names:
-                for st, nm, idx, is_c in ops:
-                    if st is sub.state and nm == name:
-                        entries.append((idx, is_c))
-                        break
+                is_complex = isinstance(getattr(sub.state, name), complex)
+                ops.append((sub.state, name, index, is_complex))
+                state_slice = self._state_slices.setdefault(
+                    (id(sub.state), name),
+                    slice(index, index + (2 if is_complex else 1)),
+                )
+                entries.append((state_slice.start, is_complex))
+                index += 2 if is_complex else 1
             rhs_layout.append((sub, tuple(entries)))
+        self._state_ops = tuple(ops)
+        self.n_states = index
         self._rhs_layout = tuple(rhs_layout)
         self._state_entries = {
             id(subsystem): (subsystem, entries)
@@ -2214,10 +2212,10 @@ class Model:
 
     def state_slice(self, sub: Subsystem, name: str) -> slice:
         """Position of a subsystem's state field in the flat vector."""
-        for st, nm, idx, is_c in self._state_ops:
-            if st is sub.state and nm == name:
-                return slice(idx, idx + (2 if is_c else 1))
-        raise KeyError(f"{type(sub).__name__} has no state {name!r}")
+        try:
+            return self._state_slices[id(sub.state), name]
+        except KeyError:
+            raise KeyError(f"{type(sub).__name__} has no state {name!r}") from None
 
     # --------------------------------------------------------- evaluation
     def set_zoh_input(

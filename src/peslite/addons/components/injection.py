@@ -182,13 +182,6 @@ class PortInjection(Element):
         if phases == 1 and cfg.axis not in ("alpha", "d"):
             raise ConfigError("a single-phase injection supports only the alpha/d axis")
 
-    def subsystems(self) -> dict:
-        return {self.name: self.model}
-
-    @staticmethod
-    def connections() -> dict:
-        return {}
-
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         if self.cfg.kind == "voltage":
             return ((self.cfg.inlet or f"{self.name}.bus.in", self.model.inlet),

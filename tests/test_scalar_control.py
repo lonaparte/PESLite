@@ -24,6 +24,7 @@ from peslite.control import (
     OutputLimit,
     PI,
 )
+from peslite.control.controller import ControlGraphOverlay
 
 
 @dataclass(frozen=True)
@@ -31,7 +32,7 @@ class _References:
     voltage: float = 24.0
 
 
-def _graph(*, continuous=False):
+def _graph(*, continuous=False, probe_unused_input=False):
     period = 0.0001
     loops = {
         "voltage": DCVoltageControl.Params(
@@ -83,6 +84,19 @@ def _graph(*, continuous=False):
         "current.current": "meas.current",
         "current.feedforward": "meas.duty_feedforward",
     }
+    if probe_unused_input:
+        loops["unused"] = DCVoltageControl.Params(
+            kp=0.18,
+            ki=35.0,
+            minimum=0.0,
+            maximum=18.0,
+            period=period,
+        )
+        connections["unused.reference"] = "references.voltage"
+        connections["unused.voltage"] = "meas.voltage"
+        ctrl._control_overlay = ControlGraphOverlay(
+            probes={"measured_voltage": "unused.voltage"},
+        )
     return ControlGraph(
         unit,
         None,
@@ -90,6 +104,13 @@ def _graph(*, continuous=False):
         {"duty": "current.duty"},
         interface=interface,
     )
+
+
+def test_probe_resolves_an_inactive_loop_input_before_graph_pruning():
+    graph = _graph(probe_unused_input=True)
+
+    assert "unused" not in graph.nodes
+    assert graph.probe_names == ("measured_voltage",)
 
 
 def test_scalar_control_uses_the_shared_control_package():

@@ -203,11 +203,6 @@ class MultirateSolver:
         self._windows = 0
         self._steps = 0
         self.parameters_changed()  # _storage_of: state index -> (subsystem, StoragePort)
-        self._coupling = np.ones(model.n_states, dtype=bool)  # states that feed back (observers do not)
-        for sub in model.subsystems:
-            if getattr(sub, "observer", False):
-                for name in sub.state_names:
-                    self._coupling[model.state_slice(sub, name)] = False
         # rated effort per declared storage entry (0 elsewhere); None without ratings
         self._rated_ref: Optional[NDArray[np.float64]] = rated_effort(model, self.ratings)
 
@@ -306,6 +301,7 @@ class MultirateSolver:
             self.model.state_slice(sub, st.state).start: (sub, st)
             for sub in self.model.subsystems for st in getattr(sub, "storage", ())
         }
+        self._refresh_held_storage()
 
     def model_plan_changed(self) -> None:
         """Refresh grouped schedules when the model compiled a new evaluation plan."""
@@ -338,12 +334,25 @@ class MultirateSolver:
                 self.outer.inputs if self.outer is not None else ()
             )
         ]
-        if hasattr(self, "_coupling"):
-            self._coupling[:] = True
-            for subsystem in model.subsystems:
-                if getattr(subsystem, "observer", False):
-                    for state in subsystem.state_names:
-                        self._coupling[model.state_slice(subsystem, state)] = False
+        self._outer_position = {
+            int(index): position
+            for position, index in enumerate(np.flatnonzero(self._mask_outer))
+        }
+        self._coupling = np.ones(model.n_states, dtype=bool)
+        for subsystem in model.subsystems:
+            if getattr(subsystem, "observer", False):
+                for state in subsystem.state_names:
+                    self._coupling[model.state_slice(subsystem, state)] = False
+        if hasattr(self, "_storage_of"):
+            self._refresh_held_storage()
+
+    def _refresh_held_storage(self) -> None:
+        """Cache storage entries assigned to the current windowed group."""
+        self._held_storage = tuple(
+            (index, subsystem, storage)
+            for index, (subsystem, storage) in self._storage_of.items()
+            if self._mask_outer[index]
+        )
 
     def _sample_outer_rate(self, t: float, y: NDArray[np.float64]) -> None:
         """Evaluate the windowed group's rates once per window to update the rate peaks."""
@@ -425,14 +434,13 @@ class MultirateSolver:
     def held_storages(self) -> tuple[HeldStorage, ...]:
         """Declared storages held over a window (empty without a windowed group); see :class:`HeldStorage`."""
         out = []
-        for idx, (sub, st) in self._storage_of.items():
-            if not self._mask_outer[idx]:
-                continue
+        labels = self.model.state_labels()
+        for _idx, sub, st in self._held_storage:
             sl = self.model.state_slice(sub, st.state)
-            labels = self.model.state_labels()
             label = labels[sl.start][:-3] if sl.stop - sl.start == 2 else labels[sl.start]
-            pos = {int(i): k for k, i in enumerate(np.flatnonzero(self._mask_outer))}
-            out.append(HeldStorage(label=label, states=sl, columns=tuple(pos[j] for j in range(sl.start, sl.stop)),
+            out.append(HeldStorage(label=label, states=sl,
+                                   columns=tuple(self._outer_position[j]
+                                                 for j in range(sl.start, sl.stop)),
                                    rated=float(self._rated_ref[sl.start]) if self._rated_ref is not None else 0.0,
                                    kind=st.kind, scale=st.scale, value=st.value))
         return tuple(out)
@@ -525,9 +533,7 @@ class MultirateSolver:
                 value = getattr(dst_inp, dst_name)
                 self._acc[key] = self._acc.get(key, 0.0) + weight * value
             # energy delivered into each windowed storage at the extrapolated effort
-            for idx, (sub, st) in self._storage_of.items():
-                if not self._mask_outer[idx]:
-                    continue
+            for idx, sub, st in self._held_storage:
                 e_seen = getattr(sub.state, st.state)  # extrapolated effort
                 flow = sum(
                     sign * getattr(port, quantity)
@@ -777,9 +783,7 @@ class MultirateSolver:
         full_new[self._mask_outer] = new
         self._note_error(self._mask_outer, y_start, full_pred, full_new, duration, t1, window=True)
         residual = 0.0
-        for idx, (sub, st) in self._storage_of.items():
-            if not self._mask_outer[idx]:
-                continue
+        for idx, sub, st in self._held_storage:
             sl = self.model.state_slice(sub, st.state)
             is_c = sl.stop - sl.start == 2
             e_old = complex(y_start[sl.start], y_start[sl.start + 1]) if is_c else y_start[sl.start]
@@ -794,16 +798,14 @@ class MultirateSolver:
         self._energy_residual += residual
         self._windows += 1
         # ripple: deviation of the running flow integral from its linear trend over the window
-        ripple = np.zeros(int(np.count_nonzero(self._mask_outer)))
-        outer_index = {idx: pos for pos, idx in enumerate(np.flatnonzero(self._mask_outer))}
-        for idx, (sub, st) in self._storage_of.items():
-            if self._mask_outer[idx]:
-                track = self._flow_track.get(idx, [])
-                total = track[-1][1] if track else 0.0
-                stray = max((abs(f - (tau / duration) * total) for tau, f in track), default=0.0) / st.value
-                sl = self.model.state_slice(sub, st.state)
-                for j in range(sl.start, sl.stop):
-                    ripple[outer_index[j]] = stray
+        ripple = np.zeros(len(self._outer_position))
+        for idx, sub, st in self._held_storage:
+            track = self._flow_track.get(idx, [])
+            total = track[-1][1] if track else 0.0
+            stray = max((abs(f - (tau / duration) * total) for tau, f in track), default=0.0) / st.value
+            sl = self.model.state_slice(sub, st.state)
+            for j in range(sl.start, sl.stop):
+                ripple[self._outer_position[j]] = stray
         self.window_log.append((t1, np.abs(new - self._anchor), np.abs(predicted - new), ripple))
         self._open_window(t1, new.copy(), (new - self._anchor) / duration)
 

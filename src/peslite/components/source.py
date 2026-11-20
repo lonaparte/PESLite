@@ -165,10 +165,6 @@ class VoltageSource(Element):
     def subsystems(self) -> dict[str, Any]:
         return {self.name: self.source}
 
-    @staticmethod
-    def connections() -> dict:
-        return {}
-
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         return ((self.cfg.bus, self.source.port),)
 

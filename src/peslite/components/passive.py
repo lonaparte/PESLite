@@ -103,14 +103,6 @@ class RLBranch(NetworkComponent):
         """Return discrete physical state that generated backends must preserve."""
         return {"breaker_open": (self, "breaker_open")}
 
-    def _device_commutation_margin(self) -> float:
-        from ..solver.netlist import device_commutation_margin
-        return device_commutation_margin(self)
-
-    def _device_commutate(self, t: float) -> None:
-        from ..solver.netlist import device_commutate
-        device_commutate(self, t)
-
     def network(self, nb):
         """Declare the series breaker, resistance, inductance and optional diode."""
         from ..solver import netlist as nl
@@ -299,9 +291,6 @@ class Load(Element):
     def subsystems(self) -> dict[str, Any]:
         return {f"{self.name}.branch": self.branch}
 
-    def connections(self) -> dict:
-        return {}
-
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         return ((self.cfg.bus, self.branch.port1),)
 
@@ -390,10 +379,6 @@ class Resistor(Element):
 
     def subsystems(self) -> dict[str, Any]:
         return {self.name: self.resistor}
-
-    @staticmethod
-    def connections() -> dict:
-        return {}
 
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         if self.cfg.series:

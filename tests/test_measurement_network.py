@@ -11,6 +11,8 @@ import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, from_dict, read_tree
 from peslite.components import ADC, MeasurementPorts
+from peslite.components.adc import _PortMeasurement
+from peslite.solver.energy import Port
 
 
 def load_case(model="pwm_averaging", link="ss", rms=True):
@@ -28,6 +30,16 @@ def load_case(model="pwm_averaging", link="ss", rms=True):
     tree["simulation"]["solver"].update(dt=50e-9, linearisations=0)
     tree["simulation"]["output"].update(period=1e-6, states=False, signals=False, energy=False)
     return tree
+
+
+def test_port_measurement_starts_from_the_bound_port_values():
+    port = Port(name="measured", voltage=12.0, current=-3.0, scale=2.0)
+    measurement = _PortMeasurement(port)
+
+    assert measurement.input.voltage == measurement.output.voltage == 12.0
+    assert measurement.input.current == measurement.output.current == -3.0
+    measurement.set_outputs(0.0)
+    assert measurement.output.power == 72.0
 
 
 @pytest.mark.parametrize("link", ["ss", "lcc"])

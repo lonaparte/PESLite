@@ -676,9 +676,6 @@ class _MagneticElement(Element):
             endpoints,
         )
 
-    def subsystems(self) -> dict[str, Any]:
-        return {self.name: self.model}
-
     def connections(self) -> dict:
         source = self.cfg.temperature_source
         return {(self.model, "temperature_K"): source} if source is not None else {}
@@ -904,9 +901,6 @@ class CompensatedLink(MagComponent):
                 after=self._mirror_conduction,
                 diodes=[device for _scc, pair in devices for device in pair],
             )
-
-    def _bind_netlist_devices(self, netlist, devices) -> None:
-        self._netlist_devices = netlist, tuple(devices)
 
 def _link_spec(cfg: Any) -> dict[str, Any]:
     """Normalize one link type into coil/side form; a compensation inductor marks an LCC side."""

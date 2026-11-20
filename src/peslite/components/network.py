@@ -100,6 +100,18 @@ class NetworkComponent:
         from ..solver.netlist import device_supplied_power
         return device_supplied_power(self)
 
+    def _bind_netlist_devices(self, netlist, devices) -> None:
+        """Retain the netlist device handles installed by the common builder."""
+        self._netlist_devices = netlist, tuple(devices)
+
+    def _device_commutation_margin(self) -> float:
+        from ..solver.netlist import device_commutation_margin
+        return device_commutation_margin(self)
+
+    def _device_commutate(self, t: float) -> None:
+        from ..solver.netlist import device_commutate
+        device_commutate(self, t)
+
 
 NetworkComponent.rhs._peslite_device_adapter = True
 NetworkComponent.set_outputs._peslite_device_adapter = True
@@ -133,6 +145,18 @@ class Element:
     type: ClassVar[str]
     Params: ClassVar[type]
     domain_transparent: ClassVar[bool] = False
+
+    def subsystems(self) -> dict[str, Any]:
+        """Expose the ordinary one-model element under its configured name."""
+        return {self.name: self.model}
+
+    @staticmethod
+    def connections() -> dict:
+        return {}
+
+    @staticmethod
+    def port_bindings() -> tuple[tuple[str, Port], ...]:
+        return ()
 
 
 @dataclass(frozen=True)
@@ -387,13 +411,6 @@ class _ConfiguredComponent(Element):
         self.name, self.cfg = name, cfg
         self.domain_transparent = bool(getattr(type(cfg), "domain_transparent", False))
         self.model = _DeclaredComponent(self, buses)
-
-    def subsystems(self) -> dict[str, Any]:
-        return {self.name: self.model}
-
-    @staticmethod
-    def connections() -> dict:
-        return {}
 
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         return tuple(

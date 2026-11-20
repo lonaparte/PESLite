@@ -389,18 +389,11 @@ class ThermalPort(Element):
                 f"file inputs {self.model.heat_names!r}"
             )
 
-    def subsystems(self) -> dict[str, ThermalPortModel]:
-        return {self.name: self.model}
-
     def connections(self) -> dict:
         return {
             (self.model, field): self.cfg.sources[name]
             for name, field in zip(self.model.heat_names, self.model.heat_fields)
         }
-
-    @staticmethod
-    def port_bindings() -> tuple:
-        return ()
 
     def signals(self) -> dict[str, float]:
         return {
