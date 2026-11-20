@@ -43,21 +43,26 @@ SIDES = ("primary", "secondary")
 
 def two_winding_modes(primary: Any, secondary: Any, mutual: Any):
     """Diagonalize two windings while retaining symbolic scalar arithmetic."""
-    if all(isinstance(value, (int, float, np.number))
-           for value in (primary, secondary, mutual)):
-        values = tuple(float(value) for value in (primary, secondary, mutual))
+    nominal = tuple(getattr(value, "_peslite_numeric_value", value)
+                    for value in (primary, secondary, mutual))
+    if all(isinstance(value, (int, float, np.number)) for value in nominal):
+        values = tuple(float(value) for value in nominal)
         if (not all(map(np.isfinite, values)) or values[0] <= 0.0 or values[1] <= 0.0
                 or values[0] * values[1] <= values[2] ** 2):
             raise ConfigError("inductance must be positive definite")
-    angle = 0.5 * np.arctan2(2.0 * mutual, primary - secondary)
-    cosine, sine = np.cos(angle), np.sin(angle)
     mean = 0.5 * (primary + secondary)
-    radius = np.sqrt((0.5 * (primary - secondary)) ** 2 + mutual ** 2)
-    first_sign = np.where(abs(sine) >= abs(cosine), np.where(sine > 0.0, -1.0, 1.0), 1.0)
-    second_sign = np.where(abs(sine) > abs(cosine), np.where(sine < 0.0, -1.0, 1.0), 1.0)
+    half_difference = 0.5 * (primary - secondary)
+    radius = np.sqrt(half_difference ** 2 + mutual ** 2)
+    distinct = radius > 0.0
+    denominator = np.where(distinct, 2.0 * radius, 1.0)
+    cosine = np.sqrt(np.maximum(0.0, (radius + half_difference) / denominator))
+    sine = np.copysign(
+        np.sqrt(np.maximum(0.0, (radius - half_difference) / denominator)), mutual,
+    )
+    cosine, sine = np.where(distinct, cosine, 1.0), np.where(distinct, sine, 0.0)
     modes = (_real(mean - radius), _real(mean + radius))
-    shapes = ((_real(-sine * first_sign), _real(cosine * second_sign)),
-              (_real(cosine * first_sign), _real(sine * second_sign)))
+    shapes = ((_real(-sine), _real(cosine)),
+              (_real(cosine), _real(sine)))
     return modes, shapes
 
 
@@ -91,12 +96,16 @@ class LinearEnergyLaw:
                 other_mutual, secondary = inductance[1]
             except (TypeError, ValueError, IndexError):
                 raise ConfigError("inductance must be a 2 x 2 matrix") from None
-            if all(isinstance(value, (int, float, np.number))
-                   for value in (primary, mutual, other_mutual, secondary)):
-                self.inductance, self.modes, self.shapes = inductance_modes(inductance, 2)
+            values = (primary, mutual, other_mutual, secondary)
+            modes, shapes = two_winding_modes(primary, secondary, mutual)
+            if (all(isinstance(value, (int, float, np.number)) for value in values)
+                    and not any(hasattr(value, "_peslite_numeric_value") for value in values)):
+                self.inductance = inductance_modes(inductance, 2)[0]
+                self.modes = np.asarray(modes, dtype=float)
+                self.shapes = np.asarray(shapes, dtype=float)
             else:
                 self.inductance = inductance
-                self.modes, self.shapes = two_winding_modes(primary, secondary, mutual)
+                self.modes, self.shapes = modes, shapes
         else:
             self.inductance, self.modes, self.shapes = inductance_modes(
                 inductance, len(self.winding_names)
@@ -437,9 +446,9 @@ class MagComponent(NetworkComponent):
         temperature_reference_K: float = 298.15,
     ) -> None:
         self.magnetic = magnetic
-        self.resistance = np.asarray(resistance, dtype=float)
-        self.temperature_coefficient_per_K = float(temperature_coefficient_per_K)
-        self.temperature_reference_K = float(temperature_reference_K)
+        self.resistance = tuple(_real(value) for value in resistance)
+        self.temperature_coefficient_per_K = _real(temperature_coefficient_per_K)
+        self.temperature_reference_K = _real(temperature_reference_K)
 
     def _effective_resistance(self) -> np.ndarray:
         if self.temperature_coefficient_per_K == 0.0:
@@ -451,7 +460,7 @@ class MagComponent(NetworkComponent):
         if (not math.isfinite(temperature) or temperature <= 0.0
                 or not math.isfinite(factor) or factor < 0.0):
             raise ConfigError("magnetic winding resistance became nonphysical")
-        return self.resistance * factor
+        return tuple(value * factor for value in self.resistance)
 
     def _winding_currents(self) -> np.ndarray:
         raise NotImplementedError
@@ -461,7 +470,10 @@ class MagComponent(NetworkComponent):
 
     def _loss_parts(self, t: float) -> tuple[Any, Any]:
         current = self._winding_currents()
-        copper = np.dot(self._effective_resistance(), current * current)
+        copper = sum(
+            resistance * value * value
+            for resistance, value in zip(self._effective_resistance(), current)
+        )
         material = self._material_loss(t)
         if isinstance(copper, numbers.Number) and isinstance(material, numbers.Number):
             if (not math.isfinite(copper) or not math.isfinite(material)
@@ -529,7 +541,7 @@ class CoupledCoilsModel(MagComponent):
                 rhs=False,
             ),
         )
-        self.storage = tuple(StoragePort(name, float(mode), kind="inductor")
+        self.storage = tuple(StoragePort(name, _real(mode), kind="inductor")
                              for name, mode in zip(self.state_names, self.law.modes))
 
         ground = Port(self, GROUND, grounded=True) if any(any(pair) for pair in terminals) else None
@@ -578,7 +590,7 @@ class CoupledCoilsModel(MagComponent):
             if not negative.grounded:
                 terminal_voltage.append((-1.0, ("node_voltage", nb.node(negative))))
             nb.linear_output(self, f"u_{name}", terminal_voltage)
-        if temperature_dependent and np.any(self.resistance):
+        if temperature_dependent and any(self.resistance):
             nb.add(nl.Dissipation(nb.function(
                 self._copper_loss,
                 ("temperature_K",),
@@ -591,11 +603,14 @@ class CoupledCoilsModel(MagComponent):
         return self._shapes @ modal
 
     def _winding_drop(self, index: int, _t: float) -> float:
-        return float(self._effective_resistance()[index] * self._winding_currents()[index])
+        return self._effective_resistance()[index] * self._winding_currents()[index]
 
     def _copper_loss(self, _t: float) -> float:
         current = self._winding_currents()
-        return np.dot(self._effective_resistance(), current * current)
+        return sum(
+            resistance * value * value
+            for resistance, value in zip(self._effective_resistance(), current)
+        )
 
     def magnetic_signals(self) -> dict[str, float]:
         """Return the public winding currents and terminal voltages."""
@@ -737,7 +752,6 @@ class CompensatedLink(MagComponent):
         self._inductance = tuple(law.modes)
         self._shapes = tuple(tuple(row) for row in law.shapes)
         self.capacitance = tuple(_real(c) for c in capacitance)
-        self.resistance = np.asarray(tuple(_real(r) for r in resistance))
 
         # state layout: LCC front ends, modal currents, coil capacitors (stable public names)
         front = [side for side in SIDES if sides[side].lcc]

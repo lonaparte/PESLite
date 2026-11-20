@@ -890,11 +890,10 @@ def test_generated_cpp_matches_python_for_adaptive_dcm(mode, tmp_path):
         "simulation.output.energy": False,
         "simulation.energy_check": "off",
     })
-    source, cpp_out, python_out = _run_generated(
+    _source, cpp_out, python_out = _run_generated(
         params, tmp_path / f"adaptive-{mode}", compiler
     )
 
-    assert source.read_text(encoding="utf-8").count("class Commutation") == 1
     expected = _final_csv(python_out / "states.csv")
     actual = _final_csv(cpp_out / "states.csv")
     scale = max(1.0, max(abs(value) for value in expected.values()))

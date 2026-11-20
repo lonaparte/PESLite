@@ -1455,7 +1455,8 @@ def test_cli_help_describes_imperix_elf_export(capsys):
 def test_cli_sidecar_and_backend_option_routing(tmp_path, capsys):
     sim = _simulation()
     case = tmp_path / "case.pes"
-    peslite.dump(sim.p, case)
+    case.write_text((EXAMPLES / "buck-example.pes").read_text(encoding="utf-8"),
+                    encoding="utf-8")
     case.with_suffix(".imperix.json").write_text(json.dumps(_mapping(sim)), encoding="utf-8")
     assert main(["export", str(case), "--imperix", "--imperix-source-only",
                  "--out", str(tmp_path / "out")]) == 0

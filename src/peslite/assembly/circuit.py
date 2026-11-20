@@ -1908,14 +1908,12 @@ class Circuit:
 
 
 def _bind_energy(component: Any, circuit: Circuit) -> tuple[Optional[Callable], Optional[Callable]]:
-    """Bind one component's declared power laws to its owning circuit."""
+    """Return one component's circuit-owned power laws without replacing its methods."""
     loss = supply = None
     if id(component) in circuit._loss_elements:
         loss = lambda: circuit.dissipated_power_of(component)
-        component.dissipated_power = loss
     if id(component) in circuit._supply_elements:
         supply = lambda: circuit.supplied_power_of(component)
-        component.supplied_power = supply
     return loss, supply
 
 

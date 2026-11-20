@@ -4085,14 +4085,16 @@ class Netlist:
     def dissipated_power(self, elements: Optional[Sequence[Element]] = None) -> float:
         """Power dissipated in resistors and resistive switches and diodes (of ``elements``, default
         all) at the last evaluation."""
-        self.outputs()
-        roles = self._last.topology.roles
+        out = self.outputs()
         selected = self.elements if elements is None else elements
         return sum(
             self.power(el, port)
             for el in selected
-            for port, k in enumerate(self._ports[id(el)])
-            if isinstance(el, (Switch, Diode)) or roles[k] == "res"
+            if isinstance(el, (Switch, Diode))
+            for port in range(len(el.ports))
+        ) + sum(
+            self._scalar_resistor_power(out, el)
+            for el in selected if isinstance(el, Resistor)
         ) + sum(
             float(el.value(self._last.t)) for el in selected if isinstance(el, Dissipation)
         )
@@ -4230,6 +4232,16 @@ class Netlist:
             for index in range(branch.dim)
         )
 
+    def _scalar_resistor_power(self, out: Sequence[Any], element: Resistor) -> Any:
+        """Resistor loss ``scale i^T R i`` from a scalar output vector."""
+        branch = self._branch(element)
+        current = self.n_e + self.n_bd + branch.output
+        return branch.scale * sum(
+            out[current + row] * element.R[row, column] * out[current + column]
+            for row in range(branch.dim)
+            for column in range(branch.dim)
+        )
+
     def scalar_power(self, out: Sequence[Any], elements: Sequence[Element]) -> Any:
         """Power absorbed by netlist elements from one scalar output vector."""
         total: Any = 0.0
@@ -4240,15 +4252,16 @@ class Netlist:
 
     def scalar_dissipated_power(
         self, out: Sequence[Any], elements: Sequence[Element], *, t: Any = 0.0,
-        topology: Optional[Topology] = None,
     ) -> Any:
         """Resistive power of selected elements from one scalar output vector."""
-        roles = (self.topology() if topology is None else topology).roles
         return sum(
             self._scalar_port_power(out, element, port)
             for element in elements
-            for port, branch in enumerate(self._ports[id(element)])
-            if isinstance(element, (Switch, Diode)) or roles[branch] == "res"
+            if isinstance(element, (Switch, Diode))
+            for port in range(len(element.ports))
+        ) + sum(
+            self._scalar_resistor_power(out, element)
+            for element in elements if isinstance(element, Resistor)
         ) + sum(
             element.value(t) for element in elements if isinstance(element, Dissipation)
         )

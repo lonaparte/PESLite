@@ -262,7 +262,7 @@ class _ImperixControlGenerator(_ProtectionGenerator, _ControlGenerator):
             ))
             voltage = "std::abs(meas_u_g)"
             frequency = f"({self.source(self.graph.outputs['omega'])} - {_number(self.cfg.base.w0)}) / (2.0 * pi)"
-            vdc_error = f"meas_u_dc - {self._reference('vdc_ref_pu')}"
+            vdc_error = f"meas_u_dc - {self._reference('vdc_ref_pu', 1.0)}"
         else:
             output = SimpleNamespace(**{port: _Expression(self.source(port), "real")
                                         for port in self.graph.interface.outputs})

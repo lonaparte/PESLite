@@ -7,8 +7,8 @@ import shutil
 import pytest
 
 import peslite
+from peslite import cli
 from peslite.assembly.params import from_dict
-from peslite.solver import simulation as simulation_module
 from peslite.cli import _export_main
 
 
@@ -35,7 +35,7 @@ def test_export_run_reuses_the_generated_program(tmp_path, monkeypatch):
         pytest.skip("a C++ compiler is required")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    monkeypatch.setattr(simulation_module, "_RESULTS", tmp_path / "output")
+    monkeypatch.setattr(cli, "_RESULTS", tmp_path / "output")
     case = tmp_path / "case.pes"
     peslite.dump(_case(), case)
 

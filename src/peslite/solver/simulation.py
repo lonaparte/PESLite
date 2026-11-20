@@ -1458,6 +1458,8 @@ class Simulation:
             except (OverflowError, FloatingPointError):
                 if accepted_steps.observers:
                     accepted_steps.restore(accepted_checkpoint)
+                mdl.set_states(plant.state)
+                plant.invalidate()
                 termination = "diverged"
                 stop_reason = (f"diverged: the states overflowed between t = {t_a:.6g} s "
                                f"and {t_b:.6g} s")

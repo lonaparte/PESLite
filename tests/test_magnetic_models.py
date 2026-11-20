@@ -448,7 +448,7 @@ def _linear_equivalence_case(inductance):
 def test_base_inductance_magport_and_magcircuit_are_numerically_equivalent(tmp_path):
     """The optimized and magnetic formulations must agree for the same complete linear model."""
     inductance = np.array([[8.0e-3, -1.5e-3], [-1.5e-3, 6.0e-3]])
-    _modes, shapes = np.linalg.eigh(inductance)
+    shapes = LinearEnergyLaw(("primary", "secondary"), inductance).shapes
     modal_initial = np.array([0.35, -0.2])
     physical_initial = shapes @ modal_initial
 

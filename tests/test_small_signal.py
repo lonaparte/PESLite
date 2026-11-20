@@ -16,6 +16,7 @@ from scipy.linalg import expm
 from conftest import EXAMPLES
 from peslite.addons.functions.online_analysis import small_signal, small_signal_report
 from peslite.components.adc import ADC, MeasurementPorts
+from peslite.defaults import DEFAULT_LINEARIZATION_RELATIVE_STEP
 from peslite.solver.linearization import (LoopMap, active_coordinates, coordinate_difference,
                                          linearize_loop)
 from peslite.solver.model import Empty, Model, StateRegistry
@@ -34,8 +35,12 @@ class _AffineMap:
     def __init__(self):
         self.calls = 0
 
-    def coordinates(self, names):
+    def coordinates(self, names, *, linearization=True):
         return self.cols
+
+    @staticmethod
+    def periodic_state(row):
+        return dict(row)
 
     def to_frame(self, row, t, cols):
         return np.array([row[name] for _kind, names, _scale in cols for name in names])
@@ -66,7 +71,9 @@ def test_shared_map_matches_known_discrete_matrix_and_preserves_split_inputs():
     expected[:2, :2] = loop.matrix
     np.testing.assert_allclose(linear.phi, expected, atol=2e-12)
 
-    phi, b_b, b_c, count = _period_map(loop, row, 0.0, loop.cols, [("x", 1.0)])
+    phi, b_b, b_c, count = _period_map(
+        loop, row, 0.0, loop.cols, [("x", 1.0)], DEFAULT_LINEARIZATION_RELATIVE_STEP,
+    )
     np.testing.assert_allclose(phi, expected, atol=2e-12)
     np.testing.assert_allclose(b_b[:, 0], [*loop.matrix[:, 0], 0.0], atol=2e-12)
     np.testing.assert_allclose(b_c[:, 0], [1.0, 0.0, 0.0], atol=2e-12)
@@ -109,7 +116,9 @@ def test_split_input_differences_use_the_same_wrapped_angle_coordinates():
 
     loop = Wrapped()
     phi, b_b, b_c, count = _period_map(
-        loop, {"theta": math.pi - 5e-5}, 0.0, loop.cols, [("theta", 1.0)])
+        loop, {"theta": math.pi - 5e-5}, 0.0, loop.cols, [("theta", 1.0)],
+        DEFAULT_LINEARIZATION_RELATIVE_STEP,
+    )
     for matrix in (phi, b_b, b_c):
         np.testing.assert_allclose(matrix, [[1.0]], atol=1e-10)
     assert count == 5

@@ -35,7 +35,6 @@ import numpy as np
 
 from ..defaults import (DEFAULT_COMMUTATION_LOCATOR_ITERATIONS,
                         DEFAULT_COMMUTATION_MAX_TRANSITIONS)
-from ..components.network import NetworkComponent
 from ..components.passive import RLBranch
 from ..components.source import ACVoltageSource
 from ..components.pwm import (_EPS, _SNAP, CarrierComparison, SynchronousCarrier, PhaseClock,
@@ -71,6 +70,7 @@ _ZERO_COEFFICIENTS: ContextVar[dict | None] = ContextVar("peslite_cpp_zero_coeff
 _CONDITIONAL_DEPENDENCIES: ContextVar[tuple | None] = ContextVar(
     "peslite_cpp_conditional_dependencies", default=None)
 _SCALAR_TERMS: ContextVar[tuple | None] = ContextVar("peslite_cpp_scalar_terms", default=None)
+_UNSET = object()
 # Keep generated expression nesting below the default depth accepted by common C++ compilers.
 _TERM_BRACKETS = 128
 _TRACE_WORK_BUDGET = (1 << 13) - 1  # bound work instead of the depth of a narrow equation
@@ -1868,7 +1868,7 @@ class _RuntimeParameters:
 
     def _initial_copies(self, original, initialized):
         """Bind construction inputs to the ordinary parameter state at the initial instant."""
-        if is_dataclass(original):
+        if is_dataclass(original) and not isinstance(original, type):
             self.initial_copies[id(original)] = initialized
             for item in fields(original):
                 if item.name not in {"events", "changes"}:
@@ -6547,9 +6547,13 @@ class _ControlGenerator:
         return (f"{self.m('startup_run')} && ({self.m('startup_ramp')} <= 0.0 || "
                 f"t - {self.m('startup_start')} >= {self.m('startup_ramp')} - time_eps)")
 
-    def _reference(self, name: str) -> str:
+    def _reference(self, name: str, default: Any = _UNSET) -> str:
         if name in self._changing_references:
             return self.m("reference_" + name)
+        if not hasattr(self.cfg.ctrl.references, name):
+            if default is _UNSET:
+                raise AttributeError(name)
+            return _number(default)
         path = f"units.{self.name}.ctrl.references.{name}"
         return self.model.runtime.value(path, getattr(self.cfg.ctrl.references, name))
 
@@ -7875,22 +7879,31 @@ class _ACControlGenerator(_ProtectionGenerator, _ControlGenerator):
     def _frequency_deviation(self) -> str:
         return f"({self.m('omega')} - {_number(self.cfg.base.w0)}) / (2.0 * pi)"
 
+    def _frame_log_lines(self, indent: str = "") -> list[str]:
+        """Generate the optional frequency and relative-angle log fields in the declared schema."""
+        names = self.ctrl.log_names()
+        lines = []
+        if "freq_dev" in names:
+            lines.append(f"{indent}{self.m('log_freq_dev')} = {self._frequency_deviation()};")
+        if "angle_rel" in names:
+            lines.append(
+                f"{indent}{self.m('log_angle_rel')} = std::remainder({self.m('theta')} - "
+                f"{_number(self.cfg.base.w0)} * t, 2.0 * pi);"
+            )
+        return lines
+
     def _mode_log_lines(self, indent: str) -> list[str]:
         """Generate the control-family-specific suffix of the AC controller log."""
         sources = self.ctrl.mode_log_sources()
-        if self.ctrl._is_gfl:
-            idref = self.source(sources["id_ref_pu"]) if "id_ref_pu" in sources else "0.0"
-            return [f"{indent}{self.m('log_id_ref_pu')} = {idref};"]
-        return [
-            f"{indent}{self.m('log_p_pu')} = "
-            f"{self.source(sources['p_pu']) if 'p_pu' in sources else '0.0'};",
-            f"{indent}{self.m('log_q_pu')} = "
-            f"{self.source(sources['q_pu']) if 'q_pu' in sources else '0.0'};",
-            f"{indent}{self.m('log_p_ref_pu')} = {self.m('startup_value')} * "
-            f"{self.source(sources['p_ref_pu'])};",
-            f"{indent}{self.m('log_v_ref_pu')} = "
-            f"{self.source(sources['v_ref_pu'])};",
-        ]
+        lines = []
+        for name in self.ctrl.log_names():
+            if name not in sources and name not in {"id_ref_pu", "p_pu", "q_pu"}:
+                continue
+            value = self.source(sources[name]) if name in sources else "0.0"
+            if name == "p_ref_pu":
+                value = f"{self.m('startup_value')} * {value}"
+            lines.append(f"{indent}{self.m('log_' + name)} = {value};")
+        return lines
 
     def controller_summary(self, stream: str = "summary") -> list[str]:
         name = self.name
@@ -8011,9 +8024,8 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
                  f"{self.m('log_id_pu')} = std::real({log_i});", f"{self.m('log_iq_pu')} = std::imag({log_i});",
                  f"{self.m('log_vd_pu')} = std::real({log_v});", f"{self.m('log_vq_pu')} = std::imag({log_v});",
                  f"{self.m('log_vac_pu')} = std::abs({log_v});", f"{self.m('log_vdc_pu')} = {self.m('meas_u_dc')};",
-                 f"{self.m('log_in_service')} = {self.m('startup_run')} ? 1.0 : 0.0;",
-                 f"{self.m('log_freq_dev')} = {self._frequency_deviation()};",
-                 f"{self.m('log_angle_rel')} = std::remainder({self.m('theta')} - {_number(self.cfg.base.w0)} * t, 2.0 * pi);"]
+                 f"{self.m('log_in_service')} = {self.m('startup_run')} ? 1.0 : 0.0;"]
+        lines += self._frame_log_lines()
         lines += self._mode_log_lines("")
         return lines
 
@@ -8046,7 +8058,7 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
             *self._rms_sample_lines(),
             f"sampled_protect_{self.tag}(t, std::abs({observed}) / {_number(self.cfg.base.v_phase_peak)},",
             f"    {self._frequency_deviation()},",
-            f"    {dc} / {_number(self.cfg.dc_base.v)} - {self._reference('vdc_ref_pu')},",
+            f"    {dc} / {_number(self.cfg.dc_base.v)} - {self._reference('vdc_ref_pu', 1.0)},",
             f"    {self._startup_complete()});")]
         lines += ["    return changed;", "}"]
         return "\n".join(lines)
@@ -8088,7 +8100,7 @@ class _UnitGenerator(_ACControlGenerator):
         lines += ["    " + line for line in self._rms_sample_lines()]
         lines += [f"    sampled_protect_{self.tag}(t, std::abs(meas_u_g),",
                   f"        {self._frequency_deviation()},",
-                  f"        meas_u_dc - {self._reference('vdc_ref_pu')}, {self.m('startup_complete')});",
+                  f"        meas_u_dc - {self._reference('vdc_ref_pu', 1.0)}, {self.m('startup_complete')});",
                   f"    {self.m('pending_on')} = {self.m('startup_run')};",
                   f"    {self.m('pending_valid')} = true;",
                   "}"]
@@ -8107,11 +8119,10 @@ class _UnitGenerator(_ACControlGenerator):
                  f"{indent}{self.m('log_vac_pu')} = std::abs(log_v);",
                  f"{indent}{self.m('log_vdc_pu')} = meas_u_dc;",
                  f"{indent}{self.m('log_m_max')} = {self.m('last_m_max')};",
-                 f"{indent}{self.m('log_in_service')} = {self.m('startup_run')} ? 1.0 : 0.0;",
-                 f"{indent}{self.m('log_freq_dev')} = {self._frequency_deviation()};",
-                 f"{indent}{self.m('log_angle_rel')} = std::remainder({self.m('theta')} - {_number(self.cfg.base.w0)} * t, 2.0 * pi);"]
+                 f"{indent}{self.m('log_in_service')} = {self.m('startup_run')} ? 1.0 : 0.0;"]
         # VSCController._raw_log: the latest ADC reading wherever it differs from the control value.
         names, nan = self.ctrl.log_names(), "std::numeric_limits<double>::quiet_NaN()"
+        lines += self._frame_log_lines(indent)
         bases = {"u_g": self.cfg.base.v_phase_peak, "i_c": self.cfg.base.i_phase_peak}
         if "vd_raw_pu" in names:
             differs = " || ".join(f"{self._adc_reading(c)} != {self._adc_value(c)}" for c in bases)
@@ -8704,18 +8715,18 @@ class _CppGenerator:
                 component = getattr(owner, "equation_owner", owner)
                 if circuit is not None and component is not owner:
                     supplied = (
-                        model.trace_scalar_method(component, "supplied_power")
-                        if type(component).supplied_power is not NetworkComponent.supplied_power
-                        else model.trace_circuit_component_power(
+                        model.trace_circuit_component_power(
                             circuit, component, supplied=True,
                         )
+                        if getattr(owner, "_supply", None) is not None
+                        else model.trace_scalar_method(component, "supplied_power")
                     )
                     dissipated = (
-                        model.trace_scalar_method(component, "dissipated_power")
-                        if type(component).dissipated_power is not NetworkComponent.dissipated_power
-                        else model.trace_circuit_component_power(
+                        model.trace_circuit_component_power(
                             circuit, component, supplied=False,
                         )
+                        if getattr(owner, "_loss", None) is not None
+                        else model.trace_scalar_method(component, "dissipated_power")
                     )
                     return supplied, dissipated
                 attributes = model._equation_attributes(sub)
