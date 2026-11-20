@@ -366,8 +366,8 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
         ap.error("--watch prints on the progress bar: add --progress")
     if args.plot:
         try:
-            from .addons import functions
-            _plot_result = functions.plot_result
+            from .assembly.addons import import_addon
+            _plot_result = import_addon("plotting", "function").plot_result
         except (ImportError, RuntimeError) as exc:
             ap.error(f"--plot: {exc}")
     sim = _assemble_command(p, config, args.json, interface_text)
@@ -376,9 +376,9 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
     reporter = None
     if args.report:
         try:
-            from .addons import functions
-            reporter = functions.small_signal_report
-        except functions.FunctionUnavailableError:
+            from .assembly.addons import AddonUnavailableError, import_addon
+            reporter = import_addon("online_analysis", "function").small_signal_report
+        except AddonUnavailableError:
             pass
         if not callable(reporter):
             warnings.warn("--report: the online stability analysis addon is unavailable; "

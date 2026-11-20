@@ -31,7 +31,7 @@ does not search parent directories or add the project root to global `sys.path`.
 addons run while the simulation file is loaded; function addon modules run when imported. All
 addon code must be treated as trusted Python code. Project function modules share the
 `peslite.addons.functions` package path and remain explicit module imports; loading a project does
-not modify the built-in function catalog.
+not modify the installed addon manifest.
 
 See [Extending PESLite](Extending-PESLite.md) for extension interfaces and
 [Architecture](Architecture.md) for package ownership.

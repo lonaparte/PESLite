@@ -1,13 +1,10 @@
 # Magnetic Components
 
-PESLite connects magnetic devices to the electrical circuit through ordinary component ports.
-`MagComponent` is the abstract component boundary for project-defined magnetic devices: it adds an
-optional physical magnetic description to the normal electrical component contract without
-prescribing a device type. Its electrical behavior may be supplied by a netlist, a constitutive law
-or imported data.
-
-The standard PESLite installation includes the `magcomponent` addon. `peslite-full` additionally
-includes the `magport` and `magcircuit` addons.
+The `magcomponent` addon connects magnetic devices to the electrical circuit through ordinary
+component ports. `MagComponent` is the abstract component boundary for project-defined magnetic
+devices: it adds an optional physical magnetic description to the normal electrical component
+contract without prescribing a device type. Its electrical behavior may be supplied by a netlist,
+a constitutive law or imported data.
 
 ## MagComponent interface
 
@@ -167,7 +164,7 @@ one scalar potential. Sampled maps must cover the complete operating range.
 Create a `magport` file with `write_magport`:
 
 ```python
-from peslite.addons.functions import write_magport
+from peslite.addons.functions.magport import write_magport
 
 write_magport(
     "models/magnetic-device.npz",
@@ -190,7 +187,7 @@ not replace the stored constitutive law.
 When a `magport` file contains field data, reconstruct the field after simulation:
 
 ```python
-from peslite.addons.functions import magnetic_field
+from peslite.addons.functions.magport import magnetic_field
 
 field = magnetic_field(
     result,
@@ -209,7 +206,7 @@ Reduce an externally prepared linear magnetic circuit to a reusable `magport` fi
 `export_magnetic_circuit`:
 
 ```python
-from peslite.addons.functions import export_magnetic_circuit
+from peslite.addons.functions.magcircuit import export_magnetic_circuit
 
 export_magnetic_circuit(
     "models/magnetic-device.npz",

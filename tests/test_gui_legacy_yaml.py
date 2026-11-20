@@ -7,7 +7,14 @@ import yaml
 
 from conftest import EXAMPLES
 from peslite.assembly.syntax import parse_native_text
-from peslite.addons.functions import legacy_yaml_patch, legacy_yaml_preview
+from peslite.addons.functions.legacy_yaml import read_simulation
+from peslite.gui.legacy_yaml import (
+    preview as legacy_yaml_preview,
+    validated_add_component as legacy_yaml_add_component,
+    validated_patch as legacy_yaml_patch,
+    validated_remove_component as legacy_yaml_remove_component,
+    validated_rewire as legacy_yaml_rewire,
+)
 from peslite.gui.workspace import patched_text, WorkspaceError
 
 
@@ -70,20 +77,12 @@ def test_invalid_yaml_is_diagnostic_and_rejected_without_writes():
         legacy_yaml_patch(text, path, 'base.s_base', 1)
 
 
-def test_legacy_adapter_is_a_lazy_function_addon():
-    from peslite.addons import functions
-
-    assert 'read_legacy_yaml' in functions.__all__
-    assert 'legacy_yaml_preview' in functions.__all__
-    assert 'legacy_yaml_patch' in functions.__all__
-    assert functions._EXPORTS['read_legacy_yaml'] == ('legacy_yaml', 'read_legacy_yaml')
-    assert functions._EXPORTS['legacy_yaml_preview'] == ('peslite.gui.legacy_yaml', 'preview')
+def test_legacy_reader_and_gui_editor_keep_separate_module_boundaries():
+    assert read_simulation.__module__ == "peslite.addons.functions.legacy_yaml"
+    assert legacy_yaml_preview.__module__ == "peslite.gui.legacy_yaml"
 
 
 def test_additional_component_preserves_text_and_validates_model():
-    from peslite.addons.functions import (
-        legacy_yaml_add_component, legacy_yaml_remove_component,
-    )
     path = EXAMPLES / 'buck-example.pes'
     original = _legacy_source(path)
     added = legacy_yaml_add_component(
@@ -104,7 +103,6 @@ def test_additional_component_preserves_text_and_validates_model():
 
 
 def test_connection_rewire_checks_existing_buses_and_preserves_source():
-    from peslite.addons.functions import legacy_yaml_rewire
     path = EXAMPLES / 'two-converters-example.pes'
     original = _legacy_source(path)
     with pytest.raises(WorkspaceError, match='unknown destination'):
@@ -119,7 +117,6 @@ def test_connection_rewire_checks_existing_buses_and_preserves_source():
 
 
 def test_removing_a_connected_bus_is_rejected():
-    from peslite.addons.functions import legacy_yaml_remove_component
     path = EXAMPLES / 'two-converters-example.pes'
     native = path.read_text(encoding='utf-8')
     original = _legacy_source(path)
@@ -128,14 +125,7 @@ def test_removing_a_connected_bus_is_rejected():
     assert path.read_text(encoding='utf-8') == native
 
 
-def test_addon_edits_are_public_lazy_functions():
-    from peslite.addons import functions
-    from peslite.addons.functions import (
-        legacy_yaml_add_component, legacy_yaml_remove_component, legacy_yaml_rewire,
-    )
+def test_gui_edits_are_public_gui_functions():
     for function in (legacy_yaml_add_component, legacy_yaml_remove_component, legacy_yaml_rewire):
         assert callable(function)
-    assert all(function in functions.__all__ for function in (
-        'legacy_yaml_add_component', 'legacy_yaml_remove_component', 'legacy_yaml_rewire'))
-    assert all(functions._EXPORTS[name][0] == 'peslite.gui.legacy_yaml' for name in (
-        'legacy_yaml_add_component', 'legacy_yaml_remove_component', 'legacy_yaml_rewire'))
+        assert function.__module__ == "peslite.gui.legacy_yaml"

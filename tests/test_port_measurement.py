@@ -8,7 +8,7 @@ import numpy as np
 import peslite
 import pytest
 
-from peslite.addons.functions import (
+from peslite.addons.functions.offline_analysis import (
     measure_multitone, measure_port_matrix, measure_recorded_transfer,
     measure_recorded_sweep, recorded_signal, run_port_matrix, run_port_sweep,
 )

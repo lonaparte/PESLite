@@ -1,7 +1,6 @@
 # Plotting
 
-The `plotting` addon is included with the standard PESLite installation; see
-[Install](Getting-Started.md#install) for the installation matrix.
+The `plotting` addon renders completed PESLite result tables.
 
 ## Command line
 
@@ -58,7 +57,7 @@ pdf = result.plot(
 Plot Python or standalone C++ CSV output directly:
 
 ```python
-from peslite.addons.functions import plot_csv
+from peslite.addons.functions.plotting import plot_csv
 
 pdf = plot_csv(
     "output/run/states.csv",

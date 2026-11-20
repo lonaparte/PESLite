@@ -2,12 +2,13 @@
 
 import json
 import shutil
+from types import SimpleNamespace
 
 import peslite
 import pytest
 
 from conftest import EXAMPLES
-from peslite.addons import functions as addon_functions
+from peslite.assembly import addons as addon_assembly
 
 
 def _args(out, *options):
@@ -18,8 +19,11 @@ def _args(out, *options):
 
 
 def _replace_report_resolver(monkeypatch, resolver):
-    monkeypatch.delattr(addon_functions, "small_signal_report", raising=False)
-    monkeypatch.setattr(addon_functions, "_resolve", resolver)
+    def import_addon(name, category):
+        assert (name, category) == ("online_analysis", "function")
+        return SimpleNamespace(small_signal_report=resolver("small_signal_report"))
+
+    monkeypatch.setattr(addon_assembly, "import_addon", import_addon)
 
 
 def test_report_runs_the_main_simulation_once_and_preserves_config_metadata(tmp_path, monkeypatch):
@@ -63,7 +67,7 @@ def test_report_filename_does_not_change_with_the_bridge_preset(tmp_path, preset
 
 def test_missing_addon_warns_and_continues_the_ordinary_simulation(tmp_path, monkeypatch):
     def absent(_name):
-        raise addon_functions.FunctionUnavailableError("report provider is unavailable")
+        raise addon_assembly.AddonUnavailableError("report provider is unavailable")
 
     _replace_report_resolver(monkeypatch, absent)
     with pytest.warns(RuntimeWarning, match="addon is unavailable.*without a report"):
@@ -142,7 +146,7 @@ def test_a_new_run_clears_its_previous_report_but_preserves_unrelated_files(tmp_
 
 
 def test_python_runs_use_the_same_report_file_lifecycle(tmp_path):
-    from peslite.addons.functions import small_signal_report
+    from peslite.addons.functions.online_analysis import small_signal_report
 
     params = peslite.load(EXAMPLES / "buck-example.pes", **{
         "simulation.t_end": 0.001, "simulation.energy_check": "off",

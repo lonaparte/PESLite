@@ -544,7 +544,7 @@ class SimulationResult:
 
     def plot(self, columns: str | Iterable[str], **options: Any) -> Path:
         """Plot recorded columns from one result CSV through the optional plotting add-on."""
-        from ..addons.functions import plot_result
+        from ..addons.functions.plotting import plot_result
 
         path = plot_result(self, columns, **options)
         if path not in self.files:

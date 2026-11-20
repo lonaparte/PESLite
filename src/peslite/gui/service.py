@@ -274,7 +274,7 @@ class FrontendService:
 
     def run_small_signal(self, request_id: Any) -> None:
         """Linearize the final state of the latest run, running the case first when needed."""
-        from ..addons.functions import small_signal
+        from ..addons.functions.online_analysis import small_signal
 
         if self.simulation is None:
             self.run(request_id, stream=False)

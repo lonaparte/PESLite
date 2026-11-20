@@ -1,9 +1,9 @@
 # Offline System Analysis
 
-The offline system analysis addon identifies a response from deliberately excited simulations or
+The `offline_analysis` addon identifies a response from deliberately excited simulations or
 recorded waveforms. Each experiment uses the ordinary PESLite plant, controller, solver, event
 schedule and output schema; the analysis runs after the required data has been recorded. Nothing is
-inserted into an ordinary simulation unless the case explicitly configures an excitation addon.
+inserted into an ordinary simulation unless the case explicitly configures the `injection` addon.
 
 For operating-point, modal and time-domain analysis of an ordinary run, use
 [Online System Analysis](Online-System-Analysis.md).
@@ -117,7 +117,7 @@ a completed run is not evidence of steady state.
 For a completed PESLite result, measure a scalar transfer directly from named signals:
 
 ```python
-from peslite.addons.functions import measure_recorded_transfer
+from peslite.addons.functions.offline_analysis import measure_recorded_transfer
 
 point = measure_recorded_transfer(
     result,
@@ -138,7 +138,7 @@ window duration, Nyquist estimate, sample jitter, convergence checks and failure
 The lower-level interface accepts arrays that already share timestamps:
 
 ```python
-from peslite.addons.functions import frequency_response, frequency_sweep
+from peslite.addons.functions.offline_analysis import frequency_response, frequency_sweep
 
 point = frequency_response(
     time,
@@ -174,7 +174,7 @@ run separate d-axis and q-axis current-injection experiments and solve `V = Z I`
 solve `I = Y V`.
 
 ```python
-from peslite.addons.functions import measure_port_matrix
+from peslite.addons.functions.offline_analysis import measure_port_matrix
 
 matrix = measure_port_matrix(
     {20.0: [result_d, result_q]},
@@ -202,7 +202,7 @@ three-phase dynamics without additional measurements.
 When phasors are already available, use the lower-level matrix fit:
 
 ```python
-from peslite.addons.functions import impedance_matrix
+from peslite.addons.functions.offline_analysis import impedance_matrix
 
 matrix = impedance_matrix(
     frequencies_hz,
@@ -227,7 +227,7 @@ other summing conventions. Dividing the return signal by the added perturbation 
 closed-loop sensitivity, not the return ratio.
 
 ```python
-from peslite.addons.functions import measure_return_ratio, loop_gain_sweep
+from peslite.addons.functions.offline_analysis import loop_gain_sweep, measure_return_ratio
 
 point = measure_return_ratio(
     result,

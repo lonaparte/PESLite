@@ -24,7 +24,6 @@ peslite case.pes
 | `boost-example` | A closed-loop 24 V to 48 V Boost application using the same DCConverter with the lower device controlled, the upper diode active and the external scalar bus as its input port. |
 | `buck-boost-example` | A closed-loop single-inductor Buck-Boost built from one DCConverter, with the half bridge's lower rail connected to the negative output bus. |
 | `cable-gfl-example` | A grid-following converter connected through the cable add-on's segmented lumped R-L/G-C model. |
-| `custom-pll-example` | Grid-following control assembled from built-in current/DC-voltage loops and an automatically discovered voltage-adaptive PLL under `addons/control`. |
 | `gfl-example` | One grid-following converter with PLL, dc-voltage control, current control and unit protection. This is the most extensively annotated configuration. |
 | `gfm-psc-example` | Grid-forming power-synchronization control with virtual impedance and active damping. |
 | `gfm-vsg-example` | Grid-forming virtual synchronous generator control. |

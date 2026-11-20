@@ -45,6 +45,7 @@ from ..solver.model import ConfigError
 from .events import EVENT_TYPES, NAMED, SWITCHABLE, events_for
 from .syntax import (PARAMETER_DOMAINS, SimulationFileError,
                      parse_parameter_mapping, read_simulation_file)
+from .addons import register_installed, register_project
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1039,6 +1040,7 @@ def from_dict(data: dict) -> Params:
     """Build, validate and resolve parameters and every event's explicit variable bindings."""
     from .validate import validate
 
+    register_installed()
     normalized = _normalize(data)
     if not isinstance(normalized, dict):
         return _build(Params, normalized, "", None, None)
@@ -1899,20 +1901,11 @@ def event_changes(p: Params) -> tuple[Change, ...]:
 
 # ------------------------------------------------------------------ files
 
-_LOAD_PREPARERS: list[Callable[[str | Path], Any]] = []
-
-
-def _register_load_preparer(function: Callable[[str | Path], Any]) -> None:
-    """Register construction-time preparation performed before a file is parsed."""
-    if function not in _LOAD_PREPARERS:
-        _LOAD_PREPARERS.append(function)
-
 def _load_case(path: str | Path, initial: str | Path | None = None,
                initial_time: Optional[float] = None,
                **overrides: Any) -> tuple[Params, str]:
     """Load parameters and return their untouched native interface source."""
-    for prepare in _LOAD_PREPARERS:
-        prepare(path)
+    register_project(path)
     token = _ASSET_DIRECTORY.set(Path(path).resolve().parent)
     try:
         try:

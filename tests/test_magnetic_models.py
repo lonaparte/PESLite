@@ -13,7 +13,7 @@ from scipy.linalg import expm
 from scipy.optimize import brentq
 
 import peslite
-from peslite.addons.components import register_component_type
+from peslite.components import register_component_type
 from peslite.addons.components.magcircuit import MagCircuitLaw
 from peslite.addons.components.magport import (
     MagPort,
@@ -22,12 +22,10 @@ from peslite.addons.components.magport import (
     TabulatedMagneticLaw,
     load_magport_data,
 )
-from peslite.addons.functions import (
-    export_magnetic_circuit,
-    magnetic_field,
-    reluctance_inductance,
-    write_magport,
+from peslite.addons.functions.magcircuit import (
+    export_magnetic_circuit, reluctance_inductance,
 )
+from peslite.addons.functions.magport import magnetic_field, write_magport
 from peslite.assembly.params import from_dict
 from peslite.addons.components.magcomponent import (
     CoupledCoilsModel,

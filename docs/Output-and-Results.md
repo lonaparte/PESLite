@@ -24,7 +24,7 @@ history and then export it afterward.
 | `ctrl.<unit>.csv` | `simulation.output.signals: 1` | Controller signals for one unit. |
 | `energy.csv` | `simulation.output.energy: 1` | Stored energy and power-balance history. |
 | `summary.json` | End of every run | Stop reason, solver counts, protection, peaks and diagnostics. |
-| `<name>_report.json` | Python `--report`, with the analysis addon available | Optional report sections, including `small_signal_stability`. |
+| `<name>_report.json` | Python `--report`, with the `online_analysis` addon available | Optional report sections, including `small_signal_stability`. |
 | `simulation.pes` | Always | Complete resolved configuration used for the run. |
 
 `simulation.pes` is not a temporary file. It records defaults and command-line changes and can be
@@ -61,10 +61,8 @@ accounting without stopping the run. Declared log columns use NaN for an unavail
 CSV retains its own sampling timestamps; different tables are not required to have equal row
 counts.
 
-After a run with `energy: 1`, `peslite.addons.functions.energy_closure(result)` compares stored-energy change
-and impulsive loss with supplied and dissipated energy accumulated at accepted solver steps. It
-returns the component energies, the closure residual and a relative residual; CSV sampling and
-precision do not affect this calculation.
+For accepted-step energy closure analysis, see
+[Online System Analysis](Online-System-Analysis.md#energy-closure).
 
 ## State and signal names
 

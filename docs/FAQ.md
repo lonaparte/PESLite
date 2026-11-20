@@ -72,9 +72,9 @@ unambiguous within the assembled system.
 
 ## Can custom components and controllers be used from a simulation file?
 
-Yes. Modules in `peslite.addons.control` and `peslite.addons.components` are discovered into the
-same registries as built-in types. Types elsewhere may use the public registration functions for
-control loops, circuit elements and events. A control-loop entry uses the registered class
+Yes. Installed addons and project modules under `PESaddons/control` or `PESaddons/components` use
+the same registries as built-in types. Types elsewhere may use the public registration functions
+for control loops, circuit elements and events. A control-loop entry uses the registered class
 name; the other extension entries use their registered type names. All entries go through normal
 parameter validation. See [Extending PESLite](Extending-PESLite.md).
 

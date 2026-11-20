@@ -7,7 +7,7 @@ name = "peslite-full"
 version = "0.6.0"
 description = "Complete PESLite installation with advanced magnetic modeling, GUI and ONNX support."
 readme = "README.md"
-requires-python = ">=3.10.1"
+requires-python = ">=3.11.0"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 dependencies = [

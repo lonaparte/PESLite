@@ -4,7 +4,7 @@
 from dataclasses import dataclass
 from typing import ClassVar
 
-from peslite.addons.components import register_component_type
+from peslite.components import register_component_type
 from peslite.solver import netlist as nl
 
 

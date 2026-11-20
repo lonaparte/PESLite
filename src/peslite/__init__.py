@@ -21,9 +21,6 @@ from .assembly.control import make_controller
 from .solver.simulation import Simulation, SimulationResult, validate_model
 from .assembly.exporter import ExportResult, export
 from . import addons
-from .assembly.params import _register_load_preparer
-
-_register_load_preparer(addons._discover_for)
 
 __version__ = "0.6.0"
 

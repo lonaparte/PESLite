@@ -1,7 +1,8 @@
 # Debugging
 
-`peslite debug` runs a temporary control-graph overlay without changing the simulation file. The
-overlay, its observations and its checks are defined by one plain-text `.pesdbg` file.
+The `debug` addon provides `peslite debug`, which runs a temporary control-graph overlay without
+changing the simulation file. One plain-text `.pesdbg` file defines the overlay, observations and
+checks.
 
 ## Run a plan
 

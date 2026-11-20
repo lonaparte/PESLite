@@ -1,9 +1,8 @@
 # Model Predictive Control
 
-Model predictive control is an addon providing continuous-control-set MPC (CCS-MPC) and
-finite-control-set MPC (FCS-MPC) as ordinary sampled control loops. They use the same typed
-connections, ADC, actuation,
-protection, start-up and saved-state mechanisms as other loops. The converter adapters support
+The `mpc` addon provides continuous-control-set MPC (CCS-MPC) and finite-control-set MPC (FCS-MPC)
+as ordinary sampled control loops. They use the same typed connections, ADC, actuation, protection,
+start-up and saved-state mechanisms as other loops. The converter adapters support
 `switching`, `pwm_averaging` and `averaging`.
 
 ## Run the examples

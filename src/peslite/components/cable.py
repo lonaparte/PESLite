@@ -7,9 +7,9 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, ClassVar
 
-from ...components.network import Element, NetworkComponent, register_component_type
-from ...solver import Bag, ConfigError, Empty, Port, StoragePort
-from ...solver.history import AcceptedSignal, DelayedSignal, DelayHistory
+from .network import Element, NetworkComponent, register_component_type
+from ..solver import Bag, ConfigError, Empty, Port, StoragePort
+from ..solver.history import AcceptedSignal, DelayedSignal, DelayHistory
 
 __all__ = ["BergeronCableModel", "Cable", "LumpedCableModel"]
 
@@ -84,7 +84,7 @@ class LumpedCableModel(NetworkComponent):
 
     def network(self, nb):
         """Declare the segmented R-L/G-C network."""
-        from ...solver import netlist as nl
+        from ..solver import netlist as nl
 
         nodes = [
             nb.node(self.port1),
@@ -187,7 +187,7 @@ class BergeronCableModel(NetworkComponent):
 
     def _line_segment(self, nb, left, right, left_history, right_history, prefix: str):
         """Declare one lossless delayed two-port in Norton form."""
-        from ...solver import netlist as nl
+        from ..solver import netlist as nl
 
         impedance = self.surge_impedance
         left_signal = DelayedSignal(right_history, -1.0 / impedance)
@@ -216,7 +216,7 @@ class BergeronCableModel(NetworkComponent):
 
     def network(self, nb):
         """Declare the two delayed LC halves and PSCAD's quarter-half-quarter resistance."""
-        from ...solver import netlist as nl
+        from ..solver import netlist as nl
 
         first, last = nb.node(self.port1), nb.node(self.port2)
         resistance = self.total_resistance

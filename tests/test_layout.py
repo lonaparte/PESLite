@@ -25,7 +25,7 @@ BELOW = {
 }
 TOP = {"solver/simulation.py"}
 INTEGRATIONS = {"gui"}
-ROOT_MODULES = {"__init__.py", "defaults.py"}
+ROOT_MODULES = {"__init__.py", "__main__.py", "cli.py", "defaults.py"}
 SHARED = {"defaults"}
 
 

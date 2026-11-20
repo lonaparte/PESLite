@@ -376,6 +376,28 @@ def test_adc_sample_and_controller_measurement_have_distinct_scopes():
     assert Measurement.__module__ == "peslite.control.controller"
 
 
+@pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
+def test_srf_pll_bandwidth_and_amplitude_normalisation_share_the_builtin_loop(
+        gfl, tmp_path, model):
+    params = gfl(**{
+        "simulation.t_end": 0.004,
+        "simulation.solver.linearisations": 0,
+        "units.vsc.bridge.model": model,
+        "units.vsc.ctrl.loops.SRFPLL": {
+            "bandwidth": 20.0,
+            "normalisation": "amplitude",
+        },
+    })
+    simulation = peslite.Simulation(params)
+    pll = simulation.unit().ctrl.graph.nodes["SRFPLL"]
+
+    assert pll.cfg.normalisation == "amplitude"
+    assert set(pll.state_names) == {"theta", "integral_pu", "u_g_pu"}
+    result = simulation.run(out_dir=tmp_path / model)
+    assert np.isfinite(result.states["vsc.ctrl.SRFPLL.theta"]).all()
+    assert not result.tripped
+
+
 def test_control_graph_has_one_typed_boundary_for_inputs_and_outputs(gfl):
     graph = peslite.Simulation(gfl()).unit().ctrl.graph
 

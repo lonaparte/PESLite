@@ -585,7 +585,7 @@ def _analyses(plan: DebugPlan, simulation: Simulation,
             raise ConfigError(f"debug analysis {name!r} must be text or a mapping")
         kind = str(config.pop("type", name)).casefold()
         if kind == "small_signal":
-            from . import small_signal
+            from .online_analysis import small_signal
             try:
                 result = small_signal(simulation, **config)
             except TypeError as exc:
@@ -600,7 +600,7 @@ def _analyses(plan: DebugPlan, simulation: Simulation,
             }
             continue
         if kind == "dynamic":
-            from . import dynamic_performance
+            from .online_analysis import dynamic_performance
             response = _signal(series, _required(
                 config, "response", f"debug analysis {name!r}",
             ))
@@ -616,7 +616,7 @@ def _analyses(plan: DebugPlan, simulation: Simulation,
             results[name] = {"type": kind, **metrics.to_dict()}
             continue
         if kind in {"frequency_response", "impedance", "loop_gain"}:
-            from . import frequency_response, loop_gain_sweep
+            from .offline_analysis import frequency_response, loop_gain_sweep
             context = f"debug analysis {name!r}"
             input_name = _required(config, "input", context)
             output_name = _required(config, "output", context)
@@ -649,7 +649,7 @@ def _analyses(plan: DebugPlan, simulation: Simulation,
                     ) for frequency in selected
                 }
                 if kind == "loop_gain":
-                    from .loop_gain import _signed_return_ratio
+                    from .offline_analysis import _signed_return_ratio
                     measurements = {
                         frequency: _signed_return_ratio(
                             measurement, feedback_sign, output_name, input_name,

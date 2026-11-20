@@ -191,7 +191,7 @@ def test_debug_run_records_control_signals_states_and_only_two_artifacts(tmp_pat
 
 
 def test_debug_cli_json_and_history_use_the_same_run(tmp_path, monkeypatch, capsys):
-    from peslite.solver import simulation as cli
+    from peslite import cli
 
     monkeypatch.setattr(cli, "_RESULTS", tmp_path / "output")
     plan_path = tmp_path / "control.pesdbg"

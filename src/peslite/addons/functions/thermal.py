@@ -1,187 +1,22 @@
-"""Loss, response and reporting functions for the thermal addon.
-
-Estimated losses are not an electrical energy sink. Switching energies must come from
-explicitly supplied, *committed* transitions, never from sampled gate traces.
-"""
+"""Loss, response and reporting functions for the thermal addon."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 
-from ..components.thermalnetwork import FosterImpedance
+from ..components.thermal import (
+    FosterImpedance, LossTable, SemiconductorLossModel, SwitchingEvent,
+    _EVENT_KINDS, _lookup, _scalar, _values,
+)
 
 __all__ = [
-    "LossTable", "SemiconductorLossModel", "SwitchingEvent", "EventLoss",
-    "DeviceLossReport", "device_loss_report", "recorded_device_loss",
-    "compare_devices", "circuit_heat_report", "foster_step_response",
-    "thermal_report", "compare_thermal_reports",
+    "EventLoss", "DeviceLossReport", "device_loss_report",
+    "recorded_device_loss", "compare_devices", "circuit_heat_report",
+    "foster_step_response", "thermal_report", "compare_thermal_reports",
 ]
-
-_AXES = frozenset(("current_A", "voltage_V", "temperature_K"))
-_EVENT_KINDS = frozenset(("turn_on", "turn_off", "reverse_recovery"))
-
-
-def _values(name: str, values: Any, count: int | None = None) -> np.ndarray:
-    try:
-        result = np.asarray(values, dtype=float)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must contain finite numeric values") from exc
-    if result.ndim != 1 or not np.isfinite(result).all():
-        raise ValueError(f"{name} must be a one-dimensional array of finite numbers")
-    if count is not None and result.size != count:
-        raise ValueError(f"{name} must have {count} samples")
-    return result
-
-
-def _scalar(name: str, value: Any, *, nonnegative: bool = False) -> float:
-    if isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{name} must be a finite number")
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a finite number") from exc
-    if not np.isfinite(result) or (nonnegative and result < 0):
-        raise ValueError(f"{name} must be {'nonnegative and ' if nonnegative else ''}finite")
-    return result
-
-
-@dataclass(frozen=True)
-class LossTable:
-    """Nonnegative loss data on named, strictly increasing SI axes.
-
-    Axes may be any nonempty subset of ``current_A``, ``voltage_V`` and
-    ``temperature_K``. Multilinear interpolation is used inside the grid.
-    Outside it, the default ``out_of_range='error'`` rejects the lookup;
-    ``'clamp'`` uses the nearest boundary rather than extrapolating.
-    Current and voltage are treated as magnitudes.
-    """
-
-    axes: Mapping[str, Sequence[float]]
-    values: Any
-    out_of_range: str = "error"
-    _names: tuple[str, ...] = field(init=False, repr=False, compare=False)
-    _interpolator: Any = field(init=False, repr=False, compare=False)
-    _grid: tuple[np.ndarray, ...] = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        if not self.axes or any(name not in _AXES for name in self.axes):
-            raise ValueError("loss table needs named current_A, voltage_V or temperature_K axes")
-        if self.out_of_range not in ("error", "clamp"):
-            raise ValueError("out_of_range must be 'error' or 'clamp'")
-        grid = []
-        for name, points in self.axes.items():
-            axis = _values(f"axis {name}", points)
-            if axis.size < 2 or np.any(np.diff(axis) <= 0):
-                raise ValueError(f"axis {name} needs at least two strictly increasing points")
-            if (np.any(axis < 0) if name != "temperature_K" else np.any(axis <= 0)):
-                raise ValueError(f"axis {name} must use physical nonnegative SI values")
-            axis = axis.copy()
-            axis.setflags(write=False)
-            grid.append(axis)
-        try:
-            values = np.array(self.values, dtype=float, copy=True)
-        except (ValueError, TypeError) as exc:
-            raise ValueError("loss table values must be finite and nonnegative") from exc
-        if values.shape != tuple(len(axis) for axis in grid):
-            raise ValueError("loss table values must match the axis grid shape")
-        if not np.isfinite(values).all() or np.any(values < 0):
-            raise ValueError("loss table values must be finite and nonnegative")
-        values.setflags(write=False)
-        object.__setattr__(self, "values", values)
-        object.__setattr__(self, "_names", tuple(self.axes))
-        object.__setattr__(self, "_grid", tuple(grid))
-        object.__setattr__(self, "_interpolator", RegularGridInterpolator(
-            grid, values, method="linear", bounds_error=self.out_of_range == "error",
-            fill_value=None,
-        ))
-
-    def evaluate(self, *, current_A: Any = 0.0, voltage_V: Any = 0.0,
-                 temperature_K: Any = 298.15) -> float | np.ndarray:
-        """Evaluate one or broadcasted lookup points using SI quantities."""
-        sources = {"current_A": current_A, "voltage_V": voltage_V,
-                   "temperature_K": temperature_K}
-        try:
-            columns = np.broadcast_arrays(*(
-                np.asarray(sources[name], dtype=float) for name in self._names
-            ))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("loss table coordinates must be broadcastable numeric arrays") from exc
-        coordinates = []
-        for name, column, grid in zip(self._names, columns, self._grid):
-            if not np.isfinite(column).all():
-                raise ValueError(f"{name} lookup coordinates must be finite")
-            if name == "temperature_K" and np.any(column <= 0):
-                raise ValueError("temperature_K must be positive")
-            magnitude = column if name == "temperature_K" else np.abs(column)
-            if self.out_of_range == "clamp":
-                magnitude = np.clip(magnitude, grid[0], grid[-1])
-            coordinates.append(magnitude.ravel())
-        points = np.stack(coordinates, axis=-1)
-        try:
-            lookup = self._interpolator(points).reshape(columns[0].shape)
-        except ValueError as exc:
-            raise ValueError("loss table lookup is outside the declared axes") from exc
-        return float(lookup) if lookup.ndim == 0 else lookup
-
-
-@dataclass(frozen=True)
-class SemiconductorLossModel:
-    """Optional conduction voltage (V) and transition energies (J) for one device.
-
-    Missing fields mean that loss mechanism is unavailable, not that it is known
-    to be zero. The caller supplies known conduction intervals and transitions.
-    """
-
-    conduction_voltage_V: float | LossTable | None = None
-    turn_on_energy_J: float | LossTable | None = None
-    turn_off_energy_J: float | LossTable | None = None
-    reverse_recovery_energy_J: float | LossTable | None = None
-    turn_on_includes_reverse_recovery: bool = False
-
-    def __post_init__(self) -> None:
-        for name in ("conduction_voltage_V", "turn_on_energy_J", "turn_off_energy_J",
-                     "reverse_recovery_energy_J"):
-            value = getattr(self, name)
-            if value is not None and not isinstance(value, LossTable):
-                object.__setattr__(self, name, _scalar(name, value, nonnegative=True))
-        if type(self.turn_on_includes_reverse_recovery) is not bool:
-            raise ValueError("turn_on_includes_reverse_recovery must be bool")
-
-
-def _lookup(value: float | LossTable | None, current: Any, voltage: Any,
-            temperature: float) -> Any:
-    return (value.evaluate(current_A=current, voltage_V=voltage,
-                           temperature_K=temperature)
-            if isinstance(value, LossTable) else 0.0 if value is None else value)
-
-
-@dataclass(frozen=True)
-class SwitchingEvent:
-    """One confirmed device transition, with pre-transition absolute operating values.
-
-    These events must originate from accepted/committed simulation transitions or
-    an independent verified event log. Snapshot-detected edges are not sufficient.
-    """
-
-    time_s: float
-    kind: str
-    current_A: float
-    voltage_V: float
-    device: str | None = None
-
-    def __post_init__(self) -> None:
-        if self.kind not in _EVENT_KINDS:
-            raise ValueError(f"unknown switching event kind: {self.kind!r}")
-        if self.device is not None and (
-                not isinstance(self.device, str) or not self.device
-                or any(not part.isidentifier() for part in self.device.split("."))):
-            raise ValueError("device must contain dot-separated identifiers")
-        for name in ("time_s", "current_A", "voltage_V"):
-            object.__setattr__(self, name, _scalar(name, getattr(self, name)))
 
 
 @dataclass(frozen=True)

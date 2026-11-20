@@ -12,7 +12,7 @@ import peslite
 import pytest
 
 from conftest import EXAMPLES
-from peslite.addons.functions import energy_closure, small_signal_report
+from peslite.addons.functions.online_analysis import energy_closure, small_signal_report
 from peslite.solver.linearization import linearize_loop
 from peslite.solver.model import Empty, Model
 from peslite.solver.simulation import SimulationTransition
@@ -90,7 +90,7 @@ def test_constant_report_has_one_row_and_reuses_main_run_endpoints(monkeypatch):
 
 
 def test_transient_skips_perturbations_until_a_periodic_state_is_established(monkeypatch):
-    module = importlib.import_module("peslite.addons.functions.online_stability")
+    module = importlib.import_module("peslite.addons.functions.online_analysis")
 
     def forbidden(*args, **kwargs):
         raise AssertionError("non-periodic operating states must not be linearized")
@@ -109,7 +109,7 @@ def test_transient_skips_perturbations_until_a_periodic_state_is_established(mon
 
 
 def test_report_starts_analysis_at_the_first_selected_periodic_operating_state(monkeypatch):
-    module = importlib.import_module("peslite.addons.functions.online_stability")
+    module = importlib.import_module("peslite.addons.functions.online_analysis")
     linearize = module.linearize_loop
     calls = []
 
@@ -399,7 +399,7 @@ def test_real_converter_reuses_baselines_and_does_not_mutate_the_main_simulation
 
 
 def test_unreused_baselines_give_the_same_report_but_cost_one_advance_per_check(monkeypatch):
-    module = importlib.import_module("peslite.addons.functions.online_stability")
+    module = importlib.import_module("peslite.addons.functions.online_analysis")
     sim = _linear_sim()
     reused = small_signal_report(sim, period=0.0001, interval=0.0005, out_dir=None)
     analyze = module._analyze
@@ -764,7 +764,7 @@ def test_report_enables_control_logs_when_explicitly_watched():
 
 
 def test_completed_analysis_windows_release_their_restart_rows_during_the_run(monkeypatch):
-    module = importlib.import_module("peslite.addons.functions.online_stability")
+    module = importlib.import_module("peslite.addons.functions.online_analysis")
     original_point, original_analyze = module._ReportPoint, module._analyze
     live = peak = 0
     during_run = []

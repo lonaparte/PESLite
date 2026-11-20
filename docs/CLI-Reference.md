@@ -120,12 +120,12 @@ progress is explicitly enabled; see
 peslite case.pes --report
 ```
 
-With the online system analysis addon available, this also writes `case_report.json`; see
+With the `online_analysis` addon available, this also writes `case_report.json`; see
 [Online System Analysis](Online-System-Analysis.md#online-simulation-report).
 
 ## Plot recorded waveforms
 
-`--plot NAME [NAME ...]` invokes the optional plotting addon after the simulation. See
+`--plot NAME [NAME ...]` invokes the `plotting` addon after the simulation. See
 [Plotting](Plotting.md) for output requirements and presentation options.
 
 ## Continue from saved state

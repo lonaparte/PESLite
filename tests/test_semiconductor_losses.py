@@ -6,11 +6,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from peslite.addons.functions import (
-    circuit_heat_report, compare_devices, device_loss_report, recorded_device_loss,
-)
+from peslite.addons.components.thermal import LossTable, SemiconductorLossModel, SwitchingEvent
 from peslite.addons.functions.thermal import (
-    LossTable, SemiconductorLossModel, SwitchingEvent,
+    circuit_heat_report, compare_devices, device_loss_report, recorded_device_loss,
 )
 
 

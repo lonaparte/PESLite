@@ -6,8 +6,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from peslite.addons.functions import loop_gain_sweep, measure_return_ratio
-from peslite.addons.functions.frequency import FrequencyMeasurement
+from peslite.addons.functions.offline_analysis import (
+    FrequencyMeasurement, loop_gain_sweep, measure_return_ratio,
+)
 
 
 def test_return_ratio_uses_both_sides_of_feedback_cut_not_disturbance():

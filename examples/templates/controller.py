@@ -4,7 +4,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
-from peslite.addons.control import Loop, PI, SignalType, register_loop_type
+from peslite.control import Loop, PI, SignalType, register_loop_type
 
 
 @register_loop_type

@@ -19,6 +19,7 @@ from .adc import ADC, ADCSample, MeasurementPorts
 from .pwm import (ZOH, CarrierComparison, PWM, PhaseShiftModulator, SwitchingSequence,
                   SynchronousCarrier, make_modulator)
 from .onnx import ONNXModel, ONNXStateParams
+from .cable import BergeronCableModel, Cable, LumpedCableModel
 
 __all__ = ["Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode", "Capacitor",
            "Bag", "Empty", "ConfigError", "StoragePort",
@@ -31,4 +32,4 @@ __all__ = ["Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode", "Capacitor",
            "MeasurementPorts", "AveragingModel", "HalfBridge",
            "FullBridge", "HalfBridgeDiodeConduction", "PWM", "SwitchingSequence",
            "CarrierComparison", "SynchronousCarrier", "ZOH", "PhaseShiftModulator", "make_modulator",
-           "ONNXModel", "ONNXStateParams"]
+           "ONNXModel", "ONNXStateParams", "BergeronCableModel", "Cable", "LumpedCableModel"]

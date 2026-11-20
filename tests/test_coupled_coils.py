@@ -18,7 +18,7 @@ from peslite.addons.components.magcomponent import (
     WindingParams,
 )
 from peslite.addons.components.magport import MagPort, MagPortModel
-from peslite.addons.functions import write_magport
+from peslite.addons.functions.magport import write_magport
 
 
 def _windings(n, *, r=0.0):

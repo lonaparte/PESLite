@@ -162,8 +162,8 @@ class Host:
                     raise WorkspaceError(
                         "project-local PESaddons execute Python code; explicit trust is required"
                     )
-                from ..addons import _discover_for
-                _discover_for(model)
+                from ..assembly.addons import register_project
+                register_project(model)
             from ..assembly.params import _load_case
             configured, _interface = _load_case(model)
             prepared = prepare_debug(configured, plan, directory=target.parent)
@@ -202,15 +202,18 @@ class Host:
                     raise WorkspaceError("new-syntax schematics must be edited in source text")
                 return _native_preview(text, target)
             if params.get("trustAddons") is True and self.files.has_project_addons(name):
-                from ..addons import _discover_for
+                from ..assembly.addons import register_project
                 # A workspace may place PESaddons next to a nested model or at
                 # the workspace root. Both locations require the same approval.
                 if (self.files.root / "PESaddons").is_dir():
-                    _discover_for(self.files.root / "workspace.pes")
-                _discover_for(target)
-            from ..addons.functions import (
-                legacy_yaml_add_component, legacy_yaml_patch, legacy_yaml_preview,
-                legacy_yaml_remove_component, legacy_yaml_rewire,
+                    register_project(self.files.root / "workspace.pes")
+                register_project(target)
+            from .legacy_yaml import (
+                validated_add_component as legacy_yaml_add_component,
+                validated_patch as legacy_yaml_patch,
+                preview as legacy_yaml_preview,
+                validated_remove_component as legacy_yaml_remove_component,
+                validated_rewire as legacy_yaml_rewire,
             )
             if method == "parameter.patch":
                 return {"edit": legacy_yaml_patch(text, target, params["key"], params["value"])}

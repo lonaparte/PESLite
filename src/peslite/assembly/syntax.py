@@ -252,8 +252,10 @@ def parse_simulation_text(text: str, path: str | Path = "<string>") -> tuple[dic
     source = Path(path)
     if is_native_source(text):
         return parse_native_text(text, source)
+    from .addons import simulation_readers
+
     errors: list[SimulationFileError] = []
-    for reader in _READERS:
+    for reader in (*_READERS, *simulation_readers()):
         try:
             parameters = reader(text, source)
         except SimulationFileError as exc:

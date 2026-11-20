@@ -17,12 +17,12 @@ interface must use the matching PESLite version.
 src/peslite/
 ├── components/   network, passive elements, sources, converter, ADC and PWM hardware
 ├── control/      control loops, graphs, startup and modulation
-├── assembly/     input syntax, typed parameters, events, units, systems and exporters
+├── assembly/     input syntax, typed parameters, events, addon loading, units, systems and exporters
 ├── solver/       connected model kernel, energy model, integrators, commutation and simulation run
 └── addons/       control, component and function addons
-    ├── control/      automatically discovered control-loop modules
-    ├── components/   automatically discovered circuit-element modules
-    └── functions/    optional functions
+    ├── control/      declared control-loop implementations
+    ├── components/   declared circuit-element implementations
+    └── functions/    declared optional functions
 ```
 
 Dependencies point inward through small interfaces: components use the model kernel, controller
@@ -31,7 +31,9 @@ assembled system.
 
 Addons use the same registries and runtime contracts as core implementations. Registration is
 completed before simulation, while function providers are loaded only when requested; neither adds
-dispatch to the simulation hot path. See [Extending PESLite](Extending-PESLite.md).
+dispatch to the simulation hot path. `addons.toml` declares each addon's metadata and dependencies.
+See [List of Addons](List-of-Addons.md) and
+[Extending PESLite](Extending-PESLite.md).
 
 Loading a simulation file also merges a sibling `PESaddons/` tree into the matching package paths
 without adding run-loop work; see [Project Workspace](Project-Workspace.md).
@@ -40,7 +42,7 @@ without adding run-loop work; see [Project Workspace](Project-Workspace.md).
 
 `components/network.py` defines the common connection, registration and netlist-translation
 interface. Core physical implementations are grouped in `components/passive.py`,
-`components/source.py` and `components/converter.py`. The standard `magcomponent` addon provides
+`components/source.py` and `components/converter.py`. The `magcomponent` addon provides
 magnetic components and compensated WPT links through the same contracts, without adding magnetic
 models to the core package. `components/adc.py` and `components/pwm.py` implement sampled converter
 peripherals.

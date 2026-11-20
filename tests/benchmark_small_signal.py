@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from peslite import Simulation, load  # noqa: E402
-from peslite.addons.functions import small_signal  # noqa: E402
+from peslite.addons.functions.online_analysis import small_signal  # noqa: E402
 from peslite.solver.linearization import linearize_loop  # noqa: E402
 from peslite.solver.simulation import SimulationTransition  # noqa: E402
 from peslite.cli import parse_override  # noqa: E402

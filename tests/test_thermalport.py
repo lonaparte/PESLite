@@ -6,13 +6,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from peslite.addons.components.thermalnetwork import (
+from peslite.addons.components.thermal import (
     LumpedThermalNetwork, SharedThermalModel, SharedThermalNetwork, ThermalLink,
 )
 from peslite.addons.components.thermalport import (
     ThermalPort, ThermalPortModel,
 )
-from peslite.addons.functions import foster_step_response, load_thermalport
+from peslite.addons.components.thermalport import load_thermalport
+from peslite.addons.functions.thermal import foster_step_response
 from peslite.solver.model import Model
 
 

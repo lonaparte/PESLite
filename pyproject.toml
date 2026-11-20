@@ -7,7 +7,7 @@ name = "peslite-core"
 version = "0.6.0"
 description = "Core runtime for the PESLite power electronics simulator."
 readme = "README.md"
-requires-python = ">=3.10.1"
+requires-python = ">=3.11.0"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 dependencies = [
@@ -20,7 +20,6 @@ dependencies = [
 test = [
     "pytest>=7.0.0",
     "matplotlib>=3.7.0",
-    "tomli>=2.0.0; python_version < '3.11'",
 ]
 
 [dependency-groups]
@@ -40,6 +39,9 @@ where = ["src"]
 
 [tool.setuptools.data-files]
 "share/peslite/examples/templates" = ["examples/templates/*.pes", "examples/templates/*.py"]
+
+[tool.setuptools.package-data]
+"peslite.addons" = ["addons.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import peslite
 import pytest
 
-from peslite.addons.functions import detect_operating_point
-from peslite.addons.functions import operating_point as operating_module
+import peslite.addons.functions.online_analysis as operating_module
+from peslite.addons.functions.online_analysis import detect_operating_point
 from peslite.solver.model import Empty, Model
 
 

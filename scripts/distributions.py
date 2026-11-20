@@ -8,12 +8,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "packages/distributions.json"
 SUPPORT_FILES = ("README.md", "LICENSE")
+ADDON_MANIFEST = ROOT / "src/peslite/addons/addons.toml"
+ADDON_DIRECTORIES = {"control": "control", "component": "components", "function": "functions"}
 
 
 def _matching_files(pattern: str) -> set[Path]:
@@ -27,6 +30,38 @@ def _configured_files(config: dict) -> set[Path]:
     return set().union(*(_matching_files(pattern) for pattern in config.get("files", ())))
 
 
+def _addon_groups() -> dict[str, set[Path]]:
+    """Assign every public addon module from the authoritative manifest."""
+    with ADDON_MANIFEST.open("rb") as stream:
+        data = tomllib.load(stream)
+    groups = {"addons": set(), "full-addons": set()}
+    declared = set()
+    for name, addon in data.items():
+        group = "addons" if addon["installation"] == "standard" else "full-addons"
+        for field, directory in ADDON_DIRECTORIES.items():
+            if not addon[field]:
+                continue
+            path = Path(f"src/peslite/addons/{directory}/{name}.py")
+            if not (ROOT / path).is_file():
+                raise RuntimeError(f"addon {name!r} is missing {path}")
+            if path in declared:
+                raise RuntimeError(f"addon module is owned twice: {path}")
+            declared.add(path)
+            groups[group].add(path)
+    actual = {
+        path.relative_to(ROOT)
+        for directory in ADDON_DIRECTORIES.values()
+        for path in (ROOT / "src/peslite/addons" / directory).glob("*.py")
+        if path.stem != "__init__" and not path.stem.startswith("_")
+    }
+    if actual != declared:
+        raise RuntimeError(
+            f"addon manifest differs from implementation files: missing "
+            f"{sorted(map(str, actual - declared))}, absent {sorted(map(str, declared - actual))}"
+        )
+    return groups
+
+
 def _manifest() -> tuple[dict[str, set[Path]], dict]:
     with MANIFEST.open(encoding="utf-8") as handle:
         data = json.load(handle)
@@ -37,6 +72,7 @@ def _manifest() -> tuple[dict[str, set[Path]], dict]:
             destination = excluded if pattern.startswith("!") else included
             destination.update(_matching_files(pattern.lstrip("!")))
         groups[name] = included - excluded
+    groups.update(_addon_groups())
     if not groups["addons"].isdisjoint(groups["gui"]):
         raise RuntimeError("addon and GUI file groups overlap")
     if not (groups["addons"] | groups["full-addons"] | groups["gui"]) <= groups["all"]:

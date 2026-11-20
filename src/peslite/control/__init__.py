@@ -37,4 +37,5 @@ __all__ = ["Loop", "SyncLaw", "Integrator", "PI", "OutputLimit", "Filter",
            "LOOP_TYPES", "register_loop_type", "ControlInterface", "CONTROL_INTERFACE",
            "ControlGraph",
            "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
-           "BridgeControlOutput", "ConverterMeasurement", "Controller", "Startup", "VSCController", "GraphController"]
+           "BridgeControlOutput", "ConverterMeasurement", "Controller", "Startup", "VSCController",
+           "GraphController"]

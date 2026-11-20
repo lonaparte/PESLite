@@ -1,23 +1,538 @@
-"""Temperature-dependent physical components."""
+"""Thermal networks, loss models and temperature-dependent components."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, ClassVar, Mapping, Protocol, Sequence
 
 import numpy as np
+from scipy.interpolate import RegularGridInterpolator
 
 from ...components.network import Element, NetworkComponent, register_component_type
 from ...solver import Bag, ConfigError, Empty, OutputMethod, Port
-from ..functions.thermal import SemiconductorLossModel, SwitchingEvent, _lookup
-from .thermalnetwork import FosterImpedance, LumpedThermalNetwork, _positive, _record
 
 __all__ = [
+    "ThermalLink", "LumpedThermalNetwork", "FosterImpedance",
+    "SharedThermalModel", "SharedThermalNetwork",
+    "LossTable", "SemiconductorLossModel", "SwitchingEvent",
     "ThermalComponent", "ThermalParams", "ThermalPropertyLaw",
     "ThermalResistor", "ThermalResistorModel",
     "ElectroThermal", "ElectroThermalModel",
 ]
+
+
+def _positive(value: float, label: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a finite positive number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} must be a finite positive number") from None
+    if not np.isfinite(number) or number <= 0.0:
+        raise ValueError(f"{label} must be a finite positive number")
+    return number
+
+
+def _finite(value: float, label: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be finite")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} must be finite") from None
+    if not np.isfinite(number):
+        raise ValueError(f"{label} must be finite")
+    return number
+
+
+@lru_cache(maxsize=None)
+def _record(prefix: str, names: tuple[str, ...]) -> type[Bag]:
+    """Return one cached state/input/output record type for a field layout."""
+    return type(prefix, (Bag,), {"__slots__": names})
+
+
+@dataclass(frozen=True)
+class ThermalLink:
+    """Thermal R in K/W between two named nodes, or a node and ambient (other=None)."""
+
+    node: str
+    other: str | None
+    resistance_K_W: float
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, "resistance_K_W", _positive(self.resistance_K_W, "resistance_K_W")
+        )
+        if self.other is not None and self.node == self.other:
+            raise ValueError("thermal link endpoints must differ")
+
+
+class LumpedThermalNetwork:
+    """Temperature dynamics of named capacitances and conductive/convective links.
+
+    An ambient link is required for physical steady state. A node can represent
+    a junction, case, shared heat sink or cooling plate. Multiple sources sharing
+    the same sink are represented by ONE network, not duplicated electrical parts.
+    """
+
+    def __init__(self, capacities_J_K: Mapping[str, float], links: Sequence[ThermalLink],
+                 *, ambient_K: float = 298.15) -> None:
+        if not capacities_J_K:
+            raise ValueError("a thermal network needs at least one capacitive node")
+        if any(not isinstance(name, str) or not name.isidentifier()
+               for name in capacities_J_K):
+            raise ValueError("thermal node names must be identifiers")
+        self.names = tuple(capacities_J_K)
+        self.capacities_J_K = np.array([
+            _positive(capacity, f"{name}.capacity_J_K")
+            for name, capacity in capacities_J_K.items()
+        ], dtype=float)
+        self.ambient_K = _positive(ambient_K, "ambient_K")
+        self.links = tuple(links)
+        positions = {name: i for i, name in enumerate(self.names)}
+        self._connections: list[tuple[int, int, float]] = []
+        self._ambient: list[tuple[int, float]] = []
+        for link in self.links:
+            if not isinstance(link, ThermalLink):
+                raise TypeError("links must contain ThermalLink entries")
+            if link.node not in positions:
+                raise ValueError(f"unknown thermal node {link.node!r}")
+            conductance = 1.0 / link.resistance_K_W
+            a = positions[link.node]
+            if link.other is None:
+                self._ambient.append((a, conductance))
+            else:
+                if link.other not in positions:
+                    raise ValueError(f"unknown thermal node {link.other!r}")
+                self._connections.append((a, positions[link.other], conductance))
+        if not self._ambient:
+            raise ValueError("at least one link to ambient is required")
+        # Every node must conduct heat to ambient through the resistance graph.
+        reachable = {idx for idx, _ in self._ambient}
+        for _ in self.names:
+            previous = len(reachable)
+            for a, b, _g in self._connections:
+                if a in reachable or b in reachable:
+                    reachable.update((a, b))
+            if len(reachable) == previous:
+                break
+        if len(reachable) != len(self.names):
+            raise ValueError("each thermal node must have a path to ambient")
+        self._positions = positions
+        self.capacities_J_K.setflags(write=False)
+
+    @classmethod
+    def cauer(cls, capacities_J_K: Sequence[float], resistances_K_W: Sequence[float],
+              *, ambient_K: float = 298.15) -> "LumpedThermalNetwork":
+        """Physical junction-to-ambient ladder with N capacities and N resistances.
+
+        The first N-1 resistances link neighboring nodes; the last attaches the
+        final case/heatsink node to the fixed ambient temperature.
+        """
+        if not capacities_J_K or len(capacities_J_K) != len(resistances_K_W):
+            raise ValueError("Cauer ladder needs equally sized, nonempty C and R lists")
+        names = tuple(f"node_{index}" for index in range(len(capacities_J_K)))
+        edges = [
+            ThermalLink(names[index], names[index + 1], resistance)
+            for index, resistance in enumerate(resistances_K_W[:-1])
+        ]
+        edges.append(ThermalLink(names[-1], None, resistances_K_W[-1]))
+        return cls(dict(zip(names, capacities_J_K)), edges, ambient_K=ambient_K)
+
+    def _array(self, temperatures_K: Sequence[float]) -> np.ndarray:
+        x = np.asarray(temperatures_K, dtype=float)
+        # Numerical/energy-structure probes may evaluate trial states outside the
+        # physical temperature range. Only committed impulses enforce positive K;
+        # otherwise the solver's speculative RHS would reject audit probes.
+        if x.shape != (len(self.names),) or not np.isfinite(x).all():
+            raise ValueError("temperatures_K need one finite K per node")
+        return x
+
+    def rates(self, temperatures_K: Sequence[float],
+              heat_W: Mapping[str, float]) -> np.ndarray:
+        """Return Kelvin/s with positive heat entering named nodes."""
+        x = self._array(temperatures_K)
+        unknown = set(heat_W) - self._positions.keys()
+        if unknown:
+            raise ValueError(f"heat sources name unknown thermal nodes: {sorted(unknown)}")
+        q = np.zeros_like(x)
+        for name, value in heat_W.items():
+            q[self._positions[name]] += _finite(value, f"{name}.heat_W")
+        for a, b, conductance in self._connections:
+            flow = conductance * (x[b] - x[a])
+            q[a] += flow
+            q[b] -= flow
+        for a, conductance in self._ambient:
+            q[a] += conductance * (self.ambient_K - x[a])
+        return q / self.capacities_J_K
+
+    def cooling_power_W(self, temperatures_K: Sequence[float]) -> float:
+        """Net heat rejected to the ambient, positive for hot components."""
+        x = self._array(temperatures_K)
+        return float(sum(g * (x[a] - self.ambient_K) for a, g in self._ambient))
+
+    def stored_excess_heat_J(self, temperatures_K: Sequence[float]) -> float:
+        """Thermal energy relative to constant ambient, in J."""
+        x = self._array(temperatures_K)
+        return float(np.dot(self.capacities_J_K, x - self.ambient_K))
+
+    def committed_impulse(self, temperatures_K: Sequence[float],
+                          energy_J: Mapping[str, float]) -> np.ndarray:
+        """Apply a confirmed energy impulse to the owning capacitive node exactly."""
+        x = self._array(temperatures_K).copy()
+        for name, energy in energy_J.items():
+            if name not in self._positions:
+                raise ValueError(f"unknown thermal node {name!r}")
+            x[self._positions[name]] += (
+                _finite(energy, f"{name}.energy_J") / self.capacities_J_K[self._positions[name]]
+            )
+        if np.any(x <= 0):
+            raise ValueError("heat impulse produced nonphysical temperature")
+        return x
+
+
+class FosterImpedance:
+    """Parallel Foster thermal impedance referenced to a *fixed* ambient.
+
+    Each branch has a temperature rise x_i and obeys
+    d(x_i)/dt = (P - x_i/R_i)/C_i; T_j = T_ambient + sum(x_i).
+    These are behavioral impedance states, not physical case or sink nodes:
+    Foster branches cannot be directly joined into a shared heat-sink network.
+    """
+
+    def __init__(self, resistances_K_W: Sequence[float], capacitances_J_K: Sequence[float],
+                 *, ambient_K: float = 298.15):
+        if not resistances_K_W or len(resistances_K_W) != len(capacitances_J_K):
+            raise ValueError("Foster impedance needs equally sized nonempty R and C lists")
+        self.resistances_K_W = np.array([
+            _positive(v, "resistance_K_W") for v in resistances_K_W], dtype=float)
+        self.capacitances_J_K = np.array([
+            _positive(v, "capacitance_J_K") for v in capacitances_J_K], dtype=float)
+        self.ambient_K = _positive(ambient_K, "ambient_K")
+        self.resistances_K_W.setflags(write=False)
+        self.capacitances_J_K.setflags(write=False)
+
+    def rates(self, rises_K: Sequence[float], heat_W: float) -> np.ndarray:
+        x = np.asarray(rises_K, dtype=float)
+        if x.shape != self.resistances_K_W.shape or not np.isfinite(x).all():
+            raise ValueError("Foster rises must match the branch count")
+        q = _finite(heat_W, "heat_W")
+        return (q - x / self.resistances_K_W) / self.capacitances_J_K
+
+    def junction_K(self, rises_K: Sequence[float]) -> float:
+        x = np.asarray(rises_K, dtype=float)
+        if x.shape != self.resistances_K_W.shape or not np.isfinite(x).all():
+            raise ValueError("Foster rises must match the branch count")
+        return float(self.ambient_K + np.sum(x))
+
+    def committed_impulse(self, rises_K: Sequence[float], energy_J: float) -> np.ndarray:
+        """Advance every branch's rise by E/C at an accepted impulse."""
+        x = np.asarray(rises_K, dtype=float)
+        if x.shape != self.resistances_K_W.shape or not np.isfinite(x).all():
+            raise ValueError("Foster rises must match the branch count")
+        return x + _finite(energy_J, "energy_J") / self.capacitances_J_K
+
+
+class SharedThermalModel:
+    """Couple independent heat inputs to one shared RC graph."""
+
+    outputs_need_inputs: ClassVar[bool] = True
+    observer: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        network: LumpedThermalNetwork,
+        sources: Mapping[str, str],
+        *,
+        initial_K: float | None = None,
+    ) -> None:
+        if not isinstance(network, LumpedThermalNetwork):
+            raise TypeError("shared thermal backend requires a physical lumped network")
+        if not sources:
+            raise ValueError("shared heat model needs at least one source")
+        if (
+            any(not isinstance(name, str) or not name.isidentifier() for name in sources)
+            or any(node not in network.names for node in sources.values())
+        ):
+            raise ValueError("heat sources need identifier names and existing thermal nodes")
+        self.network = network
+        self.source_nodes = dict(sources)
+        self.state_names = tuple(f"T_{node}_K" for node in network.names)
+        self.input_names = tuple(f"heat_{name}_W" for name in sources)
+        self.temperature_names = tuple(f"temperature_{node}_K" for node in network.names)
+        self.output_names = (*self.temperature_names, "heat_total_W", "cooling_W")
+        initial = network.ambient_K if initial_K is None else _finite(initial_K, "initial_K")
+        if initial <= 0:
+            raise ValueError("initial_K must be positive")
+        self.state = _record("_SharedThermalState", self.state_names)(
+            **dict.fromkeys(self.state_names, initial)
+        )
+        self.input = _record("_SharedThermalInput", self.input_names)(
+            **dict.fromkeys(self.input_names, 0.0)
+        )
+        self.output = _record("_SharedThermalOutput", self.output_names)()
+        self.set_outputs(0.0)
+
+    def _temperatures(self) -> np.ndarray:
+        return np.fromiter(
+            (getattr(self.state, name) for name in self.state_names),
+            dtype=float,
+            count=len(self.state_names),
+        )
+
+    def _heat(self) -> dict[str, float]:
+        heat = {name: 0.0 for name in self.network.names}
+        for source, node in self.source_nodes.items():
+            value = _finite(getattr(self.input, f"heat_{source}_W"), f"{source}.heat_W")
+            if value < 0:
+                raise ValueError("passive thermal sources require nonnegative losses")
+            heat[node] += value
+        return heat
+
+    def set_outputs(self, _t: float) -> None:
+        temperatures = self._temperatures()
+        for name, temperature in zip(self.temperature_names, temperatures):
+            setattr(self.output, name, float(temperature))
+        self.output.heat_total_W = sum(self._heat().values())
+        self.output.cooling_W = self.network.cooling_power_W(temperatures)
+
+    def rhs(self, _t: float) -> tuple[float, ...]:
+        return tuple(self.network.rates(self._temperatures(), self._heat()))
+
+
+@register_component_type
+class SharedThermalNetwork(Element):
+    """Connect several heat signals to one configured thermal network."""
+
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        capacities_J_K: dict[str, float] = field(metadata={"structural": True})
+        links: list[dict] = field(metadata={"structural": True})
+        sources: dict[str, dict[str, str]] = field(metadata={"structural": True})
+        ambient_K: float = 298.15
+        initial_K: float = 298.15
+        type: str = "shared_thermal_network"
+
+        def __post_init__(self) -> None:
+            if not isinstance(self.sources, Mapping) or not self.sources:
+                raise ConfigError("shared thermal network requires heat sources")
+            for name, source in self.sources.items():
+                if (
+                    not isinstance(name, str)
+                    or not name.isidentifier()
+                    or not isinstance(source, Mapping)
+                    or set(source) != {"path", "node"}
+                    or not all(isinstance(value, str) and value for value in source.values())
+                ):
+                    raise ConfigError("each shared heat source needs a named path and node")
+            try:
+                links = [ThermalLink(**item) for item in self.links]
+                LumpedThermalNetwork(
+                    self.capacities_J_K,
+                    links,
+                    ambient_K=self.ambient_K,
+                )
+            except (ValueError, TypeError) as exc:
+                raise ConfigError(f"invalid shared thermal network: {exc}") from None
+
+    type = "shared_thermal_network"
+
+    def __init__(self, name: str, cfg: Any, _buses: dict, _params: Any) -> None:
+        self.name, self.cfg = name, cfg
+        network = LumpedThermalNetwork(
+            cfg.capacities_J_K,
+            [ThermalLink(**item) for item in cfg.links],
+            ambient_K=cfg.ambient_K,
+        )
+        self.model = SharedThermalModel(
+            network,
+            {source: item["node"] for source, item in cfg.sources.items()},
+            initial_K=cfg.initial_K,
+        )
+
+    def subsystems(self) -> dict[str, SharedThermalModel]:
+        return {self.name: self.model}
+
+    def connections(self) -> dict:
+        return {
+            (self.model, f"heat_{name}_W"): source["path"]
+            for name, source in self.cfg.sources.items()
+        }
+
+    @staticmethod
+    def port_bindings() -> tuple:
+        return ()
+
+    def signals(self) -> dict[str, float]:
+        return {
+            f"{self.name}.{field}": getattr(self.model.output, field)
+            for field in self.model.output_names
+        }
+
+
+_AXES = frozenset(("current_A", "voltage_V", "temperature_K"))
+_EVENT_KINDS = frozenset(("turn_on", "turn_off", "reverse_recovery"))
+
+
+def _values(name: str, values: Any, count: int | None = None) -> np.ndarray:
+    try:
+        result = np.asarray(values, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must contain finite numeric values") from exc
+    if result.ndim != 1 or not np.isfinite(result).all():
+        raise ValueError(f"{name} must be a one-dimensional array of finite numbers")
+    if count is not None and result.size != count:
+        raise ValueError(f"{name} must have {count} samples")
+    return result
+
+
+def _scalar(name: str, value: Any, *, nonnegative: bool = False) -> float:
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be a finite number")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not np.isfinite(result) or (nonnegative and result < 0):
+        raise ValueError(f"{name} must be {'nonnegative and ' if nonnegative else ''}finite")
+    return result
+
+
+@dataclass(frozen=True)
+class LossTable:
+    """Nonnegative loss data on named, strictly increasing SI axes.
+
+    Axes may be any nonempty subset of ``current_A``, ``voltage_V`` and
+    ``temperature_K``. Multilinear interpolation is used inside the grid.
+    Outside it, the default ``out_of_range='error'`` rejects the lookup;
+    ``'clamp'`` uses the nearest boundary rather than extrapolating.
+    Current and voltage are treated as magnitudes.
+    """
+
+    axes: Mapping[str, Sequence[float]]
+    values: Any
+    out_of_range: str = "error"
+    _names: tuple[str, ...] = field(init=False, repr=False, compare=False)
+    _interpolator: Any = field(init=False, repr=False, compare=False)
+    _grid: tuple[np.ndarray, ...] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not self.axes or any(name not in _AXES for name in self.axes):
+            raise ValueError("loss table needs named current_A, voltage_V or temperature_K axes")
+        if self.out_of_range not in ("error", "clamp"):
+            raise ValueError("out_of_range must be 'error' or 'clamp'")
+        grid = []
+        for name, points in self.axes.items():
+            axis = _values(f"axis {name}", points)
+            if axis.size < 2 or np.any(np.diff(axis) <= 0):
+                raise ValueError(f"axis {name} needs at least two strictly increasing points")
+            if (np.any(axis < 0) if name != "temperature_K" else np.any(axis <= 0)):
+                raise ValueError(f"axis {name} must use physical nonnegative SI values")
+            axis = axis.copy()
+            axis.setflags(write=False)
+            grid.append(axis)
+        try:
+            values = np.array(self.values, dtype=float, copy=True)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("loss table values must be finite and nonnegative") from exc
+        if values.shape != tuple(len(axis) for axis in grid):
+            raise ValueError("loss table values must match the axis grid shape")
+        if not np.isfinite(values).all() or np.any(values < 0):
+            raise ValueError("loss table values must be finite and nonnegative")
+        values.setflags(write=False)
+        object.__setattr__(self, "values", values)
+        object.__setattr__(self, "_names", tuple(self.axes))
+        object.__setattr__(self, "_grid", tuple(grid))
+        object.__setattr__(self, "_interpolator", RegularGridInterpolator(
+            grid, values, method="linear", bounds_error=self.out_of_range == "error",
+            fill_value=None,
+        ))
+
+    def evaluate(self, *, current_A: Any = 0.0, voltage_V: Any = 0.0,
+                 temperature_K: Any = 298.15) -> float | np.ndarray:
+        """Evaluate one or broadcasted lookup points using SI quantities."""
+        sources = {"current_A": current_A, "voltage_V": voltage_V,
+                   "temperature_K": temperature_K}
+        try:
+            columns = np.broadcast_arrays(*(
+                np.asarray(sources[name], dtype=float) for name in self._names
+            ))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("loss table coordinates must be broadcastable numeric arrays") from exc
+        coordinates = []
+        for name, column, grid in zip(self._names, columns, self._grid):
+            if not np.isfinite(column).all():
+                raise ValueError(f"{name} lookup coordinates must be finite")
+            if name == "temperature_K" and np.any(column <= 0):
+                raise ValueError("temperature_K must be positive")
+            magnitude = column if name == "temperature_K" else np.abs(column)
+            if self.out_of_range == "clamp":
+                magnitude = np.clip(magnitude, grid[0], grid[-1])
+            coordinates.append(magnitude.ravel())
+        points = np.stack(coordinates, axis=-1)
+        try:
+            lookup = self._interpolator(points).reshape(columns[0].shape)
+        except ValueError as exc:
+            raise ValueError("loss table lookup is outside the declared axes") from exc
+        return float(lookup) if lookup.ndim == 0 else lookup
+
+
+@dataclass(frozen=True)
+class SemiconductorLossModel:
+    """Optional conduction voltage (V) and transition energies (J) for one device.
+
+    Missing fields mean that loss mechanism is unavailable, not that it is known
+    to be zero. The caller supplies known conduction intervals and transitions.
+    """
+
+    conduction_voltage_V: float | LossTable | None = None
+    turn_on_energy_J: float | LossTable | None = None
+    turn_off_energy_J: float | LossTable | None = None
+    reverse_recovery_energy_J: float | LossTable | None = None
+    turn_on_includes_reverse_recovery: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("conduction_voltage_V", "turn_on_energy_J", "turn_off_energy_J",
+                     "reverse_recovery_energy_J"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, LossTable):
+                object.__setattr__(self, name, _scalar(name, value, nonnegative=True))
+        if type(self.turn_on_includes_reverse_recovery) is not bool:
+            raise ValueError("turn_on_includes_reverse_recovery must be bool")
+
+
+def _lookup(value: float | LossTable | None, current: Any, voltage: Any,
+            temperature: float) -> Any:
+    return (value.evaluate(current_A=current, voltage_V=voltage,
+                           temperature_K=temperature)
+            if isinstance(value, LossTable) else 0.0 if value is None else value)
+
+
+@dataclass(frozen=True)
+class SwitchingEvent:
+    """One confirmed device transition, with pre-transition absolute operating values.
+
+    These events must originate from accepted/committed simulation transitions or
+    an independent verified event log. Snapshot-detected edges are not sufficient.
+    """
+
+    time_s: float
+    kind: str
+    current_A: float
+    voltage_V: float
+    device: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in _EVENT_KINDS:
+            raise ValueError(f"unknown switching event kind: {self.kind!r}")
+        if self.device is not None and (
+                not isinstance(self.device, str) or not self.device
+                or any(not part.isidentifier() for part in self.device.split("."))):
+            raise ValueError("device must contain dot-separated identifiers")
+        for name in ("time_s", "current_A", "voltage_V"):
+            object.__setattr__(self, name, _scalar(name, getattr(self, name)))
 
 
 class ThermalPropertyLaw(Protocol):

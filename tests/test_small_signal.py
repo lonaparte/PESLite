@@ -14,7 +14,7 @@ import pytest
 from scipy.linalg import expm
 
 from conftest import EXAMPLES
-from peslite.addons.functions import small_signal, small_signal_report
+from peslite.addons.functions.online_analysis import small_signal, small_signal_report
 from peslite.components.adc import ADC, MeasurementPorts
 from peslite.solver.linearization import (LoopMap, active_coordinates, coordinate_difference,
                                          linearize_loop)
@@ -426,7 +426,7 @@ def test_normal_run_does_not_construct_a_map_or_compute_modes(monkeypatch):
         raise AssertionError("ordinary simulations must not invoke stability analysis")
 
     monkeypatch.setattr("peslite.solver.simulation.SimulationTransition", forbidden)
-    monkeypatch.setattr("peslite.addons.functions.online_stability.linearize_loop", forbidden)
+    monkeypatch.setattr("peslite.addons.functions.online_analysis.linearize_loop", forbidden)
     sim = peslite.Simulation(_params())
     sim.run(out_dir=None)
     assert sim.result.summary["t_stop"] == sim.p.simulation.t_end
@@ -536,7 +536,7 @@ def test_other_addons_and_normal_runs_do_not_import_stability_analysis():
     subprocess.run([sys.executable, "-c", """
 import sys
 import peslite
-from peslite.addons.functions import plot_result
-assert 'peslite.addons.functions.online_stability' not in sys.modules
+from peslite.addons.functions.plotting import plot_result
+assert 'peslite.addons.functions.online_analysis' not in sys.modules
 assert not hasattr(peslite.Simulation, 'small_signal')
 """], env=env, check=True, capture_output=True, text=True)

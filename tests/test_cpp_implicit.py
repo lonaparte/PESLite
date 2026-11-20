@@ -109,11 +109,15 @@ def test_native_implicit_switching_commutations(case, form, method, tmp_path):
     assert max(map(abs, selected)) > 0.1
 
 
-def test_native_export_traces_registered_addon_control_equations(tmp_path):
-    params = peslite.load(EXAMPLES / "custom-pll-example.pes", **{
+def test_native_export_traces_amplitude_normalised_pll(tmp_path):
+    params = peslite.load(EXAMPLES / "gfl-example.pes", **{
         "simulation.t_end": 2e-4,
         "simulation.progress.enable": False,
         "simulation.energy_check": "off",
+        "units.vsc.ctrl.loops.SRFPLL": {
+            "bandwidth": 20.0,
+            "normalisation": "amplitude",
+        },
     })
     _compare_native(params, tmp_path, rtol=1e-10, atol=1e-11)
 

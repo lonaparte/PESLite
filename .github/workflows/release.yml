@@ -19,7 +19,6 @@ jobs:
       fail-fast: false
       matrix:
         python-version:
-          - "3.10"
           - "3.11"
           - "3.12"
           - "3.13"
@@ -48,9 +47,9 @@ jobs:
 
 
   test-minimum-python:
-    name: Test Python 3.10.1
+    name: Test Python 3.11.0
     runs-on: ubuntu-24.04
-    container: python:3.10.1-bullseye
+    container: python:3.11.0-bullseye
     timeout-minutes: 15
 
     steps:
@@ -60,7 +59,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify Python version
-        run: python -c "import sys; assert sys.version_info[:3] == (3, 10, 1)"
+        run: python -c "import sys; assert sys.version_info[:3] == (3, 11, 0)"
 
       - name: Install dependencies
         run: |

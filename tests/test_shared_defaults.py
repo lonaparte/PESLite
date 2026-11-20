@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from peslite.addons.functions.online_stability import small_signal, small_signal_report
+from peslite.addons.functions.online_analysis import small_signal, small_signal_report
 from peslite.solver.commutation import Commutation
 from peslite.assembly.cpp import _CppGenerator
 from peslite.assembly.params import OutputParams, PWMParams, SolverParams
