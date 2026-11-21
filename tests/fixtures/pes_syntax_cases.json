@@ -89,6 +89,16 @@
       "name": "indented line without a declaration",
       "valid": false,
       "text": "@circuit\nA -- B\n  kp: 1\nbase: {s_base: 1.0e6}\nsimulation: {t_end: 0.1}\n"
+    },
+    {
+      "name": "non-ASCII letter in a name",
+      "valid": false,
+      "text": "@circuit\nGrid -- Bus_ä\nbase: {s_base: 1.0e6}\n"
+    },
+    {
+      "name": "doubled single quote and hash in a quoted value",
+      "valid": true,
+      "text": "@circuit\nGrid -- PCC\nmeta: {note: 'it''s # not a comment'}\n"
     }
   ]
 }

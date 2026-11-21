@@ -1363,25 +1363,32 @@ class SCCParams:
 
 
 @dataclass(frozen=True, kw_only=True)
-class SSLinkParams:
-    """Series-series compensated two-winding inductive link in SI units."""
+class _CoilPairLinkParams:
+    """Common coupled-coil parameters of a two-winding compensated link."""
 
-    type: str = "ss"
+    type: str
     primary_inductance: float
     secondary_inductance: float
     mutual_inductance: float
-    primary_capacitance: float
-    secondary_capacitance: float
     primary_resistance: float = 0.0
     secondary_resistance: float = 0.0
     primary_scc: Optional[SCCParams] = None
     secondary_scc: Optional[SCCParams] = None
 
+
+@dataclass(frozen=True, kw_only=True)
+class SSLinkParams(_CoilPairLinkParams):
+    """Series-series compensated two-winding inductive link in SI units."""
+
+    type: str = "ss"
+    primary_capacitance: float
+    secondary_capacitance: float
+
     _choices = {"type": ("ss",)}
 
 
 @dataclass(frozen=True, kw_only=True)
-class LCCLinkParams:
+class LCCLinkParams(_CoilPairLinkParams):
     """Symmetric-form LCC-LCC compensated two-winding inductive link in SI units.
 
     Each port has a series compensation inductor, a shunt compensation capacitor and a
@@ -1389,29 +1396,22 @@ class LCCLinkParams:
     """
 
     type: str = "lcc"
-    primary_inductance: float
-    secondary_inductance: float
-    mutual_inductance: float
     primary_series_capacitance: float
     secondary_series_capacitance: float
     primary_compensation_inductance: float
     secondary_compensation_inductance: float
     primary_parallel_capacitance: float
     secondary_parallel_capacitance: float
-    primary_resistance: float = 0.0
-    secondary_resistance: float = 0.0
     primary_compensation_resistance: float = 0.0
     secondary_compensation_resistance: float = 0.0
     primary_parallel_resistance: float = 0.0  # ESR in series with the shunt capacitor
     secondary_parallel_resistance: float = 0.0
-    primary_scc: Optional[SCCParams] = None
-    secondary_scc: Optional[SCCParams] = None
 
     _choices = {"type": ("lcc",)}
 
 
 @dataclass(frozen=True, kw_only=True)
-class LCCSLinkParams:
+class LCCSLinkParams(_CoilPairLinkParams):
     """LCC-compensated primary and series-compensated secondary of a two-winding link (SI).
 
     The primary port has a series compensation inductor, a shunt capacitor (optional ESR) and a
@@ -1419,19 +1419,12 @@ class LCCSLinkParams:
     """
 
     type: str = "lcc_s"
-    primary_inductance: float
-    secondary_inductance: float
-    mutual_inductance: float
     primary_series_capacitance: float
     primary_compensation_inductance: float
     primary_parallel_capacitance: float
     secondary_capacitance: float
-    primary_resistance: float = 0.0
-    secondary_resistance: float = 0.0
     primary_compensation_resistance: float = 0.0
     primary_parallel_resistance: float = 0.0
-    primary_scc: Optional[SCCParams] = None
-    secondary_scc: Optional[SCCParams] = None
 
     _choices = {"type": ("lcc_s",)}
 

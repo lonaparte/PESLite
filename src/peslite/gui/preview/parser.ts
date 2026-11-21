@@ -3,10 +3,17 @@ import type {
   ParameterBlock, PESModel, SourceLocation, SourceRange,
 } from './types.js';
 
-const REFERENCE = /^([A-Za-z_][\w-]*)(?:\.([A-Za-z_][\w-]*))?$/;
-const VIEW_HEADER = /^@([A-Za-z_][\w-]*)\s*$/;
-const DEFINITION = /^([A-Za-z_][\w-]*)\s*:\s*([A-Za-z_][\w.-]*(?:\s*,\s*[A-Za-z_][\w.-]*)?)\s*$/;
+const NAME = '[A-Za-z_][A-Za-z0-9_-]*';
+const PATH = '[A-Za-z_][A-Za-z0-9_.-]*';
+const REFERENCE = new RegExp(`^(${NAME})(?:\\.(${NAME}))?$`);
+const VIEW_HEADER = new RegExp(`^@(${NAME})\\s*$`);
+const DEFINITION = new RegExp(`^(${NAME})\\s*:\\s*(${PATH}(?:\\s*,\\s*${PATH})?)\\s*$`);
 const QUOTED_KEY = /^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s*:/;
+const KEY = new RegExp(`^(${NAME})\\s*:\\s*(.*)$`);
+const FIELD = new RegExp(`^(${PATH})\\s*:\\s*(.*)$`);
+const NESTED = new RegExp(`^(${NAME})\\s*:\\s*(${PATH})\\s*$`);
+const GROUP = new RegExp(`^&(${NAME})\\s*:\\s*(.*)$`);
+const MEMBER = new RegExp(`^&?${NAME}$`);
 const PARAMETER_DOMAINS = new Set(['base', 'buses', 'branches', 'sources', 'units', 'elements',
   'signals', 'events', 'simulation', 'meta']);
 
@@ -35,7 +42,7 @@ function indent(text: string): number { return text.match(/^ */)![0].length; }
 function startsParameters(text: string): boolean {
   const content = stripComment(text).trimEnd();
   if (QUOTED_KEY.test(content)) return true;
-  const matched = content.match(/^([A-Za-z_][\w-]*)\s*:\s*(.*)$/);
+  const matched = content.match(KEY);
   if (!matched) return false;
   return PARAMETER_DOMAINS.has(matched[1]) || (!!matched[2].trim() && !DEFINITION.test(content));
 }
@@ -311,7 +318,7 @@ function parseView(section: ViewSection, lines: string[], diagnostics: Diagnosti
       }
       // YAML parameters are opaque to the numerical backend but their local
       // syntax still needs to be safe to display and source-located.
-      const field = expression.match(/^([A-Za-z_][\w.-]*)\s*:\s*(.*)$/);
+      const field = expression.match(FIELD);
       if (!field && !expression.startsWith('- ')) {
         diagnostic(diagnostics, lineNumber, level + 1, 'expected an indented YAML key: value');
       }
@@ -319,7 +326,7 @@ function parseView(section: ViewSection, lines: string[], diagnostics: Diagnosti
         try { yamlValue(field[2]); }
         catch (error) { diagnostic(diagnostics, lineNumber, level + 1, String(error)); }
       }
-      const candidate = expression.match(/^([A-Za-z_][\w-]*)\s*:\s*([A-Za-z_][\w.-]*)\s*$/);
+      const candidate = expression.match(NESTED);
       const nested = candidate && nodes.has(candidate[1]) ? candidate : null;
       if (level === active.indent + 2) {
         if (active.nested) {
@@ -350,14 +357,14 @@ function parseView(section: ViewSection, lines: string[], diagnostics: Diagnosti
     }
     definitionEnd(lineNumber - 1);
     if (expression.startsWith('&')) {
-      const match = expression.match(/^&([A-Za-z_][\w-]*)\s*:\s*(.*)$/);
+      const match = expression.match(GROUP);
       if (!match) {
         diagnostic(diagnostics, lineNumber, 1, 'expected &Group: Member, Member');
         continue;
       }
       const members = match[2].split(',').map(value => value.trim());
       if (members.length === 0 || members.some(name =>
-        !/^&?[A-Za-z_][\w-]*$/.test(name))) {
+        !MEMBER.test(name))) {
         diagnostic(diagnostics, lineNumber, 1, 'invalid subsystem member list');
         continue;
       }

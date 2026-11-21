@@ -17,14 +17,16 @@ PARAMETER_DOMAINS = (
     "events", "simulation", "meta",
 )
 
-_VIEW_HEADER = re.compile(r"^@([A-Za-z_][\w-]*)(?:\s+#.*)?\s*$")
+_NAME = r"[A-Za-z_][A-Za-z0-9_-]*"
+_PATH = r"[A-Za-z_][A-Za-z0-9_.-]*"
+_VIEW_HEADER = re.compile(rf"^@({_NAME})(?:\s+#.*)?\s*$")
 _VIEW_DEFINITION = re.compile(
-    r"^[A-Za-z_][\w-]*\s*:\s*[A-Za-z_][\w.-]*(?:\s*,\s*[A-Za-z_][\w.-]*)?\s*$"
+    rf"^{_NAME}\s*:\s*{_PATH}(?:\s*,\s*{_PATH})?\s*$"
 )
-_REFERENCE = r"[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)?"
-_GROUP = re.compile(rf"^&[A-Za-z_][\w-]*\s*:\s*&?{_REFERENCE}(?:\s*,\s*&?{_REFERENCE})*\s*$")
+_REFERENCE = rf"{_NAME}(?:\.{_NAME})?"
+_GROUP = re.compile(rf"^&{_NAME}\s*:\s*&?{_REFERENCE}(?:\s*,\s*&?{_REFERENCE})*\s*$")
 _CONNECTION = re.compile(rf"^{_REFERENCE}(?:\s*(?:--|->)\s*{_REFERENCE})+\s*$")
-_KEY = re.compile(r"^([A-Za-z_][\w-]*|'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\")\s*:\s*(.*)$")
+_KEY = re.compile(rf"^({_NAME}|'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\")\s*:\s*(.*)$")
 _READERS: list[Callable[[str, Path], Mapping[str, Any] | None]] = []
 
 
@@ -125,20 +127,26 @@ def _content(line: str) -> str:
     """Remove a trailing comment without interpreting view expressions."""
     quote = ""
     escaped = False
-    for index, character in enumerate(line):
+    index = 0
+    while index < len(line):
+        character = line[index]
         if quote:
+            if (quote == "'" and character == "'" and index + 1 < len(line)
+                    and line[index + 1] == "'"):
+                index += 2
+                continue
             if quote == '"' and character == "\\" and not escaped:
                 escaped = True
+                index += 1
                 continue
             if character == quote and not escaped:
-                if quote == "'" and index + 1 < len(line) and line[index + 1] == "'":
-                    continue
                 quote = ""
             escaped = False
         elif character in "'\"":
             quote = character
         elif character == "#" and (index == 0 or line[index - 1].isspace()):
             return line[:index].rstrip()
+        index += 1
     return line.rstrip()
 
 
@@ -184,7 +192,7 @@ def _validate_view(name: str, body: list[tuple[int, str]], path: str | Path) -> 
         if _VIEW_DEFINITION.fullmatch(expression):
             declaration_indent = level
             continue
-        if re.fullmatch(r"[A-Za-z_][\w-]*\s*:\s*", expression):
+        if re.fullmatch(rf"{_NAME}\s*:\s*", expression):
             raise SimulationFileError(
                 f"{expression.split(':', 1)[0]}: requires a displayed type",
                 path=path, line=number,

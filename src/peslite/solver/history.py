@@ -30,12 +30,10 @@ class DelayHistory:
         """Return the linearly interpolated value at ``t``."""
         if not self.times or t < self.times[0]:
             return self.initial
-        index = bisect.bisect_right(self.times, t)
-        if index == 0:
-            return self.initial
-        if index == len(self.times):
+        after = bisect.bisect_right(self.times, t)
+        if after == len(self.times):
             return self.values[-1]
-        before, after = index - 1, index
+        before = after - 1
         t0, t1 = self.times[before], self.times[after]
         fraction = (t - t0) / (t1 - t0)
         return self.values[before] + fraction * (self.values[after] - self.values[before])
@@ -61,11 +59,9 @@ class DelayHistory:
         At a committed knot the left slope is used, so a method-of-steps evaluation never reads
         an uncommitted value beyond the current history boundary.
         """
-        if len(self.times) < 2 or t <= self.times[0] or t > self.times[-1]:
+        if len(self.times) < 2 or not self.times[0] < t <= self.times[-1]:
             return 0.0
         after = bisect.bisect_left(self.times, t)
-        if after == len(self.times):
-            return 0.0
         before = after - 1
         return ((self.values[after] - self.values[before])
                 / (self.times[after] - self.times[before]))

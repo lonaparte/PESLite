@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Native interface names use the same ASCII grammar in Python and the browser preview, and a
+  doubled single quote no longer exposes a quoted `#` as a comment.
+- Delay histories return no derivative outside their committed interpolation bracket, including
+  a non-finite query time.
 - Behavioral electrical sources now carry total-rate declarations into the netlist. Stateful
   black boxes and nonlinear magnetic laws therefore retain series-inductor and parallel-capacitor
   dynamics instead of treating a recorded source value as constant in time.

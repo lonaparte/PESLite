@@ -858,14 +858,65 @@ def _explicit_step_check(
         return active == 0;
     }}
 
-    template <class Held> static bool explicit_mode_step_allowed(Held& held, double h) {{
+    template <class Held> void explicit_spectrum(Held& held) {{
+        held.spectrum = true;
+        const std::size_t n = held.size;
+        std::vector<Complex> matrix = std::move(held.matrix);
+        held.matrix.clear();
+        std::vector<unsigned char> pattern(matrix.size());
+        std::transform(matrix.begin(), matrix.end(), pattern.begin(),
+                       [](Complex value) {{ return value != Complex{{}}; }});
+        auto structure = std::find_if(
+            explicit_step_patterns.begin(), explicit_step_patterns.end(),
+            [&](const auto& item) {{ return item.nonzero == pattern; }}
+        );
+        if (structure == explicit_step_patterns.end()) {{
+            if (explicit_step_patterns.size() >= 64)
+                explicit_step_patterns.erase(explicit_step_patterns.begin());
+            explicit_step_patterns.push_back({{std::move(pattern), {{}}, false}});
+            held.converged = explicit_eigenvalues(std::move(matrix), n, held.eigenvalues);
+            return;
+        }}
+        if (!structure->decomposed) {{
+            structure->components = step_check_components(matrix, n);
+            structure->decomposed = true;
+        }}
+        if (structure->components.size() == 1
+                && structure->components.front().size() == n) {{
+            held.converged = explicit_eigenvalues(std::move(matrix), n, held.eigenvalues);
+            return;
+        }}
+        held.converged = true;
+        for (const auto& component : structure->components) {{
+            std::vector<Complex> block(component.size() * component.size());
+            for (std::size_t row = 0; row < component.size(); ++row)
+                for (std::size_t column = 0; column < component.size(); ++column)
+                    block[row * component.size() + column]
+                        = matrix[component[row] * n + component[column]];
+            auto cached = std::find_if(
+                explicit_step_blocks.begin(), explicit_step_blocks.end(),
+                [&](const auto& item) {{ return item.matrix == block; }}
+            );
+            if (cached == explicit_step_blocks.end()) {{
+                if (explicit_step_blocks.size() >= 256)
+                    explicit_step_blocks.erase(explicit_step_blocks.begin());
+                explicit_step_blocks.push_back({{block, {{}}, false}});
+                cached = explicit_step_blocks.end() - 1;
+                cached->converged = explicit_eigenvalues(
+                    std::move(block), component.size(), cached->eigenvalues
+                );
+            }}
+            held.converged = held.converged && cached->converged;
+            held.eigenvalues.insert(held.eigenvalues.end(),
+                                    cached->eigenvalues.begin(), cached->eigenvalues.end());
+        }}
+    }}
+
+    template <class Held> bool explicit_mode_step_allowed(Held& held, double h) {{
         if (!held.spectrum) {{
             if ({_number(half_disk)} > 0.0
                     && h * held.norm_bound <= {_number(half_disk)}) return true;
-            held.converged = explicit_eigenvalues(
-                std::move(held.matrix), held.size, held.eigenvalues
-            );
-            held.spectrum = true;
+            explicit_spectrum(held);
         }}
         if (!held.converged) return false;
         static constexpr double coefficients[] = {{{coefficients}}};
@@ -902,70 +953,11 @@ def _explicit_step_check(
             if (modes.size() >= 64) modes.erase(modes.begin());
             double norm_squared = 0.0;
             for (const auto& value : matrix) norm_squared += std::norm(value);
-            const double norm_bound = std::sqrt(norm_squared);
             modes.push_back({{
-                implicit_epoch, key, n, {{}}, norm_bound, {{}}, false, false
+                implicit_epoch, key, n, std::move(matrix), std::sqrt(norm_squared), {{}},
+                false, false
             }});
             found = modes.end() - 1;
-            if ({_number(half_disk)} > 0.0
-                    && h * norm_bound <= {_number(half_disk)}) {{
-                found->matrix = std::move(matrix);
-                return true;
-            }}
-            found->spectrum = true;
-            std::vector<unsigned char> pattern(matrix.size());
-            std::transform(matrix.begin(), matrix.end(), pattern.begin(),
-                           [](Complex value) {{ return value != Complex{{}}; }});
-            auto structure = std::find_if(
-                explicit_step_patterns.begin(), explicit_step_patterns.end(),
-                [&](const auto& item) {{ return item.nonzero == pattern; }}
-            );
-            if (structure == explicit_step_patterns.end()) {{
-                if (explicit_step_patterns.size() >= 64)
-                    explicit_step_patterns.erase(explicit_step_patterns.begin());
-                explicit_step_patterns.push_back({{std::move(pattern), {{}}, false}});
-                found->converged = explicit_eigenvalues(
-                    std::move(matrix), n, found->eigenvalues
-                );
-                return explicit_mode_step_allowed(*found, h);
-            }}
-            if (!structure->decomposed) {{
-                structure->components = step_check_components(matrix, n);
-                structure->decomposed = true;
-            }}
-            if (structure->components.size() == 1
-                    && structure->components.front().size() == n) {{
-                found->converged = explicit_eigenvalues(
-                    std::move(matrix), n, found->eigenvalues
-                );
-                return explicit_mode_step_allowed(*found, h);
-            }}
-            found->converged = true;
-            for (const auto& component : structure->components) {{
-                std::vector<Complex> block(component.size() * component.size());
-                for (std::size_t row = 0; row < component.size(); ++row)
-                    for (std::size_t column = 0; column < component.size(); ++column)
-                        block[row * component.size() + column]
-                            = matrix[component[row] * n + component[column]];
-                auto cached = std::find_if(
-                    explicit_step_blocks.begin(), explicit_step_blocks.end(),
-                    [&](const auto& item) {{
-                        return item.matrix == block;
-                    }}
-                );
-                if (cached == explicit_step_blocks.end()) {{
-                    if (explicit_step_blocks.size() >= 256)
-                        explicit_step_blocks.erase(explicit_step_blocks.begin());
-                    explicit_step_blocks.push_back({{block, {{}}, false}});
-                    cached = explicit_step_blocks.end() - 1;
-                    cached->converged = explicit_eigenvalues(
-                        std::move(block), component.size(), cached->eigenvalues
-                    );
-                }}
-                found->converged = found->converged && cached->converged;
-                found->eigenvalues.insert(found->eigenvalues.end(),
-                                          cached->eigenvalues.begin(), cached->eigenvalues.end());
-            }}
         }}
         return explicit_mode_step_allowed(*found, h);
     }}

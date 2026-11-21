@@ -1,5 +1,7 @@
 """Core cable models, history, events and bridge-mode integration."""
 
+import math
+
 import numpy as np
 import peslite
 import pytest
@@ -60,6 +62,21 @@ def test_delay_history_interpolates_committed_values_and_restores_checkpoints():
     history.restore(checkpoint)
     assert history.times == [0.0, 0.5]
     assert history.values == [0.0, 1.0]
+
+
+def test_delay_history_uses_only_the_committed_interpolation_bracket():
+    history = DelayHistory(1.0, -1.0)
+    history.accept(0.0, 0.0)
+    history.accept(0.5, 1.0)
+
+    assert history(-0.1) == -1.0
+    assert history(0.0) == 0.0
+    assert history(0.5) == 1.0
+    assert history(0.9) == 1.0
+    assert history.derivative(0.0) == 0.0
+    assert history.derivative(0.5) == pytest.approx(2.0)
+    assert history.derivative(0.6) == 0.0
+    assert history.derivative(math.nan) == 0.0
 
 
 def test_cable_defaults_to_bergeron_and_rejects_unsupported_shunt_loss():
