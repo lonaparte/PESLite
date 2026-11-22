@@ -39,7 +39,6 @@ register_unit_type(
     protection_criteria=frozenset((
         "overcurrent", "rms_current", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof",
     )),
-    defaults_grid_frequency=True,
     controller_factory=VSCController,
     validator=_unit,
     assembler=_assemble_vsc,

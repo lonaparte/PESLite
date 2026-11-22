@@ -115,6 +115,9 @@ class Loop:
     observations: ClassVar[tuple[str, ...]] = ()
     cpp_export: ClassVar[bool] = True
     native_generator: ClassVar[object | None] = None
+    continuous_capable: ClassVar[bool] = False
+    sample_evaluator: ClassVar[Any] = None
+    terminal_diagnostic_fields: ClassVar[tuple[str, str] | None] = None
 
     @classmethod
     def supports_continuous(cls) -> bool:
@@ -124,6 +127,14 @@ class Loop:
         return cls.flow_inputs is not None and (
             cls.flow_path is not Loop.flow_path or cls.equation is not Loop.equation
         )
+
+    def terminal_diagnostics(self, duty: Any) -> tuple[float, bool]:
+        """Return the modulation peak and saturation state at a terminal loop."""
+        fields = self.terminal_diagnostic_fields
+        if fields is not None:
+            return float(getattr(self, fields[0])), bool(getattr(self, fields[1]))
+        values = 2.0 * np.asarray(duty, dtype=float) - 1.0
+        return float(np.max(np.abs(values), initial=0.0)), False
 
     def __init__(self, cfg: Any, unit: Any, startup: Any) -> None:
         self.cfg, self.unit, self.startup = cfg, unit, startup
@@ -174,12 +185,7 @@ class Loop:
 
     def sample_into(self, t: float, inputs: Mapping[str, Any], outputs: dict[str, Any]) -> None:
         """Evaluate one sample into a reusable output mapping."""
-        if type(self).sample is Loop.sample:
-            result = self.equation(*(inputs[port] for port in self.flow_inputs))
-            for name, value in zip(self.outputs, result):
-                outputs[name] = value
-            return
-        outputs.update(self.sample(t, inputs))
+        type(self).sample_evaluator(self, t, inputs, outputs)
 
     def flow(self, t: float, inputs: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         """Return continuous outputs and named state derivatives for ideal averaging."""
@@ -285,6 +291,18 @@ class Loop:
         return {}
 
 
+def _evaluate_equation_sample(loop: Loop, _t: float, inputs: Mapping[str, Any],
+                              outputs: dict[str, Any]) -> None:
+    result = loop.equation(*(inputs[port] for port in loop.flow_inputs))
+    for name, value in zip(loop.outputs, result):
+        outputs[name] = value
+
+
+def _evaluate_mapping_sample(loop: Loop, t: float, inputs: Mapping[str, Any],
+                             outputs: dict[str, Any]) -> None:
+    outputs.update(loop.sample(t, inputs))
+
+
 LOOP_TYPES: dict[str, type] = {}
 
 
@@ -343,6 +361,13 @@ def register_loop_type(cls: type) -> type:
         raise TypeError(f"loop type {name!r}: Params.type must default to {name!r}")
     if cls.role is not None and cls.role not in ROLES:
         raise ValueError(f"loop type {name!r}: role {cls.role!r} is not one of {ROLES}")
+    if cls.sample_into is not Loop.sample_into:
+        cls.sample_evaluator = cls.sample_into
+    elif cls.sample is not Loop.sample:
+        cls.sample_evaluator = _evaluate_mapping_sample
+    else:
+        cls.sample_evaluator = _evaluate_equation_sample
+    cls.continuous_capable = cls.supports_continuous()
     LOOP_TYPES[name] = cls
     return cls
 
@@ -1384,6 +1409,7 @@ class ThreePhaseModulation(Loop):
     type = "three_phase_modulation"
     role = "modulation"
     carried = ("m_peak", "saturated")
+    terminal_diagnostic_fields = ("m_peak", "saturated")
     inputs = {"u_dq": V_DQ, "theta": ANGLE, "u_dc": V}
     outputs = {
         "d_a": DUTY_RATIO,

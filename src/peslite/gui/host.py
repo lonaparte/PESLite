@@ -45,7 +45,7 @@ def _native_preview(text: str, path: Path) -> dict[str, Any]:
             "range": {"start": {"line": line, "column": column},
                       "end": {"line": line, "column": column + 1}},
         })
-    return {"format": "native", "model": None, "fields": [],
+    return {"format": "native", "model": None,
             "diagnostics": diagnostics, "source": text}
 
 
@@ -133,14 +133,6 @@ class Host:
             return {"files": self.files.tree(name)}
         if method == "file.read":
             return self.files.read(name)
-        if method == "file.write":
-            return self.files.write(name, params["text"], params.get("version"))
-        if method == "file.create":
-            return self.files.write(name, params.get("text", ""), None, create=True)
-        if method == "file.rename":
-            return self.files.rename(params["source"], params["destination"], params["version"])
-        if method == "file.delete":
-            return self.files.delete(name, params["version"])
         if method == "csv.read":
             return self.files.csv(name, offset=int(params.get("offset", 0)),
                                   stride=int(params.get("stride", 1)),
@@ -190,16 +182,13 @@ class Host:
         if method == "preview.layout.clear":
             self.preview_cache.clear()
             return {"cleared": True}
-        if method in {"preview", "parameter.patch", "component.add", "component.remove",
-                      "connection.rewire"}:
+        if method == "preview":
             target = self.files.path(name, suffixes={".pes"})
             text = params.get("text")
             if not isinstance(text, str):
                 raise WorkspaceError("preview requires source text")
             from ..assembly.syntax import is_native_source
             if is_native_source(text):
-                if method != "preview":
-                    raise WorkspaceError("new-syntax schematics must be edited in source text")
                 return _native_preview(text, target)
             if params.get("trustAddons") is True and self.files.has_project_addons(name):
                 from ..assembly.addons import register_project
@@ -208,24 +197,7 @@ class Host:
                 if (self.files.root / "PESaddons").is_dir():
                     register_project(self.files.root / "workspace.pes")
                 register_project(target)
-            from .legacy_yaml import (
-                validated_add_component as legacy_yaml_add_component,
-                validated_patch as legacy_yaml_patch,
-                preview as legacy_yaml_preview,
-                validated_remove_component as legacy_yaml_remove_component,
-                validated_rewire as legacy_yaml_rewire,
-            )
-            if method == "parameter.patch":
-                return {"edit": legacy_yaml_patch(text, target, params["key"], params["value"])}
-            if method == "component.add":
-                return {"edit": legacy_yaml_add_component(
-                    text, target, params["section"], params["name"], params["definition"])}
-            if method == "component.remove":
-                return {"edit": legacy_yaml_remove_component(
-                    text, target, params["section"], params["name"])}
-            if method == "connection.rewire":
-                return {"edit": legacy_yaml_rewire(
-                    text, target, params["key"], params["target"])}
+            from .legacy_yaml import preview as legacy_yaml_preview
             return legacy_yaml_preview(text, target)
         if method == "run.start":
             return self.runs.start(name, trust_addons=params.get("trustAddons") is True)

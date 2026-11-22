@@ -1117,10 +1117,11 @@ class _AlgebraicLoop:
         r0 = y0 - x0
         scale = max(1.0, abs(x0), abs(y0))
         inverse = self._inverse
-        if abs(r0) <= atol + rtol * scale and inverse is not None:
-            corrected = x0 - inverse * r0
-            if cmath.isfinite(corrected) and abs(corrected - x0) <= limit * scale:
-                sweep(t, corrected)
+        if abs(r0) <= atol + rtol * scale:
+            if inverse is not None:
+                corrected = x0 - inverse * r0
+                if cmath.isfinite(corrected) and abs(corrected - x0) <= limit * scale:
+                    sweep(t, corrected)
             return
         x1 = x0 - inverse * r0 if inverse is not None else y0
         if not cmath.isfinite(x1) or abs(x1 - x0) > limit * scale:

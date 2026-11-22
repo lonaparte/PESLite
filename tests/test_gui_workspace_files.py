@@ -16,41 +16,6 @@ sys.modules[spec.name] = workspace
 spec.loader.exec_module(workspace)
 
 
-def test_yaml_patch_keeps_comments_and_flow_mapping():
-    original = ('# project title\nbase: {s_base: 2.0e6, f0: 50} # same\n'
-                'simulation:\n  t_end: 1.0 # preserve\n  solver: {dt: 25e-6}\n')
-    edit = workspace.patch_scalar(original, "simulation.solver.dt", 0.00005)
-    changed = workspace.patched_text(original, edit)
-    assert changed == original.replace("25e-6", "5e-05")
-    assert "# preserve" in changed and changed.startswith("# project title")
-    assert edit["line"] == 5
-
-
-def test_rejects_ambiguous_or_destructive_source_changes():
-    with pytest.raises(workspace.WorkspaceError, match="duplicated"):
-        workspace.patch_scalar("base: {s_base: 1, s_base: 2}\n", "base.s_base", 3)
-    with pytest.raises(workspace.WorkspaceError, match="aliased"):
-        workspace.patch_scalar("base: {s_base: &amount 1}\nsimulation: {t_end: *amount}\n", "base.s_base", 2)
-    with pytest.raises(workspace.WorkspaceError, match="only explicit"):
-        workspace.patch_scalar("simulation:\n  solver:\n    dt: {value: 1}\n", "simulation.solver.dt", 4)
-
-
-def test_versioned_atomic_writes_and_conflicts(tmp_path):
-    backend = workspace.Workspace(tmp_path)
-    created = backend.write("case.pes", "base: {s_base: 10}\n", None, create=True)
-    version = created["version"]
-    assert backend.read("case.pes")["version"] == version
-    changed = backend.write("case.pes", "base: {s_base: 20}\n", version)
-    with pytest.raises(workspace.FileConflict):
-        backend.write("case.pes", "base: {s_base: 30}\n", version)
-    assert backend.read("case.pes")["text"] == "base: {s_base: 20}\n"
-    backend.rename("case.pes", "renamed.pes", changed["version"])
-    with pytest.raises(workspace.FileConflict):
-        backend.delete("renamed.pes", version)
-    backend.delete("renamed.pes", backend.read("renamed.pes")["version"])
-    assert not (tmp_path / "renamed.pes").exists()
-
-
 def test_traversal_symlinks_hidden_and_disallowed_suffix(tmp_path):
     backend = workspace.Workspace(tmp_path)
     (tmp_path / "case.pes").write_text("simulation: {}")
@@ -76,14 +41,6 @@ def test_bounded_csv_windows_and_summary(tmp_path):
     assert backend.summary("summary.json") == {
         "summary": {"ok": True}, "simulationFile": "simulation.pes",
     }
-
-
-def test_source_positions_include_flow_values_and_survive_unicode():
-    text = 'meta: {title: "⚡ power"}\n# untouched\nsimulation: {t_end: 0.05}\n'
-    edit = workspace.patch_scalar(text, 'simulation.t_end', 0.1)
-    result = workspace.patched_text(text, edit)
-    assert result == text.replace('t_end: 0.05', 't_end: 0.1')
-    assert edit['line'] == 3
 
 
 def test_csv_window_on_file_growth(tmp_path):
@@ -119,7 +76,7 @@ def test_native_preview_detection_does_not_depend_on_section_order(tmp_path):
     (tmp_path / 'model.pes').write_text(text)
     response = Host(tmp_path).dispatch('preview', {'path': 'model.pes', 'text': text})
     assert response == {
-        'format': 'native', 'model': None, 'fields': [], 'diagnostics': [], 'source': text,
+        'format': 'native', 'model': None, 'diagnostics': [], 'source': text,
     }
 
 
@@ -150,51 +107,6 @@ def test_debug_plan_is_a_workspace_file_and_previews_its_model(tmp_path):
         "disconnect", "connect",
     ]
     assert result["watch"] == ["vsc.effective.re", "vsc.effective.im", "vsc.effective.abs"]
-
-
-def test_component_insertion_is_a_single_source_range_edit():
-    text = ('# keep the model header\nbase: {s_base: 2e6}\n'
-            'buses:\n  pcc:\n    c_pu: 0.02 # preserve\n'
-            'simulation:\n  t_end: 1\n')
-    patch = workspace.add_component(text, 'buses', 'aux', '{phases: 3, c_pu: 0.05}')
-    assert patch['start'] == patch['end']
-    modified = workspace.patched_text(text, patch)
-    assert modified.startswith('# keep the model header\nbase: {s_base: 2e6}\n')
-    assert 'c_pu: 0.02 # preserve\n  aux:' in modified
-    assert '  simulation:' not in modified
-    assert modified.endswith('simulation:\n  t_end: 1\n')
-    import yaml
-    parsed = yaml.safe_load(modified)
-    assert parsed['buses']['aux'] == {'phases': 3, 'c_pu': 0.05}
-
-
-def test_component_insertion_creates_missing_section_in_file_order():
-    source = 'base:\n  s_base: 2e6\nsimulation:\n  t_end: 1.0\n'
-    patch = workspace.add_component(source, 'buses', 'pcc', '{phases: 3, c_pu: 0.02}')
-    result = workspace.patched_text(source, patch)
-    assert result.index('buses:') < result.index('simulation:')
-    import yaml
-    assert yaml.safe_load(result)['buses']['pcc']['phases'] == 3
-
-
-def test_component_edit_refuses_ambiguous_and_destructive_changes():
-    with pytest.raises(workspace.WorkspaceError, match='flow-style'):
-        workspace.add_component('buses: {pcc: {phases: 3}}\n', 'buses', 'bus2', '{}')
-    with pytest.raises(workspace.WorkspaceError, match='already exists'):
-        workspace.add_component('buses:\n  pcc: {phases: 3}\n', 'buses', 'pcc', '{}')
-    with pytest.raises(workspace.WorkspaceError, match='definition must'):
-        workspace.add_component('buses:\n  pcc: {}\n', 'buses', 'other', '[1, 2]')
-    with pytest.raises(workspace.WorkspaceError, match='comment'):
-        workspace.remove_component('buses:\n  a: {phases: 3} # keep\n  b: {}\n', 'buses', 'a')
-    with pytest.raises(workspace.WorkspaceError, match='last entry'):
-        workspace.remove_component('buses:\n  pcc: {}\n', 'buses', 'pcc')
-
-
-def test_removal_of_unreferenced_simple_component_is_minimal():
-    text = 'buses:\n  a: {phases: 3}\n  b: {phases: 3}\nsimulation: {t_end: 1}\n'
-    change = workspace.remove_component(text, 'buses', 'a')
-    assert workspace.patched_text(text, change) == (
-        'buses:\n  b: {phases: 3}\nsimulation: {t_end: 1}\n')
 
 
 def test_csv_byte_cursor_tails_without_rescanning_and_skips_partial_rows(tmp_path):

@@ -12,7 +12,7 @@ from peslite.gui.web_service import LocalServer
 pytestmark = pytest.mark.ui
 
 
-def test_local_http_requires_origin_token_and_version(tmp_path):
+def test_local_http_requires_origin_token_and_keeps_workspace_read_only(tmp_path):
     assets = tmp_path / 'assets'
     assets.mkdir()
     (assets / 'index.html').write_text('<meta content="__PESLITE_TOKEN__">')
@@ -36,19 +36,13 @@ def test_local_http_requires_origin_token_and_version(tmp_path):
             reply = connection.getresponse()
             return reply.status, json.loads(reply.read())
 
-        create = {'method': 'file.create', 'params': {'path': 'model.pes',
-                                                   'text': 'base: {s_base: 5}\n'}}
-        assert send(create, token='bad')[0] == 403
-        assert send(create, origin='https://example.com')[0] == 403
-        status, created = send(create)
-        assert status == 200 and created['ok']
-        version = created['result']['version']
-        status, _ = send({'method': 'file.write', 'params': {
-            'path': 'model.pes', 'text': 'base: {s_base: 6}\n', 'version': version}})
-        assert status == 200
-        status, _ = send({'method': 'file.write', 'params': {
-            'path': 'model.pes', 'text': 'base: {s_base: 7}\n', 'version': version}})
-        assert status == 409
+        write = {'method': 'file.write', 'params': {'path': 'model.pes', 'text': 'changed'}}
+        assert send(write, token='bad')[0] == 403
+        assert send(write, origin='https://example.com')[0] == 403
+        (tmp_path / 'model.pes').write_text('@circuit\nA -- B\n')
+        status, rejected = send(write)
+        assert status == 400 and not rejected['ok']
+        assert (tmp_path / 'model.pes').read_text() == '@circuit\nA -- B\n'
         status, _ = send({'method': 'file.read', 'params': {'path': '../wrong.pes'}})
         assert status == 400
         connection.close()
@@ -72,7 +66,7 @@ def test_run_reports_process_start_failure_without_executing_a_model(tmp_path):
     assert host.dispatch('run.status', {})['running'] is False
 
 
-def test_web_host_exposes_bounded_csv_byte_cursor_and_rejects_bad_rewire(tmp_path):
+def test_web_host_exposes_bounded_csv_byte_cursor(tmp_path):
     from peslite.gui.host import Host
 
     csv_path = tmp_path / 'energy.csv'
@@ -84,3 +78,16 @@ def test_web_host_exposes_bounded_csv_byte_cursor_and_rejects_bad_rewire(tmp_pat
     tail = host.dispatch('csv.read', {'path': 'energy.csv',
                   'offset': first['nextOffset'], 'byteOffset': first['nextByteOffset']})
     assert tail['rows'] == [[2, 12]]
+
+
+@pytest.mark.parametrize("method", [
+    "file.write", "file.create", "file.rename", "file.delete", "editor.applyPatch",
+    "parameter.patch", "component.add", "component.remove", "connection.rewire",
+])
+def test_gui_host_has_no_source_mutation_operation(tmp_path, method):
+    from peslite.gui.host import Host
+    from peslite.gui.workspace import WorkspaceError
+
+    host = Host(tmp_path)
+    with pytest.raises(WorkspaceError, match="unknown GUI operation"):
+        host.dispatch(method, {})

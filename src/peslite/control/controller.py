@@ -25,7 +25,7 @@ from ..defaults import (DEFAULT_ALGEBRAIC_ATOL, DEFAULT_ALGEBRAIC_MAX_ITERATIONS
 from ..solver.model import (Bag, ConfigError, _compile_straight_line, _complex,
                             _component_plan, _dependency_plan, _real, gather, scatter)
 from ..solver.energy import Port
-from .blocks import OutputLimit, abc2complex, peak_abs, phases, smoothstep
+from .blocks import OutputLimit, abc2complex, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,
                     SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ,
                     Loop, SignalType, SyncLaw, loop_type)
@@ -435,7 +435,7 @@ def continuous_control(unit: Any) -> bool:
         if "tracking" in overlay.policies.values():
             return False
     active = _active_loop_names(classes, connections, sources)
-    return all(classes[name].supports_continuous() for name in active)
+    return all(classes[name].continuous_capable for name in active)
 
 
 class ControlGraph:
@@ -733,7 +733,7 @@ class ControlGraph:
 
     def _sample_method(self, name, node):
         if name not in self._tracking:
-            return node.sample_into
+            return type(node).sample_evaluator.__get__(node, type(node))
 
         def tracking_sample(t, inputs, outputs):
             tracked = node.track(inputs)
@@ -1404,7 +1404,7 @@ class _GraphRuntime:
         names = []
         for name in self.graph.order:
             node = self.graph.nodes[name]
-            if not type(node).supports_continuous():
+            if not type(node).continuous_capable:
                 raise ConfigError(f"ctrl.loops.{name}: loop type {node.type!r} "
                                   "has no continuous-time implementation")
             for local, value in node.flow_state().items():
@@ -1796,13 +1796,11 @@ class VSCController(_GraphRuntime):
         )
         duty = np.asarray([graph.values[source] for source in self._duty_sources], dtype=float)
         terminal = self._terminal_node
-        m_max = (float(terminal.m_peak) if hasattr(terminal, "m_peak")
-                 else peak_abs(2.0 * duty - 1.0))
+        m_max, terminal_saturated = terminal.terminal_diagnostics(duty)
         if self.stage is not None:
             if self._terminal in graph.updated and gates:
                 self.stage.n_updates += 1
-                saturated = bool(getattr(terminal, "saturated", False))
-                saturated = saturated or (
+                saturated = terminal_saturated or (
                     self._terminal_limit is not None and self._terminal_limit.saturated
                 )
                 if saturated:

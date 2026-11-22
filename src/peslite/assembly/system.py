@@ -764,7 +764,11 @@ class System:
                     p.unit(name), change.touches(f"units.{name}."), change.t)
             elif section == "elements":
                 result = self.named_elements[name].retune(p.elements[name])
-                network_changed |= True if result is None else bool(result)
+                if not isinstance(result, bool):
+                    raise TypeError(
+                        f"element {name!r} retune() must return whether the network changed"
+                    )
+                network_changed |= result
         if network_changed:
             for circuit in self.circuits:
                 circuit.build()

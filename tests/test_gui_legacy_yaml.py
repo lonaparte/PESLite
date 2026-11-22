@@ -8,14 +8,7 @@ import yaml
 from conftest import EXAMPLES
 from peslite.assembly.syntax import parse_native_text
 from peslite.addons.functions.legacy_yaml import read_simulation
-from peslite.gui.legacy_yaml import (
-    preview as legacy_yaml_preview,
-    validated_add_component as legacy_yaml_add_component,
-    validated_patch as legacy_yaml_patch,
-    validated_remove_component as legacy_yaml_remove_component,
-    validated_rewire as legacy_yaml_rewire,
-)
-from peslite.gui.workspace import patched_text, WorkspaceError
+from peslite.gui.legacy_yaml import preview as legacy_yaml_preview
 
 
 pytestmark = pytest.mark.ui
@@ -37,7 +30,6 @@ def test_legacy_samples_normalize_without_rewriting(case):
     assert model['defaultView'] == 'circuit'
     assert model['views'][0]['nodes']
     assert model['views'][0]['edges']
-    assert any(field['path'] == 'simulation.t_end' for field in response['fields'])
     assert _legacy_source(path) == text
 
 
@@ -54,78 +46,15 @@ def test_legacy_controller_scoping_and_event_boundaries():
     assert response['model']['timeline'][0]['disconnected']
 
 
-def test_legacy_validated_range_edit_preserves_original_syntax_and_comments():
-    path = EXAMPLES / 'buck-example.pes'
-    text = _legacy_source(path)
-    edit = legacy_yaml_patch(text, path, 'simulation.t_end', 0.05)
-    changed = patched_text(text, edit)
-    assert text != changed
-    assert changed.splitlines()[0] == text.splitlines()[0]
-    assert 't_end: 0.05' in changed
-    assert legacy_yaml_preview(changed, path)['diagnostics'] == []
-    assert _legacy_source(path) == text
-
-
-def test_invalid_yaml_is_diagnostic_and_rejected_without_writes():
+def test_invalid_yaml_is_a_diagnostic():
     path = Path('model.pes')
     text = 'base:\n  s_base: [\n'
     result = legacy_yaml_preview(text, path)
     assert result['model'] is None
     assert result['diagnostics'][0]['severity'] == 'error'
     assert result['diagnostics'][0]['range']['start']['line'] == 3
-    with pytest.raises(WorkspaceError):
-        legacy_yaml_patch(text, path, 'base.s_base', 1)
 
 
-def test_legacy_reader_and_gui_editor_keep_separate_module_boundaries():
+def test_legacy_reader_and_gui_preview_keep_separate_module_boundaries():
     assert read_simulation.__module__ == "peslite.addons.functions.legacy_yaml"
     assert legacy_yaml_preview.__module__ == "peslite.gui.legacy_yaml"
-
-
-def test_additional_component_preserves_text_and_validates_model():
-    path = EXAMPLES / 'buck-example.pes'
-    original = _legacy_source(path)
-    added = legacy_yaml_add_component(
-        original, path, 'elements', 'test_resistor',
-        '{type: resistor, bus: output, r: 12.0}',
-    )
-    expanded = patched_text(original, added)
-    assert expanded != original
-    assert expanded.startswith(original[:original.index('elements:')])
-    assert expanded.splitlines()[0] == original.splitlines()[0]
-    assert '  test_resistor:' in expanded
-    assert legacy_yaml_preview(expanded, path)['diagnostics'] == []
-    removed = legacy_yaml_remove_component(expanded, path, 'elements', 'test_resistor')
-    restored = patched_text(expanded, removed)
-    assert legacy_yaml_preview(restored, path)['diagnostics'] == []
-    assert restored == original
-    assert _legacy_source(path) == original
-
-
-def test_connection_rewire_checks_existing_buses_and_preserves_source():
-    path = EXAMPLES / 'two-converters-example.pes'
-    original = _legacy_source(path)
-    with pytest.raises(WorkspaceError, match='unknown destination'):
-        legacy_yaml_rewire(original, path, 'sources.grid.bus', 'not_a_bus')
-    edit = legacy_yaml_rewire(original, path, 'sources.grid.bus', 'pcc')
-    updated = patched_text(original, edit)
-    assert legacy_yaml_preview(updated, path)['diagnostics'] == []
-    assert 'bus: "pcc"' in updated
-    assert _legacy_source(path) == original
-    with pytest.raises(WorkspaceError, match='only component terminals'):
-        legacy_yaml_rewire(original, path, 'simulation.t_end', 'pcc')
-
-
-def test_removing_a_connected_bus_is_rejected():
-    path = EXAMPLES / 'two-converters-example.pes'
-    native = path.read_text(encoding='utf-8')
-    original = _legacy_source(path)
-    with pytest.raises(WorkspaceError):
-        legacy_yaml_remove_component(original, path, 'buses', 'pcc')
-    assert path.read_text(encoding='utf-8') == native
-
-
-def test_gui_edits_are_public_gui_functions():
-    for function in (legacy_yaml_add_component, legacy_yaml_remove_component, legacy_yaml_rewire):
-        assert callable(function)
-        assert function.__module__ == "peslite.gui.legacy_yaml"

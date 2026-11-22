@@ -17,16 +17,20 @@ PARAMETER_DOMAINS = (
     "events", "simulation", "meta",
 )
 
-_NAME = r"[A-Za-z_][A-Za-z0-9_-]*"
-_PATH = r"[A-Za-z_][A-Za-z0-9_.-]*"
-_VIEW_HEADER = re.compile(rf"^@({_NAME})(?:\s+#.*)?\s*$")
+NAME_PATTERN = r"[A-Za-z_][A-Za-z0-9_-]*"
+PATH_PATTERN = r"[A-Za-z_][A-Za-z0-9_.-]*"
+_VIEW_HEADER = re.compile(rf"^@({NAME_PATTERN})(?:\s+#.*)?\s*$")
 _VIEW_DEFINITION = re.compile(
-    rf"^{_NAME}\s*:\s*{_PATH}(?:\s*,\s*{_PATH})?\s*$"
+    rf"^{NAME_PATTERN}\s*:\s*{PATH_PATTERN}(?:\s*,\s*{PATH_PATTERN})?\s*$"
 )
-_REFERENCE = rf"{_NAME}(?:\.{_NAME})?"
-_GROUP = re.compile(rf"^&{_NAME}\s*:\s*&?{_REFERENCE}(?:\s*,\s*&?{_REFERENCE})*\s*$")
+_REFERENCE = rf"{NAME_PATTERN}(?:\.{NAME_PATTERN})?"
+_GROUP = re.compile(
+    rf"^&{NAME_PATTERN}\s*:\s*&?{_REFERENCE}(?:\s*,\s*&?{_REFERENCE})*\s*$"
+)
 _CONNECTION = re.compile(rf"^{_REFERENCE}(?:\s*(?:--|->)\s*{_REFERENCE})+\s*$")
-_KEY = re.compile(rf"^({_NAME}|'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\")\s*:\s*(.*)$")
+_KEY = re.compile(
+    rf"^({NAME_PATTERN}|'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\")\s*:\s*(.*)$"
+)
 _READERS: list[Callable[[str, Path], Mapping[str, Any] | None]] = []
 
 
@@ -192,7 +196,7 @@ def _validate_view(name: str, body: list[tuple[int, str]], path: str | Path) -> 
         if _VIEW_DEFINITION.fullmatch(expression):
             declaration_indent = level
             continue
-        if re.fullmatch(rf"{_NAME}\s*:\s*", expression):
+        if re.fullmatch(rf"{NAME_PATTERN}\s*:\s*", expression):
             raise SimulationFileError(
                 f"{expression.split(':', 1)[0]}: requires a displayed type",
                 path=path, line=number,

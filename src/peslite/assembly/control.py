@@ -126,6 +126,8 @@ class ControlTypeSpec:
     validator: Callable[[Any, str], None] | None = None
     modulator: str | None = None
     default_loops: Mapping[str, str] = field(default_factory=dict)
+    grid_frequency_reference: str | None = None
+    dc_voltage_reference: str | None = None
 
 
 def validate_scalar_voltage_references(references: Any, where: str) -> None:
@@ -375,6 +377,7 @@ for _control_name in ("gfl", "gfm"):
         grid_following=_control_name == "gfl", default_bridge="three_phase_bridge",
         controller_factory=VSCController,
         default_loops={"modulation": "ThreePhaseModulation"},
+        grid_frequency_reference="omega", dc_voltage_reference="vdc_ref_pu",
     )
 register_control_type(
     "dc", references=ScalarVoltageReferenceParams,

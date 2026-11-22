@@ -18,10 +18,7 @@ from typing import Any
 import yaml
 from yaml.nodes import MappingNode, ScalarNode
 
-from .workspace import (
-    WorkspaceError, add_component, explicit_parameters, patch_scalar, patched_text,
-    remove_component,
-)
+from .workspace import WorkspaceError
 
 
 def _point(line: int, column: int = 1) -> dict[str, int]:
@@ -169,7 +166,7 @@ def _event_data(config: Mapping, locations: Mapping[str, dict], params: Any,
 
 
 def preview(text: str, path: str | Path) -> dict[str, Any]:
-    """Return a normalized PESModel and editable field locations for a buffer.
+    """Return a normalized PESModel for a legacy buffer.
 
     YAML errors or PESLite validation failures become diagnostics and never
     mutate source text. Host adapters can keep showing the last valid graph.
@@ -268,8 +265,7 @@ def preview(text: str, path: str | Path) -> dict[str, Any]:
                                        topology.components, topology.connections)
         model = {"views": views, "globals": globals_, "events": events,
                  "timeline": timeline, "diagnostics": [], "defaultView": "circuit"}
-        return {"format": "legacy", "model": model,
-                "fields": explicit_parameters(text), "diagnostics": []}
+        return {"format": "legacy", "model": model, "diagnostics": []}
     except (yaml.YAMLError, ValueError, TypeError, KeyError, AttributeError, OSError) as exc:
         mark = getattr(exc, "problem_mark", None)
         line, column = (mark.line + 1, mark.column + 1) if mark else (1, 1)
@@ -283,54 +279,5 @@ def preview(text: str, path: str | Path) -> dict[str, Any]:
                     line, column = loc["start"]["line"], loc["start"]["column"]
             except (yaml.YAMLError, WorkspaceError):
                 pass
-        return {"format": "legacy", "model": None, "fields": [],
+        return {"format": "legacy", "model": None,
                 "diagnostics": [_diagnostic(message, line, column)]}
-
-
-def _validated_edit(text: str, path: str | Path, edit: dict[str, Any]) -> dict[str, Any]:
-    """Reject changes invalid under PESLite's existing schema or addon registry."""
-    checked = preview(patched_text(text, edit), path)
-    if checked["diagnostics"]:
-        raise WorkspaceError("invalid graphical edit: " + "; ".join(
-            diagnostic["message"] for diagnostic in checked["diagnostics"]))
-    return edit
-
-
-def validated_patch(text: str, path: str | Path, key: str, value: Any) -> dict[str, Any]:
-    """Edit an existing scalar; preserve unrelated comments, layout, and YAML."""
-    return _validated_edit(text, path, patch_scalar(text, key, value))
-
-
-def validated_add_component(text: str, path: str | Path, section: str,
-                            name: str, definition: str) -> dict[str, Any]:
-    """Add an explicitly configured component at one source insertion point."""
-    return _validated_edit(text, path, add_component(text, section, name, definition))
-
-
-def validated_remove_component(text: str, path: str | Path, section: str,
-                               name: str) -> dict[str, Any]:
-    """Remove only unreferenced and comment-free component declarations."""
-    return _validated_edit(text, path, remove_component(text, section, name))
-
-
-def validated_rewire(text: str, path: str | Path, key: str,
-                     target: str) -> dict[str, Any]:
-    """Change an explicitly present network terminal to an existing bus.
-
-    No new topology syntax is invented: PESLite's own validator rejects
-    incompatible electrical phases and nonexisting connections.
-    """
-    if not isinstance(target, str) or not target:
-        raise WorkspaceError("a destination bus is required")
-    from ..assembly.syntax import parse_parameter_mapping
-    config = parse_parameter_mapping(text)
-    if target not in (config.get("buses") or {}):
-        raise WorkspaceError(f"unknown destination bus: {target}")
-    parts = key.split(".")
-    if len(parts) < 3 or parts[0] not in {"sources", "units", "elements", "branches"}:
-        raise WorkspaceError("only component terminals may be reconnected")
-    terminal = parts[-1]
-    if terminal not in ({"bus1", "bus2"} if parts[0] == "branches"
-                        else {"bus", "bus1", "bus2"}):
-        raise WorkspaceError("only explicit bus, bus1 and bus2 terminals may be reconnected")
-    return validated_patch(text, path, key, target)

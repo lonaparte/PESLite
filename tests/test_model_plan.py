@@ -235,6 +235,17 @@ def test_model_only_analyzes_residual_and_solves_distinct_loops_in_order(monkeyp
     assert downstream.output.x == pytest.approx(4.0)
 
 
+def test_converged_scalar_feedback_needs_one_evaluation_without_a_warm_start():
+    block = _Feedthrough(offset=0.0, gain=0.5)
+    model = Model({"block": block}, {(block, "feedback"): (block, "x")})
+    loop, = model.algebraic_loops
+    block.calls = 0
+
+    loop._scalar(0.0)
+
+    assert block.calls == 1
+
+
 def test_state_feedback_is_not_direct_feedthrough():
     class Integrator(_Feedthrough):
         state_names = ("x",)

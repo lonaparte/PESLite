@@ -28,7 +28,7 @@ from ..control.controller import (Controller, ConverterMeasurement,
                                   Measurement, continuous_control)
 from ..solver.timing import TIME_EPS, PeriodicClock, resolve_clock_offset
 from .events import Scenario
-from .control import make_control_modulator, make_controller
+from .control import control_profile, make_control_modulator, make_controller
 from .params import SimulationParams, UnitParams, _parameterized, unit_type
 from .protection import Protection, ProtectionSample
 
@@ -105,9 +105,18 @@ class Unit(ABC):
             self._bus_voltage_field = bus.voltage_field
             self._bus_voltage = lambda: getattr(bus.output, bus.voltage_field)
         self._current_channel = unit_type(cfg.type).current_channel
+        self._bind_control_semantics()
         self.scenario = Scenario(cfg.events, f"units.{name}", initial=cfg.connected)
         self.dclink = _parameterized(lambda c: make_dclink(c.dclink), cfg)
         self.zoh = f"{name}.q"  # model label of the bridge's held switching state
+
+    def _bind_control_semantics(self) -> None:
+        """Resolve profile-defined reference meanings once per parameter configuration."""
+        profile = None if self.cfg.ctrl is None else control_profile(self.cfg.ctrl)
+        name = None if profile is None else profile.dc_voltage_reference
+        self._dc_voltage_reference_pu = (
+            1.0 if name is None else float(getattr(self.cfg.ctrl.references, name))
+        )
 
     @property
     def dc_bus(self) -> str:
@@ -322,6 +331,7 @@ class Unit(ABC):
         if any(path.startswith("protection.") for path in paths):
             self.protection.retune(cfg.protection)
         self.cfg = cfg
+        self._bind_control_semantics()
         if any(path.startswith("dclink.source.") for path in paths):
             source = cfg.dclink.source
             network_changed = self.dclink.retune_source(
@@ -828,8 +838,7 @@ class VSC(Unit):
             ),
             dc_voltage_error_pu=(
                 measurement.u_dc / self.cfg.dc_base.v
-                # Standalone controllers without a DC reference use the rated DC voltage.
-                - getattr(self.cfg.ctrl.references, "vdc_ref_pu", 1.0)
+                - self._dc_voltage_reference_pu
             ),
             startup_complete=self._startup_complete(output),
         )

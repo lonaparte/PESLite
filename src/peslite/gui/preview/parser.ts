@@ -2,9 +2,8 @@ import type {
   Diagnostic, EventSegment, GraphEdge, GraphEvent, GraphGroup, GraphNode, GraphView,
   ParameterBlock, PESModel, SourceLocation, SourceRange,
 } from './types.js';
+import { NAME, PARAMETER_DOMAINS, PATH } from './grammar.js';
 
-const NAME = '[A-Za-z_][A-Za-z0-9_-]*';
-const PATH = '[A-Za-z_][A-Za-z0-9_.-]*';
 const REFERENCE = new RegExp(`^(${NAME})(?:\\.(${NAME}))?$`);
 const VIEW_HEADER = new RegExp(`^@(${NAME})\\s*$`);
 const DEFINITION = new RegExp(`^(${NAME})\\s*:\\s*(${PATH}(?:\\s*,\\s*${PATH})?)\\s*$`);
@@ -14,8 +13,6 @@ const FIELD = new RegExp(`^(${PATH})\\s*:\\s*(.*)$`);
 const NESTED = new RegExp(`^(${NAME})\\s*:\\s*(${PATH})\\s*$`);
 const GROUP = new RegExp(`^&(${NAME})\\s*:\\s*(.*)$`);
 const MEMBER = new RegExp(`^&?${NAME}$`);
-const PARAMETER_DOMAINS = new Set(['base', 'buses', 'branches', 'sources', 'units', 'elements',
-  'signals', 'events', 'simulation', 'meta']);
 
 type Value = null | string | number | boolean | Value[] | { [key: string]: Value };
 type Mapping = { [key: string]: Value };

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -21,6 +22,20 @@ from peslite.solver.netlist import (Capacitor, CurrentSource, Diode, Inductor, N
 
 FORMS = ("statewise", "nodal")
 CIRCUIT_MODELS = ("statewise", "nodal")
+
+
+def test_source_rate_uses_one_shared_central_difference_interval():
+    evaluated = []
+
+    def value(t):
+        evaluated.append(t)
+        return t * t
+
+    source = SimpleNamespace(derivative=None, value=value)
+    actual = Netlist.source_rate(source, 2.0)
+
+    assert len(evaluated) == 2
+    assert actual == pytest.approx(4.0)
 
 
 def test_symbolic_solve_uses_a_free_reference_only_for_a_proven_gauge():

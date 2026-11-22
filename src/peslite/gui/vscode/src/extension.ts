@@ -6,7 +6,6 @@ import * as crypto from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 interface Message { id: number; method: string; params: Record<string, any> }
-interface FileEdit { start: number; end: number; replacement: string; line: number; column: number }
 const safeSuffix = /\.(pes|yaml|yml|csv|json)$/i;
 
 function python() {
@@ -159,21 +158,6 @@ async function openPreview(context: vscode.ExtensionContext, uri?: vscode.Uri) {
         editor.selection = new vscode.Selection(location, location);
         editor.revealRange(new vscode.Range(location, location));
         result = { revealed: true };
-      } else if (method === 'editor.applyPatch') {
-        const document = await vscode.workspace.openTextDocument(resource(folder, params.path));
-        if (document.getText() !== params.oldText) throw new Error('The document changed; retry the edit');
-        const edit = params.edit as FileEdit;
-        if (!(Number.isInteger(edit.start) && Number.isInteger(edit.end) && edit.start >= 0 &&
-              edit.end <= document.getText().length && edit.start <= edit.end)) {
-          throw new Error('Invalid source range');
-        }
-        const change = new vscode.WorkspaceEdit();
-        const toUtf16 = (index: number) => Array.from(document.getText()).slice(0, index).join('').length;
-        change.replace(document.uri,
-          new vscode.Range(document.positionAt(toUtf16(edit.start)), document.positionAt(toUtf16(edit.end))),
-          edit.replacement);
-        if (!await vscode.workspace.applyEdit(change)) throw new Error('Could not apply the edit');
-        result = { applied: true };
       } else if (method === 'preview.layout.load') {
         result = { layout: layouts.get(layoutKey) ?? { format: 'peslite.preview-layout', version: 1, views: {} } };
       } else if (method === 'preview.layout.save') {
@@ -182,10 +166,7 @@ async function openPreview(context: vscode.ExtensionContext, uri?: vscode.Uri) {
       } else if (method === 'preview.layout.clear') {
         layouts.delete(layoutKey);
         result = { cleared: true };
-      } else if (method === 'preview' || method === 'parameter.patch' ||
-                 method === 'component.add' || method === 'component.remove' ||
-                 method === 'connection.rewire' || method === 'csv.read' ||
-                 method === 'summary.read') {
+      } else if (method === 'preview' || method === 'csv.read' || method === 'summary.read') {
         if (params.trustAddons === true && !vscode.workspace.isTrusted) {
           throw new Error('Trust the VS Code workspace before loading project-local addons');
         }

@@ -1,8 +1,8 @@
 # Graphical Interface
 
-The PESLite graphical user interface is a source-first workbench for browsing, editing and
-previewing simulation files. The `.pes` file remains the authoritative model: the interface reads
-the current text buffer, and visual operations never create a separate simulation definition.
+The PESLite graphical user interface browses, previews and runs simulation files. The `.pes` file
+remains the authoritative model: the interface reads the source, and visual operations never write
+model changes back to it.
 
 ## Install and open
 
@@ -34,10 +34,9 @@ does not contain Python or a numerical runtime.
 
 ## Workbench
 
-The workbench combines a workspace explorer, text editor and graphical preview. Selecting a file
-loads its source and preview together; editor changes are rendered immediately, and saving writes
-only the edited source. `Ctrl+B` toggles the explorer and `Ctrl+S` saves the active file. The panes
-can be resized independently.
+The workbench combines a workspace explorer, graphical preview, simulation controls and result
+views. Selecting a file loads its source-derived preview. Source changes are made with a text
+editor and appear after the file or preview is refreshed.
 
 The preview provides:
 
@@ -48,7 +47,7 @@ The preview provides:
 - an event timeline that shows connect and disconnect states at the selected time.
 
 A `.pesdbg` file opens the referenced model with its added and removed control connections overlaid;
-editing and running it use the same source and report format as [`peslite debug`](Debugging.md).
+running it uses the same source and report format as [`peslite debug`](Debugging.md).
 
 Simulation-file and view notation is defined in
 [Simulation Files](Simulation-Files.md#interface-views).

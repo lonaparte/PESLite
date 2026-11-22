@@ -63,7 +63,6 @@ class UnitTypeSpec:
     measurement_channels: frozenset[str] = frozenset()
     current_channel: str | None = None
     protection_criteria: frozenset[str] = frozenset()
-    defaults_grid_frequency: bool = False
     controller_factory: Callable[..., Any] | None = None
     validator: Callable[..., None]
     assembler: Callable[..., Any]
@@ -734,11 +733,14 @@ class UnitParams:
                     ),
                 )
                 derived.add("ctrl.offset")
-            if (unit_type(self.type).defaults_grid_frequency
-                    and hasattr(ctrl.references, "omega") and ctrl.references.omega is None):
-                references = replace(ctrl.references, omega=system_base.w0)
+            frequency_reference = control_profile(ctrl).grid_frequency_reference
+            if (frequency_reference is not None
+                    and getattr(ctrl.references, frequency_reference) is None):
+                references = replace(
+                    ctrl.references, **{frequency_reference: system_base.w0},
+                )
                 ctrl = replace(ctrl, references=references)
-                derived.add("ctrl.references.omega")
+                derived.add(f"ctrl.references.{frequency_reference}")
             loops = dict(ctrl.loops)
             if loops and not continuous:
                 roles = {LOOP_TYPES[loop.type].role for loop in loops.values()}

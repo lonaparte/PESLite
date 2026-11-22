@@ -8140,10 +8140,10 @@ class _UnitGenerator(_ACControlGenerator):
         node = self.graph.nodes[terminal]
         duties = [self.source(self.graph.outputs[name]) for name in ("d_a", "d_b", "d_c")]
         modulation = [f"(2.0 * {duty} - 1.0)" for duty in duties]
-        diagnostics = {"m_peak", "saturated"} <= set(node.carried)
-        peak = (self.node(terminal, "m_peak") if diagnostics else
+        diagnostics = node.terminal_diagnostic_fields
+        peak = (self.node(terminal, diagnostics[0]) if diagnostics is not None else
                 f"std::max({{{', '.join(f'std::abs({value})' for value in modulation)}}})")
-        saturated = self.node(terminal, "saturated") if diagnostics else "false"
+        saturated = self.node(terminal, diagnostics[1]) if diagnostics is not None else "false"
         due = self._sampled_due(terminal)
         lines = [
                   f"{indent}{self.m('last_m_max')} = {peak};",

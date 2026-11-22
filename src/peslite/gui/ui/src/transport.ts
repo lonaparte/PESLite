@@ -1,23 +1,18 @@
 /** The shared frontend knows about messages, never HTTP or VS Code file APIs. */
 export type Operation =
-  | 'tree' | 'file.read' | 'file.write' | 'file.create' | 'file.rename' | 'file.delete'
-  | 'preview' | 'parameter.patch' | 'component.add' | 'component.remove'
-  | 'connection.rewire' | 'csv.read' | 'summary.read'
+  | 'tree' | 'file.read' | 'preview' | 'csv.read' | 'summary.read'
   | 'debug.inspect'
   | 'preview.layout.load' | 'preview.layout.save' | 'preview.layout.clear'
   | 'run.start' | 'run.stop' | 'run.status'
-  | 'workspace.active' | 'editor.reveal' | 'editor.applyPatch';
+  | 'workspace.active' | 'editor.reveal';
 
 export type JsonObject = Record<string, unknown>;
 export type ChangeEvent = { type: 'file.changed'; path: string; text: string; dirty?: boolean };
 export type TreeEntry = { path: string; name: string; directory: boolean };
 export type TextFile = { path: string; text: string; version: string; dirty?: boolean };
-export type SourceEdit = { start: number; end: number; replacement: string; line: number; column: number };
-export type Field = { path: string; text: string; start: number; end: number; line: number; column: number };
 export type PreviewResponse = {
   format: 'native' | 'legacy';
   model: import('../../preview/types.js').PESModel | null;
-  fields: Field[];
   diagnostics: import('../../preview/types.js').Diagnostic[];
   source?: string;
 };

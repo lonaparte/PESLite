@@ -3419,9 +3419,10 @@ class Netlist:
     @staticmethod
     def source_rate(source: Any, t: Any) -> Any:
         """Return one source derivative, using a central difference when none is supplied."""
-        return (source.derivative(t) if source.derivative is not None else
-                (source.value(t + _DELTA_T) - source.value(t - _DELTA_T))
-                / (2.0 * _DELTA_T))
+        if source.derivative is not None:
+            return source.derivative(t)
+        lower, upper = t - _DELTA_T, t + _DELTA_T
+        return (source.value(upper) - source.value(lower)) / (upper - lower)
 
     def rates(self, t: float, needed: Optional[NDArray[np.bool_]] = None) -> NDArray[np.float64]:
         """The source derivatives ``du/dt`` at ``t`` (zero where ``needed`` is false)."""
@@ -3430,11 +3431,7 @@ class Netlist:
             if needed is not None and not needed[j]:
                 continue
             d = self._branch(src).dim
-            if src.derivative is not None:
-                du[o:o + d] = _vector(src.derivative(t), d, src.name)
-            else:
-                hi, lo = t + _DELTA_T, t - _DELTA_T
-                du[o:o + d] = (_vector(src.value(hi), d, src.name) - _vector(src.value(lo), d, src.name)) / (hi - lo)
+            du[o:o + d] = _vector(self.source_rate(src, t), d, src.name)
         return du
 
     @staticmethod

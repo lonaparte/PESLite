@@ -1804,6 +1804,120 @@ class _PredictiveCurrentParams:
                     )
 
 
+class _CCSCurrentStrategy:
+    """Continuous-control-set optimizer bound to one predictive-current loop."""
+
+    discrete_history = False
+
+    def __init__(self, owner, unit):
+        cfg = owner.cfg
+        plant = _RLCurrentPrediction(
+            _numerical_configuration(owner.plant.L),
+            _numerical_configuration(owner.plant.R),
+            _numerical_configuration(owner.plant.period),
+            _numerical_configuration(owner.plant.delay),
+            owner.plant.voltage_map,
+            blocked_min=owner.plant.blocked_min,
+        )
+        template = plant.model(
+            _numerical_configuration(unit.dclink.vdc_ref), np.zeros(owner.n_current),
+            np.zeros(owner.n_current), np.zeros(owner.n_current), previous_applied=True,
+        )
+        self.default_input = np.full(owner.n_input, cfg.input_min, dtype=float)
+        self.optimizer = CCSMPC(
+            template, _numerical_configuration(cfg.prediction_horizon),
+            (_numerical_configuration(cfg.control_horizon)
+             if cfg.control_horizon is not None else None),
+            tracking_weight=_numerical_configuration(cfg.tracking_weight),
+            input_weight=_numerical_configuration(cfg.input_weight),
+            rate_weight=_numerical_configuration(cfg.rate_weight),
+            input_bounds=(_numerical_configuration(cfg.input_min),
+                          _numerical_configuration(cfg.input_max)),
+            output_bounds=(
+                -np.inf if cfg.current_min is None
+                else _numerical_configuration(cfg.current_min),
+                np.inf if cfg.current_max is None
+                else _numerical_configuration(cfg.current_max),
+            ), max_iterations=_numerical_configuration(cfg.max_iterations),
+            tolerance=_numerical_configuration(cfg.tolerance),
+            feasibility_tolerance=_numerical_configuration(cfg.feasibility_tolerance),
+        )
+
+    def solve(self, state, reference, previous, models):
+        return self.optimizer.solve(state, reference, previous, models=models)
+
+    @staticmethod
+    def admissible(_action) -> bool:
+        return True
+
+    @staticmethod
+    def valid_history(_action) -> bool:
+        return True
+
+
+class _FCSCurrentStrategy:
+    """Finite-control-set optimizer bound to one predictive-current loop."""
+
+    discrete_history = True
+
+    def __init__(self, owner, _unit):
+        cfg = owner.cfg
+        input_min = _numerical_configuration(cfg.input_min)
+        input_max = _numerical_configuration(cfg.input_max)
+        actions = np.array(list(product((0.0, 1.0), repeat=owner.n_input)))
+        self.actions = np.array([
+            action for action in actions
+            if all(input_min <= float(value) <= input_max for value in action)
+        ])
+        if len(self.actions) == 0:
+            raise ConfigError("input bounds exclude every finite control action")
+        self.default_input = self.actions[0]
+        self.owner = owner
+        self.models = ()
+        self.cost = _QuadraticStageCost(
+            owner.n_current, owner.n_input,
+            _numerical_configuration(cfg.tracking_weight),
+            _numerical_configuration(cfg.input_weight),
+            _numerical_configuration(cfg.rate_weight),
+        )
+        self.optimizer = FCSMPC(
+            self.actions, _numerical_configuration(cfg.prediction_horizon),
+            self._predict, self._stage_cost,
+            control_horizon=(_numerical_configuration(cfg.control_horizon)
+                             if cfg.control_horizon is not None else None),
+            constraint=owner._constraint,
+            max_evaluations=_numerical_configuration(cfg.max_evaluations),
+            feasibility_tolerance=_numerical_configuration(cfg.feasibility_tolerance),
+            vectorized=True,
+        )
+
+    def _predict(self, state, action, k):
+        model = self.models[k]
+        return state @ model.A.T + action @ model.B.T + model.offset
+
+    def _stage_cost(self, state, action, reference, previous, _k):
+        return self.cost.evaluate(
+            state[..., :self.owner.n_current], action, reference, previous,
+        )
+
+    def solve(self, state, reference, previous, models):
+        self.models = models
+        return self.optimizer.solve(state, reference, previous)
+
+    def admissible(self, action) -> bool:
+        return bool(np.any(np.all(self.actions == action, axis=1)))
+
+    @staticmethod
+    def valid_history(action) -> bool:
+        return bool(np.all((action == 0.0) | (action == 1.0)))
+
+
+_PREDICTIVE_STRATEGIES = {
+    "ccs": _CCSCurrentStrategy,
+    "fcs": _FCSCurrentStrategy,
+}
+
+
 class _PredictiveCurrentControl(Loop):
     """Shared prediction, optimization, fallback and named-state implementation."""
 
@@ -1847,20 +1961,8 @@ class _PredictiveCurrentControl(Loop):
             raise ConfigError("predictive-control execution delay must be within one loop period")
         self.delay = min(self.T, max(0.0, delay))
         self.plant = self._configure_plant(unit)
-        if cfg.algorithm == "fcs":
-            input_min = _numerical_configuration(cfg.input_min)
-            input_max = _numerical_configuration(cfg.input_max)
-            actions = np.array(list(product((0.0, 1.0), repeat=self.n_input)))
-            self.actions = np.array([
-                action for action in actions
-                if all(input_min <= float(value) <= input_max for value in action)
-            ])
-            if len(self.actions) == 0:
-                raise ConfigError("input bounds exclude every finite control action")
-            default = self.actions[0]
-        else:
-            default = [cfg.input_min] * self.n_input
-        fixed = default if cfg.fallback_input is None else cfg.fallback_input
+        self.strategy = _PREDICTIVE_STRATEGIES[cfg.algorithm](self, unit)
+        fixed = self.strategy.default_input if cfg.fallback_input is None else cfg.fallback_input
         self.fixed_input = np.asarray(_numerical_configuration(fixed), dtype=float).copy()
         if self.fixed_input.shape != (self.n_input,):
             raise ConfigError(
@@ -1873,55 +1975,6 @@ class _PredictiveCurrentControl(Loop):
         self.solve_seconds = 0.0
         self.last_result: MPCResult | None = None
         self._last_diagnostics = self._diagnostics(None, False)
-        if cfg.algorithm == "ccs":
-            numerical_plant = _RLCurrentPrediction(
-                _numerical_configuration(self.plant.L),
-                _numerical_configuration(self.plant.R),
-                _numerical_configuration(self.plant.period),
-                _numerical_configuration(self.plant.delay),
-                self.plant.voltage_map,
-                blocked_min=self.plant.blocked_min,
-            )
-            template = numerical_plant.model(
-                _numerical_configuration(unit.dclink.vdc_ref), np.zeros(self.n_current),
-                np.zeros(self.n_current), np.zeros(self.n_current),
-                previous_applied=True,
-            )
-            self.optimizer = CCSMPC(
-                template, _numerical_configuration(cfg.prediction_horizon),
-                (_numerical_configuration(cfg.control_horizon)
-                 if cfg.control_horizon is not None else None),
-                tracking_weight=_numerical_configuration(cfg.tracking_weight),
-                input_weight=_numerical_configuration(cfg.input_weight),
-                rate_weight=_numerical_configuration(cfg.rate_weight),
-                input_bounds=(_numerical_configuration(cfg.input_min),
-                              _numerical_configuration(cfg.input_max)),
-                output_bounds=(
-                    -np.inf if cfg.current_min is None
-                    else _numerical_configuration(cfg.current_min),
-                    np.inf if cfg.current_max is None
-                    else _numerical_configuration(cfg.current_max),
-                ), max_iterations=_numerical_configuration(cfg.max_iterations),
-                tolerance=_numerical_configuration(cfg.tolerance),
-                feasibility_tolerance=_numerical_configuration(cfg.feasibility_tolerance),
-            )
-        else:
-            self._cost = _QuadraticStageCost(
-                self.n_current, self.n_input,
-                _numerical_configuration(cfg.tracking_weight),
-                _numerical_configuration(cfg.input_weight),
-                _numerical_configuration(cfg.rate_weight),
-            )
-            self.optimizer = FCSMPC(
-                self.actions, _numerical_configuration(cfg.prediction_horizon),
-                self._predict, self._stage_cost,
-                control_horizon=(_numerical_configuration(cfg.control_horizon)
-                                 if cfg.control_horizon is not None else None),
-                constraint=self._constraint,
-                max_evaluations=_numerical_configuration(cfg.max_evaluations),
-                feasibility_tolerance=_numerical_configuration(cfg.feasibility_tolerance),
-                vectorized=True,
-            )
 
     def _configure_plant(self, unit) -> _RLCurrentPrediction:
         raise NotImplementedError
@@ -1962,13 +2015,6 @@ class _PredictiveCurrentControl(Loop):
             ))
         return np.r_[current, self.previous_input], references, models
 
-    def _predict(self, state, action, k):
-        model = self._models[k]
-        return state @ model.A.T + action @ model.B.T + model.offset
-
-    def _stage_cost(self, state, action, reference, previous, k):
-        return self._cost.evaluate(state[..., :self.n_current], action, reference, previous)
-
     def _constraint(self, state, action, k):
         current = state[..., :self.n_current]
         residuals = []
@@ -1980,12 +2026,8 @@ class _PredictiveCurrentControl(Loop):
 
     def solve(self, t: float, inputs: Mapping[str, Any]) -> MPCResult:
         """Optimize once; a custom registered loop may override this method."""
-        state, reference, self._models = self.prediction(t, inputs)
-        if self.cfg.algorithm == "ccs":
-            return self.optimizer.solve(
-                state, reference, self.previous_input, models=self._models,
-            )
-        return self.optimizer.solve(state, reference, self.previous_input)
+        state, reference, models = self.prediction(t, inputs)
+        return self.strategy.solve(state, reference, self.previous_input, models)
 
     def _admissible(self, action) -> bool:
         if not self._valid_history(action):
@@ -1995,8 +2037,7 @@ class _PredictiveCurrentControl(Loop):
         input_max = _numerical_configuration(self.cfg.input_max)
         if any(not input_min <= float(value) <= input_max for value in action):
             return False
-        return (self.cfg.algorithm != "fcs"
-                or bool(np.any(np.all(self.actions == action, axis=1))))
+        return self.strategy.admissible(action)
 
     def _valid_history(self, action) -> bool:
         """Whether an action can represent a previously applied bridge command."""
@@ -2005,7 +2046,12 @@ class _PredictiveCurrentControl(Loop):
                 or not np.all(np.isfinite(action))
                 or np.any(action < 0.0) or np.any(action > 1.0)):
             return False
-        return self.cfg.algorithm != "fcs" or bool(np.all((action == 0.0) | (action == 1.0)))
+        return self.strategy.valid_history(action)
+
+    @property
+    def actions(self):
+        """The finite action set, when the selected strategy defines one."""
+        return self.strategy.actions
 
     def _diagnostics(self, result, valid):
         return {
@@ -2073,7 +2119,7 @@ class _PredictiveCurrentControl(Loop):
     @property
     def discrete_state_names(self):
         names = ("previous_enabled", "solve_count", "fallback_count")
-        if self.cfg.algorithm == "fcs":
+        if self.strategy.discrete_history:
             return tuple(f"previous_input.{i}" for i in range(self.n_input)) + names
         return names
 
