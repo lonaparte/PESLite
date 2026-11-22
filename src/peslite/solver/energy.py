@@ -394,11 +394,18 @@ class _BalancePlan:
     specs: dict  # the declarations it was compiled from (``model.energy_specs``)
     subsystems: tuple[_SubsystemCheck, ...]
     transfers: tuple[_DefaultTransfer, ...]
+    power_snapshots: tuple[Any, ...]
     n_defaults: int
+
+    def _prepare_power(self) -> None:
+        """Prepare each shared physical power evaluation once for this snapshot."""
+        for prepare in self.power_snapshots:
+            prepare()
 
     def powers(self, t: float, y: np.ndarray) -> tuple[float, float]:
         """Return total continuous supplied and dissipated power without evaluating derivatives."""
         self.model.sync(t, y)
+        self._prepare_power()
         into_default = [0.0] * self.n_defaults
         for term in self.transfers:
             other = getattr(term.other_record, term.other_field)
@@ -420,6 +427,7 @@ class _BalancePlan:
         # supplied/dissipated-power methods may still read those outputs, so complete the
         # public-output synchronization promised by balance() before evaluating power.
         self.model.evaluate_outputs(t)
+        self._prepare_power()
         into_default = [0.0] * self.n_defaults
         for term in self.transfers:
             other = getattr(term.other_record, term.other_field)
@@ -572,7 +580,14 @@ def compile_balance(model: Any) -> _BalancePlan:
             name, sub, spec, default_index.get(id(sub)),
             tuple(storage_checks), tuple(power_checks), tuple(energy_states),
         ))
-    return _BalancePlan(model, specs, tuple(checks), tuple(transfers), len(default_index))
+    power_snapshots = tuple(
+        prepare
+        for subsystem in model.subsystems
+        if callable(prepare := getattr(subsystem, "prepare_power_snapshot", None))
+    )
+    return _BalancePlan(
+        model, specs, tuple(checks), tuple(transfers), power_snapshots, len(default_index)
+    )
 
 
 def balance(model: Any, t: float, y: np.ndarray) -> EnergyReport:

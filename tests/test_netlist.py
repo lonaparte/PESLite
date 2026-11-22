@@ -920,6 +920,27 @@ def test_assembled_netlist_preserves_component_views(circuit_model):
     assert simulation.ph_report.verdict == "port-hamiltonian"
 
 
+def test_energy_audit_evaluates_device_circuit_power_once(monkeypatch):
+    simulation = peslite.Simulation(peslite.load(
+        EXAMPLES / "gfl-example.pes", **QUIET,
+        **{"simulation.solver.circuit_model": "device"},
+    ))
+    model = simulation.system.model
+    circuit, = simulation.system.circuits
+    assert sum(map(bool, circuit._loss_elements.values())) > 1
+    evaluate = circuit.netlist.evaluate_scalar_raw
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(circuit.netlist, "evaluate_scalar_raw", counted)
+    model.energy_balance(0.0, model.get_initial_values())
+    assert calls == 1
+
+
 @pytest.mark.parametrize("circuit_model", CIRCUIT_MODELS)
 @pytest.mark.parametrize("example", [path.stem for path in sorted(EXAMPLES.glob("*.pes"))])
 def test_every_example_builds_with_an_electrical_netlist(example, circuit_model):

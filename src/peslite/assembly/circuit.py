@@ -1864,18 +1864,25 @@ class Circuit:
         """The power dissipated in ``component``'s resistive primitives at the last evaluation."""
         if self._mixtures:
             return self._mixture_loss.get(id(component), 0.0)
-        if self.form == "device":
-            self.netlist.evaluate_scalar_raw(self.t, self._states(), record=True)
         return self.netlist.dissipated_power(self._loss_elements[id(component)])
 
     def supplied_power_of(self, component: Any) -> float:
         """The power supplied by ``component`` source primitives at the last evaluation."""
         if self._mixtures:
             return self._mixture_supply.get(id(component), 0.0)
-        if self.form == "device":
-            self.netlist.evaluate_scalar_raw(self.t, self._states(), record=True)
         return -sum(self.netlist.power(element) for element in self._supply_elements[id(component)]
                     if isinstance(element, (VoltageSource, CurrentSource)))
+
+    def prepare_power_snapshot(self) -> None:
+        """Make the current circuit evaluation available to all component power readers."""
+        if self.form != "device" or self._mixtures:
+            return
+        previous = self.netlist._last
+        if previous is not None and previous.output is getattr(self, "_solved_outputs", None):
+            return
+        _derivatives, self._solved_outputs = self.netlist.evaluate_scalar_raw(
+            self.t, self._states(), record=True
+        )
 
     def grouping_report(self) -> dict[str, Any]:
         """The netlist's automatic state-space-nodal groups, JSON-ready: per group its member subsystems,
@@ -2342,12 +2349,14 @@ def device_outputs(component: Any, t: float) -> None:
 
 def device_dissipated_power(component: Any) -> float:
     circuit = _standalone_device(component)
+    circuit.prepare_power_snapshot()
     return (circuit.dissipated_power_of(component)
             if id(component) in circuit._loss_elements else 0.0)
 
 
 def device_supplied_power(component: Any) -> float:
     circuit = _standalone_device(component)
+    circuit.prepare_power_snapshot()
     return (circuit.supplied_power_of(component)
             if id(component) in circuit._supply_elements else 0.0)
 
