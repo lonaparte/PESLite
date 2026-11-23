@@ -8,7 +8,7 @@ import pytest
 
 from benchmark_cpp_export import (DEFAULTS, _check_baseline_settings, _comparison,
                                   _largest_changes, _load_settings, _mean_changes,
-                                  _mode_summary)
+                                  _mode_summary, _validate_summary)
 
 
 pytestmark = pytest.mark.static
@@ -87,3 +87,11 @@ def test_cpp_benchmark_compares_only_equivalent_workloads():
     previous["t_end"] = 1.0
     with pytest.raises(ValueError, match="different t_end"):
         _check_baseline_settings(current, {"settings": previous})
+
+
+def test_cpp_benchmark_rejects_incomplete_or_tripped_runs():
+    _validate_summary({"status": "completed", "tripped": False}, "case", "switching")
+    with pytest.raises(RuntimeError, match="did not complete"):
+        _validate_summary({"status": "stopped", "tripped": False}, "case", "switching")
+    with pytest.raises(RuntimeError, match="did not complete"):
+        _validate_summary({"status": "completed", "tripped": True}, "case", "switching")

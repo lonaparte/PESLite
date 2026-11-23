@@ -154,6 +154,15 @@ def _compile(source: Path, executable: Path, compiler: Sequence[str],
     return time.perf_counter() - start
 
 
+def _validate_summary(summary: Mapping[str, Any], case: str, mode: str) -> None:
+    """Reject benchmark rows that did not finish the requested workload."""
+    if summary.get("status") != "completed" or bool(summary.get("tripped")):
+        raise RuntimeError(
+            f"{case} / {mode} did not complete without a trip: "
+            f"status={summary.get('status')!r}, tripped={summary.get('tripped')!r}"
+        )
+
+
 def _benchmark_case(name: str, config: Path, work: Path, compiler: Sequence[str],
                     settings: Mapping[str, Any]) -> list[dict[str, Any]]:
     rows = []
@@ -191,6 +200,7 @@ def _benchmark_case(name: str, config: Path, work: Path, compiler: Sequence[str]
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             process_times.append(time.perf_counter() - start)
             summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+            _validate_summary(summary, name, mode)
             runtime_times.append(float(summary["wall_time"]))
             if repeat + 1 < settings["cpp_repeats"]:
                 shutil.rmtree(output)

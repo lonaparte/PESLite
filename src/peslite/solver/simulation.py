@@ -114,6 +114,14 @@ def _optional_output(t: float, name: str, read: Callable, *args):
         return _UNAVAILABLE
 
 
+def _checkpoint_at(history: list[tuple[float, tuple]], t: float, label: str) -> tuple:
+    """Return the accepted checkpoint at one physical time."""
+    for when, checkpoint in reversed(history):
+        if abs(when - t) <= TIME_EPS:
+            return checkpoint
+    raise RuntimeError(f"{label} checkpoint missing at t = {t:.12g} s")
+
+
 class _SnapshotRead:
     """Read one snapshot value at most once, including an unsuccessful calculation."""
 
@@ -249,10 +257,7 @@ class _AcceptedEnergy:
         return self._state()
 
     def checkpoint_at(self, t: float) -> tuple:
-        for when, checkpoint in reversed(self.history):
-            if abs(when - t) <= TIME_EPS:
-                return checkpoint
-        raise RuntimeError(f"accepted-step checkpoint missing at t = {t:.12g} s")
+        return _checkpoint_at(self.history, t, "accepted-step")
 
     def restore(self, checkpoint: tuple) -> None:
         (self.supplied, self.dissipated, self.last_t,
@@ -333,10 +338,7 @@ class _AcceptedHistory:
         return self._state()
 
     def checkpoint_at(self, t: float) -> tuple:
-        for when, checkpoint in reversed(self.history):
-            if abs(when - t) <= TIME_EPS:
-                return checkpoint
-        raise RuntimeError(f"accepted-history checkpoint missing at t = {t:.12g} s")
+        return _checkpoint_at(self.history, t, "accepted-history")
 
     def restore(self, checkpoint: tuple) -> None:
         self.last_t, histories, size = checkpoint

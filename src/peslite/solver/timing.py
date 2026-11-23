@@ -37,7 +37,7 @@ class PeriodicClock:
 
 def resolve_clock_offset(period: float, offset: float | None, default: float = 0.0) -> float:
     """Return the canonical offset within one period, inheriting ``default`` when omitted."""
-    return default % period if offset is None else offset
+    return (default if offset is None else offset) % period
 
 
 def common_period(periods: list[float], limit: int = 64) -> float | None:

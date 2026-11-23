@@ -11,6 +11,7 @@ from peslite.assembly.unit import Plant
 from peslite.components.converter import PWMAveragingModel, ThreePhaseBridge
 from peslite.components.pwm import ZOH, carrier_position
 from peslite.solver.model import Bag, Model
+from peslite.solver.timing import resolve_clock_offset
 
 
 class _HeldNode:
@@ -70,6 +71,11 @@ def test_shared_plant_refreshes_same_time_held_changes_and_discontinuous_states(
 
 
 T = 5e-5  # carrier period of examples/gfl-example.pes (20 kHz)
+
+
+def test_clock_offsets_are_canonical_within_one_period():
+    assert resolve_clock_offset(2.0, None, 5.0) == pytest.approx(1.0)
+    assert resolve_clock_offset(2.0, 5.0) == pytest.approx(1.0)
 
 
 class _Recorder:

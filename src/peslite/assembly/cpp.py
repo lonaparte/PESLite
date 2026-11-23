@@ -310,16 +310,14 @@ public:
         const auto found = std::upper_bound(times.begin(), times.end(), t);
         if (found == times.end()) return values.back();
         const std::size_t after = static_cast<std::size_t>(found - times.begin());
-        if (after == 0) return initial;
         const std::size_t before = after - 1;
         const double fraction = (t - times[before]) / (times[after] - times[before]);
         return values[before] + fraction * (values[after] - values[before]);
     }
 
     Value derivative(double t) const {
-        if (times.size() < 2 || t <= times.front() || t > times.back()) return Value{};
+        if (times.size() < 2 || !(times.front() < t && t <= times.back())) return Value{};
         const auto found = std::lower_bound(times.begin(), times.end(), t);
-        if (found == times.end()) return Value{};
         const std::size_t after = static_cast<std::size_t>(found - times.begin());
         const std::size_t before = after - 1;
         return (values[after] - values[before]) / (times[after] - times[before]);
@@ -604,9 +602,9 @@ def _assign_values(prefix, assignments):
 def _fixed_step(method: str, accepted: str = "") -> str:
     c, a, b = TABLEAUS[method]
     names = tuple(f"k{index}" for index in range(len(c)))
+    storage = (*names, "x") if len(c) > 1 else names
     lines = ["    inline void step(double& t, double h) {",
-             "        State " + ", ".join(f"{name}{{}}" for name in names)
-             + (", x{};" if len(c) > 1 else ";"),
+             "        State " + ", ".join(storage) + ";",
              f"        rhs(t, y, {names[0]});"]
     for index in range(1, len(c)):
         lines += ["        for (std::size_t i = 0; i < state_count; ++i) "
@@ -2279,6 +2277,9 @@ class _ModelGenerator:
         self._unit_control_inputs: dict[int, dict[str, _Expression]] = {}
         self._unit_measurements: dict[int, dict[str, _Expression]] = {}
         self._solver_observations: dict[tuple[int, str], tuple[str, Any, str]] = {}
+        self._observation_entries: dict[str, tuple[str, str]] = {}
+        self._required_observations: set[str] = set()
+        self._observed_values: dict[str, str] = {}
         self._algebraic_index = {id(loop): index
                                  for index, loop in enumerate(self.model.algebraic_loops)}
         self._algebraic_plans = {}
@@ -3175,7 +3176,7 @@ class _ModelGenerator:
                 role = "input" if record is owner.input else "output"
             observation_name = f"solver.{subsystem_name}.{role}.{field}"
             self._solver_observations[key] = (observation_name, record, field)
-        return "obs_" + _identifier(self._solver_observations[key][0])
+        return self.observation(self._solver_observations[key][0])
 
     def trace_element_signals(self, element: Any) -> dict[str, _Expression]:
         return self.trace_element_values(element, element.signals)
@@ -5643,19 +5644,17 @@ class _ModelGenerator:
             lines.extend(generator.members())
         return lines
 
-    def observations(self, generators: dict) -> tuple[list[str], list[str]]:
-        """Members and assignments for values consumed by scheduling and public output."""
-        members: list[str] = []
-        assigns: list[str] = []
-        seen: set[str] = set()
+    def observations(self, generators: dict) -> None:
+        """Register values that generated scheduling and public output may consume."""
+        self._observation_entries.clear()
         self._observed_values = {}
 
         def add(name: str, expression: str, kind: str) -> None:
             member = f"obs_{_identifier(name)}"
-            if member not in seen:
-                seen.add(member)
-                members.append(f"{_CPP_TYPES[kind]} {member}{{}};")
-            assigns.append(f"{member} = {expression};")
+            self._observation_entries[member] = (
+                f"{_CPP_TYPES[kind]} {member}{{}};",
+                f"{member} = {expression};",
+            )
             self._observed_values.setdefault(expression, member)
 
         self._add_observation = add
@@ -5712,14 +5711,33 @@ class _ModelGenerator:
                 add(signal, value.code, value.kind)
         for name, record, field in self._solver_observations.values():
             add(name, self.value(record, field), self.record_types[id(record), field])
-        return members, assigns
+
+    def observation(self, name: str) -> str:
+        """Return and retain one named generated observation."""
+        member = f"obs_{_identifier(name)}"
+        self._required_observations.add(member)
+        return member
+
+    def observation_code(self) -> tuple[list[str], list[str]]:
+        """Emit the observations retained by generated consumers."""
+        missing = self._required_observations.difference(self._observation_entries)
+        if missing:
+            raise RuntimeError(
+                "generated observation has no registered source: " + ", ".join(sorted(missing))
+            )
+        entries = [entry for member, entry in self._observation_entries.items()
+                   if member in self._required_observations]
+        return ([declaration for declaration, _assignment in entries],
+                [assignment for _declaration, assignment in entries])
 
     def observed(self, value):
         """Reuse an existing observation store for a traced lifecycle input."""
         if value.code not in self._observed_values:
             name = f"initial_{len(self._observed_values)}"
             self._add_observation(name, value.code, value.kind)
-        return _Expression(self._observed_values[value.code], value.kind)
+        member = self._observed_values[value.code]
+        self._required_observations.add(member)
+        return _Expression(member, value.kind)
 
 
 _SHORT_INTERVALS = r'''template <typename Value>
@@ -6034,14 +6052,21 @@ class _CarrierModulatorGenerator:
         return ()
 
     def members(self, generator):
-        if not isinstance(generator.bridge.modulator, SynchronousCarrier):
+        modulator = generator.bridge.modulator
+        if isinstance(modulator, ZOH):
             return []
+        members = [
+            f"std::vector<std::tuple<double, int, double>> {generator.m('carrier_edges')};"
+        ]
+        if not isinstance(modulator, SynchronousCarrier):
+            return members
         bridge = generator.bridge
         # PWM.start left the state that produced the baked first switching interval. Like that
         # interval's clocks, the carrier phase it was computed from stays specialized.
         float(bridge.modulator.phase)
         state = bridge.modulator.get_state()
-        return [f"double {generator.m('sync_theta')} = {generator.m('theta')};",
+        return [*members,
+                f"double {generator.m('sync_theta')} = {generator.m('theta')};",
                 f"double {generator.m('sync_omega')} = {generator.m('omega')};",
                 f"double {generator.m('sync_time')} = {_number(bridge.t_sync)};",
                 f"double {generator.m('carrier_angle')} = {_number(state['angle'])};",
@@ -6132,7 +6157,8 @@ class _CarrierModulatorGenerator:
     for (int k = 0; k < {generator.bridge.modulation_width}; ++k)
         q[k] = position < 0.5 ? (modulation[k] > carrier0) : (modulation[k] >= carrier0);
     held = {encoded};
-    std::vector<std::tuple<double, int, double>> edges;
+    auto& edges = {generator.m('carrier_edges')};
+    edges.clear();
     double covered = 0.0;
     for (int piece = 0; piece < 64 && covered < span - {_number(_EPS)}; ++piece) {{
         position = carrier_position(t + covered, frequency, phase);
@@ -6164,7 +6190,8 @@ class _CarrierModulatorGenerator:
         q[k] = duty > 0.0 && {gate};
     }}
     held = {encoded};
-    std::vector<std::tuple<double, int, double>> edges;
+    auto& edges = {generator.m('carrier_edges')};
+    edges.clear();
     const auto first = static_cast<long long>(std::floor(t * frequency + phase));
     const auto last = static_cast<long long>(std::ceil((t + span) * frequency + phase));
     for (auto cycle = first; cycle <= last; ++cycle) {{
@@ -6922,8 +6949,7 @@ class _ControlGenerator:
             return ""
         unit = copy.copy(self.unit)
         unit.cfg, unit.ctrl = self.cfg, self.ctrl
-        channels = {key: self.model.observed(value)
-                    for key, value in self.model.unit_measurements(self.unit).items()}
+        channels = self.model.unit_measurements(self.unit)
         measurements = self.model._trace(lambda: unit.control_inputs_from(channels))
         outputs = self._tracked_outputs()
         values = dict(self.graph.values)
@@ -6946,7 +6972,8 @@ class _ControlGenerator:
                         and source not in cyclic and source not in held_outputs):
                     values[source] = self.model.observed(_Expression(
                         self.source(source), "complex" if spec.complex_value else "real"))
-                code = (measurements[source].code if source.startswith("meas.")
+                code = (self.model.observed(measurements[source]).code
+                        if source.startswith("meas.")
                         else self.source(source))
                 inputs[port] = _Expression(code, "complex" if spec.complex_value else "real")
             state_values = {
@@ -6990,7 +7017,7 @@ class _ControlGenerator:
         return []
 
     def _adc_source(self, channel: str) -> str:
-        return f"obs_{_identifier(self.name + '.adc.' + channel)}"
+        return self.model.observation(self.name + ".adc." + channel)
 
     def _adc_reading(self, channel: str) -> str:
         adc = self.adc
@@ -7784,7 +7811,7 @@ class _ProtectionGenerator:
                  *["    " + line for line in self._trip_body()], "}"]
         sections = [self._protection_helpers(), apply, sampled]
         if not sampled_only:
-            current = f"obs_{_identifier(self.name + '.i_c')}"
+            current = self.model.observation(self.name + ".i_c")
             current_width = len(self.unit._protection_currents())
             fast = [f"bool protect_{self.tag}(double t) {{"]
             if self.unit.continuous:
@@ -8042,10 +8069,11 @@ class _ContinuousUnitGenerator(_ACControlGenerator):
         return lines
 
     def sense_method(self) -> str:
-        observed = f"obs_{_identifier(self.name + '.u_g')}"
-        dc = f"obs_{_identifier(self.name + '.u_dc')}"
         if self.cfg.meas.sources:
             observed, dc = self._adc_reading("u_g"), self._adc_reading("u_dc")
+        else:
+            observed = self.model.observation(self.name + ".u_g")
+            dc = self.model.observation(self.name + ".u_dc")
         lines = [f"bool sense_{self.tag}(double t) {{",
                  "    bool changed = false;",
                  f"    if ({self.m('track_due')}) {{"]
@@ -8194,8 +8222,8 @@ class _ElectricalUnitGenerator(_ProtectionGenerator, _ControlGenerator):
     def sense_method(self):
         lines = [f"bool sense_{self.tag}(double t) {{",
                  *("    " + line for line in self._adc_sense_lines())]
-        voltage = f"obs_{_identifier(self.name + '.u_g')}"
-        dc = f"obs_{_identifier(self.name + '.u_dc')}"
+        voltage = self.model.observation(self.name + ".u_g")
+        dc = self.model.observation(self.name + ".u_dc")
         lines += ["    " + line for line in self._clock_lines(
             f"sampled_protect_{self.tag}(t, std::abs({voltage}) / {_number(self.cfg.dc_base.v)}, "
             f"0.0, {dc} / {_number(self.cfg.dc_base.v)} - 1.0, true);")]
@@ -8262,7 +8290,7 @@ class _GraphUnitGenerator(_ElectricalUnitGenerator):
         # An open-loop controller may run before its unused measurement inputs are wired.
         # Read those logs from final model observations, not from its early output evaluation.
         return [
-            f"{self.m('log_' + key)} = obs_{_identifier(self.name + '.ctrl.' + source)};"
+            f"{self.m('log_' + key)} = {self.model.observation(self.name + '.ctrl.' + source)};"
             for key, source in self.ctrl.log_sources().items()
             if source.startswith("meas.")
         ]
@@ -8295,6 +8323,7 @@ class _GraphUnitGenerator(_ElectricalUnitGenerator):
         return tuple(_Expression.of(value) for value in self.bridge.command_registers(output))
 
     def controller_method(self) -> str:
+        dc = self.model.observation(self.name + ".u_dc")
         lines = [f"void controller_{self.tag}(double t) {{"]
         lines += ["    " + line for line in self._rms_sample_lines()]
         lines += ["    " + line for line in self._sampled_measurement_lines()]
@@ -8307,7 +8336,7 @@ class _GraphUnitGenerator(_ElectricalUnitGenerator):
             f"    sampled_protect_{self.tag}(t, "
             f"std::abs({self._measurement_name('meas.voltage')}) / "
             f"{_number(self.cfg.dc_base.v)}, 0.0, "
-            f"obs_{_identifier(self.name + '.u_dc')} / "
+            f"{dc} / "
             f"{_number(self.cfg.dc_base.v)} - 1.0, {self.m('startup_complete')});",
             f"    {self.m('pending_on')} = {self.m('startup_run')};",
             f"    {self.m('pending_valid')} = true;",
@@ -8337,8 +8366,8 @@ class _GraphUnitGenerator(_ElectricalUnitGenerator):
         return lines + self._terminal_lines
 
     def sense_method(self) -> str:
-        voltage = f"obs_{_identifier(self.name + '.ctrl.meas.voltage')}"
-        dc = f"obs_{_identifier(self.name + '.u_dc')}"
+        voltage = self.model.observation(self.name + ".ctrl.meas.voltage")
+        dc = self.model.observation(self.name + ".u_dc")
         lines = self._clock_lines(
             *self._rms_sample_lines(),
             f"sampled_protect_{self.tag}(t, std::abs({voltage}) / {_number(self.cfg.dc_base.v)},",
@@ -8581,7 +8610,8 @@ class _CppGenerator:
         times = [item[0] for item in actions]
         return times, "\n".join(cases)
 
-    def _signal_layout(self, generators: dict[str, _ControlGenerator]) -> tuple[list[str], list[str]]:
+    def _signal_layout(self, model: _ModelGenerator,
+                       generators: dict[str, _ControlGenerator]) -> tuple[list[str], list[str]]:
         """The exact public plant.csv schema and expressions used by Python's recorder."""
         from ..solver.simulation import _plant_output_row
 
@@ -8590,11 +8620,12 @@ class _CppGenerator:
         signal_values = self.system.signals(t)
         expressions = {}
         for key, value in signal_values.items():
+            observed = model.observation(key)
             if isinstance(value, numbers.Complex) and not isinstance(value, numbers.Real):
-                expressions.update((name, f"phases(obs_{_identifier(key)})[{index}]")
+                expressions.update((name, f"phases({observed})[{index}]")
                                    for index, name in enumerate(_signal_names(key, 3)))
             else:
-                expressions[key] = f"obs_{_identifier(key)}"
+                expressions[key] = observed
         control_names = {}
         for name, generator in generators.items():
             if generator.ctrl is None:
@@ -8735,17 +8766,21 @@ class _CppGenerator:
                     f"({type(sub).__name__}): {exc}"
                 ) from exc
 
+        def add_impulsive_columns(check: Any) -> None:
+            if not hasattr(check.subsystem, "impulsive_dissipated_energy"):
+                return
+            for attribute, suffix in (
+                ("impulsive_dissipated_energy", "dissipated_impulsive_J"),
+                ("impulsive_supplied_energy", "supplied_impulsive_J"),
+            ):
+                columns.append(f"{check.name}.{suffix}")
+                values.append(model.equation_members[id(check.subsystem), attribute][0])
+
         declared_index = 0
         for check in plan.subsystems:
             kind = check.spec.kind
             if kind == "observer":
-                if hasattr(check.subsystem, "impulsive_dissipated_energy"):
-                    for attribute, suffix in (
-                        ("impulsive_dissipated_energy", "dissipated_impulsive_J"),
-                        ("impulsive_supplied_energy", "supplied_impulsive_J"),
-                    ):
-                        columns.append(f"{check.name}.{suffix}")
-                        values.append(model.equation_members[id(check.subsystem), attribute][0])
+                add_impulsive_columns(check)
                 continue
             if kind == "dirac":
                 continue
@@ -8816,13 +8851,7 @@ class _CppGenerator:
             ]
             columns.append(f"{check.name}.energy_J")
             values.append(f"{tag}_energy")
-            if hasattr(check.subsystem, "impulsive_dissipated_energy"):
-                for attribute, suffix in (
-                    ("impulsive_dissipated_energy", "dissipated_impulsive_J"),
-                    ("impulsive_supplied_energy", "supplied_impulsive_J"),
-                ):
-                    columns.append(f"{check.name}.{suffix}")
-                    values.append(model.equation_members[id(check.subsystem), attribute][0])
+            add_impulsive_columns(check)
         all_values = ["total_energy", "total_supplied", "total_dissipated", "tellegen",
                       "max_residual", *values, "std::abs(tellegen) / scale", "max_residual / scale"]
         lines.append(f"    return std::array<double, {len(all_values)}>{{{{{', '.join(all_values)}}}}};")
@@ -9057,14 +9086,13 @@ class _CppGenerator:
             model.solver_expression(model.value(signal.record, signal.field))
             for signal in model.accepted_histories
         ]
-        observation_members, observation_assignments = model.observations(generators)
+        model.observations(generators)
         tracking = {generator.name: generator.tracking_method()
                     for generator in generators.values()}
         initial_tracking = [f"if ({generator.initial_connection()}) {{ "
                             f"sync({_number(self.p.simulation.initial.t)}); track_{generator.tag}(); }}"
                             for generator in generators.values()
                             if tracking[generator.name] and generator.name not in self.simulation._continued]
-        observations = "\n        ".join(observation_assignments)
         checkpoint_type = f"std::tuple<{', '.join(history_types)}>" if history_types else "std::tuple<>"
         history_members = [model.history_members[id(signal.history)]
                            for signal in model.accepted_histories]
@@ -9098,7 +9126,6 @@ class _CppGenerator:
         if energy_method:
             methods.append(energy_method)
         methods.extend(model.runtime_network_methods())
-        members = "\n    ".join([*member_lines, *observation_members])
         methods_text = "\n\n    ".join(method.replace("\n", "\n    ") for method in methods if method)
         circuit_times = [
             f"next_{tag}()"
@@ -9138,11 +9165,6 @@ class _CppGenerator:
         sync_qualifier = ("PESLITE_NOINLINE" if any(unit.bridge.has_switching_events
                           for unit in self.system.units.values()) else "inline")
         sync_template = "template <bool seed_adc = false>" if adc_seed else ""
-        sync_update = observations
-        if adc_seed:
-            # Share one model body; each instantiation retains only its required stores.
-            sync_update = ("if constexpr (seed_adc) {\n" + "\n".join(adc_seed)
-                           + "\n} else {\n" + observations + "\n}")
         snapshot_values = "\n            ".join(f"states << ',' << ({value});" for value in state_values)
         output = self.p.simulation.output
         output_precision = self.runtime.value("simulation.output.precision", output.precision)
@@ -9154,7 +9176,9 @@ class _CppGenerator:
             f"replace_all(text, {_cpp_string(marker)}, {expression});"
             for marker, expression in resolved_replacements
         )
-        plant_names, plant_values = self._signal_layout(generators)
+        plant_names, plant_values = (
+            self._signal_layout(model, generators) if output.signals else ([], [])
+        )
         plant_snapshot = (self._csv_values("plant", plant_values, "                ")
                           if output.signals else "")
         signal_declarations: list[str] = []
@@ -9459,6 +9483,14 @@ class _CppGenerator:
         parameter_domains = " || ".join(
             f"key == {_cpp_string(name)}" for name in PARAMETER_DOMAINS
         )
+        observation_members, observation_assignments = model.observation_code()
+        members = "\n    ".join([*member_lines, *observation_members])
+        observations = "\n        ".join(observation_assignments)
+        sync_update = observations
+        if adc_seed:
+            # Share one model body; each instantiation retains only its required stores.
+            sync_update = ("if constexpr (seed_adc) {\n" + "\n".join(adc_seed)
+                           + "\n} else {\n" + observations + "\n}")
         source = f'''// Generated by PESLite.  Do not edit: regenerate from the source simulation file.
 // Standalone C++17; no Python, NumPy, SciPy or YAML dependency at run time.
 #include <algorithm>

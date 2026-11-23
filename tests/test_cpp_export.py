@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -218,6 +219,32 @@ def _quick(mode: str):
         "simulation.output.period": 1e-3,
         "simulation.energy_check": "off",
     })
+
+
+def test_generated_cpp_retains_only_consumed_observations_and_reuses_step_storage(tmp_path):
+    sources = []
+    for signals in (False, True):
+        project = tmp_path / str(signals).lower()
+        params = _quick("switching").replace(**{
+            "simulation.t_end": 1.0e-3,
+            "simulation.output.signals": signals,
+            "simulation.output.energy": False,
+        })
+        peslite.export(params, "cpp", project, name="case")
+        sources.append((project / "peslite.cpp").read_text(encoding="utf-8"))
+
+    pattern = re.compile(r"\b(?:double|Complex) (obs_[A-Za-z0-9_]+)\{\};")
+    private, public = ({name for name in pattern.findall(source)} for source in sources)
+    assert private < public
+    for source, names in zip(sources, (private, public)):
+        assert all(len(re.findall(rf"\b{re.escape(name)}\b", source)) >= 3 for name in names)
+
+    assert "std::vector<std::tuple<double, int, double>> u_vsc_carrier_edges;" in sources[0]
+    assert "auto& edges = u_vsc_carrier_edges;" in sources[0]
+    assert "edges.clear();" in sources[0]
+    assert "std::vector<std::tuple<double, int, double>> edges;" not in sources[0]
+    assert "State k0, k1, k2, k3, x;" in sources[0]
+    assert "State k0{}" not in sources[0]
 
 
 def test_sampled_measurements_reuse_the_parameterized_unit_adapter(monkeypatch):
