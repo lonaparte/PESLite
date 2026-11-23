@@ -47,7 +47,7 @@ from ..components.network import Port
 from ..solver.energy import Energetic, spec_of
 from ..solver.model import (
     Bag, ConfigError, Empty, OutputMethod, SolverCheck, SolverRegion, SpectralBound,
-    _InlineProgram, _compile_straight_line, _public_fields,
+    _InlineProgram, _compile_straight_line, _public_fields, _record_type,
 )
 from ..solver.netlist import (QUANTITIES, CurrentSource, Diode, Element, Mode,
                               Netlist, Node, Topology, VoltageSource, _DENSE_GROUP, _Degenerate,
@@ -105,12 +105,14 @@ def _live_statements(statements: Sequence[str], expressions: Sequence[str]) -> l
 class _BoundValue:
     """A netlist value read directly from a component record."""
 
-    __slots__ = ("record", "field", "factor", "invert")
+    __slots__ = ("record", "field", "factor", "invert", "guaranteed_range")
 
-    def __init__(self, record: Any, field: str, factor: float = 1.0, invert: bool = False) -> None:
+    def __init__(self, record: Any, field: str, factor: float = 1.0, invert: bool = False,
+                 guaranteed_range: Any = None) -> None:
         if invert and factor != 1.0:
             raise ValueError("an inverted bound value cannot also have a numeric factor")
         self.record, self.field, self.factor, self.invert = record, field, factor, invert
+        self.guaranteed_range = guaranteed_range
 
     def __call__(self, *_args: Any) -> Any:
         value = getattr(self.record, self.field)
@@ -120,12 +122,14 @@ class _BoundValue:
 class _CallableValue:
     """A netlist callback with explicit component-input dependencies."""
 
-    __slots__ = ("callback", "inputs", "record", "state_dependencies")
+    __slots__ = ("callback", "inputs", "record", "state_dependencies", "guaranteed_range")
 
     def __init__(self, callback: Callable, inputs: Sequence[str], record: Any = None,
-                 state_dependencies: Sequence[tuple[Any, str]] = ()) -> None:
+                 state_dependencies: Sequence[tuple[Any, str]] = (),
+                 guaranteed_range: Any = None) -> None:
         self.callback, self.inputs, self.record = callback, tuple(inputs), record
         self.state_dependencies = tuple(state_dependencies)
+        self.guaranteed_range = guaranteed_range
 
     def __call__(self, *args: Any) -> Any:
         return self.callback(*args)
@@ -146,6 +150,7 @@ class NetlistBuilder:
     ``node(port)``: the bus node of a port (ground for an unattached voltage-following
     port, a floating node for an unattached driving one); ``internal(dim, scale)``: a new node;
     ``value(record, field, factor=1, invert=False)``: a primitive callback bound directly to a field;
+    ``guaranteed_range=(lower, upper)`` declares a structural range of that produced value;
     ``add(*primitives)``; ``state(component, names, transform=None)``: the indices of one state or of
     several (concatenated); with an invertible ``transform`` ``T`` the netlist sees ``T x`` there (for
     example coil currents of stored modal currents) and the component's derivatives are ``T^-1`` of the
@@ -198,15 +203,15 @@ class NetlistBuilder:
         return Node(dim, scale)
 
     def value(self, record: Any, field: str, factor: float = 1.0, *,
-              invert: bool = False) -> Callable:
+              invert: bool = False, guaranteed_range: Any = None) -> Callable:
         """A callback that reads ``record.field`` when a primitive evaluates it."""
-        value = _BoundValue(record, field, factor, invert)
+        value = _BoundValue(record, field, factor, invert, guaranteed_range)
         if self.owner is not None and record is getattr(self.owner, "output", None):
             self.value_outputs[id(record), field] = self.owner, field
         return value
 
     def function(self, callback: Callable, inputs: Sequence[str] = (),
-                 states: Sequence[str] = ()) -> Callable:
+                 states: Sequence[str] = (), *, guaranteed_range: Any = None) -> Callable:
         """A callback with named owner input and state dependencies."""
         if not callable(callback):
             raise TypeError("a netlist function value must be callable")
@@ -225,6 +230,7 @@ class NetlistBuilder:
         return _CallableValue(
             callback, inputs, record,
             tuple((self.owner, state) for state in states),
+            guaranteed_range,
         )
 
     def add(self, *elements: Element) -> Element:
@@ -383,7 +389,8 @@ class NetworkPlan:
                 replacement = target.value_bindings.get((id(value.record), value.field))
                 if replacement is not None:
                     setattr(cloned, attribute, _BoundValue(
-                        replacement.record, replacement.field, value.factor, value.invert
+                        replacement.record, replacement.field, value.factor, value.invert,
+                        value.guaranteed_range,
                     ))
             if hasattr(element, "state"):
                 cloned.state = np.asarray(
@@ -549,8 +556,8 @@ class Circuit:
 
     def finalize(self) -> None:
         """Create the records, compile the state transfers and the netlist."""
-        self.input = type("_CircuitInput", (Bag,), {"__slots__": tuple(self.inputs)})(**self.inputs)
-        self.output = type("_CircuitOutput", (Bag,), {"__slots__": tuple(self.outputs)})(**self.outputs)
+        self.input = _record_type("_CircuitInput", tuple(self.inputs))(**self.inputs)
+        self.output = _record_type("_CircuitOutput", tuple(self.outputs))(**self.outputs)
         layout, index = [], 0
         self._state_index: dict[tuple[int, str], np.ndarray] = {}
         for comp in self.components:
@@ -1884,6 +1891,16 @@ class Circuit:
             self.t, self._states(), record=True
         )
 
+    def port_output_dependency(self, port: Port, quantity: str) -> Optional[tuple[Any, str]]:
+        """Return the model output field which publishes one physical port quantity."""
+        if quantity not in ("voltage", "current"):
+            raise ValueError("a physical port quantity must be voltage or current")
+        offset = 2 if quantity == "current" else 1
+        return next(
+            ((self, entry[offset]) for entry in self.port_values if entry[0] is port),
+            None,
+        )
+
     def grouping_report(self) -> dict[str, Any]:
         """The netlist's automatic state-space-nodal groups, JSON-ready: per group its member subsystems,
         nodes (an internal node named ``<subsystem>~<k>`` after the subsystem whose primitives it joins),
@@ -2898,9 +2915,13 @@ def _circuit_spectral_bounds(circuits: Sequence[Circuit]):
 def _circuit_solver_regions(circuit: Circuit) -> tuple[SolverRegion, ...]:
     """Return known discrete regions with their declared continuous coefficient ranges."""
     coefficient_ranges = []
+    coefficient_guarantees = []
     for transformer in circuit.netlist._transformers:
         if transformer.constant is not None:
             continue
+        coefficient_guarantees.extend(
+            [transformer.range_guaranteed] * math.prod(transformer.shape)
+        )
         if transformer.bounds is None:
             coefficient_ranges.extend([None] * math.prod(transformer.shape))
         else:
@@ -2910,7 +2931,10 @@ def _circuit_solver_regions(circuit: Circuit) -> tuple[SolverRegion, ...]:
                 for minimum, maximum in zip(lower.flat, upper.flat)
             )
     return tuple(
-        SolverRegion((*structure[0], *structure[1]), tuple(coefficient_ranges), maximum)
+        SolverRegion(
+            (*structure[0], *structure[1]), tuple(coefficient_ranges),
+            tuple(coefficient_guarantees), maximum,
+        )
         for structure, maximum in circuit.netlist.ratio_range_spectral_bounds()
     )
 

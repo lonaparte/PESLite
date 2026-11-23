@@ -22,6 +22,7 @@ import re
 import weakref
 from collections import Counter, deque
 from dataclasses import dataclass
+from functools import lru_cache
 from types import MethodType
 from typing import Any, Callable, ClassVar, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
@@ -121,6 +122,12 @@ class Empty(Bag):
     """Record with no fields."""
 
     __slots__ = ()
+
+
+@lru_cache(maxsize=None)
+def _record_type(name: str, fields: tuple[str, ...]) -> type[Bag]:
+    """Return one shared fixed-record class for a name and ordered field layout."""
+    return type(name, (Bag,), {"__slots__": fields})
 
 
 def _record_fields(record: Any) -> tuple[str, ...]:
@@ -228,7 +235,7 @@ def _black_box_record(
     for name, value in entries:
         if not isinstance(value, numbers.Number):
             raise TypeError(f"{label} field {name!r} must have a scalar numeric initial value")
-    record_type = type(f"_BlackBox_{label}", (Bag,), {"__slots__": names})
+    record_type = _record_type(f"_BlackBox_{label}", names)
     return names, record_type(**dict(entries))
 
 
@@ -1458,6 +1465,7 @@ class SolverRegion:
 
     selectors: tuple[bool, ...]
     coefficient_ranges: tuple[tuple[float, float] | None, ...]
+    coefficient_guarantees: tuple[bool, ...]
     spectral_bound: float
 
 
@@ -1896,6 +1904,13 @@ class Model:
         # Reuse the scheduling pass: DAGs need neither SCC analysis nor a condensed graph.
         graph = _dependency_plan(dependencies)
         order, residual = list(graph.order), graph.residual
+        output_nodes = dict(producers)
+        for sub in self.subsystems:
+            node = legacy.get(id(sub))
+            if node is not None:
+                output_nodes.update(
+                    ((id(sub), field), node) for field in _public_fields(sub.output)
+                )
         if residual:
             # Residual nodes can be downstream of a loop. Only cyclic SCCs become solver groups.
             components = _ordered_components(graph)
@@ -1949,6 +1964,9 @@ class Model:
 
             operations, owners, dependencies, rhs_required = (
                 compact_ops, compact_owners, compact_deps, compact_rhs)
+            output_nodes = {
+                key: component_of[node] for key, node in output_nodes.items()
+            }
             graph = _dependency_plan(dependencies)
             order, residual = list(graph.order), graph.residual
             if residual:
@@ -1969,6 +1987,9 @@ class Model:
         self._plan_dependencies = tuple(
             tuple(position[d] for d in sorted(dependencies[i])) for i in order
         )
+        self._output_plan_nodes = {
+            key: position[node] for key, node in output_nodes.items()
+        }
         self.algebraic_loops = tuple(
             operations[i][1] for i in order if operations[i][0] == "algebraic"
         )
@@ -1981,6 +2002,53 @@ class Model:
                     or any(dependency in affected for dependency in self._plan_dependencies[i])):
                 affected.add(i)
         self._zoh_plan = tuple(sorted(affected))
+
+    def _operation_closure(self, seeds: Sequence[int]) -> tuple[int, ...]:
+        """Return plan operations required by ``seeds``, in execution order."""
+        needed = set(seeds)
+        pending = list(needed)
+        while pending:
+            for dependency in self._plan_dependencies[pending.pop()]:
+                if dependency not in needed:
+                    needed.add(dependency)
+                    pending.append(dependency)
+        return tuple(sorted(needed))
+
+    def output_evaluator(
+        self, requirements: Sequence[tuple[Any, str]],
+    ) -> Callable[[float, NDArray[np.float64]], None]:
+        """Compile the minimal output plan producing the requested public fields."""
+        nodes = []
+        for subsystem, field in requirements:
+            node = self._output_plan_nodes.get((id(subsystem), field))
+            if node is None:
+                if subsystem.output is subsystem.state and hasattr(subsystem.output, field):
+                    continue
+                name = next((name for name, item in zip(self.names, self.subsystems)
+                             if item is subsystem), None)
+                if name is None:
+                    raise KeyError("an output requirement is not a model subsystem") from None
+                raise KeyError(f"{name}.output.{field}: no output producer")
+            nodes.append(node)
+        selected = self._operation_closure(nodes)
+        env: dict[str, Any] = {}
+        emitter = _PlanCodeEmitter(env)
+        load = [
+            emitter.put(
+                state, name,
+                f"complex(v[{index}], v[{index + 1}])" if complex_value else f"v[{index}]",
+            )
+            for state, name, index, complex_value in self._state_ops
+        ]
+        plan = [
+            line
+            for index in selected
+            for line in emitter.operation(self._plan[index])
+        ]
+        _compile_straight_line(
+            env, "<peslite selected outputs>", (("evaluate(t, v)", [*load, *plan]),)
+        )
+        return env["evaluate"]
 
     def _compile(self) -> None:
         """Generate and compile ``_load``, ``_outputs``, ``rhs_list`` (source in ``compiled_source``)."""
@@ -2074,19 +2142,9 @@ class Model:
             if any(st is m.state for m in members):
                 mask[idx:idx + (2 if is_c else 1)] = True
 
-        def closure(seeds):
-            needed = set(seeds)
-            pending = list(needed)
-            while pending:
-                for dep in self._plan_dependencies[pending.pop()]:
-                    if dep not in needed:
-                        needed.add(dep)
-                        pending.append(dep)
-            return tuple(self._plan[i] for i in sorted(needed))
-
         member_ops = [i for i, (owners, _) in enumerate(self._plan_owners)
                       if any(id(owner) in member_ids for owner in owners)]
-        plan = closure(member_ops)
+        plan = tuple(self._plan[i] for i in self._operation_closure(member_ops))
         own = tuple(item for item, (owners, srcs) in zip(self._plan, self._plan_owners)
                     if any(id(owner) in member_ids for owner in owners)
                     and (item[0] in ("output", "algebraic")
@@ -2097,7 +2155,7 @@ class Model:
                     and any(id(x) not in member_ids for x in srcs)]
         inputs = tuple(self._plan[i] for i in boundary)
         # only the stages producing boundary signals
-        feed = closure(boundary)
+        feed = tuple(self._plan[i] for i in self._operation_closure(boundary))
         rhs = tuple((sub, entries) for sub, entries in self._rhs_layout if entries and id(sub) in member_ids)
         return GroupPlan(tuple(members), mask, plan, own, feed, inputs, rhs)
 

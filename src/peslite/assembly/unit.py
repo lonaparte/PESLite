@@ -72,6 +72,11 @@ class Plant:
             self._sync_zoh(t)
         self.zoh_changed = False
 
+    def selected_outputs(self, t: float, evaluate: Callable) -> None:
+        """Evaluate a selected output closure unless the full plant is already synchronized."""
+        if self._synced_at != t:
+            evaluate(t, self.state)
+
     def hold(self, label: str, value: Any, t: float | None = None) -> None:
         changed = self.model.set_zoh_input(label, value, t)
         if changed:
@@ -407,14 +412,18 @@ class Unit(ABC):
         sync = initial_sync() if initial_sync is not None else (None, None)
         self._begin_sampled(t, plant, sync, continued, window_given)
 
+    def protection_due(self, t: float) -> bool:
+        """Whether fast protection observes this physical boundary."""
+        return not self.tripped and (
+            self.clock.due(t, self._clock_index)
+            if self.continuous else self.bridge.fast_edge(t)
+        )
+
     def protect(self, t: float, plant: Plant) -> bool:
         """Run the common fast over-current path at a physical bridge edge or a continuous
         unit's own protection clock."""
-        due = (self.clock.due(t, self._clock_index) if self.continuous
-               else self.bridge.fast_edge(t))
-        if self.tripped or not due:
+        if not self.protection_due(t):
             return False
-        plant.outputs(t)
         if not self.protection.check_fast(t, self._protection_currents()):
             return False
         event = self.protection.trip
@@ -589,6 +598,10 @@ class Unit(ABC):
     @abstractmethod
     def _protection_currents(self) -> tuple[float, ...]:
         """Return instantaneous physical currents used by fast protection."""
+
+    def protection_dependencies(self) -> tuple[tuple[Port, str], ...]:
+        """Physical port quantities required before fast protection reads its currents."""
+        return ()
 
     @abstractmethod
     def _control_measurement(self, sample: ADCSample) -> Any:
@@ -1068,7 +1081,14 @@ class DCConverter(Unit):
         return self.power_measurement, "current", -1.0
 
     def _protection_currents(self) -> tuple[float, ...]:
-        return (self._current(),)
+        current = (
+            self.branch_f.state.i if self.branch_f is not None
+            else -self.bridge.power_port.current
+        )
+        return (current,)
+
+    def protection_dependencies(self) -> tuple[tuple[Port, str], ...]:
+        return (() if self.branch_f is not None else ((self.bridge.power_port, "current"),))
 
     def _control_measurement(self, sample: ADCSample) -> ConverterMeasurement:
         values = sample.values

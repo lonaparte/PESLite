@@ -500,8 +500,23 @@ def _symbolic_solve(matrix: Sequence[Sequence[Any] | Mapping[int, Any]], right: 
     return solution
 
 
-def _symbolic_source(expressions: Sequence[Any]) -> tuple[list[str], tuple[str, ...]]:
-    """Render expression DAGs with shared non-leaf nodes evaluated once."""
+def _symbolic_source(
+    expressions: Sequence[Any], *, language: str = "python",
+) -> tuple[list[str], tuple[str, ...]]:
+    """Render one expression DAG for Python or generated C++ equations."""
+    if language not in ("python", "cpp"):
+        raise ValueError("a symbolic-expression language must be python or cpp")
+
+    def literal(value: Any) -> str:
+        value = value.item() if isinstance(value, np.generic) else value
+        if language == "python":
+            return repr(value)
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, complex):
+            return f"Complex{{{value.real!r}, {value.imag!r}}}"
+        return repr(value)
+
     uses: dict[_Symbolic, int] = {}
 
     def count(value: Any) -> None:
@@ -540,26 +555,32 @@ def _symbolic_source(expressions: Sequence[Any]) -> tuple[list[str], tuple[str, 
                 lines.append(f"{name} = {render(argument, argument)}")
         if value.operation == "linear":
             constant, terms = value.arguments
-            parts = ([] if _zero(constant) else [_literal(constant)])
+            parts = ([] if _zero(constant) else [literal(constant)])
             for coefficient, term in terms:
                 expression = render(term)
                 parts.append(expression if _one(coefficient) else
                              f"(-({expression}))" if _minus_one(coefficient) else
-                             f"({_literal(coefficient)} * {expression})")
+                             f"({literal(coefficient)} * {expression})")
             return "(" + " + ".join(parts) + ")"
         arguments = tuple(render(argument) for argument in value.arguments)
         if value.operation == "neg":
             return f"(-({arguments[0]}))"
         if value.operation == "abs":
-            return f"abs({arguments[0]})"
+            return f"{'std::abs' if language == 'cpp' else 'abs'}({arguments[0]})"
         if value.operation in ("real", "imag"):
-            return f"({arguments[0]}).{value.operation}"
+            return (f"std::{value.operation}({arguments[0]})" if language == "cpp"
+                    else f"({arguments[0]}).{value.operation}")
         if value.operation in ("max", "min"):
-            return f"{value.operation}({arguments[0]}, {arguments[1]})"
+            prefix = "std::" if language == "cpp" else ""
+            return f"{prefix}{value.operation}({arguments[0]}, {arguments[1]})"
         if value.operation == "select":
-            return f"({arguments[1]} if {arguments[0]} else {arguments[2]})"
+            return (f"(({arguments[0]}) ? ({arguments[1]}) : ({arguments[2]}))"
+                    if language == "cpp" else
+                    f"({arguments[1]} if {arguments[0]} else {arguments[2]})")
         if value.operation in ("and", "or"):
-            return f"({arguments[0]} {value.operation} {arguments[1]})"
+            operation = ({"and": "&&", "or": "||"}[value.operation]
+                         if language == "cpp" else value.operation)
+            return f"({arguments[0]} {operation} {arguments[1]})"
         return f"({arguments[0]} {value.operation} {arguments[1]})"
 
     results = tuple(render(expression) for expression in expressions)
@@ -905,6 +926,12 @@ class Transformer(Element):
         self.ports, self.name, self.N = ((p_a, p_b), (s_a, s_b)), name, N
         self.shape, self.current_scale = (dp, ds), scale_p / scale_s
         self.constant = None if callable(N) else self._ratio(N)
+        guaranteed_range = getattr(N, "guaranteed_range", None)
+        if bounds is not None and guaranteed_range is not None:
+            raise ValueError(f"{self.name}: transformer bounds are declared twice")
+        if guaranteed_range is not None:
+            bounds = guaranteed_range
+        self.range_guaranteed = self.constant is not None or guaranteed_range is not None
         if bounds is None:
             self.bounds = ((self.constant, self.constant)
                            if self.constant is not None else None)
@@ -2178,7 +2205,7 @@ class Topology:
     ) -> Optional[tuple[object, float]]:
         """Return the structure's spectral bound when its ratio range covers ``ratios``."""
         for transformer, ratio in zip(self._store[0]._transformers, ratios):
-            if not transformer.within_bounds(ratio):
+            if not transformer.range_guaranteed and not transformer.within_bounds(ratio):
                 return None
         return self._ratio_range_spectral_bound()
 

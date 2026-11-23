@@ -8,7 +8,7 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from ..components.network import ELEMENT_TYPES, GROUND, Port, resolve_endpoints
 from ..components.passive import Bus, RCNode, RLBranch
@@ -605,6 +605,21 @@ class System:
             circuit_model, subsystems, connections, zoh, bus_ports, declarations
         )
         self.circuits = () if circuit is None else (circuit,)
+        protection_outputs = []
+        for unit in self.units.values():
+            for port, quantity in unit.protection_dependencies():
+                matches = tuple(
+                    dependency
+                    for owner in self.circuits
+                    if (dependency := owner.port_output_dependency(port, quantity)) is not None
+                )
+                if len(matches) != 1:
+                    raise ConfigError(
+                        f"unit {unit.name!r}: fast-protection {quantity} must belong to "
+                        "exactly one assembled circuit"
+                    )
+                protection_outputs.extend(matches)
+        self.protection_outputs = tuple(dict.fromkeys(protection_outputs))
         active_transitions = []
         for source, consumer in transition_bindings:
             owners = [candidate for candidate in self.circuits
@@ -737,46 +752,56 @@ class System:
             (breaker.close_breaker if on else breaker.open_breaker)()
 
     def apply(self, change: Change) -> None:
-        """Write one checked event's parameters and connection commands through existing owners."""
-        p, done, connections_changed, network_changed = change.params, set(), False, False
-        for path in change.paths:
-            if path in change.connections:
-                self.switch(path.removesuffix(".connected"), change.values[path], change.t, change.ramp)
-                connections_changed = True
-                continue
-            section, name, _ = _split_path(self.p, path)
-            if (section, name) in done:
-                continue
-            done.add((section, name))
-            if section == "buses":
-                network_changed |= self.buses[name].retune(
-                    p.buses[name].c, p.buses[name].r_d
-                )
-            elif section == "branches":
-                network_changed |= self.branches[name].retune(
-                    p.branches[name].l, p.branches[name].r
-                )
-            elif section == "sources":
-                network_changed |= self.sources[name].retune(
-                    p.sources[name], change.touches(f"sources.{name}."), change.t)
-            elif section == "units":
-                network_changed |= self.units[name].retune(
-                    p.unit(name), change.touches(f"units.{name}."), change.t)
-            elif section == "elements":
-                result = self.named_elements[name].retune(p.elements[name])
-                if not isinstance(result, bool):
-                    raise TypeError(
-                        f"element {name!r} retune() must return whether the network changed"
+        """Apply one checked event through the common boundary transaction."""
+        self.apply_changes((change,), change.t)
+
+    def apply_changes(self, changes: Sequence[Change], boundary: float) -> None:
+        """Apply ordered declarative changes and publish their shared physical boundary once."""
+        touched = connections_changed = network_changed = False
+        for change in changes:
+            p, done = change.params, set()
+            for path in change.paths:
+                if path in change.connections:
+                    self.switch(
+                        path.removesuffix(".connected"), change.values[path],
+                        change.t, change.ramp,
                     )
-                network_changed |= result
+                    connections_changed = True
+                    continue
+                section, name, _ = _split_path(self.p, path)
+                if (section, name) in done:
+                    continue
+                done.add((section, name))
+                if section == "buses":
+                    network_changed |= self.buses[name].retune(
+                        p.buses[name].c, p.buses[name].r_d
+                    )
+                elif section == "branches":
+                    network_changed |= self.branches[name].retune(
+                        p.branches[name].l, p.branches[name].r
+                    )
+                elif section == "sources":
+                    network_changed |= self.sources[name].retune(
+                        p.sources[name], change.touches(f"sources.{name}."), change.t)
+                elif section == "units":
+                    network_changed |= self.units[name].retune(
+                        p.unit(name), change.touches(f"units.{name}."), change.t)
+                elif section == "elements":
+                    result = self.named_elements[name].retune(p.elements[name])
+                    if not isinstance(result, bool):
+                        raise TypeError(
+                            f"element {name!r} retune() must return whether the network changed"
+                        )
+                    network_changed |= result
+            touched |= bool(done)
         if network_changed:
             for circuit in self.circuits:
                 circuit.build()
             model = self.model
             model.energy_specs = {name: spec_of(subsystem)
                                   for name, subsystem in zip(model.names, model.subsystems)}
-        if done or connections_changed:
-            self.reconcile_circuits(change.t)
+        if touched or connections_changed:
+            self.reconcile_circuits(boundary)
 
     def reconcile_circuits(self, t: float) -> None:
         """Commit all electrical command changes at one physical event boundary."""

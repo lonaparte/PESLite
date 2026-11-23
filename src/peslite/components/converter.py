@@ -15,7 +15,7 @@ from numpy.typing import NDArray
 from ..control.blocks import A120, phases, smoothstep
 from ..solver.energy import Port, StoragePort
 from ..solver.model import (Bag, ConfigError, Empty, LocatedZero, OutputMethod, _real,
-                            _record_fields)
+                            _record_fields, _record_type)
 from ..solver.timing import TIME_EPS, PeriodicClock
 from .network import NetworkComponent
 from .passive import RCNode
@@ -31,7 +31,7 @@ __all__ = ["ThreePhaseBridge", "SwitchingModel", "PWMAveragingModel", "Averaging
 def _extend_record(record: Bag, *names: str) -> Bag:
     """Copy one converter record with additional output fields."""
     fields = _record_fields(record)
-    return type(type(record).__name__, (Bag,), {"__slots__": (*fields, *names)})(
+    return _record_type(type(record).__name__, (*fields, *names))(
         **{name: getattr(record, name) for name in fields}
     )
 

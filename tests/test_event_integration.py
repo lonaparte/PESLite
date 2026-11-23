@@ -233,6 +233,42 @@ def test_registered_custom_event_runs_once_at_its_exact_time(monkeypatch, tmp_pa
     assert runs == [("mark", event_t)]
 
 
+def test_same_boundary_parameter_events_publish_one_circuit_rebuild(monkeypatch, tmp_path):
+    event_t = 0.000137
+    p = _gfl(
+        **{"simulation.t_end": 0.0003},
+        **_set("resistance", event_t, **{"sources.grid.r_pu": 0.08}),
+        **_set("inductance", event_t, **{"sources.grid.x_pu": 0.5}),
+    )
+    simulation = peslite.Simulation(p)
+    circuit, = simulation.system.circuits
+    builds, reconciled = 0, []
+    build = circuit.build
+    reconcile = simulation.system.reconcile_circuits
+
+    def counted_build():
+        nonlocal builds
+        builds += 1
+        build()
+
+    def counted_reconcile(t):
+        reconciled.append(t)
+        reconcile(t)
+
+    monkeypatch.setattr(circuit, "build", counted_build)
+    monkeypatch.setattr(simulation.system, "reconcile_circuits", counted_reconcile)
+    simulation.run(out_dir=tmp_path)
+
+    assert builds == 1
+    assert reconciled.count(event_t) == 1
+    assert simulation.system.sources["grid"].branch.R == pytest.approx(
+        2.0 * _gfl().sources["grid"].r
+    )
+    assert simulation.system.sources["grid"].branch.L == pytest.approx(
+        1.25 * _gfl().sources["grid"].l
+    )
+
+
 def test_event_variable_bindings_are_resolved_before_the_run(monkeypatch, tmp_path):
     from peslite.assembly import params
 

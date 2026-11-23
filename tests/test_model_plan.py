@@ -42,6 +42,13 @@ def test_record_fields_have_one_ordered_contract_for_fixed_and_dynamic_records()
     assert kernel._public_fields(dynamic) == ("first",)
 
 
+def test_dynamic_record_types_are_shared_only_for_the_same_semantic_layout():
+    first = kernel._record_type("_Record", ("x", "y"))
+    assert kernel._record_type("_Record", ("x", "y")) is first
+    assert kernel._record_type("_Record", ("x",)) is not first
+    assert kernel._record_type("_OtherRecord", ("x", "y")) is not first
+
+
 def test_residual_components_exclude_blocked_downstream_nodes_from_the_loop():
     dependencies = [set(), {0}, {1, 3}, {2}, {3}, {4}, set(), {7}]
     successors = _successors(dependencies)
@@ -311,6 +318,25 @@ def test_held_input_refresh_uses_the_same_dependency_plan(cyclic):
     assert driven.output.x == pytest.approx(expected)
     assert consumer.output.x == pytest.approx(1.0 + 0.5 * expected)
     assert independent.calls == calls
+
+
+@pytest.mark.parametrize("cyclic", [False, True])
+def test_selected_output_evaluator_uses_the_common_dependency_closure(cyclic):
+    source, consumer, unrelated = (_Feedthrough() for _ in range(3))
+    connections = {(consumer, "x"): (source, "x")}
+    if cyclic:
+        connections[(source, "feedback")] = source, "x"
+    model = Model(
+        {"source": source, "consumer": consumer, "unrelated": unrelated},
+        connections,
+    )
+
+    evaluate = model.output_evaluator(((consumer, "x"),))
+    evaluate(0.0, ())
+
+    assert source.calls >= 1
+    assert consumer.calls == 1
+    assert unrelated.calls == 0
 
 
 def test_held_numpy_scalars_enter_the_generated_equations_as_python_scalars():

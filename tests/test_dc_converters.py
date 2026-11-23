@@ -234,6 +234,22 @@ def test_dc_converter_is_an_open_unit_connected_through_the_common_terminal_api(
     assert isinstance(unit.ctrl.graph.nodes["InductorCurrentControl"], InductorCurrentControl)
 
 
+def test_unfiltered_dc_protection_uses_the_assembled_port_output_plan():
+    tree = to_dict(_case(model="switching", t_end=0.0001))
+    tree["units"]["converter"].pop("filter")
+    tree["units"]["converter"].pop("bus")
+    system = peslite.System(from_dict(tree))
+    unit = system.units["converter"]
+
+    assert unit.branch_f is None
+    assert system.protection_outputs == (
+        system.circuits[0].port_output_dependency(unit.bridge.power_port, "current"),
+    )
+    evaluator = system.model.output_evaluator(system.protection_outputs)
+    evaluator(0.0, system.model.get_initial_values())
+    assert np.isfinite(unit.bridge.power_port.current)
+
+
 def test_dc_converter_si_model_is_independent_of_the_optional_ac_base(tmp_path):
     configured = _case(t_end=0.0002)
     dc_only = _case(t_end=0.0002, ac_base=False)

@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from peslite.assembly.cpp import _Expression, _ModelGenerator
+from peslite.solver.netlist import _Symbolic, _symbolic_source
 from test_cpp_export import _compiler
 
 pytestmark = pytest.mark.long
@@ -43,6 +44,14 @@ int main() {
                    check=True, capture_output=True, text=True, timeout=60)
     result = subprocess.run([str(binary)], check=True, capture_output=True, text=True, timeout=10)
     return [[float(value) for value in row.split()] for row in result.stdout.splitlines()]
+
+
+def _symbolic_function(name, expression):
+    shared, (result,) = _symbolic_source((expression,), language="cpp")
+    declarations = [f"const auto {line};" for line in shared]
+    return f"double {name}(double input_value) {{\n" + "\n".join(
+        (*declarations, f"return {result};")
+    ) + "\n}"
 
 
 def test_shared_expressions_keep_linear_work_and_guarded_evaluation(tmp_path):
@@ -103,6 +112,25 @@ def test_shared_expressions_keep_linear_work_and_guarded_evaluation(tmp_path):
     assert rows[3][0] == pytest.approx(1.0 / 6.0)
     assert rows[4] == [7.0, 0.0]
     assert rows[5] == [3.0, 2.0]
+
+
+def test_shared_symbolic_dag_generates_valid_cpp_for_scalar_operations(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    value = _Symbolic.value("input_value")
+    complex_value = _Symbolic.value("Complex{input_value, 2.0}")
+    condition = (value > 0.0) | (value < -2.0)
+    expression = np.where(
+        condition,
+        np.maximum(2.0 * value, 1.0),
+        np.minimum(complex_value.real + complex_value.imag, 4.0),
+    )
+    rows = _rows(
+        tmp_path, compiler, (_symbolic_function("dag", expression),),
+        'for (double value : {-1.0, 0.25, 2.0}) std::cout << dag(value) << "\\n";\n',
+    )
+    assert rows == [[1.0], [1.0], [4.0]]
 
 
 def test_guarded_terms_are_set_up_on_the_branch_that_uses_them(tmp_path):

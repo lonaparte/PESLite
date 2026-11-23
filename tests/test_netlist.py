@@ -11,8 +11,8 @@ from scipy.linalg import expm
 
 import peslite
 from conftest import EXAMPLES, QUIET
-from peslite.assembly.circuit import (Circuit, NetworkView, _live_statements, _ModeStructure,
-                                      bind_device, compile_network)
+from peslite.assembly.circuit import (Circuit, NetlistBuilder, NetworkView, _live_statements,
+                                      _ModeStructure, bind_device, compile_network)
 from peslite.components.source import ACVoltageSource
 from peslite.solver import FixedStepSolver
 from peslite.solver import netlist as nl
@@ -81,6 +81,30 @@ def test_symbolic_solve_propagates_varying_entries_through_elimination():
     source = "\n".join((*shared, *expressions))
     assert "third / parameter" in source
     assert "/ (1 + (-(ratio)))" not in source
+
+
+def test_symbolic_dag_renders_backend_specific_scalar_operations():
+    x, y, z = (nl._Symbolic.value(name) for name in ("x", "y", "z"))
+    condition = (x < y) & (y <= 3.0)
+    expressions = (
+        (x + 2.0) * y / 3.0,
+        np.maximum(x, y),
+        np.minimum(x, y),
+        np.where(condition, x, y),
+        z.real + z.imag,
+    )
+    python_shared, python_results = nl._symbolic_source(expressions)
+    cpp_shared, cpp_results = nl._symbolic_source(expressions, language="cpp")
+
+    namespace = {"x": 1.0, "y": 2.0, "z": 3.0 + 4.0j}
+    exec("\n".join(python_shared), {}, namespace)
+    assert tuple(eval(value, {}, namespace) for value in python_results) == pytest.approx(
+        (2.0, 2.0, 1.0, 1.0, 7.0)
+    )
+    cpp = "\n".join((*cpp_shared, *cpp_results))
+    assert "std::max" in cpp and "std::min" in cpp
+    assert " ? " in cpp and " && " in cpp
+    assert "std::real" in cpp and "std::imag" in cpp
 
 
 def _affine(A, b, initial, t):
@@ -364,6 +388,21 @@ def test_dynamic_transformer_reports_coverage_by_its_declared_ratio_bounds():
     assert transformer.within_bounds(transformer.ratio())
     ratio[0] = 1.1
     assert not transformer.within_bounds(transformer.ratio())
+
+
+def test_coefficient_producer_can_guarantee_its_assembled_range():
+    record = SimpleNamespace(ratio=0.5)
+    source = NetlistBuilder(Netlist("device")).value(
+        record, "ratio", guaranteed_range=(0.0, 1.0),
+    )
+    transformer = Transformer(Node(), None, Node(), None, source)
+
+    assert transformer.range_guaranteed
+    np.testing.assert_allclose(transformer.bounds, (np.array([[0.0]]), np.array([[1.0]])))
+    record.ratio = 2.0
+    assert not transformer.within_bounds(transformer.ratio())
+    with pytest.raises(ValueError, match="declared twice"):
+        Transformer(Node(), None, Node(), None, source, bounds=(0.0, 1.0))
 
 
 def test_custom_ac_waveform_remains_the_source_of_its_declared_netlist():

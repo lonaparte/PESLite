@@ -17,7 +17,7 @@ from ...components.network import (GROUND, Element, NetworkComponent, register_c
                                    resolve_endpoints)
 from ...components.pwm import PhaseClock
 from ...solver import Bag, ConfigError, Empty, OutputMethod, Port, StoragePort
-from ...solver.model import LocatedZero, _real, commutation_tolerance
+from ...solver.model import LocatedZero, _real, _record_type, commutation_tolerance
 
 __all__ = [
     "MagComponent",
@@ -521,14 +521,14 @@ class CoupledCoilsModel(MagComponent):
         self.inductance = self.law.inductance
         self._shapes = self.law.shapes
         self.state_names = tuple(f"i_mode_{index + 1}" for index in range(len(names)))
-        self.state = type("_MagneticState", (Bag,), {"__slots__": self.state_names})(
+        self.state = _record_type("_MagneticState", self.state_names)(
             **dict.fromkeys(self.state_names, 0.0)
         )
         output_names = (
             *tuple(label for name in names for label in (f"i_{name}", f"u_{name}")),
             "copper_loss_W", "core_loss_W", "loss_W",
         )
-        self.output = type("_MagneticOutput", (Bag,), {"__slots__": output_names})(
+        self.output = _record_type("_MagneticOutput", output_names)(
             **dict.fromkeys(output_names, 0.0)
         )
         self.input = _MagneticInput(temperature_K=self.temperature_reference_K)
@@ -761,7 +761,7 @@ class CompensatedLink(MagComponent):
             + self._cap_names + self._scc_names
         )
         self._mode_names = tuple(f"i_mode_{m + 1}" for m in range(n))
-        self.state = type("_LinkState", (Bag,), {"__slots__": self.state_names})()
+        self.state = _record_type("_LinkState", self.state_names)()
         self.storage = (
             tuple(StoragePort(f"i_{side}_comp", sides[side].compensation_inductance,
                               kind="inductor") for side in front)
@@ -781,7 +781,7 @@ class CompensatedLink(MagComponent):
         outputs = ("i_primary", "i_secondary", "i_primary_coil", "i_secondary_coil",
                    *self._coil_outputs, *capacitor_outputs,
                    *(f"{scc.side}_scc_on" for scc in switched))
-        self.output = type("_LinkOutput", (Bag,), {"__slots__": outputs})()
+        self.output = _record_type("_LinkOutput", outputs)()
         self.output_stages = ()
         self.input = Empty()
         self.primary_port = Port(

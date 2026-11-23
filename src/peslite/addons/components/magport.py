@@ -22,6 +22,7 @@ from .magcomponent import (
 from .magcomponent import inductance_modes
 from ...components.network import register_component_type
 from ...solver import Bag, ConfigError, OutputMethod, Port, directional_derivative
+from ...solver.model import _record_type
 
 __all__ = [
     "MAGPORT_FORMAT",
@@ -520,7 +521,7 @@ class MagPortModel(MagComponent):
         if self.internal_state_names and not callable(getattr(law, "derivatives", None)):
             raise TypeError("a stateful magnetic law must define derivatives")
         self.state_names = (*flux_names, *self.internal_state_names)
-        state_type = type("_MagPortState", (Bag,), {"__slots__": self.state_names})
+        state_type = _record_type("_MagPortState", self.state_names)
         self.state = state_type(**{
             **dict.fromkeys(flux_names, 0.0),
             **{name: float(value) for name, value in initial.items()},
@@ -557,8 +558,8 @@ class MagPortModel(MagComponent):
                        (("temperature_K",)
                         if self.temperature_coefficient_per_K != 0.0 else ()))
         output_names = (*current_outputs, *current_rate_outputs, *loss_outputs)
-        input_type = type("_MagPortInput", (Bag,), {"__slots__": input_names})
-        output_type = type("_MagPortOutput", (Bag,), {"__slots__": output_names})
+        input_type = _record_type("_MagPortInput", input_names)
+        output_type = _record_type("_MagPortOutput", output_names)
         self.input = input_type(
             **{**dict.fromkeys(input_names, 0.0),
                "temperature_K": self.temperature_reference_K}

@@ -4252,7 +4252,7 @@ class _ModelGenerator:
             source = self._dynamic_netlist_sources.get(solve_key)
             if source is None:
                 source = self._dynamic_netlist_sources[solve_key] = _symbolic_source(
-                    (*derivative, *output)
+                    (*derivative, *output), language="cpp"
                 )
             values = generated(source)
             count = len(derivative)
@@ -4785,16 +4785,21 @@ class _ModelGenerator:
                         coefficient += len(ratio)
             check = self.model.solver_check
             regions = () if check is None else check.regions(circuit)
+
+            def interval(region, selector):
+                if selector is None:
+                    return None
+                kind, index = selector
+                if kind == "coefficient":
+                    return (None if region.coefficient_guarantees[index]
+                            else region.coefficient_ranges[index])
+                value = float(region.selectors[index])
+                return value, value
+
             regions = tuple(
                 (
                     region.spectral_bound,
-                    tuple(
-                        None if selector is None else
-                        region.coefficient_ranges[selector[1]]
-                        if selector[0] == "coefficient" else
-                        (float(region.selectors[selector[1]]),) * 2
-                        for selector in coverage
-                    ),
+                    tuple(interval(region, selector) for selector in coverage),
                 )
                 for region in regions
                 if all(

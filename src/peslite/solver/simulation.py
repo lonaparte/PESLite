@@ -1001,6 +1001,19 @@ class Simulation:
         if change.params is not None:
             self._parameters = change.params
 
+    def _apply_changes(self, changes, boundary: float) -> None:
+        """Apply ordered changes through one explicit physical-boundary transaction."""
+        changes = tuple(changes)
+        if not changes:
+            return
+        if len(changes) == 1:
+            self._apply_change(changes[0])
+            return
+        self.system.apply_changes(changes, boundary)
+        for change in changes:
+            if change.params is not None:
+                self._parameters = change.params
+
     def _parameter_value(self, path: str, t: float):
         if _connection_variable(self.p, path) is not None:
             return Scenario(self.p.changes, path.removesuffix(".connected"),
@@ -1127,11 +1140,15 @@ class Simulation:
                   for prefix in (f"{name}.ctrl", f"{name}.{unit.bridge.state_prefix}", f"{name}.meas")}
         self._states.load(values, [prefix for prefix, _part in system.state_parts()
                                   if prefix not in timing])
+        initial_changes = []
         for event_t, _, what in self._actions():
             if event_t <= t0 + TIME_EPS:
                 paths = tuple(path for path in what.paths if path not in what.connections)
                 if paths:
-                    self._apply_change(dataclasses.replace(what, paths=paths, connections=()))
+                    initial_changes.append(
+                        dataclasses.replace(what, paths=paths, connections=())
+                    )
+        self._apply_changes(initial_changes, t0)
         # 2. each connection owner establishes its initial command once
         _start_connections(system, self.p, t0)
         # 3. controllers, PWM registers, measurement windows and solver
@@ -1336,6 +1353,11 @@ class Simulation:
         coarse_reported = False
         stopped = False
         sync_if_needed = plant.outputs
+        protection_requirements = getattr(system, "protection_outputs", ())
+        protection_outputs = (
+            mdl.output_evaluator(protection_requirements)
+            if protection_requirements else None
+        )
 
         def snapshot(t_now: float, final: bool = False, record: bool = True,
                      notify: bool = True) -> None:
@@ -1596,14 +1618,19 @@ class Simulation:
                         mdl.set_states(plant.state)
                     else:
                         settle_now()
+                    due = []
                     while actions and actions[0][0] <= t_stop + TIME_EPS:
-                        self._apply_change(actions.popleft()[2])
+                        due.append(actions.popleft()[2])
+                    self._apply_changes(due, t_stop)
                     if parameters_changed is not None:
                         parameters_changed()
                     plant.read_state()
                     plant.inputs_changed = True
                 # Every unit protects first, then every event owner samples before any owner
                 # actuates. Coincident updates are therefore independent of assembly order.
+                if (protection_outputs is not None
+                        and any(unit.protection_due(t_stop) for unit in units)):
+                    plant.selected_outputs(t_stop, protection_outputs)
                 for unit in units:
                     if unit.protect(t_stop, plant):
                         protection_changed = True
