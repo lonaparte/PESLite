@@ -20,6 +20,8 @@ export type PreviewResponse = {
   fields: Field[];
   diagnostics: import('../../preview/types.js').Diagnostic[];
   source?: string;
+  /** Native text drawn for a .cir netlist; its diagnostics are reported on the netlist lines. */
+  nativeSource?: string;
 };
 export type CsvResponse = {
   columns: string[]; rows: (number | string | null)[][];

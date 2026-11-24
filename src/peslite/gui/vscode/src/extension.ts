@@ -7,7 +7,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 interface Message { id: number; method: string; params: Record<string, any> }
 interface FileEdit { start: number; end: number; replacement: string; line: number; column: number }
-const safeSuffix = /\.(pes|yaml|yml|csv|json)$/i;
+const safeSuffix = /\.(pes|cir|yaml|yml|csv|json)$/i;
 
 function python() {
   return vscode.workspace.getConfiguration('peslite').get<string>('pythonPath') || 'python';
@@ -82,7 +82,7 @@ class Runs {
     if (!vscode.workspace.isTrusted) throw new Error('Trust the VS Code workspace to run simulations');
     if (this.process) throw new Error('A simulation is already running');
     const uri = resource(folder, filename);
-    if (!filename.endsWith('.pes')) throw new Error('Select a .pes model');
+    if (!/\.(pes|cir)$/i.test(filename)) throw new Error('Select a .pes or .cir model');
     const addons = [folder.uri.fsPath, path.dirname(uri.fsPath)].some(directory =>
       fs.existsSync(path.join(directory, 'PESaddons')));
     if (addons && !trustAddons) {
@@ -122,7 +122,7 @@ function webviewHtml(panel: vscode.WebviewPanel, context: vscode.ExtensionContex
 
 async function openPreview(context: vscode.ExtensionContext, uri?: vscode.Uri) {
   const target = uri || vscode.window.activeTextEditor?.document.uri;
-  if (!target) throw new Error('Open a .pes, CSV or summary.json file first');
+  if (!target) throw new Error('Open a .pes, .cir, CSV or summary.json file first');
   const folder = folderFor(target);
   const filename = relative(folder, target);
   const layoutKey = `${folder.uri.toString()}\0${filename}`;
@@ -192,7 +192,7 @@ async function openPreview(context: vscode.ExtensionContext, uri?: vscode.Uri) {
         result = await bridge(folder.uri.fsPath, method, params);
       } else if (method === 'run.start') {
         const document = await vscode.workspace.openTextDocument(resource(folder, params.path));
-        if (document.isDirty) throw new Error('Save the .pes document before running a simulation');
+        if (document.isDirty) throw new Error('Save the .pes or .cir document before running a simulation');
         result = runs.start(folder, params.path, params.trustAddons === true);
       } else if (method === 'run.stop') result = runs.stop();
       else if (method === 'run.status') result = runs.status();

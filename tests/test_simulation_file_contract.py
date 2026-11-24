@@ -2,7 +2,7 @@
 
 import pytest
 from conftest import EXAMPLES
-from peslite.assembly.syntax import parse_native_text
+from peslite.assembly.syntax import read_simulation_file
 from peslite import cli
 from peslite.cli import _config_path
 
@@ -11,10 +11,11 @@ pytestmark = pytest.mark.static
 
 def test_bundled_examples_are_native_pes_files():
     paths = {path.name: path for path in EXAMPLES.iterdir() if path.is_file()}
-    assert paths and all(name.endswith("-example.pes") for name in paths)
+    # .pes examples are named *-example.pes; .cir netlist examples use their own names
+    assert paths and all(name.endswith(("-example.pes", ".cir")) for name in paths)
     for path in paths.values():
         assert path.is_file()
-        parameters, interface = parse_native_text(path.read_text(encoding="utf-8"), path)
+        parameters, interface = read_simulation_file(path)
         assert parameters
         assert interface.startswith("@circuit")
 

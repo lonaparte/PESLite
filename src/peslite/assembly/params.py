@@ -1974,7 +1974,7 @@ def read_initial(path: str | Path, t: Optional[float] = None) -> dict:
             if not math.isnan(value):
                 states[name] = value
         return {"t": float(row[0]), "states": states}
-    data = read_tree(path) if path.suffix.lower() == ".pes" else _read(path)
+    data = read_tree(path) if path.suffix.lower() in {".pes", ".cir"} else _read(path)
     if isinstance(data, dict) and isinstance(data.get("simulation"), dict):
         if "initial" not in data["simulation"]:
             raise ConfigError(f"{path}: a simulation file without a simulation.initial section")
@@ -2044,5 +2044,13 @@ def dumps(p: Params, interface_text: str = "") -> str:
 
 
 def dump(p: Params, path: str | Path, interface_text: str = "") -> None:
-    """Write a complete resolved simulation file (see :func:`dumps`)."""
-    Path(path).write_text(dumps(p, interface_text), encoding="utf-8")
+    """Write a complete resolved simulation file (see :func:`dumps`).
+
+    A ``.cir`` path is written as a netlist (see ``assembly.cir``).
+    """
+    if Path(path).suffix.lower() == ".cir":
+        from .cir import write_cir_text
+        text = write_cir_text(_written_out(p), Path(path).stem)
+    else:
+        text = dumps(p, interface_text)
+    Path(path).write_text(text, encoding="utf-8")

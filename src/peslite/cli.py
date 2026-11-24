@@ -46,7 +46,7 @@ def _example_configs_dir() -> Path:
 
 _EXAMPLE_CONFIGS = _example_configs_dir()
 _RESULTS = Path.cwd() / "output"
-_CONFIG_SUFFIXES = (".pes",)
+_CONFIG_SUFFIXES = (".pes", ".cir")
 
 
 def _config_path(value: str | None) -> Path:
@@ -465,14 +465,14 @@ def _open_file(path: Path) -> None:
 def _create_main(argv=None) -> int | _CommandOutcome:
     """Create a simulation file or project add-on from a bundled template."""
     ap = _command_parser(prog="peslite create", description=_create_main.__doc__)
-    ap.add_argument("name", help="file name to create (.pes or .py)")
+    ap.add_argument("name", help="file name to create (.pes, .cir or .py)")
     ap.add_argument("--open", action="store_true",
                     help="open the created file with the configured editor or default application")
     ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
     args = ap.parse_args(argv)
     name = Path(args.name)
-    if name.name != args.name or name.suffix not in {".pes", ".py"}:
-        ap.error("provide a file name ending in .pes or .py in the current directory")
+    if name.name != args.name or name.suffix not in {".pes", ".cir", ".py"}:
+        ap.error("provide a file name ending in .pes, .cir or .py in the current directory")
     target = Path.cwd() / name
     templates = _EXAMPLE_CONFIGS / "templates"
     template = templates / "template.pes"
@@ -491,6 +491,9 @@ def _create_main(argv=None) -> int | _CommandOutcome:
         text = template.read_text(encoding="utf-8")
         for original, replacement in replacements:
             text = text.replace(original, replacement)
+        if name.suffix == ".cir":
+            from .assembly.cir import convert_text
+            text = convert_text(text, name.with_suffix(".pes"))
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("x", encoding="utf-8") as stream:
             stream.write(text)
@@ -866,10 +869,42 @@ def _json_command(command: str, invoke: Callable[[], int | _CommandOutcome]) -> 
     return outcome.code
 
 
+def _convert_main(argv=None) -> int:
+    """Convert between .pes files and .cir netlists."""
+    ap = _command_parser(prog="peslite convert", description=_convert_main.__doc__)
+    ap.add_argument("source", help=".pes or .cir file to read")
+    ap.add_argument("output", nargs="?",
+                    help="file to write (default: the other format next to the source)")
+    ap.add_argument("--json", action="store_true", help="write one machine-readable result object")
+    args = ap.parse_args(argv)
+    from .assembly.cir import convert_text, pes_text, read_cir_text
+    from .assembly.syntax import SimulationFileError
+    source = Path(args.source).expanduser()
+    if source.suffix.lower() not in _CONFIG_SUFFIXES:
+        ap.error("the source must be a .pes or .cir file")
+    output = Path(args.output).expanduser() if args.output else source.with_suffix(
+        ".pes" if source.suffix.lower() == ".cir" else ".cir")
+    if output.suffix.lower() not in _CONFIG_SUFFIXES:
+        ap.error("the output must be a .pes or .cir file")
+    text = source.read_text(encoding="utf-8")
+    try:
+        if output.suffix.lower() == ".cir":
+            result = convert_text(text, source)
+        elif source.suffix.lower() == ".pes":
+            result = text
+        else:
+            result = pes_text(*read_cir_text(text, source))
+    except SimulationFileError as exc:
+        raise ConfigError(str(exc)) from None
+    output.write_text(result, encoding="utf-8")
+    print(f"Wrote {output}")
+    return 0
+
+
 def main(argv=None) -> int:
-    """Create, run, validate, inspect, export or debug a PESLite simulation."""
+    """Create, run, validate, inspect, export, convert or debug a PESLite simulation."""
     values = list(sys.argv[1:] if argv is None else argv)
-    commands = {"run", "create", "validate", "inspect", "export", "debug"}
+    commands = {"run", "create", "validate", "inspect", "export", "debug", "convert"}
     explicit_command = bool(values and values[0] in commands)
     command = values.pop(0) if explicit_command else "run"
     json_output = "--json" in values
@@ -883,6 +918,8 @@ def main(argv=None) -> int:
         invoke = lambda: _create_main(values)
     elif command == "debug":
         invoke = lambda: _debug_main(values)
+    elif command == "convert":
+        invoke = lambda: _convert_main(values)
     else:
         invoke = lambda: _export_main(values)
     if json_output:

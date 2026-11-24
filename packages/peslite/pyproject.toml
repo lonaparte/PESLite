@@ -27,5 +27,5 @@ include = ["peslite.addons*"]
 namespaces = true
 
 [tool.setuptools.data-files]
-"share/peslite/examples" = ["examples/*.pes"]
+"share/peslite/examples" = ["examples/*.pes", "examples/*.cir"]
 "share/peslite/examples/debug" = ["examples/debug/*.pesdbg"]

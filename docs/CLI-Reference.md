@@ -227,6 +227,18 @@ peslite export case.pes all --imperix
 peslite export case.pes all --imperix --imperix-source-only
 ```
 
+## Convert to and from `.cir` netlists
+
+```bash
+peslite convert case.pes            # writes the netlist case.cir
+peslite convert case.cir            # writes case.pes
+peslite convert case.cir other.pes  # chooses the output file
+peslite create case.cir             # a new netlist from the template
+```
+
+Every command that takes a `.pes` file also takes a `.cir` file. See
+[Simulation Files](Simulation-Files.md#cir-netlist-files).
+
 ## Common command patterns
 
 Print a short run with live values:

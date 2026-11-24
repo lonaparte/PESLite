@@ -124,3 +124,50 @@ applicable system or Unit base; do not provide both SI and per-unit forms of one
 
 Each Unit may override `s_base`. Time is in seconds, angles are in radians and ordinary frequency
 fields are in hertz. Switch values accept `0`/`1` or YAML `false`/`true`.
+
+## `.cir` netlist files
+
+A `.cir` file describes the same case as a `.pes` file as a SPICE-style netlist: the topology
+and every device are netlist cards. See `examples/gfl-example2.cir`, the grid-following case of
+`gfl-example.pes`:
+
+```text
+gfl-example2                                       <- title (line 1)
+.options sbase=2.0e6 vbase=690.0 freq=50.0 units=si
+Cpcc pcc 0 c_pu=0.02 r_d_pu=0.5                     <- bus capacitor
+Xgrid pcc 0 source x_pu=0.4 r_pu=0.04               <- source
+Xvsc pcc 0 vsc ac_filter.l_f_pu=0.2 dclink.vdc_ref=1500.0 ...
++ ctrl.type=gfl ctrl.loops.SRFPLL.kp_pu=20.0 ...    <- converter (+ continues a card)
+.event connect_vsc type=connect target=vsc t=0.2 ramp=1.0
+.simulation solver.dt=25e-6 output.record_every=10
+.tran 2.5e-05 3.0
+.end
+```
+
+| Card | Meaning |
+|---|---|
+| line 1 | title |
+| `.options sbase= vbase= freq=` | `base` (`units=pu`: positional R, L, C values in per unit) |
+| `C<bus> <bus> 0 [c] key=value` | bus capacitor and other bus fields; `.bus <name> key=value` for a bus without one |
+| `L<name> <bus1> <bus2> [l] key=value` | series R-L branch (`0` is ground) |
+| `X<name> <bus> 0 <model> key=value` | `source`, a unit type (`vsc`, `dc_converter`, ...) or an element type (`load`, `capacitor`, ...); two-terminal elements use `bus1=` and `bus2=` |
+| `.event <name> key=value` | event |
+| `.signal <name> key=value` | reference signal |
+| `.simulation key=value` | `simulation` settings; `.tran tstep tstop` sets `t_end` |
+| `.meta key=value` | notes |
+| `.param name=value` | constants for `{expression}` values |
+
+Field names are those of a `.pes` file; dotted keys set nested fields
+(`ctrl.loops.SRFPLL.kp_pu=20.0`). Values are numbers (SPICE suffixes such as `1m` and `20k` are
+accepted), words, quoted text, or YAML flow lists and mappings (`[1, 2]`, `{}`). `*` starts a
+comment line, `;` a trailing comment, and `+` continues the previous card. The circuit diagram is
+drawn from the connections.
+
+`peslite convert case.pes` writes `case.cir`, and `peslite convert case.cir` writes `case.pes`.
+Comments and `@` views of a `.pes` file are not kept in the netlist.
+
+A CodeSim netlist (a file without a `.simulation` card) is read with CodeSim's meaning: R, L and C
+cards (a branch to `0` is a load), `Infbus` sources behind one R-L branch, `.param`, `.options`
+and `.tran`. Other CodeSim devices (`GFL_C_F_L`, `GFM_A_C_L`, `SG`, ...), `PWL` references and
+`.subckt`/`.model`/`.include` cards are reported with their line number. CodeSim itself does not
+know the PESLite device models, so a PESLite netlist with `X` device cards does not run in CodeSim.

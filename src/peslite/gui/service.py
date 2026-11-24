@@ -26,7 +26,7 @@ from ..solver.simulation import Simulation, validate_model
 from .descriptor import SignalRecorder, Topology, json_safe, small_signal_descriptor
 from .preview_cache import PreviewLayoutCache
 
-CASE_SUFFIXES = (".pes",)
+CASE_SUFFIXES = (".pes", ".cir")  # a .pes file wins over a .cir file of the same name
 CASES_ENVIRONMENT = "PESLITE_CASES"
 SNAPSHOT_NAME = "gui-snapshot.json"
 # Frontend run options and the parameter path each one sets.
@@ -48,8 +48,9 @@ def discover_cases(root: Path) -> dict[str, Path]:
         if location.is_file():
             files = [location]
         elif location.is_dir():
-            files = sorted(path for path in location.iterdir()
-                           if path.is_file() and path.suffix.lower() in CASE_SUFFIXES)
+            files = sorted((path for path in location.iterdir()
+                            if path.is_file() and path.suffix.lower() in CASE_SUFFIXES),
+                           key=lambda path: (path.stem, CASE_SUFFIXES.index(path.suffix.lower())))
         else:
             continue
         for path in files:
