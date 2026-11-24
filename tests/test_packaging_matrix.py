@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import tomllib
 import yaml
-from scripts.distributions import selections
+from packages.distributions import selections
 
 pytestmark = pytest.mark.static
 

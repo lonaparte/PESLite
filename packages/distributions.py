@@ -9,7 +9,9 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from email.parser import Parser
 from pathlib import Path
+from zipfile import ZipFile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -165,6 +167,85 @@ def build(output: str | Path, *, isolation: bool = True) -> None:
             subprocess.run(command, check=True)
 
 
+def _installed_path(name: str) -> str:
+    """Return the destination represented by a path inside a wheel."""
+    if ".data/" not in name:
+        return name
+    _distribution, relative = name.split(".data/", 1)
+    scheme, separator, path = relative.partition("/")
+    if not separator:
+        return name
+    return path if scheme in {"data", "purelib", "platlib"} else f"{scheme}/{path}"
+
+
+def _wheel(path: Path) -> tuple[str, set[str]]:
+    with ZipFile(path) as archive:
+        names = archive.namelist()
+        metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
+        metadata = Parser().parsestr(archive.read(metadata_name).decode("utf-8"))
+    owned = {_installed_path(name) for name in names if ".dist-info/" not in name}
+    return metadata["Name"], owned
+
+
+def check(directory: str | Path = "dist") -> None:
+    """Validate the built wheel matrix and its disjoint installed ownership."""
+    _groups, distributions = _manifest()
+    expected = set(distributions)
+    root = Path(directory)
+    wheels = dict(_wheel(path) for path in sorted(root.glob("*/*.whl")))
+    if set(wheels) != expected:
+        raise RuntimeError(f"wheel set differs: {sorted(wheels)}")
+    if len(list(root.glob("*/*.tar.gz"))) != len(expected):
+        raise RuntimeError("each distribution must have one source archive")
+    for distribution in expected:
+        artifacts = list((root / distribution).iterdir())
+        if len(artifacts) != 2:
+            raise RuntimeError(f"{distribution} must have one wheel and one source archive")
+
+    names = tuple(expected)
+    for index, left in enumerate(names):
+        for right in names[index + 1:]:
+            overlap = wheels[left] & wheels[right]
+            if overlap:
+                raise RuntimeError(f"{left} and {right} both own {sorted(overlap)}")
+
+    required: dict[str, list[str]] = {
+        "peslite-core": [
+            "peslite/addons/addons.toml",
+            "share/peslite/examples/templates/template.pes",
+        ],
+        "peslite": [
+            "share/peslite/examples/gfl-example.pes",
+            "share/peslite/examples/debug/gfl-debug-example.pesdbg",
+        ],
+        "peslite-gui": [
+            "peslite/gui/legacy_yaml.py",
+            "peslite/gui/host.py",
+            "peslite/gui/service.py",
+            "peslite/gui/web_service.py",
+            "peslite/gui/workspace.py",
+            "peslite/gui/preview/dist/pes-preview.es.js",
+            "peslite/gui/preview/dist/pes-preview.iife.js",
+            "peslite/gui/web_dist/index.html",
+        ],
+        "peslite-full": [],
+    }
+    with ADDON_MANIFEST.open("rb") as stream:
+        addons = tomllib.load(stream)
+    for name, addon in addons.items():
+        distribution = "peslite" if addon["installation"] == "standard" else "peslite-full"
+        required[distribution].extend(
+            f"peslite/addons/{directory}/{name}.py"
+            for field, directory in ADDON_DIRECTORIES.items()
+            if addon[field]
+        )
+    for distribution, paths in required.items():
+        for path in paths:
+            if path not in wheels[distribution]:
+                raise RuntimeError(f"{distribution} does not own {path}")
+    print("validated distributions:", ", ".join(sorted(wheels)))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -175,11 +256,15 @@ def main(argv: list[str] | None = None) -> int:
     build_parser.add_argument("output")
     build_parser.add_argument("--no-isolation", action="store_true")
     commands.add_parser("validate", help="validate the distribution file ownership")
+    check_parser = commands.add_parser("check", help="validate built distribution artifacts")
+    check_parser.add_argument("directory", nargs="?", default="dist")
     args = parser.parse_args(argv)
     if args.command == "stage":
         stage(args.name, args.destination)
     elif args.command == "build":
         build(args.output, isolation=not args.no_isolation)
+    elif args.command == "check":
+        check(args.directory)
     else:
         selections()
     return 0

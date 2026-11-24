@@ -6,7 +6,7 @@ on:
       - ".readthedocs.yaml"
       - "docs/**"
       - "mkdocs.yml"
-      - "scripts/sync_wiki.py"
+      - ".github/sync_wiki.py"
       - ".github/workflows/docs.yml"
   push:
     branches:
@@ -15,7 +15,7 @@ on:
       - ".readthedocs.yaml"
       - "docs/**"
       - "mkdocs.yml"
-      - "scripts/sync_wiki.py"
+      - ".github/sync_wiki.py"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -51,7 +51,7 @@ jobs:
         run: python -m mkdocs build --strict
 
       - name: Validate Wiki rendering
-        run: python scripts/sync_wiki.py "${RUNNER_TEMP}/peslite-wiki"
+        run: python .github/sync_wiki.py "${RUNNER_TEMP}/peslite-wiki"
 
   sync-wiki:
     name: Publish GitHub Wiki
@@ -86,7 +86,7 @@ jobs:
           token: ${{ github.token }}
 
       - name: Render Wiki
-        run: python scripts/sync_wiki.py .wiki
+        run: python .github/sync_wiki.py .wiki
 
       - name: Commit and push Wiki changes
         working-directory: .wiki

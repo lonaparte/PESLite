@@ -212,13 +212,13 @@ jobs:
           python -m pip install build twine
 
       - name: Build wheels and source distributions
-        run: python scripts/distributions.py build dist
+        run: python packages/distributions.py build dist
 
       - name: Check distribution metadata
         run: python -m twine check dist/*/*
 
       - name: Check distribution ownership
-        run: python scripts/check_distributions.py dist
+        run: python packages/distributions.py check dist
 
       - name: Show distributions
         run: find dist -maxdepth 2 -type f -print

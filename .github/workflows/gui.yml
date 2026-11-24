@@ -8,8 +8,8 @@ on:
       - "src/peslite/addons/functions/__init__.py"
       - "src/peslite/addons/functions/legacy_yaml.py"
       - "packages/distributions.json"
-      - "packages/gui/pyproject.toml"
-      - "scripts/distributions.py"
+      - "packages/gui/**"
+      - "packages/distributions.py"
       - "tests/test_gui_*.py"
       - ".github/workflows/gui.yml"
   push:
@@ -20,8 +20,8 @@ on:
       - "src/peslite/addons/functions/__init__.py"
       - "src/peslite/addons/functions/legacy_yaml.py"
       - "packages/distributions.json"
-      - "packages/gui/pyproject.toml"
-      - "scripts/distributions.py"
+      - "packages/gui/**"
+      - "packages/distributions.py"
       - "tests/test_gui_*.py"
       - ".github/workflows/gui.yml"
   workflow_dispatch:
@@ -90,7 +90,7 @@ jobs:
         run: npm run package
 
       - name: Validate distribution ownership
-        run: python scripts/distributions.py validate
+        run: python packages/distributions.py validate
 
       - name: Verify generated GUI assets
         run: |
