@@ -1,0 +1,12 @@
+Infinite bus feeding an RL load through a line (plain CodeSim netlist)
+* PESLite imports the R, L, C and Infbus cards of a CodeSim netlist.
+.options sbase=1meg vbase=400 freq=50 units=si
+.param lline=1m
+Xgrid inf 0 Infbus Aref=1
+Lgrid inf pcc {lline/2} R=0.01   ; source impedance
+Rline pcc load 0.05
+Lline pcc load 2m
+C1 pcc 0 100u
+Lrl load 0 5m R=1.5
+.tran 0.1m 0.05
+.end

@@ -83,8 +83,10 @@ function GraphPane({ text, path, response, operations, layout, onLayout, onSelec
         diagnostics: response.diagnostics,
       });
     } else {
-      const parsed = parsePES(text);
-      const model = operations?.length ? debugModel(parsed, operations) : parsed;
+      const netlist = response.nativeSource !== undefined;
+      const parsed = parsePES(response.nativeSource ?? text);
+      const drawn = netlist ? { ...parsed, diagnostics: [] } : parsed;
+      const model = operations?.length ? debugModel(drawn, operations) : drawn;
       const host = response.source === text ? response.diagnostics : [];
       const lines = new Set(model.diagnostics.map(item => item.range.start.line));
       preview.current.updateModel({
@@ -164,7 +166,7 @@ export function App() {
   currentText.current = text;
   const kind = path.toLowerCase().endsWith('.csv') ? 'csv'
     : path.toLowerCase().endsWith('summary.json') ? 'summary'
-    : path.toLowerCase().endsWith('.pes') ? 'pes'
+    : /\.(pes|cir)$/i.test(path) ? 'pes'
     : path.toLowerCase().endsWith('.pesdbg') ? 'debug' : 'text';
   const isPes = !!path && kind === 'pes';
   const isDebug = !!path && kind === 'debug';
@@ -191,7 +193,7 @@ export function App() {
       } else {
         const [content, saved] = await Promise.all([
           request<TextFile>('file.read', { path: selectedPath }),
-          selectedPath.toLowerCase().endsWith('.pes')
+          /\.(pes|cir)$/i.test(selectedPath)
             ? request<{ layout: PreviewLayout }>('preview.layout.load', { path: selectedPath })
             : Promise.resolve({ layout: emptyLayout() }),
         ]);
@@ -432,7 +434,7 @@ export function App() {
   async function execute() {
     if (!isPes && !isDebug) return;
     if (dirty || (file && text !== file.text)) {
-      setError('Save your .pes source before running the CLI.'); return;
+      setError('Save your .pes or .cir source before running the CLI.'); return;
     }
     try {
       setError(''); setShowOutput(true);
@@ -520,7 +522,7 @@ export function App() {
       </aside>}
       <main className="content">
         <div className="document-bar">
-          <strong>{path || (inVSCode ? 'Select a .pes document in the editor' : 'Select a file')}</strong>
+          <strong>{path || (inVSCode ? 'Select a .pes or .cir document in the editor' : 'Select a file')}</strong>
           {(isPes || isDebug) && !inVSCode && <div className="tabs">{(['diagram', 'source', 'split'] as const)
             .map(value => <button key={value} className={tab === value ? 'active' : ''}
               onClick={() => setTab(value)}>{value}</button>)}</div>}
@@ -608,7 +610,7 @@ export function App() {
           <pre>{JSON.stringify(summary.summary, null, 2)}</pre>
         </section>}
         {!path && <div className="welcome"><h2>File-backed simulation workspace</h2>
-          <p>Select a .pes file to edit the original YAML or inspect its circuit. CSV and JSON results can be opened without rerunning.</p></div>}
+          <p>Select a .pes or .cir file to edit the original YAML or inspect its circuit. CSV and JSON results can be opened without rerunning.</p></div>}
         {run && (run.running || run.log || showOutput) && <section className="run-output">
           <div className="section-header"><h3>CLI · {run.running ? 'running' : `exit ${run.exitCode ?? '—'}`}</h3>
             <button onClick={() => setShowOutput(!showOutput)}>{showOutput ? 'Hide' : 'Show'}</button></div>

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added `.cir` netlist simulation files: R, L, C cards for the network and `X` cards for
+  PESLite sources, converters and elements, with dotted keys for nested parameters. `.cir` files
+  run, validate and preview wherever `.pes` files do, CodeSim netlists of R, L, C and `Infbus`
+  cards are imported, and `peslite convert` converts between the formats
+  (`examples/gfl-example2.cir`).
 - Behavioral electrical sources now carry total-rate declarations into the netlist. Stateful
   black boxes and nonlinear magnetic laws therefore retain series-inductor and parallel-capacitor
   dynamics instead of treating a recorded source value as constant in time.

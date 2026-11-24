@@ -27,8 +27,8 @@ def _debug_model(workspace: Workspace, path: Path, plan: Any) -> tuple[Path, str
     if not model.is_absolute():
         model = path.parent / model
     model = model.resolve()
-    if not model.is_relative_to(workspace.root) or model.suffix != ".pes":
-        raise WorkspaceError("the debug model must be a .pes file inside the workspace")
+    if not model.is_relative_to(workspace.root) or model.suffix not in {".pes", ".cir"}:
+        raise WorkspaceError("the debug model must be a .pes or .cir file inside the workspace")
     return model, model.relative_to(workspace.root).as_posix()
 
 
@@ -36,8 +36,14 @@ def _native_preview(text: str, path: Path) -> dict[str, Any]:
     """Return diagnostics from the numerical parser; the browser renders the interface."""
     from ..assembly.syntax import SimulationFileError, parse_native_text
     diagnostics = []
+    native = None
     try:
-        parse_native_text(text, path)
+        if Path(path).suffix == ".cir":
+            # a netlist has no @views: the browser draws a generated native equivalent
+            from ..assembly.cir import pes_text, read_cir_text
+            native = pes_text(*read_cir_text(text, path))
+        else:
+            parse_native_text(text, path)
     except SimulationFileError as exc:
         line, column = exc.line or 1, exc.column or 1
         diagnostics.append({
@@ -45,8 +51,11 @@ def _native_preview(text: str, path: Path) -> dict[str, Any]:
             "range": {"start": {"line": line, "column": column},
                       "end": {"line": line, "column": column + 1}},
         })
-    return {"format": "native", "model": None, "fields": [],
-            "diagnostics": diagnostics, "source": text}
+    result = {"format": "native", "model": None, "fields": [],
+              "diagnostics": diagnostics, "source": text}
+    if Path(path).suffix == ".cir":
+        result["nativeSource"] = native or "@circuit\n"
+    return result
 
 
 class SimulationProcess:
@@ -61,9 +70,9 @@ class SimulationProcess:
         self._lock = threading.RLock()
 
     def start(self, name: str, *, trust_addons: bool = False) -> dict:
-        path = self.workspace.path(name, suffixes={".pes", ".pesdbg"})
+        path = self.workspace.path(name, suffixes={".pes", ".cir", ".pesdbg"})
         if not path.is_file():
-            raise WorkspaceError("select an existing .pes or .pesdbg file")
+            raise WorkspaceError("select an existing .pes, .cir or .pesdbg file")
         model = path
         command = [self.python, "-m", "peslite.cli"]
         if path.suffix == ".pesdbg":
@@ -181,9 +190,9 @@ class Host:
                 "watch": list(prepared.watch),
             }
         if method in {"preview.layout.load", "preview.layout.save"}:
-            target = self.files.path(name, suffixes={".pes"})
+            target = self.files.path(name, suffixes={".pes", ".cir"})
             if not target.is_file():
-                raise WorkspaceError("preview layout requires an existing .pes file")
+                raise WorkspaceError("preview layout requires an existing .pes or .cir file")
             if method == "preview.layout.load":
                 return {"layout": self.preview_cache.load(name)}
             return {"layout": self.preview_cache.save(name, params.get("layout"))}
@@ -192,12 +201,12 @@ class Host:
             return {"cleared": True}
         if method in {"preview", "parameter.patch", "component.add", "component.remove",
                       "connection.rewire"}:
-            target = self.files.path(name, suffixes={".pes"})
+            target = self.files.path(name, suffixes={".pes", ".cir"})
             text = params.get("text")
             if not isinstance(text, str):
                 raise WorkspaceError("preview requires source text")
             from ..assembly.syntax import is_native_source
-            if is_native_source(text):
+            if is_native_source(text) or target.suffix == ".cir":
                 if method != "preview":
                     raise WorkspaceError("new-syntax schematics must be edited in source text")
                 return _native_preview(text, target)

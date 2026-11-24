@@ -250,6 +250,9 @@ def parse_native_text(text: str, path: str | Path = "<string>") -> tuple[dict[st
 def parse_simulation_text(text: str, path: str | Path = "<string>") -> tuple[dict[str, Any], str]:
     """Parse native syntax, or delegate a parameter-only buffer to a compatibility function."""
     source = Path(path)
+    if source.suffix.lower() == ".cir":
+        from .cir import read_cir_text
+        return read_cir_text(text, source)
     if is_native_source(text):
         return parse_native_text(text, source)
     from .addons import simulation_readers

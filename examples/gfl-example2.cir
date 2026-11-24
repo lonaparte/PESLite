@@ -1,0 +1,21 @@
+gfl-example2
+* PESLite 0.6.0 netlist. X cards are PESLite device models
+* (source, unit and element types); dotted keys set nested parameters.
+.options sbase=2.0e6 vbase=690.0 freq=50.0 units=si
+Cpcc pcc 0 c_pu=0.02 r_d_pu=0.5
+Xgrid pcc 0 source x_pu=0.4 r_pu=0.04
+Xvsc pcc 0 vsc ac_filter.l_f_pu=0.2 ac_filter.r_f_pu=0.01 dclink.vdc_ref=1500.0
++ dclink.capacitor.c_pu=35.0 dclink.capacitor.r_esr_pu=0.001 dclink.source.type=current
++ dclink.source.i_pu=0.9 pwm.f_sw=20000.0 pwm.modulation_limit=0.95 ctrl.type=gfl
++ ctrl.loops.SRFPLL.kp_pu=20.0 ctrl.loops.SRFPLL.ki_pu=1200.0 ctrl.loops.CurrentLoop.bandwidth=200.0
++ ctrl.loops.ThreePhaseModulation={} ctrl.loops.DCVoltageControl.kp=0.8
++ ctrl.loops.DCVoltageControl.ki=90.0 ctrl.loops.DCVoltageControl.minimum=0.0
++ ctrl.loops.DCVoltageControl.maximum=1.15 ctrl.loops.DCVoltageControl.feedforward=0.9
++ ctrl.loops.DCVoltageControl.output_polarity=-1.0 protection.overcurrent.enable=1
++ protection.overcurrent.limit_pu=1.15 protection.undervoltage.enable=1
++ protection.undervoltage.limit_pu=0.5 protection.overvoltage.enable=1
++ protection.overvoltage.limit_pu=1.2 protection.rocof.enable=1 protection.rocof.limit=1.0
+.event connect_vsc type=connect target=vsc t=0.2 ramp=1.0
+.simulation solver.dt=25e-6 output.record_every=10
+.tran 2.5e-05 3.0
+.end

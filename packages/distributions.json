@@ -32,6 +32,7 @@
       ],
       "files": [
         "examples/*.pes",
+        "examples/*.cir",
         "examples/debug/*.pesdbg"
       ]
     },

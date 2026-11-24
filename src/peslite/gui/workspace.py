@@ -22,7 +22,7 @@ from typing import Any
 import yaml
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
-TEXT_SUFFIXES = frozenset({".pes", ".pesdbg", ".yaml", ".yml", ".json"})
+TEXT_SUFFIXES = frozenset({".pes", ".cir", ".pesdbg", ".yaml", ".yml", ".json"})
 READ_SUFFIXES = TEXT_SUFFIXES | {".csv"}
 MAX_FILE_SIZE = 4 * 1024 * 1024
 MAX_ROWS = 4000
@@ -476,7 +476,7 @@ class Workspace:
                 if model.is_file() and not model.is_symlink() else None}
 
     def has_project_addons(self, name: str) -> bool:
-        path = self.path(name, suffixes={".pes"})
+        path = self.path(name, suffixes={".pes", ".cir"})
         return any((directory / "PESaddons").is_dir() for directory in
                    [self.root, *[parent for parent in path.parents if parent != self.root
                                    and parent.is_relative_to(self.root)]])

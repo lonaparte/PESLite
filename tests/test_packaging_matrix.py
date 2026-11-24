@@ -108,7 +108,7 @@ def test_templates_and_cases_have_distinct_owners():
         distributions = json.load(handle)["distributions"]
     assert distributions["peslite-core"]["files"] == ["examples/templates/*"]
     assert distributions["peslite"]["files"] == [
-        "examples/*.pes", "examples/debug/*.pesdbg",
+        "examples/*.pes", "examples/*.cir", "examples/debug/*.pesdbg",
     ]
 
 
