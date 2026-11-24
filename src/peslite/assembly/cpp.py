@@ -28,8 +28,9 @@ from dataclasses import dataclass, field, fields, is_dataclass, replace
 from functools import cache, cached_property, partial
 from importlib import import_module
 from pathlib import Path
+from string import Template
 from types import SimpleNamespace
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -48,9 +49,10 @@ from ..solver.integrators import DormandPrince45, FixedStepSolver, TABLEAUS, _ST
 from ..solver.implicit import (ImplicitSolver, _JACOBIAN_STEP, _MAX_SPLITS, _TABLEAUX,
                                _NEWTON_ITERATIONS, _NEWTON_SCALE, _THETA_MAX)
 from ..solver.model import _dependency_plan, _record_fields, commutation_tolerance
-from ..solver.netlist import (Dissipation, Element as NetlistElement, Mode, Netlist, Topology,
+from ..solver.netlist import (Element as NetlistElement, Mode, Netlist, Topology,
                               _Degenerate, _FLOAT_RTOL, _MARGIN_RTOL, _MAX_PATTERNS,
-                              _Symbolic, _constant, _symbolic_solve, _symbolic_source)
+                              _Symbolic, _SymbolicFactors, _constant, _symbolic_solve,
+                              _symbolic_source)
 from ..solver.timing import TIME_EPS
 from ..solver.commutation import Commutation
 from .circuit import _BoundValue, _NETWORK_DECLARATION, _mode_decomposition, compile_network
@@ -1537,6 +1539,48 @@ def _symbolic_node(value: Any) -> Any:
     return value.item() if isinstance(value, np.generic) else value
 
 
+def _generated_symbolic(
+        source: tuple[Sequence[str], Sequence[str]],
+        leaves: Mapping[str, _Expression] | None = None,
+) -> tuple[_Expression, ...]:
+    """Materialize one explicit-leaf symbolic template in the current term pool."""
+    values = {name: value.code for name, value in (leaves or {}).items()}
+    for assignment in source[0]:
+        name, code = assignment.split(" = ", 1)
+        values[name.removeprefix("$")] = _Expression(
+            Template(code).substitute(values), "real",
+        ).code
+    return tuple(
+        _Expression(Template(code).substitute(values), "real") for code in source[1]
+    )
+
+
+def _normalized_symbolic_inputs(
+        vectors: Sequence[tuple[Sequence[Any], Sequence[Any]]],
+) -> tuple[tuple[tuple[Any, ...], ...], tuple[Any, ...], dict[str, _Expression]] | None:
+    """Replace stage-local symbolic leaves with stable structural identities."""
+    first: dict[_Symbolic, int] = {}
+    shape: list[Any] = []
+    leaves: dict[str, _Expression] = {}
+    normalized: list[tuple[Any, ...]] = []
+    for original, symbolic in vectors:
+        placed = []
+        for value, node in zip(original, symbolic):
+            if isinstance(node, _Symbolic):
+                if node.operation != "value":
+                    return None
+                index = first.setdefault(node, len(first))
+                key = f"i{index:06d}"
+                leaves.setdefault(key, _Expression.of(value))
+                shape.append(("leaf", index))
+                placed.append(_Symbolic.value(f"${key}"))
+            else:
+                shape.append(("constant", type(node), repr(node)))
+                placed.append(node)
+        normalized.append(tuple(placed))
+    return tuple(normalized), tuple(shape), leaves
+
+
 def _while_gated(gates: Mapping[int, Any], values: Sequence[Any], gated: Any) -> tuple:
     """Per diode position: the value it takes while its controlled device is gated on."""
     return tuple(np.where(gates[index], gated, value) if index in gates else value
@@ -2293,9 +2337,11 @@ class _ModelGenerator:
         self._coefficient_plans = {}
         self._coefficient_topologies = {}
         self._dynamic_netlist_traces = {}
-        # symbolic eliminations by their inputs' codes, shared by every term pool
+        # Symbolic right-hand sides by their input codes, shared by every term pool.
         self._dynamic_netlist_solutions = {}
-        self._dynamic_netlist_sources = {}
+        # Matrix eliminations and normalized solutions shared across output stages.
+        self._dynamic_netlist_factors = {}
+        self._dynamic_netlist_programs = {}
         self.event_parameter_bindings: dict[str, tuple[bool, str | None]] = {}
         self._runtime_networks = {}
         self.equation_bindings = {}
@@ -3299,7 +3345,6 @@ class _ModelGenerator:
 
     def _output(self, method: Any) -> list[str]:
         owner = method.__self__
-        out = owner.output
         function = getattr(method, "__func__", method)
         generated = getattr(function, "_peslite_netlist_outputs", None)
         if generated is not None:
@@ -4176,23 +4221,6 @@ class _ModelGenerator:
         self, circuit: Any, t: Any, states: list[Any], *, topology=None, raw=False,
     ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
         """Eliminate the shared netlist equations through the netlist's expression DAG."""
-        def generated(source: tuple[Sequence[str], Sequence[str]]) -> tuple[_Expression, ...]:
-            shared, rendered = source
-            names: dict[str, str] = {}
-
-            def resolve(code: str) -> str:
-                return re.sub(r"\bv\d+\b", lambda match: names[match.group(0)], code)
-
-            def expression(code: str) -> _Expression:
-                code = resolve(code)
-                return (_Expression(_number(float(code)), "real")
-                        if re.fullmatch(r"[+-]?\d+", code) else _Expression(code, "real"))
-
-            for assignment in shared:
-                name, code = assignment.split(" = ", 1)
-                names[name] = expression(code).code
-            return tuple(expression(code) for code in rendered)
-
         net = circuit.netlist
         ratios = self._traced_ratios(net)
         topology = net.topology() if topology is None else topology
@@ -4211,10 +4239,41 @@ class _ModelGenerator:
         topology, resolved = self._resolved_equation_topology(
             circuit, topology, ratios
         )
-        topology, matrices, matrix, reference, varying = self._symbolic_netlist_matrix(
-            circuit, topology, tuple(resolved)
+        ratio_codes = tuple(
+            _Expression.of(entry).code
+            for ratio in resolved for entry in np.asarray(ratio, dtype=object).flat
         )
+        factor_key = id(circuit), topology.mode.key, ratio_codes
+        factored = self._dynamic_netlist_factors.get(factor_key)
+        if factored is None:
+            topology, matrices, matrix, reference, varying = self._symbolic_netlist_matrix(
+                circuit, topology, tuple(resolved)
+            )
+            factors = (_SymbolicFactors(
+                matrix, reference, varying, gauge=topology.gauge_singular,
+            ) if topology._pattern.n else None)
+            output_rows = tuple(
+                tuple((int(column), row[column]) for column in np.flatnonzero(row))
+                for row in topology.S_out.toarray()
+            )
+            factored = self._dynamic_netlist_factors[factor_key] = (
+                topology, matrices, factors, output_rows,
+            )
+        topology, matrices, factors, output_rows = factored
         pattern = topology._pattern
+
+        def solve(vectors: Sequence[Sequence[Any]]) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+            right = [0.0] * pattern.n
+            for name, vector in zip(("y", "u", "du"), vectors):
+                stamps = matrices[name]
+                for row, column, coefficient in zip(stamps.r, stamps.c, stamps.v):
+                    right[row] += _symbolic_node(coefficient) * vector[column]
+            solution = factors.solve(right) if factors is not None else []
+            return (
+                tuple(solution[int(index)] for index in topology.xd_index),
+                tuple(sum(coefficient * solution[column] for column, coefficient in row)
+                      for row in output_rows),
+            )
 
         inputs, rates = self._traced_sources(net, t, topology.needs_rate)
         state_values = tuple(states[int(index)] for index in net.states)
@@ -4225,38 +4284,40 @@ class _ModelGenerator:
         # The elimination depends on the mode, the ratio and input expressions alone. A term
         # pool names its own temporaries, so equal codes are equal expressions in every pool.
         solve_key = (
-            id(circuit), topology.mode.key,
-            codes(entry for ratio in resolved for entry in np.asarray(ratio, dtype=object).flat),
+            id(circuit), topology.mode.key, ratio_codes,
             codes(state_values), codes(inputs), codes(rates),
             None if control is None else tuple(sorted(control.decisions.items())),
         )
-        solved = self._dynamic_netlist_solutions.get(solve_key)
-        if solved is None:
-            right = [0.0] * pattern.n
-            for name, vector in (("y", state_values), ("u", inputs), ("du", rates)):
-                stamps = matrices[name]
-                for row, column, coefficient in zip(stamps.r, stamps.c, stamps.v):
-                    right[row] += _symbolic_node(coefficient) * _symbolic_node(vector[column])
-            solution = _symbolic_solve(
-                matrix, right, reference, varying, gauge=topology.gauge_singular
-            ) if pattern.n else []
-            solved = self._dynamic_netlist_solutions[solve_key] = (
-                tuple(solution[int(index)] for index in topology.xd_index),
-                tuple(sum(coefficient * value for coefficient, value in zip(row, solution)
-                          if coefficient != 0.0)
-                      for row in topology.S_out.toarray()),
-            )
-        derivative, output = solved
+        originals = (state_values, inputs, rates)
+        vectors = tuple(tuple(_symbolic_node(value) for value in vector)
+                        for vector in originals)
         if raw:
+            solved = self._dynamic_netlist_solutions.get(solve_key)
+            if solved is None:
+                solved = self._dynamic_netlist_solutions[solve_key] = solve(vectors)
+            derivative, output = solved
             result = tuple(derivative), tuple(output)
         else:
-            source = self._dynamic_netlist_sources.get(solve_key)
-            if source is None:
-                source = self._dynamic_netlist_sources[solve_key] = _symbolic_source(
-                    (*derivative, *output), language="cpp"
+            normalized = _normalized_symbolic_inputs(tuple(zip(originals, vectors)))
+            if normalized is None:
+                derivative, output = solve(vectors)
+                leaves = None
+                source = _symbolic_source(
+                    (*derivative, *output), language="cpp",
+                    shared_name=lambda index: f"$n{index:06d}",
                 )
-            values = generated(source)
-            count = len(derivative)
+            else:
+                generic, shape, leaves = normalized
+                program_key = factor_key, shape
+                source = self._dynamic_netlist_programs.get(program_key)
+                if source is None:
+                    derivative, output = solve(generic)
+                    source = self._dynamic_netlist_programs[program_key] = _symbolic_source(
+                        (*derivative, *output), language="cpp",
+                        shared_name=lambda index: f"$n{index:06d}",
+                    )
+            values = _generated_symbolic(source, leaves)
+            count = len(topology.xd_index)
             result = net._place_scalar_derivatives(values[:count], len(states)), values[count:]
         self._dynamic_netlist_traces[cache_key] = result
         return result
@@ -5650,11 +5711,17 @@ class _ModelGenerator:
         self._observed_values = {}
 
         def add(name: str, expression: str, kind: str) -> None:
-            member = f"obs_{_identifier(name)}"
-            self._observation_entries[member] = (
+            member = self.observation_member(name)
+            entry = (
                 f"{_CPP_TYPES[kind]} {member}{{}};",
                 f"{member} = {expression};",
             )
+            previous = self._observation_entries.get(member)
+            if previous is not None and previous != entry:
+                raise ValueError(
+                    f"C++ export: observation name {name!r} collides with another signal"
+                )
+            self._observation_entries[member] = entry
             self._observed_values.setdefault(expression, member)
 
         self._add_observation = add
@@ -5712,9 +5779,14 @@ class _ModelGenerator:
         for name, record, field in self._solver_observations.values():
             add(name, self.value(record, field), self.record_types[id(record), field])
 
+    @staticmethod
+    def observation_member(name: str) -> str:
+        """Return the generated member that stores one named observation."""
+        return f"obs_{_identifier(name)}"
+
     def observation(self, name: str) -> str:
         """Return and retain one named generated observation."""
-        member = f"obs_{_identifier(name)}"
+        member = self.observation_member(name)
         self._required_observations.add(member)
         return member
 

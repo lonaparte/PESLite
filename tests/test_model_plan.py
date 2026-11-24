@@ -43,10 +43,10 @@ def test_record_fields_have_one_ordered_contract_for_fixed_and_dynamic_records()
 
 
 def test_dynamic_record_types_are_shared_only_for_the_same_semantic_layout():
-    first = kernel._record_type("_Record", ("x", "y"))
-    assert kernel._record_type("_Record", ("x", "y")) is first
-    assert kernel._record_type("_Record", ("x",)) is not first
-    assert kernel._record_type("_OtherRecord", ("x", "y")) is not first
+    first = kernel.record_type("_Record", ("x", "y"))
+    assert kernel.record_type("_Record", ("x", "y")) is first
+    assert kernel.record_type("_Record", ("x",)) is not first
+    assert kernel.record_type("_OtherRecord", ("x", "y")) is not first
 
 
 def test_residual_components_exclude_blocked_downstream_nodes_from_the_loop():

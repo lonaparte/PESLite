@@ -19,7 +19,7 @@ from typing import Any, ClassVar, Mapping, Optional
 import numpy as np
 
 from ..solver.model import ConfigError, _complex, _real, assign, gather, join, scatter
-from .blocks import Filter, OutputLimit, PI, complex_power
+from .blocks import Filter, OutputLimit, PI, complex_power, peak_abs
 from .modulation import OutputStage
 
 __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
@@ -115,7 +115,6 @@ class Loop:
     observations: ClassVar[tuple[str, ...]] = ()
     cpp_export: ClassVar[bool] = True
     native_generator: ClassVar[object | None] = None
-    continuous_capable: ClassVar[bool] = False
     sample_evaluator: ClassVar[Any] = None
     terminal_diagnostic_fields: ClassVar[tuple[str, str] | None] = None
 
@@ -133,8 +132,7 @@ class Loop:
         fields = self.terminal_diagnostic_fields
         if fields is not None:
             return float(getattr(self, fields[0])), bool(getattr(self, fields[1]))
-        values = 2.0 * np.asarray(duty, dtype=float) - 1.0
-        return float(np.max(np.abs(values), initial=0.0)), False
+        return peak_abs(2.0 * np.asarray(duty, dtype=float) - 1.0), False
 
     def __init__(self, cfg: Any, unit: Any, startup: Any) -> None:
         self.cfg, self.unit, self.startup = cfg, unit, startup
@@ -367,7 +365,6 @@ def register_loop_type(cls: type) -> type:
         cls.sample_evaluator = _evaluate_mapping_sample
     else:
         cls.sample_evaluator = _evaluate_equation_sample
-    cls.continuous_capable = cls.supports_continuous()
     LOOP_TYPES[name] = cls
     return cls
 

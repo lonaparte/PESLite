@@ -1429,3 +1429,28 @@ def test_generated_cpp_runtime_parameters(tmp_path):
     )
     assert rejected.returncode == 1
     assert "parameter 'units.vsc.ctrl.references.q_ref_pu' is not variable" in rejected.stderr
+
+
+def test_output_stages_share_symbolic_network_elimination(monkeypatch, tmp_path):
+    from peslite.assembly import cpp
+
+    counts = {"factorizations": 0, "traces": 0}
+    factor = cpp._SymbolicFactors.__init__
+    trace = cpp._ModelGenerator._trace_dynamic_netlist
+
+    def counted_factor(self, *args, **kwargs):
+        counts["factorizations"] += 1
+        factor(self, *args, **kwargs)
+
+    def counted_trace(self, *args, **kwargs):
+        counts["traces"] += 1
+        return trace(self, *args, **kwargs)
+
+    monkeypatch.setattr(cpp._SymbolicFactors, "__init__", counted_factor)
+    monkeypatch.setattr(cpp._ModelGenerator, "_trace_dynamic_netlist", counted_trace)
+    params = peslite.load(EXAMPLES / "cable-gfl-example.pes", **{
+        "simulation.progress.enable": False,
+        "simulation.energy_check": "off",
+    })
+    peslite.export(params, "cpp", tmp_path)
+    assert 0 < counts["factorizations"] < counts["traces"]

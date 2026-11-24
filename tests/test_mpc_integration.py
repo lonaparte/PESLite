@@ -703,6 +703,17 @@ def test_mpc_export_uses_the_shared_native_control_backend(format, filename, tmp
     assert (out / filename).is_file()
 
 
+@pytest.mark.static
+@pytest.mark.parametrize("example", [
+    "mpc-buck-example.pes",
+    "mpc-vsc-matrices-example.pes",
+])
+def test_mpc_cpp_export_accepts_runtime_parameters(example, tmp_path):
+    params = peslite.load(EXAMPLES / example)
+    peslite.export(params, "cpp", tmp_path, variables=("all",))
+    assert (tmp_path / "peslite.cpp").is_file()
+
+
 def _assert_native_mpc_result(actual_dir, expected_dir):
     for filename in ("states.csv", "plant.csv"):
         actual = _final_csv(actual_dir / filename)

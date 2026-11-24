@@ -19,6 +19,7 @@ PARAMETER_DOMAINS = (
 
 NAME_PATTERN = r"[A-Za-z_][A-Za-z0-9_-]*"
 PATH_PATTERN = r"[A-Za-z_][A-Za-z0-9_.-]*"
+QUOTED_KEY_PATTERN = r"'(?:[^']|'')*'" + "|" + r'"(?:[^"\\]|\\.)*"'
 _VIEW_HEADER = re.compile(rf"^@({NAME_PATTERN})(?:\s+#.*)?\s*$")
 _VIEW_DEFINITION = re.compile(
     rf"^{NAME_PATTERN}\s*:\s*{PATH_PATTERN}(?:\s*,\s*{PATH_PATTERN})?\s*$"
@@ -28,9 +29,7 @@ _GROUP = re.compile(
     rf"^&{NAME_PATTERN}\s*:\s*&?{_REFERENCE}(?:\s*,\s*&?{_REFERENCE})*\s*$"
 )
 _CONNECTION = re.compile(rf"^{_REFERENCE}(?:\s*(?:--|->)\s*{_REFERENCE})+\s*$")
-_KEY = re.compile(
-    rf"^({NAME_PATTERN}|'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\")\s*:\s*(.*)$"
-)
+_KEY = re.compile(rf"^({NAME_PATTERN}|{QUOTED_KEY_PATTERN})\s*:\s*(.*)$")
 _READERS: list[Callable[[str, Path], Mapping[str, Any] | None]] = []
 
 

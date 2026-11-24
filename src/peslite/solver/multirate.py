@@ -154,6 +154,7 @@ class MultirateSolver:
         assignment.update({n: "outer" for n in outer})
         self._assignment = assignment
         self._plan_revision = model.plan_revision
+        self._storage_of: dict[int, tuple[Any, Any]] = {}
         self._refresh_group_plans()
         empty = [label for label, group in (("inner", self.inner), ("outer", self.outer))
                  if group is not None and not np.any(group.mask)]
@@ -343,8 +344,7 @@ class MultirateSolver:
             if getattr(subsystem, "observer", False):
                 for state in subsystem.state_names:
                     self._coupling[model.state_slice(subsystem, state)] = False
-        if hasattr(self, "_storage_of"):
-            self._refresh_held_storage()
+        self._refresh_held_storage()
 
     def _refresh_held_storage(self) -> None:
         """Cache storage entries assigned to the current windowed group."""

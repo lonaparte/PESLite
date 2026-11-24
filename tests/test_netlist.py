@@ -1016,3 +1016,25 @@ def test_projection_parts_use_their_own_scale():
     assert projector.changed_states(state, [0.0, 100.0]) == [True, False]
     assert projector.significant(state, np.array([0.0, 100.0]), 0.0)
     assert not projector.significant(state, state.copy(), 0.0)
+
+
+def test_symbolic_factors_replay_the_joint_elimination():
+    ratio = nl._Symbolic.value("ratio")
+    matrix = [
+        [2.0, ratio, 0.0, 1.0],
+        [1.0, 3.0, -ratio, 0.0],
+        [0.0, 1.0, 4.0, ratio],
+        [ratio, 0.0, 1.0, 5.0],
+    ]
+    reference = np.array([
+        [2.0, 0.5, 0.0, 1.0], [1.0, 3.0, -0.5, 0.0],
+        [0.0, 1.0, 4.0, 0.5], [0.5, 0.0, 1.0, 5.0],
+    ])
+    varying = {(0, 1), (1, 2), (2, 3), (3, 0)}
+    factors = nl._SymbolicFactors(matrix, reference, varying)
+    for leaves in (("a", "b", "c", "d"), ("x", "x", "0", "y")):
+        right = [0.0 if leaf == "0" else nl._Symbolic.value(leaf) for leaf in leaves]
+        joint = nl._symbolic_solve(matrix, right, reference, varying)
+        assert nl._symbolic_source(factors.solve(right)) == nl._symbolic_source(joint)
+    with pytest.raises(ValueError):
+        factors.solve([0.0, 0.0, 0.0])

@@ -160,20 +160,17 @@ class VoltageSource(Element):
         if buses[cfg.bus].phases != 1:
             raise ConfigError("a scalar voltage source needs a single-phase bus")
         self.name, self.cfg = name, cfg
-        self.source = _VoltageSourceModel(cfg.v, cfg.r)
-
-    def subsystems(self) -> dict[str, Any]:
-        return {self.name: self.source}
+        self.model = _VoltageSourceModel(cfg.v, cfg.r)
 
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
-        return ((self.cfg.bus, self.source.port),)
+        return ((self.cfg.bus, self.model.port),)
 
     def signals(self) -> dict[str, float]:
-        return {f"{self.name}.i": self.source.output.i}
+        return {f"{self.name}.i": self.model.output.i}
 
     def retune(self, cfg: Any) -> bool:
         changed = self.cfg.r != cfg.r
         self.cfg = cfg
-        self.source.voltage, self.source.resistance = cfg.v, cfg.r
+        self.model.voltage, self.model.resistance = cfg.v, cfg.r
         return changed
 

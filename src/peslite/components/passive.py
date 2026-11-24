@@ -375,27 +375,24 @@ class Resistor(Element):
 
     def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
         self.name, self.cfg = name, cfg
-        self.resistor = _ResistorModel(cfg.r, buses[cfg.bus].phases, cfg.series)
-
-    def subsystems(self) -> dict[str, Any]:
-        return {self.name: self.resistor}
+        self.model = _ResistorModel(cfg.r, buses[cfg.bus].phases, cfg.series)
 
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         if self.cfg.series:
-            return ((f"{self.name}.bus.in", self.resistor.port1),
-                    (self.cfg.bus, self.resistor.port2))
-        return ((self.cfg.bus, self.resistor.port1),)
+            return ((f"{self.name}.bus.in", self.model.port1),
+                    (self.cfg.bus, self.model.port2))
+        return ((self.cfg.bus, self.model.port1),)
 
     def series_connections(self) -> dict[str, str]:
         return {self.cfg.bus: f"{self.name}.bus.in"} if self.cfg.series else {}
 
     def parameter_bindings(self) -> dict[str, tuple[Any, str]]:
         """Runtime scalar parameters, shared by Python retuning and native export."""
-        return {"r": (self.resistor, "resistance")}
+        return {"r": (self.model, "resistance")}
 
     def signals(self) -> dict[str, complex | float]:
-        return {f"{self.name}.i": self.resistor.output.i,
-                f"{self.name}.power": self.resistor.output.power}
+        return {f"{self.name}.i": self.model.output.i,
+                f"{self.name}.power": self.model.output.power}
 
     def retune(self, cfg: Any) -> bool:
         changed = self.cfg.r != cfg.r

@@ -58,7 +58,8 @@ def _linear_sim(*, initial=0.0, growth=-4.0, decay_from_load=False, fail_at=None
         model = Model({"plant": plant}, {})
         return SimpleNamespace(units={}, event_subsystems=(), model=model, _unit_port_bindings={},
                                state_parts=lambda: [("", model)],
-                               apply=lambda change: retune(change.params),
+                               apply_changes=lambda changes, _boundary: [
+                                   retune(change.params) for change in changes],
                                signals=lambda t: {"plant.signal": plant.output.x})
 
     return peslite.Simulation(_params(**overrides), parts={"system": factory})

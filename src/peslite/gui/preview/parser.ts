@@ -2,12 +2,12 @@ import type {
   Diagnostic, EventSegment, GraphEdge, GraphEvent, GraphGroup, GraphNode, GraphView,
   ParameterBlock, PESModel, SourceLocation, SourceRange,
 } from './types.js';
-import { NAME, PARAMETER_DOMAINS, PATH } from './grammar.js';
+import { NAME, PARAMETER_DOMAINS, PATH, QUOTED_KEY } from './grammar.js';
 
 const REFERENCE = new RegExp(`^(${NAME})(?:\\.(${NAME}))?$`);
 const VIEW_HEADER = new RegExp(`^@(${NAME})\\s*$`);
 const DEFINITION = new RegExp(`^(${NAME})\\s*:\\s*(${PATH}(?:\\s*,\\s*${PATH})?)\\s*$`);
-const QUOTED_KEY = /^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s*:/;
+const QUOTED_KEY_START = new RegExp(`^(?:${QUOTED_KEY})\\s*:`);
 const KEY = new RegExp(`^(${NAME})\\s*:\\s*(.*)$`);
 const FIELD = new RegExp(`^(${PATH})\\s*:\\s*(.*)$`);
 const NESTED = new RegExp(`^(${NAME})\\s*:\\s*(${PATH})\\s*$`);
@@ -38,7 +38,7 @@ function indent(text: string): number { return text.match(/^ */)![0].length; }
 
 function startsParameters(text: string): boolean {
   const content = stripComment(text).trimEnd();
-  if (QUOTED_KEY.test(content)) return true;
+  if (QUOTED_KEY_START.test(content)) return true;
   const matched = content.match(KEY);
   if (!matched) return false;
   return PARAMETER_DOMAINS.has(matched[1]) || (!!matched[2].trim() && !DEFINITION.test(content));

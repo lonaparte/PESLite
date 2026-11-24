@@ -417,7 +417,7 @@ def _run_main(argv=None, *, prog: str = "peslite run") -> int | _CommandOutcome:
     if args.plot:
         try:
             from .assembly.addons import import_addon
-            _plot_result = import_addon("plotting", "function").plot_result
+            import_addon("plotting", "function").plot_result  # validate before simulation
         except (ImportError, RuntimeError) as exc:
             ap.error(f"--plot: {exc}")
     sim = _assemble_command(p, config, args.json, interface_text)
@@ -881,6 +881,7 @@ def _debug_main(argv=None) -> int | _CommandOutcome:
         raise
     status = report["status"]
     error = report.get("error")
+    report_path = _absolute(run_dir / "report.json")
     code = (0 if status == "passed" else 6 if status == "failed" else
             2 if error and error["stage"] in {"configuration", "assembly"} else 4)
     if args.json:
@@ -888,22 +889,22 @@ def _debug_main(argv=None) -> int | _CommandOutcome:
         if error:
             failure = {
                 "code": f"debug_{error['stage']}_error", "message": error["message"],
-                "path": _absolute(run_dir / "report.json"),
+                "path": report_path,
             }
         elif status == "failed":
             failure = {"code": "debug_checks_failed",
                        "message": "one or more debug checks failed",
-                       "path": _absolute(run_dir / "report.json")}
+                       "path": report_path}
         elif status == "stopped":
             failure = {"code": "debug_stopped",
                        "message": report["simulation"].get("stop_reason"),
-                       "path": _absolute(run_dir / "report.json")}
+                       "path": report_path}
         return _CommandOutcome(code, _payload(
             "debug", config=config, status="ok" if code == 0 else "error", code=code,
             output={"directory": _absolute(run_dir),
-                    "summary": _absolute(run_dir / "report.json"),
+                    "summary": report_path,
                     "files": [_absolute(run_dir / "debug.pesdbg"),
-                              _absolute(run_dir / "report.json")]},
+                              report_path]},
             simulation=report["simulation"] or None,
             diagnostics=report["diagnostics"], error=failure,
             debug={"status": status, "checks": report["checks"]},

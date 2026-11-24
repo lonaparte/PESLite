@@ -7,7 +7,8 @@ command line.
 """
 
 from .model import (Bag, BlackBoxSubsystem, ConfigError, Empty, GroupPlan, Model, OutputMethod,
-                    SolverCheck, SolverRegion, SpectralBound, StateRegistry, Stateful, Subsystem)
+                    SolverCheck, SolverRegion, SpectralBound, StateRegistry, Stateful, Subsystem,
+                    record_type)
 from .differentiation import directional_derivative
 from .energy import Energetic, Port, StoragePort
 from .integrators import (ADAPTIVE_METHODS, CIRCUIT_MODELS, FIXED_METHODS, RHS, AdaptiveSolver, AutoSolver,
@@ -16,7 +17,7 @@ from .multirate import HeldStorage, MultirateSolver
 from .signals import TableSignal
 
 __all__ = ["Model", "GroupPlan", "Bag", "Empty", "ConfigError", "Subsystem", "BlackBoxSubsystem",
-           "SolverCheck", "SolverRegion", "SpectralBound",
+           "SolverCheck", "SolverRegion", "SpectralBound", "record_type",
            "OutputMethod", "directional_derivative", "Energetic",
            "StoragePort", "Port", "Solver", "SolverStep", "Stateful", "StateRegistry", "RHS",
            "FixedStepSolver", "AdaptiveSolver", "AutoSolver", "DormandPrince45", "MultirateSolver", "HeldStorage",

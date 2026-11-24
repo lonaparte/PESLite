@@ -98,9 +98,12 @@ def test_debug_plan_is_a_workspace_file_and_previews_its_model(tmp_path):
     try:
         assert "control.pesdbg" in {entry["name"] for entry in host.dispatch("tree", {})["files"]}
         result = host.dispatch("debug.inspect", {"path": "control.pesdbg", "text": text})
+        command = host.dispatch("run.command", {"path": "control.pesdbg"})["command"]
     finally:
         host.close()
 
+    assert command[1:] == ["-m", "peslite.cli", "debug", str(tmp_path / "case.pes"),
+                           "--plan", str(tmp_path / "control.pesdbg")]
     assert result["modelPath"] == "case.pes"
     assert result["preview"]["format"] == "native"
     assert [operation["kind"] for operation in result["operations"]] == [

@@ -35,7 +35,7 @@ from . import energy as _energy
 from .differentiation import directional_derivative
 from .timing import TIME_EPS, PeriodicClock
 
-__all__ = ["ConfigError", "LocatedZero", "Bag", "Empty", "OutputMethod", "Subsystem",
+__all__ = ["ConfigError", "LocatedZero", "Bag", "Empty", "record_type", "OutputMethod", "Subsystem",
            "BlackBoxSubsystem", "Model", "SolverCheck", "SolverRegion", "SpectralBound",
            "GroupPlan", "Stateful", "StateRegistry", "join", "gather", "scatter", "flatten", "resolve",
            "expand_aliases", "assign"]
@@ -125,7 +125,7 @@ class Empty(Bag):
 
 
 @lru_cache(maxsize=None)
-def _record_type(name: str, fields: tuple[str, ...]) -> type[Bag]:
+def record_type(name: str, fields: tuple[str, ...]) -> type[Bag]:
     """Return one shared fixed-record class for a name and ordered field layout."""
     return type(name, (Bag,), {"__slots__": fields})
 
@@ -235,8 +235,8 @@ def _black_box_record(
     for name, value in entries:
         if not isinstance(value, numbers.Number):
             raise TypeError(f"{label} field {name!r} must have a scalar numeric initial value")
-    record_type = _record_type(f"_BlackBox_{label}", names)
-    return names, record_type(**dict(entries))
+    record_class = record_type(f"_BlackBox_{label}", names)
+    return names, record_class(**dict(entries))
 
 
 def _black_box_values(record: Any, names: Sequence[str]) -> NDArray:
@@ -2055,7 +2055,7 @@ class Model:
         owners = {id(s): n for n, s in zip(self.names, self.subsystems)}
         env: dict[str, Any] = {}
         emitter = _PlanCodeEmitter(env)
-        ref, put = emitter.ref, emitter.put
+        put = emitter.put
         load = [put(st, name, f"complex(v[{idx}], v[{idx + 1}])" if is_c else f"v[{idx}]")
                 for st, name, idx, is_c in self._state_ops]
 

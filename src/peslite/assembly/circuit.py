@@ -46,8 +46,8 @@ import numpy as np
 from ..components.network import Port
 from ..solver.energy import Energetic, spec_of
 from ..solver.model import (
-    Bag, ConfigError, Empty, OutputMethod, SolverCheck, SolverRegion, SpectralBound,
-    _InlineProgram, _compile_straight_line, _public_fields, _record_type,
+    ConfigError, Empty, OutputMethod, SolverCheck, SolverRegion, SpectralBound,
+    _InlineProgram, _compile_straight_line, _public_fields, record_type,
 )
 from ..solver.netlist import (QUANTITIES, CurrentSource, Diode, Element, Mode,
                               Netlist, Node, Topology, VoltageSource, _DENSE_GROUP, _Degenerate,
@@ -496,6 +496,7 @@ class Circuit:
         self.value_inputs: dict[tuple[int, str], str] = {}  # bound component outputs -> input key
         self.netlist: Optional[Netlist] = None
         self.derivatives: list[float] = []
+        self._solved_outputs: Any = None
         self.t = 0.0
         self.impulsive_dissipated_energy = 0.0  # J, dissipated by state jumps at mode changes
         self.impulsive_supplied_energy = 0.0  # J, delivered by sources during those jumps
@@ -556,8 +557,8 @@ class Circuit:
 
     def finalize(self) -> None:
         """Create the records, compile the state transfers and the netlist."""
-        self.input = _record_type("_CircuitInput", tuple(self.inputs))(**self.inputs)
-        self.output = _record_type("_CircuitOutput", tuple(self.outputs))(**self.outputs)
+        self.input = record_type("_CircuitInput", tuple(self.inputs))(**self.inputs)
+        self.output = record_type("_CircuitOutput", tuple(self.outputs))(**self.outputs)
         layout, index = [], 0
         self._state_index: dict[tuple[int, str], np.ndarray] = {}
         for comp in self.components:
@@ -1885,7 +1886,7 @@ class Circuit:
         if self.form != "device" or self._mixtures:
             return
         previous = self.netlist._last
-        if previous is not None and previous.output is getattr(self, "_solved_outputs", None):
+        if previous is not None and previous.output is self._solved_outputs:
             return
         _derivatives, self._solved_outputs = self.netlist.evaluate_scalar_raw(
             self.t, self._states(), record=True
@@ -2276,7 +2277,6 @@ def _bind_standalone(component: Any, circuit: Circuit, outputs: Sequence[str]) -
     rhs._peslite_netlist_rhs = (circuit, tuple(entries))
     component.rhs = MethodType(rhs, component)
 
-    _bind_energy(component, circuit)
     if circuit.commutation_active:
         component.commutation_margin = circuit.commutation_margin
         component.commutate = circuit.commutate

@@ -8,7 +8,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from ..components.thermal import (
-    FosterImpedance, LossTable, SemiconductorLossModel, SwitchingEvent,
+    FosterImpedance, SemiconductorLossModel, SwitchingEvent,
     _EVENT_KINDS, _lookup, _scalar, _values,
 )
 

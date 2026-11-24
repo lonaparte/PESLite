@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import math
 from pathlib import Path, PurePosixPath
@@ -27,10 +26,6 @@ class FileConflict(WorkspaceError):
     """A streamed result cursor no longer refers to the current file."""
 
     status = 409
-
-
-def content_version(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 class Workspace:
@@ -86,7 +81,7 @@ class Workspace:
             text = data.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise WorkspaceError("file is not UTF-8") from exc
-        return {"path": name, "text": text, "version": content_version(data)}
+        return {"path": name, "text": text}
 
     def csv(self, name: str, *, offset: int = 0, limit: int = 1000,
             stride: int = 1, byte_offset: int | None = None) -> dict[str, Any]:

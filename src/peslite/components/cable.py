@@ -9,7 +9,7 @@ from typing import Any, ClassVar
 from .network import Element, NetworkComponent, register_component_type
 from ..solver import Bag, ConfigError, Empty, Port, StoragePort
 from ..solver.history import AcceptedSignal, DelayedSignal, DelayHistory
-from ..solver.model import _record_type
+from ..solver.model import record_type
 
 __all__ = ["BergeronCableModel", "Cable", "LumpedCableModel"]
 
@@ -22,7 +22,7 @@ def _state_record(sections: int) -> type[Bag]:
     names = tuple(f"iL{k}" for k in range(1, sections + 2)) + tuple(
         f"uC{k}" for k in range(1, sections + 1)
     )
-    return _record_type(f"_LumpedCableState{sections}", names)
+    return record_type(f"_LumpedCableState{sections}", names)
 
 
 class LumpedCableModel(NetworkComponent):

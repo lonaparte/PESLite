@@ -3,13 +3,13 @@ export type Operation =
   | 'tree' | 'file.read' | 'preview' | 'csv.read' | 'summary.read'
   | 'debug.inspect'
   | 'preview.layout.load' | 'preview.layout.save' | 'preview.layout.clear'
-  | 'run.start' | 'run.stop' | 'run.status'
+  | 'run.command' | 'run.start' | 'run.stop' | 'run.status'
   | 'workspace.active' | 'editor.reveal';
 
 export type JsonObject = Record<string, unknown>;
-export type ChangeEvent = { type: 'file.changed'; path: string; text: string; dirty?: boolean };
+export type ChangeEvent = { type: 'file.changed'; path: string; text: string };
 export type TreeEntry = { path: string; name: string; directory: boolean };
-export type TextFile = { path: string; text: string; version: string; dirty?: boolean };
+export type TextFile = { path: string; text: string };
 export type PreviewResponse = {
   format: 'native' | 'legacy';
   model: import('../../preview/types.js').PESModel | null;

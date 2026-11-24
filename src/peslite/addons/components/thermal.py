@@ -11,7 +11,7 @@ from scipy.interpolate import RegularGridInterpolator
 
 from ...components.network import Element, NetworkComponent, register_component_type
 from ...solver import Bag, ConfigError, Empty, OutputMethod, Port
-from ...solver.model import _record_type
+from ...solver import record_type
 
 __all__ = [
     "ThermalLink", "LumpedThermalNetwork", "FosterImpedance",
@@ -49,7 +49,7 @@ def _finite(value: float, label: str) -> float:
 
 def _record(prefix: str, names: tuple[str, ...]) -> type[Bag]:
     """Return one cached state/input/output record type for a field layout."""
-    return _record_type(prefix, names)
+    return record_type(prefix, names)
 
 
 @dataclass(frozen=True)

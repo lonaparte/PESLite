@@ -41,6 +41,17 @@ class _HeldNode:
         return (0.0,)
 
 
+def test_selected_plant_outputs_refresh_same_time_held_changes():
+    nodes = {name: _HeldNode() for name in ("first", "second")}
+    model = Model(nodes, {}, {(node, "i"): name for name, node in nodes.items()})
+    plant = Plant(model, model.get_initial_values())
+    selected = model.output_evaluator(((nodes["second"], "u"),))
+    plant.outputs(0.0)
+    plant.hold("second", 2.0)
+    plant.selected_outputs(0.0, selected)
+    assert nodes["second"].output.u == 2.0
+
+
 def test_shared_plant_refreshes_same_time_held_changes_and_discontinuous_states(monkeypatch):
     nodes = {name: _HeldNode() for name in ("first", "second")}
     model = Model(nodes, {}, {(node, "i"): name for name, node in nodes.items()})

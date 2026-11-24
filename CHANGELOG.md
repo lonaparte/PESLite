@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The VS Code extension opens `.pesdbg` plans through the same read-only preview and shared Python
+  validation used by the Web workbench; the file protocol no longer carries unused edit metadata.
+- Event changes due at one boundary are reconciled through one `apply_changes(changes, boundary)`
+  protocol, whether one or several changes are due.
+- Fast protection refreshes selected plant outputs after a held input changes at the same instant.
 - Native interface names use the same ASCII grammar in Python and the browser preview, and a
   doubled single quote no longer exposes a quoted `#` as a comment.
 - Delay histories return no derivative outside their committed interpolation bracket, including

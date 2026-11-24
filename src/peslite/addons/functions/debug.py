@@ -7,6 +7,7 @@ import json
 import math
 import operator
 import re
+import shutil
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -730,8 +731,6 @@ def debug_history(config: str | Path, output: str | Path = "output") -> list[Pat
 def remove_debug_history(config: str | Path, runs: tuple[str, ...] = (), *,
                          output: str | Path = "output", all_runs: bool = False) -> list[Path]:
     """Remove selected debug-run directories from one case's current output root."""
-    import shutil
-
     history = {path.name: path for path in debug_history(config, output)}
     selected = tuple(history) if all_runs else runs
     missing = [run for run in selected if run not in history]
@@ -811,10 +810,11 @@ def execute_debug(config: str | Path, p: Params, interface_text: str, plan: Debu
     try:
         report["model"]["sha256"] = hashlib.sha256(config.read_bytes()).hexdigest()
         canonical = _canonical_plan(plan, config, Path(plan_directory).resolve())
-        (run_dir / "debug.pesdbg").write_text(canonical.to_text(), encoding="utf-8")
+        plan_file = run_dir / "debug.pesdbg"
+        plan_file.write_text(canonical.to_text(), encoding="utf-8")
         prepared = prepare_debug(p, canonical, directory=config.parent)
         canonical = replace(canonical, operations=prepared.operations)
-        (run_dir / "debug.pesdbg").write_text(canonical.to_text(), encoding="utf-8")
+        plan_file.write_text(canonical.to_text(), encoding="utf-8")
         report["plan"] = {
             **_json_safe(canonical),
             "parameter_overrides": prepared.parameter_overrides,
@@ -824,44 +824,36 @@ def execute_debug(config: str | Path, p: Params, interface_text: str, plan: Debu
         stage = "assembly"
         simulation = validate_model(prepared.params, interface_text=interface_text)
         state_probes = _resolve_state_probes(simulation, prepared.state_probes)
-        for alias, names in prepared.probes.items():
-            for full in names:
-                marker = f".{alias}"
-                suffix = full[full.rfind(marker) + len(marker):]
-                series[alias + suffix] = []
+        probe_columns = {
+            full: alias + full[full.rfind(f".{alias}") + len(alias) + 1:]
+            for alias, names in prepared.probes.items() for full in names
+        }
+        series.update((public, []) for public in probe_columns.values())
         for alias, names in state_probes.items():
             suffixes = (".re", ".im", ".abs") if len(names) == 2 else ("",)
-            for suffix in suffixes:
-                series[alias + suffix] = []
+            series.update((alias + suffix, []) for suffix in suffixes)
 
         def observe(t, states, read_values, *, final, stop_reason):
             values = read_values()
-            if series["t"] and math.isclose(
-                    series["t"][-1], t, rel_tol=0.0, abs_tol=1e-15):
-                index = -1
-            else:
+            if not (series["t"] and math.isclose(
+                    series["t"][-1], t, rel_tol=0.0, abs_tol=1e-15)):
                 series["t"].append(float(t))
-                for name in series:
+                for name, column in series.items():
                     if name != "t":
-                        series[name].append(math.nan)
-                index = -1
-            for alias, names in prepared.probes.items():
-                for full in names:
-                    marker = f".{alias}"
-                    suffix = full[full.rfind(marker) + len(marker):]
-                    public = alias + suffix
-                    if full in values:
-                        series[public][index] = float(values[full])
+                        column.append(math.nan)
+            for full, public in probe_columns.items():
+                if full in values:
+                    series[public][-1] = float(values[full])
+            if states is None:
+                return
             for alias, names in state_probes.items():
-                if states is None:
-                    continue
                 if len(names) == 1:
-                    series[alias][index] = float(states[names[0]])
+                    series[alias][-1] = float(states[names[0]])
                     continue
                 real, imaginary = (float(states[name]) for name in names)
-                series[f"{alias}.re"][index] = real
-                series[f"{alias}.im"][index] = imaginary
-                series[f"{alias}.abs"][index] = math.hypot(real, imaginary)
+                series[f"{alias}.re"][-1] = real
+                series[f"{alias}.im"][-1] = imaginary
+                series[f"{alias}.abs"][-1] = math.hypot(real, imaginary)
 
         stage = "simulation"
         result = simulation.run(

@@ -872,7 +872,8 @@ class Simulation:
         check_events = getattr(self.system, "check_events", None)
         if check_events is not None:
             check_events(p)
-        for needed, what in (("switch", switching_schedule(p.changes)), ("apply", p.changes)):
+        for needed, what in (("switch", switching_schedule(p.changes)),
+                             ("apply_changes", p.changes)):
             if what and not hasattr(self.system, needed):
                 raise ConfigError(f"the events need a system with {needed}(); "
                                   f"{type(self.system).__name__} has none")
@@ -997,19 +998,9 @@ class Simulation:
         parts.append(("solver", self.solver))
         return parts
 
-    def _apply_change(self, change) -> None:
-        """Apply one checked write and retain its existing effective parameter snapshot."""
-        self.system.apply(change)
-        if change.params is not None:
-            self._parameters = change.params
-
     def _apply_changes(self, changes, boundary: float) -> None:
         """Apply ordered changes through one explicit physical-boundary transaction."""
-        changes = tuple(changes)
         if not changes:
-            return
-        if len(changes) == 1:
-            self._apply_change(changes[0])
             return
         self.system.apply_changes(changes, boundary)
         for change in changes:

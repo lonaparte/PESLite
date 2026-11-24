@@ -14,7 +14,7 @@ import cmath
 import math
 import numbers
 from dataclasses import dataclass, field, fields, replace
-from types import MappingProxyType
+from types import MappingProxyType, MethodType
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 import numpy as np
@@ -28,7 +28,7 @@ from ..solver.energy import Port
 from .blocks import OutputLimit, abc2complex, phases, smoothstep
 from .loops import (ANGLE, DUTY_RATIO, ENABLE, FREQUENCY, HERTZ, I, I_AB, LOOP_TYPES, MODE, MODULATION, POWER,
                     SI_CURRENT, SI_VOLTAGE, SI_POWER, V, V_AB, V_DQ,
-                    Loop, SignalType, SyncLaw, loop_type)
+                    Loop, SignalType, loop_type)
 from .modulation import CONFIGURED, OutputStage
 
 __all__ = ["Measurement", "ConverterMeasurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
@@ -435,7 +435,7 @@ def continuous_control(unit: Any) -> bool:
         if "tracking" in overlay.policies.values():
             return False
     active = _active_loop_names(classes, connections, sources)
-    return all(classes[name].continuous_capable for name in active)
+    return all(classes[name].supports_continuous() for name in active)
 
 
 class ControlGraph:
@@ -733,7 +733,7 @@ class ControlGraph:
 
     def _sample_method(self, name, node):
         if name not in self._tracking:
-            return type(node).sample_evaluator.__get__(node, type(node))
+            return MethodType(type(node).sample_evaluator, node)
 
         def tracking_sample(t, inputs, outputs):
             tracked = node.track(inputs)
@@ -1404,7 +1404,7 @@ class _GraphRuntime:
         names = []
         for name in self.graph.order:
             node = self.graph.nodes[name]
-            if not type(node).continuous_capable:
+            if not type(node).supports_continuous():
                 raise ConfigError(f"ctrl.loops.{name}: loop type {node.type!r} "
                                   "has no continuous-time implementation")
             for local, value in node.flow_state().items():

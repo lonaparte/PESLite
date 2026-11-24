@@ -60,7 +60,8 @@ class SimulationProcess:
         self.log: deque[str] = deque(maxlen=300)
         self._lock = threading.RLock()
 
-    def start(self, name: str, *, trust_addons: bool = False) -> dict:
+    def command(self, name: str, *, trust_addons: bool = False) -> list[str]:
+        """Validate one run request and return its CLI command."""
         path = self.workspace.path(name, suffixes={".pes", ".pesdbg"})
         if not path.is_file():
             raise WorkspaceError("select an existing .pes or .pesdbg file")
@@ -76,6 +77,10 @@ class SimulationProcess:
             command.append(str(path))
         if self.workspace.has_project_addons(model_name) and not trust_addons:
             raise WorkspaceError("project-local PESaddons execute Python code; explicit trust is required")
+        return command
+
+    def start(self, name: str, *, trust_addons: bool = False) -> dict:
+        command = self.command(name, trust_addons=trust_addons)
         with self._lock:
             if self.process is not None and self.process.poll() is None:
                 raise WorkspaceError("another simulation is already running")
@@ -199,6 +204,10 @@ class Host:
                 register_project(target)
             from .legacy_yaml import preview as legacy_yaml_preview
             return legacy_yaml_preview(text, target)
+        if method == "run.command":
+            return {"command": self.runs.command(
+                name, trust_addons=params.get("trustAddons") is True,
+            )}
         if method == "run.start":
             return self.runs.start(name, trust_addons=params.get("trustAddons") is True)
         if method == "run.stop":

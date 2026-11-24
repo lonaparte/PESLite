@@ -1823,7 +1823,9 @@ class _CCSCurrentStrategy:
             _numerical_configuration(unit.dclink.vdc_ref), np.zeros(owner.n_current),
             np.zeros(owner.n_current), np.zeros(owner.n_current), previous_applied=True,
         )
-        self.default_input = np.full(owner.n_input, cfg.input_min, dtype=float)
+        self.default_input = np.full(
+            owner.n_input, _numerical_configuration(cfg.input_min), dtype=float,
+        )
         self.optimizer = CCSMPC(
             template, _numerical_configuration(cfg.prediction_horizon),
             (_numerical_configuration(cfg.control_horizon)

@@ -1,6 +1,6 @@
 # PESLite Workspace
 
-PESLite Workspace previews and edits simulation files and displays completed simulation results
+PESLite Workspace previews simulation files and displays completed simulation results
 through the PESLite graphical interface. Simulation commands use the PESLite installation selected
 by `peslite.pythonPath`; the extension does not bundle Python or a numerical runtime.
 

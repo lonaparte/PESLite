@@ -2,16 +2,15 @@
 import * as vscode from 'vscode';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as crypto from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 interface Message { id: number; method: string; params: Record<string, any> }
-const safeSuffix = /\.(pes|yaml|yml|csv|json)$/i;
+const bridged = new Set(['preview', 'debug.inspect', 'csv.read', 'summary.read']);
+const safeSuffix = /\.(pes|pesdbg|yaml|yml|csv|json)$/i;
 
 function python() {
   return vscode.workspace.getConfiguration('peslite').get<string>('pythonPath') || 'python';
 }
-function hash(value: string) { return crypto.createHash('sha256').update(value).digest('hex'); }
 function folderFor(uri: vscode.Uri): vscode.WorkspaceFolder {
   const folder = vscode.workspace.getWorkspaceFolder(uri);
   if (!folder || uri.scheme !== 'file') throw new Error('Open a file inside a trusted workspace');
@@ -77,18 +76,15 @@ class Runs {
     return { running: this.process !== null, exitCode: this.code,
       path: this.file, log: this.output.slice(-30000) };
   }
-  start(folder: vscode.WorkspaceFolder, filename: string, trustAddons: boolean) {
+  async start(folder: vscode.WorkspaceFolder, filename: string, trustAddons: boolean) {
     if (!vscode.workspace.isTrusted) throw new Error('Trust the VS Code workspace to run simulations');
     if (this.process) throw new Error('A simulation is already running');
-    const uri = resource(folder, filename);
-    if (!filename.endsWith('.pes')) throw new Error('Select a .pes model');
-    const addons = [folder.uri.fsPath, path.dirname(uri.fsPath)].some(directory =>
-      fs.existsSync(path.join(directory, 'PESaddons')));
-    if (addons && !trustAddons) {
-      throw new Error('Project-local PESaddons execute Python code; explicit trust is required');
-    }
+    resource(folder, filename);
+    const { command }: { command: string[] } =
+      await bridge(folder.uri.fsPath, 'run.command', { path: filename, trustAddons });
+    if (this.process) throw new Error('A simulation is already running');
     this.output = ''; this.code = null; this.file = filename;
-    const child = spawn(python(), ['-m', 'peslite.cli', uri.fsPath], {
+    const child = spawn(command[0], command.slice(1), {
       cwd: folder.uri.fsPath, env: process.env, windowsHide: true,
     });
     this.process = child;
@@ -121,7 +117,7 @@ function webviewHtml(panel: vscode.WebviewPanel, context: vscode.ExtensionContex
 
 async function openPreview(context: vscode.ExtensionContext, uri?: vscode.Uri) {
   const target = uri || vscode.window.activeTextEditor?.document.uri;
-  if (!target) throw new Error('Open a .pes, CSV or summary.json file first');
+  if (!target) throw new Error('Open a .pes, .pesdbg, CSV or summary.json file first');
   const folder = folderFor(target);
   const filename = relative(folder, target);
   const layoutKey = `${folder.uri.toString()}\0${filename}`;
@@ -137,7 +133,7 @@ async function openPreview(context: vscode.ExtensionContext, uri?: vscode.Uri) {
   disposables.push(vscode.workspace.onDidChangeTextDocument(event => {
     if (event.document.uri.toString() === target.toString()) {
       void panel.webview.postMessage({ type: 'file.changed', path: filename,
-        text: event.document.getText(), dirty: event.document.isDirty });
+        text: event.document.getText() });
     }
   }));
   disposables.push(panel.webview.onDidReceiveMessage(async (message: Message) => {
@@ -148,8 +144,7 @@ async function openPreview(context: vscode.ExtensionContext, uri?: vscode.Uri) {
         result = { path: filename };
       } else if (method === 'file.read') {
         const document = await vscode.workspace.openTextDocument(resource(folder, params.path));
-        result = { path: params.path, text: document.getText(),
-          version: hash(document.getText()), dirty: document.isDirty };
+        result = { path: params.path, text: document.getText() };
       } else if (method === 'editor.reveal') {
         const document = await vscode.workspace.openTextDocument(resource(folder, params.path));
         const editor = await vscode.window.showTextDocument(document, { viewColumn: vscode.ViewColumn.One });
@@ -166,7 +161,7 @@ async function openPreview(context: vscode.ExtensionContext, uri?: vscode.Uri) {
       } else if (method === 'preview.layout.clear') {
         layouts.delete(layoutKey);
         result = { cleared: true };
-      } else if (method === 'preview' || method === 'csv.read' || method === 'summary.read') {
+      } else if (bridged.has(method)) {
         if (params.trustAddons === true && !vscode.workspace.isTrusted) {
           throw new Error('Trust the VS Code workspace before loading project-local addons');
         }
@@ -174,7 +169,7 @@ async function openPreview(context: vscode.ExtensionContext, uri?: vscode.Uri) {
       } else if (method === 'run.start') {
         const document = await vscode.workspace.openTextDocument(resource(folder, params.path));
         if (document.isDirty) throw new Error('Save the .pes document before running a simulation');
-        result = runs.start(folder, params.path, params.trustAddons === true);
+        result = await runs.start(folder, params.path, params.trustAddons === true);
       } else if (method === 'run.stop') result = runs.stop();
       else if (method === 'run.status') result = runs.status();
       else throw new Error(`Unsupported VS Code operation: ${method}`);
@@ -196,9 +191,13 @@ export function activate(context: vscode.ExtensionContext) {
     catch (error) { void vscode.window.showErrorMessage(String(error)); }
   }));
   context.subscriptions.push(vscode.commands.registerCommand('peslite.run', async () => {
-    const uri = vscode.window.activeTextEditor?.document.uri;
-    if (!uri) return;
-    try { runs.start(folderFor(uri), relative(folderFor(uri), uri), false); }
+    const document = vscode.window.activeTextEditor?.document;
+    if (!document) return;
+    try {
+      if (document.isDirty) throw new Error('Save the document before running a simulation');
+      const uri = document.uri;
+      await runs.start(folderFor(uri), relative(folderFor(uri), uri), false);
+    }
     catch (error) { void vscode.window.showErrorMessage(String(error)); }
   }));
   context.subscriptions.push(vscode.commands.registerCommand('peslite.stop', () => runs.stop()));

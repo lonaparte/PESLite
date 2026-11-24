@@ -190,13 +190,13 @@ def test_event_is_an_exact_stop_and_solver_hooks_bracket_the_model_change(tmp_pa
     sim = peslite.Simulation(p, solver=solver)
     solver.source = sim.system.sources["grid"]
     old_r = solver.source.branch.R
-    apply = sim.system.apply
+    apply_changes = sim.system.apply_changes
 
-    def recorded_apply(change):
-        solver.hooks.append(("apply", change.t))
-        apply(change)
+    def recorded_apply(changes, boundary):
+        solver.hooks.extend(("apply", change.t) for change in changes)
+        apply_changes(changes, boundary)
 
-    sim.system.apply = recorded_apply
+    sim.system.apply_changes = recorded_apply
     sim.run(out_dir=tmp_path)
 
     assert any(abs(end - event_t) < 1e-14 for end in solver.ends)
@@ -222,13 +222,13 @@ def test_registered_custom_event_runs_once_at_its_exact_time(monkeypatch, tmp_pa
     })
     sim = peslite.Simulation(p)
     runs = []
-    apply = sim.system.apply
+    apply_changes = sim.system.apply_changes
 
-    def record(change):
-        runs.append((change.event, change.t))
-        apply(change)
+    def record(changes, boundary):
+        runs.extend((change.event, change.t) for change in changes)
+        apply_changes(changes, boundary)
 
-    monkeypatch.setattr(sim.system, "apply", record)
+    monkeypatch.setattr(sim.system, "apply_changes", record)
     sim.run(out_dir=tmp_path)
     assert runs == [("mark", event_t)]
 
@@ -407,12 +407,12 @@ def test_fixed_adaptive_multirate_and_user_solver_use_the_right_model_at_event(k
     )
     model, source = simulation.system.model, simulation.system.sources["grid"]
     old_resistance = source.branch.R
-    apply, seen = simulation.system.apply, []
+    apply_changes, seen = simulation.system.apply_changes, []
     changed = False
 
-    def recorded_apply(change):
+    def recorded_apply(changes, boundary):
         nonlocal changed
-        apply(change)
+        apply_changes(changes, boundary)
         changed = True
 
     def watch(rhs):
@@ -427,7 +427,7 @@ def test_fixed_adaptive_multirate_and_user_solver_use_the_right_model_at_event(k
             return value
         return watched
 
-    simulation.system.apply = recorded_apply
+    simulation.system.apply_changes = recorded_apply
     model.rhs_list = watch(model.rhs_list)
     model.rhs_group = watch(model.rhs_group)
     simulation.run(out_dir=tmp_path)

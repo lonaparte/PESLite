@@ -154,7 +154,7 @@ class _Symbolic:
         return self._hash
 
     @classmethod
-    def value(cls, code: str) -> "_Symbolic":
+    def value(cls, code: Any) -> "_Symbolic":
         return cls("value", (code,))
 
     def __add__(self, other):
@@ -422,86 +422,116 @@ def _symbolic_solve(matrix: Sequence[Sequence[Any] | Mapping[int, Any]], right: 
                     varying: Optional[set[tuple[int, int]]] = None, *,
                     gauge: bool = False) -> list[Any]:
     """Eliminate a generated sparse linear system using one valid numerical pivot pattern."""
-    n = len(right)
-    rows = [
-        dict(row) if isinstance(row, Mapping) else
-        {column: value for column, value in enumerate(row) if not _zero(value)}
-        for row in matrix
-    ]
-    moving = [
-        {
-            column for column, value in row.items()
-            if ((index, column) in varying if varying is not None else not _constant(value))
-        }
-        for index, row in enumerate(rows)
-    ]
-    right = list(right)
-    reference = np.array(reference, dtype=float, copy=True)
-    pivots: list[tuple[int, int]] = []
-    pivot_row = 0
-    for column in range(n):
-        active = [row for row in range(pivot_row, n)
-                  if column in rows[row] and reference[row, column] != 0.0]
-        if not active:
-            if gauge:
-                continue
-            raise ValueError(f"the generated netlist equations are singular at column {column}")
-        stable = [row for row in active if column not in moving[row]]
-        candidates = stable or active
-        constants = [row for row in candidates if _constant(rows[row][column])]
-        candidates = constants or candidates
-        pivot = max(candidates, key=lambda row: abs(reference[row, column]))
-        if pivot != pivot_row:
-            rows[pivot_row], rows[pivot] = rows[pivot], rows[pivot_row]
-            moving[pivot_row], moving[pivot] = moving[pivot], moving[pivot_row]
-            right[pivot_row], right[pivot] = right[pivot], right[pivot_row]
-            reference[[pivot_row, pivot]] = reference[[pivot, pivot_row]]
-        source = rows[pivot_row]
-        pivot_value = source[column]
-        trailing = tuple((entry, value) for entry, value in source.items()
-                         if entry > column)
-        for row in range(pivot_row + 1, n):
-            value = rows[row].pop(column, None)
-            if value is None:
-                continue
-            factor_moves = column in moving[row] or column in moving[pivot_row]
-            moving[row].discard(column)
-            factor = value / pivot_value
-            numeric_factor = reference[row, column] / reference[pivot_row, column]
-            reference[row, column] = 0.0
-            target = rows[row]
-            for entry, pivot_entry in trailing:
-                entry_moves = (
-                    entry in moving[row]
-                    or factor_moves
-                    or entry in moving[pivot_row]
+    return _SymbolicFactors(matrix, reference, varying, gauge=gauge).solve(right)
+
+
+class _SymbolicFactors:
+    """One symbolic matrix elimination reusable for multiple right-hand sides."""
+
+    def __init__(self, matrix: Sequence[Sequence[Any] | Mapping[int, Any]],
+                 reference: NDArray[np.float64],
+                 varying: Optional[set[tuple[int, int]]] = None, *,
+                 gauge: bool = False) -> None:
+        n = len(matrix)
+        rows = [
+            dict(row) if isinstance(row, Mapping) else
+            {column: value for column, value in enumerate(row) if not _zero(value)}
+            for row in matrix
+        ]
+        moving = [
+            {
+                column for column, value in row.items()
+                if ((index, column) in varying
+                    if varying is not None else not _constant(value))
+            }
+            for index, row in enumerate(rows)
+        ]
+        reference = np.array(reference, dtype=float, copy=True)
+        pivots: list[tuple[int, int]] = []
+        steps: list[tuple[int, int, tuple[tuple[int, Any], ...]]] = []
+        pivot_row = 0
+        for column in range(n):
+            active = [row for row in range(pivot_row, n)
+                      if column in rows[row] and reference[row, column] != 0.0]
+            if not active:
+                if gauge:
+                    continue
+                raise ValueError(
+                    f"the generated netlist equations are singular at column {column}"
                 )
-                updated = target.get(entry, 0.0) - factor * pivot_entry
-                if _zero(updated):
-                    target.pop(entry, None)
-                    moving[row].discard(entry)
-                else:
-                    target[entry] = updated
-                    if entry_moves:
-                        moving[row].add(entry)
-                    else:
+            stable = [row for row in active if column not in moving[row]]
+            candidates = stable or active
+            constants = [row for row in candidates if _constant(rows[row][column])]
+            candidates = constants or candidates
+            pivot = max(candidates, key=lambda row: abs(reference[row, column]))
+            if pivot != pivot_row:
+                rows[pivot_row], rows[pivot] = rows[pivot], rows[pivot_row]
+                moving[pivot_row], moving[pivot] = moving[pivot], moving[pivot_row]
+                reference[[pivot_row, pivot]] = reference[[pivot, pivot_row]]
+            source = rows[pivot_row]
+            pivot_value = source[column]
+            trailing = tuple((entry, value) for entry, value in source.items()
+                             if entry > column)
+            updates: list[tuple[int, Any]] = []
+            for row in range(pivot_row + 1, n):
+                value = rows[row].pop(column, None)
+                if value is None:
+                    continue
+                factor_moves = column in moving[row] or column in moving[pivot_row]
+                moving[row].discard(column)
+                factor = value / pivot_value
+                numeric_factor = reference[row, column] / reference[pivot_row, column]
+                reference[row, column] = 0.0
+                target = rows[row]
+                for entry, pivot_entry in trailing:
+                    entry_moves = (
+                        entry in moving[row]
+                        or factor_moves
+                        or entry in moving[pivot_row]
+                    )
+                    updated = target.get(entry, 0.0) - factor * pivot_entry
+                    if _zero(updated):
+                        target.pop(entry, None)
                         moving[row].discard(entry)
-                reference[row, entry] -= numeric_factor * reference[pivot_row, entry]
-            right[row] -= factor * right[pivot_row]
-        pivots.append((pivot_row, column))
-        pivot_row += 1
-    solution: list[Any] = [0.0] * n
-    for row, column in reversed(pivots):
-        residual = right[row] - sum(
-            value * solution[entry]
-            for entry, value in rows[row].items() if entry > column
-        )
-        solution[column] = residual / rows[row][column]
-    return solution
+                    else:
+                        target[entry] = updated
+                        if entry_moves:
+                            moving[row].add(entry)
+                        else:
+                            moving[row].discard(entry)
+                    reference[row, entry] -= numeric_factor * reference[pivot_row, entry]
+                updates.append((row, factor))
+            steps.append((pivot_row, pivot, tuple(updates)))
+            pivots.append((pivot_row, column))
+            pivot_row += 1
+        self.n = n
+        self._rows = rows
+        self._pivots = tuple(pivots)
+        self._steps = tuple(steps)
+
+    def solve(self, right: Sequence[Any]) -> list[Any]:
+        """Apply the recorded elimination to one right-hand side."""
+        if len(right) != self.n:
+            raise ValueError("the right-hand side does not match the eliminated system")
+        values = list(right)
+        for pivot_row, pivot, updates in self._steps:
+            if pivot != pivot_row:
+                values[pivot_row], values[pivot] = values[pivot], values[pivot_row]
+            for row, factor in updates:
+                values[row] -= factor * values[pivot_row]
+        solution: list[Any] = [0.0] * self.n
+        for row, column in reversed(self._pivots):
+            residual = values[row] - sum(
+                value * solution[entry]
+                for entry, value in self._rows[row].items() if entry > column
+            )
+            solution[column] = residual / self._rows[row][column]
+        return solution
 
 
 def _symbolic_source(
     expressions: Sequence[Any], *, language: str = "python",
+    shared_name: Optional[Callable[[int], str]] = None,
 ) -> tuple[list[str], tuple[str, ...]]:
     """Render one expression DAG for Python or generated C++ equations."""
     if language not in ("python", "cpp"):
@@ -550,7 +580,8 @@ def _symbolic_source(
                     if value.operation == "linear" else value.arguments)
         for argument in children:
             if isinstance(argument, _Symbolic) and argument in shared and argument not in names:
-                name = f"v{len(names)}"
+                name = (shared_name(len(names)) if shared_name is not None
+                        else f"v{len(names)}")
                 names[argument] = name
                 lines.append(f"{name} = {render(argument, argument)}")
         if value.operation == "linear":

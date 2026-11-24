@@ -73,8 +73,8 @@ class Plant:
         self.zoh_changed = False
 
     def selected_outputs(self, t: float, evaluate: Callable) -> None:
-        """Evaluate a selected output closure unless the full plant is already synchronized."""
-        if self._synced_at != t:
+        """Evaluate selected outputs unless the plant and its held inputs are current."""
+        if self._synced_at != t or self.zoh_changed:
             evaluate(t, self.state)
 
     def hold(self, label: str, value: Any, t: float | None = None) -> None:
@@ -941,6 +941,19 @@ class DCConverter(Unit):
             _PortMeasurement(self._power_port)
             if self.continuous and (needs_power or self.branch_f is None) else None
         )
+        if self.branch_f is None:
+            self._current_value = self.bridge.power_port, "current", -1.0
+            self._protection_current_value = self._current_value
+            self._current_feedback = (
+                None if self.power_measurement is None
+                else (self.power_measurement, "current", -1.0)
+            )
+            self._current_dependencies = ((self.bridge.power_port, "current"),)
+        else:
+            self._current_value = self.branch_f.output, "i", 1.0
+            self._protection_current_value = self.branch_f.state, "i", 1.0
+            self._current_feedback = (self.branch_f, "i")
+            self._current_dependencies = ()
         self._configure_runtime(
             sim,
             channel_zeros,
@@ -1069,26 +1082,20 @@ class DCConverter(Unit):
         return source.v if source.type == "voltage" else self.cfg.dclink.vdc_ref
 
     def _current(self) -> float:
-        if self.branch_f is not None:
-            return self.branch_f.output.i
-        return -self.bridge.power_port.current
+        record, field, factor = self._current_value
+        return factor * getattr(record, field)
 
     def _current_connection(self) -> Any:
-        if self.branch_f is not None:
-            return self.branch_f, "i"
-        if self.power_measurement is None:
+        if self._current_feedback is None:
             raise RuntimeError(f"{self.name}: continuous current feedback needs a port measurement")
-        return self.power_measurement, "current", -1.0
+        return self._current_feedback
 
     def _protection_currents(self) -> tuple[float, ...]:
-        current = (
-            self.branch_f.state.i if self.branch_f is not None
-            else -self.bridge.power_port.current
-        )
-        return (current,)
+        record, field, factor = self._protection_current_value
+        return (factor * getattr(record, field),)
 
     def protection_dependencies(self) -> tuple[tuple[Port, str], ...]:
-        return (() if self.branch_f is not None else ((self.bridge.power_port, "current"),))
+        return self._current_dependencies
 
     def _control_measurement(self, sample: ADCSample) -> ConverterMeasurement:
         values = sample.values

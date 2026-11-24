@@ -58,7 +58,7 @@ def test_series_resistor_matches_physical_series_loss_without_adding_states(link
                                rtol=1e-12, atol=1e-8)
     a.run(out_dir=None)
     load = a.system.named_elements["load"]
-    assert load.resistor.output.power == pytest.approx(2.0 * load.resistor.output.i ** 2)
+    assert load.model.output.power == pytest.approx(2.0 * load.model.output.i ** 2)
 
 
 @pytest.mark.parametrize("endpoint", ["charger", "charger.primary", "charger.primary.dc"])
@@ -69,8 +69,8 @@ def test_shunt_load_resolves_unit_default_and_named_ports(endpoint):
     sim.system.model.sync(0.0, sim.system.model.get_initial_values())
     load = sim.system.named_elements["load"]
     primary = sim.units["charger.primary"]
-    assert load.resistor.port1.voltage == primary.dclink.output.u_dc
-    assert load.resistor.output.i == pytest.approx(primary.dclink.output.u_dc / 2.0)
+    assert load.model.port1.voltage == primary.dclink.output.u_dc
+    assert load.model.output.i == pytest.approx(primary.dclink.output.u_dc / 2.0)
 
 
 def test_series_elements_share_the_same_generic_insertion_path_in_declaration_order():
@@ -80,8 +80,8 @@ def test_series_elements_share_the_same_generic_insertion_path_in_declaration_or
     }
     sim = peslite.Simulation(from_dict(tree))
     sim.run(out_dir=None)
-    first = sim.system.named_elements["load"].resistor
-    second = sim.system.named_elements["extra"].resistor
+    first = sim.system.named_elements["load"].model
+    second = sim.system.named_elements["extra"].model
     np.testing.assert_allclose(first.output.i, second.output.i)
     assert second.port1.voltage == first.output.u
     assert second.output.power == pytest.approx(first.output.power * 1.5)
@@ -100,11 +100,11 @@ def test_load_power_drives_the_existing_graph_and_load_step_keeps_state(model):
     before = sim.system.model.get_initial_values().copy()
     sim.system.apply(p.changes[0])
     np.testing.assert_array_equal(before, sim.system.model.get_initial_values())
-    assert sim.system.named_elements["load"].resistor.resistance == 3.0
+    assert sim.system.named_elements["load"].model.resistance == 3.0
     sim = peslite.Simulation(p)
     result = sim.run(out_dir=None)
     unit = sim.units["charger.secondary"]
-    load = sim.system.named_elements["load"].resistor
+    load = sim.system.named_elements["load"].model
     assert unit.ports.value("power") == load.output.power
     assert type(unit.ctrl).__name__ == "GraphController"
     assert result.summary["ph_verdict"] == "port-hamiltonian"
