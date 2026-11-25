@@ -130,6 +130,7 @@ export function App() {
   const [comparison, setComparison] = useState<{ path: string; data: CsvResponse } | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [summary, setSummary] = useState<{ summary: unknown; simulationFile: string | null } | null>(null);
+  const [jsonDocument, setJsonDocument] = useState<unknown>(null);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [debugPreview, setDebugPreview] = useState<DebugPreview | null>(null);
   const [layout, setLayout] = useState<PreviewLayout>(emptyLayout());
@@ -144,6 +145,7 @@ export function App() {
   activePath.current = path;
   const kind = path.toLowerCase().endsWith('.csv') ? 'csv'
     : path.toLowerCase().endsWith('summary.json') ? 'summary'
+    : path.toLowerCase().endsWith('.json') ? 'json'
     : path.toLowerCase().endsWith('.pes') ? 'pes'
     : path.toLowerCase().endsWith('.pesdbg') ? 'debug' : 'text';
   const isPes = !!path && kind === 'pes';
@@ -161,12 +163,17 @@ export function App() {
         setCsv(await request<CsvResponse>('csv.read', {
           path: selectedPath, offset: 0, stride: 1, limit: 1200,
         }));
-        setStride(1); setSummary(null); setFile(null); setText('');
+        setStride(1); setSummary(null); setJsonDocument(null); setFile(null); setText('');
         setLayout(emptyLayout());
       } else if (selectedPath.endsWith('summary.json')) {
         setSummary(await request<{ summary: unknown; simulationFile: string | null }>(
           'summary.read', { path: selectedPath }));
-        setCsv(null); setFile(null); setText('');
+        setCsv(null); setJsonDocument(null); setFile(null); setText('');
+        setLayout(emptyLayout());
+      } else if (selectedPath.endsWith('.json')) {
+        const result = await request<{ document: unknown }>('json.read', { path: selectedPath });
+        setJsonDocument(result.document);
+        setCsv(null); setSummary(null); setFile(null); setText('');
         setLayout(emptyLayout());
       } else {
         const [content, saved] = await Promise.all([
@@ -177,7 +184,7 @@ export function App() {
         ]);
         setFile(content); setText(content.text);
         setLayout(saved.layout);
-        setCsv(null); setSummary(null);
+        setCsv(null); setSummary(null); setJsonDocument(null);
       }
     } catch (problem) { setError(message(problem)); }
   }, []);
@@ -402,6 +409,10 @@ export function App() {
           {summary.simulationFile && <button onClick={() => void open(summary.simulationFile!)}>
             Open simulation.pes</button>}
           <pre>{JSON.stringify(summary.summary, null, 2)}</pre>
+        </section>}
+        {!!path && kind === 'json' && jsonDocument !== null && <section className="results">
+          <h3>JSON document</h3>
+          <pre>{JSON.stringify(jsonDocument, null, 2)}</pre>
         </section>}
         {!path && <div className="welcome"><h2>File-backed simulation workspace</h2>
           <p>Select a .pes file to inspect its circuit and run it. CSV and JSON results can be opened without rerunning.</p></div>}

@@ -82,11 +82,14 @@ graph assembly checks the source type, target type and connection ownership befo
 model: ../buck-open-loop-example.pes
 
 @debug
-- converter.references.duty -> converter.DutyModulation.duty
-+ Test.out -> converter.DutyModulation.duty
+Test: sine
+  amplitude: 0.02
+  frequency: 100.0
+  offset: 0.4
 
-@sources
-Test: {type: sine, amplitude: 0.02, frequency: 100.0, offset: 0.4}
+@converter
+- references.duty -> DutyModulation.duty
++ Test.out -> DutyModulation.duty
 
 @probe
 before: converter.references.duty

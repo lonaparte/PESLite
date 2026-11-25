@@ -800,7 +800,7 @@ def _debug_main(argv=None) -> int | _CommandOutcome:
     ap = _command_parser(prog="peslite debug", description=_debug_main.__doc__)
     _add_configuration_arguments(ap)
     ap.add_argument("operations", nargs="*", metavar="OPERATION",
-                    help="quoted +/− connection or ~ parameter operation")
+                    help="quoted +/− connection or PATH=VALUE parameter operation")
     origin = ap.add_mutually_exclusive_group()
     origin.add_argument("--plan", metavar="FILE", help="read this .pesdbg plan")
     origin.add_argument("--from", dest="from_run", metavar="RUN_ID",

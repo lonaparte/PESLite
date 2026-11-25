@@ -170,6 +170,10 @@ class Workspace:
                 "simulationFile": model.relative_to(self.root).as_posix()
                 if model.is_file() and not model.is_symlink() else None}
 
+    def json_document(self, name: str) -> dict[str, Any]:
+        """Read any workspace JSON file through the same bounded, read-only path."""
+        return {"document": json.loads(self.read(name)["text"])}
+
     def has_project_addons(self, name: str) -> bool:
         path = self.path(name, suffixes={".pes"})
         return any((directory / "PESaddons").is_dir() for directory in

@@ -35,7 +35,7 @@
       "explorer/context": [
         {
           "command": "peslite.preview",
-          "when": "resourceExtname == .pes || resourceExtname == .pesdbg || resourceExtname == .csv || resourceFilename == summary.json"
+          "when": "resourceExtname == .pes || resourceExtname == .pesdbg || resourceExtname == .csv || resourceExtname == .json"
         }
       ]
     },

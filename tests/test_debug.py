@@ -11,8 +11,8 @@ import pytest
 
 from conftest import EXAMPLES
 from peslite.addons.functions.debug import (
-    DebugOperation, DebugPlan, _analyses, execute_debug, parse_debug_text, prepare_debug,
-    read_debug_plan,
+    DebugOperation, DebugPlan, _analyses, execute_debug, parse_debug_text, parse_operation,
+    prepare_debug, read_debug_plan,
 )
 from peslite.solver.model import ConfigError
 
@@ -56,6 +56,30 @@ def test_plan_round_trip_and_strict_sections():
         parse_debug_text("model: case.pes\n@probe\na: A.out\n@probe\nb: B.out\n")
     with pytest.raises(ConfigError, match="state_policy"):
         parse_debug_text("model: case.pes\nstate_policy: discard\n")
+
+
+def test_native_debug_views_and_cli_assignments_share_one_operation_model():
+    plan = parse_debug_text("""model: case.pes
+
+@debug
+Test: sine
+  amplitude: 0.02
+  frequency: 500.0
+
+@vsc
+- CurrentLoop.u_dq -> ThreePhaseModulation.u_dq
++ Test.out -> ThreePhaseModulation.u_dq
+~ CurrentLoop.bandwidth = 250.0
+""")
+
+    assert plan.sources == {
+        "Test": {"type": "sine", "amplitude": 0.02, "frequency": 500.0},
+    }
+    assert {operation.scope for operation in plan.operations} == {"vsc"}
+    assert parse_debug_text(plan.to_text()) == plan
+    assert parse_operation("CurrentLoop.bandwidth=250.0") == DebugOperation(
+        "set", path="CurrentLoop.bandwidth", value=250.0,
+    )
 
 
 @pytest.mark.parametrize(
@@ -110,6 +134,13 @@ def test_overlay_reuses_parameter_replacement_and_the_typed_control_graph():
     assert graph.connections["ThreePhaseModulation.u_dq"] == "debug.Test"
     assert graph._frozen == {"CurrentLoop"}
     assert graph.probe_names == ("effective.re", "effective.im", "effective.abs")
+
+    scoped = prepare_debug(original, DebugPlan(operations=(
+        DebugOperation("set", path="CurrentLoop.bandwidth", value=250.0, scope="vsc"),
+    )))
+    assert scoped.parameter_overrides == {
+        "units.vsc.ctrl.loops.CurrentLoop.bandwidth": 250.0,
+    }
 
 
 def test_invalid_overlay_is_rejected_before_simulation():
@@ -248,7 +279,8 @@ def test_debug_cli_json_and_history_use_the_same_run(tmp_path, monkeypatch, caps
     plan_path = tmp_path / "control.pesdbg"
     plan_path.write_text(_bypass().to_text(), encoding="utf-8")
 
-    assert peslite.main(["debug", str(MODEL), "--plan", str(plan_path),
+    assert peslite.main(["debug", str(MODEL), "CurrentLoop.bandwidth=210.0",
+                         "--plan", str(plan_path),
                          "--set", "simulation.t_end=0.0005",
                          "--set", "simulation.energy_check=off",
                          "--set", "simulation.solver.linearisations=0", "--json"]) == 0
@@ -256,6 +288,9 @@ def test_debug_cli_json_and_history_use_the_same_run(tmp_path, monkeypatch, caps
     assert payload["command"] == "debug" and payload["debug"]["status"] == "passed"
     report = Path(payload["output"]["summary"])
     assert report.name == "report.json" and report.is_file()
+    assert json.loads(report.read_text(encoding="utf-8"))["plan"]["parameter_overrides"] == {
+        "units.vsc.ctrl.loops.CurrentLoop.bandwidth": 210.0,
+    }
 
     assert peslite.main(["debug", str(MODEL),
                          "--set", "simulation.t_end=0.0005",

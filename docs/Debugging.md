@@ -8,11 +8,12 @@ checks.
 
 ```bash
 peslite debug case.pes --plan control.pesdbg
+peslite debug case.pes CurrentLoop.bandwidth=250.0
 peslite debug case.pes --probe command=vsc.CurrentLoop.u_dq
 ```
 
 Each run creates `output/<case>/debug/YYMMDDTHHMM-NNN/` containing the effective
-`debug.pesdbg`, `report.json` and any additional evidence from that run. With no `--plan`, PESLite
+`debug.pesdbg` and `report.json`. With no `--plan`, PESLite
 inherits the latest run for that case; use `--fresh` to start with an empty overlay, pass an ID
 printed by `debug ls` to `--from`, or list the history with:
 
@@ -38,16 +39,15 @@ model: case.pes
 state_policy: continue
 
 @debug
-- vsc.CurrentLoop.u_dq -> vsc.ThreePhaseModulation.u_dq
-+ Test.out -> vsc.ThreePhaseModulation.u_dq
-~ units.vsc.ctrl.loops.CurrentLoop.bandwidth = 250.0
-
-@sources
-Test:
-  type: sine
+Test: sine
   amplitude: 0.02
   frequency: 500.0
   offset: 0.1
+
+@vsc
+- CurrentLoop.u_dq -> ThreePhaseModulation.u_dq
++ Test.out -> ThreePhaseModulation.u_dq
+~ CurrentLoop.bandwidth = 250.0
 
 @probe
 original: vsc.CurrentLoop.u_dq
@@ -69,10 +69,11 @@ command_limit:
   value: 0.2
 ```
 
-Connection edits use the same loop and port names as the control view. A disconnect must match an
-existing connection, a connect requires a free compatible input, and all replacements pass the
-ordinary typed-port validation before assembly. Parameter paths may be complete or an unambiguous
-suffix.
+A Unit view such as `@vsc` uses the same loop, port and `Name: Type` declaration syntax as a
+simulation-file view. A disconnect must match an existing connection, a connect requires a free
+compatible input, and all replacements pass the ordinary typed-port validation before assembly.
+Parameter paths may be complete or an unambiguous suffix; the CLI also accepts
+`CurrentLoop.bandwidth=250.0` directly.
 
 Source types are `constant`, `step`, `ramp`, `sine`, `pulse`, `chirp`, `prbs`, `multitone`, `table`
 and `csv`. Complex probes expose `.re`, `.im` and `.abs`; scalar probes retain their alias. Prefix
@@ -87,7 +88,8 @@ operators `<`, `<=`, `>`, `>=`, `==` and `!=`.
 
 The graphical interface opens `.pesdbg` as its authoritative source, validates it against the
 referenced `.pes` file and overlays added and removed control connections on the model view. Running
-the file invokes the same `peslite debug` command and produces the same history and report.
+the file invokes the same `peslite debug` command; previous runs and their JSON reports remain
+available in the workspace file tree.
 
 ## Report
 

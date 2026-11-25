@@ -146,6 +146,8 @@ class Host:
                                                if params.get("byteOffset") is not None else None))
         if method == "summary.read":
             return self.files.summary(name)
+        if method == "json.read":
+            return self.files.json_document(name)
         if method == "debug.inspect":
             target = self.files.path(name, suffixes={".pesdbg"})
             text = params.get("text")

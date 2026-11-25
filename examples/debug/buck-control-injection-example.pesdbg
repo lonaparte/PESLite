@@ -4,15 +4,14 @@ state_policy: continue
 @debug
 ~ simulation.t_end = 0.015
 ~ simulation.output.period = 0.00001
-- converter.references.duty -> converter.DutyModulation.duty
-+ Test.out -> converter.DutyModulation.duty
-
-@sources
-Test:
-  type: sine
+Test: sine
   amplitude: 0.03
   frequency: 100.0
   offset: 0.4
+
+@converter
+- references.duty -> DutyModulation.duty
++ Test.out -> DutyModulation.duty
 
 @probe
 before: converter.references.duty

@@ -4,15 +4,14 @@ state_policy: continue
 @debug
 ~ simulation.t_end = 0.02
 ~ simulation.output.period = 0.0001
-- vsc.CurrentLoop.u_dq -> vsc.ThreePhaseModulation.u_dq
-+ Test.out -> vsc.ThreePhaseModulation.u_dq
-
-@sources
-Test:
-  type: sine
+Test: sine
   amplitude: 0.02
   frequency: 500.0
   offset: 0.1
+
+@vsc
+- CurrentLoop.u_dq -> ThreePhaseModulation.u_dq
++ Test.out -> ThreePhaseModulation.u_dq
 
 @probe
 original: vsc.CurrentLoop.u_dq

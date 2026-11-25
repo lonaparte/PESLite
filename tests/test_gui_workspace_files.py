@@ -41,6 +41,10 @@ def test_bounded_csv_windows_and_summary(tmp_path):
     assert backend.summary("summary.json") == {
         "summary": {"ok": True}, "simulationFile": "simulation.pes",
     }
+    (tmp_path / "report.json").write_text(json.dumps({"schema": "peslite.debug/v1"}))
+    assert backend.json_document("report.json") == {
+        "document": {"schema": "peslite.debug/v1"},
+    }
 
 
 def test_csv_window_on_file_growth(tmp_path):
@@ -88,17 +92,23 @@ def test_debug_plan_is_a_workspace_file_and_previews_its_model(tmp_path):
     copyfile(EXAMPLES / "gfl-example.pes", tmp_path / "case.pes")
     text = (
         "model: case.pes\n\n@debug\n"
-        "- vsc.CurrentLoop.u_dq -> vsc.ThreePhaseModulation.u_dq\n"
-        "+ Test.out -> vsc.ThreePhaseModulation.u_dq\n\n"
-        "@sources\nTest: 0.1\n\n"
+        "Test: constant\n  value: 0.1\n\n"
+        "@vsc\n- CurrentLoop.u_dq -> ThreePhaseModulation.u_dq\n"
+        "+ Test.out -> ThreePhaseModulation.u_dq\n\n"
         "@probe\neffective: vsc.ThreePhaseModulation.u_dq\n"
     )
     (tmp_path / "control.pesdbg").write_text(text, encoding="utf-8")
+    report = tmp_path / "output/case/debug/261120T1030-000/report.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps({"schema": "peslite.debug/v1", "status": "passed"}))
     host = Host(tmp_path)
     try:
         assert "control.pesdbg" in {entry["name"] for entry in host.dispatch("tree", {})["files"]}
         result = host.dispatch("debug.inspect", {"path": "control.pesdbg", "text": text})
         command = host.dispatch("run.command", {"path": "control.pesdbg"})["command"]
+        saved = host.dispatch("json.read", {
+            "path": "output/case/debug/261120T1030-000/report.json",
+        })
     finally:
         host.close()
 
@@ -110,6 +120,7 @@ def test_debug_plan_is_a_workspace_file_and_previews_its_model(tmp_path):
         "disconnect", "connect",
     ]
     assert result["watch"] == ["vsc.effective.re", "vsc.effective.im", "vsc.effective.abs"]
+    assert saved["document"]["status"] == "passed"
 
 
 def test_csv_byte_cursor_tails_without_rescanning_and_skips_partial_rows(tmp_path):

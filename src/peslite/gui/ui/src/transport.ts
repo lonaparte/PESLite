@@ -1,6 +1,6 @@
 /** The shared frontend knows about messages, never HTTP or VS Code file APIs. */
 export type Operation =
-  | 'tree' | 'file.read' | 'preview' | 'csv.read' | 'summary.read'
+  | 'tree' | 'file.read' | 'preview' | 'csv.read' | 'summary.read' | 'json.read'
   | 'debug.inspect'
   | 'preview.layout.load' | 'preview.layout.save' | 'preview.layout.clear'
   | 'run.command' | 'run.start' | 'run.stop' | 'run.status'

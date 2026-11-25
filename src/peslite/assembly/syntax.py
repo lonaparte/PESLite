@@ -153,6 +153,15 @@ def _content(line: str) -> str:
     return line.rstrip()
 
 
+def parse_view_declaration(statement: str) -> tuple[str, tuple[str, ...]] | None:
+    """Return the name and displayed types from one native view declaration."""
+    content = _content(statement).strip()
+    if not _VIEW_DEFINITION.fullmatch(content):
+        return None
+    name, written = (part.strip() for part in content.split(":", 1))
+    return name, tuple(part.strip() for part in written.split(","))
+
+
 def _starts_parameters(statement: str) -> bool:
     """Recognize a parameter domain without treating a bare view declaration as one."""
     content = _content(statement).strip()
@@ -192,7 +201,7 @@ def _validate_view(name: str, body: list[tuple[int, str]], path: str | Path) -> 
         declaration_indent = None
         if _GROUP.fullmatch(expression) or _CONNECTION.fullmatch(expression):
             continue
-        if _VIEW_DEFINITION.fullmatch(expression):
+        if parse_view_declaration(expression) is not None:
             declaration_indent = level
             continue
         if re.fullmatch(rf"{NAME_PATTERN}\s*:\s*", expression):
@@ -295,7 +304,9 @@ def read_simulation_file(path: str | Path) -> tuple[dict[str, Any], str]:
 
 
 __all__ = [
-    "PARAMETER_DOMAINS", "SimulationFileError", "is_native_source", "parse_native_text",
-    "parse_parameter_mapping", "parse_simulation_text", "read_simulation_file",
+    "NAME_PATTERN", "PARAMETER_DOMAINS", "SimulationFileError", "is_native_source",
+    "parse_native_text",
+    "parse_parameter_mapping", "parse_simulation_text", "parse_view_declaration",
+    "read_simulation_file",
     "register_simulation_reader", "split_simulation_text",
 ]

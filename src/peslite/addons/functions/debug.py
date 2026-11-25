@@ -8,6 +8,7 @@ import math
 import operator
 import re
 import shutil
+import textwrap
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +19,7 @@ import yaml
 
 from ... import __version__
 from ...assembly.params import Params, _unit_items, flat_paths, to_dict, unit_type
-from ...assembly.syntax import parse_parameter_mapping
+from ...assembly.syntax import NAME_PATTERN, parse_parameter_mapping, parse_view_declaration
 from ...control.controller import ControlGraphOverlay, continuous_control
 from ...control.loops import LOOP_TYPES
 from ...assembly.control import control_profile, resolved_control_interface
@@ -27,13 +28,14 @@ from ...solver.model import ConfigError
 from ...solver.simulation import Simulation, validate_model
 
 
-_SECTIONS = ("debug", "sources", "probe", "analysis", "checks")
-_HEADER = re.compile(r"^@([A-Za-z_][\w-]*)\s*(?:#.*)?$")
-_NAME = re.compile(r"^[A-Za-z_][\w-]*$")
-_PATH = r"[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)+"
+_MAPPING_SECTIONS = ("probe", "analysis", "checks")
+_HEADER = re.compile(rf"^@({NAME_PATTERN})\s*(?:#.*)?$")
+_NAME = re.compile(rf"^{NAME_PATTERN}$")
+_PATH = rf"{NAME_PATTERN}(?:\.{NAME_PATTERN})+"
 _PATH_NAME = re.compile(rf"^{_PATH}$")
 _WIRE = re.compile(rf"^([+-])\s*({_PATH})\s*->\s*({_PATH})\s*$")
 _SET = re.compile(rf"^~\s*({_PATH})\s*=\s*(.+)$")
+_SET_SHORT = re.compile(rf"^({_PATH})\s*=\s*(.+)$")
 _RUN_ID = re.compile(r"^\d{6}T\d{4}-\d{3}$")
 _OPERATORS = {
     "<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge,
@@ -50,6 +52,7 @@ class DebugOperation:
     target: str = ""
     path: str = ""
     value: Any = None
+    scope: str = ""
 
 
 @dataclass(frozen=True)
@@ -82,9 +85,16 @@ class DebugPlan:
     def to_text(self) -> str:
         lines = [f"model: {_scalar(self.model)}", f"state_policy: {self.state_policy}"]
         lines.extend(("", "@debug"))
-        lines.extend(_operation_text(operation) for operation in self.operations)
-        for name, values in (("sources", self.sources), ("probe", self.probes),
-                             ("analysis", self.analyses), ("checks", self.checks)):
+        lines.extend(_source_text(name, values) for name, values in self.sources.items())
+        lines.extend(_operation_text(operation) for operation in self.operations
+                     if not operation.scope)
+        scopes = dict.fromkeys(operation.scope for operation in self.operations if operation.scope)
+        for scope in scopes:
+            lines.extend(("", f"@{scope}"))
+            lines.extend(_operation_text(operation) for operation in self.operations
+                         if operation.scope == scope)
+        for name, values in (("probe", self.probes), ("analysis", self.analyses),
+                             ("checks", self.checks)):
             lines.extend(("", f"@{name}"))
             if values:
                 lines.extend(yaml.safe_dump(dict(values), sort_keys=False,
@@ -121,23 +131,44 @@ def _operation_text(operation: DebugOperation) -> str:
     return f"{symbol} {operation.source} -> {operation.target}"
 
 
-def parse_operation(text: str, *, where: str = "debug operation") -> DebugOperation:
+def _source_text(name: str, written: Any) -> str:
+    if isinstance(written, (int, float)) and not isinstance(written, bool):
+        values = {"value": written}
+        kind = "constant"
+    elif isinstance(written, Mapping):
+        values = dict(written)
+        kind = values.pop("type", "constant")
+    else:
+        raise ConfigError(f"debug source {name!r} must be a number or mapping")
+    if not isinstance(kind, str) or not kind:
+        raise ConfigError(f"debug source {name!r} type must be text")
+    lines = [f"{name}: {kind}"]
+    if values:
+        body = yaml.safe_dump(values, sort_keys=False, default_flow_style=False).rstrip()
+        lines.extend("  " + line for line in body.splitlines())
+    return "\n".join(lines)
+
+
+def parse_operation(text: str, *, where: str = "debug operation",
+                    scope: str = "") -> DebugOperation:
     """Parse one connection or parameter operation."""
     statement = text.strip()
     match = _WIRE.fullmatch(statement)
     if match is not None:
         symbol, source, target = match.groups()
         return DebugOperation("connect" if symbol == "+" else "disconnect",
-                              source=source, target=target)
-    match = _SET.fullmatch(statement)
+                              source=source, target=target, scope=scope)
+    match = _SET.fullmatch(statement) or _SET_SHORT.fullmatch(statement)
     if match is not None:
         path, written = match.groups()
         try:
             value = parse_parameter_mapping(f"value: {written}\n", where)["value"]
         except (KeyError, ValueError) as exc:
             raise ConfigError(f"{where}: invalid parameter value: {exc}") from None
-        return DebugOperation("set", path=path, value=value)
-    raise ConfigError(f"{where}: expected '+ source -> target', '- source -> target', or '~ path = value'")
+        return DebugOperation("set", path=path, value=value, scope=scope)
+    raise ConfigError(
+        f"{where}: expected '+ source -> target', '- source -> target', or 'path = value'"
+    )
 
 
 def _validate_plan(plan: DebugPlan, where: str = "debug plan") -> DebugPlan:
@@ -153,14 +184,16 @@ def _validate_plan(plan: DebugPlan, where: str = "debug plan") -> DebugPlan:
             raise ConfigError(f"{where}: @{name} must be a mapping")
     if any(not isinstance(name, str) or _NAME.fullmatch(name) is None
            for name in plan.sources):
-        raise ConfigError(f"{where}: @sources names must be simple identifiers")
+        raise ConfigError(f"{where}: source names must be simple identifiers")
     if any(not isinstance(name, str) or _NAME.fullmatch(name) is None
            or not isinstance(value, str) for name, value in plan.probes.items()):
         raise ConfigError(f"{where}: @probe aliases need simple names and dotted-path values")
     for operation in plan.operations:
         if not isinstance(operation, DebugOperation):
             raise ConfigError(f"{where}: operations must be DebugOperation values")
-        if operation.kind == "set":
+        if operation.scope and _NAME.fullmatch(operation.scope) is None:
+            valid = False
+        elif operation.kind == "set":
             valid = _PATH_NAME.fullmatch(operation.path) is not None
         elif operation.kind in {"connect", "disconnect"}:
             valid = (_PATH_NAME.fullmatch(operation.source) is not None
@@ -172,9 +205,54 @@ def _validate_plan(plan: DebugPlan, where: str = "debug plan") -> DebugPlan:
     return plan
 
 
+def _parse_debug_view(body: list[tuple[int, str]], path: str | Path, scope: str
+                      ) -> tuple[list[DebugOperation], dict[str, Any]]:
+    """Parse native declarations and debug operations from one interface view."""
+    operations: list[DebugOperation] = []
+    sources: dict[str, Any] = {}
+    declaration: tuple[str, str, int] | None = None
+    fields: list[str] = []
+
+    def finish() -> None:
+        nonlocal declaration, fields
+        if declaration is None:
+            return
+        name, kind, number = declaration
+        values = parse_parameter_mapping(
+            textwrap.dedent("\n".join(fields)) or "{}", f"{path}:{number} {name}",
+        )
+        if "type" in values:
+            raise ConfigError(f"{path}:{number}: source type is already declared after {name}:")
+        if name in sources:
+            raise ConfigError(f"{path}:{number}: duplicate debug source {name!r}")
+        sources[name] = {"type": kind, **values}
+        declaration, fields = None, []
+
+    for number, raw in body:
+        statement = raw.rstrip()
+        if not statement.strip() or statement.lstrip().startswith("#"):
+            continue
+        if statement[:1].isspace():
+            if declaration is None:
+                raise ConfigError(f"{path}:{number}: indented content requires a source declaration")
+            fields.append(statement)
+            continue
+        finish()
+        parsed = parse_view_declaration(statement)
+        if parsed is not None:
+            name, kinds = parsed
+            if len(kinds) != 1:
+                raise ConfigError(f"{path}:{number}: a debug source requires one type")
+            declaration = (name, kinds[0], number)
+            continue
+        operations.append(parse_operation(statement, where=f"{path}:{number}", scope=scope))
+    finish()
+    return operations, sources
+
+
 def parse_debug_text(text: str, path: str | Path = "<string>") -> DebugPlan:
     """Parse a ``.pesdbg`` file without interpreting its referenced simulation."""
-    bodies: dict[str, list[tuple[int, str]]] = {name: [] for name in _SECTIONS}
+    bodies: dict[str, list[tuple[int, str]]] = {}
     preamble: list[str] = []
     active: str | None = None
     seen: set[str] = set()
@@ -182,11 +260,10 @@ def parse_debug_text(text: str, path: str | Path = "<string>") -> DebugPlan:
         match = _HEADER.fullmatch(raw)
         if match is not None:
             active = match.group(1)
-            if active not in bodies:
-                raise ConfigError(f"{path}: unknown @{active} section at line {number}")
             if active in seen:
                 raise ConfigError(f"{path}: duplicate @{active} section at line {number}")
             seen.add(active)
+            bodies[active] = []
             continue
         if active is None:
             preamble.append(raw)
@@ -198,19 +275,26 @@ def parse_debug_text(text: str, path: str | Path = "<string>") -> DebugPlan:
         raise ConfigError(f"{path}: unknown debug fields {sorted(unknown)}")
     model = header.get("model", "")
     state_policy = header.get("state_policy", "continue")
-    operations = []
-    for number, raw in bodies["debug"]:
-        statement = raw.strip()
-        if not statement or statement.startswith("#"):
+    operations: list[DebugOperation] = []
+    sources: dict[str, Any] = {}
+    for name, body in bodies.items():
+        if name in _MAPPING_SECTIONS:
             continue
-        operations.append(parse_operation(statement, where=f"{path}:{number}"))
+        parsed_operations, parsed_sources = _parse_debug_view(
+            body, path, "" if name == "debug" else name,
+        )
+        duplicate = set(sources) & set(parsed_sources)
+        if duplicate:
+            raise ConfigError(f"{path}: duplicate debug sources {sorted(duplicate)}")
+        operations.extend(parsed_operations)
+        sources.update(parsed_sources)
     mappings = {}
-    for section in _SECTIONS[1:]:
-        body = "\n".join(raw for _number, raw in bodies[section])
+    for section in _MAPPING_SECTIONS:
+        body = "\n".join(raw for _number, raw in bodies.get(section, ()))
         mappings[section] = parse_parameter_mapping(body or "{}", f"{path} @{section}")
     return _validate_plan(DebugPlan(
         model=model, state_policy=state_policy,
-        operations=tuple(operations), sources=mappings["sources"], probes=mappings["probe"],
+        operations=tuple(operations), sources=sources, probes=mappings["probe"],
         analyses=mappings["analysis"], checks=mappings["checks"],
     ), str(path))
 
@@ -240,11 +324,14 @@ def _split_control_path(path: str, units: Mapping[str, Any], *, default: str | N
     raise ConfigError(f"control path {path!r} must name one of the units {sorted(units)}")
 
 
-def _parameter_path(p: Params, written: str) -> str:
+def _parameter_path(p: Params, written: str, scope: str = "") -> str:
     values = flat_paths(to_dict(p, derived=True))
     if written in values:
         return written
     candidates = [path for path in values if path.endswith("." + written)]
+    if scope:
+        prefix = f"units.{scope}."
+        candidates = [path for path in candidates if path.startswith(prefix)]
     if len(candidates) == 1:
         return candidates[0]
     if not candidates:
@@ -387,12 +474,12 @@ def prepare_debug(p: Params, plan: DebugPlan, *, directory: str | Path = ".") ->
         if operation.kind != "set":
             operations.append(operation)
             continue
-        path = _parameter_path(p, operation.path)
+        path = _parameter_path(p, operation.path, operation.scope)
         previous = previous_sets.get(path)
         if previous is not None:
             operations[previous] = None
         previous_sets[path] = len(operations)
-        operations.append(replace(operation, path=path))
+        operations.append(replace(operation, path=path, scope=""))
         overrides[path] = operation.value
     canonical_operations = tuple(operation for operation in operations if operation is not None)
     if overrides:
@@ -435,7 +522,9 @@ def prepare_debug(p: Params, plan: DebugPlan, *, directory: str | Path = ".") ->
     for operation in plan.operations:
         if operation.kind == "set":
             continue
-        unit_name, target = _split_control_path(operation.target, units)
+        unit_name, target = _split_control_path(
+            operation.target, units, default=operation.scope or None,
+        )
         data = descriptions[unit_name]
         if target not in data["targets"]:
             raise ConfigError(f"debug target {operation.target!r} is not a loop input")

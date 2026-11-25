@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 interface Message { id: number; method: string; params: Record<string, any> }
-const bridged = new Set(['preview', 'debug.inspect', 'csv.read', 'summary.read']);
+const bridged = new Set(['preview', 'debug.inspect', 'csv.read', 'summary.read', 'json.read']);
 const safeSuffix = /\.(pes|pesdbg|yaml|yml|csv|json)$/i;
 
 function python() {
