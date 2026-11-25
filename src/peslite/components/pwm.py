@@ -18,6 +18,7 @@ from ..defaults import (DEFAULT_PWM_ALIGNMENT, DEFAULT_PWM_CARRIER_PHASE,
                         DEFAULT_PWM_MIN_INTERVAL)
 from ..solver.model import ConfigError, _integer, _real
 from ..solver.timing import TIME_EPS, PeriodicClock
+from .registry import MODULATOR_TYPES, register_modulator_type
 
 PWM_ALIGNMENTS = ("center", "trailing", "leading")
 
@@ -32,7 +33,7 @@ PHASE_SHIFT_MODES = {
 __all__ = ["PWM", "PhaseClock", "PulseSequence", "SwitchingSequence",
            "Modulator", "CarrierComparison",
            "SynchronousCarrier", "ZOH", "PhaseShiftModulator",
-           "phase_shift_level", "carrier", "carrier_position", "MODULATOR_TYPES",
+           "phase_shift_level", "carrier", "carrier_position",
            "make_modulator"]
 
 
@@ -1097,7 +1098,7 @@ class PhaseShiftModulator:
                                    ((x, self.pulse_groups[0], _LEGS[after]) for x, after in changes))
 
 
-MODULATOR_TYPES = {"phase_shift": PhaseShiftModulator}
+register_modulator_type("phase_shift", PhaseShiftModulator)
 
 
 def modulator_type(pwm, model, kind=None):

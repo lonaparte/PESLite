@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
-from ...components.network import Element, NetworkComponent, register_component_type
+from ...components.network import Element, NetworkComponent
+from ...components.registry import register_component_type
 from ...solver import ConfigError, Empty, Port
 from ...solver import netlist as nl
 

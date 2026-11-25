@@ -27,7 +27,8 @@ from pathlib import Path
 from types import MappingProxyType, UnionType
 from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
 
-from ..components.network import ELEMENT_TYPES, element_buses
+from ..components.network import element_buses
+from ..components.registry import ELEMENT_TYPES
 from ..components.pwm import PWM_ALIGNMENTS
 from ..defaults import (DEFAULT_CONTROL_COMPUTATION, DEFAULT_MULTIRATE_SWEEPS,
                         DEFAULT_OUTPUT_PRECISION,
@@ -635,7 +636,7 @@ class BridgeParams:
     @property
     def neutral_duty(self) -> float:
         """Duty coordinate of zero bridge voltage, from the registered topology."""
-        from ..components.converter import topology_type
+        from ..components.registry import topology_type
         return topology_type(self.type).neutral_duty
 
 

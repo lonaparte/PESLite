@@ -6,7 +6,8 @@ the same assembled model.
 """
 
 from ..solver import Bag, ConfigError, Empty, Port, StoragePort
-from .network import GROUND, register_component_type, resolve_endpoints
+from .network import GROUND, resolve_endpoints
+from .registry import register_component_type
 from .passive import Bus, Capacitor, Load, Resistor, RCNode, RLBranch
 from .source import ACVoltageSource, VoltageSource
 from .converter import (AveragingModel, PWMAveragingModel, SwitchingModel,

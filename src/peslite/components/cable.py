@@ -6,7 +6,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from .network import Element, NetworkComponent, register_component_type
+from .network import Element, NetworkComponent
+from .registry import register_component_type
 from ..solver import Bag, ConfigError, Empty, Port, StoragePort
 from ..solver.history import AcceptedSignal, DelayedSignal, DelayHistory
 from ..solver.model import record_type

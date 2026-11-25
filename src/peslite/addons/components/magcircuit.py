@@ -9,7 +9,7 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 
 from .magcomponent import MagneticParams, _MagneticElement, _validate_winding_names
-from ...components.network import register_component_type
+from ...components.registry import register_component_type
 from ...solver import ConfigError, directional_derivative
 from .magport import _attach_magnetic_law
 

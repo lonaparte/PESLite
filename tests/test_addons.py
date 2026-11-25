@@ -10,7 +10,7 @@ from peslite.addons import control as addon_control
 from peslite.assembly import addons as addon_assembly
 from peslite.addons.control.mpc import (PredictiveCurrentControl,
                                         ThreePhasePredictiveCurrentControl)
-from peslite.components.network import ELEMENT_TYPES
+from peslite.components.registry import ELEMENT_TYPES
 from peslite.control import LOOP_TYPES, Loop
 
 

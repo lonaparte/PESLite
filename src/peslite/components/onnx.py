@@ -12,7 +12,8 @@ from typing import Any
 import numpy as np
 
 from ..solver.model import BlackBoxSubsystem, ConfigError
-from .network import Element, register_component_type
+from .network import Element
+from .registry import register_component_type
 
 __all__ = ["ONNXModel", "ONNXStateParams"]
 

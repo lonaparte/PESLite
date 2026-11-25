@@ -20,7 +20,7 @@ from .magcomponent import (
     _validate_winding_names,
 )
 from .magcomponent import inductance_modes
-from ...components.network import register_component_type
+from ...components.registry import register_component_type
 from ...solver import Bag, ConfigError, OutputMethod, Port, directional_derivative
 from ...solver import record_type
 

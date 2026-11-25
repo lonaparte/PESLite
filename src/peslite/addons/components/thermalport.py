@@ -10,7 +10,8 @@ from typing import Any, ClassVar, Mapping, Protocol, Sequence
 
 import numpy as np
 
-from ...components.network import Element, register_component_type
+from ...components.network import Element
+from ...components.registry import register_component_type
 from ...solver import Bag, ConfigError
 from .thermal import _finite, _record
 

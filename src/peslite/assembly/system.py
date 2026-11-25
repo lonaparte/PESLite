@@ -10,7 +10,8 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Mapping, Optional, Sequence
 
-from ..components.network import ELEMENT_TYPES, GROUND, Port, resolve_endpoints
+from ..components.network import GROUND, Port, resolve_endpoints
+from ..components.registry import ELEMENT_TYPES
 from ..components.passive import Bus, RCNode, RLBranch
 from ..components.source import ACVoltageSource
 from ..components.adc import _PortMeasurement

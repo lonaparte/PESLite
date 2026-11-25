@@ -8,7 +8,8 @@ from typing import Any, Callable, ClassVar, Optional
 
 from ..solver.energy import Port, StoragePort
 from ..solver.model import Bag, ConfigError, Empty
-from .network import Element, NetworkComponent, _phase_convention, register_component_type
+from .network import Element, NetworkComponent, _phase_convention
+from .registry import register_component_type
 
 __all__ = ["ACVoltageSource", "VoltageSource"]
 

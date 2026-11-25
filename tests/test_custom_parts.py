@@ -11,7 +11,8 @@ import peslite
 from peslite.assembly import Event, register_event_type
 from peslite.assembly.params import ConfigError, from_dict
 from peslite.components import RLBranch, register_component_type
-from peslite.components.network import ELEMENT_TYPES, Element
+from peslite.components.network import Element
+from peslite.components.registry import ELEMENT_TYPES
 from peslite.control import ANGLE, FREQUENCY, V_AB, V_DQ, Loop, SyncLaw, register_loop_type
 from peslite.solver import SolverStep
 

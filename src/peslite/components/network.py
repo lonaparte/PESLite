@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields
 from types import SimpleNamespace
 from typing import Any, Callable, ClassVar, Mapping, Optional
 
@@ -12,8 +12,8 @@ from ..solver.energy import Port, StoragePort
 from ..solver.model import ConfigError, Empty, _complex, _real
 
 __all__ = [
-    "Port", "ElectricalEndpoint", "NetworkComponent", "Element", "ComponentDefinition",
-    "ELEMENT_TYPES", "register_component_type", "element_buses", "resolve_endpoints", "GROUND",
+    "Port", "ElectricalEndpoint", "NetworkComponent", "Element",
+    "element_buses", "resolve_endpoints", "GROUND",
 ]
 
 GROUND = "ground"
@@ -157,36 +157,6 @@ class Element:
     @staticmethod
     def port_bindings() -> tuple[tuple[str, Port], ...]:
         return ()
-
-
-@dataclass(frozen=True)
-class ComponentDefinition:
-    """One normalized configuration type and its assembly-time constructor."""
-
-    type: str
-    params: type
-    constructor: Callable[[str, Any, dict, Any], Element]
-
-    def __call__(self, name: str, cfg: Any, buses: dict, p: Any) -> Element:
-        return self.constructor(name, cfg, buses, p)
-
-
-ELEMENT_TYPES: dict[str, ComponentDefinition] = {}
-
-
-def _register_definition(cls: type, params: type, constructor: Callable) -> type:
-    """Store one normalized component definition and return its public class."""
-    name = getattr(cls, "type", None)
-    if not isinstance(name, str) or not name:
-        raise TypeError("a component type needs a name: the class attribute 'type'")
-    if name in ELEMENT_TYPES:
-        raise ValueError(f"component type {name!r} is already registered")
-    if not is_dataclass(params) or "type" not in params.__dataclass_fields__:
-        raise TypeError(f"component type {name!r}: parameters need a dataclass type field")
-    if params.__dataclass_fields__["type"].default != name:
-        raise TypeError(f"component type {name!r}: type must default to {name!r}")
-    ELEMENT_TYPES[name] = ComponentDefinition(name, params, constructor)
-    return cls
 
 
 def element_buses(cfg: Any) -> dict[str, str]:
@@ -435,22 +405,3 @@ class _ConfiguredComponent(Element):
         changed = self.cfg != cfg
         self.cfg = cfg
         return changed
-
-
-def register_component_type(cls: type) -> type:
-    """Register a declarative component or a complete :class:`Element` adapter."""
-    if isinstance(cls, type) and issubclass(cls, Element):
-        return _register_definition(cls, getattr(cls, "Params", None), cls)
-    if is_dataclass(cls):
-        if not cls.__dataclass_params__.frozen:
-            raise TypeError("a declarative component parameter dataclass must be frozen")
-        if not callable(getattr(cls, "network", None)):
-            raise TypeError("a declarative component type needs network(builder)")
-        return _register_definition(
-            cls,
-            cls,
-            lambda name, cfg, buses, _params: _ConfiguredComponent(
-                name, cfg, buses, _params
-            ),
-        )
-    raise TypeError("a component type must be a frozen parameter dataclass or Element adapter")

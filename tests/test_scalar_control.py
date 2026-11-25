@@ -165,7 +165,8 @@ def test_registered_carrier_keeps_its_own_topology_capabilities(monkeypatch):
     from conftest import EXAMPLES
     from peslite.assembly.control import make_control_modulator
     from peslite.components.converter import HalfBridge, make_bridge
-    from peslite.components.pwm import CarrierComparison, MODULATOR_TYPES, validate_modulator
+    from peslite.components.pwm import CarrierComparison, validate_modulator
+    from peslite.components.registry import MODULATOR_TYPES
     from peslite.assembly.control import CONTROL_TYPES
 
     class CustomCarrier(CarrierComparison):

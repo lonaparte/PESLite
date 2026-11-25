@@ -13,8 +13,8 @@ import numpy as np
 
 from ...assembly.params import _parameterized, register_unit_type, unit_type
 from ...assembly.system import _UnitAssembly, _assemble_unit, _part
-from ...components.network import (GROUND, Element, NetworkComponent, register_component_type,
-                                   resolve_endpoints)
+from ...components.network import GROUND, Element, NetworkComponent, resolve_endpoints
+from ...components.registry import register_component_type
 from ...components.pwm import PhaseClock
 from ...solver import Bag, ConfigError, Empty, OutputMethod, Port, StoragePort
 from ...solver import record_type

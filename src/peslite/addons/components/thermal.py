@@ -9,7 +9,8 @@ from typing import Any, ClassVar, Mapping, Protocol, Sequence
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
-from ...components.network import Element, NetworkComponent, register_component_type
+from ...components.network import Element, NetworkComponent
+from ...components.registry import register_component_type
 from ...solver import Bag, ConfigError, Empty, OutputMethod, Port
 from ...solver import record_type
 

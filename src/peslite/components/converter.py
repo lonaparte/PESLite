@@ -20,6 +20,7 @@ from ..solver.timing import TIME_EPS, PeriodicClock
 from .network import NetworkComponent
 from .passive import RCNode
 from .pwm import CarrierComparison, Modulator, PWM, ZOH, make_modulator
+from .registry import register_topology, topology_type
 
 __all__ = ["ThreePhaseBridge", "SwitchingModel", "PWMAveragingModel", "AveragingModel",
            "HalfBridge", "FullBridge", "DCLink", "DCCapacitor",
@@ -156,21 +157,7 @@ class ThreePhaseBridge(_BridgeTopology):
         return output.d_abc
 
 
-TOPOLOGY_TYPES: dict[str, type] = {}
-
-
-def _register_topology(cls: type) -> type:
-    """Register one bridge topology under its configuration name."""
-    name = getattr(cls, "type", None)
-    if not isinstance(name, str) or not name:
-        raise TypeError("a bridge topology needs a non-empty type")
-    if name in TOPOLOGY_TYPES:
-        raise ValueError(f"bridge topology {name!r} is already registered")
-    TOPOLOGY_TYPES[name] = cls
-    return cls
-
-
-_register_topology(ThreePhaseBridge)
+register_topology(ThreePhaseBridge)
 
 
 class _BridgeModel(NetworkComponent):
@@ -684,16 +671,6 @@ def make_topology(cfg: Any):
     return topology_type(cfg.type).from_config(cfg)
 
 
-def topology_type(name: str, where: str = "bridge.type") -> type:
-    """Return a registered bridge topology class by configuration name."""
-    try:
-        return TOPOLOGY_TYPES[name]
-    except KeyError:
-        raise ConfigError(
-            f"{where}: unknown bridge topology {name!r}; known: {sorted(TOPOLOGY_TYPES)}"
-        ) from None
-
-
 def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None, *,
                 continuous: bool | None = None) -> _BridgeModel:
     """Compose a bridge topology with switching, PWM or averaging behavior."""
@@ -744,7 +721,7 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None, *,
     )
 
 
-@_register_topology
+@register_topology
 class HalfBridge(_BridgeTopology):
     """One scalar switching leg between upper and lower DC rails.
 
@@ -979,7 +956,7 @@ class HalfBridgeDiodeConduction:
         return self.output.maximum_step
 
 
-@_register_topology
+@register_topology
 class FullBridge(_BridgeTopology):
     """Two half bridges forming one scalar H-bridge.
 

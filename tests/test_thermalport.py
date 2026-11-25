@@ -258,7 +258,7 @@ def test_thermal_component_types_share_the_component_registry():
     import peslite
 
     # Standard and full addon types use the same component registry.
-    from peslite.components.network import ELEMENT_TYPES
+    from peslite.components.registry import ELEMENT_TYPES
     for name in ("shared_thermal_network", "thermalport"):
         assert name in ELEMENT_TYPES
     assert callable(peslite.Simulation)
