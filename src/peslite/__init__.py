@@ -10,7 +10,7 @@ from . import solver, control, components, assembly
 from .solver import (AdaptiveSolver, BlackBoxSubsystem, DormandPrince45, FixedStepSolver, Model,
                      MultirateSolver, make_solver)
 from .control import OutputStage, VSCController, register_loop_type
-from .components import (ADC, ADCSample, Element, PWM, PWMAveragingModel, ZOH, AveragingModel, SwitchingModel,
+from .components import (ADC, ADCSample, Element, Passive, PWM, PWMAveragingModel, ZOH, AveragingModel, SwitchingModel,
                          ThreePhaseBridge, CarrierComparison, FullBridge, HalfBridge,
                          MeasurementPorts, make_bridge,
                          make_modulator, register_component_type)
@@ -37,7 +37,7 @@ __all__ = [
     "DCConverter", "Protection", "ProtectionSample", "MeasurementPorts", "Model", "BlackBoxSubsystem",
     "SourceScenario",
     "Simulation", "SimulationResult", "ExportResult", "export", "VSCController", "main", "make_controller", "make_modulator", "make_solver",
-    "register_loop_type", "register_component_type", "register_event_type", "validate_model", "Element",
+    "register_loop_type", "register_component_type", "register_event_type", "validate_model", "Element", "Passive",
     "OutputStage", "ADC", "ADCSample", "PWM", "SwitchingModel", "PWMAveragingModel", "AveragingModel",
     "ThreePhaseBridge", "make_bridge",
     "HalfBridge", "FullBridge",

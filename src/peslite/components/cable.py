@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from .network import Element, NetworkComponent
+from .network import Element
 from .registry import register_component_type
 from ..solver import Bag, ConfigError, Empty, Port, StoragePort
 from ..solver.history import AcceptedSignal, DelayedSignal, DelayHistory
@@ -26,7 +26,7 @@ def _state_record(sections: int) -> type[Bag]:
     return record_type(f"_LumpedCableState{sections}", names)
 
 
-class LumpedCableModel(NetworkComponent):
+class LumpedCableModel(Element):
     """Segmented two-port R-L/G-C cable; both currents are positive into the cable."""
 
     outputs_need_inputs: ClassVar[bool] = False
@@ -121,7 +121,7 @@ class _BergeronOutput(Bag):
                  "wave_2_left", "wave_2_right")
 
 
-class BergeronCableModel(NetworkComponent):
+class BergeronCableModel(Element):
     """PSCAD-style Bergeron line: distributed LC delay with lumped series resistance."""
 
     state_names: ClassVar[tuple[str, ...]] = ()

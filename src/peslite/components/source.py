@@ -8,7 +8,7 @@ from typing import Any, Callable, ClassVar, Optional
 
 from ..solver.energy import Port, StoragePort
 from ..solver.model import Bag, ConfigError, Empty
-from .network import Element, NetworkComponent, _phase_convention
+from .network import Element, _phase_convention
 from .registry import register_component_type
 
 __all__ = ["ACVoltageSource", "VoltageSource"]
@@ -18,7 +18,7 @@ class _SourceOutput(Bag):
     __slots__ = ("e_g", "phi", "theta")
 
 
-class ACVoltageSource(NetworkComponent):
+class ACVoltageSource(Element):
     """Ideal single- or three-phase AC voltage source.
 
     Three phases use ``E exp(j (w0 t + phi(t)))``; one phase uses its real cosine.
@@ -104,7 +104,7 @@ class _VoltageSourceOutput(Bag):
     __slots__ = ("i",)
 
 
-class _VoltageSourceModel(NetworkComponent):
+class _VoltageSourceModel(Element):
     """Scalar voltage source behind a series resistance."""
 
     state_names: ClassVar[tuple[str, ...]] = ()

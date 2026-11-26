@@ -10,7 +10,7 @@ from ..solver.energy import Port, StoragePort
 from ..solver.model import ConfigError, Empty, _complex, _real, _record_fields
 
 __all__ = [
-    "Port", "ElectricalEndpoint", "NetworkComponent", "Element",
+    "Port", "ElectricalEndpoint", "Element",
     "element_buses", "resolve_endpoints", "GROUND",
 ]
 
@@ -75,9 +75,16 @@ def resolve_endpoints(
     }
 
 
-class NetworkComponent:
-    """Common runtime adapter for a physical component declared by ``network(builder)``."""
+class Element:
+    """Common assembly and runtime boundary for a PESLite element.
 
+    An element may directly define a physical ``network(builder)`` or expose one or more runtime
+    subsystems through ``subsystems()``. The solver continues to recognize physical models by the
+    structural ``Subsystem`` protocol rather than by this base class.
+    """
+
+    domain_transparent = False
+    signal_fields: Mapping[str, str] = {}
     parameter_fields: Mapping[str, str] = {}
     structural_parameters: frozenset[str] = frozenset()
     equation_fields: Mapping[str, str] = {}
@@ -142,31 +149,6 @@ class NetworkComponent:
         from ..solver.netlist import device_commutate
         device_commutate(self, t)
 
-
-NetworkComponent.rhs._peslite_device_adapter = True
-NetworkComponent.set_outputs._peslite_device_adapter = True
-
-
-def _phase_convention(phases: int, initial: complex | float = 0.0):
-    """Power scale, zero and ``initial`` of peak complex space vectors (3) or real scalars (1)."""
-    if phases not in (1, 3):
-        raise ValueError(f"phases must be 1 or 3, got {phases!r}")
-    if phases == 3:
-        return 1.5, 0j, _complex(initial)
-    return 1.0, 0.0, _real(initial.real if isinstance(initial, complex) else initial)
-
-
-class Element:
-    """Common contract for an object that contributes parts to system assembly.
-
-    Units, sources, branches and registered ``elements`` entries expose their runtime subsystems,
-    signal connections and physical port bindings through this interface. Optional overrides add
-    series insertion, recorded signals, runtime retuning, switching and native parameter bindings.
-    """
-
-    domain_transparent = False
-    signal_fields: Mapping[str, str] = {}
-
     @classmethod
     def from_config(cls, name: str, cfg: Any, buses: dict, params: Any) -> "Element":
         """Build an element from its resolved configuration and assembly context."""
@@ -198,6 +180,19 @@ class Element:
         return ({f"{self.name}.{name}": getattr(output, field)
                  for name, field in self.signal_fields.items()}
                 if output is not None else {})
+
+
+Element.rhs._peslite_device_adapter = True
+Element.set_outputs._peslite_device_adapter = True
+
+
+def _phase_convention(phases: int, initial: complex | float = 0.0):
+    """Power scale, zero and ``initial`` of peak complex space vectors (3) or real scalars (1)."""
+    if phases not in (1, 3):
+        raise ValueError(f"phases must be 1 or 3, got {phases!r}")
+    if phases == 3:
+        return 1.5, 0j, _complex(initial)
+    return 1.0, 0.0, _real(initial.real if isinstance(initial, complex) else initial)
 
 
 def element_buses(cfg: Any) -> dict[str, str]:
@@ -337,7 +332,7 @@ class _ComponentNetwork:
         raise AttributeError(name)
 
 
-class _DeclaredComponent(NetworkComponent):
+class _DeclaredComponent(Element):
     """Runtime physical component generated from one declarative parameter object."""
 
     outputs_need_inputs = False

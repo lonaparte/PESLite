@@ -17,7 +17,7 @@ from ..solver.energy import Port, StoragePort
 from ..solver.model import (Bag, ConfigError, Empty, LocatedZero, OutputMethod, _real,
                             _record_fields, record_type)
 from ..solver.timing import TIME_EPS, PeriodicClock
-from .network import NetworkComponent
+from .network import Element
 from .passive import RLBranch
 from .pwm import CarrierComparison, Modulator, PWM, ZOH, make_modulator
 from .registry import register_topology, topology_type
@@ -153,7 +153,7 @@ class ThreePhaseBridge(_BridgeTopology):
     def command_duties(output):
         return output.d_abc
 
-class _BridgeModel(NetworkComponent):
+class _BridgeModel(Element):
     """One bridge topology composed with one simulation form.
 
     Topology selection binds its power equation once during construction.  The
@@ -172,7 +172,7 @@ class _BridgeModel(NetworkComponent):
         OutputMethod("set_dc_current", inputs=("q", "i_c"), outputs=("i_dc",)),
         OutputMethod("set_ac_voltage", inputs=("q", "u_dc"), outputs=("u_c",)),
     )
-    set_dc_current = set_ac_voltage = NetworkComponent.set_outputs
+    set_dc_current = set_ac_voltage = Element.set_outputs
 
     def __init__(self, topology=None, *, parallel_capacitance: float = 0.0,
                  switch_resistance: float = 0.0,
@@ -1109,7 +1109,7 @@ class DCVoltageSource:
     def __init__(self, u_dc: float, R: float = 0.0) -> None:
         self.u_dc, self.R = _real(u_dc), _real(R)
 
-class DCLink(NetworkComponent):
+class DCLink(Element):
     """DC link made of an optional capacitor and a current source, voltage source or no source.
 
     Without a capacitor a voltage source is required; a voltage source with a
@@ -1121,7 +1121,7 @@ class DCLink(NetworkComponent):
         OutputMethod("set_stored_voltage", inputs=(), outputs=("u_C",)),
         OutputMethod("set_outputs", inputs=(), outputs=("u_dc", "i_src")),
     )
-    set_stored_voltage = NetworkComponent.set_outputs
+    set_stored_voltage = Element.set_outputs
 
     def __init__(self, capacitor: DCCapacitor | None = None,
                  source: DCCurrentSource | DCVoltageSource | None = None) -> None:

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
-from ...components.network import Element, NetworkComponent
+from ...components.network import Element
 from ...components.registry import register_component_type
 from ...solver import ConfigError, Empty, Port
 from ...solver import netlist as nl
@@ -34,7 +34,7 @@ def _numbers(values: Any, label: str) -> tuple[float, ...]:
         raise ConfigError(f"{label} must be a sequence of finite numbers") from None
 
 
-class PortInjectionModel(NetworkComponent):
+class PortInjectionModel(Element):
     """A stateless, restartable electrical source; only the wiring differs by mode."""
 
     state_names: ClassVar[tuple[str, ...]] = ()

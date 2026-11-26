@@ -13,7 +13,7 @@ import numpy as np
 
 from ...assembly.params import _parameterized, register_unit_type, unit_type
 from ...assembly.system import _UnitAssembly, _assemble_unit, _part
-from ...components.network import GROUND, Element, NetworkComponent, resolve_endpoints
+from ...components.network import GROUND, Element, resolve_endpoints
 from ...components.registry import register_component_type
 from ...components.pwm import PhaseClock
 from ...solver import Bag, ConfigError, Empty, OutputMethod, Port, StoragePort
@@ -436,7 +436,7 @@ class MagneticParams:
         return _winding_buses(self.windings)
 
 
-class MagComponent(NetworkComponent):
+class MagComponent(Element):
     """Common magnetic component contract and cross-domain coupling signals."""
 
     def __init__(

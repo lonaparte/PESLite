@@ -9,7 +9,7 @@ from typing import Any, ClassVar, Mapping, Protocol, Sequence
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
-from ...components.network import Element, NetworkComponent
+from ...components.network import Element
 from ...components.registry import register_component_type
 from ...solver import Bag, ConfigError, Empty, OutputMethod, Port
 from ...solver import record_type
@@ -547,7 +547,7 @@ class ThermalParams:
             raise ConfigError("temperature_source must name a physical output")
 
 
-class ThermalComponent(NetworkComponent):
+class ThermalComponent(Element):
     """Physical component whose constitutive properties depend on temperature.
 
     Concrete components retain the ordinary network-component interface. The thermal addon only

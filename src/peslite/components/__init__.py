@@ -8,7 +8,7 @@ the same assembled model.
 from ..solver import Bag, ConfigError, Empty, Port, StoragePort
 from .network import Element, GROUND, resolve_endpoints
 from .registry import register_component_type
-from .passive import Bus, Capacitor, ParallelRLC, Resistor, RLBranch, SeriesRLC
+from .passive import Bus, Capacitor, ParallelRLC, Passive, Resistor, RLBranch, SeriesRLC
 from .source import ACVoltageSource, VoltageSource
 from .converter import (AveragingModel, PWMAveragingModel, SwitchingModel,
                         ThreePhaseBridge,
@@ -22,7 +22,7 @@ from .pwm import (ZOH, CarrierComparison, PWM, PhaseShiftModulator, SwitchingSeq
 from .onnx import ONNXModel, ONNXStateParams
 from .cable import BergeronCableModel, Cable, LumpedCableModel
 
-__all__ = ["Port", "Element", "ACVoltageSource", "Bus", "SeriesRLC", "ParallelRLC",
+__all__ = ["Port", "Element", "Passive", "ACVoltageSource", "Bus", "SeriesRLC", "ParallelRLC",
            "RLBranch", "Capacitor", "Resistor",
            "Bag", "Empty", "ConfigError", "StoragePort",
            "register_component_type", "resolve_endpoints", "GROUND",

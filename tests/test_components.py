@@ -16,7 +16,9 @@ from peslite.components import (
     PWM,
     PWMAveragingModel,
     Bus,
+    Element,
     ParallelRLC,
+    Passive,
     Resistor,
     RLBranch,
     SeriesRLC,
@@ -42,6 +44,20 @@ def test_builtin_element_configuration_and_assembly_are_separate_from_physics():
         assert definition.params.__module__ == "peslite.assembly.elements"
         assert definition.constructor.__module__ == "peslite.assembly.elements"
         assert "Params" not in physical_type.__dict__
+
+
+def test_passive_elements_share_the_general_element_boundary():
+    assert issubclass(Passive, Element)
+    assert SeriesRLC.__bases__ == (Passive,)
+    assert ParallelRLC.__bases__ == (Passive,)
+
+
+def test_passive_initialization_keeps_series_and_parallel_current_meanings():
+    series = SeriesRLC(R=1.0, L=2.0, C=3.0, i0=4.0, u0=5.0, phases=1)
+    parallel = ParallelRLC(R=1.0, L=2.0, C=3.0, i0=4.0, u0=5.0, phases=1)
+
+    assert (series.state.i, series.state.u_C, series.output.i) == (4.0, 5.0, 4.0)
+    assert (parallel.state.i_L, parallel.state.u_C, parallel.output.i) == (4.0, 5.0, 0.0)
 
 
 def test_electrical_ports_store_inward_current_and_numbered_names():
