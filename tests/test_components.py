@@ -62,8 +62,8 @@ def test_passive_initialization_keeps_series_and_parallel_current_meanings():
 
 def test_zero_contribution_passive_values_use_the_absent_representation():
     for zero, absent in (
-        (SeriesRLC(R=0.0, L=0.0, C=0.0, phases=1), SeriesRLC(phases=1)),
-        (ParallelRLC(R=0.0, L=0.0, C=0.0, phases=1), ParallelRLC(phases=1)),
+        (SeriesRLC(R=0.0, L=0.0, C=1.0, phases=1), SeriesRLC(C=1.0, phases=1)),
+        (ParallelRLC(R=1.0, C=0.0, phases=1), ParallelRLC(R=1.0, phases=1)),
     ):
         assert (zero.R, zero.L, zero.C) == (absent.R, absent.L, absent.C)
         assert zero.state_names == absent.state_names
@@ -75,13 +75,26 @@ def test_zero_contribution_passive_values_use_the_absent_representation():
         )
 
 
-def test_zero_passive_values_stay_absent_during_updates_and_specialization():
-    series = SeriesRLC(phases=1)
-    parallel = ParallelRLC(phases=1)
-    assert not series.set_parameters(r=0.0, l=0.0, c=0.0)
-    assert not parallel.set_parameters(r=0.0, l=0.0, c=0.0)
-    for component in (RLBranch(), Capacitor(), Resistor(0.0)):
-        assert (component.R, component.L, component.C) == (None, None, None)
+def test_only_topologically_neutral_zero_values_are_absent():
+    assert (RLBranch().R, RLBranch().L) == (None, None)
+    assert Resistor(0.0).R is None
+    assert Capacitor(C=0.0).C == 0.0
+    assert ParallelRLC(R=0.0).R == 0.0
+    assert ParallelRLC(L=0.0).L == 0.0
+
+    series = SeriesRLC(C=1.0, phases=1)
+    parallel = ParallelRLC(R=1.0, phases=1)
+    assert not series.set_parameters(r=0.0, l=0.0)
+    assert not parallel.set_parameters(c=0.0)
+
+
+@pytest.mark.parametrize("component", (
+    SeriesRLC(C=0.0, phases=1),
+    ParallelRLC(L=0.0, phases=1),
+))
+def test_non_neutral_zero_storage_is_rejected_by_network_assembly(component):
+    with pytest.raises(ValueError, match="must be symmetric positive definite"):
+        peslite.Model({"component": component}, {})
 
 
 def test_electrical_ports_store_inward_current_and_numbered_names():

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import replace
 from typing import ClassVar
 
@@ -27,14 +26,15 @@ class Passive(Element):
     output_stages = (OutputMethod(
         "set_voltage_and_power", (), ("u", "power"), rhs=False,
     ),)
+    zero_absent: ClassVar[str] = ""
 
     def __init__(self, R: float | None, L: float | None, C: float | None, *,
                  i0: complex | float, u0: complex | float,
                  phases: int, breakable: bool) -> None:
-        R, L, C = (None if value == 0.0 else value for value in (R, L, C))
-        for name, value in (("R", R), ("L", L), ("C", C)):
-            if value is not None and (not math.isfinite(value) or value <= 0.0):
-                raise ValueError(f"{name} must be finite and > 0, got {value}")
+        R, L, C = (
+            None if name in self.zero_absent and value == 0.0 else value
+            for name, value in zip("RLC", (R, L, C))
+        )
         self.power_scale, self.zero, initial_i = _phase_convention(phases, i0)
         _scale, _zero, initial_u = _phase_convention(phases, u0)
         self.R, self.L, self.C = R, L, C
@@ -63,7 +63,8 @@ class Passive(Element):
 
     def set_parameters(self, **values) -> bool:
         return super().set_parameters(**{
-            name: None if value == 0.0 else value for name, value in values.items()
+            name: None if name.upper() in self.zero_absent and value == 0.0 else value
+            for name, value in values.items()
         })
 
     def open_breaker(self) -> None:
@@ -98,6 +99,7 @@ class SeriesRLC(Passive):
     inductor_state = output_current_state = "i"
     structural_parameters = frozenset(("l", "c"))
     netlist_jumps = False
+    zero_absent = "RL"
 
     def __init__(self, R: float = 0.0, L: float | None = None,
                  C: float | None = None, *, i0: complex | float = 0j,
@@ -132,6 +134,7 @@ class ParallelRLC(Passive):
     inductor_state = "i_L"
     output_current_state = None
     structural_parameters = frozenset(("r", "l", "c"))
+    zero_absent = "C"
 
     def __init__(self, R: float | None = None, L: float | None = None,
                  C: float | None = None, *, i0: complex | float = 0j,
