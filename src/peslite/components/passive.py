@@ -10,7 +10,7 @@ from ..solver.energy import Port, StoragePort
 from ..solver.model import Empty, OutputMethod, record_type
 from .network import Element, NetworkComponent, _phase_convention
 
-__all__ = ["SeriesRLC", "RLBranch", "Capacitor", "Resistor", "ParallelRLC", "Bus"]
+__all__ = ["SeriesRLC", "ParallelRLC", "RLBranch", "Capacitor", "Resistor", "Bus"]
 
 
 class SeriesRLC(Element, NetworkComponent):
@@ -67,23 +67,14 @@ class SeriesRLC(Element, NetworkComponent):
     def close_breaker(self) -> None:
         self.breaker_open = False
 
-    def set_values(self, L: float | None, R: float,
-                   C: float | None = None) -> bool:
-        return self.set_parameters(l=L, r=R, c=C)
-
-    def resistive_power(self) -> float:
-        return self.power_scale * self.R * abs(self.output.i) ** 2
-
     def set_voltage_and_power(self, _t: float) -> None:
         self.output.u = self.port1.voltage - self.port2.voltage
-        self.output.power = self.resistive_power()
+        self.output.power = self.power_scale * self.R * abs(self.output.i) ** 2
 
     def network(self, nb):
-        return self._declare_network(nb, nb.node(self.port1))
-
-    def _declare_network(self, nb, start):
         from ..solver import netlist as nl
 
+        start = nb.node(self.port1)
         if self.breakable:
             path = nb.internal(start.dim, start.scale)
             nb.add(nl.Switch(start, path, nb.value(self, "breaker_open", invert=True)))
@@ -103,87 +94,6 @@ class SeriesRLC(Element, NetworkComponent):
             path = end
         nb.port_output(self, "i", self.port1, "current")
         nb.losses(self)
-
-
-class RLBranch(SeriesRLC):
-    """A series R-L branch with optional one-way and external conduction behavior."""
-
-    Input = record_type("RLBranchInput", ("di_dt", "loss_factor"))
-
-    def __init__(self, R: float = 0.0, L: float | None = None, *,
-                 i0: complex | float = 0j, phases: int = 3,
-                 unilateral: bool = False, breakable: bool = True) -> None:
-        if L is None:
-            raise ValueError("an R-L branch requires L")
-        if unilateral and phases != 1:
-            raise ValueError("unilateral current requires a scalar R-L branch")
-        super().__init__(R=R, L=L, i0=i0, phases=phases, breakable=breakable)
-        self.unilateral = bool(unilateral)
-        self.external_conduction = False
-        self.input = self.Input(di_dt=self.zero, loss_factor=1.0)
-        if self.unilateral:
-            self.state_bounds = {"i": (0.0, None)}
-            self.commutation_margin = self._device_commutation_margin
-            self.commutate = self._device_commutate
-
-    def use_external_conduction(self) -> None:
-        """Take derivative and copper-loss factor from a connected constitutive subsystem."""
-        self.external_conduction = True
-        self.commutation_margin = None
-        self.commutate = None
-        self.energy_audit_note = (
-            "cycle-averaged DCM current does not have the branch's linear instantaneous "
-            "storage function"
-        )
-
-    def diode_blocks_reverse_current(self) -> bool:
-        return self.unilateral
-
-    def network(self, nb):
-        from ..solver import netlist as nl
-
-        if self.external_conduction:
-            branch = nb.add(nl.CurrentState(
-                nb.node(self.port1), nb.node(self.port2), nb.state(self, "i"),
-                nb.function(
-                    lambda _t: self.zero if self.breaker_open else self.input.di_dt,
-                    ("di_dt",), states=("i",),
-                ),
-            ))
-            nb.output(self, "i", ("branch_current", branch))
-            if self.R:
-                nb.add(nl.Dissipation(nb.function(
-                    lambda _t: self.power_scale * self.R
-                    * max(0.0, self.input.loss_factor) * abs(self.state.i) ** 2,
-                    ("loss_factor",),
-                )))
-            nb.losses(self)
-            return None
-
-        start = nb.node(self.port1)
-        if self.unilateral:
-            diode = nb.add(nl.Diode(start, nb.internal(start.dim, start.scale)))
-            start = diode.ports[0][1]
-        return self._declare_network(nb, start)
-
-
-class Capacitor(SeriesRLC):
-    """A two-terminal capacitor with optional series resistance."""
-
-    def __init__(self, R: float = 0.0, C: float | None = None, *,
-                 u0: complex | float = 0j, phases: int = 3,
-                 breakable: bool = True) -> None:
-        if C is None:
-            raise ValueError("a capacitor requires C")
-        super().__init__(R, None, C, u0=u0, phases=phases, breakable=breakable)
-
-
-class Resistor(SeriesRLC):
-    """A pure resistance connected to ground, between terminals or in series at a bus."""
-
-    def __init__(self, R: float, *, phases: int = 3,
-                 breakable: bool = True) -> None:
-        super().__init__(R, phases=phases, breakable=breakable)
 
 
 class ParallelRLC(Element, NetworkComponent):
@@ -234,17 +144,10 @@ class ParallelRLC(Element, NetworkComponent):
     def close_breaker(self) -> None:
         self.breaker_open = False
 
-    def set_values(self, L: float | None, R: float | None,
-                   C: float | None = None) -> bool:
-        return self.set_parameters(l=L, r=R, c=C)
-
-    def resistive_power(self) -> float:
-        return (0.0 if self.R is None else
-                self.power_scale * abs(self.output.u) ** 2 / self.R)
-
     def set_voltage_and_power(self, _t: float) -> None:
         self.output.u = self.port1.voltage - self.port2.voltage
-        self.output.power = self.resistive_power()
+        self.output.power = (0.0 if self.R is None else
+                             self.power_scale * abs(self.output.u) ** 2 / self.R)
 
     def network(self, nb):
         from ..solver import netlist as nl
@@ -266,11 +169,43 @@ class ParallelRLC(Element, NetworkComponent):
         nb.losses(self)
 
 
+class RLBranch(SeriesRLC):
+    """A series R-L branch."""
+
+    def __init__(self, R: float = 0.0, L: float | None = None, *,
+                 i0: complex | float = 0j, phases: int = 3,
+                 breakable: bool = True) -> None:
+        if L is None:
+            raise ValueError("an R-L branch requires L")
+        super().__init__(R=R, L=L, i0=i0, phases=phases, breakable=breakable)
+
+
+class Capacitor(SeriesRLC):
+    """A two-terminal capacitor with optional series resistance."""
+
+    def __init__(self, R: float = 0.0, C: float | None = None, *,
+                 u0: complex | float = 0j, phases: int = 3,
+                 breakable: bool = True) -> None:
+        if C is None:
+            raise ValueError("a capacitor requires C")
+        super().__init__(R, None, C, u0=u0, phases=phases, breakable=breakable)
+
+
+class Resistor(SeriesRLC):
+    """A pure resistance connected to ground, between terminals or in series at a bus."""
+
+    def __init__(self, R: float, *, phases: int = 3,
+                 breakable: bool = True) -> None:
+        super().__init__(R, phases=phases, breakable=breakable)
+
+
 class Bus(NetworkComponent):
     """Electrical connection point, optionally with a damped shunt capacitor to ground."""
 
     State = record_type("BusState", ("u_C",))
     Output = record_type("BusOutput", ("u",))
+    parameter_fields = {"c": "C", "r_d": "R_d"}
+    structural_parameters = frozenset(("c",))
     voltage_field: ClassVar[str] = "u"
     outputs_need_inputs: ClassVar[bool] = False
 
@@ -295,14 +230,10 @@ class Bus(NetworkComponent):
             "u_C", C, self.power_scale, ((self.port, "current", 1.0),)
         ),))
 
-    def retune(self, C: float | None, R_d: float) -> bool:
-        if (self.C is None) != (C is None):
-            raise ValueError("bus capacitance cannot be added or removed after assembly")
-        if C is None:
-            return False
-        changed = self.C != C or self.R_d != R_d
-        self.C, self.R_d = C, R_d
-        self.storage = (replace(self.storage[0], value=C),)
+    def set_parameters(self, **values) -> bool:
+        changed = super().set_parameters(**values)
+        if self.C is not None:
+            self.storage = (replace(self.storage[0], value=self.C),)
         return changed
 
     def network(self, nb):

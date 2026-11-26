@@ -67,15 +67,12 @@ def test_inherited_branch_behavior_uses_the_declared_netlist_equations():
     class DerivedBranch(RLBranch):
         pass
 
-    branch = DerivedBranch(L=1.0, R=0.0, i0=1.0, phases=1, unilateral=True)
+    branch = DerivedBranch(L=1.0, R=0.0, i0=1.0, phases=1)
     branch.port1.voltage, branch.port2.voltage = 0.0, 1.0
     branch.set_outputs(0.0)
 
     assert any(type(element).__name__ == "Inductor"
                for element in branch._device_circuit.netlist.elements)
-    if branch.commutation_margin() < 0.0:
-        branch.commutate(0.0)
-        branch.set_outputs(0.0)
     assert branch.output.i == 1.0
     assert branch.rhs(0.0) == (-1.0,)
     branch.open_breaker()

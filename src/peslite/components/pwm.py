@@ -493,6 +493,32 @@ class PWM:
         """Number of control interrupts in ``[t_a, t_b]``, including both ends."""
         return max(0, self.after(t_b) - int(self.control_clock.index_at_or_after(t_a)))
 
+    @property
+    def event_periods(self) -> list[float]:
+        """Periods which can change the sampled-data map."""
+        periods = [self.period, self.load_period]
+        if not isinstance(self.modulator, ZOH):
+            periods.append(self.carrier_period)
+        return periods
+
+    def next_time(self) -> float:
+        """Next controller, register-load or internal switching event."""
+        return min(self.t_interrupt, self.t_load, self.next_switch)
+
+    @property
+    def next_control_time(self) -> float:
+        return self.t_interrupt
+
+    @property
+    def control_index(self) -> int:
+        return self.k
+
+    def previous_control_time(self) -> float:
+        return self.interrupt(self.k - 1)
+
+    def control_due(self, t: float) -> bool:
+        return abs(self.t_interrupt - t) < TIME_EPS
+
     def describe(self) -> str:
         double = self.load_period < 0.75 * self.carrier_period
         dead_time = (f", dead time {self.dead_time * 1e9:g} ns"

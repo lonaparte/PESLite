@@ -882,12 +882,9 @@ class DCConverter(Unit):
             cfg,
         )
         self.continuous = self.bridge.continuous
-        self.branch_f = None if cfg.filter is None else _parameterized(lambda c: RLBranch(
-            L=c.l_f,
-            R=c.r_f,
-            phases=1,
-            unilateral=self.bridge.diode_blocks_reverse_current(),
-        ), cfg.filter)
+        self.branch_f = None if cfg.filter is None else _parameterized(
+            lambda c: self.bridge.filter_branch(c.l_f, c.r_f), cfg.filter,
+        )
         controlled = topology.controlled
         self._blocked_warned = False
         self._external_lower_rail = getattr(topology, "external_port", None) == "lower_rail"
@@ -903,8 +900,7 @@ class DCConverter(Unit):
             power_voltage_port if topology.reverse_port else (self.dclink, "u_dc")
         )
         self.conduction = None
-        if (self.branch_f is not None and self.branch_f.unilateral
-                and cfg.bridge.model != "switching"):
+        if self.branch_f is not None and self.bridge.averaged_natural_conduction:
             self.conduction = _parameterized(lambda c: HalfBridgeDiodeConduction(
                 c.pwm.switching_period,
                 c.filter.l_f,
@@ -912,7 +908,6 @@ class DCConverter(Unit):
                 topology,
             ), cfg)
             self.conduction.local_step_state = self.branch_f
-            self.branch_f.use_external_conduction()
             self.bridge.use_current_transfer_ratios()
         if not controlled and ctrl is not None:
             raise TypeError(f"{name}: a diode full-bridge rectifier takes no controller part")

@@ -18,7 +18,7 @@ from ..solver.model import (Bag, ConfigError, Empty, LocatedZero, OutputMethod, 
                             _record_fields, record_type)
 from ..solver.timing import TIME_EPS, PeriodicClock
 from .network import NetworkComponent
-from .passive import Bus
+from .passive import RLBranch
 from .pwm import CarrierComparison, Modulator, PWM, ZOH, make_modulator
 from .registry import register_topology, topology_type
 
@@ -27,15 +27,6 @@ __all__ = ["ThreePhaseBridge", "SwitchingModel", "PWMAveragingModel", "Averaging
            "DCCurrentSource", "DCVoltageSource",
            "HalfBridgeDiodeConduction",
            "make_topology", "make_bridge", "make_dclink"]
-
-
-def _extend_record(record: Bag, *names: str) -> Bag:
-    """Copy one converter record with additional output fields."""
-    fields = _record_fields(record)
-    return record_type(type(record).__name__, (*fields, *names))(
-        **{name: getattr(record, name) for name in fields}
-    )
-
 
 class _BridgeInput(Bag):
     __slots__ = ("q", "u_dc", "i_c")
@@ -54,6 +45,10 @@ class _HalfBridgeInput(Bag):
 
 class _HalfBridgeOutput(Bag):
     __slots__ = ("u_c", "i_dc", "i_lower")
+
+
+class _BridgeCapacitorState(Bag):
+    __slots__ = ("u_C",)
 
 
 class _SwitchingTransition(NamedTuple):
@@ -95,6 +90,11 @@ class _BridgeTopology:
 
     __slots__ = ()
 
+    @classmethod
+    def from_config(cls, cfg: Any):
+        """Construct a topology from the fields it declares as applicable."""
+        return cls(**{name: getattr(cfg, name) for name in cls.config_fields})
+
     def ratio_bounds(self):
         """Return componentwise bounds reached by duty ratios in ``[0, 1]``."""
         values = tuple(
@@ -112,6 +112,7 @@ class _BridgeTopology:
         return np.min(array, axis=0), np.max(array, axis=0)
 
 
+@register_topology
 class ThreePhaseBridge(_BridgeTopology):
     """Three-leg topology used by the existing AC converter model."""
 
@@ -137,10 +138,6 @@ class ThreePhaseBridge(_BridgeTopology):
         offset = -lo if switching else 0.5 * (1.0 - hi - lo)
         return tuple(value + offset for value in values)
 
-    @classmethod
-    def from_config(cls, _cfg: Any) -> "ThreePhaseBridge":
-        return cls()
-
     @staticmethod
     def switching_state(states):
         a, b, c = states
@@ -155,10 +152,6 @@ class ThreePhaseBridge(_BridgeTopology):
     @staticmethod
     def command_duties(output):
         return output.d_abc
-
-
-register_topology(ThreePhaseBridge)
-
 
 class _BridgeModel(NetworkComponent):
     """One bridge topology composed with one simulation form.
@@ -205,20 +198,20 @@ class _BridgeModel(NetworkComponent):
         self.lower_port = None
         self.modulator = None
         self.state_owner = self
-        self._switching_devices = ()
+        self._netlist_devices = None
         self.continuous = True
         self.enabled = False
         self._current_transfer = False
         self.ratio_bounds = None
-        initialize = getattr(self.topology, "initialize_model", None)
-        if initialize is not None:
-            initialize(self, parallel_capacitance)
         values = (parallel_capacitance, switch_resistance, diode_resistance)
         if any(not math.isfinite(value) or value < 0.0 for value in values):
             raise ConfigError("bridge capacitance and device resistance must be finite and >= 0")
         self.parallel_capacitance = _real(parallel_capacitance)
         self.device_switch_resistance = _real(switch_resistance)
         self.device_diode_resistance = _real(diode_resistance)
+        initialize = getattr(self.topology, "initialize_model", None)
+        if initialize is not None:
+            initialize(self, self.parallel_capacitance)
         self._device_resistance_sensitive = (
             self.topology.controlled
             and self.device_switch_resistance != self.device_diode_resistance
@@ -229,7 +222,29 @@ class _BridgeModel(NetworkComponent):
                 raise ConfigError(
                     "bridge.parallel_capacitance requires positive conducting-device resistance"
                 )
-            self._capacitive_devices(parallel_capacitance, switching)
+            self._switching_poles = switching
+            self._leg_gates = _LegGates(self)
+            self.state = _BridgeCapacitorState(u_C=self.topology.zero)
+            self.state_names = ("u_C",)
+            self.storage = (
+                StoragePort("u_C", self.parallel_capacitance, self.topology.power_scale),
+            )
+            fields = _record_fields(self.output)
+            self.output = record_type(
+                type(self.output).__name__, (*fields, "i_device", "power_loss")
+            )(**{name: getattr(self.output, name) for name in fields})
+            self.output.i_device = self.topology.zero
+            inputs = ("q", "u_dc") + (("u_lower",) if self.lower_port else ())
+            currents = ("i_dc", "i_device")
+            if self.lower_port is not None:
+                currents += ("i_lower",)
+            self.output_stages = (
+                OutputMethod("set_ac_voltage", (), ("u_c",)),
+                OutputMethod("set_dc_current", inputs, currents),
+                OutputMethod("set_power_loss", (), ("power_loss",), rhs=False),
+            )
+            self.dirac = False
+            self.models_blocked_diodes = True
         elif self._device_resistance_sensitive:
             self.dirac = False
         elif self.device_diode_resistance > 0.0:
@@ -239,13 +254,19 @@ class _BridgeModel(NetworkComponent):
                 replace(stage, inputs=tuple(dict.fromkeys((*stage.inputs, "i_c"))))
                 if "u_c" in stage.outputs else stage for stage in self.output_stages)
 
-    def diode_blocks_reverse_current(self) -> bool:
-        """Whether an external averaged branch must enforce reverse-current blocking."""
+    @property
+    def averaged_natural_conduction(self) -> bool:
+        """Whether this bridge form owns the filter's cycle-averaged diode conduction."""
         return (
             self.topology.unilateral
             and not self.state_names
             and not self.has_switching_events
         )
+
+    def filter_branch(self, inductance: float, resistance: float) -> RLBranch:
+        """Build the scalar filter selected by this bridge's physical conduction model."""
+        branch = (_AveragedHalfBridgeFilter if self.averaged_natural_conduction else RLBranch)
+        return branch(L=inductance, R=resistance, phases=1)
 
     def network(self, nb):
         """Declare the bridge as explicit legs or a lossless conversion ratio."""
@@ -274,7 +295,7 @@ class _BridgeModel(NetworkComponent):
             return None
         if self.parallel_capacitance > 0.0:
             capacitor = nb.add(nl.Capacitor(
-                nb.node(self.power_port), None, self.capacitor.C,
+                nb.node(self.power_port), None, self.parallel_capacitance,
                 nb.state(self, "u_C"),
             ))
             if not self._switching_poles:
@@ -341,7 +362,6 @@ class _BridgeModel(NetworkComponent):
             nb.add(nl.Transformer(high, low, dc, None, ((1.0,),)))
             devices = (*leg(ac, high, low, 0), *leg(None, high, low, 1))
             if getattr(self, "_current", None) is not None:
-                nb.bind(self._bind_netlist_devices, devices)
                 nb.commutation(self, after=self._mirror_netlist_conduction, diodes=devices)
         else:
             high = nb.internal()
@@ -368,12 +388,8 @@ class _BridgeModel(NetworkComponent):
                         chain[index], chain[index + 1], midpoint, None,
                         tuple((value,) for value in column),
                     ))
-        nb.bind(self._bind_switching_devices, tuple(devices))
+        nb.bind(self._bind_netlist_devices, tuple(devices))
         nb.losses(self)
-
-    def _bind_switching_devices(self, _netlist, devices) -> None:
-        """Bind the physical device positions created by the ordinary netlist plan."""
-        self._switching_devices = tuple(devices)
 
     def committed_transition_state(self) -> tuple[tuple[bool | None, ...], tuple[bool | None, ...]]:
         """Return committed gate commands and diode conduction by device position."""
@@ -392,17 +408,19 @@ class _BridgeModel(NetworkComponent):
                 if self.topology.controlled and self.topology.lower_controlled else None,
             )
         )
+        devices = () if self._netlist_devices is None else self._netlist_devices[1]
         diodes = (
-            tuple(bool(device.conducting) for device in self._switching_devices)
-            if len(self._switching_devices) == len(gates)
+            tuple(bool(device.conducting) for device in devices)
+            if len(devices) == len(gates)
             else (None,) * len(gates)
         )
         return gates, diodes
 
     def has_committed_transitions(self) -> bool:
         """Whether carrier or natural-conduction edges are physically resolved."""
+        devices = () if self._netlist_devices is None else self._netlist_devices[1]
         return self.has_switching_events or (
-            not self.topology.controlled and bool(self._switching_devices)
+            not self.topology.controlled and bool(devices)
         )
 
     def committed_transitions(self, t: float, before, after):
@@ -428,29 +446,6 @@ class _BridgeModel(NetworkComponent):
                     float(t), "reverse_recovery", currents[leg], voltage, device,
                 ))
         return tuple(events)
-
-    def _capacitive_devices(self, capacitance, switching) -> None:
-        """Compose finite device conductances with the existing capacitor and algebraic solver."""
-        self._switching_poles = switching
-        self._leg_gates = _LegGates(self)
-        self.capacitor = Bus(
-            capacitance, phases=3 if isinstance(self.topology.zero, complex) else 1
-        )
-        self.state, self.state_names = self.capacitor.state, self.capacitor.state_names
-        self.storage = tuple(replace(port, power_terms=()) for port in self.capacitor.storage)
-        self.output = _extend_record(self.output, "i_device", "power_loss")
-        self.output.i_device = self.topology.zero
-        inputs = ("q", "u_dc") + (("u_lower",) if self.lower_port else ())
-        currents = ("i_dc", "i_device")
-        if self.lower_port is not None:
-            currents += ("i_lower",)
-        self.output_stages = (
-            OutputMethod("set_ac_voltage", (), ("u_c",)),
-            OutputMethod("set_dc_current", inputs, currents),
-            OutputMethod("set_power_loss", (), ("power_loss",), rhs=False),
-        )
-        self.dirac = False
-        self.models_blocked_diodes = True
 
     def set_power_loss(self, _t: float) -> None:
         self.output.power_loss = self.dissipated_power()
@@ -513,29 +508,65 @@ class _BridgeModel(NetworkComponent):
         return []
 
     def describe(self) -> str:
-        return "ideal averaging, continuous control"
+        return getattr(self, "description", "ideal averaging, continuous control")
 
     def get_state(self) -> dict[str, Any]:
-        return {}
+        current = getattr(self, "_current", None)
+        return ({} if current is None else
+                {"direction": _real(current.sign), "i_ref": _real(current.residual)})
 
     def set_state(self, values: Mapping[str, Any]) -> None:
-        if values:
-            raise KeyError(f"unclocked model has no states, got {sorted(values)}")
+        current = getattr(self, "_current", None)
+        if current is None:
+            if values:
+                raise KeyError(f"unclocked model has no states, got {sorted(values)}")
+            return
+        unknown = set(values) - {"direction", "i_ref"}
+        if unknown:
+            raise KeyError(f"diode bridge: no state(s) {sorted(unknown)}")
+        if "direction" in values:
+            direction = float(values["direction"])
+            if direction not in (-1.0, 0.0, 1.0):
+                raise ValueError(f"diode bridge direction must be -1, 0 or 1, got {direction}")
+            current.sign = direction
+        if "i_ref" in values:
+            current.residual = float(values["i_ref"])
+        if self._netlist_devices is not None:
+            netlist, devices = self._netlist_devices
+            sign, residual = current.sign, current.residual
+            states = (sign < 0.0, sign > 0.0, sign > 0.0, sign < 0.0)
+            currents = (-residual, residual, residual, -residual)
+            for device, conducting, value in zip(devices, states, currents):
+                netlist.set_conducting(device, conducting, value if conducting else 0.0)
+
+    def equation_state_bindings(self) -> dict[str, tuple[Any, str]]:
+        """Mutable rectifier memory retained by generated backends when present."""
+        current = getattr(self, "_current", None)
+        if current is None:
+            return super().equation_state_bindings()
+        return {
+            "direction": (current, "sign"),
+            "i_ref": (current, "residual"),
+            "commutations": (self, "commutations"),
+        }
+
+    def _mirror_netlist_conduction(self, t: float, before: Mapping[str, Any]) -> None:
+        """Mirror the rectifier diodes into its public discrete state."""
+        netlist, devices = self._netlist_devices
+        (c1, r1), (c2, r2), (c3, _), (c4, _) = (
+            netlist.conduction(device) for device in devices
+        )
+        positive, negative = c2 and c3, c1 and c4
+        sign = 1.0 if positive and not negative else -1.0 if negative and not positive else 0.0
+        if sign != self._current.sign:
+            self.commutations += 1
+        self._current.locate(r2 if sign > 0.0 else -r1 if sign < 0.0 else 0.0, sign)
 
 
-class _SampledModel(_BridgeModel, PWM):
+class _SampledModel(PWM, _BridgeModel):
     """Shared sampled timing for exact-switching and PWM-averaged forms."""
 
     state_prefix = "pwm"
-
-    on = PWM.on
-    reset = PWM.reset
-    start = PWM.start
-    control_count = PWM.control_count
-    fast_edge = PWM.fast_edge
-    get_state = PWM.get_state
-    set_state = PWM.set_state
-    describe = PWM.describe
 
     def zoh_connections(self, label: str) -> dict:
         return {(self, "q"): label}
@@ -555,8 +586,7 @@ class _SampledModel(_BridgeModel, PWM):
                               switch_resistance=switch_resistance,
                               diode_resistance=diode_resistance,
                               switching=self.has_switching_events)
-        ratio_bounds = getattr(topology, "ratio_bounds", None)
-        self.ratio_bounds = None if ratio_bounds is None else ratio_bounds()
+        self.ratio_bounds = self.topology.ratio_bounds()
         registers = getattr(modulator, "registers", None)
         carried = tuple(modulator.carried)
         PWM.__init__(
@@ -586,33 +616,6 @@ class _SampledModel(_BridgeModel, PWM):
             else (self.topology.neutral_duty,) * len(self.topology.duty_names) + (0.0,) * len(carried)
         )
         self.reset(self.neutral_registers, on=False)
-        self.state_owner = self
-
-    @property
-    def event_periods(self) -> list[float]:
-        """Periods which can change this bridge's sampled-data map."""
-        periods = [self.period, self.load_period]
-        if self.has_switching_events:
-            periods.append(self.carrier_period)
-        return periods
-
-    def next_time(self) -> float:
-        """Next controller, register-load or internal switching event."""
-        return min(self.t_interrupt, self.t_load, self.next_switch)
-
-    @property
-    def next_control_time(self) -> float:
-        return self.t_interrupt
-
-    @property
-    def control_index(self) -> int:
-        return self.k
-
-    def previous_control_time(self) -> float:
-        return self.interrupt(self.k - 1)
-
-    def control_due(self, t: float) -> bool:
-        return abs(self.t_interrupt - t) < TIME_EPS
 
     def actuate(self, t: float, command: tuple[float, Any, Any] | None,
                 enabled: bool) -> list[Any]:
@@ -692,7 +695,10 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None, *,
             if modulator is not None:
                 raise ValueError("a continuously controlled averaging bridge does not use a modulator")
             return AveragingModel(topology, **impedance)
-        control_offset = cfg.ctrl.offset
+    if modulator is None:
+        modulator = make_modulator(pwm, cfg.base.f0, cfg.bridge)
+    control_offset = cfg.ctrl.offset
+    if cfg.bridge.model == "averaging":
         actuation = PeriodicClock(
             cfg.ctrl.period,
             (control_offset + cfg.ctrl.computation) % cfg.ctrl.period,
@@ -700,21 +706,16 @@ def make_bridge(cfg: Any, modulator: Modulator | None = None, topology=None, *,
         return _SampledAveragingModel(
             cfg.ctrl.period, actuation.period, control_offset, actuation.offset,
             cfg.ctrl.computation, cfg.ctrl.period,
-            modulator if modulator is not None else make_modulator(
-                pwm, cfg.base.f0, cfg.bridge,
-            ),
+            modulator,
             topology,
             pattern_sync="interval",
             **impedance,
         )
     model_type = SwitchingModel if cfg.bridge.model == "switching" else PWMAveragingModel
-    control_offset = cfg.ctrl.offset
     return model_type(
         cfg.ctrl.period, pwm.load_period, control_offset, pwm.grid_offset, cfg.ctrl.computation,
         pwm.switching_period,
-        modulator if modulator is not None else make_modulator(
-            pwm, cfg.base.f0, cfg.bridge,
-        ),
+        modulator,
         topology,
         pattern_sync=pwm.pattern_sync,
         dead_time=pwm.dead_time,
@@ -745,7 +746,7 @@ class HalfBridge(_BridgeTopology):
     )
     def initialize_model(self, model, parallel_capacitance: float) -> None:
         model.input.loss_factor = 1.0
-        external = self._external_port == "lower_rail"
+        external = self.external_port == "lower_rail"
         model.lower_port = Port(
             model,
             "lower",
@@ -772,16 +773,16 @@ class HalfBridge(_BridgeTopology):
     @staticmethod
     def pole_gates(q, switching):
         return (q,)
-    __slots__ = ("upper_controlled", "lower_controlled", "_reverse_port", "_external_port")
+    __slots__ = ("upper_controlled", "lower_controlled", "reverse_port", "external_port")
 
     def switching_state(self, states) -> float:
         state = states[0]
-        return 1.0 - state if self._reverse_port else state
+        return 1.0 - state if self.reverse_port else state
 
     def pole_currents(self, current):
         """Pole current expressed in the commanded leg's orientation."""
         current = np.real(current)
-        return (-current if self._reverse_port else current,)
+        return (-current if self.reverse_port else current,)
 
     @staticmethod
     def command_duties(output):
@@ -809,31 +810,11 @@ class HalfBridge(_BridgeTopology):
                 "a lower-rail external port uses the forward half-bridge orientation"
             )
         self.upper_controlled, self.lower_controlled = upper_controlled, lower_controlled
-        self._reverse_port = reverse_port
-        self._external_port = external_port
-
-    @classmethod
-    def from_config(cls, cfg: Any) -> "HalfBridge":
-        return cls(
-            upper_controlled=cfg.upper_controlled,
-            lower_controlled=cfg.lower_controlled,
-            reverse_port=cfg.reverse_port,
-            external_port=cfg.external_port,
-        )
+        self.reverse_port, self.external_port = reverse_port, external_port
 
     def state_from_duty(self, duty: float) -> float:
         """Return the bridge output ratio produced by its controlled device's duty."""
         return self.switching_state((min(1.0, max(0.0, duty)),))
-
-    @property
-    def reverse_port(self) -> bool:
-        """Whether the external scalar port is on the bridge's input side."""
-        return self._reverse_port
-
-    @property
-    def external_port(self) -> str:
-        """The half-bridge port exposed as the converter's external bus."""
-        return self._external_port
 
     @property
     def unilateral(self) -> bool:
@@ -843,11 +824,11 @@ class HalfBridge(_BridgeTopology):
     def control_values(self, current, voltage, supply):
         """Return canonical control measurements and the topology's feed-forward duty."""
         current, voltage = np.real(current), np.real(voltage)
-        if self._external_port == "lower_rail":
+        if self.external_port == "lower_rail":
             voltage = -voltage
             denominator = supply + voltage
             feedforward = voltage / denominator if denominator > 0.0 else 0.0
-        elif self._reverse_port:
+        elif self.reverse_port:
             feedforward = 1.0 - supply / voltage if voltage > 0.0 else 0.0
         else:
             feedforward = voltage / supply if supply > 0.0 else 0.0
@@ -870,6 +851,44 @@ class _ConductionInput(Bag):
 
 class _ConductionOutput(Bag):
     __slots__ = (*_DiodeConductionResult._fields, "maximum_step")
+
+
+class _AveragedHalfBridgeFilter(RLBranch):
+    """Filter current state driven by a unilateral half bridge's averaged conduction law."""
+
+    Input = record_type("AveragedHalfBridgeFilterInput", ("di_dt", "loss_factor"))
+    state_bounds = {"i": (0.0, None)}
+    energy_audit_note = (
+        "cycle-averaged DCM current does not have the branch's linear instantaneous "
+        "storage function"
+    )
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.input = self.Input(di_dt=self.zero, loss_factor=1.0)
+
+    @staticmethod
+    def diode_blocks_reverse_current() -> bool:
+        return True
+
+    def network(self, nb):
+        from ..solver import netlist as nl
+
+        branch = nb.add(nl.CurrentState(
+            nb.node(self.port1), nb.node(self.port2), nb.state(self, "i"),
+            nb.function(
+                lambda _t: self.zero if self.breaker_open else self.input.di_dt,
+                ("di_dt",), states=("i",),
+            ),
+        ))
+        nb.output(self, "i", ("branch_current", branch))
+        if self.R:
+            nb.add(nl.Dissipation(nb.function(
+                lambda _t: self.power_scale * self.R
+                * max(0.0, self.input.loss_factor) * abs(self.state.i) ** 2,
+                ("loss_factor",),
+            )))
+        nb.losses(self)
 
 
 class HalfBridgeDiodeConduction:
@@ -983,13 +1002,7 @@ class FullBridge(_BridgeTopology):
             return np.maximum(q, 0.0).item(), np.maximum(-q, 0.0).item()
         return 0.5 * (1.0 + q), 0.5 * (1.0 - q)
 
-    __slots__ = ("controlled",)
-
-    @property
-    def upper_controlled(self) -> bool:
-        return self.controlled
-
-    lower_controlled = upper_controlled
+    __slots__ = ("controlled", "upper_controlled", "lower_controlled")
 
     def __init__(self, *, upper_controlled: bool = True, lower_controlled: bool = True) -> None:
         if type(upper_controlled) is not bool or type(lower_controlled) is not bool:
@@ -997,7 +1010,7 @@ class FullBridge(_BridgeTopology):
         if upper_controlled != lower_controlled:
             raise ConfigError("a full bridge has either four controlled devices or none "
                               "(upper_controlled and lower_controlled must be equal)")
-        self.controlled = upper_controlled or lower_controlled
+        self.controlled = self.upper_controlled = self.lower_controlled = upper_controlled
 
     @staticmethod
     def switching_state(states) -> float:
@@ -1013,10 +1026,6 @@ class FullBridge(_BridgeTopology):
     def command_duties(output):
         duty = output.duty
         return duty, 1.0 - duty
-
-    @classmethod
-    def from_config(cls, cfg: Any) -> "FullBridge":
-        return cls(upper_controlled=cfg.upper_controlled, lower_controlled=cfg.lower_controlled)
 
     def state_from_duty(self, duty: float) -> float:
         """Return the differential bridge ratio produced by a bipolar duty command."""
@@ -1040,67 +1049,13 @@ class FullBridge(_BridgeTopology):
         model.dirac = False
         model._current = LocatedZero()  # sign: the conducting direction, 0 while blocked
         model.commutations = 0
+        model.description = (
+            "diode full-bridge rectifier, exact commutation with discontinuous conduction"
+        )
         model.discrete_state_names = ("direction",)
         model.linearization_state_names = ()
-        methods = (
-            ("describe", "_diode_description"),
-            ("get_state", "_conduction_state"),
-            ("set_state", "_restore_conduction_state"),
-            ("equation_state_bindings", "_conduction_bindings"),
-            ("_mirror_netlist_conduction", "_mirror_netlist_conduction"),
-        )
-        model._netlist_devices = None
-        for name, method in methods:
-            setattr(model, name, getattr(type(self), method).__get__(model, type(model)))
         model.commutation_margin = model._device_commutation_margin
         model.commutate = model._device_commutate
-
-    @staticmethod
-    def _diode_description(model) -> str:
-        return "diode full-bridge rectifier, exact commutation with discontinuous conduction"
-
-    @staticmethod
-    def _conduction_state(model) -> dict[str, Any]:
-        return {"direction": _real(model._current.sign), "i_ref": _real(model._current.residual)}
-
-    @staticmethod
-    def _conduction_bindings(model):
-        """Mutable equation memory; the ODE and public restart schema stay unchanged."""
-        return {"direction": (model._current, "sign"), "i_ref": (model._current, "residual"),
-                "commutations": (model, "commutations")}
-
-    @staticmethod
-    def _restore_conduction_state(model, values: Mapping[str, Any]) -> None:
-        unknown = set(values) - {"direction", "i_ref"}
-        if unknown:
-            raise KeyError(f"diode bridge: no state(s) {sorted(unknown)}")
-        if "direction" in values:
-            direction = float(values["direction"])
-            if direction not in (-1.0, 0.0, 1.0):
-                raise ValueError(f"diode bridge direction must be -1, 0 or 1, got {direction}")
-            model._current.sign = direction
-        if "i_ref" in values:
-            model._current.residual = float(values["i_ref"])
-        if model._netlist_devices is not None:
-            netlist, devices = model._netlist_devices
-            sign, residual = model._current.sign, model._current.residual
-            states = (sign < 0.0, sign > 0.0, sign > 0.0, sign < 0.0)
-            currents = (-residual, residual, residual, -residual)
-            for device, conducting, current in zip(devices, states, currents):
-                netlist.set_conducting(device, conducting, current if conducting else 0.0)
-
-    @staticmethod
-    def _mirror_netlist_conduction(model, t: float, before: Mapping[str, Any]) -> None:
-        """Mirror the netlist diode pair into the rectifier's public discrete state."""
-        netlist, devices = model._netlist_devices
-        (c1, r1), (c2, r2), (c3, _), (c4, _) = (
-            netlist.conduction(device) for device in devices
-        )
-        positive, negative = c2 and c3, c1 and c4
-        sign = 1.0 if positive and not negative else -1.0 if negative and not positive else 0.0
-        if sign != model._current.sign:
-            model.commutations += 1
-        model._current.locate(r2 if sign > 0.0 else -r1 if sign < 0.0 else 0.0, sign)
 
 class _DCState(Bag):
     __slots__ = ("u_C",)

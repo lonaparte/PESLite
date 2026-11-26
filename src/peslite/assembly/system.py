@@ -222,7 +222,7 @@ class Source(Element):
         self.cfg = cfg
         network_changed = False
         if "l" in paths or "r" in paths:
-            network_changed = self.branch.set_values(cfg.l, cfg.r)
+            network_changed = self.branch.set_parameters(l=cfg.l, r=cfg.r)
         if "v" in paths or "f" in paths or "angle" in paths:
             voltage, phase = self.scenario.law(t)
             if "v" in paths:
@@ -790,12 +790,12 @@ class System:
                     continue
                 done.add((section, name))
                 if section == "buses":
-                    network_changed |= self.buses[name].retune(
-                        p.buses[name].c, p.buses[name].r_d
+                    network_changed |= self.buses[name].set_parameters(
+                        c=p.buses[name].c, r_d=p.buses[name].r_d,
                     )
                 elif section == "branches":
-                    network_changed |= self.branches[name].set_values(
-                        p.branches[name].l, p.branches[name].r
+                    network_changed |= self.branches[name].set_parameters(
+                        l=p.branches[name].l, r=p.branches[name].r,
                     )
                 elif section == "sources":
                     network_changed |= self.sources[name].retune(

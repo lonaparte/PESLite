@@ -289,7 +289,7 @@ def test_export_preserves_system_factories_without_mutating_the_caller(tmp_path)
     def make_system(params):
         system = peslite.System(params)
         branch = system.units["vsc"].branch_f
-        branch.set_values(1.8 * branch.L, branch.R)
+        branch.set_parameters(l=1.8 * branch.L, r=branch.R)
         calls.append(system)
         return system
 

@@ -294,14 +294,6 @@ def test_native_branch_keeps_its_own_output_and_rhs(instance_override, tmp_path)
     assert actual == 6.0
 
 
-def test_native_unilateral_output_clamps_a_negative_trial_state(tmp_path):
-    branch = RLBranch(L=1.0, R=0.0, i0=-1.0, phases=1, unilateral=True)
-    model = Model({"branch": branch}, {})
-    actual, = _run_model(model, [(branch.output, "i")], tmp_path)
-    model.sync(0.0, model.get_initial_values())
-    assert actual == branch.output.i == 0.0
-
-
 @pytest.mark.parametrize("capacitance", [None, 0.1])
 def test_dclink_lowering_traces_the_shared_capacitor_state(capacitance, tmp_path):
     cap = DCCapacitor(12.0, capacitance, 0.25) if capacitance is not None else None

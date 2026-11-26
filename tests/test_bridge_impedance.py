@@ -89,7 +89,7 @@ def test_diode_leg_blocks_device_current_without_clamping_its_capacitor_port_cur
     bridge.power_port.current = 2.0
     y = model.get_initial_values()
     model.sync(0.0, y)
-    assert not bridge.diode_blocks_reverse_current()
+    assert not bridge.averaged_natural_conduction
     assert bridge.output.i_device == pytest.approx(0.0, abs=1e-15)
     assert model.rhs(0.0, y)[0] == pytest.approx(2.0 / 1e-4)
 

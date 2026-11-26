@@ -181,7 +181,7 @@ class _ShuntRL(Element):
 
     def retune(self, cfg):
         self.cfg = cfg
-        return self.branch.set_values(cfg.l, cfg.r)
+        return self.branch.set_parameters(l=cfg.l, r=cfg.r)
 
 
 @register_event_type

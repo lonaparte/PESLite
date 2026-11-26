@@ -156,6 +156,7 @@ class VoltageSource(Element):
                 raise ConfigError(f"r must be finite and positive, got {self.r}")
 
     type = "voltage_source"
+    signal_fields = {"i": "i"}
 
     def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
         if buses[cfg.bus].phases != 1:
@@ -165,9 +166,6 @@ class VoltageSource(Element):
 
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         return ((self.cfg.bus, self.model.port),)
-
-    def signals(self) -> dict[str, float]:
-        return {f"{self.name}.i": self.model.output.i}
 
     def retune(self, cfg: Any) -> bool:
         changed = self.cfg.r != cfg.r

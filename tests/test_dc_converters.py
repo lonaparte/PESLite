@@ -310,8 +310,8 @@ def test_half_bridge_device_placement_controls_unilateral_current():
     diode_unit = peslite.Simulation(_case(lower_controlled=False)).unit()
     controlled_unit = peslite.Simulation(_case(lower_controlled=True)).unit()
 
-    assert diode_unit.branch_f.unilateral
-    assert not controlled_unit.branch_f.unilateral
+    assert diode_unit.conduction is not None
+    assert controlled_unit.conduction is None
     assert not diode_unit.bridge.topology.lower_controlled
     assert controlled_unit.bridge.topology.lower_controlled
 

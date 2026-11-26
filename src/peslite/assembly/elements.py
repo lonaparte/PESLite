@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, ClassVar
 
 from ..components.network import element_buses, resolve_endpoints
 from ..components.passive import Capacitor, ParallelRLC, Resistor, SeriesRLC
@@ -12,13 +12,13 @@ from ..components.registry import register_component
 from ..solver.model import ConfigError
 
 
-def _positive_optional(name: str, value: float | None) -> None:
+def validate_positive(name: str, value: float | None) -> None:
     if value is not None and (not math.isfinite(value) or value <= 0.0):
         raise ConfigError(f"{name} must be finite and > 0, got {value}")
 
 
-def _connections(bus: str | None, bus1: str | None, bus2: str | None,
-                 series: bool = False) -> None:
+def validate_connections(bus: str | None, bus1: str | None, bus2: str | None,
+                         series: bool = False) -> None:
     one_terminal = bus is not None and bus1 is None and bus2 is None
     two_terminal = bus is None and bus1 is not None and bus2 is not None
     if not (one_terminal or two_terminal):
@@ -31,6 +31,7 @@ def _connections(bus: str | None, bus1: str | None, bus2: str | None,
 
 @dataclass(frozen=True, kw_only=True)
 class SeriesRLCParams:
+    component_type: ClassVar[Any] = SeriesRLC
     type: str = "series_rlc"
     bus: str | None = None
     bus1: str | None = None
@@ -44,11 +45,11 @@ class SeriesRLCParams:
     _input_aliases = {"x_pu": "l_pu"}
 
     def __post_init__(self) -> None:
-        _connections(self.bus, self.bus1, self.bus2, self.series)
+        validate_connections(self.bus, self.bus1, self.bus2, self.series)
         if not math.isfinite(self.r) or self.r < 0.0:
             raise ConfigError(f"r must be finite and >= 0, got {self.r}")
-        _positive_optional("l", self.l)
-        _positive_optional("c", self.c)
+        validate_positive("l", self.l)
+        validate_positive("c", self.c)
         if self.r == 0.0 and self.l is None and self.c is None:
             raise ConfigError("a series RLC needs at least one nonzero element")
         if type(self.series) is not bool:
@@ -57,6 +58,7 @@ class SeriesRLCParams:
 
 @dataclass(frozen=True, kw_only=True)
 class CapacitorParams:
+    component_type: ClassVar[Any] = Capacitor
     type: str = "capacitor"
     bus1: str
     bus2: str
@@ -66,14 +68,15 @@ class CapacitorParams:
     _quantities = {"c": "capacitance", "r": "resistance"}
 
     def __post_init__(self) -> None:
-        _connections(None, self.bus1, self.bus2)
-        _positive_optional("c", self.c)
+        validate_connections(None, self.bus1, self.bus2)
+        validate_positive("c", self.c)
         if not math.isfinite(self.r) or self.r < 0.0:
             raise ConfigError(f"r must be finite and >= 0, got {self.r}")
 
 
 @dataclass(frozen=True, kw_only=True)
 class ResistorParams:
+    component_type: ClassVar[Any] = Resistor
     type: str = "resistor"
     bus: str | None = None
     bus1: str | None = None
@@ -84,14 +87,15 @@ class ResistorParams:
     _quantities = {"r": "resistance"}
 
     def __post_init__(self) -> None:
-        _connections(self.bus, self.bus1, self.bus2, self.series)
-        _positive_optional("r", self.r)
+        validate_connections(self.bus, self.bus1, self.bus2, self.series)
+        validate_positive("r", self.r)
         if type(self.series) is not bool:
             raise ConfigError("series must be bool")
 
 
 @dataclass(frozen=True, kw_only=True)
 class ParallelRLCParams:
+    component_type: ClassVar[Any] = ParallelRLC
     type: str = "parallel_rlc"
     bus: str | None = None
     bus1: str | None = None
@@ -104,26 +108,31 @@ class ParallelRLCParams:
     _input_aliases = {"x_pu": "l_pu"}
 
     def __post_init__(self) -> None:
-        _connections(self.bus, self.bus1, self.bus2)
-        _positive_optional("r", self.r)
-        _positive_optional("l", self.l)
-        _positive_optional("c", self.c)
+        validate_connections(self.bus, self.bus1, self.bus2)
+        validate_positive("r", self.r)
+        validate_positive("l", self.l)
+        validate_positive("c", self.c)
         if self.r is None and self.l is None and self.c is None:
             raise ConfigError("a parallel RLC needs at least one element")
 
 
-def _switchable(name: str, params: Any) -> bool:
-    path = f"elements.{name}.connected"
-    return any(path in change.connections for change in getattr(params, "changes", ()))
-
-
-def _assemble(name: str, cfg: Any, buses: dict, params: Any,
-              make: Callable[[int, bool], Any]) -> Any:
+def assemble_element(name: str, cfg: Any, buses: dict, params: Any) -> Any:
+    """Construct one registered passive element and attach its resolved endpoints."""
     endpoints = resolve_endpoints(
         element_buses(cfg), buses, f"elements.{name}", same_phases=True,
     )
     phases = next(iter(endpoints.values())).phases
-    element = make(phases, _switchable(name, params))
+    path = f"elements.{name}.connected"
+    breakable = any(path in change.connections for change in getattr(params, "changes", ()))
+    element = cfg.component_type(
+        **{
+            attribute: getattr(cfg, name)
+            for name, attribute in cfg.component_type.parameter_fields.items()
+            if hasattr(cfg, name)
+        },
+        phases=phases,
+        breakable=breakable,
+    )
     element.name, element.cfg, element.endpoint_by_field = name, cfg, endpoints
     element.model = element
     element.breakers = [element] if element.breakable else []
@@ -156,51 +165,15 @@ def _assemble(name: str, cfg: Any, buses: dict, params: Any,
     return element
 
 
-def _series_rlc(name: str, cfg: SeriesRLCParams, buses: dict, params: Any) -> SeriesRLC:
-    return _assemble(
-        name, cfg, buses, params,
-        lambda phases, breakable: SeriesRLC(
-            cfg.r, cfg.l, cfg.c, phases=phases, breakable=breakable,
-        ),
-    )
-
-
-def _capacitor(name: str, cfg: CapacitorParams, buses: dict, params: Any) -> Capacitor:
-    return _assemble(
-        name, cfg, buses, params,
-        lambda phases, breakable: Capacitor(
-            cfg.r, cfg.c, phases=phases, breakable=breakable,
-        ),
-    )
-
-
-def _resistor(name: str, cfg: ResistorParams, buses: dict, params: Any) -> Resistor:
-    return _assemble(
-        name, cfg, buses, params,
-        lambda phases, breakable: Resistor(cfg.r, phases=phases, breakable=breakable),
-    )
-
-
-def _parallel_rlc(name: str, cfg: ParallelRLCParams, buses: dict,
-                  params: Any) -> ParallelRLC:
-    return _assemble(
-        name, cfg, buses, params,
-        lambda phases, breakable: ParallelRLC(
-            cfg.r, cfg.l, cfg.c, phases=phases, breakable=breakable,
-        ),
-    )
-
-
-def _retune_rlc(element: Any, cfg: Any) -> bool:
-    changed = element.set_values(
-        getattr(cfg, "l", element.L), getattr(cfg, "r", element.R),
-        getattr(cfg, "c", element.C),
-    )
+def retune_element(element: Any, cfg: Any) -> bool:
+    """Apply the parameters declared by both the configuration and component."""
+    changed = element.set_parameters(**{
+        name: getattr(cfg, name)
+        for name in element.parameter_fields if hasattr(cfg, name)
+    })
     element.cfg = cfg
     return changed
 
 
-register_component(SeriesRLCParams, _series_rlc, _retune_rlc)
-register_component(CapacitorParams, _capacitor, _retune_rlc)
-register_component(ResistorParams, _resistor, _retune_rlc)
-register_component(ParallelRLCParams, _parallel_rlc, _retune_rlc)
+for parameter_type in (SeriesRLCParams, CapacitorParams, ResistorParams, ParallelRLCParams):
+    register_component(parameter_type, assemble_element, retune_element)

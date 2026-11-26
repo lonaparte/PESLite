@@ -47,6 +47,30 @@ class _Ramp:
         return self.scheduled[0] if self.scheduled else math.inf
 
 
+class _BoundedCurrent:
+    """Minimal current state used to exercise the solver's generic one-way guard."""
+
+    state_names = ("i",)
+    state_bounds = {"i": (0.0, None)}
+    outputs_need_inputs = False
+
+    def __init__(self, initial=0.5):
+        self.state = type("_S", (Bag,), {"__slots__": ("i",)})(i=initial)
+        self.input = type("_I", (Bag,), {"__slots__": ()})()
+        self.output = self.state
+
+    @staticmethod
+    def diode_blocks_reverse_current():
+        return True
+
+    @staticmethod
+    def set_outputs(_t):
+        return None
+
+    def rhs(self, _t):
+        return (0.0 if self.state.i <= 0.0 else -1.0,)
+
+
 def _handler(part, dt=0.1):
     from peslite.solver.integrators import FixedStepSolver
     model = Model({"ramp": part}, {})
@@ -168,11 +192,9 @@ def test_located_and_scheduled_events_on_distinct_owners_share_the_boundary():
 
 
 def test_bounded_current_and_margin_event_use_the_same_advance():
-    from peslite.components import RLBranch
     from peslite.solver.integrators import FixedStepSolver
 
-    branch = RLBranch(L=1.0, R=0.0, i0=0.5, phases=1, unilateral=True)
-    branch.port1.voltage = -1.0
+    branch = _BoundedCurrent()
     ramp = _Ramp()
     model = Model({"branch": branch, "ramp": ramp}, {})
     handler = Commutation(model, FixedStepSolver(0.1, "RK4"))
@@ -183,7 +205,6 @@ def test_bounded_current_and_margin_event_use_the_same_advance():
 
 
 def test_current_zero_locator_preserves_plain_float_solver_times():
-    from peslite.components import RLBranch
     from peslite.solver.integrators import FixedStepSolver
 
     class CheckingSolver(FixedStepSolver):
@@ -191,8 +212,7 @@ def test_current_zero_locator_preserves_plain_float_solver_times():
             assert type(t0) is float and type(t1) is float
             return super().advance(rhs, t0, t1, state, **kwargs)
 
-    branch = RLBranch(L=1.0, R=0.0, i0=0.5, phases=1, unilateral=True)
-    branch.port1.voltage = -1.0
+    branch = _BoundedCurrent()
     model = Model({"branch": branch}, {})
     handler = Commutation(model, CheckingSolver(1.0, "RK4"))
     state = handler.advance(0.0, 1.0, model.get_initial_values())

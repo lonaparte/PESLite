@@ -22,8 +22,8 @@ from .pwm import (ZOH, CarrierComparison, PWM, PhaseShiftModulator, SwitchingSeq
 from .onnx import ONNXModel, ONNXStateParams
 from .cable import BergeronCableModel, Cable, LumpedCableModel
 
-__all__ = ["Port", "Element", "ACVoltageSource", "Bus", "SeriesRLC", "RLBranch",
-           "Capacitor", "Resistor", "ParallelRLC",
+__all__ = ["Port", "Element", "ACVoltageSource", "Bus", "SeriesRLC", "ParallelRLC",
+           "RLBranch", "Capacitor", "Resistor",
            "Bag", "Empty", "ConfigError", "StoragePort",
            "register_component_type", "resolve_endpoints", "GROUND",
            "VoltageSource",

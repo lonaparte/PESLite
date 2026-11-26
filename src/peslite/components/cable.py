@@ -35,11 +35,12 @@ class LumpedCableModel(NetworkComponent):
                  g_per_km: float, c_per_km: float, sections: int,
                  voltage0: complex) -> None:
         self.sections = sections
-        self.state_names = _state_record(sections).__slots__
+        state_type = _state_record(sections)
+        self.state_names = state_type.__slots__
         self.state_dimensions = dict.fromkeys(self.state_names, 2)
         initial = {name: 0j for name in self.state_names}
         initial.update({f"uC{k}": complex(voltage0) for k in range(1, sections + 1)})
-        self.state = _state_record(sections)(**initial)
+        self.state = state_type(**initial)
         self.input = Empty()
         self.output = _CableOutput(i1=0j, i2=0j)
         self.port1 = Port(
@@ -291,6 +292,7 @@ class Cable(Element):
 
     type = "cable"
     domain_transparent = True
+    signal_fields = {"i1": "i1", "i2": "i2"}
 
     def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
         self.name, self.cfg = name, cfg
@@ -312,10 +314,6 @@ class Cable(Element):
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         return ((self.cfg.bus1, self.model.port1),
                 (self.cfg.bus2, self.model.port2))
-
-    def signals(self) -> dict[str, complex]:
-        return {f"{self.name}.i1": self.model.output.i1,
-                f"{self.name}.i2": self.model.output.i2}
 
     def retune(self, cfg: Any) -> bool:
         """Apply numerical changes without replacing the selected physical model."""

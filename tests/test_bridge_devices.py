@@ -26,9 +26,13 @@ def _custom_case():
     })
 
 
+def _devices(bridge):
+    return () if bridge._netlist_devices is None else bridge._netlist_devices[1]
+
+
 def test_bridge_uses_independent_switch_and_diode_resistance():
     bridge = peslite.Simulation(_custom_case()).unit("converter").bridge
-    high, low = bridge._switching_devices
+    high, low = _devices(bridge)
     assert high.R_gated == pytest.approx(0.035)
     assert high.R_on == pytest.approx(0.045)
     assert low.gate is None
@@ -43,8 +47,8 @@ def test_bridge_topologies_share_independent_device_resistance(topology):
     bridge = make_bridge(cfg, topology=topology)
     Model({"bridge": bridge}, {})
 
-    assert bridge._switching_devices
-    for device in bridge._switching_devices:
+    assert _devices(bridge)
+    for device in _devices(bridge):
         assert device.R_on == pytest.approx(0.045)
         assert device.R_gated == pytest.approx(
             0.035 if device.gate is not None else 0.045
@@ -58,7 +62,7 @@ def test_device_resistance_defaults_are_ideal():
     })
     assert params.units["converter"].bridge.switch_resistance == 0.0
     assert params.units["converter"].bridge.diode_resistance == 0.0
-    high, low = peslite.Simulation(params).unit("converter").bridge._switching_devices
+    high, low = _devices(peslite.Simulation(params).unit("converter").bridge)
     assert high.R_on == high.R_gated == pytest.approx(0.0)
     assert low.R_on == low.R_gated == pytest.approx(0.0)
 
@@ -71,7 +75,7 @@ def test_equal_explicit_resistances_reuse_the_shared_bridge_equation():
     })
     bridge = peslite.Simulation(params).unit("converter").bridge
     assert bridge.resistance == pytest.approx(0.04)
-    assert not bridge._switching_devices
+    assert not _devices(bridge)
 
 
 @pytest.mark.parametrize("form", ["device", "statewise", "nodal"])
