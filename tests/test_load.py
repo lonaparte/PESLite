@@ -1,4 +1,4 @@
-"""Built-in R-L load and switching events in a running network."""
+"""Passive RLC elements and switching events in a running network."""
 
 import numpy as np
 import pytest
@@ -7,6 +7,7 @@ import peslite
 from dataclasses import replace
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, from_dict
+from peslite.components import Element
 
 
 def test_unit_dc_base_is_reused_but_replaced_parameters_get_a_fresh_base():
@@ -36,7 +37,7 @@ def _two_buses(case, events):
         "line": {"bus1": "pcc", "bus2": "b2", "x_pu": 0.05}
     }
     tree["elements"] = {
-        "load": {"type": "load", "bus": "b2", "r_pu": 1.0, "x_pu": 0.5}
+        "load": {"type": "series_rlc", "bus": "b2", "r_pu": 1.0, "x_pu": 0.5}
     }
     tree["events"] = events
     tree["simulation"]["output"] = {"period": 2.5e-5}
@@ -53,7 +54,7 @@ def test_branch_source_and_load_switch_during_a_run(case, tmp_path):
     result = peslite.Simulation(params).run(out_dir=tmp_path)
     t = result.states["t"]
     line = _current(result, "line.i")
-    load = _current(result, "load.branch.i")
+    load = _current(result, "load.i")
     grid = _current(result, "grid.branch.i")
     assert np.all(line[(t > 0.001 + 1e-9) & (t < 0.002 - 1e-9)] == 0.0)
     assert np.max(line[t > 0.0022]) > 0.0
@@ -63,10 +64,15 @@ def test_branch_source_and_load_switch_during_a_run(case, tmp_path):
     assert np.max(grid[t < 0.003]) > 0.0
 
 
-def test_every_network_component_uses_the_same_port_assembly(case):
+def test_every_system_element_uses_the_same_assembly_contract(case):
     params = _two_buses(case, {})
     system = peslite.System(params)
     line = system.branches["line"]
+
+    assert all(isinstance(element, Element) for element in (
+        *system.sources.values(), *system.units.values(),
+        *system.named_elements.values(), *system.branch_elements,
+    ))
 
     source = system.sources["grid"]
     assert source.port_bindings() == (
@@ -80,7 +86,7 @@ def test_every_network_component_uses_the_same_port_assembly(case):
     assert ("vsc.bus.power", unit.bridge.power_port) in unit.port_bindings()
     assert ("pcc", unit.branch_f.port2) in unit.port_bindings()
     assert system.named_elements["load"].port_bindings() == (
-        ("b2", system.named_elements["load"].branch.port1),
+        ("b2", system.named_elements["load"].port1),
     )
 
 
@@ -201,7 +207,7 @@ def test_signal_collection_allows_the_same_producer_to_be_reused(case):
 def test_small_load_can_model_a_switched_fault(case, tmp_path):
     tree = case()
     tree["elements"] = {
-        "fault": {"type": "load", "bus": "pcc", "r_pu": 0.01, "x_pu": 0.01}
+        "fault": {"type": "series_rlc", "bus": "pcc", "r_pu": 0.01, "x_pu": 0.01}
     }
     tree["events"] = {
         "fault_on": {"type": "connect", "target": "fault", "t": 0.002}

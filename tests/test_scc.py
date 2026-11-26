@@ -347,7 +347,7 @@ class _Clock:
 
 def _capacitor(current, *, angle=1.2, drive="alternating", voltage=0.0):
     """Use the existing capacitor and real commutation dispatcher for device tests."""
-    from peslite.components.passive import RCNode
+    from peslite.components.passive import Bus
     from peslite.solver.model import Model
     from peslite.solver.commutation import Commutation
     from peslite.solver.integrators import FixedStepSolver
@@ -356,7 +356,7 @@ def _capacitor(current, *, angle=1.2, drive="alternating", voltage=0.0):
     switch.state_name = "u_C"
     switch.bind_bridge(_Clock())
 
-    class Capacitor(RCNode):
+    class Capacitor(Bus):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self._commutation_t = 0.0

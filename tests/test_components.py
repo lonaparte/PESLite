@@ -11,21 +11,41 @@ from conftest import EXAMPLES
 from peslite.components import (
     ADC,
     AveragingModel,
+    Capacitor,
     MeasurementPorts,
     PWM,
     PWMAveragingModel,
-    RCNode,
+    Bus,
+    ParallelRLC,
+    Resistor,
     RLBranch,
+    SeriesRLC,
     Port,
     ThreePhaseBridge,
     ZOH,
 )
+from peslite.components.registry import ELEMENT_TYPES
 
 COMPONENTS = Path(peslite.components.__file__).parent
 
 
+def test_builtin_element_configuration_and_assembly_are_separate_from_physics():
+    physical_types = {
+        "series_rlc": SeriesRLC,
+        "parallel_rlc": ParallelRLC,
+        "capacitor": Capacitor,
+        "resistor": Resistor,
+    }
+
+    for name, physical_type in physical_types.items():
+        definition = ELEMENT_TYPES[name]
+        assert definition.params.__module__ == "peslite.assembly.elements"
+        assert definition.constructor.__module__ == "peslite.assembly.elements"
+        assert "Params" not in physical_type.__dict__
+
+
 def test_electrical_ports_store_inward_current_and_numbered_names():
-    branch = RLBranch(0.1, 0.01)
+    branch = RLBranch(L=0.1, R=0.01)
 
     assert (branch.port1.component, branch.port1.name,
             branch.port1.voltage, branch.port1.current) == (
@@ -36,7 +56,7 @@ def test_electrical_ports_store_inward_current_and_numbered_names():
                 branch, "2", 0j, 0j,
             )
 
-    node = RCNode(0.1, 0.01)
+    node = Bus(0.1, 0.01)
     assert node.port.component is node
     assert node.port.name == "power"
     with pytest.raises(ValueError, match="scale must be positive"):
@@ -47,7 +67,7 @@ def test_inherited_branch_behavior_uses_the_declared_netlist_equations():
     class DerivedBranch(RLBranch):
         pass
 
-    branch = DerivedBranch(1.0, 0.0, i0=1.0, phases=1, unilateral=True)
+    branch = DerivedBranch(L=1.0, R=0.0, i0=1.0, phases=1, unilateral=True)
     branch.port1.voltage, branch.port2.voltage = 0.0, 1.0
     branch.set_outputs(0.0)
 
@@ -66,13 +86,47 @@ def test_inherited_branch_behavior_uses_the_declared_netlist_equations():
 
 
 def test_model_prepares_a_standalone_component_before_planning():
-    branch = RLBranch(1.0, 2.0, i0=3.0, phases=1)
+    branch = RLBranch(L=1.0, R=2.0, i0=3.0, phases=1)
     branch.port1.voltage, branch.port2.voltage = 5.0, 1.0
 
     model = peslite.Model({"branch": branch}, {})
 
     assert branch._device_circuit is not None
     assert model.rhs_list(0.0, [3.0]) == [-2.0]
+
+
+@pytest.mark.parametrize(
+    ("component", "states"),
+    [
+        (SeriesRLC(R=2.0, phases=1), ()),
+        (SeriesRLC(C=1.0e-3, phases=1), ("u_C",)),
+        (SeriesRLC(R=2.0, L=1.0e-3, C=2.0e-3, phases=1), ("i", "u_C")),
+        (ParallelRLC(R=2.0, phases=1), ()),
+        (ParallelRLC(L=1.0e-3, phases=1), ("i_L",)),
+        (ParallelRLC(R=2.0, L=1.0e-3, C=2.0e-3, phases=1), ("i_L", "u_C")),
+    ],
+)
+def test_series_and_parallel_rlc_share_the_netlist_model(component, states):
+    model = peslite.Model({"rlc": component}, {})
+
+    assert component.state_names == states
+    assert model.state_labels() == [f"rlc.{name}" for name in states]
+    assert tuple(item.state for item in component.storage) == states
+    model.rhs(0.0, model.get_initial_values())
+
+
+def test_rlc_constructors_accept_values_in_resistance_inductance_capacitance_order():
+    series = SeriesRLC(2.0, 1.0e-3, 2.0e-3)
+    parallel = ParallelRLC(3.0, 4.0e-3, 5.0e-3)
+    branch = RLBranch(6.0, 7.0e-3)
+    capacitor = Capacitor(8.0, 9.0e-3)
+    resistor = Resistor(10.0)
+
+    assert (series.R, series.L, series.C) == (2.0, 1.0e-3, 2.0e-3)
+    assert (parallel.R, parallel.L, parallel.C) == (3.0, 4.0e-3, 5.0e-3)
+    assert (branch.R, branch.L, branch.C) == (6.0, 7.0e-3, None)
+    assert (capacitor.R, capacitor.L, capacitor.C) == (8.0, None, 9.0e-3)
+    assert (resistor.R, resistor.L, resistor.C) == (10.0, None, None)
 
 
 def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():
@@ -102,7 +156,7 @@ def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():
     (1, 24.0, 5.0, 120.0), (3, 3.0 + 4.0j, 2.0 - 1.0j, 3.0),
 ])
 def test_port_power_reuses_the_declared_energy_convention(phases, voltage, current, expected):
-    branch = RLBranch(0.1, 0.01, phases=phases)
+    branch = RLBranch(L=0.1, R=0.01, phases=phases)
     branch.port1.voltage = branch.port2.voltage = voltage
     branch.port1.current = current
     branch.port2.current = -current

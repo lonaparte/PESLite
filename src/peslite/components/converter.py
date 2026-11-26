@@ -18,7 +18,7 @@ from ..solver.model import (Bag, ConfigError, Empty, LocatedZero, OutputMethod, 
                             _record_fields, record_type)
 from ..solver.timing import TIME_EPS, PeriodicClock
 from .network import NetworkComponent
-from .passive import RCNode
+from .passive import Bus
 from .pwm import CarrierComparison, Modulator, PWM, ZOH, make_modulator
 from .registry import register_topology, topology_type
 
@@ -433,7 +433,9 @@ class _BridgeModel(NetworkComponent):
         """Compose finite device conductances with the existing capacitor and algebraic solver."""
         self._switching_poles = switching
         self._leg_gates = _LegGates(self)
-        self.capacitor = RCNode(capacitance, 0.0, phases=3 if isinstance(self.topology.zero, complex) else 1)
+        self.capacitor = Bus(
+            capacitance, phases=3 if isinstance(self.topology.zero, complex) else 1
+        )
         self.state, self.state_names = self.capacitor.state, self.capacitor.state_names
         self.storage = tuple(replace(port, power_terms=()) for port in self.capacitor.storage)
         self.output = _extend_record(self.output, "i_device", "power_loss")

@@ -42,24 +42,31 @@ Branch current is positive from `bus1` to `bus2`. Both ports must use the same p
 `ground` takes the representation of the other port.
 Use [Events Timeline](Events-Timeline.md) to connect or disconnect a branch.
 
-## Passive elements
+## RLC elements
 
 ```yaml
 elements:
-  load: {type: load, bus: pcc, x_pu: 0.4, r_pu: 0.1}
+  load: {type: series_rlc, bus: pcc, x_pu: 0.4, r_pu: 0.1}
   damping: {type: resistor, bus: pcc, r: 20.0}
   compensation: {type: capacitor, bus1: input, bus2: output, c: 35.0e-9, r: 0.08}
 ```
 
-| `type` | Required fields | Optional fields | Connection |
-|---|---|---|---|
-| `load` | `bus`, `l` or `x_pu` | `r` or `r_pu` | series R-L branch from the bus to ground |
-| `resistor` | `bus`, `r` | `series` (default 0) | shunt resistor, or series resistor after the bus voltage driver |
-| `capacitor` | `bus1`, `bus2`, `c` | `r` (default 0) | capacitance with optional series resistance between two scalar terminals |
+| `type` | Values | Connection |
+|---|---|---|
+| `resistor` | positive `r` | `bus` or `bus1` and `bus2`; `series: true` is supported with `bus` |
+| `capacitor` | positive `c` with optional series `r` | `bus1` to `bus2` |
+| `series_rlc` | `r`, `l` and `c` in series; at least one must be present and nonzero | `bus` or `bus1` and `bus2`; `series: true` is supported with `bus` |
+| `parallel_rlc` | any nonempty parallel combination of `r`, `l` and `c` | `bus` to ground or `bus1` to `bus2` |
 
-`load.l` must be positive, `load.r` non-negative and `resistor.r` positive. Per-unit values use the
-system base. Capacitor terminals must be distinct, `c` must be positive and `r` non-negative. The
-capacitor exposes `<element>.u`; energy accounting includes its stored energy and series loss.
+Use `r_pu`, `l_pu` or `x_pu`, and `c_pu` for system-base per-unit values. Resistances are
+positive for `resistor` and parallel RLC branches; a series resistance may also be zero.
+Inductances and capacitances are positive when present. Every RLC element exposes
+`<element>.i`, `<element>.voltage` and `<element>.power`; energy accounting includes its storage
+and resistive loss.
+
+With `bus`, an element is normally connected between that point and `ground`. For `resistor` and
+`series_rlc`, `series: true` instead places it in the connection path. Use `bus1` and `bus2` for
+an explicit two-terminal connection.
 
 ## Cables
 
@@ -95,12 +102,12 @@ elements:
   grounded_capacitor: {type: capacitor, bus1: output, bus2: ground, c: 1e-3}
 ```
 
-Single-terminal shunt components already include their ground terminal, so configurations such as
-`{type: load, bus: pcc, ...}` do not write it. A network with no implicit or explicit ground
-connection remains floating; a numerical reference chosen for its equations does not create a
-physical current path. `ground` denotes ideal zero voltage, not a neutral conductor or protective
-earth. The three-phase space-vector representation contains no zero-sequence quantity, so neutral
-impedance, ground current and common-mode networks require a multi-conductor model.
+An element using `bus` without `series: true` does not need a separate `bus2: ground`. A network
+with no connection to `ground` remains floating. PESLite may select a numerical voltage reference
+to solve it, but that reference does not add a physical ground branch. `ground` denotes ideal zero
+voltage, not a neutral conductor or protective earth. The three-phase space-vector representation
+contains no zero-sequence quantity, so neutral impedance, ground current and common-mode networks
+require a multi-conductor model.
 
 The phase count is resolved during assembly. A connection between incompatible explicit AC and DC
 domains is rejected before simulation.

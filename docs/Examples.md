@@ -110,17 +110,14 @@ voltage/current.
 
 ## Independent loads and measurement selection
 
-`wpt-load-example` uses the existing `Resistor`, power loop and `set` event. `series: true`
-inserts the resistor after the selected bus's voltage driver, before all of that bus's followers.
-Omit it for a shunt resistor. No artificial capacitor/inductor is inserted, and load dissipation
-is recorded separately from winding losses. Multiple series elements on the same bus form a chain
-in declaration order, from the original voltage driver to the followers.
+`wpt-load-example` places a resistor in series with the secondary power port, feeds `load.power`
+to `PowerControl`, and changes the resistance from 5 to 8 ohms with a `set` event.
 
 An element's `bus` may name a configured bus, a Unit's default port (`charger` or
 `charger.secondary`), or a named port (`charger.secondary.dc` or `charger.secondary.power`).
 Nested Units resolve through the same declared default-port contract.
-Element per-unit inputs retain the network/system base; selecting a Unit port does not silently
-change their base. The example specifies load resistance directly in ohms.
+Element per-unit inputs use the system base. This example specifies the load resistance directly
+in ohms.
 
 ```yaml
 elements:

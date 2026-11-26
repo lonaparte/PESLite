@@ -44,12 +44,12 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 import numpy as np
 
 from ..components.network import Port
-from ..solver.energy import Energetic, spec_of
+from ..solver.energy import Energetic, StoragePort, spec_of
 from ..solver.model import (
     ConfigError, Empty, OutputMethod, SolverCheck, SolverRegion, SpectralBound,
     _InlineProgram, _compile_straight_line, _public_fields, record_type,
 )
-from ..solver.netlist import (QUANTITIES, CurrentSource, Diode, Element, Mode,
+from ..solver.netlist import (QUANTITIES, Capacitor, CurrentSource, Diode, Element, Inductor, Mode,
                               Netlist, Node, Topology, VoltageSource, _DENSE_GROUP, _Degenerate,
                               _Evaluation, _linear_expression, _numeric_values, _roles, _UnionFind)
 
@@ -444,6 +444,31 @@ def compile_network(sub: Any) -> Optional[NetworkPlan]:
             return None
     finally:
         _NETWORK_DECLARATION.reset(token)
+    if getattr(sub, "infer_netlist_storage", False):
+        states = {
+            name: tuple(int(index) for index in indices)
+            for (owner, name), indices in probe._states.items() if owner == id(sub)
+        }
+        storage = []
+        for primitive in probe.owned.get(id(sub), ()):
+            attribute = "L" if isinstance(primitive, Inductor) else (
+                "C" if isinstance(primitive, Capacitor) else None
+            )
+            if attribute is None:
+                continue
+            indices = tuple(int(index) for index in primitive.state)
+            names = [name for name, state in states.items() if state == indices]
+            matrix = getattr(primitive, attribute)
+            diagonal = np.diag(matrix)
+            if (len(names) != 1 or not np.allclose(matrix, np.diag(diagonal))
+                    or not np.allclose(diagonal, diagonal[0])):
+                continue
+            nodes = [node for port in primitive.ports for node in port if node is not None]
+            storage.append(StoragePort(
+                names[0], float(diagonal[0]), nodes[0].scale if nodes else 1.0,
+                kind="inductor" if attribute == "L" else "capacitor",
+            ))
+        sub.storage = tuple(storage)
     sub._network_has_losses = id(sub) in probe.lossy
     sub._network_has_supplies = id(sub) in probe.supplying
     return NetworkPlan(probe)

@@ -20,7 +20,7 @@ import numpy as np
 from ..components.adc import ADC, ADCSample, MeasurementPorts, _PortMeasurement
 from ..components.converter import (HalfBridgeDiodeConduction, make_bridge, make_dclink,
                                     make_topology)
-from ..components.network import Port
+from ..components.network import Element, Port
 from ..components.passive import RLBranch
 from ..components.pwm import Modulator
 from ..control.blocks import phases
@@ -98,7 +98,7 @@ class Plant:
         self.inputs_changed = True
 
 
-class Unit(ABC):
+class Unit(Element, ABC):
     """Common runtime interface and lifecycle mechanics for one converter unit."""
 
     def __init__(self, name: str, cfg: UnitParams, bus: Any) -> None:
@@ -730,7 +730,7 @@ class VSC(Unit):
         except ValueError as exc:
             raise ValueError(f"{name}: {exc}") from None
         self.continuous = self.bridge.continuous
-        self.branch_f = _parameterized(lambda c: RLBranch(c.l_f, c.r_f), cfg.ac_filter)
+        self.branch_f = _parameterized(lambda c: RLBranch(L=c.l_f, R=c.r_f), cfg.ac_filter)
         self._diodes_warned = False
 
         # ------------------------------------------------------------ ADC
@@ -883,8 +883,8 @@ class DCConverter(Unit):
         )
         self.continuous = self.bridge.continuous
         self.branch_f = None if cfg.filter is None else _parameterized(lambda c: RLBranch(
-            c.l_f,
-            c.r_f,
+            L=c.l_f,
+            R=c.r_f,
             phases=1,
             unilateral=self.bridge.diode_blocks_reverse_current(),
         ), cfg.filter)

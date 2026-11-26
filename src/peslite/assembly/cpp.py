@@ -36,7 +36,7 @@ import numpy as np
 
 from ..defaults import (DEFAULT_COMMUTATION_LOCATOR_ITERATIONS,
                         DEFAULT_COMMUTATION_MAX_TRANSITIONS)
-from ..components.passive import RLBranch
+from ..components.passive import SeriesRLC
 from ..components.source import ACVoltageSource
 from ..components.pwm import (_EPS, _SNAP, CarrierComparison, SynchronousCarrier, PhaseClock,
                                PhaseShiftModulator, ZOH)
@@ -1252,6 +1252,8 @@ class _Expression:
     })
 
     def __init__(self, code: str, kind: str, *, pure: bool | None = None) -> None:
+        if kind == "real" and re.fullmatch(r"-?\d+", code):
+            code += ".0"
         pool = _SCALAR_TERMS.get()
         calls = set(re.findall(r"([A-Za-z_]\w*(?:::\w+)*)\s*\(", code))
         prefix = pool[0] if pool is not None else None
@@ -2470,8 +2472,8 @@ class _ModelGenerator:
                 + " control the declared circuit structure.",
             })
 
-    def breaker_lines(self, branch: RLBranch, open_expression: str) -> list[str]:
-        """Render the state transition implemented by ``RLBranch`` breaker methods."""
+    def breaker_lines(self, branch: SeriesRLC, open_expression: str) -> list[str]:
+        """Render the state transition implemented by ``SeriesRLC`` breaker methods."""
         flag = self._equation_attributes(branch)["breaker_open"].code
 
         def transition(owner):

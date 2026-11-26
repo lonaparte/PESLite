@@ -10,8 +10,7 @@ import pytest
 import peslite
 from peslite.assembly import Event, register_event_type
 from peslite.assembly.params import ConfigError, from_dict
-from peslite.components import RLBranch, register_component_type
-from peslite.components.network import Element
+from peslite.components import Element, RLBranch, register_component_type
 from peslite.components.registry import ELEMENT_TYPES
 from peslite.control import ANGLE, FREQUENCY, V_AB, V_DQ, Loop, SyncLaw, register_loop_type
 from peslite.solver import SolverStep
@@ -169,7 +168,7 @@ class _ShuntRL(Element):
 
     def __init__(self, name, cfg, buses, _params):
         self.name, self.cfg = name, cfg
-        self.branch = RLBranch(cfg.l, cfg.r)
+        self.branch = RLBranch(L=cfg.l, R=cfg.r)
 
     def subsystems(self):
         return {f"{self.name}.branch": self.branch}
@@ -182,7 +181,7 @@ class _ShuntRL(Element):
 
     def retune(self, cfg):
         self.cfg = cfg
-        return self.branch.retune(cfg.l, cfg.r)
+        return self.branch.set_values(cfg.l, cfg.r)
 
 
 @register_event_type

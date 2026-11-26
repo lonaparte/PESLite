@@ -715,7 +715,7 @@ def test_connection_reads_share_the_same_path_for_all_switchable_sections(gfl):
         "simulation.t_end": 0.002, "simulation.energy_check": "off",
         "buses.remote": {"c": 1e-5},
         "branches.line": {"bus1": "pcc", "bus2": "remote", "l": 0.001, "r": 0.1},
-        "elements.load": {"type": "load", "bus": "remote", "l": 0.001, "r": 10.0},
+        "elements.load": {"type": "series_rlc", "bus": "remote", "l": 0.001, "r": 10.0},
         "events.switch": {"type": "set", "t": 0.001,
                           "set": dict.fromkeys(paths, False)},
     }))

@@ -47,7 +47,7 @@ def test_explicit_ground_matches_the_existing_implicit_load(tmp_path, phases):
     implicit = deepcopy(explicit)
     implicit.pop("branches")
     implicit["elements"] = {
-        "shunt": {"type": "load", "bus": "node", "l": 2.0e-3, "r": 2.0},
+        "shunt": {"type": "series_rlc", "bus": "node", "l": 2.0e-3, "r": 2.0},
     }
 
     branch_simulation = peslite.Simulation(from_dict(explicit))
@@ -56,7 +56,7 @@ def test_explicit_ground_matches_the_existing_implicit_load(tmp_path, phases):
     load_simulation.run(out_dir=tmp_path / "load")
 
     branch_current = branch_simulation.system.branches["shunt"].state.i
-    load_current = load_simulation.system.named_elements["shunt"].branch.state.i
+    load_current = load_simulation.system.named_elements["shunt"].state.i
     np.testing.assert_allclose(branch_current, load_current, rtol=1e-12, atol=1e-12)
 
 
@@ -71,9 +71,9 @@ def test_declarative_two_terminal_component_accepts_ground():
     system = peslite.System(from_dict(tree))
     component = system.named_elements["capacitor"].model
 
-    assert not component.port_bus1.grounded
-    assert component.port_bus2.grounded
-    assert component.port_bus2 in component.ports
+    assert not component.port1.grounded
+    assert component.port2.grounded
+    assert component.port2 in component.ports
 
 
 def test_network_without_ground_connection_remains_floating():
@@ -98,6 +98,6 @@ def test_ground_is_reserved_and_cannot_be_the_only_component_endpoint():
         from_dict(conflict)
 
     isolated = _network()
-    isolated["elements"] = {"load": {"type": "load", "bus": "ground", "l": 1.0e-3}}
+    isolated["elements"] = {"load": {"type": "series_rlc", "bus": "ground", "l": 1.0e-3}}
     with pytest.raises(ConfigError, match="cannot connect only to ground"):
         from_dict(isolated)

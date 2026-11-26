@@ -281,13 +281,17 @@ def test_state_backed_physical_output_propagates_its_total_rate(tmp_path):
                 "inductance": 2.0e-3,
             },
             "positive_resistance": {"type": "resistor", "bus": "positive", "r": 1.0},
-            "return": {"type": "load", "bus": "return", "l": 1.0e-3, "r": 0.5},
+        },
+        "branches": {
+            "return_path": {
+                "bus1": "return", "bus2": "ground", "l": 1.0e-3, "r": 0.5,
+            },
         },
         "simulation": {
             "t_end": 1.0e-3,
             "initial": {"states": {
                 "dynamic.current": 0.4,
-                "return.branch.i": 0.4,
+                "return_path.i": 0.4,
             }},
             "solver": {"dt": 1.0e-5},
             "output": {"period": 1.0e-4, "precision": 17, "states": True},

@@ -4,12 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from types import SimpleNamespace
-from typing import Any, Callable, ClassVar, Mapping, Optional
-
-import numpy as np
+from typing import Any, Callable, Mapping, Optional
 
 from ..solver.energy import Port, StoragePort
-from ..solver.model import ConfigError, Empty, _complex, _real
+from ..solver.model import ConfigError, Empty, _complex, _real, _record_fields
 
 __all__ = [
     "Port", "ElectricalEndpoint", "NetworkComponent", "Element",
@@ -80,6 +78,38 @@ def resolve_endpoints(
 class NetworkComponent:
     """Common runtime adapter for a physical component declared by ``network(builder)``."""
 
+    parameter_fields: Mapping[str, str] = {}
+    structural_parameters: frozenset[str] = frozenset()
+    equation_fields: Mapping[str, str] = {}
+    infer_netlist_storage = False
+
+    def set_parameters(self, **values: Any) -> bool:
+        """Update declared netlist coefficients without changing its primitive structure."""
+        unknown = set(values) - set(self.parameter_fields)
+        if unknown:
+            raise ValueError(f"unknown component parameters: {sorted(unknown)}")
+        attributes = {name: self.parameter_fields[name] for name in values}
+        old = {name: getattr(self, attribute) for name, attribute in attributes.items()}
+        if any((old[name] is None) != (values[name] is None)
+               for name in self.structural_parameters & values.keys()):
+            raise ValueError("netlist elements cannot be added or removed after assembly")
+        for name, attribute in attributes.items():
+            setattr(self, attribute, values[name])
+        return old != values
+
+    def parameter_bindings(self) -> dict[str, tuple[Any, str]]:
+        return {
+            name: (self, attribute)
+            for name, attribute in self.parameter_fields.items()
+            if getattr(self, attribute) is not None
+        }
+
+    def equation_state_bindings(self) -> dict[str, tuple[Any, str]]:
+        return {
+            name: (self, attribute)
+            for name, attribute in self.equation_fields.items()
+        }
+
     def set_outputs(self, t: float) -> None:
         from ..solver.netlist import device_outputs
         device_outputs(self, t)
@@ -127,24 +157,20 @@ def _phase_convention(phases: int, initial: complex | float = 0.0):
 
 
 class Element:
-    """Base of a registered ``elements`` entry, built as ``cls(name, cfg, buses, p)``.
+    """Common contract for an object that contributes parts to system assembly.
 
-    A type defines ``type`` and a frozen ``Params`` dataclass with a matching ``type`` field.
-    An instance supplies ``subsystems()``, ``connections()`` and ``port_bindings()``. A connection
-    source is another subsystem output or a configured physical-output path resolved by assembly.
-    Each binding joins a configured bus name to a :class:`Port`; one- and multi-port
-    elements use the same interface. Optional ``breakers`` or ``connect()`` enable switching;
-    optional ``retune()`` enables runtime parameter changes and returns whether its network
-    declaration changed. Optional ``series_connections()`` maps a bus to an inlet bus: assembly
-    moves the original voltage driver to that inlet, inserting a two-port element before the bus's
-    followers without adding an artificial energy-storage state.
-    Optional ``parameter_bindings()`` maps retunable scalar fields to ``(subsystem, attribute)``
-    pairs so native export uses the same parameters as Python, including energy equations.
+    Units, sources, branches and registered ``elements`` entries expose their runtime subsystems,
+    signal connections and physical port bindings through this interface. Optional overrides add
+    series insertion, recorded signals, runtime retuning, switching and native parameter bindings.
     """
 
-    type: ClassVar[str]
-    Params: ClassVar[type]
-    domain_transparent: ClassVar[bool] = False
+    domain_transparent = False
+    signal_fields: Mapping[str, str] = {}
+
+    @classmethod
+    def from_config(cls, name: str, cfg: Any, buses: dict, params: Any) -> "Element":
+        """Build an element from its resolved configuration and assembly context."""
+        return cls(name, cfg, buses, params)
 
     def subsystems(self) -> dict[str, Any]:
         """Expose the ordinary one-model element under its configured name."""
@@ -154,14 +180,30 @@ class Element:
     def connections() -> dict:
         return {}
 
-    @staticmethod
-    def port_bindings() -> tuple[tuple[str, Port], ...]:
-        return ()
+    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
+        return getattr(self, "assembled_port_bindings", ())
+
+    def series_connections(self) -> dict[str, str]:
+        return getattr(self, "assembled_series_connections", {})
+
+    def output_bindings(self) -> dict[str, tuple[Any, str]]:
+        """Expose the primary model's direct outputs under this element's public name."""
+        model = getattr(self, "model", None)
+        output = getattr(model, "output", None)
+        return ({f"{self.name}.{field}": (model, field) for field in _record_fields(output)}
+                if output is not None else {})
+
+    def signals(self) -> dict[str, complex | float]:
+        output = getattr(getattr(self, "model", self), "output", None)
+        return ({f"{self.name}.{name}": getattr(output, field)
+                 for name, field in self.signal_fields.items()}
+                if output is not None else {})
 
 
 def element_buses(cfg: Any) -> dict[str, str]:
     """Return flat bus fields and additional declared element buses."""
-    buses = {f.name: getattr(cfg, f.name) for f in fields(cfg)
+    buses = {f.name: value for f in fields(cfg)
+             if (value := getattr(cfg, f.name)) is not None
              if f.init and (f.name == "bus"
                             or (f.name.startswith("bus") and f.name[3:].isdigit()
                                 and int(f.name[3:]) > 0))}
@@ -289,36 +331,6 @@ class _ComponentNetwork:
     def commutation(self, **kwargs: Any) -> None:
         self.builder.commutation(self.component, **kwargs)
 
-    def finish(self) -> None:
-        """Infer ordinary scalar storage declarations from the primitives just emitted."""
-        from ..solver import netlist as nl
-
-        storage = []
-        state_indices = {
-            name: tuple(int(index) for index in indices)
-            for (owner, name), indices in self.builder._states.items()
-            if owner == id(self.component)
-        }
-        for primitive in self.builder.owned.get(id(self.component), ()):
-            attribute = "L" if isinstance(primitive, nl.Inductor) else (
-                "C" if isinstance(primitive, nl.Capacitor) else None
-            )
-            if attribute is None:
-                continue
-            indices = tuple(int(index) for index in primitive.state)
-            names = [name for name, state in state_indices.items() if state == indices]
-            matrix = getattr(primitive, attribute)
-            diagonal = np.diag(matrix)
-            if (len(names) != 1 or not np.allclose(matrix, np.diag(diagonal))
-                    or not np.allclose(diagonal, diagonal[0])):
-                continue
-            nodes = [node for port in primitive.ports for node in port if node is not None]
-            storage.append(StoragePort(
-                names[0], float(diagonal[0]), nodes[0].scale if nodes else 1.0,
-                kind="inductor" if attribute == "L" else "capacitor",
-            ))
-        self.component.storage = tuple(storage)
-
     def __getattr__(self, name: str):
         if name in self.component.port_by_field:
             return self.node(name)
@@ -329,6 +341,7 @@ class _DeclaredComponent(NetworkComponent):
     """Runtime physical component generated from one declarative parameter object."""
 
     outputs_need_inputs = False
+    infer_netlist_storage = True
 
     def __init__(self, element: "_ConfiguredComponent", buses: dict[str, Any]) -> None:
         self.element = element
@@ -369,9 +382,7 @@ class _DeclaredComponent(NetworkComponent):
 
     def network(self, builder):
         network = _ComponentNetwork(self, builder)
-        result = self.element.cfg.network(network)
-        network.finish()
-        return result
+        return self.element.cfg.network(network)
 
 
 class _ConfiguredComponent(Element):

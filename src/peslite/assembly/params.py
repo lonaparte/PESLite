@@ -27,6 +27,7 @@ from pathlib import Path
 from types import MappingProxyType, UnionType
 from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
 
+from . import elements as _elements
 from ..components.network import element_buses
 from ..components.registry import ELEMENT_TYPES
 from ..components.pwm import PWM_ALIGNMENTS

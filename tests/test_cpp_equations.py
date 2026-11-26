@@ -282,7 +282,8 @@ class _ModifiedBranch(RLBranch):
 @pytest.mark.parametrize("instance_override", [False, True])
 def test_native_branch_keeps_its_own_output_and_rhs(instance_override, tmp_path):
     cls = RLBranch if instance_override else _ModifiedBranch
-    branch = cls(2.0, 1.0, i0=3.0, phases=1)
+    branch = cls(L=2.0, R=1.0, i0=3.0, phases=1)
+    branch.output_stages = None
     if instance_override:
         branch.set_outputs = _ModifiedBranch.set_outputs.__get__(branch)
         branch.rhs = _ModifiedBranch.rhs.__get__(branch)
@@ -294,7 +295,7 @@ def test_native_branch_keeps_its_own_output_and_rhs(instance_override, tmp_path)
 
 
 def test_native_unilateral_output_clamps_a_negative_trial_state(tmp_path):
-    branch = RLBranch(1.0, 0.0, i0=-1.0, phases=1, unilateral=True)
+    branch = RLBranch(L=1.0, R=0.0, i0=-1.0, phases=1, unilateral=True)
     model = Model({"branch": branch}, {})
     actual, = _run_model(model, [(branch.output, "i")], tmp_path)
     model.sync(0.0, model.get_initial_values())

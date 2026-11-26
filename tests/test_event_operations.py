@@ -8,7 +8,7 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.params import ConfigError, from_dict, read_tree, to_dict
-from peslite.components import RLBranch, register_component_type
+from peslite.components import RLBranch, SeriesRLC, register_component_type
 from peslite.components.network import Element
 from peslite.control import Measurement
 from peslite.solver import netlist as nl
@@ -20,7 +20,7 @@ def _tree():
 
 def _load(tree, name="load", **values):
     tree["elements"] = {
-        name: {"type": "load", "bus": "pcc", "x_pu": 0.5, "r_pu": 2.0, **values}
+        name: {"type": "series_rlc", "bus": "pcc", "x_pu": 0.5, "r_pu": 2.0, **values}
     }
     return tree
 
@@ -55,7 +55,7 @@ class _PassiveShunt(Element):
 
     def __init__(self, name, cfg, buses, p):
         self.name, self.cfg = name, cfg
-        self.branch = RLBranch(cfg.l, cfg.r)
+        self.branch = RLBranch(L=cfg.l, R=cfg.r)
 
     def subsystems(self):
         return {f"{self.name}.branch": self.branch}
@@ -73,15 +73,15 @@ def test_builtin_load_is_typed_scaled_built_and_written(tmp_path):
     assert (cfg.r, cfg.l) == pytest.approx(
         (2.0 * p.base.z_base, 0.5 * p.base.z_base / p.base.w0)
     )
-    assert to_dict(p)["elements"]["load"]["type"] == "load"
+    assert to_dict(p)["elements"]["load"]["type"] == "series_rlc"
     assert from_dict(to_dict(p)).elements == p.elements
     assert peslite.register_component_type is register_component_type
 
     system = peslite.System(p)
-    branch = system.named_elements["load"].branch
+    branch = system.named_elements["load"]
     assert any(getattr(subsystem, "component", subsystem) is branch
                for subsystem in system.model.subsystems)
-    assert "load.branch.i" in system.model.get_state()
+    assert "load.i" in system.model.get_state()
 
     quick = p.replace(**{
         "events.connect_vsc.t": 0.0,
@@ -90,7 +90,7 @@ def test_builtin_load_is_typed_scaled_built_and_written(tmp_path):
         "simulation.energy_check": "off",
     })
     result = peslite.Simulation(quick).run(out_dir=tmp_path)
-    assert "load.branch.i.re" in result.states
+    assert "load.i.re" in result.states
 
 
 @pytest.mark.parametrize(
@@ -98,7 +98,7 @@ def test_builtin_load_is_typed_scaled_built_and_written(tmp_path):
     [
         ({"type": "unknown"}, "Register a custom component type"),
         ({"bus": "nowhere"}, "elements.load.bus: unknown bus"),
-        ({"x_pu": -0.1}, "l must be > 0"),
+        ({"x_pu": -0.1}, "l must be finite and > 0"),
         ({"r_pu": float("inf")}, "elements.load.r must be finite"),
     ],
 )
@@ -116,6 +116,7 @@ def test_element_names_are_section_scoped_and_registrations_are_checked():
     signals = system.signals(params.simulation.initial.t)
 
     assert "pcc" in params.buses and "pcc" in params.elements
+    assert "elements.pcc" in system.model.names
     assert {"pcc.u", "pcc.i"} <= set(signals)
 
     class NoType(Element):
@@ -166,8 +167,13 @@ def test_system_switches_units_sources_and_loads():
     system = peslite.System(p)
     system.check_events(p)
 
+    assert type(system.named_elements["load"]) is SeriesRLC
+    assert isinstance(system.sources["grid"].branch, RLBranch)
+    assert isinstance(system.branches["line"], RLBranch)
+    assert isinstance(system.units["vsc"].branch_f, RLBranch)
+
     for name, branch in (("grid", system.sources["grid"].branch),
-                         ("load", system.named_elements["load"].branch),
+                         ("load", system.named_elements["load"]),
                          ("line", system.branches["line"])):
         branch.state.i = 2 + 3j
         system.switch(name, False, 0.1)
@@ -230,7 +236,7 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     bus.state.u_C = 3 + 4j
     source.branch.state.i = 5 + 6j
     line.state.i = 6 + 7j
-    load.branch.state.i = 7 + 8j
+    load.state.i = 7 + 8j
     old_pll = unit.ctrl.graph.nodes["SRFPLL"]
     old_pll.theta, old_pll.integral = 1.2, 0.3
     old_dvc = unit.ctrl.graph.nodes["DCVoltageControl"]
@@ -250,7 +256,7 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     assert source.emf.phi(change.t + 0.001) == pytest.approx(0.1 + 2 * np.pi * 0.001)
     assert line.state.i == 6 + 7j
     assert (line.L, line.R) == (current.branches["line"].l, current.branches["line"].r)
-    assert load.branch.state.i == 7 + 8j and load.branch.R == current.elements["load"].r
+    assert load.state.i == 7 + 8j and load.R == current.elements["load"].r
     assert unit.dclink.source.i_nom == current.unit("vsc").dclink.source.i
     assert unit.protection.cfg.hold == 0.01
     assert unit.protection._rocof_window == pytest.approx(0.2)
@@ -272,7 +278,7 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     assert specs["pcc"].storage[0].value == current.buses["pcc"].c
     assert specs["grid.branch"].storage[0].value == current.sources["grid"].l
     assert specs["line"].storage[0].value == current.branches["line"].l
-    assert specs["load.branch"].storage[0].value == current.elements["load"].l
+    assert specs["load"].storage[0].value == current.elements["load"].l
     audit = system.model.energy_balance(change.t, system.model.get_initial_values())
     stored = next(entry.energy for entry in audit.subsystems if entry.name == "pcc")
     assert stored == pytest.approx(0.5 * bus.power_scale * current.buses["pcc"].c * 25.0)

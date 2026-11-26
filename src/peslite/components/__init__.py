@@ -6,9 +6,9 @@ the same assembled model.
 """
 
 from ..solver import Bag, ConfigError, Empty, Port, StoragePort
-from .network import GROUND, resolve_endpoints
+from .network import Element, GROUND, resolve_endpoints
 from .registry import register_component_type
-from .passive import Bus, Capacitor, Load, Resistor, RCNode, RLBranch
+from .passive import Bus, Capacitor, ParallelRLC, Resistor, RLBranch, SeriesRLC
 from .source import ACVoltageSource, VoltageSource
 from .converter import (AveragingModel, PWMAveragingModel, SwitchingModel,
                         ThreePhaseBridge,
@@ -22,10 +22,11 @@ from .pwm import (ZOH, CarrierComparison, PWM, PhaseShiftModulator, SwitchingSeq
 from .onnx import ONNXModel, ONNXStateParams
 from .cable import BergeronCableModel, Cable, LumpedCableModel
 
-__all__ = ["Port", "ACVoltageSource", "Bus", "RLBranch", "RCNode", "Capacitor",
+__all__ = ["Port", "Element", "ACVoltageSource", "Bus", "SeriesRLC", "RLBranch",
+           "Capacitor", "Resistor", "ParallelRLC",
            "Bag", "Empty", "ConfigError", "StoragePort",
            "register_component_type", "resolve_endpoints", "GROUND",
-           "Load", "Resistor", "VoltageSource",
+           "VoltageSource",
            "ThreePhaseBridge", "SwitchingModel",
            "PWMAveragingModel", "make_bridge", "DCLink",
            "DCCapacitor", "DCCurrentSource", "DCVoltageSource",

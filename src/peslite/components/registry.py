@@ -8,7 +8,7 @@ from typing import Any, Callable
 from ..solver.model import ConfigError
 
 __all__ = [
-    "ComponentDefinition", "ELEMENT_TYPES", "register_component_type",
+    "ComponentDefinition", "ELEMENT_TYPES", "register_component", "register_component_type",
     "TOPOLOGY_TYPES", "register_topology", "topology_type",
     "MODULATOR_TYPES", "register_modulator_type",
 ]
@@ -21,9 +21,18 @@ class ComponentDefinition:
     type: str
     params: type
     constructor: Callable[[str, Any, dict, Any], Any]
+    retuner: Callable[[Any, Any], bool] | None = None
 
     def __call__(self, name: str, cfg: Any, buses: dict, p: Any) -> Any:
         return self.constructor(name, cfg, buses, p)
+
+    def retune(self, element: Any, cfg: Any) -> bool:
+        if self.retuner is not None:
+            return self.retuner(element, cfg)
+        return element.retune(cfg)
+
+    def supports_retune(self, element: Any) -> bool:
+        return self.retuner is not None or callable(getattr(element, "retune", None))
 
 
 ELEMENT_TYPES: dict[str, ComponentDefinition] = {}
@@ -40,16 +49,25 @@ def _register(registry: dict[str, Any], name: str, value: Any, label: str) -> An
     return value
 
 
-def _register_component(cls: type, params: type, constructor: Callable) -> type:
-    name = getattr(cls, "type", None)
+def _register_component(name: str, params: type, constructor: Callable,
+                        retuner: Callable | None = None) -> None:
     if not isinstance(name, str) or not name:
         raise TypeError("a component type needs a name: the class attribute 'type'")
     if not is_dataclass(params) or "type" not in params.__dataclass_fields__:
         raise TypeError(f"component type {name!r}: parameters need a dataclass type field")
     if params.__dataclass_fields__["type"].default != name:
         raise TypeError(f"component type {name!r}: type must default to {name!r}")
-    _register(ELEMENT_TYPES, name, ComponentDefinition(name, params, constructor), "component")
-    return cls
+    _register(
+        ELEMENT_TYPES, name, ComponentDefinition(name, params, constructor, retuner), "component",
+    )
+
+
+def register_component(params: type, constructor: Callable,
+                       retuner: Callable | None = None) -> None:
+    """Register separate configuration and assembly implementations for one component type."""
+    type_field = getattr(params, "__dataclass_fields__", {}).get("type")
+    name = None if type_field is None else type_field.default
+    _register_component(name, params, constructor, retuner)
 
 
 def register_component_type(cls: type) -> type:
@@ -57,16 +75,20 @@ def register_component_type(cls: type) -> type:
     from .network import Element, _ConfiguredComponent
 
     if isinstance(cls, type) and issubclass(cls, Element):
-        return _register_component(cls, getattr(cls, "Params", None), cls)
+        _register_component(
+            getattr(cls, "type", None), getattr(cls, "Params", None), cls.from_config,
+        )
+        return cls
     if is_dataclass(cls):
         if not cls.__dataclass_params__.frozen:
             raise TypeError("a declarative component parameter dataclass must be frozen")
         if not callable(getattr(cls, "network", None)):
             raise TypeError("a declarative component type needs network(builder)")
-        return _register_component(
-            cls, cls,
+        _register_component(
+            getattr(cls, "type", None), cls,
             lambda name, cfg, buses, params: _ConfiguredComponent(name, cfg, buses, params),
         )
+        return cls
     raise TypeError("a component type must be a frozen parameter dataclass or Element adapter")
 
 

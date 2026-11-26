@@ -10,9 +10,9 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Mapping, Optional, Sequence
 
-from ..components.network import GROUND, Port, resolve_endpoints
+from ..components.network import Element, GROUND, Port, resolve_endpoints
 from ..components.registry import ELEMENT_TYPES
-from ..components.passive import Bus, RCNode, RLBranch
+from ..components.passive import Bus, RLBranch
 from ..components.source import ACVoltageSource
 from ..components.adc import _PortMeasurement
 from ..solver.energy import spec_of
@@ -199,7 +199,7 @@ def _source_scenario(p: Params, path: str, select: Callable[[Params], Any]) -> S
     return SourceScenario(select(p), p.base.f0, steps)
 
 
-class _Source:
+class Source(Element):
     """Voltage source (emf) behind a series R-L branch."""
 
     def __init__(self, name: str, p: Params, t0: float, phases: int) -> None:
@@ -211,7 +211,7 @@ class _Source:
                 values[0].w0, *self.scenario.law(t0), phases=values[1]
             ), (base, phases))
         self.branch = _parameterized(
-            lambda values: RLBranch(values[0].l, values[0].r, phases=values[1]),
+            lambda values: RLBranch(L=values[0].l, R=values[0].r, phases=values[1]),
             (cfg, phases),
         )
         self.branch.port2.electrical_domain = "ac"
@@ -222,7 +222,7 @@ class _Source:
         self.cfg = cfg
         network_changed = False
         if "l" in paths or "r" in paths:
-            network_changed = self.branch.retune(cfg.l, cfg.r)
+            network_changed = self.branch.set_values(cfg.l, cfg.r)
         if "v" in paths or "f" in paths or "angle" in paths:
             voltage, phase = self.scenario.law(t)
             if "v" in paths:
@@ -234,9 +234,6 @@ class _Source:
     def subsystems(self) -> dict[str, Any]:
         return {f"{self.name}.emf": self.emf, f"{self.name}.branch": self.branch}
 
-    def connections(self) -> dict:
-        return {}
-
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         internal = f"{self.name}.source"
         return ((internal, self.emf.port),
@@ -247,8 +244,8 @@ class _Source:
         return {f"{self.name}.i": self.branch.output.i, f"{self.name}.angle": self.emf.output.phi}
 
 
-class _BranchAssembly:
-    """Give a configured bare RLBranch the common network-component assembly interface."""
+class Branch(Element):
+    """Configured two-terminal branch backed by one runtime R-L branch."""
 
     domain_transparent = True
 
@@ -258,13 +255,12 @@ class _BranchAssembly:
     def subsystems(self) -> dict[str, RLBranch]:
         return {self.name: self.branch}
 
-    @staticmethod
-    def connections() -> dict:
-        return {}
-
     def port_bindings(self) -> tuple[tuple[str, Port], ...]:
         return ((self.cfg.bus1, self.branch.port1),
                 (self.cfg.bus2, self.branch.port2))
+
+    def signals(self) -> dict[str, complex]:
+        return {f"{self.name}.i": self.branch.output.i}
 
 
 def _part(parts: Mapping[str, Any], name: str, suffix: str = "") -> Any:
@@ -358,12 +354,11 @@ class System:
         # A capacitor gives the bus a physical state; otherwise it remains a connection point.
         def make_bus(values):
             cfg, system_base = values
-            if cfg.c is None:
-                return Bus(phases=cfg.phases)
-            return RCNode(
+            return Bus(
                 cfg.c,
                 cfg.r_d,
-                u0=system_base.v_phase_peak if cfg.phases == 3 else 0.0,
+                u0=(system_base.v_phase_peak
+                    if cfg.c is not None and cfg.phases == 3 else 0.0),
                 phases=cfg.phases,
             )
 
@@ -415,7 +410,7 @@ class System:
             return port.bus if port is not None else name
 
         self.sources = {
-            name: _Source(
+            name: Source(
                 name, p, p.simulation.initial.t, network_buses[cfg.bus].phases
             )
             for name, cfg in p.sources.items()
@@ -428,8 +423,8 @@ class System:
             for name, cfg in p.branches.items()
         }
         self.branches = {name: _parameterized(lambda values: RLBranch(
-                             values[0].l,
-                             values[0].r,
+                             L=values[0].l,
+                             R=values[0].r,
                              phases=values[1],
                          ), (cfg, next(iter(branch_endpoints[name].values())).phases))
                          for name, cfg in p.branches.items()}
@@ -438,17 +433,30 @@ class System:
                                       name, values[0], network_buses, values[1]), (cfg, p))
                                for name, cfg in p.elements.items()}
 
-        branch_assemblies = tuple(_BranchAssembly(name, p.branches[name], branch)
-                                  for name, branch in self.branches.items())
-        elements = (*branch_assemblies, *self.sources.values(), *self.units.values(),
-                    *self.named_elements.values())
+        self.branch_elements = tuple(
+            Branch(name, p.branches[name], branch)
+            for name, branch in self.branches.items()
+        )
+        scoped_elements = (
+            *(("branches", element) for element in self.branch_elements),
+            *(("sources", element) for element in self.sources.values()),
+            *(("units", element) for element in self.units.values()),
+            *(("elements", element) for element in self.named_elements.values()),
+        )
+        elements = tuple(element for _section, element in scoped_elements)
         element_ports = tuple(
             (element, tuple(element.port_bindings()),
-             dict(getattr(element, "series_connections", lambda: {})()))
+             dict(element.series_connections()))
             for element in elements
         )
-        for element in elements:
-            _merge_unique(subsystems, element.subsystems(), "subsystem name")
+        for section, element in scoped_elements:
+            declared = element.subsystems()
+            scoped = {
+                (f"{section}.{name}"
+                 if name == element.name and name in subsystems else name): subsystem
+                for name, subsystem in declared.items()
+            }
+            _merge_unique(subsystems, scoped, "subsystem name")
         transition_bindings = []
         for element in elements:
             declare = getattr(element, "transition_bindings", None)
@@ -537,6 +545,11 @@ class System:
                     )
                 else:
                     connections[target] = source
+        physical_outputs: dict[str, tuple[Any, str]] = {}
+        for element in elements:
+            _merge_unique(
+                physical_outputs, element.output_bindings(), "physical output name"
+            )
         zoh: dict = {}
         for unit in self.units.values():
             own_zoh = unit.zoh_connections()
@@ -546,6 +559,9 @@ class System:
         port_measurements = {}
 
         def physical_output(source: str, where: str):
+            binding = physical_outputs.get(source)
+            if binding is not None:
+                return binding
             owner, separator, output = source.rpartition(".")
             subsystem = subsystems.get(owner) if separator else None
             if subsystem is None and owner in network_buses and output in (
@@ -778,7 +794,7 @@ class System:
                         p.buses[name].c, p.buses[name].r_d
                     )
                 elif section == "branches":
-                    network_changed |= self.branches[name].retune(
+                    network_changed |= self.branches[name].set_values(
                         p.branches[name].l, p.branches[name].r
                     )
                 elif section == "sources":
@@ -788,7 +804,8 @@ class System:
                     network_changed |= self.units[name].retune(
                         p.unit(name), change.touches(f"units.{name}."), change.t)
                 elif section == "elements":
-                    result = self.named_elements[name].retune(p.elements[name])
+                    cfg = p.elements[name]
+                    result = ELEMENT_TYPES[cfg.type].retune(self.named_elements[name], cfg)
                     if not isinstance(result, bool):
                         raise TypeError(
                             f"element {name!r} retune() must return whether the network changed"
@@ -836,7 +853,9 @@ class System:
                             raise ConfigError(f"{path}: its type has no breakers and no connect()")
                     continue
                 section, name, rest = _split_path(p, path)
-                if section == "elements" and not hasattr(self.named_elements[name], "retune"):
+                if section == "elements" and not ELEMENT_TYPES[
+                    p.elements[name].type
+                ].supports_retune(self.named_elements[name]):
                     raise ConfigError(
                         f"events.{change.event}: elements.{name} has no retune(parameters), so a "
                         "set event cannot change it")
@@ -869,12 +888,12 @@ class System:
 
         for element in (*self.sources.values(), *self.units.values(),
                         *self.composite_signal_sources, *self.named_elements.values()):
-            add(element, element.signals() if hasattr(element, "signals") else {})
+            add(element, element.signals())
         for unit in self.units.values():
             if unit.adc is not None and (unit.adc.clocked or unit.adc.rms):
                 add(unit, unit.measurement_signals())
-        for name, branch in self.branches.items():
-            add(branch, {f"{name}.i": branch.output.i})
+        for branch in self.branch_elements:
+            add(branch, branch.signals())
         for name, node in self.buses.items():
             if node.port is not None:
                 add(node, {f"{name}.u": getattr(node.output, node.voltage_field)})

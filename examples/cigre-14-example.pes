@@ -33,16 +33,16 @@ branches:
 sources:
   grid: {bus: bus1, x_pu: 0.124975185951, r_pu: 0.001497518595, v_pu: 1.0}
 elements:
-  load1: {type: load, bus: bus1, x_pu: 0.2792856825, r_pu: 1.1948643729}
-  load3: {type: load, bus: bus3, x_pu: 17.6818289189, r_pu: 42.4687635523}
-  load4: {type: load, bus: bus4, x_pu: 13.6575795294, r_pu: 54.4943820225}
-  load5: {type: load, bus: bus5, x_pu: 8.1034971874, r_pu: 32.3333333333}
-  load6: {type: load, bus: bus6, x_pu: 10.7568546736, r_pu: 42.9203539823}
-  load7: {type: load, bus: bus7, x_pu: 146.3285243452, r_pu: 236.1111111111}
-  load8: {type: load, bus: bus8, x_pu: 10.0456576704, r_pu: 40.0826446281}
-  load9: {type: load, bus: bus9, x_pu: 19.5104699127, r_pu: 31.4814814815}
-  load10: {type: load, bus: bus10, x_pu: 12.5524265176, r_pu: 42.2892420265}
-  load11: {type: load, bus: bus11, x_pu: 17.8753614429, r_pu: 71.3235294118}
+  load1: {type: series_rlc, bus: bus1, x_pu: 0.2792856825, r_pu: 1.1948643729}
+  load3: {type: series_rlc, bus: bus3, x_pu: 17.6818289189, r_pu: 42.4687635523}
+  load4: {type: series_rlc, bus: bus4, x_pu: 13.6575795294, r_pu: 54.4943820225}
+  load5: {type: series_rlc, bus: bus5, x_pu: 8.1034971874, r_pu: 32.3333333333}
+  load6: {type: series_rlc, bus: bus6, x_pu: 10.7568546736, r_pu: 42.9203539823}
+  load7: {type: series_rlc, bus: bus7, x_pu: 146.3285243452, r_pu: 236.1111111111}
+  load8: {type: series_rlc, bus: bus8, x_pu: 10.0456576704, r_pu: 40.0826446281}
+  load9: {type: series_rlc, bus: bus9, x_pu: 19.5104699127, r_pu: 31.4814814815}
+  load10: {type: series_rlc, bus: bus10, x_pu: 12.5524265176, r_pu: 42.2892420265}
+  load11: {type: series_rlc, bus: bus11, x_pu: 17.8753614429, r_pu: 71.3235294118}
 units:
   vsg:
     type: vsc

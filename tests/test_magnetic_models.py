@@ -433,7 +433,7 @@ def _linear_equivalence_case(inductance):
                 "inductance": np.asarray(inductance).tolist(),
             },
             "p_load": {"type": "resistor", "bus": "p", "r": 1.2},
-            "return": {"type": "load", "bus": "n", "l": 2.0e-3, "r": 0.4},
+            "return": {"type": "series_rlc", "bus": "n", "l": 2.0e-3, "r": 0.4},
             "s_load": {"type": "resistor", "bus": "s", "r": 1.7},
         },
         "simulation": {
@@ -457,7 +457,7 @@ def test_base_inductance_magport_and_magcircuit_are_numerically_equivalent(tmp_p
         "states": {
             "coils.i_mode_1": float(modal_initial[0]),
             "coils.i_mode_2": float(modal_initial[1]),
-            "return.branch.i": float(physical_initial[0]),
+            "return.i": float(physical_initial[0]),
         }
     }
 
@@ -627,10 +627,10 @@ def test_nonlinear_magport_file_and_magcircuit_branch_law(tmp_path):
         series = deepcopy(case)
         series["buses"]["return"] = {"phases": 1}
         series["elements"]["magnet"]["windings"]["coil"]["negative"] = "return"
-        series["elements"]["return"] = {
-            "type": "load", "bus": "return", "l": 1.0e-3, "r": 0.5,
+        series["elements"]["return_path"] = {
+            "type": "series_rlc", "bus": "return", "l": 1.0e-3, "r": 0.5,
         }
-        series["simulation"]["initial"]["states"]["return.branch.i"] = initial_current
+        series["simulation"]["initial"]["states"]["return_path.i"] = initial_current
         simulation = peslite.Simulation(from_dict(series))
         result = simulation.run(out_dir=tmp_path / f"nonlinear_{label}_series")
         assert not simulation.energy_problems

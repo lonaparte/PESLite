@@ -170,7 +170,6 @@ magnetic constitutive law without repeating winding validation, ports or signals
 Configured element buses may also name an assembled Unit default or named port. An optional
 `series_connections()` mapping `{bus: inlet_bus}` cuts a node that joins exactly two ports and
 places the element between them. Repeated declarations form a series chain in declaration order.
-The built-in `Resistor(series=True)` is a stateless reference implementation.
 
 Structural changes remain assembly-time configuration. Mark a field with dataclass metadata
 `{"runtime": False}` to reject its `set` events; `{"structural": True}` also excludes a numerical

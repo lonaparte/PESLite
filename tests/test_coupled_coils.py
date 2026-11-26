@@ -201,10 +201,10 @@ def test_coupled_coils_reject_bad_winding_and_terminal_reference():
         from_dict(bad)
 
 
-def test_compensation_capacitor_is_a_separate_registered_element():
+def test_builtin_magnetic_and_rlc_components_are_registered():
     assert "coupled_coils" in ELEMENT_TYPES
     assert "magport" in ELEMENT_TYPES
-    assert ELEMENT_TYPES["magport"].constructor is MagPort
+    assert ELEMENT_TYPES["magport"].params is MagPort.Params
     assert "capacitor" in ELEMENT_TYPES
     c = ELEMENT_TYPES["capacitor"].params(bus1="p", bus2="q", c=1e-6, r=0.02)
     assert c.type == "capacitor"
@@ -222,7 +222,7 @@ def test_compensation_capacitor_joins_independent_coil_network(tmp_path):
     }
     simulation = peslite.Simulation(from_dict(case))
     capacitor = simulation.system.named_elements["compensation"].model
-    assert capacitor.state_names == ("u",)
+    assert capacitor.state_names == ("u_C",)
     assert not simulation.energy_problems
     result = simulation.run(out_dir=tmp_path)
     assert result.summary["t_stop"] == pytest.approx(case["simulation"]["t_end"])

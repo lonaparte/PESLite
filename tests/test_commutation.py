@@ -171,7 +171,7 @@ def test_bounded_current_and_margin_event_use_the_same_advance():
     from peslite.components import RLBranch
     from peslite.solver.integrators import FixedStepSolver
 
-    branch = RLBranch(1.0, 0.0, i0=0.5, phases=1, unilateral=True)
+    branch = RLBranch(L=1.0, R=0.0, i0=0.5, phases=1, unilateral=True)
     branch.port1.voltage = -1.0
     ramp = _Ramp()
     model = Model({"branch": branch, "ramp": ramp}, {})
@@ -191,7 +191,7 @@ def test_current_zero_locator_preserves_plain_float_solver_times():
             assert type(t0) is float and type(t1) is float
             return super().advance(rhs, t0, t1, state, **kwargs)
 
-    branch = RLBranch(1.0, 0.0, i0=0.5, phases=1, unilateral=True)
+    branch = RLBranch(L=1.0, R=0.0, i0=0.5, phases=1, unilateral=True)
     branch.port1.voltage = -1.0
     model = Model({"branch": branch}, {})
     handler = Commutation(model, CheckingSolver(1.0, "RK4"))

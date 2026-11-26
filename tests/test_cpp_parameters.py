@@ -706,7 +706,7 @@ def test_unrecorded_factory_mutation_cannot_be_silently_discarded(tmp_path):
     def make_system(params):
         system = peslite.System(params)
         branch = system.units["converter"].branch_f
-        branch.retune(1.8 * branch.L, branch.R)
+        branch.set_values(1.8 * branch.L, branch.R)
         return system
 
     simulation = peslite.Simulation(_case("buck", "pwm_averaging"), parts={"system": make_system})

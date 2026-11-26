@@ -83,7 +83,7 @@ def test_series_elements_share_the_same_generic_insertion_path_in_declaration_or
     first = sim.system.named_elements["load"].model
     second = sim.system.named_elements["extra"].model
     np.testing.assert_allclose(first.output.i, second.output.i)
-    assert second.port1.voltage == first.output.u
+    assert second.port1.voltage == first.port2.voltage
     assert second.output.power == pytest.approx(first.output.power * 1.5)
 
 
@@ -100,7 +100,7 @@ def test_load_power_drives_the_existing_graph_and_load_step_keeps_state(model):
     before = sim.system.model.get_initial_values().copy()
     sim.system.apply(p.changes[0])
     np.testing.assert_array_equal(before, sim.system.model.get_initial_values())
-    assert sim.system.named_elements["load"].model.resistance == 3.0
+    assert sim.system.named_elements["load"].model.R == 3.0
     sim = peslite.Simulation(p)
     result = sim.run(out_dir=None)
     unit = sim.units["charger.secondary"]

@@ -310,13 +310,13 @@ def test_dc_converter_allows_an_unattached_power_port():
 def test_scalar_converter_connects_a_registered_load_without_a_composite():
     tree = _tree()
     tree["units"] = {"port": tree["units"]["charger"]["primary"]}
-    tree["elements"] = {"load": {"type": "load", "bus": "port.power", "l": 1e-3, "r": 20.0}}
+    tree["elements"] = {"load": {"type": "series_rlc", "bus": "port.power", "l": 1e-3, "r": 20.0}}
     tree["simulation"]["t_end"] = 20e-6
     tree["simulation"]["output"].update(states=False, signals=False, energy=False)
     sim = peslite.Simulation(from_dict(tree))
     result = sim.run(out_dir=None)
     assert result.summary["t_stop"] == pytest.approx(20e-6)
-    assert abs(result.final_states()["load.branch.i"]) > 0.0
+    assert abs(result.final_states()["load.i"]) > 0.0
 
 
 def test_wpt_tree_round_trips_without_losing_child_unit_types():

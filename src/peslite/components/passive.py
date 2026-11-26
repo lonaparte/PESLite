@@ -1,90 +1,130 @@
-"""Passive electrical branches, buses and registered loads."""
+"""Series and parallel RLC networks and electrical buses."""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
-from typing import Any, ClassVar
+from dataclasses import replace
+from typing import ClassVar
 
 from ..solver.energy import Port, StoragePort
-from ..solver.model import Bag, ConfigError, Empty, OutputMethod
+from ..solver.model import Empty, OutputMethod, record_type
 from .network import Element, NetworkComponent, _phase_convention
-from .registry import register_component_type
 
-__all__ = ["RLBranch", "Bus", "RCNode", "Capacitor", "Load", "Resistor"]
-
-
-def _node_kind(phases: int) -> tuple[int, float]:
-    """Return the netlist node dimension and power scale for a phase convention."""
-    return (2, 1.5) if phases == 3 else (1, 1.0)
+__all__ = ["SeriesRLC", "RLBranch", "Capacitor", "Resistor", "ParallelRLC", "Bus"]
 
 
-class _BranchState(Bag):
-    __slots__ = ("i",)
+class SeriesRLC(Element, NetworkComponent):
+    """A series connection containing any nonempty combination of R, L and C."""
 
-class _BranchInput(Bag):
-    __slots__ = ("di_dt", "loss_factor")
-
-class _BranchOutput(Bag):
-    __slots__ = ("i",)
-
-class RLBranch(NetworkComponent):
-    """Series R-L branch with positive current from port 1 to port 2.
-
-    ``phases=3`` uses the peak-scaled complex space-vector convention. ``phases=1`` uses a real
-    scalar and the same port contract, so converter units do not need a second network API.
-    """
-
-    state_names: ClassVar[tuple[str, ...]] = ("i",)
+    State = record_type("SeriesRLCState", ("i", "u_C"))
+    Output = record_type("SeriesRLCOutput", ("i", "u", "power"))
+    domain_transparent = True
     outputs_need_inputs: ClassVar[bool] = False
-    netlist_jumps: bool = False
-    def __init__(self, L: float, R: float, i0: complex | float = 0j, *, phases: int = 3,
-                 unilateral: bool = False) -> None:
-        self.power_scale, self.zero, initial = _phase_convention(phases, i0)
-        if unilateral and phases != 1:
-            raise ValueError("unilateral current is only available for scalar branches")
-        self.L, self.R = L, R
-        self.phases = phases
-        self.unilateral = bool(unilateral)
-        self.state = _BranchState(i=initial)
-        self.input = _BranchInput(di_dt=self.zero, loss_factor=1.0)
-        self.output = _BranchOutput(i=initial)
-        self.port1 = Port(
-            self, "1", voltage=self.zero, current=initial,
-            scale=self.power_scale, standalone="voltage"
-        )
-        self.port2 = Port(
-            self, "2", voltage=self.zero, current=-initial,
-            scale=self.power_scale, standalone="voltage"
-        )
+    parameter_fields = {"r": "R", "l": "L", "c": "C"}
+    structural_parameters = frozenset(("l", "c"))
+    equation_fields = {"breaker_open": "breaker_open"}
+    signal_fields = {"i": "i", "voltage": "u", "power": "power"}
+    infer_netlist_storage = True
+    netlist_jumps = False
+    output_stages = (OutputMethod(
+        "set_voltage_and_power", (), ("u", "power"), rhs=False,
+    ),)
+
+    def __init__(self, R: float = 0.0, L: float | None = None,
+                 C: float | None = None, *, i0: complex | float = 0j,
+                 u0: complex | float = 0j, phases: int = 3,
+                 breakable: bool = True) -> None:
+        self.power_scale, self.zero, initial_i = _phase_convention(phases, i0)
+        _scale, _zero, initial_u = _phase_convention(phases, u0)
+        if not math.isfinite(R) or R < 0.0:
+            raise ValueError(f"R must be finite and >= 0, got {R}")
+        if L is not None and (not math.isfinite(L) or L <= 0.0):
+            raise ValueError(f"L must be finite and > 0, got {L}")
+        if C is not None and (not math.isfinite(C) or C <= 0.0):
+            raise ValueError(f"C must be finite and > 0, got {C}")
+        if R == 0.0 and L is None and C is None:
+            raise ValueError("a series RLC needs at least one nonzero element")
+        self.R, self.L, self.C = R, L, C
+        self.phases, self.breakable = phases, bool(breakable)
+        self.state_names = tuple(name for name, value in (("i", L), ("u_C", C))
+                                 if value is not None)
+        self.state = self.State(i=initial_i, u_C=initial_u)
+        self.input = Empty()
+        self.output = self.Output(i=initial_i, u=initial_u, power=0.0)
+        self.port1 = Port(self, "1", voltage=self.zero, current=initial_i,
+                          scale=self.power_scale, standalone="voltage")
+        self.port2 = Port(self, "2", voltage=self.zero, current=-initial_i,
+                          scale=self.power_scale, standalone="voltage")
         self.ports = (self.port1, self.port2)
-        self.storage = (StoragePort(
-            "i", L, self.power_scale,
-            ((self.port1, "voltage", 1.0), (self.port2, "voltage", -1.0)),
-            "inductor",
-        ),)
+        self.storage = ()
         self.breaker_open = False
+
+    def open_breaker(self) -> None:
+        self.breaker_open = True
+        if not self.netlist_jumps and "i" in self.state_names:
+            self.state.i = self.zero
+
+    def close_breaker(self) -> None:
+        self.breaker_open = False
+
+    def set_values(self, L: float | None, R: float,
+                   C: float | None = None) -> bool:
+        return self.set_parameters(l=L, r=R, c=C)
+
+    def resistive_power(self) -> float:
+        return self.power_scale * self.R * abs(self.output.i) ** 2
+
+    def set_voltage_and_power(self, _t: float) -> None:
+        self.output.u = self.port1.voltage - self.port2.voltage
+        self.output.power = self.resistive_power()
+
+    def network(self, nb):
+        return self._declare_network(nb, nb.node(self.port1))
+
+    def _declare_network(self, nb, start):
+        from ..solver import netlist as nl
+
+        if self.breakable:
+            path = nb.internal(start.dim, start.scale)
+            nb.add(nl.Switch(start, path, nb.value(self, "breaker_open", invert=True)))
+        else:
+            path = start
+        values = (("R", self.R), ("L", self.L), ("C", self.C))
+        active = tuple((kind, value) for kind, value in values if value not in (None, 0.0))
+        for index, (kind, value) in enumerate(active):
+            end = (nb.node(self.port2) if index == len(active) - 1
+                   else nb.internal(start.dim, start.scale))
+            if kind == "R":
+                nb.add(nl.Resistor(path, end, value))
+            elif kind == "L":
+                nb.add(nl.Inductor(path, end, value, nb.state(self, "i")))
+            else:
+                nb.add(nl.Capacitor(path, end, value, nb.state(self, "u_C")))
+            path = end
+        nb.port_output(self, "i", self.port1, "current")
+        nb.losses(self)
+
+
+class RLBranch(SeriesRLC):
+    """A series R-L branch with optional one-way and external conduction behavior."""
+
+    Input = record_type("RLBranchInput", ("di_dt", "loss_factor"))
+
+    def __init__(self, R: float = 0.0, L: float | None = None, *,
+                 i0: complex | float = 0j, phases: int = 3,
+                 unilateral: bool = False, breakable: bool = True) -> None:
+        if L is None:
+            raise ValueError("an R-L branch requires L")
+        if unilateral and phases != 1:
+            raise ValueError("unilateral current requires a scalar R-L branch")
+        super().__init__(R=R, L=L, i0=i0, phases=phases, breakable=breakable)
+        self.unilateral = bool(unilateral)
         self.external_conduction = False
+        self.input = self.Input(di_dt=self.zero, loss_factor=1.0)
         if self.unilateral:
             self.state_bounds = {"i": (0.0, None)}
             self.commutation_margin = self._device_commutation_margin
             self.commutate = self._device_commutate
-
-    def open_breaker(self) -> None:
-        self.breaker_open = True
-        if not self.netlist_jumps:
-            self.state.i = self.zero
-
-    def close_breaker(self) -> None:
-        """Close the breaker; current resumes from zero after an opening."""
-        self.breaker_open = False
-
-    def retune(self, L: float, R: float) -> bool:
-        """Change impedance without changing current; report a network change."""
-        changed = self.L != L or self.R != R
-        self.L, self.R = L, R
-        self.storage = (replace(self.storage[0], value=L),)
-        return changed
 
     def use_external_conduction(self) -> None:
         """Take derivative and copper-loss factor from a connected constitutive subsystem."""
@@ -97,15 +137,9 @@ class RLBranch(NetworkComponent):
         )
 
     def diode_blocks_reverse_current(self) -> bool:
-        """Return whether this branch represents a diode-bounded current path."""
         return self.unilateral
 
-    def equation_state_bindings(self) -> dict[str, tuple[Any, str]]:
-        """Return discrete physical state that generated backends must preserve."""
-        return {"breaker_open": (self, "breaker_open")}
-
     def network(self, nb):
-        """Declare the series breaker, resistance, inductance and optional diode."""
         from ..solver import netlist as nl
 
         if self.external_conduction:
@@ -126,281 +160,163 @@ class RLBranch(NetworkComponent):
             nb.losses(self)
             return None
 
-        kind = _node_kind(self.phases)
-        inductor = nb.internal(*kind)
-        resistor = nb.internal(*kind) if self.R else inductor
         start = nb.node(self.port1)
         if self.unilateral:
-            start = nb.add(nl.Diode(start, nb.internal(*kind))).ports[0][1]
-        nb.add(nl.Switch(start, resistor, nb.value(self, "breaker_open", invert=True)))
-        if self.R:
-            nb.add(nl.Resistor(resistor, inductor, self.R))
-        nb.add(nl.Inductor(
-            inductor, nb.node(self.port2), self.L, nb.state(self, "i")
-        ))
+            diode = nb.add(nl.Diode(start, nb.internal(start.dim, start.scale)))
+            start = diode.ports[0][1]
+        return self._declare_network(nb, start)
+
+
+class Capacitor(SeriesRLC):
+    """A two-terminal capacitor with optional series resistance."""
+
+    def __init__(self, R: float = 0.0, C: float | None = None, *,
+                 u0: complex | float = 0j, phases: int = 3,
+                 breakable: bool = True) -> None:
+        if C is None:
+            raise ValueError("a capacitor requires C")
+        super().__init__(R, None, C, u0=u0, phases=phases, breakable=breakable)
+
+
+class Resistor(SeriesRLC):
+    """A pure resistance connected to ground, between terminals or in series at a bus."""
+
+    def __init__(self, R: float, *, phases: int = 3,
+                 breakable: bool = True) -> None:
+        super().__init__(R, phases=phases, breakable=breakable)
+
+
+class ParallelRLC(Element, NetworkComponent):
+    """A parallel connection containing any nonempty combination of R, L and C."""
+
+    State = record_type("ParallelRLCState", ("i_L", "u_C"))
+    Output = record_type("ParallelRLCOutput", ("i", "u", "power"))
+    domain_transparent = True
+    outputs_need_inputs: ClassVar[bool] = False
+    parameter_fields = {"r": "R", "l": "L", "c": "C"}
+    structural_parameters = frozenset(("r", "l", "c"))
+    equation_fields = {"breaker_open": "breaker_open"}
+    signal_fields = {"i": "i", "voltage": "u", "power": "power"}
+    infer_netlist_storage = True
+    output_stages = (OutputMethod(
+        "set_voltage_and_power", (), ("u", "power"), rhs=False,
+    ),)
+
+    def __init__(self, R: float | None = None, L: float | None = None,
+                 C: float | None = None, *, i0: complex | float = 0j,
+                 u0: complex | float = 0j, phases: int = 3,
+                 breakable: bool = True) -> None:
+        self.power_scale, self.zero, initial_i = _phase_convention(phases, i0)
+        _scale, _zero, initial_u = _phase_convention(phases, u0)
+        for name, value in (("R", R), ("L", L), ("C", C)):
+            if value is not None and (not math.isfinite(value) or value <= 0.0):
+                raise ValueError(f"{name} must be finite and > 0, got {value}")
+        if R is None and L is None and C is None:
+            raise ValueError("a parallel RLC needs at least one element")
+        self.R, self.L, self.C, self.phases = R, L, C, phases
+        self.breakable = bool(breakable)
+        self.state_names = tuple(name for name, value in (("i_L", L), ("u_C", C))
+                                 if value is not None)
+        self.state = self.State(i_L=initial_i, u_C=initial_u)
+        self.input = Empty()
+        self.output = self.Output(i=self.zero, u=initial_u, power=0.0)
+        self.port1 = Port(self, "1", voltage=self.zero, current=self.zero,
+                          scale=self.power_scale, standalone="voltage")
+        self.port2 = Port(self, "2", voltage=self.zero, current=self.zero,
+                          scale=self.power_scale, standalone="voltage")
+        self.ports = (self.port1, self.port2)
+        self.storage = ()
+        self.breaker_open = False
+
+    def open_breaker(self) -> None:
+        self.breaker_open = True
+
+    def close_breaker(self) -> None:
+        self.breaker_open = False
+
+    def set_values(self, L: float | None, R: float | None,
+                   C: float | None = None) -> bool:
+        return self.set_parameters(l=L, r=R, c=C)
+
+    def resistive_power(self) -> float:
+        return (0.0 if self.R is None else
+                self.power_scale * abs(self.output.u) ** 2 / self.R)
+
+    def set_voltage_and_power(self, _t: float) -> None:
+        self.output.u = self.port1.voltage - self.port2.voltage
+        self.output.power = self.resistive_power()
+
+    def network(self, nb):
+        from ..solver import netlist as nl
+
+        start = nb.node(self.port1)
+        if self.breakable:
+            common = nb.internal(start.dim, start.scale)
+            nb.add(nl.Switch(start, common, nb.value(self, "breaker_open", invert=True)))
+        else:
+            common = start
+        end = nb.node(self.port2)
+        if self.R is not None:
+            nb.add(nl.Resistor(common, end, self.R))
+        if self.L is not None:
+            nb.add(nl.Inductor(common, end, self.L, nb.state(self, "i_L")))
+        if self.C is not None:
+            nb.add(nl.Capacitor(common, end, self.C, nb.state(self, "u_C")))
         nb.port_output(self, "i", self.port1, "current")
         nb.losses(self)
 
-class _NodeState(Bag):
-    __slots__ = ("u_C",)
-
-class _NodeOutput(Bag):
-    __slots__ = ("u",)
-
 
 class Bus(NetworkComponent):
-    """A non-loading electrical connection point with a published voltage."""
+    """Electrical connection point, optionally with a damped shunt capacitor to ground."""
 
-    state_names: ClassVar[tuple[str, ...]] = ()
+    State = record_type("BusState", ("u_C",))
+    Output = record_type("BusOutput", ("u",))
     voltage_field: ClassVar[str] = "u"
     outputs_need_inputs: ClassVar[bool] = False
-    observer: ClassVar[bool] = True
 
-    def __init__(self, *, phases: int = 3) -> None:
-        self.power_scale, zero, _initial = _phase_convention(phases)
-        self.phases = phases
-        self.state = Empty()
-        self.input = Empty()
-        self.output = _NodeOutput(u=zero)
-        self.port: Port | None = Port(
-            self, "power", voltage=zero, current=zero,
-            scale=self.power_scale,
-            electrical_domain="ac" if phases == 3 else None,
-        )
-        self.ports = (self.port,)
-
-    def network(self, nb):
-        """Publish the voltage of the node joined to this bus."""
-        if self.port is None:
-            return NotImplemented
-        nb.node(self.port)
-        nb.port_output(self, "u", self.port, "voltage")
-
-
-class RCNode(NetworkComponent):
-    """Node with a shunt capacitor ``C`` (F) in series with ``R_d`` (ohm) to ground.
-
-    Port current is positive into the node. Output ``u = u_C + R_d i``.
-    """
-
-    state_names: ClassVar[tuple[str, ...]] = ("u_C",)
-    voltage_field: ClassVar[str] = "u"
-    outputs_need_inputs: ClassVar[bool] = False
-    def __init__(self, C: float, R_d: float, u0: complex | float = 0j, *, phases: int = 3) -> None:
+    def __init__(self, C: float | None = None, R_d: float = 0.0,
+                 u0: complex | float = 0j, *, phases: int = 3) -> None:
         self.power_scale, zero, initial = _phase_convention(phases, u0)
         self.C, self.R_d = C, R_d
         self.phases = phases
-        self.state = _NodeState(u_C=initial)
+        self.state_names = () if C is None else ("u_C",)
+        self.state = Empty() if C is None else self.State(u_C=initial)
         self.input = Empty()
-        self.output = _NodeOutput(u=initial)
-        self.port = Port(
-            self, "power", voltage=initial, current=zero,
-            scale=self.power_scale, standalone="current"
+        self.output = self.Output(u=zero if C is None else initial)
+        self.observer = C is None
+        self.port: Port | None = Port(
+            self, "power", voltage=self.output.u, current=zero,
+            scale=self.power_scale,
+            electrical_domain="ac" if C is None and phases == 3 else None,
+            standalone="current" if C is not None else None,
         )
         self.ports = (self.port,)
-        self.storage = (StoragePort(
+        self.storage = (() if C is None else (StoragePort(
             "u_C", C, self.power_scale, ((self.port, "current", 1.0),)
-        ),)
+        ),))
 
-    def retune(self, C: float, R_d: float) -> bool:
-        """Change impedance without changing voltage; report a network change."""
+    def retune(self, C: float | None, R_d: float) -> bool:
+        if (self.C is None) != (C is None):
+            raise ValueError("bus capacitance cannot be added or removed after assembly")
+        if C is None:
+            return False
         changed = self.C != C or self.R_d != R_d
         self.C, self.R_d = C, R_d
         self.storage = (replace(self.storage[0], value=C),)
         return changed
 
     def network(self, nb):
-        """Declare the damping resistance and shunt capacitor."""
         from ..solver import netlist as nl
 
+        if self.port is None:
+            return NotImplemented
         node = nb.node(self.port)
-        capacitor = nb.internal(*_node_kind(self.phases)) if self.R_d else node
+        if self.C is None:
+            nb.port_output(self, "u", self.port, "voltage")
+            return None
+        capacitor = nb.internal(node.dim, node.scale) if self.R_d else node
         if self.R_d:
             nb.add(nl.Resistor(node, capacitor, self.R_d))
-        nb.add(nl.Capacitor(
-            capacitor, None, self.C, nb.state(self, "u_C")
-        ))
+        nb.add(nl.Capacitor(capacitor, None, self.C, nb.state(self, "u_C")))
         nb.port_output(self, "u", self.port, "voltage")
         nb.losses(self)
-
-
-@register_component_type
-@dataclass(frozen=True, kw_only=True)
-class Capacitor:
-    """Two-terminal capacitor with optional series resistance."""
-
-    bus1: str
-    bus2: str
-    c: float
-    r: float = 0.0
-    type: str = "capacitor"
-    domain_transparent: ClassVar[bool] = True
-
-    _quantities = {"c": "capacitance", "r": "resistance"}
-
-    def __post_init__(self) -> None:
-        if self.bus1 == self.bus2:
-            raise ConfigError("bus1 and bus2 must be distinct")
-        if not math.isfinite(self.c) or self.c <= 0.0:
-            raise ConfigError(f"c must be finite and > 0, got {self.c}")
-        if not math.isfinite(self.r) or self.r < 0.0:
-            raise ConfigError(f"r must be finite and >= 0, got {self.r}")
-
-    def network(self, nb) -> None:
-        from ..solver import netlist as nl
-
-        positive = nb.bus1
-        if self.r:
-            middle = nb.internal()
-            nb.add(nl.Resistor(positive, middle, self.r))
-            positive = middle
-        capacitor = nb.add(nl.Capacitor(positive, nb.bus2, self.c, nb.state("u")))
-        nb.output("u", ("branch_voltage", capacitor))
-        nb.port_output("i", "bus1", "current")
-        nb.losses()
-
-
-
-@register_component_type
-class Load(Element):
-    """Built-in series R-L load from ``bus`` to ground; a small impedance models a fault."""
-
-    @dataclass(frozen=True, kw_only=True)
-    class Params:
-        type: str = "load"
-        bus: str
-        l: float
-        r: float = 0.0
-
-        _quantities = {"l": "inductance", "r": "resistance"}
-        _input_aliases = {"x_pu": "l_pu"}
-
-        def __post_init__(self) -> None:
-            if not self.l > 0.0:
-                raise ConfigError(f"l must be > 0 (x_pu > 0), got {self.l}")
-            if not self.r >= 0.0:
-                raise ConfigError(f"r must be >= 0, got {self.r}")
-
-    type = "load"
-
-    def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
-        self.name, self.cfg = name, cfg
-        self.branch = RLBranch(cfg.l, cfg.r, phases=buses[cfg.bus].phases)
-        self.branch.port2.grounded = True
-        self.breakers = [self.branch]
-
-    def subsystems(self) -> dict[str, Any]:
-        return {f"{self.name}.branch": self.branch}
-
-    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
-        return ((self.cfg.bus, self.branch.port1),)
-
-    def signals(self) -> dict[str, complex]:
-        return {f"{self.name}.i": self.branch.output.i}
-
-    def retune(self, cfg: Any) -> bool:
-        """Take new load parameters while preserving branch current."""
-        self.cfg = cfg
-        return self.branch.retune(cfg.l, cfg.r)
-
-
-class _ResistorOutput(Bag):
-    __slots__ = ("i", "u", "power")
-
-
-class _ResistorModel(NetworkComponent):
-    """One resistance, in shunt admittance or series voltage-drop form."""
-
-    state_names: ClassVar[tuple[str, ...]] = ()
-    outputs_need_inputs: ClassVar[bool] = False
-    storage: ClassVar[tuple[StoragePort, ...]] = ()
-
-    def __init__(self, resistance: float, phases: int, series: bool = False) -> None:
-        self.resistance = resistance
-        self.series = series
-        self.power_scale, zero, _ = _phase_convention(phases)
-        self.state = Empty()
-        self.input = Empty()
-        self.output = _ResistorOutput(i=zero, u=zero, power=0.0)
-        self.port1 = Port(
-            self, "1", voltage=zero, current=zero,
-            scale=self.power_scale, standalone="voltage"
-        )
-        self.ports = (self.port1,)
-        if series:
-            self.port2 = Port(
-                self, "2", voltage=zero, current=zero,
-                scale=self.power_scale, standalone="voltage"
-            )
-            self.ports += (self.port2,)
-        self.output_stages = (OutputMethod(
-            "set_power", (), ("power",), rhs=False
-        ),)
-    def set_power(self, t: float) -> None:
-        self.output.power = self.power_scale * self.resistance * abs(self.output.i) ** 2
-
-    def network(self, nb):
-        """Declare the shunt or series resistance."""
-        from ..solver import netlist as nl
-
-        other = nb.node(self.port2) if self.series else None
-        nb.add(nl.Resistor(nb.node(self.port1), other, self.resistance))
-        nb.port_output(self, "i", self.port1, "current")
-        nb.port_output(
-            self, "u", self.port2 if self.series else self.port1, "voltage"
-        )
-        nb.losses(self)
-
-
-@register_component_type
-class Resistor(Element):
-    """Shunt resistance, or a series resistance inserted after a bus's voltage driver."""
-
-    @dataclass(frozen=True, kw_only=True)
-    class Params:
-        type: str = "resistor"
-        bus: str
-        r: float
-        series: bool = field(default=False, metadata={"runtime": False})
-
-        _quantities = {"r": "resistance"}
-
-        def __post_init__(self) -> None:
-            if not self.r > 0.0:
-                raise ConfigError(f"r must be > 0, got {self.r}")
-            if type(self.series) is not bool:
-                raise ConfigError("series must be bool")
-
-    type = "resistor"
-    domain_transparent = True
-
-    def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
-        self.name, self.cfg = name, cfg
-        self.model = _ResistorModel(cfg.r, buses[cfg.bus].phases, cfg.series)
-
-    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
-        if self.cfg.series:
-            return ((f"{self.name}.bus.in", self.model.port1),
-                    (self.cfg.bus, self.model.port2))
-        return ((self.cfg.bus, self.model.port1),)
-
-    def series_connections(self) -> dict[str, str]:
-        return {self.cfg.bus: f"{self.name}.bus.in"} if self.cfg.series else {}
-
-    def parameter_bindings(self) -> dict[str, tuple[Any, str]]:
-        """Runtime scalar parameters, shared by Python retuning and native export."""
-        return {"r": (self.model, "resistance")}
-
-    def signals(self) -> dict[str, complex | float]:
-        return {f"{self.name}.i": self.model.output.i,
-                f"{self.name}.power": self.model.output.power}
-
-    def retune(self, cfg: Any) -> bool:
-        changed = self.cfg.r != cfg.r
-        self.cfg = cfg
-        for name, (subsystem, attribute) in self.parameter_bindings().items():
-            setattr(subsystem, attribute, getattr(cfg, name))
-        return changed
-
-
-
