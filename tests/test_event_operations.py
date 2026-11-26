@@ -98,7 +98,7 @@ def test_builtin_load_is_typed_scaled_built_and_written(tmp_path):
     [
         ({"type": "unknown"}, "Register a custom component type"),
         ({"bus": "nowhere"}, "elements.load.bus: unknown bus"),
-        ({"x_pu": -0.1}, "l must be finite and > 0"),
+        ({"x_pu": -0.1}, "l must be finite and >= 0"),
         ({"r_pu": float("inf")}, "elements.load.r must be finite"),
     ],
 )

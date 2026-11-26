@@ -31,6 +31,10 @@ class Passive(Element):
     def __init__(self, R: float | None, L: float | None, C: float | None, *,
                  i0: complex | float, u0: complex | float,
                  phases: int, breakable: bool) -> None:
+        R, L, C = (None if value == 0.0 else value for value in (R, L, C))
+        for name, value in (("R", R), ("L", L), ("C", C)):
+            if value is not None and (not math.isfinite(value) or value <= 0.0):
+                raise ValueError(f"{name} must be finite and > 0, got {value}")
         self.power_scale, self.zero, initial_i = _phase_convention(phases, i0)
         _scale, _zero, initial_u = _phase_convention(phases, u0)
         self.R, self.L, self.C = R, L, C
@@ -57,6 +61,11 @@ class Passive(Element):
         self.storage = ()
         self.breaker_open = False
 
+    def set_parameters(self, **values) -> bool:
+        return super().set_parameters(**{
+            name: None if value == 0.0 else value for name, value in values.items()
+        })
+
     def open_breaker(self) -> None:
         self.breaker_open = True
         if not self.netlist_jumps and "i" in self.state_names:
@@ -68,6 +77,9 @@ class Passive(Element):
     def network(self, nb):
         from ..solver import netlist as nl
 
+        if self.R is None and self.L is None and self.C is None:
+            nb.port_output(self, "i", self.port1, "current")
+            return None
         start = nb.node(self.port1)
         if self.breakable:
             path = nb.internal(start.dim, start.scale)
@@ -91,25 +103,17 @@ class SeriesRLC(Passive):
                  C: float | None = None, *, i0: complex | float = 0j,
                  u0: complex | float = 0j, phases: int = 3,
                  breakable: bool = True) -> None:
-        if not math.isfinite(R) or R < 0.0:
-            raise ValueError(f"R must be finite and >= 0, got {R}")
-        if L is not None and (not math.isfinite(L) or L <= 0.0):
-            raise ValueError(f"L must be finite and > 0, got {L}")
-        if C is not None and (not math.isfinite(C) or C <= 0.0):
-            raise ValueError(f"C must be finite and > 0, got {C}")
-        if R == 0.0 and L is None and C is None:
-            raise ValueError("a series RLC needs at least one nonzero element")
         super().__init__(R, L, C, i0=i0, u0=u0, phases=phases, breakable=breakable)
 
     def set_voltage_and_power(self, _t: float) -> None:
         self.output.u = self.port1.voltage - self.port2.voltage
-        self.output.power = self.power_scale * self.R * abs(self.output.i) ** 2
+        self.output.power = self.power_scale * (self.R or 0.0) * abs(self.output.i) ** 2
 
     def declare_network(self, nb, path, end) -> None:
         from ..solver import netlist as nl
 
         values = (("R", self.R), ("L", self.L), ("C", self.C))
-        active = tuple((kind, value) for kind, value in values if value not in (None, 0.0))
+        active = tuple((kind, value) for kind, value in values if value is not None)
         for index, (kind, value) in enumerate(active):
             target = end if index == len(active) - 1 else nb.internal(path.dim, path.scale)
             if kind == "R":
@@ -133,11 +137,6 @@ class ParallelRLC(Passive):
                  C: float | None = None, *, i0: complex | float = 0j,
                  u0: complex | float = 0j, phases: int = 3,
                  breakable: bool = True) -> None:
-        for name, value in (("R", R), ("L", L), ("C", C)):
-            if value is not None and (not math.isfinite(value) or value <= 0.0):
-                raise ValueError(f"{name} must be finite and > 0, got {value}")
-        if R is None and L is None and C is None:
-            raise ValueError("a parallel RLC needs at least one element")
         super().__init__(R, L, C, i0=i0, u0=u0, phases=phases, breakable=breakable)
 
     def set_voltage_and_power(self, _t: float) -> None:
@@ -162,8 +161,6 @@ class RLBranch(SeriesRLC):
     def __init__(self, R: float = 0.0, L: float | None = None, *,
                  i0: complex | float = 0j, phases: int = 3,
                  breakable: bool = True) -> None:
-        if L is None:
-            raise ValueError("an R-L branch requires L")
         super().__init__(R=R, L=L, i0=i0, phases=phases, breakable=breakable)
 
 
@@ -173,8 +170,6 @@ class Capacitor(SeriesRLC):
     def __init__(self, R: float = 0.0, C: float | None = None, *,
                  u0: complex | float = 0j, phases: int = 3,
                  breakable: bool = True) -> None:
-        if C is None:
-            raise ValueError("a capacitor requires C")
         super().__init__(R, None, C, u0=u0, phases=phases, breakable=breakable)
 
 

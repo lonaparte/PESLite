@@ -60,6 +60,30 @@ def test_passive_initialization_keeps_series_and_parallel_current_meanings():
     assert (parallel.state.i_L, parallel.state.u_C, parallel.output.i) == (4.0, 5.0, 0.0)
 
 
+def test_zero_contribution_passive_values_use_the_absent_representation():
+    for zero, absent in (
+        (SeriesRLC(R=0.0, L=0.0, C=0.0, phases=1), SeriesRLC(phases=1)),
+        (ParallelRLC(R=0.0, L=0.0, C=0.0, phases=1), ParallelRLC(phases=1)),
+    ):
+        assert (zero.R, zero.L, zero.C) == (absent.R, absent.L, absent.C)
+        assert zero.state_names == absent.state_names
+        zero_model = peslite.Model({"component": zero}, {})
+        absent_model = peslite.Model({"component": absent}, {})
+        assert zero_model.state_labels() == absent_model.state_labels()
+        assert tuple(type(item).__name__ for item in zero._device_circuit.netlist.elements) == tuple(
+            type(item).__name__ for item in absent._device_circuit.netlist.elements
+        )
+
+
+def test_zero_passive_values_stay_absent_during_updates_and_specialization():
+    series = SeriesRLC(phases=1)
+    parallel = ParallelRLC(phases=1)
+    assert not series.set_parameters(r=0.0, l=0.0, c=0.0)
+    assert not parallel.set_parameters(r=0.0, l=0.0, c=0.0)
+    for component in (RLBranch(), Capacitor(), Resistor(0.0)):
+        assert (component.R, component.L, component.C) == (None, None, None)
+
+
 def test_electrical_ports_store_inward_current_and_numbered_names():
     branch = RLBranch(L=0.1, R=0.01)
 
