@@ -6,7 +6,8 @@ import pytest
 
 import peslite
 from peslite.assembly.params import ConfigError, from_dict
-from peslite.components.source import ACSource
+from peslite.assembly.circuit import compile_network
+from peslite.components.source import ACCurrentSource, ACSource, DCCurrentSource
 
 
 def _rectifier_tree(source_bus="rectifier.power"):
@@ -45,6 +46,30 @@ def test_ac_source_representation_follows_the_connected_phase_count():
     assert isinstance(single.output.voltage, float)
     assert isinstance(three.output.voltage, complex)
     assert single.output.voltage == pytest.approx(three.output.voltage.real)
+
+
+def test_ac_current_source_representation_follows_the_connected_phase_count():
+    angle = lambda _t: 0.3
+    single = ACCurrentSource(2.0 * math.pi * 50.0, 10.0, angle, phases=1)
+    three = ACCurrentSource(2.0 * math.pi * 50.0, 10.0, angle, phases=3)
+
+    for source in (single, three):
+        source.set_outputs(1.0e-3)
+        assert source.port.electrical_domain == "ac"
+        assert compile_network(source) is not None
+    assert isinstance(single.output.current, float)
+    assert isinstance(three.output.current, complex)
+    assert single.output.current == pytest.approx(three.output.current.real)
+
+
+def test_dc_current_source_uses_the_common_current_source_network():
+    source = DCCurrentSource(12.0)
+
+    assert source.current == source.output.current == 12.0
+    assert source.port.electrical_domain == "dc"
+    assert compile_network(source) is not None
+    assert source.set_parameters(current=-3.0)
+    assert source.output.current == -3.0
 
 
 def test_single_phase_source_connects_directly_to_converter_power_port(tmp_path):

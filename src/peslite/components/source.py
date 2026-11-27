@@ -1,4 +1,4 @@
-"""AC and DC voltage sources built on one physical source contract."""
+"""AC/DC voltage and current sources."""
 
 from __future__ import annotations
 
@@ -10,7 +10,10 @@ from ..solver.model import Empty, record_type
 from .network import Element, _phase_convention
 from .passive import RLBranch
 
-__all__ = ["VoltageSource", "ACSource", "DCSource"]
+__all__ = [
+    "VoltageSource", "ACSource", "DCSource",
+    "CurrentSource", "ACCurrentSource", "DCCurrentSource",
+]
 
 
 class VoltageSource(Element):
@@ -20,8 +23,6 @@ class VoltageSource(Element):
     outputs_need_inputs: ClassVar[bool] = False
     storage: ClassVar[tuple[StoragePort, ...]] = ()
     has_source: ClassVar[bool] = True
-    source_signals: ClassVar[dict[str, str]] = {}
-
     def __init__(self, output: Any, *, R: float = 0.0, L: float | None = None,
                  phases: int, electrical_domain: str, breakable: bool) -> None:
         self.power_scale, zero, _ = _phase_convention(phases)
@@ -71,10 +72,7 @@ class VoltageSource(Element):
     def signals(self) -> dict[str, float | complex]:
         return {
             f"{self.name}.i": self.branch.output.i,
-            **{
-                f"{self.name}.{name}": getattr(self.output, field)
-                for name, field in self.source_signals.items()
-            },
+            **super().signals(),
         }
 
 
@@ -82,7 +80,7 @@ class ACSource(VoltageSource):
     """Single- or three-phase sinusoidal voltage source behind a series R-L branch."""
 
     Output = record_type("ACSourceOutput", ("voltage", "phi", "theta"))
-    source_signals = {"angle": "phi"}
+    signal_fields = {"angle": "phi"}
 
     def __init__(self, w0: float, e_peak: float,
                  phi: Optional[Callable[[float], float]] = None, *,
@@ -141,3 +139,98 @@ class DCSource(VoltageSource):
     @voltage.setter
     def voltage(self, value: float) -> None:
         self.output.voltage = float(value)
+
+
+class CurrentSource(Element):
+    """Common ideal current source connected from ground into its power port."""
+
+    state_names: ClassVar[tuple[str, ...]] = ()
+    outputs_need_inputs: ClassVar[bool] = False
+    storage: ClassVar[tuple[StoragePort, ...]] = ()
+    has_source: ClassVar[bool] = True
+    signal_fields = {"i": "current"}
+
+    def __init__(self, output: Any, *, phases: int,
+                 electrical_domain: str) -> None:
+        self.power_scale, zero, _ = _phase_convention(phases)
+        self.phases = phases
+        self.state = Empty()
+        self.input = Empty()
+        self.output = output
+        self.port = Port(
+            self, "power", voltage=zero, current=zero,
+            scale=self.power_scale, electrical_domain=electrical_domain,
+        )
+        self.ports = (self.port,)
+
+    def set_parameters(self, *, current: float) -> bool:
+        """Apply the commanded source current."""
+        previous = self.current
+        self.current = float(current)
+        return previous != self.current
+
+    def declare(self, nb, node):
+        """Declare positive current from ground into ``node``."""
+        from ..solver import netlist as nl
+
+        return nb.add(nl.CurrentSource(
+            None, node, nb.value(self.output, "current")
+        ))
+
+    def network(self, nb) -> None:
+        self.declare(nb, nb.node(self.port))
+        nb.supplies(self)
+
+
+class ACCurrentSource(CurrentSource):
+    """Single- or three-phase sinusoidal current source."""
+
+    Output = record_type("ACCurrentSourceOutput", ("current", "phi", "theta"))
+    signal_fields = {"i": "current", "angle": "phi"}
+
+    def __init__(self, w0: float, i_peak: float,
+                 phi: Optional[Callable[[float], float]] = None, *,
+                 phases: int = 3) -> None:
+        _scale, zero, _ = _phase_convention(phases)
+        self.w0, self.current = w0, 0.0
+        self.phase = None
+        self.waveform = ((lambda angle: complex(math.cos(angle), math.sin(angle)))
+                         if phases == 3 else math.cos)
+        super().__init__(
+            self.Output(current=zero, phi=0.0, theta=0.0),
+            phases=phases, electrical_domain="ac",
+        )
+        self.set_parameters(current=i_peak, phase=phi)
+
+    def set_parameters(self, *, current: float,
+                       phase: Optional[Callable[[float], float]]) -> bool:
+        """Apply the AC magnitude and optional phase law."""
+        self.phase = phase
+        return super().set_parameters(current=current)
+
+    def set_outputs(self, t: float) -> None:
+        phi = self.phase(t) if self.phase is not None else 0.0
+        theta = self.w0 * t + phi
+        self.output.phi = phi
+        self.output.theta = theta
+        self.output.current = self.current * self.waveform(theta)
+
+
+class DCCurrentSource(CurrentSource):
+    """Constant DC current source."""
+
+    Output = record_type("DCCurrentSourceOutput", ("current",))
+
+    def __init__(self, current: float) -> None:
+        super().__init__(
+            self.Output(current=0.0), phases=1, electrical_domain="dc",
+        )
+        self.set_parameters(current=current)
+
+    @property
+    def current(self) -> float:
+        return self.output.current
+
+    @current.setter
+    def current(self, value: float) -> None:
+        self.output.current = float(value)
