@@ -353,7 +353,7 @@ def test_jacobian_includes_state_feedback_inside_a_source(form):
     linear = linear_system(model)
     linear.ensure(model.rhs, 0.0, y, model.rhs(0.0, y))
     assert linear.J[index, index] == pytest.approx(
-        -dclink.source.k_dc / dclink.capacitor.C, rel=2e-6
+        -dclink.k_dc / dclink.C, rel=2e-6
     )
 
 

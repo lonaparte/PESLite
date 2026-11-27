@@ -13,7 +13,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 from ..components.network import Element, GROUND, Port, resolve_endpoints
 from ..components.registry import ELEMENT_TYPES
 from ..components.passive import Bus, RLBranch
-from ..components.source import ACSource
+from ..components.source import ACVoltageSource
 from ..components.adc import _PortMeasurement
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather, scatter
@@ -199,12 +199,12 @@ def _source_scenario(p: Params, path: str, select: Callable[[Params], Any]) -> S
     return SourceScenario(select(p), p.base.f0, steps)
 
 
-def assemble_source(name: str, p: Params, t0: float, phases: int) -> ACSource:
+def assemble_source(name: str, p: Params, t0: float, phases: int) -> ACVoltageSource:
     """Construct one configured AC source without a separate assembly wrapper."""
     cfg, base = p.sources[name], p.base
     scenario = _source_scenario(p, f"sources.{name}", lambda q: q.sources[name])
     source = _parameterized(
-        lambda values: ACSource(
+        lambda values: ACVoltageSource(
             values[0].w0, *scenario.law(t0), R=values[1].r, L=values[1].l,
             phases=values[2],
         ), (base, cfg, phases),
@@ -214,7 +214,7 @@ def assemble_source(name: str, p: Params, t0: float, phases: int) -> ACSource:
     return source
 
 
-def set_source_parameters(source: ACSource, cfg: Any,
+def set_source_parameters(source: ACVoltageSource, cfg: Any,
                           paths: list[str], t: float) -> bool:
     """Resolve the source timeline and apply it through the common parameter path."""
     voltage, phase = source.voltage, source.phase

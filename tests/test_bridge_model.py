@@ -205,7 +205,7 @@ def test_changing_bridge_model_keeps_the_same_bridge_power_boundary(gfl):
     assert [port for _component, port in switching.zoh_connections()] == ["q"]
     assert averaging.zoh_connections() == {}
     assert (averaging.bridge, "q") in averaging.connections()
-    assert averaging.connections()[(averaging.ctrl, "u_dc")] == (averaging.dclink, "u_dc")
+    assert averaging.connections()[(averaging.ctrl, "u_dc")] == (averaging.dclink, "u")
     for unit in (switching, averaging):
         assert unit.bridge.dc_port in [port for _bus, port in unit.port_bindings()]
         assert unit.bridge.power_port in [port for _bus, port in unit.port_bindings()]

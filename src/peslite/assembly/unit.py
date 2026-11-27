@@ -738,7 +738,7 @@ class VSC(Unit):
             {
                 "u_g": self._bus_voltage,
                 "i_c": lambda: self.branch_f.output.i,
-                "u_dc": lambda: self.dclink.output.u_dc,
+                "u_dc": lambda: self.dclink.output.u,
             }
         )
         self._configure_runtime(
@@ -766,7 +766,7 @@ class VSC(Unit):
         connections = self._measurement_connections({
             "u_g": (self.bus, self._bus_voltage_field),
             "i_c": (self.branch_f, "i"),
-            "u_dc": (self.dclink, "u_dc"),
+            "u_dc": (self.dclink, "u"),
         })
         if self.continuous and self.ctrl is not None:
             connections[(self.bridge, "q")] = (self.ctrl, "q")
@@ -806,7 +806,7 @@ class VSC(Unit):
         return {
             f"{self.name}.i_c": self.branch_f.output.i,
             f"{self.name}.u_g": self._bus_voltage(),
-            f"{self.name}.u_dc": self.dclink.output.u_dc,
+            f"{self.name}.u_dc": self.dclink.output.u,
             f"{self.name}.i_dc": -self.dclink.port.current,
         }
 
@@ -894,10 +894,10 @@ class DCConverter(Unit):
                               if bus is not None else (self.bridge, "u_c"))
         self._control_voltage_port = (
             power_voltage_port if self._external_lower_rail or not topology.reverse_port
-            else (self.dclink, "u_dc")
+            else (self.dclink, "u")
         )
         self._control_supply_port = (
-            power_voltage_port if topology.reverse_port else (self.dclink, "u_dc")
+            power_voltage_port if topology.reverse_port else (self.dclink, "u")
         )
         self.conduction = None
         if self.branch_f is not None and self.bridge.averaged_natural_conduction:
@@ -994,7 +994,7 @@ class DCConverter(Unit):
             assert self.branch_f is not None
             connections.update({
                 (self.conduction, "current"): (self.branch_f, "i"),
-                (self.conduction, "upper"): (self.dclink, "u_dc"),
+                (self.conduction, "upper"): (self.dclink, "u"),
                 (self.branch_f, "di_dt"): (self.conduction, "derivative"),
                 (self.branch_f, "loss_factor"): (
                     self.conduction, "resistance_factor",
@@ -1058,7 +1058,7 @@ class DCConverter(Unit):
                 self._bus_voltage()
                 if self.bus is not None else self.bridge.output.u_c
             ),
-            f"{self.name}.u_dc": self.dclink.output.u_dc,
+            f"{self.name}.u_dc": self.dclink.output.u,
             f"{self.name}.i_dc": self.bridge.output.i_dc,
         }
 
@@ -1108,7 +1108,7 @@ class DCConverter(Unit):
         return ProtectionSample(
             terminal_voltage_pu=abs(measurement.voltage) / self.cfg.dc_base.v,
             dc_voltage_error_pu=(
-                float(self.dclink.output.u_dc) / self.cfg.dc_base.v - 1.0
+                float(self.dclink.output.u) / self.cfg.dc_base.v - 1.0
             ),
             startup_complete=self._startup_complete(output),
         )

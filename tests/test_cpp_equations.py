@@ -9,10 +9,10 @@ import pytest
 from peslite.assembly.cpp import (_ALGEBRAIC_SOLVER, _ControlGenerator, _ModelGenerator,
                                   _RuntimeParameters, _number, _uses_implementation)
 from peslite.components import Bag
-from peslite.components.dclink import DCCapacitor, DCLink
-from peslite.components.source import DCSource
+from peslite.components.dclink import DCLink
+from peslite.components.source import DCVoltageSource
 from peslite.components.passive import RLBranch
-from peslite.components.source import ACSource
+from peslite.components.source import ACVoltageSource
 from peslite.solver.model import Empty, Model
 from peslite.control import Loop
 from peslite.control.blocks import PI
@@ -251,7 +251,7 @@ def test_native_multivariable_feedback_keeps_the_previous_output_between_calls(t
 
 
 def test_native_inherited_source_keeps_the_existing_adapter():
-    class AnnotatedSource(ACSource):
+    class AnnotatedSource(ACVoltageSource):
         pass
 
     source = AnnotatedSource(314.0, 325.0)
@@ -261,7 +261,7 @@ def test_native_inherited_source_keeps_the_existing_adapter():
 
 @pytest.mark.parametrize("phases", [1, 3])
 def test_native_ac_source_preserves_the_connected_phase_representation(phases, tmp_path):
-    source = ACSource(2.0 * np.pi * 50.0, 325.0, phases=phases)
+    source = ACVoltageSource(2.0 * np.pi * 50.0, 325.0, phases=phases)
     model = Model({"source": source}, {})
     times = (0.0, 1.0e-3, 2.5e-3)
     actual = _run_model(model, [(source.output, "voltage")], tmp_path, times=times)
@@ -297,11 +297,15 @@ def test_native_branch_keeps_its_own_output_and_rhs(instance_override, tmp_path)
 
 @pytest.mark.parametrize("capacitance", [None, 0.1])
 def test_dclink_lowering_traces_the_shared_capacitor_state(capacitance, tmp_path):
-    cap = DCCapacitor(12.0, capacitance, 0.25) if capacitance is not None else None
-    link = DCLink(cap, DCSource(24.0, R=2.0))
+    link = DCLink(
+        12.0, capacitance, 0.25 if capacitance is not None else 0.0,
+        DCVoltageSource(24.0, R=2.0),
+    )
     link.port.current = -3.0
     model = Model({"link": link}, {})
-    readings = [(link.output, name) for name in ("u_dc", "u_C", "i_src")]
+    readings = [(link.output, "u")]
+    if capacitance is not None:
+        readings.append((link.state, "u_C"))
     actual = _run_model(model, readings, tmp_path)
     model.sync(0.0, model.get_initial_values())
     np.testing.assert_allclose(actual, [getattr(record, name) for record, name in readings],

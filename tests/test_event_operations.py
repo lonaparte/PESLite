@@ -184,7 +184,7 @@ def test_system_switches_units_sources_and_loads():
     unit = system.units["vsc"]
     source = unit.dclink.source
     system.switch("vsc", False, 0.1)
-    assert unit.branch_f.breaker_open and source(0.15, source.u_ref) == 0.0
+    assert unit.branch_f.breaker_open and unit.dclink(0.15, unit.dclink.u_ref) == 0.0
     cc = unit.ctrl.graph.nodes["CurrentLoop"]
     dvc = unit.ctrl.graph.nodes["DCVoltageControl"]
     cc.integral, dvc.integral = 0.2 + 0.1j, 0.3
@@ -194,7 +194,7 @@ def test_system_switches_units_sources_and_loads():
 
     system.switch("vsc", True, 0.2, 0.1)
     assert unit.breaker and unit.branch_f.breaker_open  # gates stay blocked until a PWM load enables them
-    assert 0.0 < source(0.25, source.u_ref) < source.i_nom
+    assert 0.0 < unit.dclink(0.25, unit.dclink.u_ref) < source.current
     unit.trip(0.25, "test")
     system.switch("vsc", True, 0.3)
     assert unit.tripped and unit.branch_f.breaker_open
@@ -257,7 +257,7 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     assert line.state.i == 6 + 7j
     assert (line.L, line.R) == (current.branches["line"].l, current.branches["line"].r)
     assert load.state.i == 7 + 8j and load.R == current.elements["load"].r
-    assert unit.dclink.source.i_nom == current.unit("vsc").dclink.source.i
+    assert unit.dclink.source.current == current.unit("vsc").dclink.source.i
     assert unit.protection.cfg.hold == 0.01
     assert unit.protection._rocof_window == pytest.approx(0.2)
     assert unit.ctrl.graph.nodes["SRFPLL"] is old_pll  # queued until the next controller update

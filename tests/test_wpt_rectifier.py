@@ -476,7 +476,7 @@ def test_shunt_load_does_not_make_a_prescribed_dc_voltage_nonstiff():
     tree["simulation"]["output"]["signals"] = False
     sim = peslite.Simulation(from_dict(tree))
     sim.run(out_dir=None)
-    assert sim.unit("charger.primary").dclink.output.u_dc == 400.0
+    assert sim.unit("charger.primary").dclink.output.u == 400.0
 
 
 @pytest.mark.parametrize("local_filter", [True, False])

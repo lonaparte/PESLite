@@ -67,7 +67,8 @@ def test_explicit_initial_command_keeps_source_and_controller_consistent(connect
     assert unit.breaker == connected
     assert unit.ctrl.startup.run == connected
     source = unit.dclink.source
-    assert source(0, source.u_ref) == pytest.approx(source.i_nom if connected else 0)
+    link = unit.dclink
+    assert link(0, link.u_ref) == pytest.approx(source.current if connected else 0)
 
 
 @pytest.mark.parametrize("name", ["gfl", "buck", "wpt"])
@@ -100,9 +101,10 @@ def test_initial_source_command_uses_the_original_ramp_time(t0):
     sim._apply_initial(t0)
     source = sim.units["vsc"].dclink.source
     expected = smoothstep((t0 - since) / ramp) if t0 >= since else 0.0
-    assert source(t0, source.u_ref) == pytest.approx(source.i_nom * expected)
+    link = sim.units["vsc"].dclink
+    assert link(t0, link.u_ref) == pytest.approx(source.current * expected)
     if t0 >= since + ramp:
-        assert source.ramp is None
+        assert link.ramp is None
 
 
 def test_initial_network_disconnect_is_applied_after_loading_physical_state():

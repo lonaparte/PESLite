@@ -123,7 +123,7 @@ def test_scalar_power_uses_the_external_port_not_control_feedback(
     # Keep the regulation feedback deliberately different from the measured power port.
     unit.branch_f.output.i = current
     unit.bus.output.u = voltage
-    unit.dclink.output.u_dc = 48.0 if case == "boost" else 24.0
+    unit.dclink.output.u = 48.0 if case == "boost" else 24.0
     assert unit.ports.value("power") == pytest.approx(expected)
     if case != "buck":
         control_voltage = unit._port_value(unit._control_voltage_port)
@@ -443,9 +443,9 @@ def test_averaged_bridge_currents_follow_the_connected_converter_state(model, tm
     assert unit.bridge.output.i_dc == pytest.approx(
         unit.bridge.input.upper_current_ratio * unit.branch_f.output.i
     )
-    assert unit.dclink.output.i_src == pytest.approx(unit.bridge.output.i_dc)
+    assert -unit.dclink.port.current == pytest.approx(unit.bridge.output.i_dc)
     assert unit.bridge.output.u_c * unit.branch_f.output.i == pytest.approx(
-        unit.dclink.output.u_dc * unit.bridge.output.i_dc
+        unit.dclink.output.u * unit.bridge.output.i_dc
     )
 
 
@@ -464,7 +464,7 @@ def test_reverse_averaged_bridge_is_a_lossless_two_port(
     simulation.run(out_dir=tmp_path / f"{model}-{circuit_model}")
     unit = simulation.unit()
     assert abs(unit.bridge.output.u_c * unit.branch_f.output.i) == pytest.approx(
-        abs(unit.dclink.output.u_dc * unit.bridge.output.i_dc)
+        abs(unit.dclink.output.u * unit.bridge.output.i_dc)
     )
     assert sum(port.power() for port in unit.bridge.ports) == pytest.approx(0.0, abs=1e-12)
 

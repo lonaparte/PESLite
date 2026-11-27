@@ -8,7 +8,7 @@ from typing import Any, ClassVar
 
 from ..components.network import element_buses, resolve_endpoints
 from ..components.passive import Capacitor, ParallelRLC, Resistor, SeriesRLC
-from ..components.source import DCSource
+from ..components.source import DCVoltageSource
 from ..components.registry import register_component
 from ..solver.model import ConfigError
 
@@ -187,16 +187,16 @@ def retune_element(element: Any, cfg: Any) -> bool:
     return changed
 
 
-def assemble_voltage_source(name: str, cfg: Any, buses: dict, _params: Any) -> DCSource:
+def assemble_voltage_source(name: str, cfg: Any, buses: dict, _params: Any) -> DCVoltageSource:
     """Construct one scalar DC source using the common source and branch implementation."""
     if buses[cfg.bus].phases != 1:
         raise ConfigError("a scalar voltage source needs a single-phase bus")
-    source = DCSource(cfg.v, R=cfg.r)
+    source = DCVoltageSource(cfg.v, R=cfg.r)
     source.name, source.bus, source.cfg = name, cfg.bus, cfg
     return source
 
 
-def set_voltage_source_parameters(source: DCSource, cfg: Any) -> bool:
+def set_voltage_source_parameters(source: DCVoltageSource, cfg: Any) -> bool:
     source.cfg = cfg
     return source.set_parameters(voltage=cfg.v, r=cfg.r, l=None)
 

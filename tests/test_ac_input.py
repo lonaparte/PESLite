@@ -7,7 +7,7 @@ import pytest
 import peslite
 from peslite.assembly.params import ConfigError, from_dict
 from peslite.assembly.circuit import compile_network
-from peslite.components.source import ACCurrentSource, ACSource, DCCurrentSource
+from peslite.components.source import ACCurrentSource, ACVoltageSource, DCCurrentSource
 
 
 def _rectifier_tree(source_bus="rectifier.power"):
@@ -37,8 +37,8 @@ def _rectifier_tree(source_bus="rectifier.power"):
 
 def test_ac_source_representation_follows_the_connected_phase_count():
     angle = lambda _t: 0.3
-    single = ACSource(2.0 * math.pi * 50.0, 325.0, angle, phases=1)
-    three = ACSource(2.0 * math.pi * 50.0, 325.0, angle, phases=3)
+    single = ACVoltageSource(2.0 * math.pi * 50.0, 325.0, angle, phases=1)
+    three = ACVoltageSource(2.0 * math.pi * 50.0, 325.0, angle, phases=3)
 
     for source in (single, three):
         source.set_outputs(1.0e-3)

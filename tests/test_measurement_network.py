@@ -69,8 +69,8 @@ def test_shunt_load_resolves_unit_default_and_named_ports(endpoint):
     sim.system.model.sync(0.0, sim.system.model.get_initial_values())
     load = sim.system.named_elements["load"]
     primary = sim.units["charger.primary"]
-    assert load.model.port1.voltage == primary.dclink.output.u_dc
-    assert load.model.output.i == pytest.approx(primary.dclink.output.u_dc / 2.0)
+    assert load.model.port1.voltage == primary.dclink.output.u
+    assert load.model.output.i == pytest.approx(primary.dclink.output.u / 2.0)
 
 
 def test_series_elements_share_the_same_generic_insertion_path_in_declaration_order():

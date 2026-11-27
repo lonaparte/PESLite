@@ -37,7 +37,7 @@ import numpy as np
 from ..defaults import (DEFAULT_COMMUTATION_LOCATOR_ITERATIONS,
                         DEFAULT_COMMUTATION_MAX_TRANSITIONS)
 from ..components.passive import SeriesRLC
-from ..components.source import ACSource
+from ..components.source import ACVoltageSource
 from ..components.pwm import (_EPS, _SNAP, CarrierComparison, SynchronousCarrier, PhaseClock,
                                PhaseShiftModulator, ZOH)
 from ..components.pwm import PHASE_SHIFT_MODES
@@ -3305,7 +3305,7 @@ class _ModelGenerator:
         terms = [f"({_number(gain)} * {self.value(out, name)})" for out, name, gain in fanin]
         return " + ".join(terms) if terms else "0.0"
 
-    def _source_values(self, source: ACSource) -> tuple[str, str]:
+    def _source_values(self, source: ACVoltageSource) -> tuple[str, str]:
         entry = next(((name, item) for name, item in self.system.sources.items()
                       if item is source), None)
         wrapper = entry[1] if entry is not None else None
@@ -3390,7 +3390,7 @@ class _ModelGenerator:
             )
         return attributes
 
-    def source_output_lines(self, source: ACSource) -> list[str]:
+    def source_output_lines(self, source: ACVoltageSource) -> list[str]:
         """Render one source's configured native waveform."""
         return [
             f"{self.value(source.output, field)} = {value.code};"
@@ -8543,7 +8543,7 @@ class _CppGenerator:
         t0 = self.p.simulation.initial.t
         for name, source in self.system.sources.items():
             view = copy.copy(source)
-            if ACSource.uses_standard_outputs(source.set_outputs):
+            if ACVoltageSource.uses_standard_outputs(source.set_outputs):
                 expression = model._source_equations(source, _number(t0))["voltage"]
             else:
                 def read():
@@ -8642,7 +8642,7 @@ class _CppGenerator:
                     if generator is None:
                         raise TypeError(f"C++ export: connection variable {path!r} has no controller")
                     source_ramp = model.ramp_member_names(
-                        generator.unit.dclink, generator.unit.dclink.source
+                        generator.unit.dclink, generator.unit.dclink.current_profile
                     )
                     if source_ramp is not None:
                         start, duration, _law = source_ramp

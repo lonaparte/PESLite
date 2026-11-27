@@ -11,7 +11,7 @@ from .network import Element, _phase_convention
 from .passive import RLBranch
 
 __all__ = [
-    "VoltageSource", "ACSource", "DCSource",
+    "VoltageSource", "ACVoltageSource", "DCVoltageSource",
     "CurrentSource", "ACCurrentSource", "DCCurrentSource",
 ]
 
@@ -45,12 +45,13 @@ class VoltageSource(Element):
         self.voltage = float(voltage)
         return self.branch.set_parameters(r=r, l=l)
 
-    def declare(self, nb, node):
-        """Declare the ideal source at ``node`` and return its netlist primitive."""
+    def declare(self, nb, node, value=None):
+        """Declare the ideal source, using its output unless a bound value is supplied."""
         from ..solver import netlist as nl
 
         return nb.add(nl.VoltageSource(
-            node, None, nb.value(self.output, "voltage")
+            node, None,
+            nb.value(self.output, "voltage") if value is None else value,
         ))
 
     def network(self, nb) -> None:
@@ -76,10 +77,10 @@ class VoltageSource(Element):
         }
 
 
-class ACSource(VoltageSource):
+class ACVoltageSource(VoltageSource):
     """Single- or three-phase sinusoidal voltage source behind a series R-L branch."""
 
-    Output = record_type("ACSourceOutput", ("voltage", "phi", "theta"))
+    Output = record_type("ACVoltageSourceOutput", ("voltage", "phi", "theta"))
     signal_fields = {"angle": "phi"}
 
     def __init__(self, w0: float, e_peak: float,
@@ -119,10 +120,10 @@ class ACSource(VoltageSource):
                 if self.uses_standard_outputs(method) else None)
 
 
-class DCSource(VoltageSource):
+class DCVoltageSource(VoltageSource):
     """Constant DC voltage source behind a series resistance."""
 
-    Output = record_type("DCSourceOutput", ("voltage",))
+    Output = record_type("DCVoltageSourceOutput", ("voltage",))
 
     def __init__(self, voltage: float, *, R: float = 0.0,
                  breakable: bool = False) -> None:
@@ -169,12 +170,13 @@ class CurrentSource(Element):
         self.current = float(current)
         return previous != self.current
 
-    def declare(self, nb, node):
-        """Declare positive current from ground into ``node``."""
+    def declare(self, nb, node, value=None):
+        """Declare positive current, using its output unless a bound value is supplied."""
         from ..solver import netlist as nl
 
         return nb.add(nl.CurrentSource(
-            None, node, nb.value(self.output, "current")
+            None, node,
+            nb.value(self.output, "current") if value is None else value,
         ))
 
     def network(self, nb) -> None:

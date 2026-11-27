@@ -165,10 +165,10 @@ def test_averaged_state_fractions_match_the_existing_exact_carrier(width):
 def test_three_phase_device_equations_solve_the_dc_network_directly(mode, resistance):
     from peslite.assembly.circuit import compile_network, lower
     from peslite.components.dclink import DCLink
-    from peslite.components.source import DCSource
+    from peslite.components.source import DCVoltageSource
 
     bridge, _ = _model(ThreePhaseBridge(), mode)
-    link = DCLink(None, DCSource(48.0, R=resistance))
+    link = DCLink(48.0, source=DCVoltageSource(48.0, R=resistance))
     subsystems = {"bridge": bridge, "link": link}
     declarations = {id(value): compile_network(value) for value in subsystems.values()}
     subsystems, connections, zoh, _circuit = lower(
@@ -185,7 +185,7 @@ def test_three_phase_device_equations_solve_the_dc_network_directly(mode, resist
     model = Model(subsystems, connections, zoh)
     model.sync(0.0, model.get_initial_values())
     expected = 48.0 / (1.0 + resistance * (2.0 / 3.0) / bridge.device_diode_resistance)
-    assert link.output.u_dc == pytest.approx(expected, rel=1e-8)
+    assert link.output.u == pytest.approx(expected, rel=1e-8)
     assert not model.algebraic_loops
 
 
