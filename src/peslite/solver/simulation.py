@@ -1784,7 +1784,7 @@ class SimulationTransition:
         if repeat_forcing:
             for source in getattr(sim.system, "sources", {}).values():
                 relative = abs(source.cfg.f - frequency)
-                if relative > 0.0 and source.emf.e_peak != 0.0:
+                if relative > 0.0 and source.voltage != 0.0:
                     periods.add(1.0 / relative)
         if any(not math.isfinite(value) or value <= 0.0 for value in periods):
             raise ValueError("transition periods must be finite and positive")

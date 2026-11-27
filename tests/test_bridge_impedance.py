@@ -164,10 +164,11 @@ def test_averaged_state_fractions_match_the_existing_exact_carrier(width):
 @pytest.mark.parametrize("resistance", [1.0, 75.0])
 def test_three_phase_device_equations_solve_the_dc_network_directly(mode, resistance):
     from peslite.assembly.circuit import compile_network, lower
-    from peslite.components.dclink import DCLink, DCVoltageSource
+    from peslite.components.dclink import DCLink
+    from peslite.components.source import DCSource
 
     bridge, _ = _model(ThreePhaseBridge(), mode)
-    link = DCLink(None, DCVoltageSource(48.0, resistance))
+    link = DCLink(None, DCSource(48.0, R=resistance))
     subsystems = {"bridge": bridge, "link": link}
     declarations = {id(value): compile_network(value) for value in subsystems.values()}
     subsystems, connections, zoh, _circuit = lower(

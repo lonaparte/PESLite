@@ -8,6 +8,7 @@ from typing import Any, ClassVar
 
 from ..components.network import element_buses, resolve_endpoints
 from ..components.passive import Capacitor, ParallelRLC, Resistor, SeriesRLC
+from ..components.source import DCSource
 from ..components.registry import register_component
 from ..solver.model import ConfigError
 
@@ -111,6 +112,22 @@ class ParallelRLCParams:
         validate_nonnegative("c", self.c)
 
 
+@dataclass(frozen=True, kw_only=True)
+class VoltageSourceParams:
+    type: str = "voltage_source"
+    bus: str
+    v: float
+    r: float
+
+    _quantities = {"v": "voltage", "r": "resistance"}
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.v):
+            raise ConfigError(f"v must be finite, got {self.v}")
+        if not math.isfinite(self.r) or self.r <= 0.0:
+            raise ConfigError(f"r must be finite and positive, got {self.r}")
+
+
 def assemble_element(name: str, cfg: Any, buses: dict, params: Any) -> Any:
     """Construct one registered passive element and attach its resolved endpoints."""
     endpoints = resolve_endpoints(
@@ -170,5 +187,23 @@ def retune_element(element: Any, cfg: Any) -> bool:
     return changed
 
 
+def assemble_voltage_source(name: str, cfg: Any, buses: dict, _params: Any) -> DCSource:
+    """Construct one scalar DC source using the common source and branch implementation."""
+    if buses[cfg.bus].phases != 1:
+        raise ConfigError("a scalar voltage source needs a single-phase bus")
+    source = DCSource(cfg.v, R=cfg.r)
+    source.name, source.bus, source.cfg = name, cfg.bus, cfg
+    return source
+
+
+def set_voltage_source_parameters(source: DCSource, cfg: Any) -> bool:
+    source.cfg = cfg
+    return source.set_parameters(voltage=cfg.v, r=cfg.r, l=None)
+
+
 for parameter_type in (SeriesRLCParams, CapacitorParams, ResistorParams, ParallelRLCParams):
     register_component(parameter_type, assemble_element, retune_element)
+
+register_component(
+    VoltageSourceParams, assemble_voltage_source, set_voltage_source_parameters,
+)

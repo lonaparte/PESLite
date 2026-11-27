@@ -1,175 +1,143 @@
-"""Ideal AC and scalar DC sources connected through the component network."""
+"""AC and DC voltage sources built on one physical source contract."""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Any, Callable, ClassVar, Optional
 
 from ..solver.energy import Port, StoragePort
-from ..solver.model import Bag, ConfigError, Empty
+from ..solver.model import Empty, record_type
 from .network import Element, _phase_convention
-from .registry import register_component_type
+from .passive import RLBranch
 
-__all__ = ["ACVoltageSource", "VoltageSource"]
-
-
-class _SourceOutput(Bag):
-    __slots__ = ("e_g", "phi", "theta")
+__all__ = ["VoltageSource", "ACSource", "DCSource"]
 
 
-class ACVoltageSource(Element):
-    """Ideal single- or three-phase AC voltage source.
-
-    Three phases use ``E exp(j (w0 t + phi(t)))``; one phase uses its real cosine.
-    ``w0`` is in rad/s, ``e_peak`` in V and ``phi(t)`` is the relative angle in rad.
-    """
+class VoltageSource(Element):
+    """Common ideal voltage source and its existing series R-L branch."""
 
     state_names: ClassVar[tuple[str, ...]] = ()
     outputs_need_inputs: ClassVar[bool] = False
     storage: ClassVar[tuple[StoragePort, ...]] = ()
     has_source: ClassVar[bool] = True
+    source_signals: ClassVar[dict[str, str]] = {}
 
-    def __init__(self, w0: float, e_peak: float,
-                 phi: Optional[Callable[[float], float]] = None, *, phases: int = 3) -> None:
+    def __init__(self, output: Any, *, R: float = 0.0, L: float | None = None,
+                 phases: int, electrical_domain: str, breakable: bool) -> None:
         self.power_scale, zero, _ = _phase_convention(phases)
-        self.w0, self.e_peak, self.phases = w0, e_peak, phases
-        self.phi = phi
+        self.phases = phases
         self.state = Empty()
         self.input = Empty()
-        self.output = _SourceOutput()
-        self.output.e_g = zero
-        self.port = Port(
+        self.output = output
+        self.emf_port = Port(
             self, "power", voltage=zero, current=zero,
-            scale=self.power_scale, electrical_domain="ac",
+            scale=self.power_scale, electrical_domain=electrical_domain,
         )
-        self.ports = (self.port,)
-        self._output_equation = (self._set_three_phase_outputs if phases == 3
-                                 else self._set_single_phase_outputs)
-        if type(self).set_outputs is ACVoltageSource.set_outputs:
-            self.set_outputs = self._output_equation
+        self.ports = (self.emf_port,)
+        self.branch = RLBranch(R=R, L=L, phases=phases, breakable=breakable)
+        self.branch.port2.electrical_domain = electrical_domain
+        self.port = self.branch.port2
+
+    def set_parameters(self, *, voltage: float,
+                       r: float, l: float | None) -> bool:
+        """Apply source voltage and impedance through the shared parameter path."""
+        self.voltage = float(voltage)
+        return self.branch.set_parameters(r=r, l=l)
+
+    def declare(self, nb, node):
+        """Declare the ideal source at ``node`` and return its netlist primitive."""
+        from ..solver import netlist as nl
+
+        return nb.add(nl.VoltageSource(
+            node, None, nb.value(self.output, "voltage")
+        ))
+
+    def network(self, nb) -> None:
+        self.declare(nb, nb.node(self.emf_port))
+        nb.supplies(self)
+
+    def subsystems(self) -> dict[str, Any]:
+        return {self.name: self, f"{self.name}.branch": self.branch}
+
+    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
+        internal = f"{self.name}.source"
+        return ((internal, self.emf_port),
+                (internal, self.branch.port1),
+                (self.bus, self.port))
+
+    def output_bindings(self) -> dict[str, tuple[Any, str]]:
+        return {f"{self.name}.i": (self.branch, "i")}
+
+    def signals(self) -> dict[str, float | complex]:
+        return {
+            f"{self.name}.i": self.branch.output.i,
+            **{
+                f"{self.name}.{name}": getattr(self.output, field)
+                for name, field in self.source_signals.items()
+            },
+        }
+
+
+class ACSource(VoltageSource):
+    """Single- or three-phase sinusoidal voltage source behind a series R-L branch."""
+
+    Output = record_type("ACSourceOutput", ("voltage", "phi", "theta"))
+    source_signals = {"angle": "phi"}
+
+    def __init__(self, w0: float, e_peak: float,
+                 phi: Optional[Callable[[float], float]] = None, *,
+                 R: float = 0.0, L: float | None = None, phases: int = 3,
+                 breakable: bool = True) -> None:
+        _scale, zero, _ = _phase_convention(phases)
+        self.w0, self.voltage = w0, 0.0
+        self.phase = None
+        self.waveform = ((lambda angle: complex(math.cos(angle), math.sin(angle)))
+                         if phases == 3 else math.cos)
+        super().__init__(
+            self.Output(voltage=zero, phi=0.0, theta=0.0),
+            R=R, L=L, phases=phases, electrical_domain="ac", breakable=breakable,
+        )
+        self.set_parameters(voltage=e_peak, r=R, l=L, phase=phi)
+
+    def set_parameters(self, *, voltage: float, r: float,
+                       l: float | None, phase: Optional[Callable[[float], float]]) -> bool:
+        """Apply the AC magnitude, phase law and series impedance."""
+        self.phase = phase
+        return super().set_parameters(voltage=voltage, r=r, l=l)
 
     def set_outputs(self, t: float) -> None:
-        """Evaluate the phase representation selected when the source was constructed."""
-        self._output_equation(t)
-
-    def _set_single_phase_outputs(self, t: float) -> None:
-        phi = self.phi(t) if self.phi is not None else 0.0
+        phi = self.phase(t) if self.phase is not None else 0.0
         theta = self.w0 * t + phi
-        out = self.output
-        out.phi = phi
-        out.theta = theta
-        out.e_g = self.e_peak * math.cos(theta)
-
-    def _set_three_phase_outputs(self, t: float) -> None:
-        phi = self.phi(t) if self.phi is not None else 0.0
-        theta = self.w0 * t + phi
-        out = self.output
-        out.phi = phi
-        out.theta = theta
-        out.e_g = complex(self.e_peak * math.cos(theta), self.e_peak * math.sin(theta))
+        self.output.phi = phi
+        self.output.theta = theta
+        self.output.voltage = self.voltage * self.waveform(theta)
 
     @classmethod
     def uses_standard_outputs(cls, method: Any) -> bool:
-        """Whether ``method`` is one of the built-in phase-specialized source equations."""
-        return getattr(method, "__func__", None) in (
-            cls.set_outputs, cls._set_single_phase_outputs, cls._set_three_phase_outputs,
-        )
+        return getattr(method, "__func__", None) is cls.set_outputs
 
     def cpp_output_stage(self, generator: Any, method: Any):
-        """Use the configured native source scenario for the built-in waveform."""
         return (generator.source_output_lines(self)
                 if self.uses_standard_outputs(method) else None)
 
-    def rhs(self, t: float):
-        return ()
 
-    def voltage(self, t: float) -> complex | float:
-        """Evaluate and return the source's selected output equation."""
-        self._output_equation(t)
-        return self.output.e_g
+class DCSource(VoltageSource):
+    """Constant DC voltage source behind a series resistance."""
 
-    def network(self, nb):
-        """Declare an ideal voltage source from the port to ground."""
-        from ..solver import netlist as nl
+    Output = record_type("DCSourceOutput", ("voltage",))
 
-        nb.add(nl.VoltageSource(
-            nb.node(self.port), None, nb.value(self.output, "e_g")
-        ))
-        nb.supplies(self)
-
-
-
-class _VoltageSourceOutput(Bag):
-    __slots__ = ("i",)
-
-
-class _VoltageSourceModel(Element):
-    """Scalar voltage source behind a series resistance."""
-
-    state_names: ClassVar[tuple[str, ...]] = ()
-    outputs_need_inputs: ClassVar[bool] = False
-    storage: ClassVar[tuple[StoragePort, ...]] = ()
-
-    def __init__(self, voltage: float, resistance: float) -> None:
-        self.voltage, self.resistance = voltage, resistance
-        self.state = Empty()
-        self.input = Empty()
-        self.output = _VoltageSourceOutput(i=0.0)
-        self.port = Port(
-            self, "power", voltage=0.0, current=0.0,
-            electrical_domain="dc"
+    def __init__(self, voltage: float, *, R: float = 0.0,
+                 breakable: bool = False) -> None:
+        super().__init__(
+            self.Output(voltage=0.0), R=R, phases=1,
+            electrical_domain="dc", breakable=breakable,
         )
-        self.ports = (self.port,)
+        self.set_parameters(voltage=voltage, r=R, l=None)
 
-    def network(self, nb):
-        """Declare the source and its series resistance."""
-        from ..solver import netlist as nl
+    @property
+    def voltage(self) -> float:
+        return self.output.voltage
 
-        inner = nb.internal()
-        nb.add(nl.Resistor(nb.node(self.port), inner, self.resistance))
-        nb.add(nl.VoltageSource(
-            inner, None, nb.function(lambda _t: self.voltage)
-        ))
-        nb.port_output(self, "i", self.port, "current")
-        nb.losses(self)
-        nb.supplies(self)
-
-
-@register_component_type
-class VoltageSource(Element):
-    """Scalar named-bus voltage source behind a positive series resistance."""
-
-    @dataclass(frozen=True, kw_only=True)
-    class Params:
-        type: str = "voltage_source"
-        bus: str
-        v: float
-        r: float
-
-        _quantities = {"v": "voltage", "r": "resistance"}
-
-        def __post_init__(self) -> None:
-            if not math.isfinite(self.v):
-                raise ConfigError(f"v must be finite, got {self.v}")
-            if not math.isfinite(self.r) or self.r <= 0.0:
-                raise ConfigError(f"r must be finite and positive, got {self.r}")
-
-    type = "voltage_source"
-    signal_fields = {"i": "i"}
-
-    def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
-        if buses[cfg.bus].phases != 1:
-            raise ConfigError("a scalar voltage source needs a single-phase bus")
-        self.name, self.cfg = name, cfg
-        self.model = _VoltageSourceModel(cfg.v, cfg.r)
-
-    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
-        return ((self.cfg.bus, self.model.port),)
-
-    def retune(self, cfg: Any) -> bool:
-        changed = self.cfg.r != cfg.r
-        self.cfg = cfg
-        self.model.voltage, self.model.resistance = cfg.v, cfg.r
-        return changed
-
+    @voltage.setter
+    def voltage(self, value: float) -> None:
+        self.output.voltage = float(value)

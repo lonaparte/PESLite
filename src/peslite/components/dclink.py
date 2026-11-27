@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, ClassVar, Optional
+from typing import Any, ClassVar
 
 from ..control.blocks import smoothstep
 from ..solver.energy import Port, StoragePort
 from ..solver.model import Bag, Empty, OutputMethod, _real
 from .network import Element
+from .source import DCSource
 
 __all__ = [
-    "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "DCLink", "make_dclink",
+    "DCCapacitor", "DCLink", "make_dclink",
 ]
 
 
@@ -30,44 +31,6 @@ class DCCapacitor:
         self.state = _DCState(u_C=_real(u0))
 
 
-def _zero(t: float) -> float:
-    return 0.0
-
-
-class DCCurrentSource:
-    """Supply current ``ramp(t) i_nom + k_dc (u_ref - u_C)`` (A); may be negative.
-
-    ``k_dc`` is in A/V and ``u_ref`` in V. :meth:`connect` controls its nominal-current ramp.
-    """
-
-    def __init__(self, i_nom: float, k_dc: float = 0.0, u_ref: float = 0.0) -> None:
-        self.i_nom, self.k_dc, self.u_ref = _real(i_nom), _real(k_dc), _real(u_ref)
-        self.ramp: Optional[Callable[[float], float]] = None
-
-    def connect(self, on: bool, t: float, ramp: float = 0.0) -> None:
-        """Connect at ``t``, optionally with a smooth ramp, or disconnect the nominal current."""
-        if not on:
-            self.ramp = _zero
-        elif ramp <= 0.0:
-            self.ramp = None
-        else:
-            end = t + ramp
-            self.ramp = lambda at: 1.0 if at >= end else smoothstep((at - t) / ramp)
-
-    def __call__(self, t: float, u_C: float) -> float:
-        i = self.i_nom if self.ramp is None else self.ramp(t) * self.i_nom
-        if self.k_dc != 0.0:
-            i += self.k_dc * (self.u_ref - u_C)
-        return i
-
-
-class DCVoltageSource:
-    """Constant dc voltage source ``u_dc`` (V) with series resistance ``R`` (ohm)."""
-
-    def __init__(self, u_dc: float, R: float = 0.0) -> None:
-        self.u_dc, self.R = _real(u_dc), _real(R)
-
-
 class DCLink(Element):
     """DC link made of an optional capacitor and a current source, voltage source or no source.
 
@@ -84,20 +47,29 @@ class DCLink(Element):
     set_stored_voltage = Element.set_outputs
 
     def __init__(self, capacitor: DCCapacitor | None = None,
-                 source: DCCurrentSource | DCVoltageSource | None = None) -> None:
+                 source: DCSource | None = None,
+                 current: tuple[float, float, float] | None = None) -> None:
         if capacitor is not None and not isinstance(capacitor, DCCapacitor):
             raise TypeError("capacitor must be a DCCapacitor or None")
-        if source is not None and not isinstance(source, (DCCurrentSource, DCVoltageSource)):
-            raise TypeError("source must be a DCCurrentSource, DCVoltageSource or None")
-        if capacitor is None and not isinstance(source, DCVoltageSource):
+        if source is not None and not isinstance(source, DCSource):
+            raise TypeError("source must be a DCSource or None")
+        if source is not None and current is not None:
+            raise ValueError("a DC link cannot have both voltage and current supplies")
+        if capacitor is None and not isinstance(source, DCSource):
             raise ValueError("a DC link without a capacitor requires a voltage source")
-        if capacitor is not None and isinstance(source, DCVoltageSource) and source.R + capacitor.R_esr <= 0:
+        if (capacitor is not None and isinstance(source, DCSource)
+                and (source.branch.R or 0.0) + capacitor.R_esr <= 0):
             raise ValueError("a voltage source with a capacitor requires positive source resistance or ESR")
-        self.capacitor, self.source = capacitor, source
+        self.capacitor = capacitor
+        self.current_mode = current is not None
+        if current is not None:
+            self.i_nom, self.k_dc, self.u_ref = map(_real, current)
+            self.ramp = None
+        self.source = self if self.current_mode else source
         self.state = capacitor.state if capacitor is not None else Empty()
         self.state_names = ("u_C",) if capacitor is not None else ()
-        self.has_source = source is not None
-        u0 = capacitor.state.u_C if capacitor is not None else source.u_dc
+        self.has_source = source is not None or self.current_mode
+        u0 = capacitor.state.u_C if capacitor is not None else source.voltage
         self.input = Empty()
         self.output = _DCOutput(u_dc=u0, u_C=u0, i_src=0.0)
         self.port = Port(
@@ -110,6 +82,12 @@ class DCLink(Element):
         ),))
         self.tripped = False
 
+    def __call__(self, t: float, voltage: float) -> float:
+        current = self.i_nom if self.ramp is None else self.ramp(t) * self.i_nom
+        if self.k_dc != 0.0:
+            current += self.k_dc * (self.u_ref - voltage)
+        return current
+
     def open_breaker(self) -> None:
         """Disconnect the source from the capacitor; a link without capacitor is unchanged."""
         self.tripped = True
@@ -120,19 +98,23 @@ class DCLink(Element):
 
     def connect(self, on: bool, t: float, ramp: float = 0.0) -> None:
         """Connect or disconnect the source; current sources honor the connection ramp."""
-        if isinstance(self.source, DCCurrentSource):
-            self.source.connect(on, t, ramp)
+        if self.current_mode:
+            if not on:
+                self.ramp = lambda _at: 0.0
+            elif ramp <= 0.0:
+                self.ramp = None
+            else:
+                end = t + ramp
+                self.ramp = lambda at: 1.0 if at >= end else smoothstep((at - t) / ramp)
 
-    def retune_source(self, i: float, k: float, v: float, r: float) -> bool:
-        """Retune the source and report whether its network declaration changed."""
+    def set_source_parameters(self, i: float, k: float, v: float, r: float) -> bool:
+        """Apply source parameters and report whether its network declaration changed."""
         source = self.source
-        if isinstance(source, DCCurrentSource):
-            source.i_nom, source.k_dc = float(i), float(k)
+        if source is self:
+            self.i_nom, self.k_dc = float(i), float(k)
             return False
-        elif isinstance(source, DCVoltageSource):
-            changed = source.R != r
-            source.u_dc, source.R = float(v), float(r)
-            return changed
+        elif isinstance(source, DCSource):
+            return source.set_parameters(voltage=v, r=r, l=None)
         return False
 
     def network(self, nb):
@@ -149,7 +131,7 @@ class DCLink(Element):
                 inner, None, capacitor.C, nb.state(self, "u_C")
             ))
             nb.output(self, "u_C", ("branch_voltage", capacitor_element))
-        if isinstance(source, DCCurrentSource):
+        if source is self:
             supply = nb.add(nl.CurrentSource(
                 None,
                 node,
@@ -160,20 +142,19 @@ class DCLink(Element):
                 ),
             ))
             nb.output(self, "i_src", ("branch_current", supply))
-        elif isinstance(source, DCVoltageSource):
-            emf = nb.internal() if source.R or capacitor is not None else node
-            supply = nb.add(nl.VoltageSource(
-                emf, None, nb.function(lambda _t: self.source.u_dc)
-            ))
+        elif isinstance(source, DCSource):
+            resistance = source.branch.R
+            emf = nb.internal() if resistance or capacitor is not None else node
+            supply = source.declare(nb, emf)
             nb.linear_output(self, "i_src", ((-1.0, ("branch_current", supply)),))
             if capacitor is None:
                 nb.output(self, "u_C", ("branch_voltage", supply))
             if capacitor is not None:
-                connected = nb.internal() if source.R else node
+                connected = nb.internal() if resistance else node
                 nb.add(nl.Switch(emf, connected, nb.value(self, "tripped", invert=True)))
                 emf = connected
-            if source.R:
-                nb.add(nl.Resistor(emf, node, source.R))
+            if resistance:
+                source.branch.declare_network(nb, emf, node)
         else:
             nb.linear_output(self, "i_src", ())
         nb.losses(self)
@@ -187,11 +168,11 @@ def make_dclink(cfg: Any) -> DCLink:
         capacitor = DCCapacitor(cfg.vdc_ref, cfg.capacitor.c, cfg.capacitor.r_esr)
     p = cfg.source
     if p.type == "current":
-        source = DCCurrentSource(p.i, p.k, cfg.vdc_ref)
+        source, current = None, (p.i, p.k, cfg.vdc_ref)
     elif p.type == "voltage":
-        source = DCVoltageSource(p.v, p.r)
+        source, current = DCSource(p.v, R=p.r), None
     elif p.type == "none":
-        source = None
+        source = current = None
     else:
         raise ValueError(f"unknown DC source type {p.type!r}")
-    return DCLink(capacitor, source)
+    return DCLink(capacitor, source, current)

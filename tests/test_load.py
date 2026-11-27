@@ -76,7 +76,7 @@ def test_every_system_element_uses_the_same_assembly_contract(case):
 
     source = system.sources["grid"]
     assert source.port_bindings() == (
-        ("grid.source", source.emf.port),
+        ("grid.source", source.emf_port),
         ("grid.source", source.branch.port1),
         ("pcc", source.branch.port2),
     )

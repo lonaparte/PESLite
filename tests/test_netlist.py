@@ -13,7 +13,7 @@ import peslite
 from conftest import EXAMPLES, QUIET
 from peslite.assembly.circuit import (Circuit, NetlistBuilder, NetworkView, _live_statements,
                                       _ModeStructure, bind_device, compile_network)
-from peslite.components.source import ACVoltageSource
+from peslite.components.source import ACSource
 from peslite.solver import FixedStepSolver
 from peslite.solver import netlist as nl
 from peslite.solver.netlist import (Capacitor, CurrentSource, Diode, Inductor, Netlist, Node,
@@ -406,16 +406,16 @@ def test_coefficient_producer_can_guarantee_its_assembled_range():
 
 
 def test_custom_ac_waveform_remains_the_source_of_its_declared_netlist():
-    class CustomSource(ACVoltageSource):
+    class CustomSource(ACSource):
         def set_outputs(self, t):
-            self.output.e_g = 40.0 + t
+            self.output.voltage = 40.0 + t
 
     source = CustomSource(2.0 * np.pi * 50.0, 325.0, phases=1)
     declaration = compile_network(source)
     assert declaration is not None
     bind_device("source", source, declaration)
     source.set_outputs(2.0)
-    assert source.output.e_g == 42.0
+    assert source.output.voltage == 42.0
 
 
 @pytest.mark.parametrize("form", FORMS)

@@ -9,26 +9,25 @@ from ..solver import Bag, ConfigError, Empty, Port, StoragePort
 from .network import Element, GROUND, resolve_endpoints
 from .registry import register_component_type
 from .passive import Bus, Capacitor, ParallelRLC, Passive, Resistor, RLBranch, SeriesRLC
-from .source import ACVoltageSource, VoltageSource
+from .source import ACSource, DCSource, VoltageSource
 from .converter import (AveragingModel, FullBridge, HalfBridge,
                         HalfBridgeDiodeConduction, PWMAveragingModel,
                         SwitchingModel, ThreePhaseBridge, make_bridge)
-from .dclink import (DCCapacitor, DCCurrentSource, DCLink, DCVoltageSource,
-                     make_dclink)
+from .dclink import DCCapacitor, DCLink, make_dclink
 from .adc import ADC, ADCSample, MeasurementPorts
 from .pwm import (ZOH, CarrierComparison, PWM, PhaseShiftModulator, SwitchingSequence,
                   SynchronousCarrier, make_modulator)
 from .onnx import ONNXModel, ONNXStateParams
 from .cable import BergeronCableModel, Cable, LumpedCableModel
 
-__all__ = ["Port", "Element", "Passive", "ACVoltageSource", "Bus", "SeriesRLC", "ParallelRLC",
+__all__ = ["Port", "Element", "Passive", "VoltageSource", "ACSource", "DCSource",
+           "Bus", "SeriesRLC", "ParallelRLC",
            "RLBranch", "Capacitor", "Resistor",
            "Bag", "Empty", "ConfigError", "StoragePort",
            "register_component_type", "resolve_endpoints", "GROUND",
-           "VoltageSource",
            "ThreePhaseBridge", "SwitchingModel",
            "PWMAveragingModel", "make_bridge", "DCLink",
-           "DCCapacitor", "DCCurrentSource", "DCVoltageSource",
+           "DCCapacitor",
            "make_dclink", "ADC", "ADCSample",
            "MeasurementPorts", "AveragingModel", "HalfBridge",
            "FullBridge", "HalfBridgeDiodeConduction", "PWM", "SwitchingSequence",

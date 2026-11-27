@@ -13,7 +13,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 from ..components.network import Element, GROUND, Port, resolve_endpoints
 from ..components.registry import ELEMENT_TYPES
 from ..components.passive import Bus, RLBranch
-from ..components.source import ACVoltageSource
+from ..components.source import ACSource
 from ..components.adc import _PortMeasurement
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather, scatter
@@ -199,49 +199,35 @@ def _source_scenario(p: Params, path: str, select: Callable[[Params], Any]) -> S
     return SourceScenario(select(p), p.base.f0, steps)
 
 
-class Source(Element):
-    """Voltage source (emf) behind a series R-L branch."""
+def assemble_source(name: str, p: Params, t0: float, phases: int) -> ACSource:
+    """Construct one configured AC source without a separate assembly wrapper."""
+    cfg, base = p.sources[name], p.base
+    scenario = _source_scenario(p, f"sources.{name}", lambda q: q.sources[name])
+    source = _parameterized(
+        lambda values: ACSource(
+            values[0].w0, *scenario.law(t0), R=values[1].r, L=values[1].l,
+            phases=values[2],
+        ), (base, cfg, phases),
+    )
+    source.name, source.bus, source.cfg = name, cfg.bus, cfg
+    source.scenario = scenario
+    return source
 
-    def __init__(self, name: str, p: Params, t0: float, phases: int) -> None:
-        cfg, base = p.sources[name], p.base
-        self.name, self.cfg = name, cfg
-        self.scenario = _source_scenario(p, f"sources.{name}", lambda q: q.sources[name])
-        self.emf = _parameterized(
-            lambda values: ACVoltageSource(
-                values[0].w0, *self.scenario.law(t0), phases=values[1]
-            ), (base, phases))
-        self.branch = _parameterized(
-            lambda values: RLBranch(L=values[0].l, R=values[0].r, phases=values[1]),
-            (cfg, phases),
-        )
-        self.branch.port2.electrical_domain = "ac"
-        self.port = self.branch.port2
 
-    def retune(self, cfg, paths: list[str], t: float) -> bool:
-        """Apply source parameters and report whether its network declaration changed."""
-        self.cfg = cfg
-        network_changed = False
-        if "l" in paths or "r" in paths:
-            network_changed = self.branch.set_parameters(l=cfg.l, r=cfg.r)
-        if "v" in paths or "f" in paths or "angle" in paths:
-            voltage, phase = self.scenario.law(t)
-            if "v" in paths:
-                self.emf.e_peak = voltage
-            if "f" in paths or "angle" in paths:
-                self.emf.phi = phase
-        return network_changed
-
-    def subsystems(self) -> dict[str, Any]:
-        return {f"{self.name}.emf": self.emf, f"{self.name}.branch": self.branch}
-
-    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
-        internal = f"{self.name}.source"
-        return ((internal, self.emf.port),
-                (internal, self.branch.port1),
-                (self.cfg.bus, self.port))
-
-    def signals(self) -> dict[str, float | complex]:
-        return {f"{self.name}.i": self.branch.output.i, f"{self.name}.angle": self.emf.output.phi}
+def set_source_parameters(source: ACSource, cfg: Any,
+                          paths: list[str], t: float) -> bool:
+    """Resolve the source timeline and apply it through the common parameter path."""
+    voltage, phase = source.voltage, source.phase
+    if "v" in paths or "f" in paths or "angle" in paths:
+        resolved_voltage, resolved_phase = source.scenario.law(t)
+        if "v" in paths:
+            voltage = resolved_voltage
+        if "f" in paths or "angle" in paths:
+            phase = resolved_phase
+    source.cfg = cfg
+    return source.set_parameters(
+        voltage=voltage, r=cfg.r, l=cfg.l, phase=phase,
+    )
 
 
 class Branch(Element):
@@ -410,7 +396,7 @@ class System:
             return port.bus if port is not None else name
 
         self.sources = {
-            name: Source(
+            name: assemble_source(
                 name, p, p.simulation.initial.t, network_buses[cfg.bus].phases
             )
             for name, cfg in p.sources.items()
@@ -710,7 +696,7 @@ class System:
         ``rated``: the unit's rated dc voltage (V); ``source``: the emf at the state's bus (V).
         """
         for src in self.sources.values():
-            src.emf.set_outputs(t)
+            src.set_outputs(t)
 
         def preset(key: str, word: str):
             head = _unit_path(self.p.units, key) or key.partition(".")[0]
@@ -725,11 +711,11 @@ class System:
                 if internal is not None:
                     return internal
                 bus = self.units[head].cfg.bus if head in self.units else head
-                at_bus = [s.emf.output.e_g for s in self.sources.values() if s.cfg.bus == bus]
+                at_bus = [s.output.voltage for s in self.sources.values() if s.cfg.bus == bus]
                 if at_bus:
                     return at_bus[0]
                 if len(self.sources) == 1:
-                    return next(iter(self.sources.values())).emf.output.e_g
+                    return next(iter(self.sources.values())).output.voltage
                 raise ValueError(f"{key}: 'source' needs a source at bus {bus!r}, or exactly one "
                                  f"source in the system (there are {len(self.sources)})")
             raise ValueError(f"{key}: unknown keyword {word!r} (keywords here: rated, source)")
@@ -798,8 +784,10 @@ class System:
                         l=p.branches[name].l, r=p.branches[name].r,
                     )
                 elif section == "sources":
-                    network_changed |= self.sources[name].retune(
-                        p.sources[name], change.touches(f"sources.{name}."), change.t)
+                    network_changed |= set_source_parameters(
+                        self.sources[name], p.sources[name],
+                        change.touches(f"sources.{name}."), change.t,
+                    )
                 elif section == "units":
                     network_changed |= self.units[name].retune(
                         p.unit(name), change.touches(f"units.{name}."), change.t)

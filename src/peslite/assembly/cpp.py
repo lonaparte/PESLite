@@ -37,7 +37,7 @@ import numpy as np
 from ..defaults import (DEFAULT_COMMUTATION_LOCATOR_ITERATIONS,
                         DEFAULT_COMMUTATION_MAX_TRANSITIONS)
 from ..components.passive import SeriesRLC
-from ..components.source import ACVoltageSource
+from ..components.source import ACSource
 from ..components.pwm import (_EPS, _SNAP, CarrierComparison, SynchronousCarrier, PhaseClock,
                                PhaseShiftModulator, ZOH)
 from ..components.pwm import PHASE_SHIFT_MODES
@@ -3305,12 +3305,12 @@ class _ModelGenerator:
         terms = [f"({_number(gain)} * {self.value(out, name)})" for out, name, gain in fanin]
         return " + ".join(terms) if terms else "0.0"
 
-    def _source_values(self, source: ACVoltageSource) -> tuple[str, str]:
+    def _source_values(self, source: ACSource) -> tuple[str, str]:
         entry = next(((name, item) for name, item in self.system.sources.items()
-                      if item.emf is source), None)
+                      if item is source), None)
         wrapper = entry[1] if entry is not None else None
         if wrapper is None:
-            return _number(source.e_peak), "0.0"
+            return _number(source.voltage), "0.0"
         source_name = entry[0]
         self.event_parameter_bindings.update(
             (f"sources.{source_name}.{field}", (False, None))
@@ -3343,7 +3343,9 @@ class _ModelGenerator:
         voltage = (f"({magnitude}) * std::cos({theta})" if source.phases == 1 else
                    f"({magnitude}) * Complex{{std::cos({theta}), std::sin({theta})}}")
         return {"phi": _Expression(phi, "real"), "theta": _Expression(theta, "real"),
-                "e_g": _Expression(voltage, "real" if source.phases == 1 else "complex")}
+                "voltage": _Expression(
+                    voltage, "real" if source.phases == 1 else "complex"
+                )}
 
     def _output(self, method: Any) -> list[str]:
         owner = method.__self__
@@ -3388,7 +3390,7 @@ class _ModelGenerator:
             )
         return attributes
 
-    def source_output_lines(self, source: ACVoltageSource) -> list[str]:
+    def source_output_lines(self, source: ACSource) -> list[str]:
         """Render one source's configured native waveform."""
         return [
             f"{self.value(source.output, field)} = {value.code};"
@@ -8541,19 +8543,22 @@ class _CppGenerator:
         t0 = self.p.simulation.initial.t
         for name, source in self.system.sources.items():
             view = copy.copy(source)
-            if ACVoltageSource.uses_standard_outputs(source.emf.set_outputs):
-                expression = model._source_equations(source.emf, _number(t0))["e_g"]
+            if ACSource.uses_standard_outputs(source.set_outputs):
+                expression = model._source_equations(source, _number(t0))["voltage"]
             else:
                 def read():
-                    clone = model._equation_clone(source.emf)
+                    clone = model._equation_clone(source)
                     clone.set_outputs(_Expression(_number(t0), "real"))
-                    return clone.output.e_g
+                    return clone.output.voltage
                 expression = model._trace(read)
-            value = _InitializationExpression.make(expression, source.emf.output.e_g, self.runtime)
+            value = _InitializationExpression.make(
+                expression, source.output.voltage, self.runtime
+            )
             # The normal preset resolver asks the source for its value once. Its AOT source
             # adapter has already evaluated that same expression at the initial instant.
-            view.emf = SimpleNamespace(set_outputs=lambda _t: None,
-                                       output=SimpleNamespace(e_g=value))
+            view.set_outputs = lambda _t: None
+            view.output = copy.copy(source.output)
+            view.output.voltage = value
             system.sources[name] = view
         simulation = copy.copy(self.simulation)
         simulation.system, simulation.p = system, self.p

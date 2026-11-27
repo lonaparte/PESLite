@@ -422,7 +422,7 @@ def test_fixed_adaptive_multirate_and_user_solver_use_the_right_model_at_event(k
                 assert t >= event_t - 1e-14
             else:
                 assert source.branch.R == old_resistance
-                assert source.emf.output.phi == 0.0
+                assert source.output.phi == 0.0
             seen.append((t, changed))
             return value
         return watched
@@ -433,7 +433,7 @@ def test_fixed_adaptive_multirate_and_user_solver_use_the_right_model_at_event(k
     simulation.run(out_dir=tmp_path)
 
     assert any(abs(t - event_t) < 1e-14 and not after for t, after in seen)
-    assert source.emf.output.phi == 0.1
+    assert source.output.phi == 0.1
     assert source.branch.R == pytest.approx(2 * old_resistance)
     if kind == "multirate":
         ends = np.array([entry[0] for entry in simulation.solver.window_log])

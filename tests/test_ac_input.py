@@ -6,7 +6,7 @@ import pytest
 
 import peslite
 from peslite.assembly.params import ConfigError, from_dict
-from peslite.components.source import ACVoltageSource
+from peslite.components.source import ACSource
 
 
 def _rectifier_tree(source_bus="rectifier.power"):
@@ -36,22 +36,22 @@ def _rectifier_tree(source_bus="rectifier.power"):
 
 def test_ac_source_representation_follows_the_connected_phase_count():
     angle = lambda _t: 0.3
-    single = ACVoltageSource(2.0 * math.pi * 50.0, 325.0, angle, phases=1)
-    three = ACVoltageSource(2.0 * math.pi * 50.0, 325.0, angle, phases=3)
+    single = ACSource(2.0 * math.pi * 50.0, 325.0, angle, phases=1)
+    three = ACSource(2.0 * math.pi * 50.0, 325.0, angle, phases=3)
 
     for source in (single, three):
         source.set_outputs(1.0e-3)
         assert source.port.electrical_domain == "ac"
-    assert isinstance(single.output.e_g, float)
-    assert isinstance(three.output.e_g, complex)
-    assert single.output.e_g == pytest.approx(three.output.e_g.real)
+    assert isinstance(single.output.voltage, float)
+    assert isinstance(three.output.voltage, complex)
+    assert single.output.voltage == pytest.approx(three.output.voltage.real)
 
 
 def test_single_phase_source_connects_directly_to_converter_power_port(tmp_path):
     simulation = peslite.Simulation(from_dict(_rectifier_tree()))
     source = simulation.system.sources["line"]
 
-    assert source.emf.phases == 1
+    assert source.phases == 1
     assert source.branch.phases == 1
     assert simulation.system._unit_port_bindings["rectifier.dclink"][0].electrical_domain == "dc"
     result = simulation.run(out_dir=tmp_path)

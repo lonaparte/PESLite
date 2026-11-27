@@ -339,7 +339,7 @@ class Unit(Element, ABC):
         self._bind_control_semantics()
         if any(path.startswith("dclink.source.") for path in paths):
             source = cfg.dclink.source
-            network_changed = self.dclink.retune_source(
+            network_changed = self.dclink.set_source_parameters(
                 source.i, source.k, source.v, source.r
             )
         rest = [path for path in paths if not path.startswith(("dclink.", "protection."))]

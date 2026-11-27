@@ -664,7 +664,7 @@ def test_native_vsc_uses_the_same_measurement_binding_and_rms(mode, method, tmp_
     params = peslite.load(EXAMPLES / "gfl-example.pes").replace(**{
         "units.vsc.bridge.model": mode,
         "units.vsc.pwm.method": method,
-        "units.vsc.meas.sources": {"u_g": "grid.emf.e_g", "i_c": "vsc.branch_f.i"},
+        "units.vsc.meas.sources": {"u_g": "grid.voltage", "i_c": "vsc.branch_f.i"},
         "units.vsc.meas.rms": {"i_c": 1e-3},
         "units.vsc.protection.overcurrent.enable": False,
         "units.vsc.protection.undervoltage.enable": False,

@@ -248,12 +248,12 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     assert bus.state.u_C == 3 + 4j
     assert (bus.C, bus.R_d) == (current.buses["pcc"].c, current.buses["pcc"].r_d)
     assert source.branch.state.i == 5 + 6j
-    assert (source.branch.L, source.branch.R, source.emf.e_peak) == pytest.approx(
+    assert (source.branch.L, source.branch.R, source.voltage) == pytest.approx(
         (current.sources["grid"].l, current.sources["grid"].r,
          current.sources["grid"].v)
     )
-    assert source.emf.phi(change.t) == pytest.approx(0.1)
-    assert source.emf.phi(change.t + 0.001) == pytest.approx(0.1 + 2 * np.pi * 0.001)
+    assert source.phase(change.t) == pytest.approx(0.1)
+    assert source.phase(change.t + 0.001) == pytest.approx(0.1 + 2 * np.pi * 0.001)
     assert line.state.i == 6 + 7j
     assert (line.L, line.R) == (current.branches["line"].l, current.branches["line"].r)
     assert load.state.i == 7 + 8j and load.R == current.elements["load"].r
