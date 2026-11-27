@@ -10,12 +10,11 @@ from .network import Element, GROUND, resolve_endpoints
 from .registry import register_component_type
 from .passive import Bus, Capacitor, ParallelRLC, Passive, Resistor, RLBranch, SeriesRLC
 from .source import ACVoltageSource, VoltageSource
-from .converter import (AveragingModel, PWMAveragingModel, SwitchingModel,
-                        ThreePhaseBridge,
-                        DCCapacitor, DCCurrentSource, DCLink,
-                        DCVoltageSource, FullBridge, HalfBridge,
-                        HalfBridgeDiodeConduction,
-                        make_bridge, make_dclink)
+from .converter import (AveragingModel, FullBridge, HalfBridge,
+                        HalfBridgeDiodeConduction, PWMAveragingModel,
+                        SwitchingModel, ThreePhaseBridge, make_bridge)
+from .dclink import (DCCapacitor, DCCurrentSource, DCLink, DCVoltageSource,
+                     make_dclink)
 from .adc import ADC, ADCSample, MeasurementPorts
 from .pwm import (ZOH, CarrierComparison, PWM, PhaseShiftModulator, SwitchingSequence,
                   SynchronousCarrier, make_modulator)

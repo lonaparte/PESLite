@@ -9,7 +9,7 @@ import pytest
 from peslite.assembly.cpp import (_ALGEBRAIC_SOLVER, _ControlGenerator, _ModelGenerator,
                                   _RuntimeParameters, _number, _uses_implementation)
 from peslite.components import Bag
-from peslite.components.converter import DCCapacitor, DCLink, DCVoltageSource
+from peslite.components.dclink import DCCapacitor, DCLink, DCVoltageSource
 from peslite.components.passive import RLBranch
 from peslite.components.source import ACVoltageSource
 from peslite.solver.model import Empty, Model

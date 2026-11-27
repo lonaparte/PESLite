@@ -18,8 +18,8 @@ from typing import Any, Callable, Iterator, Mapping, Optional
 import numpy as np
 
 from ..components.adc import ADC, ADCSample, MeasurementPorts, _PortMeasurement
-from ..components.converter import (HalfBridgeDiodeConduction, make_bridge, make_dclink,
-                                    make_topology)
+from ..components.converter import HalfBridgeDiodeConduction, make_bridge, make_topology
+from ..components.dclink import make_dclink
 from ..components.network import Element, Port
 from ..components.passive import RLBranch
 from ..components.pwm import Modulator

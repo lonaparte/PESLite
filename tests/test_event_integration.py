@@ -72,7 +72,7 @@ def test_explicit_initial_command_keeps_source_and_controller_consistent(connect
 
 @pytest.mark.parametrize("name", ["gfl", "buck", "wpt"])
 def test_connection_commands_are_initialized_once_after_assembly(name, monkeypatch):
-    from peslite.components.converter import DCLink
+    from peslite.components.dclink import DCLink
 
     calls = []
     connect = DCLink.connect
