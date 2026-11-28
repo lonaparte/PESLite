@@ -10,7 +10,7 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite import BlackBoxSubsystem, Simulation
-from peslite.assembly.params import from_dict
+from peslite.assembly.syntax import from_dict
 from peslite.components import register_component_type
 from peslite.components.network import Element
 from peslite.solver import Bag, Model, StateRegistry

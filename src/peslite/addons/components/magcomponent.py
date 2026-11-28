@@ -11,7 +11,7 @@ from typing import Any, ClassVar, Mapping, Optional, Sequence
 
 import numpy as np
 
-from ...assembly.params import _parameterized, register_unit_type, unit_type
+from ...assembly.syntax import _parameterized, register_unit_type, unit_type
 from ...assembly.system import _UnitAssembly, _assemble_unit, _part
 from ...components.network import GROUND, Element, resolve_endpoints
 from ...components.registry import register_component_type

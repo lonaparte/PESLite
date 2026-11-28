@@ -194,7 +194,7 @@ def test_registers_are_validated():
 import copy  # noqa: E402
 
 import peslite  # noqa: E402
-from peslite.assembly.params import ConfigError, from_dict, read_initial  # noqa: E402
+from peslite.assembly.syntax import ConfigError, from_dict, read_initial  # noqa: E402
 from peslite.control.loops import LOOP_TYPES  # noqa: E402
 
 from test_wpt_rectifier import F, SS, V1, _rectifier, _reference  # noqa: E402

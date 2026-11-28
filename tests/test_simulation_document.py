@@ -8,7 +8,7 @@ import pytest
 from peslite.assembly.syntax import (
     SimulationFileError, parse_native_text, parse_simulation_text,
 )
-from peslite.assembly.params import read_initial
+from peslite.assembly.syntax import read_initial
 
 pytestmark = pytest.mark.static
 

@@ -2,7 +2,7 @@
 
 The PESLite frontend draws a topology of buses, devices and connections, edits flat system
 parameters, plots named signals and shows small-signal modes. This module derives those views from
-an ordinary :class:`~peslite.assembly.params.Params` tree and read-only run observations; it adds
+an ordinary :class:`~peslite.assembly.syntax.Params` tree and read-only run observations; it adds
 no simulation behaviour.
 """
 
@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 
-from ..assembly.params import Params, _unit_items, flat_paths, to_dict, unit_type
+from ..assembly.syntax import Params, _unit_items, flat_paths, to_dict, unit_type
 from ..components.network import GROUND, element_buses
 from ..control.blocks import complex2abc
 

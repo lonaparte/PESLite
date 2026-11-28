@@ -8,7 +8,7 @@ import peslite
 import pytest
 
 from conftest import EXAMPLES
-from peslite.assembly.params import from_dict, to_dict
+from peslite.assembly.syntax import from_dict, to_dict
 from peslite.control import DUTY_RATIO, ControlGraph, Loop, register_loop_type
 from peslite.defaults import DEFAULT_LINEARIZATION_RELATIVE_STEP
 from peslite.solver.linearization import linearize_loop

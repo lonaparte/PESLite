@@ -44,7 +44,7 @@ def test_topology_references_only_existing_components(case):
 def test_topology_renders_one_shared_explicit_ground(tmp_path):
     path = tmp_path / "ground.pes"
     path.write_text("@circuit\nsource -- node -- shunt -- ground\n", encoding="utf-8")
-    params = peslite.assembly.params.from_dict({
+    params = peslite.assembly.syntax.from_dict({
         "base": {"s_base": 1000.0, "v_ll_rms": 100.0, "f0": 50.0},
         "buses": {"node": {"phases": 1}},
         "branches": {

@@ -20,7 +20,7 @@ import traceback
 from pathlib import Path
 from typing import Any, TextIO
 
-from ..assembly.params import load
+from ..assembly.syntax import load
 from ..cli import _example_configs_dir
 from ..solver.simulation import Simulation, validate_model
 from .descriptor import SignalRecorder, Topology, json_safe, small_signal_descriptor

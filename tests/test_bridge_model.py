@@ -10,7 +10,7 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import ConfigError, _unit_items, read_tree
+from peslite.assembly.syntax import ConfigError, _unit_items, read_tree
 from peslite.assembly.syntax import parse_native_text
 from peslite.components.pwm import modulator_type
 from peslite.assembly.control import control_type

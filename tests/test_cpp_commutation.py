@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 import peslite
-from peslite.assembly.params import from_dict, read_initial
+from peslite.assembly.syntax import from_dict, read_initial
 from peslite.solver.model import Bag, Empty, Model
 from test_cpp_parameters import _case as _example, _compare_run, _compile, _table
 from test_phase_shift import _phase_shift, _ps_tree

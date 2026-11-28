@@ -13,7 +13,7 @@ from collections.abc import Iterable
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, Callable
 
-from .params import Params
+from .syntax import Params
 
 if TYPE_CHECKING:  # pragma: no cover - imports used only by type checkers
     from ..solver.simulation import Simulation

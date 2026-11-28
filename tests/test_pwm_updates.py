@@ -8,14 +8,14 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import from_dict, read_initial
+from peslite.assembly.syntax import from_dict, read_initial
 from peslite.components.pwm import (CarrierComparison, _DeadTimeSequence, PulseSequence,
                                     SwitchingSequence, SynchronousCarrier)
 from test_cpp_parameters import _case, _compare_run, _compile
 
 
 def _with_explicit_pwm_defaults(params):
-    from peslite.assembly.params import _unit_items
+    from peslite.assembly.syntax import _unit_items
 
     return params.replace(**{
         path: value
@@ -184,9 +184,9 @@ def test_pwm_register_layout_rejects_state_collisions(registers, modulator, matc
 @pytest.mark.parametrize("example", ["gfl", "buck", "wpt"])
 @pytest.mark.parametrize("mode", ["switching", "pwm_averaging", "averaging"])
 def test_explicit_default_does_not_add_policy_or_state(example, mode):
-    from peslite.assembly.params import read_tree
+    from peslite.assembly.syntax import read_tree
     tree = read_tree(EXAMPLES / f"{example}-example.pes")
-    from peslite.assembly.params import _unit_items
+    from peslite.assembly.syntax import _unit_items
     initial = from_dict(tree)
     changes = {f"units.{name}.bridge.model": mode for name, _ in _unit_items(initial.units)}
     omitted = initial.replace(**changes)
@@ -257,7 +257,7 @@ def test_switching_continuation_restores_the_applied_waveform(
 def test_native_carrier_pulse_updates_match_python(example, synchronous, update, control_offset, restart,
                                                    variables, tmp_path):
     params = _case(example, "switching")
-    from peslite.assembly.params import _unit_items
+    from peslite.assembly.syntax import _unit_items
     changes = {f"units.{name}.pwm.pattern_sync": update for name, _ in _unit_items(params.units)}
     changes["simulation.t_end"] = 80e-6 if example == "wpt" else .001
     if synchronous:

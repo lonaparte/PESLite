@@ -19,7 +19,7 @@ import pytest
 
 import peslite
 from reference_metrics import check_comparison
-from peslite.assembly.params import from_dict
+from peslite.assembly.syntax import from_dict
 
 pytest.importorskip(
     "motulator", reason="install the Motulator reference dependency"

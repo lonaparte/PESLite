@@ -17,7 +17,7 @@ from typing import Any, Callable, Iterator, Mapping, Optional
 
 import numpy as np
 
-from ..components.adc import ADC, ADCSample, MeasurementPorts, _PortMeasurement
+from ..components.adc import ADC, ADCSample, MeasurementPorts, PortMeasurement
 from ..components.converter import HalfBridgeDiodeConduction, make_bridge, make_topology
 from ..components.dclink import make_dclink
 from ..components.network import Element, Port
@@ -29,7 +29,7 @@ from ..control.controller import (Controller, ConverterMeasurement,
 from ..solver.timing import TIME_EPS, PeriodicClock, resolve_clock_offset
 from .events import Scenario
 from .control import control_profile, make_control_modulator, make_controller
-from .params import SimulationParams, UnitParams, _parameterized, unit_type
+from .syntax import SimulationParams, UnitParams, _parameterized, unit_type
 from .protection import Protection, ProtectionSample
 
 __all__ = ["Plant", "Unit", "VSC", "DCConverter"]
@@ -933,7 +933,7 @@ class DCConverter(Unit):
             if needs_power:
                 self.ctrl.bind_power_port(self._power_port)
         self.power_measurement = (
-            _PortMeasurement(self._power_port)
+            PortMeasurement(self._power_port)
             if self.continuous and (needs_power or self.branch_f is None) else None
         )
         if self.branch_f is None:

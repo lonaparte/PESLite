@@ -12,7 +12,7 @@ from peslite.addons.functions.offline_analysis import (
     measure_multitone, measure_port_matrix, measure_recorded_transfer,
     measure_recorded_sweep, recorded_signal, run_port_matrix, run_port_sweep,
 )
-from peslite.assembly.params import from_dict
+from peslite.assembly.syntax import from_dict
 
 
 def _fake_result(t, *, scalar=None, vectors=None, ctrl=None):

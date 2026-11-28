@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 import peslite
-from peslite.assembly.params import ConfigError
+from peslite.assembly.syntax import ConfigError
 
 
 def _progress(*args):

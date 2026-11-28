@@ -9,7 +9,7 @@ import numpy as np
 from peslite.addons.functions.online_analysis import small_signal, small_signal_report
 from peslite.solver.commutation import Commutation
 from peslite.assembly.cpp import _CppGenerator
-from peslite.assembly.params import OutputParams, PWMParams, SolverParams
+from peslite.assembly.syntax import OutputParams, PWMParams, SolverParams
 from peslite.components.pwm import (CarrierComparison, PhaseShiftModulator,
                                     SynchronousCarrier, carrier)
 from peslite.control.controller import ControlGraph

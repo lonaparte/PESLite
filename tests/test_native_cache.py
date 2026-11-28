@@ -8,7 +8,7 @@ import pytest
 
 import peslite
 from peslite import cli
-from peslite.assembly.params import from_dict
+from peslite.assembly.syntax import from_dict
 from peslite.cli import _export_main
 
 

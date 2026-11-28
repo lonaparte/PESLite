@@ -26,7 +26,7 @@ from peslite.addons.functions.magcircuit import (
     export_magnetic_circuit, reluctance_inductance,
 )
 from peslite.addons.functions.magport import magnetic_field, write_magport
-from peslite.assembly.params import from_dict
+from peslite.assembly.syntax import from_dict
 from peslite.addons.components.magcomponent import (
     CoupledCoilsModel,
     MagneticBranchDescription,

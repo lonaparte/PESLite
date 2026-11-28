@@ -123,7 +123,7 @@ def _event_data(config: Mapping, locations: Mapping[str, dict], params: Any,
                                "line": locations.get(f"events.{name}", {}).get("start", {}).get("line", 1)})
 
     from ..assembly.events import _initial_connection, switching_schedule
-    from ..assembly.params import connection_defaults
+    from ..assembly.syntax import connection_defaults
 
     initially_inactive = set()
     for path, connected in connection_defaults(params):
@@ -177,7 +177,7 @@ def preview(text: str, path: str | Path) -> dict[str, Any]:
         from ..assembly.syntax import parse_parameter_mapping
         config = parse_parameter_mapping(text, path)
         # Do not call load(path): load preparers may execute project-local addons.
-        from ..assembly.params import _ASSET_DIRECTORY, from_dict
+        from ..assembly.syntax import _ASSET_DIRECTORY, from_dict
         from .descriptor import Topology
 
         token: Token = _ASSET_DIRECTORY.set(path.resolve().parent)

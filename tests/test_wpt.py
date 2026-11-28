@@ -9,7 +9,7 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly import Event, register_event_type
-from peslite.assembly.params import ConfigError, _unit_leaves, from_dict, read_tree, to_dict
+from peslite.assembly.syntax import ConfigError, _unit_leaves, from_dict, read_tree, to_dict
 from peslite.addons.components.magcomponent import CompensatedLink
 from peslite.control import GraphController, ResonantModulation
 

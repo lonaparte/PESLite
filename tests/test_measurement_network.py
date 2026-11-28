@@ -9,9 +9,9 @@ import pytest
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import ConfigError, from_dict, read_tree
+from peslite.assembly.syntax import ConfigError, from_dict, read_tree
 from peslite.components import ADC, MeasurementPorts
-from peslite.components.adc import _PortMeasurement
+from peslite.components.adc import PortMeasurement
 from peslite.solver.energy import Port
 
 
@@ -34,7 +34,7 @@ def load_case(model="pwm_averaging", link="ss", rms=True):
 
 def test_port_measurement_starts_from_the_bound_port_values():
     port = Port(name="measured", voltage=12.0, current=-3.0, scale=2.0)
-    measurement = _PortMeasurement(port)
+    measurement = PortMeasurement(port)
 
     assert measurement.input.voltage == measurement.output.voltage == 12.0
     assert measurement.input.current == measurement.output.current == -3.0

@@ -8,7 +8,7 @@ import pytest
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import (DCVoltageLimitParams, FrequencyLimitParams, OvercurrentParams,
+from peslite.assembly.syntax import (DCVoltageLimitParams, FrequencyLimitParams, OvercurrentParams,
                                      ProtectionParams, VoltageLimitParams)
 from peslite.control import Measurement, Startup
 from peslite.control.blocks import smoothstep

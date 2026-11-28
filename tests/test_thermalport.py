@@ -266,7 +266,7 @@ def test_thermal_component_types_share_the_component_registry():
 
 def test_magnetic_and_thermal_ports_couple_without_owning_each_other(tmp_path):
     import peslite
-    from peslite.assembly.params import from_dict
+    from peslite.assembly.syntax import from_dict
 
     model_file = _thermalport_file(tmp_path / "thermal.json")
     case = {

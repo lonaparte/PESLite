@@ -1,209 +1,143 @@
-"""Configuration and assembly of the built-in simulation-file elements."""
+"""Generic assembly adapters for registered simulation-file elements."""
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any
 
+from ..components.cable import CABLE_MODELS
 from ..components.network import element_buses, resolve_endpoints
+from ..components.onnx import ONNXModel
 from ..components.passive import Capacitor, ParallelRLC, Resistor, SeriesRLC
-from ..components.source import DCVoltageSource
 from ..components.registry import register_component
+from ..components.source import DCVoltageSource
 from ..solver.model import ConfigError
-
-
-def validate_nonnegative(name: str, value: float | None) -> None:
-    if value is not None and (not math.isfinite(value) or value < 0.0):
-        raise ConfigError(f"{name} must be finite and >= 0, got {value}")
-
-
-def validate_connections(bus: str | None, bus1: str | None, bus2: str | None,
-                         series: bool = False) -> None:
-    one_terminal = bus is not None and bus1 is None and bus2 is None
-    two_terminal = bus is None and bus1 is not None and bus2 is not None
-    if not (one_terminal or two_terminal):
-        raise ConfigError("specify either bus or both bus1 and bus2")
-    if bus1 is not None and bus1 == bus2:
-        raise ConfigError("bus1 and bus2 must be distinct")
-    if series and not one_terminal:
-        raise ConfigError("automatic series insertion requires bus")
-
-
-@dataclass(frozen=True, kw_only=True)
-class SeriesRLCParams:
-    component_type: ClassVar[Any] = SeriesRLC
-    type: str = "series_rlc"
-    bus: str | None = None
-    bus1: str | None = None
-    bus2: str | None = None
-    r: float = 0.0
-    l: float | None = None
-    c: float | None = None
-    series: bool = field(default=False, metadata={"runtime": False})
-
-    _quantities = {"r": "resistance", "l": "inductance", "c": "capacitance"}
-    _input_aliases = {"x_pu": "l_pu"}
-
-    def __post_init__(self) -> None:
-        validate_connections(self.bus, self.bus1, self.bus2, self.series)
-        validate_nonnegative("r", self.r)
-        validate_nonnegative("l", self.l)
-        validate_nonnegative("c", self.c)
-        if type(self.series) is not bool:
-            raise ConfigError("series must be bool")
-
-
-@dataclass(frozen=True, kw_only=True)
-class CapacitorParams:
-    component_type: ClassVar[Any] = Capacitor
-    type: str = "capacitor"
-    bus1: str
-    bus2: str
-    c: float
-    r: float = 0.0
-
-    _quantities = {"c": "capacitance", "r": "resistance"}
-
-    def __post_init__(self) -> None:
-        validate_connections(None, self.bus1, self.bus2)
-        validate_nonnegative("c", self.c)
-        if not math.isfinite(self.r) or self.r < 0.0:
-            raise ConfigError(f"r must be finite and >= 0, got {self.r}")
-
-
-@dataclass(frozen=True, kw_only=True)
-class ResistorParams:
-    component_type: ClassVar[Any] = Resistor
-    type: str = "resistor"
-    bus: str | None = None
-    bus1: str | None = None
-    bus2: str | None = None
-    r: float
-    series: bool = field(default=False, metadata={"runtime": False})
-
-    _quantities = {"r": "resistance"}
-
-    def __post_init__(self) -> None:
-        validate_connections(self.bus, self.bus1, self.bus2, self.series)
-        validate_nonnegative("r", self.r)
-        if type(self.series) is not bool:
-            raise ConfigError("series must be bool")
-
-
-@dataclass(frozen=True, kw_only=True)
-class ParallelRLCParams:
-    component_type: ClassVar[Any] = ParallelRLC
-    type: str = "parallel_rlc"
-    bus: str | None = None
-    bus1: str | None = None
-    bus2: str | None = None
-    r: float | None = None
-    l: float | None = None
-    c: float | None = None
-
-    _quantities = {"r": "resistance", "l": "inductance", "c": "capacitance"}
-    _input_aliases = {"x_pu": "l_pu"}
-
-    def __post_init__(self) -> None:
-        validate_connections(self.bus, self.bus1, self.bus2)
-        validate_nonnegative("r", self.r)
-        validate_nonnegative("l", self.l)
-        validate_nonnegative("c", self.c)
-
-
-@dataclass(frozen=True, kw_only=True)
-class VoltageSourceParams:
-    type: str = "voltage_source"
-    bus: str
-    v: float
-    r: float
-
-    _quantities = {"v": "voltage", "r": "resistance"}
-
-    def __post_init__(self) -> None:
-        if not math.isfinite(self.v):
-            raise ConfigError(f"v must be finite, got {self.v}")
-        if not math.isfinite(self.r) or self.r <= 0.0:
-            raise ConfigError(f"r must be finite and positive, got {self.r}")
-
-
-def assemble_element(name: str, cfg: Any, buses: dict, params: Any) -> Any:
-    """Construct one registered passive element and attach its resolved endpoints."""
-    endpoints = resolve_endpoints(
-        element_buses(cfg), buses, f"elements.{name}", same_phases=True,
-    )
-    phases = next(iter(endpoints.values())).phases
-    path = f"elements.{name}.connected"
-    breakable = any(path in change.connections for change in getattr(params, "changes", ()))
-    element = cfg.component_type(
-        **{
-            attribute: getattr(cfg, name)
-            for name, attribute in cfg.component_type.parameter_fields.items()
-            if hasattr(cfg, name)
-        },
-        phases=phases,
-        breakable=breakable,
-    )
-    element.name, element.cfg, element.endpoint_by_field = name, cfg, endpoints
-    element.model = element
-    element.breakers = [element] if element.breakable else []
-
-    ports = {
-        field_name: element.port1 if field_name in ("bus", "bus1") else element.port2
-        for field_name in endpoints
-    }
-    for field_name, endpoint in endpoints.items():
-        port = ports[field_name]
-        if endpoint.grounded:
-            port.grounded = True
-        else:
-            port.electrical_domain = endpoint.electrical_domain
-
-    bus = getattr(cfg, "bus", None)
-    series = bool(getattr(cfg, "series", False))
-    if bus is not None and series:
-        inlet = f"{name}.bus.in"
-        element.assembled_series_connections = {bus: inlet}
-        element.assembled_port_bindings = ((inlet, element.port1), (bus, element.port2))
-    else:
-        element.assembled_series_connections = {}
-        element.assembled_port_bindings = tuple(
-            (endpoint.name, ports[field_name])
-            for field_name, endpoint in endpoints.items() if not endpoint.grounded
-        )
-        if bus is not None:
-            element.port2.grounded = True
-    return element
-
-
-def retune_element(element: Any, cfg: Any) -> bool:
-    """Apply the parameters declared by both the configuration and component."""
-    changed = element.set_parameters(**{
-        name: getattr(cfg, name)
-        for name in element.parameter_fields if hasattr(cfg, name)
-    })
-    element.cfg = cfg
-    return changed
-
-
-def assemble_voltage_source(name: str, cfg: Any, buses: dict, _params: Any) -> DCVoltageSource:
-    """Construct one scalar DC source using the common source and branch implementation."""
-    if buses[cfg.bus].phases != 1:
-        raise ConfigError("a scalar voltage source needs a single-phase bus")
-    source = DCVoltageSource(cfg.v, R=cfg.r)
-    source.name, source.bus, source.cfg = name, cfg.bus, cfg
-    return source
-
-
-def set_voltage_source_parameters(source: DCVoltageSource, cfg: Any) -> bool:
-    source.cfg = cfg
-    return source.set_parameters(voltage=cfg.v, r=cfg.r, l=None)
-
-
-for parameter_type in (SeriesRLCParams, CapacitorParams, ResistorParams, ParallelRLCParams):
-    register_component(parameter_type, assemble_element, retune_element)
-
-register_component(
-    VoltageSourceParams, assemble_voltage_source, set_voltage_source_parameters,
+from .syntax import (
+    CableParams,
+    CapacitorParams,
+    ONNXParams,
+    ParallelRLCParams,
+    ResistorParams,
+    SeriesRLCParams,
+    VoltageSourceParams,
 )
+
+
+class ElementAssembly:
+    """Common registration boundary between typed syntax and a physical model."""
+
+    def register(self, params: type, *, retunable: bool = True) -> "ElementAssembly":
+        register_component(params, self.construct, self.retune if retunable else None)
+        return self
+
+    def construct(self, name: str, cfg: Any, buses: dict, params: Any) -> Any:
+        raise NotImplementedError
+
+    def retune(self, element: Any, cfg: Any) -> bool:
+        raise NotImplementedError
+
+
+class PassiveElementAssembly(ElementAssembly):
+    """Assembly shared by passive models with the ordinary two-terminal contract."""
+
+    def __init__(self, model: type) -> None:
+        self.model = model
+
+    def construct(self, name: str, cfg: Any, buses: dict, params: Any) -> Any:
+        endpoints = resolve_endpoints(
+            element_buses(cfg), buses, f"elements.{name}", same_phases=True,
+        )
+        phases = next(iter(endpoints.values())).phases
+        path = f"elements.{name}.connected"
+        breakable = any(
+            path in change.connections for change in getattr(params, "changes", ())
+        )
+        element = self.model(
+            **{
+                attribute: getattr(cfg, parameter)
+                for parameter, attribute in self.model.parameter_fields.items()
+                if hasattr(cfg, parameter)
+            },
+            phases=phases,
+            breakable=breakable,
+        )
+        element.name, element.cfg, element.endpoint_by_field = name, cfg, endpoints
+        element.model = element
+        element.breakers = [element] if element.breakable else []
+
+        ports = {
+            field: element.port1 if field in ("bus", "bus1") else element.port2
+            for field in endpoints
+        }
+        for field, endpoint in endpoints.items():
+            port = ports[field]
+            if endpoint.grounded:
+                port.grounded = True
+            else:
+                port.electrical_domain = endpoint.electrical_domain
+
+        bus = getattr(cfg, "bus", None)
+        if bus is not None and getattr(cfg, "series", False):
+            inlet = f"{name}.bus.in"
+            element.assembled_series_connections = {bus: inlet}
+            element.assembled_port_bindings = ((inlet, element.port1), (bus, element.port2))
+        else:
+            element.assembled_series_connections = {}
+            element.assembled_port_bindings = tuple(
+                (endpoint.name, ports[field])
+                for field, endpoint in endpoints.items() if not endpoint.grounded
+            )
+            if bus is not None:
+                element.port2.grounded = True
+        return element
+
+    def retune(self, element: Any, cfg: Any) -> bool:
+        changed = element.set_parameters(**{
+            parameter: getattr(cfg, parameter)
+            for parameter in element.parameter_fields if hasattr(cfg, parameter)
+        })
+        element.cfg = cfg
+        return changed
+
+
+class SourceElementAssembly(ElementAssembly):
+    """Assembly shared by scalar source elements connected to one named endpoint."""
+
+    def __init__(self, model: type) -> None:
+        self.model = model
+
+    def construct(self, name: str, cfg: Any, buses: dict, _params: Any) -> Any:
+        if buses[cfg.bus].phases != 1:
+            raise ConfigError("a scalar voltage source needs a single-phase bus")
+        source = self.model(cfg.v, R=cfg.r)
+        source.name, source.bus, source.cfg = name, cfg.bus, cfg
+        return source
+
+    def retune(self, element: Any, cfg: Any) -> bool:
+        element.cfg = cfg
+        return element.set_parameters(voltage=cfg.v, r=cfg.r, l=None)
+
+
+class ModelElementAssembly(ElementAssembly):
+    """Assembly for a model that already implements the common configuration boundary."""
+
+    def __init__(self, model: type) -> None:
+        self.model = model
+
+    def construct(self, name: str, cfg: Any, buses: dict, params: Any) -> Any:
+        return self.model.from_config(name, cfg, buses, params)
+
+    def retune(self, element: Any, cfg: Any) -> bool:
+        return element.retune(cfg)
+
+
+for _params, _model in (
+    (SeriesRLCParams, SeriesRLC),
+    (CapacitorParams, Capacitor),
+    (ResistorParams, Resistor),
+    (ParallelRLCParams, ParallelRLC),
+):
+    PassiveElementAssembly(_model).register(_params)
+
+SourceElementAssembly(DCVoltageSource).register(VoltageSourceParams)
+ModelElementAssembly(ONNXModel).register(ONNXParams, retunable=False)
+register_component(CableParams, CABLE_MODELS, selector="model")

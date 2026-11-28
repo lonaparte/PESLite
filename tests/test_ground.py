@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import peslite
-from peslite.assembly.params import ConfigError, from_dict
+from peslite.assembly.syntax import ConfigError, from_dict
 
 
 def _network(phases: int = 1) -> dict:

@@ -10,23 +10,17 @@ import numpy as np
 
 from ..control.blocks import MovingWindow
 from ..solver.energy import Port, re_product
-from ..solver.model import Bag, Empty, OutputMethod, _real
+from ..solver.model import Empty, OutputMethod, _real, record_type
 from ..solver.timing import TIME_EPS, PeriodicClock
 
-__all__ = ["ADCSample", "MeasurementPorts", "ADC"]
+__all__ = ["PortMeasurement", "ADCSample", "MeasurementPorts", "ADC"]
 
 
-class _PortMeasurementInput(Bag):
-    __slots__ = ("voltage", "current")
-
-
-class _PortMeasurementOutput(Bag):
-    __slots__ = ("voltage", "current", "power")
-
-
-class _PortMeasurement:
+class PortMeasurement:
     """Non-loading observation of an already assembled electrical port."""
 
+    Input = record_type("PortMeasurementInput", ("voltage", "current"))
+    Output = record_type("PortMeasurementOutput", ("voltage", "current", "power"))
     observer = True
     voltage_field = "voltage"
     outputs_need_inputs = True
@@ -38,8 +32,8 @@ class _PortMeasurement:
     def __init__(self, port: Port) -> None:
         self.port = port
         self.state = Empty()
-        self.input = _PortMeasurementInput(voltage=port.voltage, current=port.current)
-        self.output = _PortMeasurementOutput(
+        self.input = self.Input(voltage=port.voltage, current=port.current)
+        self.output = self.Output(
             voltage=port.voltage, current=port.current, power=0.0,
         )
         self.ports = (Port.signals(

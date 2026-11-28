@@ -17,7 +17,7 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import from_dict, to_dict
+from peslite.assembly.syntax import from_dict, to_dict
 from peslite.components import Bag, Port, register_component_type
 from peslite.components.network import Element
 from peslite.solver import BlackBoxSubsystem
@@ -519,7 +519,7 @@ def test_fixed_solver_lowering_uses_the_shared_tableau(method, tmp_path):
 
 def test_native_continuous_control_feedback_checks_convergence(tmp_path):
     from test_control import _AffineFeedback  # noqa: F401 - Register the feedback loop used below.
-    from peslite.assembly.params import read_tree
+    from peslite.assembly.syntax import read_tree
 
     compiler = _compiler()
     if compiler is None:
@@ -1100,7 +1100,7 @@ def test_generated_cpp_matches_composite_wpt_switching_events(tmp_path):
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
-    from peslite.assembly.params import read_tree
+    from peslite.assembly.syntax import read_tree
     tree = read_tree(EXAMPLES / "wpt-example.pes")
     for side in ("primary", "secondary"):
         tree["units"]["charger"][side]["bridge"] = {"model": "pwm_averaging"}
@@ -1318,7 +1318,7 @@ def test_generic_cpp_fallback_lowers_custom_equations_and_state_branches(tmp_pat
     compiler = _compiler()
     if compiler is None:
         pytest.skip("no C++17 compiler installed")
-    from peslite.assembly.params import read_tree
+    from peslite.assembly.syntax import read_tree
     tree = read_tree(EXAMPLES / "gfl-example.pes")
     tree["elements"] = {"conditional": {
         "type": "test_conditional_element",

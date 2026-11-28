@@ -11,7 +11,7 @@ import peslite
 from conftest import EXAMPLES
 from peslite.assembly import Event, Scenario, register_event_type
 from peslite.assembly.events import EVENT_TYPES, SourceScenario, events_for, switching_schedule
-from peslite.assembly.params import ConfigError, dumps, from_dict, read_tree
+from peslite.assembly.syntax import ConfigError, dumps, from_dict, read_tree
 from peslite.assembly.syntax import parse_native_text
 from peslite.control import Startup
 

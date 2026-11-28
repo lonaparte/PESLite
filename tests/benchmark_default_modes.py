@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from peslite import Simulation, load  # noqa: E402
-from peslite.assembly.params import _unit_items  # noqa: E402
+from peslite.assembly.syntax import _unit_items  # noqa: E402
 from peslite.solver.simulation import read_csv  # noqa: E402
 from benchmark_averaging_solvers import _errors  # noqa: E402
 

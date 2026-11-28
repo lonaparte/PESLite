@@ -8,7 +8,7 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import ConfigError, dumps, from_dict, read_tree, to_dict
+from peslite.assembly.syntax import ConfigError, dumps, from_dict, read_tree, to_dict
 from peslite.assembly.syntax import parse_native_text
 
 
@@ -77,7 +77,7 @@ def test_missing_optional_base_values_are_reported_only_when_used():
 @pytest.mark.parametrize("filename", ["gfl-example.pes", "buck-example.pes", "wpt-load-example.pes"])
 def test_shared_unit_schema_round_trips_without_persisting_cached_derived_fields(filename):
     params = peslite.load(EXAMPLES / filename)
-    from peslite.assembly.params import _unit_items
+    from peslite.assembly.syntax import _unit_items
     for _name, unit in _unit_items(params.units):
         assert unit.dc_base is unit.dc_base
     written = to_dict(params)

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import peslite
-from peslite.assembly.params import ConfigError
+from peslite.assembly.syntax import ConfigError
 from peslite.assembly.unit import Plant
 from peslite.components.converter import PWMAveragingModel, ThreePhaseBridge
 from peslite.components.pwm import ZOH, carrier_position

@@ -284,7 +284,7 @@ def test_averaged_bridge_warns_instead_of_inventing_switching_edges(tmp_path):
 
 def test_natural_diode_commutations_apply_online_recovery_heat(tmp_path):
     import peslite
-    from peslite.assembly.params import from_dict
+    from peslite.assembly.syntax import from_dict
     from test_wpt_rectifier import SS, _tree
 
     tree = _tree(SS, 200.0, 30.0e-6, dt=20.0e-9)

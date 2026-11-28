@@ -10,7 +10,7 @@ import pytest
 
 import peslite
 from peslite.assembly.exporter import _signal_names
-from peslite.assembly.params import from_dict
+from peslite.assembly.syntax import from_dict
 from peslite.control.blocks import complex2abc
 from peslite.solver.model import ConfigError
 from peslite.solver.simulation import _CSVTable, _PlantRows, _plant_output_row

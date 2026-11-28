@@ -18,7 +18,7 @@ import numpy as np
 import yaml
 
 from ... import __version__
-from ...assembly.params import Params, _unit_items, flat_paths, to_dict, unit_type
+from ...assembly.syntax import Params, _unit_items, flat_paths, to_dict, unit_type
 from ...assembly.syntax import NAME_PATTERN, parse_parameter_mapping, parse_view_declaration
 from ...control.controller import ControlGraphOverlay, continuous_control
 from ...control.loops import LOOP_TYPES

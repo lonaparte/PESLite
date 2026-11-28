@@ -29,7 +29,7 @@ import numpy as np
 from ..defaults import DEFAULT_OUTPUT_PRECISION, DEFAULT_OUTPUT_WRITE_LENGTH
 from ..assembly.events import Scenario, switching_schedule
 from ..assembly.exporter import _signal_names
-from ..assembly.params import (Params, _connection_variable, _parameterized, _unit_at, _unit_items,
+from ..assembly.syntax import (Params, _connection_variable, _parameterized, _unit_at, _unit_items,
                                _unit_leaves, connection_defaults, dump, unit_type)
 from ..assembly.system import System, _start_connections
 from ..assembly.unit import Plant, Unit

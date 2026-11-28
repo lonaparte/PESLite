@@ -11,8 +11,11 @@ from conftest import EXAMPLES
 from peslite.components import (
     ADC,
     AveragingModel,
+    BergeronCableModel,
     Capacitor,
+    DCVoltageSource,
     MeasurementPorts,
+    ONNXModel,
     PWM,
     PWMAveragingModel,
     Bus,
@@ -22,6 +25,7 @@ from peslite.components import (
     Resistor,
     RLBranch,
     SeriesRLC,
+    LumpedCableModel,
     Port,
     ThreePhaseBridge,
     ZOH,
@@ -31,19 +35,38 @@ from peslite.components.registry import ELEMENT_TYPES
 COMPONENTS = Path(peslite.components.__file__).parent
 
 
-def test_builtin_element_configuration_and_assembly_are_separate_from_physics():
+def test_builtin_element_configuration_uses_the_shared_assembly_boundary():
     physical_types = {
         "series_rlc": SeriesRLC,
         "parallel_rlc": ParallelRLC,
         "capacitor": Capacitor,
         "resistor": Resistor,
+        "voltage_source": DCVoltageSource,
     }
 
     for name, physical_type in physical_types.items():
         definition = ELEMENT_TYPES[name]
-        assert definition.params.__module__ == "peslite.assembly.elements"
-        assert definition.constructor.__module__ == "peslite.assembly.elements"
+        assert definition.params.__module__ == "peslite.assembly.syntax"
+        assert definition.default is not None
+        assert not definition.models
+        assert definition.selector is None
+        assert definition.default.constructor.__module__ == "peslite.assembly.elements"
         assert "Params" not in physical_type.__dict__
+
+    onnx = ELEMENT_TYPES["onnx"]
+    assert onnx.params.__module__ == "peslite.assembly.syntax"
+    assert onnx.default is not None
+    assert onnx.default.constructor.__module__ == "peslite.assembly.elements"
+
+    cable = ELEMENT_TYPES["cable"]
+    assert cable.params.__module__ == "peslite.assembly.syntax"
+    assert cable.default is None
+    assert cable.selector == "model"
+    assert set(cable.models) == {"bergeron", "lumped"}
+    assert all(model.constructor.__module__ == "peslite.components.cable"
+               for model in cable.models.values())
+    assert all("Params" not in model.__dict__
+               for model in (BergeronCableModel, LumpedCableModel))
 
 
 def test_passive_elements_share_the_general_element_boundary():

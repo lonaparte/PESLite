@@ -15,11 +15,11 @@ from .converter import (AveragingModel, FullBridge, HalfBridge,
                         HalfBridgeDiodeConduction, PWMAveragingModel,
                         SwitchingModel, ThreePhaseBridge, make_bridge)
 from .dclink import DCLink, make_dclink
-from .adc import ADC, ADCSample, MeasurementPorts
+from .adc import ADC, ADCSample, MeasurementPorts, PortMeasurement
 from .pwm import (ZOH, CarrierComparison, PWM, PhaseShiftModulator, SwitchingSequence,
                   SynchronousCarrier, make_modulator)
-from .onnx import ONNXModel, ONNXStateParams
-from .cable import BergeronCableModel, Cable, LumpedCableModel
+from .onnx import ONNXModel
+from .cable import BergeronCableModel, LumpedCableModel
 
 __all__ = ["Port", "Element", "Passive", "VoltageSource",
            "ACVoltageSource", "DCVoltageSource",
@@ -30,8 +30,8 @@ __all__ = ["Port", "Element", "Passive", "VoltageSource",
            "register_component_type", "resolve_endpoints", "GROUND",
            "ThreePhaseBridge", "SwitchingModel",
            "PWMAveragingModel", "make_bridge", "DCLink",
-           "make_dclink", "ADC", "ADCSample",
+           "make_dclink", "ADC", "ADCSample", "PortMeasurement",
            "MeasurementPorts", "AveragingModel", "HalfBridge",
            "FullBridge", "HalfBridgeDiodeConduction", "PWM", "SwitchingSequence",
            "CarrierComparison", "SynchronousCarrier", "ZOH", "PhaseShiftModulator", "make_modulator",
-           "ONNXModel", "ONNXStateParams", "BergeronCableModel", "Cable", "LumpedCableModel"]
+           "ONNXModel", "BergeronCableModel", "LumpedCableModel"]

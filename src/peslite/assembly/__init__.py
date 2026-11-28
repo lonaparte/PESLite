@@ -1,22 +1,23 @@
 """Assembly of a system from a simulation file.
 
-``params``: the file parameters, including runtime changes; ``validate``: cross-section checks;
+``syntax``: simulation-file parsing and typed parameters; ``validate``: cross-section checks;
 ``events``: event types and scenarios; ``protection``: the unified protection subsystem;
 ``unit``: a converter unit; ``system``: the network, registered elements and event operations as
 one model.
 """
 
-from .params import (BaseValues, ConfigError, ControlParams, Params, UnitParams,
+from .syntax import (BaseValues, ConfigError, ControlParams, Params, UnitParams,
                      dump, dumps, from_dict, load, register_unit_type,
-                     read_initial, to_dict)
-from .syntax import (SimulationFileError, parse_simulation_text,
-                              read_simulation_file, register_simulation_reader)
+                     read_initial, to_dict, SimulationFileError,
+                     parse_simulation_text, read_simulation_file,
+                     register_simulation_reader)
+from . import elements as _elements
 from .events import (EVENT_TYPES, Event, Scenario, SourceScenario,
                      register_event_type)
 from .protection import Protection, ProtectionSample
 from .unit import DCConverter, Unit, VSC
 from .system import System
-from .params import _DCConverterUnitFields, _VSCUnitFields
+from .syntax import _DCConverterUnitFields, _VSCUnitFields
 from .system import _assemble_dc_converter, _assemble_vsc
 from .validate import _dc_converter, _unit
 from ..control.controller import GraphController, VSCController

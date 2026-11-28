@@ -1,13 +1,15 @@
 """Core cable models, history, events and bridge-mode integration."""
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import peslite
 import pytest
 
-from peslite.assembly.params import from_dict, runtime_changeable
-from peslite.components.cable import BergeronCableModel, Cable, LumpedCableModel
+from peslite.assembly.syntax import CableParams, from_dict, runtime_changeable
+from peslite.components.cable import BergeronCableModel, LumpedCableModel
+from peslite.components.registry import ELEMENT_TYPES
 from peslite.solver import ConfigError
 from peslite.solver.history import DelayHistory
 
@@ -84,9 +86,14 @@ def test_cable_defaults_to_bergeron_and_rejects_unsupported_shunt_loss():
         "bus1": "left", "bus2": "right", "length_km": 5.0,
         "r_per_km": 0.05, "l_per_km": 0.4e-3, "c_per_km": 0.2e-6,
     }
-    assert Cable.Params(**values).model == "bergeron"
+    assert CableParams(**values).model == "bergeron"
     with pytest.raises(ConfigError, match="requires g_per_km=0"):
-        Cable.Params(**values, g_per_km=1.0e-8)
+        ELEMENT_TYPES["cable"](
+            "line", CableParams(**values, g_per_km=1.0e-8), {},
+            SimpleNamespace(base=SimpleNamespace(v_phase_peak=1.0)),
+        )
+    with pytest.raises(ConfigError, match="cable.model: unknown model 'unknown'"):
+        ELEMENT_TYPES["cable"].model(CableParams(**values, model="unknown"))
 
 
 @pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
@@ -107,6 +114,7 @@ def test_custom_cable_gfl_case_runs_in_every_bridge_mode(examples, tmp_path, mod
     simulation = peslite.Simulation(params)
     result = simulation.run(out_dir=tmp_path / model)
 
+    assert not runtime_changeable("elements.cable1.model", params)
     assert not runtime_changeable("elements.cable1.sections", params)
     assert simulation.ph_report.verdict == "port-hamiltonian"
     assert not result.tripped

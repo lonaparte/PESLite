@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import keyword
 import math
-import numbers
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +11,8 @@ import numpy as np
 
 from ..solver.model import BlackBoxSubsystem, ConfigError
 from .network import Element
-from .registry import register_component_type
 
-__all__ = ["ONNXModel", "ONNXStateParams"]
+__all__ = ["ONNXModel"]
 
 
 _TENSOR_DTYPES = {
@@ -34,37 +31,6 @@ _TENSOR_DTYPES = {
     "tensor(complex64)": np.dtype(np.complex64),
     "tensor(complex128)": np.dtype(np.complex128),
 }
-
-
-def _names(mapping: dict[str, list[str]], label: str) -> tuple[str, ...]:
-    """Validate tensor-to-scalar mappings and return their flattened scalar names."""
-    flattened = []
-    for tensor, names in mapping.items():
-        if not isinstance(tensor, str) or not tensor:
-            raise ConfigError(f"{label} tensor names must be nonempty strings")
-        if not isinstance(names, list) or not names:
-            raise ConfigError(f"{label}.{tensor} must be a nonempty list")
-        if any(not isinstance(name, str) or not name for name in names):
-            raise ConfigError(f"{label}.{tensor} names must be nonempty strings")
-        flattened.extend(names)
-    return tuple(flattened)
-
-
-@dataclass(frozen=True, kw_only=True)
-class ONNXStateParams:
-    """One recurrent ONNX input, its next-state output and initial flattened value."""
-
-    output: str
-    initial: list[complex | float | int | bool]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.output, str) or not self.output:
-            raise ConfigError("output must be a nonempty ONNX tensor name")
-        if not isinstance(self.initial, list) or not self.initial:
-            raise ConfigError("initial must be a nonempty list")
-        if any(not isinstance(value, numbers.Number) or not np.isfinite(value)
-               for value in self.initial):
-            raise ConfigError("initial values must be finite numeric scalars")
 
 
 @dataclass(frozen=True)
@@ -199,54 +165,10 @@ class _ONNXInference:
         return flattened(self.public), flattened(self.next_hidden)
 
 
-@register_component_type
 class ONNXModel(Element):
     """A configured, non-loading ONNX model connected to physical subsystem outputs."""
 
-    type = "onnx"
-
-    @dataclass(frozen=True, kw_only=True)
-    class Params:
-        model: str = field(metadata={"asset": True, "runtime": False})
-        outputs: dict[str, list[str]] = field(
-            metadata={"literal_keys": True, "runtime": False}
-        )
-        inputs: dict[str, list[str]] = field(
-            default_factory=dict, metadata={"literal_keys": True, "runtime": False}
-        )
-        period: float | None = field(default=None, metadata={"runtime": False})
-        offset: float = field(default=0.0, metadata={"runtime": False})
-        state: dict[str, ONNXStateParams] = field(
-            default_factory=dict,
-            metadata={"entries": ONNXStateParams, "literal_keys": True, "runtime": False},
-        )
-        type: str = "onnx"
-
-        def __post_init__(self) -> None:
-            if not isinstance(self.model, str) or not self.model:
-                raise ConfigError("model must be a nonempty path")
-            _names(self.inputs, "inputs")
-            outputs = _names(self.outputs, "outputs")
-            if not outputs:
-                raise ConfigError("outputs must contain at least one tensor mapping")
-            if any(not name.isidentifier() or keyword.iskeyword(name) for name in outputs):
-                raise ConfigError("output names must be valid identifiers")
-            if len(set(outputs)) != len(outputs):
-                raise ConfigError("output names must be unique")
-            if self.state and self.period is None:
-                raise ConfigError("recurrent state requires period")
-            if self.period is not None and (
-                    isinstance(self.period, bool) or not math.isfinite(self.period)
-                    or self.period <= 0.0):
-                raise ConfigError(f"period must be finite and positive, got {self.period}")
-            if (isinstance(self.offset, bool) or not math.isfinite(self.offset)
-                    or self.offset < 0.0
-                    or (self.period is not None and self.offset >= self.period)):
-                raise ConfigError("offset must be in [0, period)")
-            if self.period is None and self.offset != 0.0:
-                raise ConfigError("offset requires period")
-
-    def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
+    def __init__(self, name: str, cfg: Any) -> None:
         self.name, self.cfg = name, cfg
         runtime = _ONNXInference(cfg)
         source_paths = tuple(
@@ -307,6 +229,10 @@ class ONNXModel(Element):
             cpp_export=False,
             observer=True,
         )
+
+    @classmethod
+    def from_config(cls, name: str, cfg: Any, _buses: dict, _params: Any) -> "ONNXModel":
+        return cls(name, cfg)
 
     def connections(self) -> dict:
         return {(self.model, name): source for name, source in self._sources.items()}

@@ -180,7 +180,7 @@ def test_configured_recurrent_onnx_model_uses_registered_sampled_state(tmp_path)
     )
     path = tmp_path / "recurrent.onnx"
     onnx.save(model, path)
-    params = peslite.assembly.params.from_dict({
+    params = peslite.assembly.syntax.from_dict({
         "base": {"s_base": 1.0},
         "buses": {"node": {"phases": 1, "c": 1.0e-3}},
         "elements": {

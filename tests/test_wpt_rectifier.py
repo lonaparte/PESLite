@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 import peslite
-from peslite.assembly.params import ConfigError, from_dict, read_initial
+from peslite.assembly.syntax import ConfigError, from_dict, read_initial
 from peslite.components import FullBridge
 from wpt_reference import Circuit, rectify
 

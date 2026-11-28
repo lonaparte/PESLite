@@ -272,7 +272,7 @@ def test_same_boundary_parameter_events_publish_one_circuit_rebuild(monkeypatch,
 
 
 def test_event_variable_bindings_are_resolved_before_the_run(monkeypatch, tmp_path):
-    from peslite.assembly import params
+    from peslite.assembly import syntax
 
     p = _gfl(**{
         "simulation.t_end": 0.0003,
@@ -284,7 +284,7 @@ def test_event_variable_bindings_are_resolved_before_the_run(monkeypatch, tmp_pa
     def unexpected(*args):
         pytest.fail("the runtime must use compiled variable bindings")
 
-    monkeypatch.setattr(params, "_event_assignments", unexpected)
+    monkeypatch.setattr(syntax, "_event_assignments", unexpected)
     sim.run(out_dir=tmp_path)
 
 

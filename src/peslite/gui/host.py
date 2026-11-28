@@ -163,7 +163,7 @@ class Host:
                     )
                 from ..assembly.addons import register_project
                 register_project(model)
-            from ..assembly.params import _load_case
+            from ..assembly.syntax import _load_case
             configured, _interface = _load_case(model)
             prepared = prepare_debug(configured, plan, directory=target.parent)
             source = self.files.read(model_name)["text"]

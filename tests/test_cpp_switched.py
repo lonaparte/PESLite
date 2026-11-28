@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 import peslite
-from peslite.assembly.params import from_dict
+from peslite.assembly.syntax import from_dict
 from test_cpp_export import _compiler
 
 pytestmark = pytest.mark.long

@@ -9,7 +9,7 @@ import pytest
 
 import peslite
 from peslite.assembly import Event, register_event_type
-from peslite.assembly.params import ConfigError, from_dict
+from peslite.assembly.syntax import ConfigError, from_dict
 from peslite.components import Element, RLBranch, register_component_type
 from peslite.components.registry import ELEMENT_TYPES
 from peslite.control import ANGLE, FREQUENCY, V_AB, V_DQ, Loop, SyncLaw, register_loop_type

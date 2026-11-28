@@ -7,7 +7,7 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 
 import peslite.control
-from peslite.assembly.params import BridgeParams
+from peslite.assembly.syntax import BridgeParams
 from peslite.control import (
     DUTY_RATIO,
     LOOP_TYPES,
@@ -144,7 +144,7 @@ def test_scalar_output_alias_and_named_commands_share_one_value():
     ("full_bridge", 0.5),
 ])
 def test_open_loop_startup_ramps_from_the_topology_neutral_duty(bridge, neutral):
-    from peslite.assembly.params import BridgeParams
+    from peslite.assembly.syntax import BridgeParams
 
     startup = SimpleNamespace(value=0.0)
     unit = SimpleNamespace(
@@ -364,7 +364,7 @@ def test_scalar_output_limits_keep_the_original_positive_upper_contract(lower, u
 @pytest.mark.parametrize("lower,upper", [(-1.0, float("inf")), (float("nan"), 1.0),
                                           (-1.2, 0.0), (-1.2, -0.1), (1.0, 1.0)])
 def test_scalar_output_limits_reject_invalid_intervals(lower, upper):
-    from peslite.assembly.params import ConfigError
+    from peslite.assembly.syntax import ConfigError
 
     with pytest.raises(ConfigError, match="limit"):
         OutputLimit(upper, lower=lower)

@@ -26,7 +26,7 @@ pytestmark = pytest.mark.long
 def _simulation(name="buck"):
     p = peslite.load(EXAMPLES / f"{name.removesuffix('-slow-terminal')}-example.pes")
     values = {"simulation.solver.linearisations": 0, "simulation.initial.states": {}}
-    from peslite.assembly.params import _unit_items
+    from peslite.assembly.syntax import _unit_items
     for key, unit in _unit_items(p.units):
         values.update({f"units.{key}.bridge.model": "pwm_averaging",
                        f"units.{key}.meas": {}, f"units.{key}.protection": {}})

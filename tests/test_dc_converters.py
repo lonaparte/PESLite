@@ -8,7 +8,7 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.assembly.circuit import Circuit
-from peslite.assembly.params import ConfigError, from_dict, to_dict
+from peslite.assembly.syntax import ConfigError, from_dict, to_dict
 from peslite.components import HalfBridge, HalfBridgeDiodeConduction, PWMAveragingModel
 from peslite.solver.commutation import Commutation
 from peslite.control import (BridgeControlOutput, DCVoltageControl, GraphController,

@@ -3,20 +3,14 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from .network import Element
-from .registry import register_component_type
-from ..solver import Bag, ConfigError, Empty, Port, StoragePort
+from ..solver import Bag, Empty, Port, StoragePort
 from ..solver.history import AcceptedSignal, DelayedSignal, DelayHistory
-from ..solver.model import record_type
+from ..solver.model import ConfigError, record_type
 
-__all__ = ["BergeronCableModel", "Cable", "LumpedCableModel"]
-
-
-class _CableOutput(Bag):
-    __slots__ = ("i1", "i2")
+__all__ = ["BergeronCableModel", "LumpedCableModel"]
 
 
 def _state_record(sections: int) -> type[Bag]:
@@ -26,10 +20,75 @@ def _state_record(sections: int) -> type[Bag]:
     return record_type(f"_LumpedCableState{sections}", names)
 
 
-class LumpedCableModel(Element):
+class _CableModel(Element):
+    """Common two-port boundary of every cable formulation."""
+
+    Output = record_type("CableOutput", ("i1", "i2"))
+    configuration_fields: ClassVar[tuple[str, ...]] = ()
+    retunable_fields: ClassVar[tuple[str, ...]] = ()
+    zero_fields: ClassVar[tuple[str, ...]] = ()
+    outputs_need_inputs: ClassVar[bool] = False
+    domain_transparent = True
+    signal_fields = {"i1": "i1", "i2": "i2"}
+
+    def __init__(self, output: Bag, voltage0: complex) -> None:
+        initial = complex(voltage0)
+        self.input = Empty()
+        self.output = output
+        self.port1 = Port(
+            self, "1", voltage=initial, current=0j, scale=1.5,
+            electrical_domain="ac", standalone="voltage",
+        )
+        self.port2 = Port(
+            self, "2", voltage=initial, current=0j, scale=1.5,
+            electrical_domain="ac", standalone="voltage",
+        )
+        self.ports = (self.port1, self.port2)
+
+    @classmethod
+    def from_config(cls, name: str, cfg: Any, _buses: dict, params: Any) -> "_CableModel":
+        """Construct and connect one selected cable model."""
+        for field in cls.zero_fields:
+            if getattr(cfg, field) != 0.0:
+                raise ConfigError(
+                    f"model={cfg.model!r} requires {field}=0 because that branch "
+                    "is not represented by the selected cable model"
+                )
+        values = {field: getattr(cfg, field) for field in cls.configuration_fields}
+        cable = cls(**values, voltage0=complex(params.base.v_phase_peak))
+        cable.name, cable.cfg, cable.model = name, cfg, cable
+        cable.assembled_port_bindings = ((cfg.bus1, cable.port1), (cfg.bus2, cable.port2))
+        return cable
+
+    def retune(self, cfg: Any) -> bool:
+        """Update coefficients without reselecting or rebuilding the cable model."""
+        changed = tuple(
+            field for field in self.configuration_fields
+            if getattr(self.cfg, field) != getattr(cfg, field)
+        )
+        fixed = tuple(field for field in changed if field not in self.retunable_fields)
+        if fixed:
+            raise ConfigError(
+                f"{type(self).__name__} parameters {', '.join(fixed)} "
+                "cannot change during a run"
+            )
+        if changed:
+            self.set_parameters(**{
+                field: getattr(cfg, field) for field in self.retunable_fields
+            })
+        self.cfg = cfg
+        return bool(changed)
+
+
+class LumpedCableModel(_CableModel):
     """Segmented two-port R-L/G-C cable; both currents are positive into the cable."""
 
-    outputs_need_inputs: ClassVar[bool] = False
+    configuration_fields = (
+        "length_km", "r_per_km", "l_per_km", "g_per_km", "c_per_km", "sections",
+    )
+    retunable_fields = (
+        "length_km", "r_per_km", "l_per_km", "g_per_km", "c_per_km",
+    )
 
     def __init__(self, *, length_km: float, r_per_km: float, l_per_km: float,
                  g_per_km: float, c_per_km: float, sections: int,
@@ -41,17 +100,7 @@ class LumpedCableModel(Element):
         initial = {name: 0j for name in self.state_names}
         initial.update({f"uC{k}": complex(voltage0) for k in range(1, sections + 1)})
         self.state = state_type(**initial)
-        self.input = Empty()
-        self.output = _CableOutput(i1=0j, i2=0j)
-        self.port1 = Port(
-            self, "1", voltage=complex(voltage0), current=0j, scale=1.5,
-            electrical_domain="ac", standalone="voltage"
-        )
-        self.port2 = Port(
-            self, "2", voltage=complex(voltage0), current=0j, scale=1.5,
-            electrical_domain="ac", standalone="voltage"
-        )
-        self.ports = (self.port1, self.port2)
+        super().__init__(self.Output(i1=0j, i2=0j), voltage0)
         self.set_parameters(
             length_km=length_km,
             r_per_km=r_per_km,
@@ -116,37 +165,28 @@ class LumpedCableModel(Element):
         nb.losses(self)
 
 
-class _BergeronOutput(Bag):
-    __slots__ = ("i1", "i2", "i_mid", "wave_1_left", "wave_1_right",
-                 "wave_2_left", "wave_2_right")
-
-
-class BergeronCableModel(Element):
+class BergeronCableModel(_CableModel):
     """PSCAD-style Bergeron line: distributed LC delay with lumped series resistance."""
 
+    configuration_fields = ("length_km", "r_per_km", "l_per_km", "c_per_km")
+    zero_fields = ("g_per_km",)
+    Output = record_type(
+        "BergeronCableOutput",
+        ("i1", "i2", "i_mid", "wave_1_left", "wave_1_right",
+         "wave_2_left", "wave_2_right"),
+    )
     state_names: ClassVar[tuple[str, ...]] = ()
-    outputs_need_inputs: ClassVar[bool] = False
     energy_states: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self, *, length_km: float, r_per_km: float, l_per_km: float,
                  c_per_km: float, voltage0: complex) -> None:
         self.state = Empty()
-        self.input = Empty()
         initial = complex(voltage0)
-        self.output = _BergeronOutput(
+        super().__init__(self.Output(
             i1=0j, i2=0j, i_mid=0j,
             wave_1_left=initial, wave_1_right=initial,
             wave_2_left=initial, wave_2_right=initial,
-        )
-        self.port1 = Port(
-            self, "1", voltage=initial, current=0j, scale=1.5,
-            electrical_domain="ac", standalone="voltage",
-        )
-        self.port2 = Port(
-            self, "2", voltage=initial, current=0j, scale=1.5,
-            electrical_domain="ac", standalone="voltage",
-        )
-        self.ports = (self.port1, self.port2)
+        ), initial)
         self.length_km = float(length_km)
         self.total_resistance = float(r_per_km * length_km)
         self.surge_impedance = math.sqrt(l_per_km / c_per_km)
@@ -246,93 +286,7 @@ class BergeronCableModel(Element):
         nb.port_output(self, "i2", self.port2, "current")
 
 
-@register_component_type
-class Cable(Element):
-    """Registered two-port cable with Bergeron and segmented lumped models."""
-
-    @dataclass(frozen=True, kw_only=True)
-    class Params:
-        bus1: str
-        bus2: str
-        length_km: float
-        r_per_km: float
-        l_per_km: float
-        c_per_km: float
-        g_per_km: float = 0.0
-        model: str = field(default="bergeron", metadata={"structural": True})
-        sections: int = field(default=4, metadata={"structural": True})
-        type: str = "cable"
-
-        def __post_init__(self) -> None:
-            positive = {
-                "length_km": self.length_km,
-                "l_per_km": self.l_per_km,
-                "c_per_km": self.c_per_km,
-            }
-            nonnegative = {"r_per_km": self.r_per_km, "g_per_km": self.g_per_km}
-            for name, value in positive.items():
-                if not math.isfinite(value) or value <= 0.0:
-                    raise ConfigError(f"{name} must be finite and > 0, got {value}")
-            for name, value in nonnegative.items():
-                if not math.isfinite(value) or value < 0.0:
-                    raise ConfigError(f"{name} must be finite and >= 0, got {value}")
-            if self.model not in ("bergeron", "lumped"):
-                raise ConfigError(
-                    f"model must be 'bergeron' or 'lumped', got {self.model!r}"
-                )
-            if self.sections < 1:
-                raise ConfigError(f"sections must be >= 1, got {self.sections}")
-            if self.model == "bergeron" and self.g_per_km != 0.0:
-                raise ConfigError(
-                    "model='bergeron' requires g_per_km=0 because the Bergeron loss "
-                    "approximation uses lumped series resistance"
-                )
-            if self.bus1 == self.bus2:
-                raise ConfigError("bus1 and bus2 must name different buses")
-
-    type = "cable"
-    domain_transparent = True
-    signal_fields = {"i1": "i1", "i2": "i2"}
-
-    def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
-        self.name, self.cfg = name, cfg
-        common = dict(
-            length_km=cfg.length_km,
-            r_per_km=cfg.r_per_km,
-            l_per_km=cfg.l_per_km,
-            c_per_km=cfg.c_per_km,
-            voltage0=complex(p.base.v_phase_peak),
-        )
-        self.model = (
-            BergeronCableModel(**common)
-            if cfg.model == "bergeron" else
-            LumpedCableModel(
-                **common, g_per_km=cfg.g_per_km, sections=cfg.sections,
-            )
-        )
-
-    def port_bindings(self) -> tuple[tuple[str, Port], ...]:
-        return ((self.cfg.bus1, self.model.port1),
-                (self.cfg.bus2, self.model.port2))
-
-    def retune(self, cfg: Any) -> bool:
-        """Apply numerical changes without replacing the selected physical model."""
-        if self.cfg == cfg:
-            return False
-        if isinstance(self.model, LumpedCableModel):
-            self.cfg = cfg
-            self.model.set_parameters(
-                length_km=cfg.length_km,
-                r_per_km=cfg.r_per_km,
-                l_per_km=cfg.l_per_km,
-                g_per_km=cfg.g_per_km,
-                c_per_km=cfg.c_per_km,
-            )
-            return True
-        if any(getattr(self.cfg, name) != getattr(cfg, name)
-               for name in ("length_km", "r_per_km", "l_per_km", "c_per_km")):
-            raise ConfigError(
-                "Bergeron cable parameters define its delay history and cannot change during a run"
-            )
-        self.cfg = cfg
-        return False
+CABLE_MODELS = {
+    "bergeron": BergeronCableModel,
+    "lumped": LumpedCableModel,
+}

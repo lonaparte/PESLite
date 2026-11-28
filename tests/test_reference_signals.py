@@ -10,7 +10,7 @@ from peslite.addons.functions.reference_signals import (
     reference_csv, reference_expression, reference_table,
 )
 from peslite.assembly.cpp import _validate_native_control_graph
-from peslite.assembly.params import from_dict, read_initial, read_tree, to_dict
+from peslite.assembly.syntax import from_dict, read_initial, read_tree, to_dict
 from peslite.control import ControlMeasurement
 from peslite.solver import TableSignal
 from peslite.control.controller import ConverterMeasurement

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import peslite
-from peslite.assembly.params import _unit_items
+from peslite.assembly.syntax import _unit_items
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

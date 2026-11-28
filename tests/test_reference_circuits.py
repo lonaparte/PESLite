@@ -7,7 +7,7 @@ import pytest
 from scipy.linalg import expm
 
 import peslite
-from peslite.assembly.params import from_dict
+from peslite.assembly.syntax import from_dict
 
 F_SW, VDC = 20.0e3, 48.0
 L_F, R_F, C_BUS, R_LOAD = 0.5e-3, 0.05, 100.0e-6, 2.0

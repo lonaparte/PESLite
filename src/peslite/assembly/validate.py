@@ -1,7 +1,7 @@
 """Checks across the sections of a constructed parameter tree (read-only).
 
 Covers topology, dc link, control, timing, solver settings and initial values; the construction
-(:func:`peslite.assembly.params.from_dict`) has checked each field on its own.
+(:func:`peslite.assembly.syntax.from_dict`) has checked each field on its own.
 """
 
 from __future__ import annotations
@@ -24,11 +24,11 @@ from ..solver.model import ConfigError
 from ..solver.multirate import own_schedule, parse_step
 from ..solver.timing import TIME_EPS, PeriodicClock
 from .events import NAMED, SWITCHABLE, SWITCHING
-from .params import (_control_computation, _control_offset, _control_period,
+from .syntax import (_control_computation, _control_offset, _control_period,
                      unit_type)
 
 if TYPE_CHECKING:
-    from .params import Params
+    from .syntax import Params
 
 __all__ = ["validate"]
 
@@ -388,7 +388,7 @@ def _dc_converter(u, base, where: str, *, nested: bool = False) -> None:
 
 def _network(p: Params) -> None:
     """Check element identities, network values and bus references."""
-    from .params import _unit_items, _unit_path
+    from .syntax import _unit_items, _unit_path
 
     connected_units = {
         name: unit for name, unit in _unit_items(p.units)
@@ -524,7 +524,7 @@ def _events(p: Params) -> None:
 
 def _initial(p: Params) -> None:
     """Check the start/end times and the shape of initial state values."""
-    from .params import _unit_items
+    from .syntax import _unit_items
 
     t0 = p.simulation.initial.t
     if not math.isfinite(p.simulation.output.period) or p.simulation.output.period <= 0.0:
@@ -586,7 +586,7 @@ def _progress(progress) -> None:
 
 def _reference_signals(p: Params) -> None:
     """Validate each bound signal over the actual simulation window."""
-    from .params import _unit_items
+    from .syntax import _unit_items
 
     window = p.simulation.initial.t, p.simulation.t_end
     for name, unit in _unit_items(p.units):
@@ -620,7 +620,7 @@ def validate(p: Params) -> Params:
     _network(p)
     for name, unit in p.units.items():
         unit_type(unit.type, f"units.{name}.type").validator(unit, p.base, f"units.{name}")
-    from .params import _unit_items
+    from .syntax import _unit_items
     for name, unit in _unit_items(p.units):
         continuous = unit.ctrl is None or continuous_control(unit)
         period = ((unit.meas.period or p.simulation.output.period) if unit.ctrl is None

@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 import peslite
-from peslite.assembly.params import from_dict
+from peslite.assembly.syntax import from_dict
 from reference_metrics import check_comparison, normalized_errors
 
 

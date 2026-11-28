@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 import peslite
-from peslite.assembly.params import ConfigError, from_dict, read_initial
+from peslite.assembly.syntax import ConfigError, from_dict, read_initial
 from peslite.addons.components.magcomponent import SwitchControlledCapacitor
 from phase_shift_reference import level
 from test_phase_shift import _phase_shift, _ps_tree, _square_wave_breaks

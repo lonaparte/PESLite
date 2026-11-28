@@ -4,7 +4,7 @@ import pytest
 
 import peslite
 from peslite.addons.functions.magport import write_magport
-from peslite.assembly.params import from_dict
+from peslite.assembly.syntax import from_dict
 from conftest import EXAMPLES
 from test_cpp_export import _compiler, _final_csv, _run_generated
 

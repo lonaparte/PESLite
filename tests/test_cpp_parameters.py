@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 import peslite
-from peslite.assembly.params import _written_out
+from peslite.assembly.syntax import _written_out
 from conftest import EXAMPLES
 from test_cpp_export import _compiler
 
@@ -19,7 +19,7 @@ pytestmark = pytest.mark.long
 
 def _case(name, mode):
     p = peslite.load(EXAMPLES / f"{name}-example.pes")
-    from peslite.assembly.params import _unit_items
+    from peslite.assembly.syntax import _unit_items
 
     values = {f"units.{unit}.bridge.model": mode for unit, _ in _unit_items(p.units)}
     values.update({
@@ -540,7 +540,7 @@ def test_adc_offset_uses_the_shared_structural_guard(initial, changed, tmp_path)
     ("gfl", "pwm_averaging", "common"),
 ])
 def test_finite_bridge_parameters_use_the_shared_native_equations(name, mode, selection, tmp_path):
-    from peslite.assembly.params import _unit_items
+    from peslite.assembly.syntax import _unit_items
 
     p = _case(name, mode)
     names = tuple(unit for unit, _ in _unit_items(p.units))
@@ -671,7 +671,7 @@ def test_retained_clock_and_supply_reinitialize_the_adc_window_before_first_samp
 
 
 def test_retained_rms_periods_preserve_fixed_history_dimensions(tmp_path):
-    from peslite.assembly.params import from_dict
+    from peslite.assembly.syntax import from_dict
     from test_measurement_network import load_case
 
     tree = load_case()

@@ -57,10 +57,10 @@ from ..solver.timing import TIME_EPS
 from ..solver.commutation import Commutation
 from .circuit import _BoundValue, _NETWORK_DECLARATION, _mode_decomposition, compile_network
 from .protection import ProtectionStats
-from .params import (BaseValues, ConfigError, SourceParams, UnitParams, _PARAMETER_RECORDER, _event_assignments,
+from .syntax import (BaseValues, ConfigError, PARAMETER_DOMAINS, SourceParams, UnitParams,
+                     _PARAMETER_RECORDER, _event_assignments,
                      _native_text, _written_out, connection_defaults, dumps, parameter_leaves,
                      unit_type)
-from .syntax import PARAMETER_DOMAINS
 from .exporter import ExportResult, _exporter, _signal_names
 from .system import _source_scenario
 from .unit import Plant

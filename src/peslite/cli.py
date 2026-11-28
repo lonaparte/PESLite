@@ -18,7 +18,7 @@ from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .assembly.params import Params, _load_case, _unit_items, dumps, to_dict
+from .assembly.syntax import Params, _load_case, _unit_items, dumps, to_dict
 from .solver.model import ConfigError
 from .solver.simulation import Simulation, SimulationResult, json_value, validate_model
 

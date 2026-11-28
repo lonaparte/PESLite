@@ -5,7 +5,7 @@ import math
 import pytest
 
 import peslite
-from peslite.assembly.params import ConfigError, from_dict
+from peslite.assembly.syntax import ConfigError, from_dict
 from peslite.assembly.circuit import compile_network
 from peslite.components.source import ACCurrentSource, ACVoltageSource, DCCurrentSource
 

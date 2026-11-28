@@ -14,11 +14,11 @@ from ..components.network import Element, GROUND, Port, resolve_endpoints
 from ..components.registry import ELEMENT_TYPES
 from ..components.passive import Bus, RLBranch
 from ..components.source import ACVoltageSource
-from ..components.adc import _PortMeasurement
+from ..components.adc import PortMeasurement
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather, scatter
 from .events import SWITCHABLE, Scenario, SourceScenario
-from .params import (Change, Params, _parameterized, _split_path, _unit_leaves, _unit_path,
+from .syntax import (Change, Params, _parameterized, _split_path, _unit_leaves, _unit_path,
                      unit_type)
 from .unit import DCConverter, Unit, VSC
 
@@ -560,7 +560,7 @@ class System:
                             f"{where}: bus {owner!r} has no connected electrical port"
                         )
                     port = ports[0]
-                    observer = _PortMeasurement(port)
+                    observer = PortMeasurement(port)
                     _merge_unique(subsystems, {f"measurements.{owner}": observer},
                                   "subsystem name")
                     port_measurements[bus] = observer

@@ -921,6 +921,9 @@ class SynchronousCarrier(Modulator):
         self.phase = _real(phase)
         self.min_interval = min_interval
         self.alignment = alignment
+        self.comparison = CarrierComparison(
+            1.0, 0.0, min_interval, alignment=alignment,
+        )
         self._angle = self._frequency = 0.0
         self._time = None
         self._restored = set()
@@ -935,10 +938,9 @@ class SynchronousCarrier(Modulator):
         self._frequency, self._time = frequency, t
         self._restored.clear()
         position = self._angle / (2.0 * math.pi)
-        return CarrierComparison(
-            frequency, position - t * frequency, self.min_interval,
-            alignment=self.alignment,
-        )(t, T_s, d_abc)
+        self.comparison.f_sw = frequency
+        self.comparison.phase = position - t * frequency
+        return self.comparison(t, T_s, d_abc)
 
     def get_state(self):
         return {"angle": float(self._angle), "frequency": float(self._frequency)}

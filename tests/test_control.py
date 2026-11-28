@@ -10,7 +10,7 @@ import pytest
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import from_dict, read_tree, runtime_changeable, to_dict
+from peslite.assembly.syntax import from_dict, read_tree, runtime_changeable, to_dict
 from peslite.control import (ANGLE, CONTROL_INTERFACE, DUTY_RATIO, FREQUENCY, I, I_AB, I_DQ,
                              LOOP_TYPES, POWER, V, V_AB, V_DQ, Filter, Integrator, Loop,
                              Measurement, ModulationLimiter, OutputStage, PI, SignalType, SyncLaw,

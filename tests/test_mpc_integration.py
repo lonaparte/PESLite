@@ -15,7 +15,7 @@ from conftest import EXAMPLES
 from peslite.control.loops import SRFPLL
 from peslite.addons.functions.online_analysis import energy_closure, small_signal
 from peslite.addons.functions.plotting import plot_result
-from peslite.assembly.params import from_dict, read_initial
+from peslite.assembly.syntax import from_dict, read_initial
 from peslite.control import ConverterMeasurement, Measurement, register_loop_type
 from peslite.addons.control.mpc import MPCResult
 from peslite.addons.control.mpc import PredictiveCurrentControl

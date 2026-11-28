@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import peslite
-from peslite.assembly.params import ConfigError, from_dict, runtime_changeable, to_dict
+from peslite.assembly.syntax import ConfigError, from_dict, runtime_changeable, to_dict
 from peslite.control import ControlInterface, ControlOutput, Startup
 from peslite.assembly.control import register_control_type
 

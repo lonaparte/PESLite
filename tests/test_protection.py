@@ -2,7 +2,7 @@
 
 import peslite
 from dataclasses import replace
-from peslite.assembly.params import ProtectionParams, RocofParams
+from peslite.assembly.syntax import ProtectionParams, RocofParams
 
 
 def test_frequency_history_is_lazy_and_retunes_without_changing_window_timing():

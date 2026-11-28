@@ -7,7 +7,7 @@ import pytest
 
 import peslite
 from conftest import EXAMPLES
-from peslite.assembly.params import ConfigError, from_dict, read_tree, to_dict
+from peslite.assembly.syntax import ConfigError, from_dict, read_tree, to_dict
 from peslite.components import RLBranch, SeriesRLC, register_component_type
 from peslite.components.network import Element
 from peslite.control import Measurement

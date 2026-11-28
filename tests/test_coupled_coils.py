@@ -9,7 +9,7 @@ import pytest
 from scipy.linalg import expm
 
 import peslite
-from peslite.assembly.params import from_dict, to_dict
+from peslite.assembly.syntax import from_dict, to_dict
 from peslite.components.network import element_buses
 from peslite.components.registry import ELEMENT_TYPES
 from peslite.addons.components.magcomponent import (
